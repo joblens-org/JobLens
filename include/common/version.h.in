@@ -1,0 +1,4 @@
+#pragma once
+#define PROJ_VERSION "@PROJECT_VERSION@"
+#define PROJ_BUILD_ID "@BUILD_ID@"
+#define PROJ_BUILD_TIME "@BUILD_TIME@"

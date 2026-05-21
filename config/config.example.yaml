@@ -1,0 +1,434 @@
+# JobLens Main Configuration File
+# This file configures the functional parameters for the JobLens job monitoring system.
+# Configuration items are organized by functional module, each responsible for specific
+# monitoring or data output functionality.
+
+# ============================================================
+# Base Config
+# ============================================================
+# Contains fundamental parameters for JobLens core operation, such as RPC communication,
+# logging, threads, etc.
+lens_config:
+  # Unix Domain Socket path for RPC communication
+  # Used for local inter-process communication; JobLens components interact via this socket
+  rpc_socket_path: /var/JobLens/rpc.sock
+  
+  # RPC call timeout (seconds)
+  # RPC calls that do not respond within this time are considered failed
+  rpc_timeout: 5
+  
+  # Process lock file path
+  # Prevents multiple JobLens instances from running simultaneously, ensuring single-instance operation
+  lock_path: /var/JobLens/JobLens.lock
+  
+  # 节点 PID 文件存储目录
+  # 用于分布式模式下存储各节点的 PID 信息，支持主从切换
+  pid_dir: /var/JobLens/node_pids
+  
+  # 采集器线程池最大线程数
+  # 决定同时可以运行多少个采集任务，根据系统资源调整
+  max_collector_threads: 8
+  
+  # Log level
+  # Valid values: trace, debug, info, warn, error, critical, off
+  # Recommended: info for production, debug for troubleshooting
+  log_level: info
+
+# ============================================================
+# Job Registry Config
+# ============================================================
+# Manages persistent storage and auto-discovery of jobs
+job_registry_config:
+  # Job database file path (SQLite format)
+  # Used for persistent storage of job information, supports restoring job state after service restart
+  job_db_path: /var/JobLens/job.db
+  
+  # 是否自动发现并添加 Condor 作业
+  # 开启后通过 eBPF 监听 condor_startd 的 fork 调用自动发现新作业
+  auto_add_condorjob: false
+  
+  # 是否自动发现并添加 Slurm 作业
+  # 开启后通过 eBPF 监听 slurmstepd 的 fork 调用自动发现新作业
+  auto_add_slurmjob: false
+
+  # 规则文件存放目录
+  # 存放用于匹配 Condor 作业和Slurm的规则文件
+  rules_dir: /etc/JobLens/rules/
+
+# ============================================================
+# Condor Job Watcher
+# ============================================================
+# Uses eBPF to listen for condor_startd fork calls, automatically discovering Condor jobs
+condor_job_watcher:
+  # 是否启用规则过滤
+  # 启用后只监控匹配规则文件的作业
+  use_rules: false
+  
+  # 规则文件前缀
+  # 只有以此前缀开头的规则文件才会被加载
+  rules_prefix: rules_condor_
+  
+  # 自动为新发现的 Condor 作业添加的采集器列表
+  # 这些采集器将自动附加到新发现的作业上进行数据收集
+  auto_add_collectors:
+    - cpumem_collector    # CPU 和内存使用率采集器
+    - net_collector       # 网络使用情况采集器
+    - io_collector        # IO 使用情况采集器
+
+# ============================================================
+# Slurm 作业监视器配置 (Slurm Job Watcher)
+# ============================================================
+# 通过 eBPF 机制监听 slurmstepd 的 fork 调用，自动发现 Slurm 作业
+slurm_job_watcher:
+  # 是否启用规则过滤
+  # 启用后只监控匹配规则文件的作业
+  use_rules: true
+  
+  # 规则文件前缀
+  # 只有以此前缀开头的规则文件才会被加载
+  rules_prefix: rules_slurm_
+  
+  # 自动为新发现的 Slurm 作业添加的采集器列表
+  # 这些采集器将自动附加到新发现的作业上进行数据收集
+  auto_add_collectors:
+    - cpumem_collector    # CPU 和内存使用率采集器
+    - net_collector       # 网络使用情况采集器
+    - io_collector        # IO 使用情况采集器
+
+# ============================================================
+# Writers Config
+# ============================================================
+# Configures data output destinations (e.g., Elasticsearch, Kafka, Prometheus, etc.)
+writers_config:
+  # Whether to enable writer performance monitoring
+  # When enabled, records statistics such as invocation count, error count, and execution time for each writer
+  enable_writer_perf: true
+  
+  # Performance monitoring window size
+  # Number of samples used for calculating sliding window averages
+  perf_window_size: 1000
+  
+  # Writer buffer capacity
+  # Size of the internal buffer queue for each writer; affects memory usage and batch write efficiency
+  buffer_capacity: 4096
+  
+  # Writer instance list
+  # Defines specific data output destinations; each writer has its own configuration
+  writers:
+    - name: es_writer                    # Writer name, used for reference in collectors
+      type: ESWriter                     # Writer type: Elasticsearch writer
+      config: ES_writer_config           # Refer to detailed configuration below
+    - name: prmxs_writer                 # Writer name
+      type: PrometheusExporterWriter     # Writer type: Prometheus exporter
+      config: prmxs_writer_config        # Refer to detailed configuration below
+    - name: kafka_writer                 # Writer name
+      type: KafkaWriter                  # Writer type: Kafka writer
+      config: kafka_writer_config        # Refer to detailed configuration below
+
+# ============================================================
+# Collectors Config
+# ============================================================
+# Configures various monitoring data collectors, responsible for collecting performance data
+# from job processes
+collectors_config:
+  # Whether to enable collector performance monitoring
+  # When enabled, records statistics such as invocation count, error count, and execution time
+  # for each collector
+  enable_collector_perf: true
+  
+  # Performance monitoring window size
+  # Number of samples used for calculating sliding window averages
+  perf_window_size: 1000
+  
+  # 作业添加器 FIFO 路径
+  # 用于外部程序通过 FIFO 向 JobLens 动态添加/删除作业
+  job_adder_fifo: /var/JobLens/job_adder_fifo
+  
+  # 默认采集频率（Hz）
+  # 当采集器配置中未指定 freq 时使用的默认值
+  # 1Hz = 每秒采集一次，0.2Hz = 每5秒采集一次
+  default_freq: 1
+  
+  # Default writers to use
+  # Default value used when a collector's configuration does not specify use_writers
+  default_use_writers:
+    - es_writer
+  
+  # Collector instance list
+  # Defines specific monitoring data collectors; each collector has its own configuration
+  collectors:
+    - name: proc_collector               # 采集器名称
+      type: ProcCollector                # 采集器类型：进程信息采集器
+      config: proc_collector_config      # 引用下方的详细配置
+    - name: cpumem_collector             # 采集器名称
+      type: CPUMemCollector              # 采集器类型：CPU/内存采集器
+      config: cpumem_collector_config    # 引用下方的详细配置
+    - name: net_collector                # 采集器名称
+      type: NetUsageCollector            # 采集器类型：网络使用采集器
+      config: net_collector_config       # 引用下方的详细配置
+    - name: io_collector                 # 采集器名称
+      type: IOUsageCollector             # 采集器类型：IO 使用采集器
+      config: io_collector_config        # 引用下方的详细配置
+    - name: basic_info_collector         # 采集器名称
+      type: BasicInfoCollector           # 采集器类型：基础信息采集器（使用 taskstats）
+      config: basic_info_collector_config # 引用下方的详细配置
+    - name: gpu_collector                 # 采集器名称
+      type: GPUUsageCollector           # 采集器类型：基础信息采集器（使用 taskstats）
+      config: gpu_collector_config # 引用下方的详细配置
+
+# ============================================================
+# 基础写入器配置 (Base Writer Config)
+# ============================================================
+# 所有写入器的通用基础配置
+base_writer_config:
+  # 写入操作超时时间（秒）
+  # 超过此时间未完成的写入操作将被视为失败
+  write_timeout: 5
+
+# ============================================================
+# ES Writer Config
+# ============================================================
+# Sends collected data to Elasticsearch for storage and retrieval
+ES_writer_config:
+  # ES 服务器地址（支持环境变量 ES_HOST 覆盖）
+  host: your-es-host.example.com
+  
+  # ES server port
+  # Default is 9200 for HTTP, 443 for HTTPS
+  port: 443
+  
+  # 认证用户名（支持环境变量 ES_USER 覆盖）
+  user: your_es_user
+  
+  # 认证密码（支持环境变量 ES_PASSWORD 覆盖）
+  passwd: your_es_password
+  
+  # Batch write size
+  # Number of records accumulated before performing a batch write; affects write performance
+  # and real-time behavior
+  batch_size: 1
+  
+  # Write timeout (seconds)
+  # Overrides the default value in base_writer_config
+  write_timeout: 1
+  
+  # Collector-to-index mapping configuration
+  # Defines which ES index each collector's data should be written to
+  indexs:
+    - collector_name: cpumem_collector
+      index_name: cpumem_collector
+    - collector_name: net_collector      
+      index_name: net_collector        
+    - collector_name: io_collector      
+      index_name: io_collector       
+    - collector_name: gpu_collector
+      index_name: gpu_collector
+
+# ============================================================
+# Prometheus 导出器写入器配置 (Prometheus Exporter Writer Config)
+# ============================================================
+# 通过 FIFO 文件导出 Prometheus 格式的指标数据
+prmxs_writer_config:
+  # FIFO 文件路径
+  # Prometheus 可通过读取此 FIFO 获取指标数据
+  fifo_path: /var/prom_metrics.fifo
+
+# ============================================================
+# 进程信息采集器配置 (Proc Collector Config)
+# ============================================================
+# 采集进程的详细信息，如命令行参数、环境变量等
+proc_collector_config:
+  # 采集频率（Hz）
+  # 1 = 每秒采集一次
+  freq: 1
+  
+  # 采集周期（秒）- 可选
+  # 用于较长时间间隔的采样，表示采样过去多长时间的数据
+  # period: 1
+
+gpu_collector_config:
+  freq: 1
+  summary: true
+
+# ============================================================
+# CPUMem Collector Config
+# ============================================================
+# Collects CPU and memory usage of processes
+# Data sources: /proc/[pid]/stat and /proc/[pid]/status
+cpumem_collector_config:
+  # Collection frequency (Hz)
+  # 1 = collect once per second
+  freq: 1
+  
+  # Whether to aggregate data
+  # true: outputs aggregate statistics across all processes in addition to per-process data
+  # false: outputs only per-process data
+  summary: true
+
+# ============================================================
+# IO Collector Config
+# ============================================================
+# Collects I/O usage of processes, including read/write bytes, file descriptors, etc.
+# Data sources: /proc/[pid]/io and /proc/[pid]/fd/
+io_collector_config:
+  # Collection frequency (Hz)
+  freq: 1
+  
+  # Whether to aggregate data
+  summary: true
+  
+  # Whether to use eBPF for more detailed I/O data collection
+  # Note: requires root privileges and relevant kernel support
+  use_ebpf: true
+
+# ============================================================
+# Net Collector Config
+# ============================================================
+# Collects network connections and traffic usage of processes
+# Data sources: /proc/[pid]/net/tcp, tcp6, udp, udp6
+net_collector_config:
+  # Collection frequency (Hz)
+  freq: 1
+  
+  # Whether to use the Netlink interface for detailed TCP connection info
+  # When enabled, retrieves detailed TCP statistics such as RTT and retransmission count
+  use_netlink: true
+  
+  # Whether to aggregate data
+  summary: true
+
+# ============================================================
+# 基础信息采集器配置 (Basic Info Collector Config)
+# ============================================================
+# 使用 Linux taskstats 接口采集进程的基础统计信息
+# 包括 CPU 时间、内存使用、IO 统计、上下文切换等
+basic_info_collector_config:
+  # 采集频率（Hz）
+  freq: 1
+  
+  # 是否汇总数据
+  summary: true
+  
+  # 此采集器使用的写入器列表
+  # 可以覆盖默认的 default_use_writers
+  use_writers:
+    - kafka_writer
+
+# ============================================================
+# 文件写入器配置 (File Writer Config)
+# ============================================================
+# 将采集的数据写入本地文件
+file_writer_config:
+  # 输出文件路径
+  path: /tmp/joblens_test
+  
+  # 写入超时时间（秒）
+  write_timeout: 5
+
+# ============================================================
+# Condor ClassAds 写入器配置 (Condor ClassAds Writer Config)
+# ============================================================
+# 通过 condor_chirp 将数据写入 Condor 的 ClassAds 系统
+condor_classads_writer_config:
+  # 写入超时时间（秒）
+  write_timeout: 5
+  
+  # condor_chirp 命令路径
+  chirp_path: /usr/libexec/condor/condor_chirp
+  
+  # ClassAds 文件测试路径
+  classads_path: /tmp/classads_test
+  
+  # chirp 配置目录
+  chirp_config_dir: /tmp/chirp_configs
+  
+  # 使用的 chirp 配置文件路径
+  chirp_config_path: /tmp/chirp_configs/used_config
+
+# ============================================================
+# Kafka 写入器配置 (Kafka Writer Config)
+# ============================================================
+# 将采集的数据发送到 Kafka 消息队列
+kafka_writer_config:
+  # Kafka Broker 列表
+  # 格式: host1:port1,host2:port2（支持环境变量 KAFKA_BROKERS 覆盖）
+  brokers: [your-kafka-broker:9092]
+  
+  # Topic 前缀
+  # 最终 topic 名称为: {topic_prefix}{collector_name}
+  topic_prefix: joblens.jobs_data.
+  
+  # 死信队列 Topic
+  # 用于存储无法成功发送的消息
+  topic_dlq: joblens_dlq
+  
+  # Kafka 客户端 ID
+  # 用于在 Kafka 中标识此生产者
+  client_id: joblens_kafka_writer
+  
+  # 事务 ID
+  # 启用事务时需要配置
+  transactional_id: joblens_txn_1
+  
+  # 是否启用事务
+  # 开启后保证消息的 exactly-once 语义
+  enable_transaction: false
+  
+  # 安全协议
+  # 可选值: plaintext, ssl, sasl_plaintext, sasl_ssl
+  security_protocol: plaintext
+  
+  # SASL 认证机制
+  # 可选值: plain, scram-sha-256, scram-sha-512
+  sasl_mechanism: plain
+  
+  # 消息发送延迟（毫秒）
+  # 生产者等待积累批次的时间，增加可提高吞吐量但增加延迟
+  linger_ms: 100
+  
+  # 每批消息行数
+  # 每批发送的消息数量
+  batch_rows: 10
+  
+  # 以下认证信息仅在 security_protocol 不为 plaintext 时使用
+  # username: "your_kafka_username"
+  # password: "your_kafka_password"
+
+# ============================================================
+# InfluxDB 写入器配置 (InfluxDB Writer Config)
+# ============================================================
+# 将采集的数据写入 InfluxDB 时序数据库
+influxdb_writer_config:
+  # InfluxDB 版本
+  # 目前支持版本 3
+  version: 3
+  
+  # InfluxDB 服务器地址（支持环境变量 INFLUXDB_HOST 覆盖）
+  host: your-influxdb-host
+  
+  # InfluxDB 服务器端口
+  port: 8181
+  
+  # 目标数据库名称（支持环境变量 INFLUXDB_DATABASE 覆盖）
+  database: your_influxdb_database
+  
+  # API Token（InfluxDB v3 认证，支持环境变量 INFLUXDB_TOKEN 覆盖）
+  token: your_influxdb_token
+  
+  # 连接超时时间（秒）
+  timeout: 5
+  
+  # 写入模式
+  # 可选值: sync（同步）, async（异步）
+  mode: async
+  
+  # 批量写入大小
+  # 每批写入的数据点数量
+  batch_size: 1000
+  
+  # 写入频率（秒）
+  # 数据写入的时间间隔
+  freq: 10
+  
+  # 写入超时时间（秒）
+  write_timeout: 5

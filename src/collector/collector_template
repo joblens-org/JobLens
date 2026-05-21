@@ -1,0 +1,74 @@
+#include "collector/__YOUR_COLLECTOR_NAME___collector.h"
+#include "core/collector_registry.hpp"
+#include <spdlog/spdlog.h>
+#include <chrono>
+#include <fstream>
+
+/*================ 注册到工厂 ================*/
+AUTO_REGISTER_JOB_COLLECTOR(
+    __YOUR_COLLECTOR_NAME__Collector,
+    "Put a short description here",
+    ConfigParams{
+        {"freq", "Sampling frequency in Hz, default 0.2"},
+        {"summary", "Whether to summarize (true/false), default false"}
+    }
+)
+
+/*================ 生命周期 ================*/
+bool __YOUR_COLLECTOR_NAME__Collector::init(const nlohmann::json& cfg) {
+    if (cfg.contains("freq")) freq_ = cfg["freq"].get<double>();
+    if (cfg.contains("summary") && cfg["summary"].get<std::string>() == "true")
+        summary_ = true;
+    spdlog::info("__YOUR_COLLECTOR_NAME__Collector init ok");
+    return true;
+}
+
+void __YOUR_COLLECTOR_NAME__Collector::deinit() noexcept {
+    last_value_.clear();
+    spdlog::info("__YOUR_COLLECTOR_NAME__Collector deinit");
+}
+
+/*================ 采集接口 ================*/
+CollectResult __YOUR_COLLECTOR_NAME__Collector::collect() {
+    // 系统级采集：/proc、/sys、命令行等
+    std::vector<__YOUR_COLLECTOR_NAME__Data> ret;
+    // TODO: 填入业务逻辑
+    return ret;
+}
+
+CollectResult __YOUR_COLLECTOR_NAME__Collector::collect(const Job& job) {
+    std::vector<__YOUR_COLLECTOR_NAME__Data> ret;
+    for (int pid : job.JobPIDs) {
+        __YOUR_COLLECTOR_NAME__Data d;
+        d.pid = pid;
+        // TODO: 填入业务逻辑，读 /proc/pid/xxx 等
+        ret.emplace_back(d);
+    }
+
+    if (summary_) { /* 可选：汇总逻辑 */ }
+    return ret;
+}
+
+/*================ 输出适配 ================*/
+CollectDataParseFunc __YOUR_COLLECTOR_NAME__Collector::get_writer_parser(
+    const std::string& writer_type) {
+    using nlohmann::json;
+
+    if (writer_type == "ESWriter") {
+        return [](std::any data)->std::any {
+            json root;
+            root["process_data"] = json::array();
+            if (!data.has_value()) return root;
+
+            auto vec = std::any_cast<std::vector<__YOUR_COLLECTOR_NAME__Data>>(data);
+            for (const auto& v : vec) {
+                json j;
+                j["pid"]   = v.pid;
+                j["value"] = v.value;
+                root["process_data"].push_back(j);
+            }
+            return root;
+        };
+    }
+    return nullptr;   // 不支持的 writer
+}

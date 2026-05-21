@@ -1,0 +1,34 @@
+#pragma once
+#include "icollector.h"
+#include "core/collector_type.h"
+#include "nlohmann/json.hpp"
+#include <unordered_map>
+#include <vector>
+
+//-------------------- 采集结果结构体 --------------------
+struct __YOUR_COLLECTOR_NAME__Data {
+    pid_t pid{};                 // 按需增删字段
+    double value{0.0};
+    // ...
+};
+
+//-------------------- 采集器声明 --------------------
+class __YOUR_COLLECTOR_NAME__Collector : public ICollector {
+public:
+    /*-------- 生命周期 --------*/
+    bool init(const nlohmann::json& cfg) override;
+    void deinit() noexcept override;
+
+    /*-------- 采集接口 --------*/
+    CollectResult collect() override;                    // 系统级采集
+    CollectResult collect(const Job& job) override;      // 进程级采集
+
+    /*-------- 输出适配 --------*/
+    CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
+
+private:
+    /*-------- 业务状态 --------*/
+    double freq_{0.2};               // 例子：采样周期
+    std::unordered_map<pid_t, double> last_value_;  // 例子：上次采样值
+    bool summary_{false};            // 例子：是否汇总
+};
