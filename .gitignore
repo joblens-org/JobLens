@@ -141,3 +141,6 @@ config/config.yaml
 
 # 备份文件
 *~
+
+.omo/*
+AGENTS.md
