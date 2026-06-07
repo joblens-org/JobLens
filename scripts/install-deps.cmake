@@ -13,10 +13,10 @@ set(OS_ID almalinux)
 set(PKGS_DEB
     "clang libbpf-dev libelf-dev cmake pkg-config"
     "libssl-dev zlib1g-dev libcurl4-openssl-dev"
-    "libsasl2-dev libzstd-dev liblz4-dev librdkafka-dev")
+    "libsasl2-dev libzstd-dev liblz4-dev librdkafka-dev libleveldb-dev")
 
 set(PKGS_RPM
-    "clang libbpf-devel elfutils-libelf-devel cmake pkgconfig openssl-devel zlib-devel libcurl-devel cyrus-sasl-devel libzstd-devel lz4-devel librdkafka-devel libnl3-devel nlohmann-json-devel fmt-devel spdlog-devel yaml-cpp-devel
+    "clang libbpf-devel elfutils-libelf-devel cmake pkgconfig openssl-devel zlib-devel libcurl-devel cyrus-sasl-devel libzstd-devel lz4-devel librdkafka-devel libnl3-devel nlohmann-json-devel fmt-devel spdlog-devel yaml-cpp-devel leveldb-devel
 ")
 
 set(PKGS_ALPINE

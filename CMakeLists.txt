@@ -144,16 +144,8 @@ set_target_properties(RdKafka::rdkafka++ PROPERTIES
 
 find_package(Boost REQUIRED)
 
-# 排除SQLiteCpp的脚本文件，避免CMake错误
-set(SQLITECPP_INCLUDE_SCRIPT OFF CACHE BOOL "Include SQLiteCpp config & script files" FORCE)
-
-# 禁用SQLiteCpp安装，避免在make install时将SQLiteCpp文件安装到系统目录
-set(SQLITECPP_INSTALL OFF CACHE BOOL "Disable SQLiteCpp installation" FORCE)
-
-# 禁用SQLite3安装，避免在make install时将sqlite3.h和libsqlite3.a文件安装到系统目录
-set(SQLITE3_INSTALL OFF CACHE BOOL "Disable SQLite3 installation" FORCE)
-
-add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/thirdparty/SQLiteCpp)
+# LevelDB 替代 SQLite 作为作业持久化存储
+pkg_check_modules(LEVELDB REQUIRED IMPORTED_TARGET leveldb)
 
 
 # ===============  6. eBPF 编译 ===============
@@ -200,7 +192,6 @@ target_include_directories(JobLens
         OpenSSL::Crypto
         ZLIB::ZLIB
         Boost::boost
-        ${CMAKE_CURRENT_LIST_DIR}/thirdparty/include
         lua5.4
         PkgConfig::XXHASH
 )
@@ -224,8 +215,7 @@ target_link_libraries(JobLens
         # $<$<TARGET_EXISTS:RdKafka::rdkafka++>:RdKafka::rdkafka++>
         ${SASL2_LIB} ${ZSTD_LIB} ${LZ4_LIB}
         ${NETLINK_LIBRARIES}
-        SQLiteCpp
-        sqlite3
+        PkgConfig::LEVELDB
         pthread
         dl
         lua5.4
