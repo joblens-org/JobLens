@@ -22,6 +22,8 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <thread>
+#include <chrono>
+#include <filesystem>
 
 #include "common/utils.hpp"
 #include "common/condor_job.hpp"
@@ -37,14 +39,70 @@ split_two(std::string s, char sep = '.') {
            : std::pair{s.substr(0, p), s.substr(p + 1)};
 }
 
-// Helper functions to split/merge uint64 for SQLite storage
-static inline void split_uint64(uint64_t value, uint32_t& high, uint32_t& low) {
-    high = static_cast<uint32_t>(value >> 32);
-    low = static_cast<uint32_t>(value & 0xFFFFFFFF);
+// hex64: uint64 → 16 字符零填充十六进制，保证字典序与数值序一致
+static std::string hex64(uint64_t v) {
+    return fmt::format("{:016x}", v);
 }
 
-static inline uint64_t combine_high_low(uint32_t high, uint32_t low) {
-    return (static_cast<uint64_t>(high) << 32) | static_cast<uint64_t>(low);
+static uint64_t unhex64(const std::string& s) {
+    return std::stoull(s, nullptr, 16);
+}
+
+static const std::string KEY_PREFIX_JOB     = "j:";
+static const std::string KEY_PREFIX_HISTORY = "h:";
+static const std::string KEY_PREFIX_COUNTER = "c:";
+
+static std::string key_job(uint64_t jobID) {
+    return KEY_PREFIX_JOB + hex64(jobID);
+}
+
+static std::string key_history(uint64_t jobID, uint64_t end_time) {
+    return KEY_PREFIX_HISTORY + hex64(jobID) + ":" + hex64(end_time);
+}
+
+static std::string key_counter(const std::string& name) {
+    return KEY_PREFIX_COUNTER + name;
+}
+
+static std::string persist_job_to_json(const Job& job) {
+    nlohmann::json j;
+    j["jobtype"]       = static_cast<int>(job.jobtype);
+    j["subtype"]       = static_cast<int>(job.subtype);
+    j["pids"]          = job.JobPIDs;
+    j["collectors"]    = job.CollectorNames;
+    j["native_job_id"] = job.NativeJobID;
+    std::visit([&j](const auto& obj) {
+        j["sub_attr"] = nlohmann::json(obj);
+    }, job.sub_attr);
+    return j.dump();
+}
+
+static Job persist_json_to_job(const std::string& json_str) {
+    auto j = nlohmann::json::parse(json_str);
+    Job job;
+    job.jobtype       = static_cast<JobType>(j.value("jobtype", 0));
+    job.subtype       = static_cast<JobSubType>(j.value("subtype", 0));
+    job.JobPIDs       = j.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>();
+    job.CollectorNames = j.value("collectors", nlohmann::json::array()).get<std::vector<std::string>>();
+    job.NativeJobID   = j.value("native_job_id", "");
+
+    if (job.subtype == JobSubType::Condor) {
+        if (j.contains("sub_attr")) {
+            job.sub_attr = j["sub_attr"].get<CondorJobAttr>();
+        } else {
+            job.sub_attr = CondorJobAttr{};
+        }
+    } else if (job.subtype == JobSubType::Slurm) {
+        if (j.contains("sub_attr")) {
+            job.sub_attr = j["sub_attr"].get<SlurmJobAttr>();
+        } else {
+            job.sub_attr = SlurmJobAttr{};
+        }
+    } else {
+        job.sub_attr = CommonJobAttr{.auto_update_child = true};
+    }
+
+    return job;
 }
 
 
@@ -514,68 +572,27 @@ std::vector<Job> JobRegistry::findJob(const SubAttrMatcher& matcher) const {
 
 bool JobRegistry::init_job_db(){
     auto db_path = Config::instance().getString("job_registry_config", "job_db_path");
-    job_db = std::make_unique<SQLite::Database>(db_path, SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
-    if (!job_db) {
-        spdlog::error("JobRegistry: failed to create job database");
-        return false;
-    }
-    // 创建表
-    try{
-        job_db->exec("CREATE TABLE IF NOT EXISTS jobs \
-                 (id INTEGER PRIMARY KEY, \
-                  jobid_high INTEGER, \
-                  jobid_low INTEGER, \
-                  jobtype INTEGER, \
-                  subtype INTEGER, \
-                  pids TEXT, \
-                  collectors TEXT, \
-                  native_job_id TEXT DEFAULT '', \
-                  status INTEGER DEFAULT 1, \
-                  UNIQUE(jobid_high, jobid_low));");
-        job_db->exec("CREATE INDEX IF NOT EXISTS idx_jobid ON jobs (jobid_high, jobid_low);");
-        
-        // 迁移已有表：添加 native_job_id 列（如果不存在）
-        try {
-            job_db->exec("ALTER TABLE jobs ADD COLUMN native_job_id TEXT DEFAULT ''");
-        } catch (const SQLite::Exception& e) {
-            // 列已存在则忽略
-        }
-        
-        // 创建历史表
-        job_db->exec("CREATE TABLE IF NOT EXISTS jobs_history \
-                 (id INTEGER PRIMARY KEY, \
-                  jobid_high INTEGER, \
-                  jobid_low INTEGER, \
-                  jobtype INTEGER, \
-                  subtype INTEGER, \
-                  pids TEXT, \
-                  collectors TEXT, \
-                  native_job_id TEXT DEFAULT '', \
-                  status INTEGER DEFAULT 0, \
-                  end_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP);");
-        job_db->exec("CREATE INDEX IF NOT EXISTS idx_history_jobid ON jobs_history (jobid_high, jobid_low);");
-        job_db->exec("CREATE INDEX IF NOT EXISTS idx_history_endtime ON jobs_history (end_time);");
 
-        // 迁移 jobs_history 表：添加 native_job_id 列（如果不存在）
-        try {
-            job_db->exec("ALTER TABLE jobs_history ADD COLUMN native_job_id TEXT DEFAULT ''");
-        } catch (const SQLite::Exception& e) {
-            // 列已存在则忽略
-        }
-    }catch(const SQLite::Exception& e){
-        spdlog::error("JobRegistry: failed to create jobs table: {}", e.what());
+    std::filesystem::path db_dir(db_path);
+    if (db_dir.has_parent_path()) {
+        std::error_code ec;
+        std::filesystem::create_directories(db_dir.parent_path(), ec);
+    }
+
+    leveldb::Options options;
+    options.create_if_missing = true;
+    leveldb::Status status = leveldb::DB::Open(options, db_path, &job_db);
+    if (!status.ok()) {
+        spdlog::error("JobRegistry: failed to open LevelDB at {}: {}", db_path, status.ToString());
         return false;
     }
+
     spdlog::info("JobRegistry: init_job_db at {}", db_path);
     
-    // 迁移历史数据（一次性）
-    // migrate_ended_jobs_to_history();
-    
-    try{       
+    try{
         restore_jobs_from_db();
     }
     catch(const std::exception& e){
-        // 不影响正常初始化结果
         spdlog::warn("JobRegistry: failed to restore jobs from db: {}", e.what());
     }
     
@@ -583,47 +600,28 @@ bool JobRegistry::init_job_db(){
 }
 
 void JobRegistry::deinit_job_db(){
-    job_db.reset();
+    delete job_db;
+    job_db = nullptr;
     spdlog::info("JobRegistry: deinit_job_db");
 }
 
 void JobRegistry::restore_jobs_from_db(){
-    SQLite::Transaction transaction(*job_db);
-    SQLite::Statement query(*job_db, "SELECT jobid_high, jobid_low, jobtype, subtype, pids, collectors, native_job_id, status FROM jobs;");
-    while (query.executeStep()) {
-        Job job;
-        uint32_t high = static_cast<uint32_t>(query.getColumn(0).getInt());
-        uint32_t low = static_cast<uint32_t>(query.getColumn(1).getInt());
-        job.JobID = combine_high_low(high, low);
-        job.jobtype = static_cast<JobType>(query.getColumn(2).getInt());
-        job.subtype = static_cast<JobSubType>(query.getColumn(3).getInt());
-        std::string pids_str = query.getColumn(4).getString();
-        std::string collectors_str = query.getColumn(5).getString();
-        // 解析 pids 和 collectors
-        nlohmann::json pids_json = nlohmann::json::parse(pids_str);
-        nlohmann::json collectors_json = nlohmann::json::parse(collectors_str);
-        job.JobPIDs = pids_json.get<std::vector<int>>();
-        job.CollectorNames = collectors_json.get<std::vector<std::string>>();
-        job.NativeJobID = query.getColumn(6).getString();
+    leveldb::Iterator* it = job_db->NewIterator(leveldb::ReadOptions());
+    for (it->Seek(KEY_PREFIX_JOB); it->Valid() && it->key().starts_with(KEY_PREFIX_JOB); it->Next()) {
+        std::string key_str = it->key().ToString();
+        uint64_t jobID = unhex64(key_str.substr(KEY_PREFIX_JOB.size()));
 
-        if (job.subtype == JobSubType::Condor) {
-            job.sub_attr = CondorJobAttr{};
-        } else if (job.subtype == JobSubType::Slurm) {
-            job.sub_attr = SlurmJobAttr{};
-        } else if (job.subtype == JobSubType::Common) {
-            job.sub_attr = CommonJobAttr{
-                .auto_update_child = true
-            };
-        }
+        Job job = persist_json_to_job(it->value().ToString());
+        job.JobID = jobID;
 
-        
         restore_jobs_.push_back(std::move(job));
-        
-        spdlog::debug("JobRegistry: restored job with JobID {} from db", job.JobID);
+        spdlog::debug("JobRegistry: restored job with JobID {} from db", jobID);
     }
+    if (!it->status().ok()) {
+        spdlog::warn("JobRegistry: iterator error during restore: {}", it->status().ToString());
+    }
+    delete it;
     spdlog::info("JobRegistry: restored {} jobs from db", restore_jobs_.size());
-    transaction.commit();
-    return;
 }
 
 void JobRegistry::persist_new_job(const Job& job)
@@ -631,42 +629,15 @@ void JobRegistry::persist_new_job(const Job& job)
     if (!db_running) return;
 
     std::lock_guard<std::mutex> db_lock(db_mtx_);
-    SQLite::Transaction transaction(*job_db);
 
-    try
-    {
-        SQLite::Statement query(*job_db,
-            "INSERT INTO jobs(jobid_high, jobid_low, jobtype, subtype, pids, collectors, native_job_id, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
-            "ON CONFLICT(jobid_high, jobid_low) DO UPDATE "
-            "SET status = excluded.status, native_job_id = excluded.native_job_id;");
-
-        uint32_t high, low;
-        split_uint64(job.JobID, high, low);
-        query.bind(1, static_cast<int>(high));
-        query.bind(2, static_cast<int>(low));
-        query.bind(3, static_cast<int>(job.jobtype));
-        query.bind(4, static_cast<int>(job.subtype));
-
-        nlohmann::json pids_json        = job.JobPIDs;
-        nlohmann::json collectors_json  = job.CollectorNames;
-        query.bind(5, pids_json.dump());
-        query.bind(6, collectors_json.dump());
-        query.bind(7, job.NativeJobID);
-
-        query.exec();                 // 可能抛出 SQLiteException
-        transaction.commit();         // 只有 exec 成功才提交
-
-        spdlog::info("JobRegistry: insert new job with JobID {} to db", job.JobID);
-    }
-    catch (const SQLite::Exception& e)
-    {
-        transaction.rollback();
-
-        spdlog::error("JobRegistry: failed to persist JobID {} — SQLite error [{}] {}",
-                      job.JobID, e.getErrorCode(), e.what());
-
-        return;
+    std::string key = key_job(job.JobID);
+    std::string json = persist_job_to_json(job);
+    leveldb::Status s = job_db->Put(leveldb::WriteOptions(), key, json);
+    if (s.ok()) {
+        spdlog::info("JobRegistry: persist new job with JobID {} to db", job.JobID);
+    } else {
+        spdlog::error("JobRegistry: failed to persist JobID {} — LevelDB error: {}",
+                      job.JobID, s.ToString());
     }
 }
 
@@ -674,33 +645,15 @@ void JobRegistry::persist_new_job(const Job& job)
 void JobRegistry::update_job_info(const Job& job){
     if(!db_running) return;
     std::lock_guard<std::mutex> db_lock(db_mtx_);
-    SQLite::Transaction transaction(*job_db);
-    try
-    {
-        SQLite::Statement query(*job_db, "UPDATE jobs SET pids = ?, collectors = ?, native_job_id = ? WHERE jobid_high = ? AND jobid_low = ?;");
-        nlohmann::json pids_json = job.JobPIDs;
-        nlohmann::json collectors_json = job.CollectorNames;
-        query.bind(1, pids_json.dump());
-        query.bind(2, collectors_json.dump());
-        query.bind(3, job.NativeJobID);
-        
-        uint32_t high, low;
-        split_uint64(job.JobID, high, low);
-        query.bind(4, static_cast<int>(high));
-        query.bind(5, static_cast<int>(low));
-        
-        query.exec();
-        transaction.commit();
+
+    std::string key = key_job(job.JobID);
+    std::string json = persist_job_to_json(job);
+    leveldb::Status s = job_db->Put(leveldb::WriteOptions(), key, json);
+    if (s.ok()) {
         spdlog::info("JobRegistry: update job info with JobID {} in db", job.JobID);
-    }
-    catch(const SQLite::Exception& e)
-    {
-        transaction.rollback();
-
-        spdlog::error("JobRegistry: failed to update JobID {} — SQLite error [{}] {}",
-                      job.JobID, e.getErrorCode(), e.what());
-
-        return;
+    } else {
+        spdlog::error("JobRegistry: failed to update JobID {} — LevelDB error: {}",
+                      job.JobID, s.ToString());
     }
 }
     
@@ -709,56 +662,33 @@ void JobRegistry::end_job_in_db(uint64_t jobID){
     if(!db_running) return;
     
     std::lock_guard<std::mutex> db_lock(db_mtx_);
-    SQLite::Transaction transaction(*job_db);
     
-    try
-    {
-        // 1. 从 jobs 表查询任务数据
-        SQLite::Statement select_query(*job_db, 
-            "SELECT jobid_high, jobid_low, jobtype, subtype, pids, collectors, native_job_id, status FROM jobs WHERE jobid_high = ? AND jobid_low = ?;");
-        
-        uint32_t high, low;
-        split_uint64(jobID, high, low);
-        select_query.bind(1, static_cast<int>(high));
-        select_query.bind(2, static_cast<int>(low));
-        
-        if (!select_query.executeStep()) {
-            spdlog::warn("JobRegistry: job {} not found in db when ending", jobID);
-            transaction.rollback();
-            return;
-        }
-        
-        // 2. 插入到 history 表
-        SQLite::Statement insert_query(*job_db,
-            "INSERT INTO jobs_history(jobid_high, jobid_low, jobtype, subtype, pids, collectors, native_job_id, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 0);");
-        
-        insert_query.bind(1, select_query.getColumn(0).getInt());
-        insert_query.bind(2, select_query.getColumn(1).getInt());
-        insert_query.bind(3, select_query.getColumn(2).getInt());
-        insert_query.bind(4, select_query.getColumn(3).getInt());
-        insert_query.bind(5, select_query.getColumn(4).getString());
-        insert_query.bind(6, select_query.getColumn(5).getString());
-        insert_query.bind(7, select_query.getColumn(6).getString());
-        insert_query.exec();
-        
-        // 3. 从 jobs 表删除
-        SQLite::Statement delete_query(*job_db, "DELETE FROM jobs WHERE jobid_high = ? AND jobid_low = ?;");
-        delete_query.bind(1, static_cast<int>(high));
-        delete_query.bind(2, static_cast<int>(low));
-        delete_query.exec();
-        
-        transaction.commit();
-        spdlog::info("JobRegistry: moved ended job {} from jobs to jobs_history", jobID);
-    }
-    catch(const SQLite::Exception& e)
-    {
-        transaction.rollback();
-        spdlog::error("JobRegistry: failed to end_job_in_db for JobID {} — SQLite error [{}] {}",
-                      jobID, e.getErrorCode(), e.what());
+    std::string key = key_job(jobID);
+    std::string json;
+    leveldb::Status s = job_db->Get(leveldb::ReadOptions(), key, &json);
+    if (s.IsNotFound()) {
+        spdlog::warn("JobRegistry: job {} not found in db when ending", jobID);
         return;
     }
-    
+    if (!s.ok()) {
+        spdlog::error("JobRegistry: failed to read job {} for archival: {}", jobID, s.ToString());
+        return;
+    }
+
+    uint64_t now = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    leveldb::WriteBatch batch;
+    batch.Delete(key);
+    batch.Put(key_history(jobID, now), json);
+
+    s = job_db->Write(leveldb::WriteOptions(), &batch);
+    if (s.ok()) {
+        spdlog::info("JobRegistry: moved ended job {} from jobs to jobs_history", jobID);
+    } else {
+        spdlog::error("JobRegistry: failed to end_job_in_db for JobID {} — LevelDB error: {}",
+                      jobID, s.ToString());
+    }
 }
 
 
@@ -830,53 +760,56 @@ void JobRegistry::init_job_id_counter() {
     }
 
     try {
-        // 创建计数器表（如果不存在）
-        job_db->exec("CREATE TABLE IF NOT EXISTS job_id_counter ( \
-                     id INTEGER PRIMARY KEY CHECK(id = 1), \
-                     next_job_id INTEGER NOT NULL DEFAULT 1);");
-        
-        // 初始化计数器记录（如果不存在）
-        job_db->exec("INSERT OR IGNORE INTO job_id_counter (id, next_job_id) VALUES (1, 1);");
-
-        // 先从计数器表读取值
-        SQLite::Statement query(*job_db, "SELECT next_job_id FROM job_id_counter WHERE id = 1;");
         uint64_t counter_value = 1;
-        if (query.executeStep()) {
-            counter_value = static_cast<uint64_t>(query.getColumn(0).getInt64());
+
+        std::string counter_json;
+        leveldb::Status s = job_db->Get(leveldb::ReadOptions(), key_counter("job_id"), &counter_json);
+        if (s.ok()) {
+            counter_value = std::stoull(counter_json);
         }
 
-        // 从jobs表和jobs_history表中找出最大的JobID
         uint64_t max_job_id = 0;
-        
-        // 检查jobs表
-        SQLite::Statement query_jobs(*job_db, 
-            "SELECT MAX((CAST(jobid_high AS INTEGER) << 32) | CAST(jobid_low AS INTEGER)) as max_id FROM jobs;");
-        if (query_jobs.executeStep() && !query_jobs.getColumn(0).isNull()) {
-            max_job_id = static_cast<uint64_t>(query_jobs.getColumn(0).getInt64());
-        }
 
-        // 检查jobs_history表
-        SQLite::Statement query_history(*job_db, 
-            "SELECT MAX((CAST(jobid_high AS INTEGER) << 32) | CAST(jobid_low AS INTEGER)) as max_id FROM jobs_history;");
-        if (query_history.executeStep() && !query_history.getColumn(0).isNull()) {
-            uint64_t history_max = static_cast<uint64_t>(query_history.getColumn(0).getInt64());
-            if (history_max > max_job_id) {
-                max_job_id = history_max;
+        // 扫描 jobs 前缀取最大 JobID
+        leveldb::Iterator* it = job_db->NewIterator(leveldb::ReadOptions());
+        it->Seek(KEY_PREFIX_JOB);
+        if (it->Valid() && it->key().starts_with(KEY_PREFIX_JOB)) {
+            // 跳到最后一个 j: key
+            it->SeekToLast();
+            // 回退确保在 j: 范围内
+            while (it->Valid() && !it->key().starts_with(KEY_PREFIX_JOB)) {
+                it->Prev();
+            }
+            if (it->Valid()) {
+                uint64_t id = unhex64(it->key().ToString().substr(2));
+                if (id > max_job_id) max_job_id = id;
             }
         }
 
-        // 取最大值 + 1 作为下一个可用的JobID
+        // 扫描 history 前缀
+        it->Seek(KEY_PREFIX_HISTORY);
+        if (it->Valid() && it->key().starts_with(KEY_PREFIX_HISTORY)) {
+            it->SeekToLast();
+            while (it->Valid() && !it->key().starts_with(KEY_PREFIX_HISTORY)) {
+                it->Prev();
+            }
+            if (it->Valid()) {
+                // history key: "h:" + hex64(JobID) + ":" + hex64(timestamp)
+                std::string hex_part = it->key().ToString().substr(2, 16);
+                uint64_t id = unhex64(hex_part);
+                if (id > max_job_id) max_job_id = id;
+            }
+        }
+        delete it;
+
         next_job_id_ = std::max(counter_value, max_job_id + 1);
-        
-        // 更新计数器表
-        SQLite::Statement update(*job_db, 
-            "INSERT INTO job_id_counter (id, next_job_id) VALUES (1, ?) \
-             ON CONFLICT(id) DO UPDATE SET next_job_id = excluded.next_job_id;");
-        update.bind(1, static_cast<int64_t>(next_job_id_));
-        update.exec();
+
+        // 持久化当前值
+        std::string value = std::to_string(next_job_id_);
+        job_db->Put(leveldb::WriteOptions(), key_counter("job_id"), value);
 
         spdlog::info("JobRegistry: initialized job_id_counter, next_job_id_ = {}", next_job_id_);
-    } catch (const SQLite::Exception& e) {
+    } catch (const std::exception& e) {
         spdlog::error("JobRegistry: failed to init job_id_counter: {}", e.what());
         next_job_id_ = 1;
     }
@@ -886,14 +819,10 @@ void JobRegistry::persist_job_id_counter() {
     if (!db_running) return;
 
     std::lock_guard<std::mutex> db_lock(db_mtx_);
-    try {
-        SQLite::Statement query(*job_db, 
-            "INSERT INTO job_id_counter (id, next_job_id) VALUES (1, ?) \
-             ON CONFLICT(id) DO UPDATE SET next_job_id = excluded.next_job_id;");
-        query.bind(1, static_cast<int64_t>(next_job_id_));
-        query.exec();
-    } catch (const SQLite::Exception& e) {
-        spdlog::error("JobRegistry: failed to persist job_id_counter: {}", e.what());
+    std::string value = std::to_string(next_job_id_);
+    leveldb::Status s = job_db->Put(leveldb::WriteOptions(), key_counter("job_id"), value);
+    if (!s.ok()) {
+        spdlog::error("JobRegistry: failed to persist job_id_counter: {}", s.ToString());
     }
 }
 

@@ -18,7 +18,8 @@
 #include <vector>
 #include <functional>
 #include <optional>
-#include <SQLiteCpp/SQLiteCpp.h>
+#include <leveldb/db.h>
+#include <leveldb/write_batch.h>
 #include <thread>
 
 
@@ -85,7 +86,7 @@ private:
     void update_job_info(const Job& job);
     void end_job_in_db(uint64_t jobID);
     bool db_running{false};
-    std::unique_ptr<SQLite::Database> job_db;
+    leveldb::DB* job_db = nullptr;    // LevelDB 实例，通过 delete 释放
     std::mutex db_mtx_;                 // 序列化job_db的并发事务操作
 
     // JobID计数器相关
