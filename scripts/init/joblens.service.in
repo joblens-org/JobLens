@@ -1,0 +1,22 @@
+[Unit]
+Description=JobLens - high-performance job monitoring daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/JobLens
+Environment=LD_LIBRARY_PATH=@CMAKE_INSTALL_FULL_LIBDIR@/joblens
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/JobLens \
+          -m service \
+          -c /etc/JobLens/config.yaml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=joblens
+
+[Install]
+WantedBy=multi-user.target
