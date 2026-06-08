@@ -124,11 +124,9 @@ test/__pycache__/
 test/venv/
 test/test_es.py
 
-.github/
 __pycache__/
 *.pyc
 venv/
-.github/
 include/common/version.h
 ai-doc/
 build*/
@@ -144,3 +142,5 @@ config/config.yaml
 
 .omo/*
 AGENTS.md
+
+.cache/*
