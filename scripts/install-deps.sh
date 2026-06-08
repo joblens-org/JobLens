@@ -12,6 +12,25 @@ fi
 
 source /etc/os-release
 
+install_sol2() {
+    local SOL2_VERSION="v3.3.0"
+    local SOL2_INSTALL_DIR="/usr/local/include/sol"
+    local SOL2_URL="https://github.com/ThePhD/sol2/releases/download/${SOL2_VERSION}/sol.hpp"
+
+    if [ -f "${SOL2_INSTALL_DIR}/sol.hpp" ]; then
+        echo "sol2 already installed at ${SOL2_INSTALL_DIR}"
+        return 0
+    fi
+
+    echo "Installing sol2 ${SOL2_VERSION} single header..."
+    sudo mkdir -p "${SOL2_INSTALL_DIR}"
+    curl -fsSL "${SOL2_URL}" -o "${SOL2_INSTALL_DIR}/sol.hpp" || {
+        echo "ERROR: Failed to download sol2"
+        return 1
+    }
+    echo "sol2 installed to ${SOL2_INSTALL_DIR}"
+}
+
 install_deb() {
     echo "Detected Debian/Ubuntu. Installing dependencies..."
     sudo apt-get update
@@ -40,6 +59,7 @@ install_deb() {
         libzstd-dev \
         liblz4-dev \
         nlohmann-json3-dev
+    install_sol2
     echo "Done."
 }
 
@@ -69,6 +89,7 @@ install_rpm() {
         fmt-devel \
         date-devel \
         nlohmann-json-devel
+    install_sol2
     echo "Done."
 }
 
@@ -98,6 +119,7 @@ install_arch() {
         fmt \
         chrono-date \
         nlohmann-json
+    install_sol2
     echo "Done."
 }
 

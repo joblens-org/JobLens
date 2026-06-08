@@ -85,6 +85,15 @@ find_package(CURL REQUIRED)
 
 find_package(nlohmann_json REQUIRED)
 
+
+find_path(SOL2_INCLUDE_DIR NAMES sol/sol.hpp)
+if(NOT SOL2_INCLUDE_DIR)
+    message(FATAL_ERROR "sol2 not found")
+endif()
+add_library(sol2::sol2 INTERFACE IMPORTED)
+set_target_properties(sol2::sol2 PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${SOL2_INCLUDE_DIR}")
+
 find_path(RDKAFKA_INCLUDE_DIR
           NAMES rdkafkacpp.h
           PATHS /usr/local/include /usr/include
@@ -163,6 +172,7 @@ target_link_libraries(JobLens
         Boost::boost
         date::date
         nlohmann_json::nlohmann_json
+        sol2::sol2
         ${SASL2_LIB} ${ZSTD_LIB} ${LZ4_LIB}
         ${NETLINK_LIBRARIES}
         LevelDB::LevelDB
