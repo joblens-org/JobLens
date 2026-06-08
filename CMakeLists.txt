@@ -4,7 +4,7 @@
 # 环境依赖安装见 scripts/install-deps.sh
 # ============================================================
 
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.25)
 project(JobLens
         VERSION 0.0.21
         DESCRIPTION "High-performance job profiler"
@@ -32,16 +32,18 @@ if(NOT BUILD_ID)
 endif()
 string(TIMESTAMP BUILD_TIME UTC)
 
+# 生成 version.h 到构建目录，避免污染源码树
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/include/common)
 configure_file(
   ${CMAKE_SOURCE_DIR}/include/common/version.h.in
-  ${CMAKE_SOURCE_DIR}/include/common/version.h
+  ${CMAKE_BINARY_DIR}/include/common/version.h
   @ONLY)
 
 set(PROFILER_INC_DIR "${CMAKE_SOURCE_DIR}/include")
 set(PROFILER_SRC_DIR "${CMAKE_SOURCE_DIR}/src")
 
 # ---- 构建工具 ----
-find_program(CLANG clang)
+find_program(CLANG clang REQUIRED)
 find_package(PkgConfig REQUIRED)
 
 # ---- 系统库 ----
@@ -123,18 +125,17 @@ add_executable(JobLens ${PROFILER_SOURCES})
 add_dependencies(JobLens ebpf_objects)
 
 target_include_directories(JobLens
-    PUBLIC
+    PRIVATE
+        ${CMAKE_BINARY_DIR}/include      # 生成的 version.h 优先于源码目录
         ${PROFILER_INC_DIR}
         ${NETLINK_INCLUDE_DIRS}
         /usr/include/libnl3
-        ELF::ELF   ZLIB::ZLIB
         fmt::fmt   spdlog::spdlog
         yaml-cpp::yaml-cpp
         PkgConfig::CURL
         RdKafka::rdkafka++
         OpenSSL::SSL OpenSSL::Crypto
         Boost::boost
-        lua5.4
         PkgConfig::XXHASH)
 
 target_link_libraries(JobLens

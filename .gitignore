@@ -129,6 +129,7 @@ __pycache__/
 venv/
 include/common/version.h
 ai-doc/
+.ccache
 build*/
 .gitlab-ci-local/
 rpm-output/

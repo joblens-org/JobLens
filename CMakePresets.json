@@ -1,0 +1,64 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "ci-linux",
+      "displayName": "CI Linux (RelWithDebInfo, /usr prefix)",
+      "description": "GitHub Actions CI 构建与打包预设",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_INSTALL_PREFIX": "/usr"
+      }
+    },
+    {
+      "name": "dev-linux",
+      "displayName": "本地开发 (RelWithDebInfo)",
+      "description": "本地开发构建，前缀 /usr/local",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_INSTALL_PREFIX": "/usr/local",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "ci-linux",
+      "configurePreset": "ci-linux"
+    },
+    {
+      "name": "dev-linux",
+      "configurePreset": "dev-linux"
+    }
+  ],
+  "packagePresets": [
+    {
+      "name": "ci-linux-tgz",
+      "configurePreset": "ci-linux",
+      "generators": ["TGZ"],
+      "description": "CI 验证 TGZ 打包产物"
+    },
+    {
+      "name": "ci-linux-rpm",
+      "configurePreset": "ci-linux",
+      "generators": ["RPM"],
+      "description": "生产 RPM 包，含 systemd 服务与维护脚本",
+      "configurations": ["RelWithDebInfo"]
+    },
+    {
+      "name": "ci-linux-all",
+      "configurePreset": "ci-linux",
+      "generators": ["TGZ", "RPM"],
+      "description": "一次性生成 TGZ + RPM 产物"
+    }
+  ]
+}
