@@ -79,7 +79,7 @@ jobs:
       - name: Verify RPM contents
         run: |
           echo "=== RPM 包信息 ==="
-          RPM=$(ls build/joblens-*.rpm 2>/dev/null | head -1)
+          RPM=$(ls build/JobLens-*.rpm 2>/dev/null | head -1)
           if [ -z "$RPM" ]; then
             echo "✗ 未找到 RPM 包"
             exit 1
