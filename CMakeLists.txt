@@ -149,6 +149,7 @@ target_include_directories(JobLens
     PRIVATE
         ${CMAKE_BINARY_DIR}/include      # 生成的 version.h 优先于源码目录
         ${PROFILER_INC_DIR}
+        ${LUA_INCLUDE_DIR}
         ${NETLINK_INCLUDE_DIRS}
         /usr/include/libnl3
         fmt::fmt   spdlog::spdlog
