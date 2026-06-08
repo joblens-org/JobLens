@@ -83,6 +83,8 @@ find_package(date REQUIRED)
 
 find_package(CURL REQUIRED)
 
+find_package(nlohmann_json REQUIRED)
+
 find_path(RDKAFKA_INCLUDE_DIR
           NAMES rdkafkacpp.h
           PATHS /usr/local/include /usr/include
@@ -160,6 +162,7 @@ target_link_libraries(JobLens
         RdKafka::rdkafka++
         Boost::boost
         date::date
+        nlohmann_json::nlohmann_json
         ${SASL2_LIB} ${ZSTD_LIB} ${LZ4_LIB}
         ${NETLINK_LIBRARIES}
         LevelDB::LevelDB

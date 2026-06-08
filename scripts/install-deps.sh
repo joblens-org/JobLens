@@ -38,7 +38,8 @@ install_deb() {
         libhowardhinnant-date-dev \
         libsasl2-dev \
         libzstd-dev \
-        liblz4-dev
+        liblz4-dev \
+        nlohmann-json3-dev
     echo "Done."
 }
 
@@ -95,7 +96,8 @@ install_arch() {
         spdlog \
         yaml-cpp \
         fmt \
-        chrono-date
+        chrono-date \
+        nlohmann-json
     echo "Done."
 }
 
