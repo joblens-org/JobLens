@@ -13,22 +13,60 @@ fi
 source /etc/os-release
 
 install_sol2() {
-    local SOL2_VERSION="v3.3.0"
-    local SOL2_INSTALL_DIR="/usr/local/include/sol"
-    local SOL2_URL="https://github.com/ThePhD/sol2/releases/download/${SOL2_VERSION}/sol.hpp"
+    local SOL2_VERSION="${SOL2_VERSION:-v3.5.0}"
+    local INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
 
-    if [ -f "${SOL2_INSTALL_DIR}/sol.hpp" ]; then
-        echo "sol2 already installed at ${SOL2_INSTALL_DIR}"
-        return 0
-    fi
+    # 检查是否已安装（系统路径或自定义路径）
+    for prefix in "${INSTALL_PREFIX}" "/usr"; do
+        if [ -f "${prefix}/include/sol/sol.hpp" ] && \
+           [ -f "${prefix}/include/sol/config.hpp" ]; then
+            echo "    sol2 already installed at ${prefix}/include/sol/"
+            return 0
+        fi
+    done
 
-    echo "Installing sol2 ${SOL2_VERSION} single header..."
-    sudo mkdir -p "${SOL2_INSTALL_DIR}"
-    curl -fsSL "${SOL2_URL}" -o "${SOL2_INSTALL_DIR}/sol.hpp" || {
+    echo "==> Installing sol2 (${SOL2_VERSION})..."
+
+    # 优先尝试系统包管理器（非交互，失败静默 fallback）
+    case "$ID" in
+        fedora)
+            if sudo dnf install -y sol2-devel 2>/dev/null; then
+                echo "✅ sol2 installed via dnf (sol2-devel)"
+                return 0
+            fi
+            echo "    dnf sol2-devel not available, falling back to tarball"
+            ;;
+        ubuntu|debian)
+            if sudo apt-get install -y sol2-dev 2>/dev/null; then
+                echo "✅ sol2 installed via apt (sol2-dev)"
+                return 0
+            fi
+            echo "    apt sol2-dev not available, falling back to tarball"
+            ;;
+    esac
+
+    # Fallback: 从 GitHub release tarball 安装完整 include/sol
+    local SOL2_URL="https://github.com/ThePhD/sol2/archive/refs/tags/${SOL2_VERSION}.tar.gz"
+    local SOL2_TMP_DIR
+    SOL2_TMP_DIR=$(mktemp -d)
+    trap "rm -rf ${SOL2_TMP_DIR}" RETURN
+
+    curl -fsSL "${SOL2_URL}" -o "${SOL2_TMP_DIR}/sol2.tar.gz" || {
         echo "ERROR: Failed to download sol2"
         return 1
     }
-    echo "sol2 installed to ${SOL2_INSTALL_DIR}"
+
+    tar -xzf "${SOL2_TMP_DIR}/sol2.tar.gz" -C "${SOL2_TMP_DIR}"
+    sudo mkdir -p "${INSTALL_PREFIX}/include"
+    sudo cp -r "${SOL2_TMP_DIR}/sol2-${SOL2_VERSION#v}/include/sol" "${INSTALL_PREFIX}/include/"
+
+    if [ -f "${INSTALL_PREFIX}/include/sol/sol.hpp" ] && \
+       [ -f "${INSTALL_PREFIX}/include/sol/config.hpp" ]; then
+        echo "✅ sol2 installed successfully"
+    else
+        echo "❌ Installation failed"
+        return 1
+    fi
 }
 
 install_deb() {
