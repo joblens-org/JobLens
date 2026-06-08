@@ -51,8 +51,9 @@ install_sol2() {
     SOL2_TMP_DIR=$(mktemp -d)
     trap "rm -rf ${SOL2_TMP_DIR}" RETURN
 
-    curl -fsSL "${SOL2_URL}" -o "${SOL2_TMP_DIR}/sol2.tar.gz" || {
-        echo "ERROR: Failed to download sol2"
+    curl -fsSL --retry 3 --retry-delay 5 --retry-max-time 60 \
+        "${SOL2_URL}" -o "${SOL2_TMP_DIR}/sol2.tar.gz" || {
+        echo "ERROR: Failed to download sol2 (HTTP 500 is transient GitHub tarball issue, retry later)"
         return 1
     }
 
