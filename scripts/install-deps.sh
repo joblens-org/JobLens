@@ -23,6 +23,7 @@ install_deb() {
         libbpf-dev \
         libelf-dev \
         libleveldb-dev \
+        leveldb-dev \
         libnl-3-dev \
         libnl-genl-3-dev \
         libssl-dev \
