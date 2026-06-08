@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - 'LICENSE'
+  pull_request:
+    branches: [main, develop]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - 'LICENSE'
+
+jobs:
+  build:
+    name: Build & Package
+    runs-on: ubuntu-latest
+
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 200M
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'scripts/cmake/Packaging.cmake') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Install system dependencies
+        run: |
+          sudo bash scripts/install-deps.sh
+          # RPM 打包工具（Ubuntu 上生成 .rpm 需要）
+          sudo apt-get install -y --no-install-recommends rpm
+
+      - name: Install ccache
+        run: sudo apt-get install -y --no-install-recommends ccache
+
+      - name: Get CMake & Ninja
+        uses: lukka/get-cmake@latest
+
+      - name: Configure & Build (CMakePresets)
+        uses: lukka/run-cmake@v10
+        with:
+          configurePreset: 'ci-linux'
+          buildPreset: 'ci-linux'
+
+      - name: Package (CPack TGZ)
+        uses: lukka/run-cmake@v10
+        with:
+          packagePreset: 'ci-linux-tgz'
+
+      - name: Package (CPack RPM)
+        uses: lukka/run-cmake@v10
+        with:
+          packagePreset: 'ci-linux-rpm'
+
+      - name: Verify TGZ contents
+        run: |
+          echo "=== TGZ 包列表 ==="
+          TGZ=$(ls build/JobLens-*-Linux.tar.gz | head -1)
+          tar -tzf "$TGZ" | sort
+
+          echo ""
+          echo "=== TGZ 关键产物检查 ==="
+          tar -tzf "$TGZ" | grep -q 'bin/JobLens$' && echo "✓ JobLens 二进制" || { echo "✗ 缺少 JobLens"; exit 1; }
+          tar -tzf "$TGZ" | grep -q 'bin/bpf_obj/.*\.bpf\.o$' && echo "✓ eBPF 对象文件" || echo "⚠ 未找到 bpf_obj"
+          tar -tzf "$TGZ" | grep -q 'etc/JobLens/config.yaml$' && echo "✓ 默认配置文件" || { echo "✗ 缺少 config.yaml"; exit 1; }
+          tar -tzf "$TGZ" | grep -q 'systemd/system/joblens.service$' && echo "✓ systemd 服务单元" || echo "⚠ 未找到 joblens.service"
+          tar -tzf "$TGZ" | grep -q 'lib/joblens/.*\.so' && echo "✓ 运行时 .so" || echo "⚠ 未收集运行时库"
+          echo "TGZ 大小: $(ls -lh "$TGZ" | awk '{print $5}')"
+
+      - name: Verify RPM contents
+        run: |
+          echo "=== RPM 包信息 ==="
+          RPM=$(ls build/joblens-*.rpm 2>/dev/null | head -1)
+          if [ -z "$RPM" ]; then
+            echo "✗ 未找到 RPM 包"
+            exit 1
+          fi
+
+          echo "文件列表:"
+          rpm -qpl "$RPM"
+
+          echo ""
+          echo "=== RPM 关键产物检查 ==="
+          rpm -qpl "$RPM" | grep -q '/bin/JobLens$' && echo "✓ JobLens 二进制" || { echo "✗ 缺少 JobLens"; exit 1; }
+          rpm -qpl "$RPM" | grep -q '/bin/bpf_obj/.*\.bpf\.o$' && echo "✓ eBPF 对象文件" || echo "⚠ 未找到 bpf_obj"
+          rpm -qpl "$RPM" | grep -q '/etc/JobLens/config.yaml$' && echo "✓ 默认配置文件" || { echo "✗ 缺少 config.yaml"; exit 1; }
+          rpm -qpl "$RPM" | grep -q '/systemd/system/joblens.service$' && echo "✓ systemd 服务单元" || echo "⚠ 未找到 joblens.service"
+          rpm -qpl "$RPM" | grep -q '/lib/joblens/.*\.so' && echo "✓ 运行时 .so" || echo "⚠ 未收集运行时库"
+
+          echo ""
+          echo "=== RPM 依赖 ==="
+          rpm -qp --requires "$RPM" | sort
+
+          echo ""
+          echo "=== RPM 维护脚本 ==="
+          rpm -qp --scripts "$RPM"
+
+          echo ""
+          echo "RPM 大小: $(ls -lh "$RPM" | awk '{print $5}')"
+
+  trigger-check:
+    name: Trigger (Python syntax check)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Check Python syntax
+        run: |
+          python -m py_compile trigger/app.py
+          python -m py_compile trigger/app_factory.py
+          for f in trigger/core/*.py; do
+            python -m py_compile "$f" || true
+          done
+          for f in trigger/api/*.py; do
+            python -m py_compile "$f" || true
+          done
