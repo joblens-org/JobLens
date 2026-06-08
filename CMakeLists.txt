@@ -97,7 +97,17 @@ set_target_properties(RdKafka::rdkafka++ PROPERTIES
                       INTERFACE_LINK_LIBRARIES "${RDKAFKA_LIB}")
 
 find_package(Boost REQUIRED)
-pkg_check_modules(LEVELDB REQUIRED IMPORTED_TARGET leveldb)
+
+# LevelDB — Debian/Ubuntu 的 libleveldb-dev 不提供 leveldb.pc，用原生 CMake 查找
+find_path(LEVELDB_INCLUDE_DIR NAMES leveldb/db.h)
+find_library(LEVELDB_LIBRARY NAMES leveldb)
+if(NOT LEVELDB_INCLUDE_DIR OR NOT LEVELDB_LIBRARY)
+    message(FATAL_ERROR "LevelDB not found.")
+endif()
+add_library(LevelDB::LevelDB UNKNOWN IMPORTED)
+set_target_properties(LevelDB::LevelDB PROPERTIES
+    IMPORTED_LOCATION "${LEVELDB_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${LEVELDB_INCLUDE_DIR}")
 
 # ---- eBPF 编译 ----
 file(GLOB BPF_C_LIST CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/ebpf/*.bpf.c")
@@ -152,7 +162,7 @@ target_link_libraries(JobLens
         date::date
         ${SASL2_LIB} ${ZSTD_LIB} ${LZ4_LIB}
         ${NETLINK_LIBRARIES}
-        PkgConfig::LEVELDB
+        LevelDB::LevelDB
         pthread dl
         lua5.4
         PkgConfig::XXHASH)
