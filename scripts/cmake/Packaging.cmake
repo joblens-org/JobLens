@@ -57,9 +57,9 @@ install(DIRECTORY ${DEPS_STAGING_DIR}/
 set_target_properties(JobLens PROPERTIES
     INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}/joblens")
 
-# eBPF 对象文件
+# eBPF 对象文件（非标准 ELF，放到 /usr/lib/joblens/）
 install(DIRECTORY ${BPF_OBJECT_DIR}/
-        DESTINATION ${CMAKE_INSTALL_BINDIR}/bpf_obj/
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/joblens/bpf_obj/
         FILES_MATCHING PATTERN "*.bpf.o")
 
 # 配置文件
@@ -115,5 +115,8 @@ set(CPACK_RPM_PRE_UNINSTALL_SCRIPT_FILE
     ${CMAKE_CURRENT_SOURCE_DIR}/scripts/rpm/preuninstall.sh)
 set(CPACK_RPM_POST_UNINSTALL_SCRIPT_FILE
     ${CMAKE_CURRENT_SOURCE_DIR}/scripts/rpm/postuninstall.sh)
+
+# RPM brp-strip 无法处理 eBPF .bpf.o（非标准 ELF 字节码），禁用 strip
+set(CPACK_RPM_SPEC_MORE_DEFINE "%define __strip /bin/true")
 
 include(CPack)
