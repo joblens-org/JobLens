@@ -1,39 +1,39 @@
 # ============================================================================
 # JobLens Trigger Configuration
 # ============================================================================
-# 触发器服务配置
+# Trigger service configuration
 
 service:
   host: 0.0.0.0
   port: 7592
 
-# 服务注册中心配置
+# Service registry configuration
 service_registry:
-  enabled: true  # 是否启用服务注册
-  url: "http://your-registry-host:8080"  # 注册中心地址（支持环境变量 REGISTRY_URL 覆盖）
-  retry_interval: 10  # 注册失败重试间隔（秒）
-  max_retries: 3  # 最大重试次数
-  heartbeat_interval: 1800  # 心跳间隔（秒），默认30分钟
+  enabled: true  # Whether to enable service registration
+  url: "http://your-registry-host:8080"  # Registry center URL (supports REGISTRY_URL env var override)
+  retry_interval: 10  # Retry interval on registration failure (seconds)
+  max_retries: 3  # Maximum retry attempts
+  heartbeat_interval: 1800  # Heartbeat interval (seconds), default 30 minutes
 
-# 配置管理器
+# Configuration manager
 config_manager:
   enabled: false
-  config_file: "/etc/JobLens/config.yaml"  # 配置文件路径
-  etcd_priority: false # ihep使用puppet管理配置
+  config_file: "/etc/JobLens/config.yaml"  # Configuration file path
+  etcd_priority: false # IHEP uses Puppet for configuration management
 
-# 规则管理器
+# Rule manager
 rule_manager:
   enabled: false
-  etcd_priority: true  # etcd是否优先（True: etcd修改覆盖本地；False: 本地修改有效）
+  etcd_priority: true  # Whether etcd has priority (true: etcd changes override local; false: local changes take effect)
 
-# RPC客户端配置
+# RPC client configuration
 lens_config:
-  rpc_timeout: 5.0  # RPC超时（秒）
+  rpc_timeout: 5.0  # RPC timeout (seconds)
 
-# 邮件通知配置（敏感信息从环境变量读取覆盖）
+# Email notification configuration (sensitive info read from environment variables)
 email_notifier:
-  smtp_server: "smtp.example.com"  # SMTP服务器，实际值覆盖环境变量 EMAIL_SMTP_SERVER
-  smtp_port: 587                   # SMTP端口，实际值覆盖环境变量 EMAIL_SMTP_PORT
-  use_tls: true                    # 是否启用TLS，实际值覆盖环境变量 EMAIL_USE_TLS
-  sender_email: ""                 # 发件人邮箱，由环境变量 EMAIL_SENDER 设置
-  recipients: []                   # 收件人列表（逗号分隔），由环境变量 EMAIL_RECIPIENTS 设置
+  smtp_server: "smtp.example.com"  # SMTP server, overridden by EMAIL_SMTP_SERVER env var
+  smtp_port: 587                   # SMTP port, overridden by EMAIL_SMTP_PORT env var
+  use_tls: true                    # Whether to enable TLS, overridden by EMAIL_USE_TLS env var
+  sender_email: ""                 # Sender email, set by EMAIL_SENDER env var
+  recipients: []                   # Recipient list (comma-separated), set by EMAIL_RECIPIENTS env var

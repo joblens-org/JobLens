@@ -87,6 +87,10 @@ for activate in %{buildroot}/usr/lib/joblens-trigger/venv/bin/activate*; do
     [ -f "$activate" ] && sed -i "s|%{buildroot}||g" "$activate"
 done
 
+# 3b. 修复 pyvenv.cfg 中的 buildroot 路径
+#     check-buildroot 不允许已安装文件中出现 buildroot 路径
+sed -i "s|%{buildroot}||g" %{buildroot}/usr/lib/joblens-trigger/venv/pyvenv.cfg
+
 # 4. 清理 pip 可能遗留的 .pyc 和 __pycache__（仍可能包含 buildroot 路径）
 find %{buildroot}/usr/lib/joblens-trigger/venv -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 find %{buildroot}/usr/lib/joblens-trigger/venv -name '*.pyc' -delete 2>/dev/null || true
@@ -95,6 +99,9 @@ find %{buildroot}/usr/lib/joblens-trigger/venv -name '*.pyc' -delete 2>/dev/null
 install -d -m 755 %{buildroot}%{_sysconfdir}/JobLens/trigger
 install -m 644 config.example.yaml %{buildroot}%{_sysconfdir}/JobLens/trigger/
 install -m 644 gunicorn.conf.py %{buildroot}%{_sysconfdir}/JobLens/trigger/
+# Install default config.yaml (from example), marked %config(noreplace) so
+# user modifications are preserved across upgrades
+install -m 644 config.example.yaml %{buildroot}%{_sysconfdir}/JobLens/trigger/config.yaml
 
 # 6. 安装 systemd unit
 install -d -m 755 %{buildroot}%{_unitdir}

@@ -1,7 +1,7 @@
 # ============================================================
-# JobLens — 高性能分布式作业监控 Agent (build-only)
-# 打包配置见 scripts/cmake/Packaging.cmake
-# 环境依赖安装见 scripts/install-deps.sh
+# JobLens — High-Performance Distributed Job Monitoring Agent (build-only)
+# Packaging config: see scripts/cmake/Packaging.cmake
+# Environment dependency install: see scripts/install-deps.sh
 # ============================================================
 
 cmake_minimum_required(VERSION 3.25)
@@ -17,7 +17,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type: Debug, Release, RelWithDebInfo, MinSizeRel")
 include(GNUInstallDirs)
 
-# ---- 打包策略选项 ----
+# ---- Packaging Strategy Options ----
 # JOBLENS_BUNDLE_LIBS=ON : 传统模式，打包所有非系统 .so (collect_libs.sh + RPATH)
 # JOBLENS_BUNDLE_LIBS=OFF: 依赖系统 RPM 包管理器，不打包 .so，不设 RPATH
 option(JOBLENS_BUNDLE_LIBS "Bundle runtime .so into RPM" ON)
@@ -25,7 +25,7 @@ option(JOBLENS_BUNDLE_LIBS "Bundle runtime .so into RPM" ON)
 # JOBLENS_STATIC_EPEL=ON : 静态链接 leveldb / xxhash，减少 EPEL 运行时依赖
 option(JOBLENS_STATIC_EPEL "Statically link EPEL-only libraries (leveldb, xxhash)" OFF)
 
-# ---- 版本信息 ----
+# ---- Version Info ----
 find_package(Git QUIET)
 if(Git_FOUND)
   execute_process(
@@ -40,7 +40,7 @@ if(NOT BUILD_ID)
 endif()
 string(TIMESTAMP BUILD_TIME UTC)
 
-# 生成 version.h 到构建目录，避免污染源码树
+# Generate version.h in the build directory to avoid polluting source tree
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/include/common)
 configure_file(
   ${CMAKE_SOURCE_DIR}/include/common/version.h.in
@@ -50,11 +50,11 @@ configure_file(
 set(PROFILER_INC_DIR "${CMAKE_SOURCE_DIR}/include")
 set(PROFILER_SRC_DIR "${CMAKE_SOURCE_DIR}/src")
 
-# ---- 构建工具 ----
+# ---- Build Tools ----
 find_program(CLANG clang REQUIRED)
 find_package(PkgConfig REQUIRED)
 
-# ---- 系统库 ----
+# ---- System Libraries ----
 pkg_check_modules(LIBBPF REQUIRED libbpf)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
@@ -70,7 +70,7 @@ set_target_properties(ELF::ELF PROPERTIES
 find_package(Lua 5.4 REQUIRED)
 pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
 
-# 静态链接模式下额外查找 .a，用于替换动态链接
+# In static link mode, additionally search for .a to replace dynamic linking
 if(JOBLENS_STATIC_EPEL)
     find_library(XXHASH_STATIC_LIB NAMES libxxhash.a)
     if(XXHASH_STATIC_LIB)
@@ -85,7 +85,7 @@ find_library(SASL2_LIB NAMES sasl2 libsasl2)
 find_library(ZSTD_LIB NAMES zstd libzstd)
 find_library(LZ4_LIB  NAMES lz4  liblz4)
 
-# ---- 第三方 C++ 库 ----
+# ---- Third-Party C++ Libraries ----
 find_package(fmt QUIET)
 if(fmt_FOUND AND NOT TARGET fmt::fmt)
     add_library(fmt::fmt ALIAS fmt)
@@ -128,7 +128,7 @@ set_target_properties(RdKafka::rdkafka++ PROPERTIES
 
 find_package(Boost REQUIRED)
 
-# LevelDB — 优先静态链接（当 JOBLENS_STATIC_EPEL=ON 时）
+# LevelDB — Prefer static linking (when JOBLENS_STATIC_EPEL=ON)
 find_path(LEVELDB_INCLUDE_DIR NAMES leveldb/db.h)
 if(JOBLENS_STATIC_EPEL)
     find_library(LEVELDB_LIBRARY NAMES libleveldb.a leveldb)
@@ -148,7 +148,7 @@ set_target_properties(LevelDB::LevelDB PROPERTIES
     IMPORTED_LOCATION "${LEVELDB_LIBRARY}"
     INTERFACE_INCLUDE_DIRECTORIES "${LEVELDB_INCLUDE_DIR}")
 
-# ---- eBPF 编译 ----
+# ---- eBPF Compilation ----
 file(GLOB BPF_C_LIST CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/ebpf/*.bpf.c")
 set(BPF_OBJECT_DIR "${CMAKE_BINARY_DIR}/bpf_obj")
 file(MAKE_DIRECTORY ${BPF_OBJECT_DIR})
@@ -166,7 +166,7 @@ foreach(bpf_c ${BPF_C_LIST})
 endforeach()
 add_custom_target(ebpf_objects ALL DEPENDS ${BPF_O_LIST})
 
-# ---- 主可执行 ----
+# ---- Main Executable ----
 file(GLOB_RECURSE PROFILER_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")
 list(FILTER PROFILER_SOURCES EXCLUDE REGEX ".*/ebpf/.*")
 
@@ -175,7 +175,7 @@ add_dependencies(JobLens ebpf_objects)
 
 target_include_directories(JobLens
     PRIVATE
-        ${CMAKE_BINARY_DIR}/include      # 生成的 version.h 优先于源码目录
+        ${CMAKE_BINARY_DIR}/include      # Generated version.h takes priority over source directory
         ${PROFILER_INC_DIR}
         ${LUA_INCLUDE_DIR}
         ${NETLINK_INCLUDE_DIRS}
@@ -210,5 +210,5 @@ target_link_libraries(JobLens
         $<$<BOOL:${XXHASH_USE_STATIC}>:${XXHASH_STATIC_LIB}>
         $<$<NOT:$<BOOL:${XXHASH_USE_STATIC}>>:PkgConfig::XXHASH>)
 
-# ---- 打包 (install / systemd / CPack) ----
+# ---- Packaging (install / systemd / CPack) ----
 include(${CMAKE_CURRENT_SOURCE_DIR}/scripts/cmake/Packaging.cmake)
