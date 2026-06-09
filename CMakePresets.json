@@ -7,14 +7,15 @@
   },
   "configurePresets": [
     {
-      "name": "ci-linux",
-      "displayName": "CI Linux (RelWithDebInfo, /usr prefix)",
-      "description": "GitHub Actions CI 构建与打包预设",
+      "name": "rpm-system-deps",
+      "displayName": "CI/RPM 系统依赖 (不打包 .so)",
+      "description": "CI 构建预设。动态库全部由系统 RPM 包管理器提供，RPM Requires 完整声明依赖",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "CMAKE_INSTALL_PREFIX": "/usr"
+        "CMAKE_INSTALL_PREFIX": "/usr",
+        "JOBLENS_BUNDLE_LIBS": "OFF"
       }
     },
     {
@@ -22,43 +23,50 @@
       "displayName": "本地开发 (RelWithDebInfo)",
       "description": "本地开发构建，前缀 /usr/local",
       "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build",
+      "binaryDir": "${sourceDir}/build/dev",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_INSTALL_PREFIX": "/usr/local",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
+    },
+    {
+      "name": "rpm-static-epel",
+      "displayName": "RPM 自包含 (离线部署)",
+      "description": "打包所有 .so + 静态链接 EPEL 库，RPATH 环境隔离，适合无网络环境安装",
+      "inherits": "rpm-system-deps",
+      "cacheVariables": {
+        "JOBLENS_BUNDLE_LIBS": "ON",
+        "JOBLENS_STATIC_EPEL": "ON"
+      }
     }
   ],
   "buildPresets": [
     {
-      "name": "ci-linux",
-      "configurePreset": "ci-linux"
+      "name": "rpm-system-deps",
+      "configurePreset": "rpm-system-deps"
     },
     {
       "name": "dev-linux",
       "configurePreset": "dev-linux"
+    },
+    {
+      "name": "rpm-static-epel",
+      "configurePreset": "rpm-static-epel"
     }
   ],
   "packagePresets": [
     {
-      "name": "ci-linux-tgz",
-      "configurePreset": "ci-linux",
-      "generators": ["TGZ"],
-      "description": "CI 验证 TGZ 打包产物"
-    },
-    {
-      "name": "ci-linux-rpm",
-      "configurePreset": "ci-linux",
-      "generators": ["RPM"],
-      "description": "生产 RPM 包，含 systemd 服务与维护脚本",
-      "configurations": ["RelWithDebInfo"]
-    },
-    {
-      "name": "ci-linux-all",
-      "configurePreset": "ci-linux",
+      "name": "rpm-system-deps",
+      "configurePreset": "rpm-system-deps",
       "generators": ["TGZ", "RPM"],
-      "description": "一次性生成 TGZ + RPM 产物"
+      "description": "CI 打包：TGZ + RPM，不捆绑 .so"
+    },
+    {
+      "name": "rpm-static-epel",
+      "configurePreset": "rpm-static-epel",
+      "generators": ["RPM"],
+      "description": "自包含 RPM 包，捆绑 .so + RPATH 隔离，无网络可安装"
     }
   ]
 }

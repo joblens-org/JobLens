@@ -18,8 +18,8 @@ set -e
 EXE=$(realpath "$1")
 OUT=$(realpath "$2")
 SYSTEM_LIBS=(
-    # 白名单：不打包的系统库
-    b64/ld-linux
+    # 白名单：不打包的系统库（glibc 核心 + GCC 运行时 + 动态链接器）
+    ld-linux
     libc.so.6
     libm.so.6
     libdl.so.2
@@ -28,6 +28,7 @@ SYSTEM_LIBS=(
     libresolv.so.2
     linux-vdso.so.1
     libgcc_s.so.1
+    libstdc++.so.6
 )
 
 # 递归拷贝函数
@@ -42,7 +43,7 @@ copy_deps(){
         done
         # 已拷贝过则跳过
         [[ -f "$OUT/$name" ]] && continue
-        cp -Lv "$lib" "$OUT/" 2>/dev/null || true
+        cp -Lv "$lib" "$OUT/" 2>/dev/null || echo "WARNING: failed to copy $lib" >&2
         # 继续递归该 .so 本身
         copy_deps "$OUT/$name"
     done

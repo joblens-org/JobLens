@@ -18,6 +18,14 @@ endif()
 message(STATUS "systemd unit dir: ${SYSTEMD_UNIT_DIR}")
 
 # ---- systemd 服务文件 ----
+# 自包含模式：通过 LD_LIBRARY_PATH 优先加载打包的 .so
+# 系统依赖模式：不设置，由系统 ldconfig 处理
+if(JOBLENS_BUNDLE_LIBS)
+    set(JOBLENS_SERVICE_ENV "Environment=LD_LIBRARY_PATH=${CMAKE_INSTALL_FULL_LIBDIR}/joblens")
+else()
+    set(JOBLENS_SERVICE_ENV "# LD_LIBRARY_PATH not set — using system ld.so.cache")
+endif()
+
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/scripts/init/joblens.service.in
     ${CMAKE_CURRENT_BINARY_DIR}/joblens.service
@@ -37,25 +45,27 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/90-joblens.preset
 install(TARGETS JobLens
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-# 运行时 .so 收集与安装
-set(DEPS_STAGING_DIR "${CMAKE_BINARY_DIR}/runtime_deps")
-file(MAKE_DIRECTORY ${DEPS_STAGING_DIR})
+# 运行时 .so 收集与 RPATH（仅传统模式）
+if(JOBLENS_BUNDLE_LIBS)
+    set(DEPS_STAGING_DIR "${CMAKE_BINARY_DIR}/runtime_deps")
+    file(MAKE_DIRECTORY ${DEPS_STAGING_DIR})
 
-add_custom_target(collect_deps ALL
-    COMMAND ${CMAKE_COMMAND} -E env
-        LD_LIBRARY_PATH=${DEPS_STAGING_DIR}:$ENV{LD_LIBRARY_PATH}
-        bash "${CMAKE_SOURCE_DIR}/scripts/collect_libs.sh"
-            $<TARGET_FILE:JobLens>
-            ${DEPS_STAGING_DIR}
-    COMMENT "Collecting runtime .so ..."
-    VERBATIM)
+    add_custom_target(collect_deps ALL
+        COMMAND ${CMAKE_COMMAND} -E env
+            LD_LIBRARY_PATH=${DEPS_STAGING_DIR}:$ENV{LD_LIBRARY_PATH}
+            bash "${CMAKE_SOURCE_DIR}/scripts/collect_libs.sh"
+                $<TARGET_FILE:JobLens>
+                ${DEPS_STAGING_DIR}
+        COMMENT "Collecting runtime .so ..."
+        VERBATIM)
 
-install(DIRECTORY ${DEPS_STAGING_DIR}/
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/joblens
-        FILES_MATCHING PATTERN "*.so*")
+    install(DIRECTORY ${DEPS_STAGING_DIR}/
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/joblens
+            FILES_MATCHING PATTERN "*.so*")
 
-set_target_properties(JobLens PROPERTIES
-    INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}/joblens")
+    set_target_properties(JobLens PROPERTIES
+        INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}/joblens")
+endif()
 
 # eBPF 对象文件（非标准 ELF，放到 /usr/lib/joblens/）
 install(DIRECTORY ${BPF_OBJECT_DIR}/
@@ -77,9 +87,8 @@ install(DIRECTORY DESTINATION /var/JobLens/node_pids
 install(CODE "
     message(STATUS 'Removing redundant date headers/cmake files ...')
     file(REMOVE_RECURSE
-        \${CMAKE_INSTALL_PREFIX}/include/date
-        \${CMAKE_INSTALL_PREFIX}/lib64/cmake/date
-        \${CMAKE_INSTALL_PREFIX}/lib/cmake/date)
+        \"\${CMAKE_INSTALL_PREFIX}/include/date\"
+        \"\${CMAKE_INSTALL_PREFIX}/\${CMAKE_INSTALL_LIBDIR}/cmake/date\")
 ")
 
 # ---- CPack 通用配置 ----
@@ -106,7 +115,18 @@ set(CPACK_RPM_PACKAGE_URL "https://github.com/nowzycc/JobLens")
 set(CPACK_RPM_PACKAGE_VENDOR ${CPACK_PACKAGE_VENDOR})
 set(CPACK_RPM_PACKAGE_MAINTAINER ${CPACK_PACKAGE_CONTACT})
 
-set(CPACK_RPM_PACKAGE_REQUIRES "systemd, libbpf >= 1.0, libnl3 >= 3.7, openssl >= 1.1, lua >= 5.4, libcurl, librdkafka, boost")
+# ---- RPM 运行时依赖 ----
+# 自包含模式 vs 系统依赖模式
+if(JOBLENS_BUNDLE_LIBS)
+    # 自包含模式：.so 已打包进 RPM，RPATH 优先加载自带版本
+    # RPM Requires 最小化，适合无网络离线部署
+    set(CPACK_RPM_PACKAGE_REQUIRES "systemd")
+else()
+    # 系统依赖模式：所有动态库由 RPM 包管理器提供（含 EPEL）
+    set(CPACK_RPM_PACKAGE_REQUIRES
+        "systemd, libbpf >= 1.0, libnl3 >= 3.7, openssl-libs >= 1.1, lua-libs >= 5.4, libcurl, librdkafka, zlib, cyrus-sasl-lib, libzstd, lz4-libs, elfutils-libelf, leveldb, xxhash-libs")
+endif()
+message(STATUS "RPM requires: ${CPACK_RPM_PACKAGE_REQUIRES}")
 set(CPACK_RPM_BUILDREQUIRES "cmake >= 3.16, gcc-c++, systemd, libbpf-devel, libnl3-devel, openssl-devel, zlib-devel, lua-devel, clang, libcurl-devel, librdkafka-devel, boost-devel, leveldb-devel, elfutils-libelf-devel, xxhash-devel, spdlog-devel, yaml-cpp-devel, fmt-devel")
 
 set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE

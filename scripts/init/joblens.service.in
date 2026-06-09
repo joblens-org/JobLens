@@ -1,5 +1,6 @@
 [Unit]
 Description=JobLens - high-performance job monitoring daemon
+Documentation=https://github.com/joblens-org/JobLens
 After=network-online.target
 Wants=network-online.target
 
@@ -7,10 +8,12 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/var/JobLens
-Environment=LD_LIBRARY_PATH=@CMAKE_INSTALL_FULL_LIBDIR@/joblens
+@JOBLENS_SERVICE_ENV@
+ExecStartPre=@CMAKE_INSTALL_FULL_BINDIR@/JobLens -v
 ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/JobLens \
           -m service \
           -c /etc/JobLens/config.yaml
+ExecStopPost=-/bin/rm -f /var/JobLens/JobLens.lock
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536

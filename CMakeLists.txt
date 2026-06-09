@@ -17,6 +17,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type: Debug, Release, RelWithDebInfo, MinSizeRel")
 include(GNUInstallDirs)
 
+# ---- 打包策略选项 ----
+# JOBLENS_BUNDLE_LIBS=ON : 传统模式，打包所有非系统 .so (collect_libs.sh + RPATH)
+# JOBLENS_BUNDLE_LIBS=OFF: 依赖系统 RPM 包管理器，不打包 .so，不设 RPATH
+option(JOBLENS_BUNDLE_LIBS "Bundle runtime .so into RPM" ON)
+
+# JOBLENS_STATIC_EPEL=ON : 静态链接 leveldb / xxhash，减少 EPEL 运行时依赖
+option(JOBLENS_STATIC_EPEL "Statically link EPEL-only libraries (leveldb, xxhash)" OFF)
+
 # ---- 版本信息 ----
 find_package(Git QUIET)
 if(Git_FOUND)
@@ -61,6 +69,17 @@ set_target_properties(ELF::ELF PROPERTIES
 
 find_package(Lua 5.4 REQUIRED)
 pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
+
+# 静态链接模式下额外查找 .a，用于替换动态链接
+if(JOBLENS_STATIC_EPEL)
+    find_library(XXHASH_STATIC_LIB NAMES libxxhash.a)
+    if(XXHASH_STATIC_LIB)
+        message(STATUS "Using static xxhash: ${XXHASH_STATIC_LIB}")
+        set(XXHASH_USE_STATIC ON)
+    else()
+        message(WARNING "JOBLENS_STATIC_EPEL=ON but libxxhash.a not found, falling back to shared")
+    endif()
+endif()
 
 find_library(SASL2_LIB NAMES sasl2 libsasl2)
 find_library(ZSTD_LIB NAMES zstd libzstd)
@@ -109,9 +128,18 @@ set_target_properties(RdKafka::rdkafka++ PROPERTIES
 
 find_package(Boost REQUIRED)
 
-# LevelDB — Debian/Ubuntu 的 libleveldb-dev 不提供 leveldb.pc，用原生 CMake 查找
+# LevelDB — 优先静态链接（当 JOBLENS_STATIC_EPEL=ON 时）
 find_path(LEVELDB_INCLUDE_DIR NAMES leveldb/db.h)
-find_library(LEVELDB_LIBRARY NAMES leveldb)
+if(JOBLENS_STATIC_EPEL)
+    find_library(LEVELDB_LIBRARY NAMES libleveldb.a leveldb)
+    if(LEVELDB_LIBRARY MATCHES "\\.a$")
+        message(STATUS "Using static LevelDB: ${LEVELDB_LIBRARY}")
+    else()
+        message(STATUS "Static LevelDB not found, using shared")
+    endif()
+else()
+    find_library(LEVELDB_LIBRARY NAMES leveldb)
+endif()
 if(NOT LEVELDB_INCLUDE_DIR OR NOT LEVELDB_LIBRARY)
     message(FATAL_ERROR "LevelDB not found.")
 endif()
@@ -179,7 +207,8 @@ target_link_libraries(JobLens
         LevelDB::LevelDB
         pthread dl
         lua5.4
-        PkgConfig::XXHASH)
+        $<$<BOOL:${XXHASH_USE_STATIC}>:${XXHASH_STATIC_LIB}>
+        $<$<NOT:$<BOOL:${XXHASH_USE_STATIC}>>:PkgConfig::XXHASH>)
 
 # ---- 打包 (install / systemd / CPack) ----
 include(${CMAKE_CURRENT_SOURCE_DIR}/scripts/cmake/Packaging.cmake)
