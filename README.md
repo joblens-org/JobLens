@@ -1,10 +1,10 @@
 # JobLens
 
-高性能分布式作业监控与性能分析采集端Agent，专为 HTC/HPC 环境设计。
+High-performance distributed job monitoring and performance analysis agent, designed for HTC/HPC environments.
 
-[English](README_EN.md)
+[中文](README_zh.md)
 
-## 快速安装
+## Quick Install
 
 ```bash
 git clone https://github.com/joblens-org/JobLens.git
@@ -14,45 +14,45 @@ mkdir build && cd build
 cmake .. && make -j$(nproc)
 ```
 
-## 使用方法
+## Usage
 
 ```bash
-# 服务模式启动
+# Start in service mode
 ./JobLens -m service -c config/config.yaml
 
-# 查看版本
+# Show version
 ./JobLens -v
 
-# 查看帮助
+# Show help
 ./JobLens -h
 
-# 健康检查
+# Health check
 curl http://localhost:7592/joblens/healthy
 ```
 
-## 文档
+## Documentation
 
-| 文档 | 说明 |
-|------|------|
-| [API 文档](doc/api_documentation_zh.md) | Trigger RESTful API 接口说明 |
-| [配置手册](doc/configuration_zh.md) | 完整配置参数说明 |
-| [开发指南](doc/develop_guide.md) | 分支结构、提交规范等协作约定 |
-| [最简可部署套件](doc/joblens_simplest_deployable_suite.md) | 生产环境部署指南 |
+| Document | Description |
+|----------|-------------|
+| [API Documentation](doc/api_documentation.md) | Trigger RESTful API reference |
+| [Configuration Manual](doc/configuration.md) | Complete configuration parameters |
+| [Development Guide](doc/develop_guide.md) | Branch structure, commit conventions, etc. |
+| [Minimal Deployment Kit](doc/joblens_simplest_deployable_suite.md) | Production deployment guide |
 
-## 项目结构
+## Project Structure
 
 ```
 JobLens/
-├── config/                     # 配置文件
-├── include/                    # 头文件（collector/writer/core/ebpf）
-├── src/                        # 源码实现
-├── scripts/                    # 脚本工具（安装/部署/CLI）
-├── test/                       # 测试文件
-├── trigger/                    # 触发器服务（Flask）
-├── doc/                        # 文档资源
-└── thirdparty/                 # 第三方依赖
+├── config/                     # Configuration files
+├── include/                    # Headers (collector/writer/core/ebpf)
+├── src/                        # Source implementation
+├── scripts/                    # Scripts (install/deploy/CLI)
+├── test/                       # Test files
+├── trigger/                    # Trigger service (Flask)
+├── doc/                        # Documentation
+└── thirdparty/                 # Third-party dependencies
 ```
 
-## 许可证
+## License
 
 [Apache-2.0](LICENSE)

@@ -1,4 +1,4 @@
-# JobLens 最简可部署套件 (Agent + Agent Trigger)
+# JobLens Minimal Deployment Kit (Agent + Agent Trigger)
 
 > **Document Version**: v1.0.0  
 > **Last Updated**: 2026-04-25  
@@ -6,152 +6,212 @@
 > **Trigger RPM**: joblens-trigger-0.0.9-1.dev.el9.x86_64.rpm  
 > **Status**: Production-tested at IHEP, open for cross-site evaluation
 
-## 1. 项目简介
-- JobLens是一个Job-Native的可观测性系统，其中Agent为部署在作业节点上的采集Daemon
-- 本套件目标：在受控节点上快速部署 Agent 与本地控制组件，实现作业级数据采集与基本查询/转发
-- 适用对象：站点管理员、实验计算运维、合作机构评估人员
-- 当前仅提供rpm包，开源代码正在准备中
+## 1. Project Overview
 
-## 2. 术语表
-- JobLens Agent：采集守护进程
-- JobLens Trigger：Agent 的本地控制接口，负责 Agent 生命周期管理、规则注入、作业元数据注册。（内部代号“Trigger”，因历史原因保留。）
-- JobLens Manager（后续组件，本套件不含）：集中式控制平面，统一管理配置文件，规则文件，以及提供相关监控
+- **JobLens** is a **Job-Native** observability system. The **Agent** is a collection daemon deployed on compute nodes.
+- **Goal of this kit**: Rapidly deploy the Agent and local control components on evaluation nodes to enable job-level data collection, basic querying, and forwarding.
+- **Target audience**: Site administrators, experiment computing operations teams, and partner institutions evaluating the stack.
+- **Current delivery**: RPM packages only. Open-source release of the codebase is in active preparation.
 
-## 3. 架构速览
+## 2. Glossary
 
-### 部署拓扑图(IHEP)
-目前在ihep的部署模式如下
+| Component | Description |
+|-----------|-------------|
+| **JobLens Agent** | The collection daemon running on compute nodes. |
+| **JobLens Trigger** | Local control interface for the Agent, responsible for lifecycle management, rule injection, and job metadata registration. *(Internal codename "Trigger" is retained for historical reasons.)* |
+| **JobLens Manager** *(not included in this kit)* | Centralized control plane for unified configuration, rule distribution, and operational monitoring. Planned for future release. |
+
+## 3. Architecture at a Glance
+
+### Deployment Topology (IHEP)
+
+Current production deployment at IHEP:
 ![deploy arch](img/arch.png)
-### 数据流图
+
+### Data Flow
+
 ![data flow](img/data_flow.png)
-## 4. 资源要求与兼容性
-Validated Environment: AlmaLinux 9 (Kernel 5.14.0-427.el9). Other RHEL 9-compatible distributions (Rocky Linux, CentOS Stream 9) are expected to work but not yet fully tested. If you run a different OS, please contact us before deployment.
 
-Resource Footprint: Designed for minimal overhead. On a 256-core production node: <0.15% total CPU (~37% of a single core), ~145 MB RAM. Scales linearly with core count due to per-CPU eBPF maps.
+## 4. System Requirements & Compatibility
 
-## 5. 快速入门
-### 5.0 基础准备
+**Validated Environment**
 
-- 操作系统：AlmaLinux 9 (已验证)，其他 RHEL 9 兼容发行版（未充分测试）
-- systemd 作为服务管理器
-- HTCondor 作业节点（测试阶段建议搭建 HTCondor 测试集群）
+- **OS**: AlmaLinux 9 (Kernel `5.14.0-427.el9.x86_64`)
+- **Other RHEL 9-compatible distributions** (Rocky Linux 9, CentOS Stream 9) are expected to work but have not been fully tested.  
+  *If you run a different OS, please contact us before deployment.*
 
-**数据存储选择（二选一）：**
-- **Option A: 完整评估（含可视化）**：需自建 Elasticsearch (>= 7.x) 作为数据后端，Python 可视化脚本将从中查询数据。
-- **Option B: 仅 Agent 采集（无 ES）**：Agent 可独立运行，输出至本地文件。当loglevel使用debug时，也可以通过 `journalctl -u joblens -f` 实时观测采集指标。需要注意的是，当大量Job的metrics被写入本地文件时，可能会导致io卡顿，影响作业本身，此方法仅用以测试。
+**Resource Footprint**
 
-### 5.1 安装 RPM
-- 下载rpm包
-- `dnf install ./joblens-*.el9.x86_64.rpm ./joblens-trigger-*.el9.x86_64.rpm`
-- 验证安装路径与二进制
+- Designed for minimal overhead. On a 256-core production node:
+  - **CPU**: **< 0.15%** of total node capacity (~37% of a single logical core)
+  - **Memory**: **~145 MB** RSS
+- Scales roughly linearly with core count due to per-CPU eBPF maps.
 
-### 5.2 基础配置
-安装后rpm包后会带有默认的配置，请根据需要进行修改
-- Agent 配置文件概览（`/etc/JobLens/config.yaml`）
-  - 监听地址与 Trigger 通信方式
-  - 日志级别与输出
-  - es相关配置
-- Trigger 配置文件概览（`/opt/JobLens/trigger/config.yaml`）
-  - 监听端口
+## 5. Quick Start
 
-### 5.3 启动与自检
-- 安装rpm包会自动启动agent和trigger
-- 自检命令（`service joblens status`，`curl localhost:7592/joblens/healthy`）
+### 5.0 Prerequisites
 
-### 5.4 可视化
-由于当前在ihep部署的可视化和ihep内部业务耦合严重，所以尚且不能提供部署的网页版
+- **Operating System**: AlmaLinux 9 (validated). Other RHEL 9-compatible distros are not yet fully tested.
+- **Init system**: `systemd` is required for service management.
+- **Workload scheduler**: HTCondor compute nodes. *(For evaluation, we recommend setting up a small HTCondor test cluster.)*
 
-作为替代，我们提供了一个python脚本用以进行快速的可视化
+**Data Storage: Choose One**
 
-该python脚本的原理是使用plotly.graph_objects生成交互式的网页，该网页会定时刷新
+| Option | Description | Use Case |
+|--------|-------------|----------|
+| **A: Full evaluation (with visualization)** | Deploy your own **Elasticsearch (>= 7.x)** as the data backend. The Python visualization script queries ES. | End-to-end trial with dashboards |
+| **B: Agent-only (no ES required)** | The Agent runs standalone and writes to local files. With config `log_level: debug`, you can observe captured metrics in real time via `journalctl -u joblens -f`.<br><br>⚠️ **Caution**: Writing large volumes of job metrics to local files may cause I/O pressure under heavy load. This mode is intended **only for functional testing**, not production use. | Quick functionality check without backend infrastructure |
 
-使用方法为首先在环境变量中设置ES存储后端相关参数
+### 5.1 Install the RPMs
+
+Download the RPM packages, then install:
+
 ```bash
+sudo dnf install ./joblens-*.el9.x86_64.rpm ./joblens-trigger-*.el9.x86_64.rpm
+```
 
+Verify installation paths and binaries:
+
+```bash
+rpm -ql joblens joblens-trigger
+which joblens joblens-trigger
+```
+
+### 5.2 Basic Configuration
+
+Default configurations are shipped with the RPMs. Modify them to match your environment:
+
+- **Agent config**: `/etc/JobLens/config.yaml`
+  - Listen address and Trigger communication method
+  - Log level and output target
+  - Elasticsearch connection parameters
+- **Trigger config**: `/opt/JobLens/trigger/config.yaml`
+  - Listen port for local API
+
+### 5.3 Start and Health Check
+
+The RPM installation automatically starts both services via `systemd`.
+
+```bash
+# Check service status
+sudo systemctl status joblens joblens-trigger
+
+# Health check
+curl http://localhost:7592/joblens/healthy
+```
+
+### 5.4 Visualization
+
+The production web dashboard at IHEP is tightly coupled with internal business logic and is **not yet available** for general deployment.
+
+As an interim solution, we provide a lightweight **Python script** that generates an interactive, auto-refreshing web page using **Plotly**.
+
+**Dependencies**
+```bash
+pip install plotly requests
+```
+
+**Environment variables**
+```bash
 export ES_HOST=your_es_host
 export ES_PORT=your_es_port
-export ES_SCHEME=http/https
+export ES_SCHEME=http        # or https
 export ES_USERNAME=es_access_username
-export ES_PASSWORD=es_access_passwd
-
+export ES_PASSWORD=es_access_password
 ```
-之后运行该指令
+
+**Run the script**
 ```bash
-python3 joblens-simple-viz.py jobid
+python3 joblens-simple-viz.py <jobid>
 ```
 
-该指令也有一些配置参数
+**Available options**
 ```bash
 usage: joblens-simple-viz.py [-h] [--cluster {ihep_condor,ihep_slurm}] [--refresh SEC] [--port PORT] [--hours N] [--no-browser] jobid
+
 positional arguments:
-  jobid                 Job ID (如 "12345.0" 或 "123456")
+  jobid                 Job ID (e.g., "12345.0" or "123456")
 
 options:
-  -h, --help            show this help message and exit
-  --refresh SEC         页面自动刷新间隔秒数 (默认: 10)
-  --port PORT           本地 HTTP 端口 (默认: 8765)
-  --hours N             查询最近 N 小时的数据 (默认: 2, 设为 0 表示不限)
-  --no-browser          不自动打开浏览器
+  -h, --help            Show this help message and exit
+  --refresh SEC         Auto-refresh interval in seconds (default: 10)
+  --port PORT           Local HTTP port (default: 8765)
+  --hours N             Query data from last N hours (default: 2; set 0 for unlimited)
+  --no-browser          Do not auto-open browser
+  --cluster {ihep_condor,ihep_slurm}  Cluster context for query routing
 
-example:
+examples:
   export ES_USERNAME=readonly
   export ES_PASSWORD=your_password
-  python tools/joblens_viz.py 12345.0
-  python tools/joblens_viz.py 12345.0 --cluster ihep_slurm --refresh 15
-  python tools/joblens_viz.py 12345.0 --hours 12
+  python3 tools/joblens_viz.py 12345.0
+  python3 tools/joblens_viz.py 12345.0 --cluster ihep_slurm --refresh 15
+  python3 tools/joblens_viz.py 12345.0 --hours 12
 ```
 
-### 5.5 卸载与回滚
+### 5.5 Uninstall and Rollback
 
 ```bash
-# 停止服务
-systemctl stop joblens joblens-trigger
+# Stop services
+sudo systemctl stop joblens joblens-trigger
 
-# 卸载RPM（保留配置备份）
-dnf remove joblens joblens-trigger
+# Remove RPMs (configs are preserved as .rpmsave)
+sudo dnf remove joblens joblens-trigger
 
-# 验证：确认无残留进程
-ps aux | grep joblens
+# Verify no residual processes
+ps aux | grep -i joblens
 ```
 
-## 6. 部署模式详解
-### 6.1 单节点评估模式
-- 面向试用或小规模验证
+> **Zero residual state**: Uninstall removes all binaries and eBPF programs. Any data stored in Elasticsearch is retained according to your ES retention policy.
 
-### 6.2 与上游 Manager 对接（预留模式）
-- Trigger 配置上游 Manager 地址，实现服务注册，规则和配置集中分发
-- 本套件仅预留接口，Manager 部署后续会提供
+## 6. Deployment Modes
 
-### 6.3 作业关联方式
-- 手动关联：Trigger 提供 API 注入 PID → Job 映射
-- 自动关联：Condor启动的作业可以自动进行添加并且关联
+### 6.1 Single-Node Evaluation Mode
+For pilot trials or small-scale validation on a single compute node.
 
-## 7. 配置详解
-见文件configuration.md
+### 6.2 Upstream Manager Integration (Reserved)
+The Trigger can be configured with an upstream **Manager** address for service registration, centralized rule distribution, and remote configuration management.
 
-## 8. 数据写入器配置
-- 使用ElasticSearch
-Writers: This release focuses on Elasticsearch validation. The file writers are functional for local testing. Additional backends (Prometheus, Kafka, InfluxDB) are interface-ready and will be validated in upcoming releases based on demand.
+> **Note**: This kit only reserves the interface. The Manager component will be provided in a future release.
 
-## 9. 验证指南
-- 通过condor_submit提交作业
-- 观察 Agent 日志确认采集命中
-- 解读返回的示例 Job 视图（JSON 结构）
+### 6.3 Job Association Methods
 
-## 10. 共建邀请以及反馈联系方式
+| Method | Description |
+|--------|-------------|
+| **Automatic** | Jobs launched by **HTCondor** are discovered and associated automatically via the Starter hook mechanism. |
+| **Manual** | Use the Trigger REST API to inject a `PID → JobID` mapping for workloads not captured by auto-discovery. |
 
-JobLens is actively evolving toward v1.0 API stability. We welcome:
+## 7. Configuration Reference
 
-- **Trial Feedback**: 我们正在收集各站点的实际部署环境，以构建 v1.0 的兼容性矩阵。
-- **Scheduler Integration**: If you have expertise in SLURM, PBS, or UGE 
-  job discovery mechanisms, we would love to collaborate on auto-attachment.
-- **Backend Validation**: Help us verify your existing storage stack 
-  (InfluxDB, Prometheus, or others) as a JobLens sink.
+See `configuration.md` for detailed parameter descriptions.
 
-The core agent is **production-hardened at IHEP** (~1,000 nodes). 
-Peripheral components (Manager, Web UI) are iterating rapidly based on 
-community input. Your participation will help JobLens become a 
-portable, job-native observability foundation for HPC/HTC sites.
+## 8. Data Writer Configuration
 
-Contact: wangzhenyuan@ihep.ac.cn (cc: shijy@ihep.ac.cn)  
+**Current Release Focus**: **Elasticsearch** sink (validated in production).
 
+The **file writer** is functional for local testing. Additional backends (**Prometheus**, **Kafka**, **InfluxDB**) are interface-ready and will be validated in upcoming releases based on community demand.
+
+## 9. Validation Guide
+
+1. Submit a test job via `condor_submit`.
+2. Observe the Agent logs to confirm collection hits:
+   ```bash
+   sudo journalctl -u joblens -f | grep "job_id"
+   ```
+3. Query the returned job view (JSON structure) via the Trigger API or ES.
+
+## 10. Community & Feedback
+
+JobLens is actively evolving toward **v1.0 API stability**. We welcome your participation:
+
+- **🧪 Trial Feedback**: Share your deployment environment details (OS, kernel, scheduler) to help us build the v1.0 compatibility matrix.
+- **🔌 Scheduler Integration**: If you have expertise in **SLURM**, **PBS**, **UGE**, or other batch systems, we'd love to collaborate on auto-attachment mechanisms.
+- **💾 Backend Validation**: Help us verify your existing storage stack (InfluxDB, Prometheus, etc.) as a JobLens sink.
+
+The core Agent is **production-hardened at IHEP** (~1,000 nodes, 50,000+ cores). Peripheral components (Manager, Web UI) are iterating rapidly based on community input. Your participation will help JobLens become a portable, job-native observability foundation for HPC/HTC sites worldwide.
+
+**Contact**:  
+`wangzhenyuan@ihep.ac.cn` (cc: `shijy@ihep.ac.cn`)
+
+---
+
+*Thank you for evaluating JobLens. We look forward to your feedback.*

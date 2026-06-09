@@ -1,239 +1,239 @@
-# 开发协作规范
+# Development Collaboration Guidelines
 
-## 1. 分支结构说明
+## 1. Branch Structure
 
-### 1.1 核心分支
-- **main**: 生产稳定分支
-  - 只包含已发布的生产代码
-  - 只能通过Pull Request（PR）合并
-  - 受保护分支，禁止直接推送
-  - 触发GitLab CI/CD部署到生产环境
+### 1.1 Core Branches
+- **main**: Production stable branch
+  - Contains only released production code
+  - Can only be merged via Pull Request (PR)
+  - Protected branch, direct pushes are forbidden
+  - Triggers GitLab CI/CD deployment to production
 
-- **develop**: 集成分支
-  - 日常开发集成分支
-  - 所有功能开发完成后合并至此
-  - 触发GitLab CI/CD部署到开发/测试环境
+- **develop**: Integration branch
+  - Daily development integration branch
+  - All feature development is merged here upon completion
+  - Triggers GitLab CI/CD deployment to dev/test environment
 
-### 1.2 临时分支
-- **feature/\***: 功能分支
-  - 格式：`feature/功能名称-日期` 或 `feature/issue编号-简短描述`
-  - 示例：`feature/user-auth-20231015` 或 `feature/#123-add-login`
-  - 从`develop`分支创建
-  - 开发完成后合并回`develop`
-  - **不触发自动部署**
+### 1.2 Temporary Branches
+- **feature/***: Feature branches
+  - Format: `feature/<feature-name>-<date>` or `feature/<issue-number>-<short-description>`
+  - Example: `feature/user-auth-20231015` or `feature/#123-add-login`
+  - Created from the `develop` branch
+  - Merged back into `develop` after completion
+  - **Does not trigger automatic deployment**
 
-- **hotfix/\***: 紧急修复分支
-  - 格式：`hotfix/问题描述-日期`
-  - 示例：`hotfix/fix-crash-20231015`
-  - 从`main`分支创建
-  - 修复完成后合并到`main`和`develop`
-  - **不触发自动部署**
+- **hotfix/***: Emergency fix branches
+  - Format: `hotfix/<issue-description>-<date>`
+  - Example: `hotfix/fix-crash-20231015`
+  - Created from the `main` branch
+  - Merged into both `main` and `develop` after the fix
+  - **Does not trigger automatic deployment**
 
-## 2. 开发流程
+## 2. Development Workflow
 
-### 2.1 功能开发流程
+### 2.1 Feature Development Workflow
 ```
-1. 从develop创建功能分支
+1. Create a feature branch from develop
    git checkout develop
    git pull origin develop
    git checkout -b feature/your-feature-name
 
-2. 在功能分支上开发
-   # 进行开发工作，多次提交
+2. Develop on the feature branch
+   # Do development work, commit multiple times
 
-3. 推送到远程仓库
+3. Push to remote repository
    git push origin feature/your-feature-name
 
-4. 创建合并请求（Pull Request）
-   - 目标分支：develop
-   - 添加描述和审查者
-   - 等待CI检查通过
+4. Create a Pull Request (PR)
+   - Target branch: develop
+   - Add description and reviewers
+   - Wait for CI checks to pass
 
-5. 代码审查和合并
-   - 至少1人审查通过
-   - 解决冲突（如有）
-   - 合并到develop分支
+5. Code review and merge
+   - At least 1 reviewer must approve
+   - Resolve conflicts (if any)
+   - Merge into the develop branch
 ```
 
-### 2.2 热修复流程
+### 2.2 Hotfix Workflow
 ```
-1. 从main创建热修复分支
+1. Create a hotfix branch from main
    git checkout main
    git pull origin main
    git checkout -b hotfix/issue-description
 
-2. 进行修复和测试
-   # 修复问题并充分测试
+2. Fix and test
+   # Fix the issue and test thoroughly
 
-3. 创建两个合并请求
+3. Create two Pull Requests
    PR1: hotfix → main
    PR2: hotfix → develop
 
-4. 合并顺序
-   - 先合并到main（部署到生产）
-   - 再合并到develop（保持同步）
+4. Merge order
+   - Merge into main first (deploy to production)
+   - Then merge into develop (keep in sync)
 ```
 
-## 3. 提交规范
+## 3. Commit Conventions
 
-### 3.1 提交信息格式
+### 3.1 Commit Message Format
 ```
-类型(范围): 描述
+type(scope): description
 
-正文（可选）
+body (optional)
 
-脚注（可选）
+footer (optional)
 ```
 
-### 3.2 类型说明
-- `feat`: 新功能
-- `fix`: 修复bug
-- `docs`: 文档更新
-- `style`: 代码格式调整（不影响功能）
-- `refactor`: 重构代码
-- `test`: 测试相关
-- `chore`: 构建过程或辅助工具变更
+### 3.2 Type Descriptions
+- `feat`: New feature
+- `fix`: Bug fix
+- `docs`: Documentation updates
+- `style`: Code formatting (does not affect functionality)
+- `refactor`: Code refactoring
+- `test`: Test-related
+- `chore`: Build process or tooling changes
 
-### 3.3 示例
+### 3.3 Examples
 ```
-feat(auth): 添加用户登录功能
+feat(auth): add user login functionality
 
-- 实现JWT token认证
-- 添加用户登录接口
-- 更新相关文档
+- Implement JWT token authentication
+- Add user login endpoint
+- Update related documentation
 
 Closes #123
 ```
 
-## 4. 合并请求（PR）规范
+## 4. Pull Request (PR) Guidelines
 
-### 4.1 PR标题格式
+### 4.1 PR Title Format
 ```
-[类型] 简要描述
+[Type] Brief description
 ```
-示例：`[Feature] 添加用户管理系统`
+Example: `[Feature] Add user management system`
 
-### 4.2 PR描述模板
+### 4.2 PR Description Template
 ```markdown
-## 变更说明
-简要描述本次变更的内容
+## Change Description
+Briefly describe the changes in this PR
 
-## 相关Issue
-关联的问题编号：#123
+## Related Issues
+Linked issue numbers: #123
 
-## 测试说明
-- [ ] 单元测试通过
-- [ ] 集成测试通过
-- [ ] 手动测试步骤...
+## Test Instructions
+- [ ] Unit tests pass
+- [ ] Integration tests pass
+- [ ] Manual testing steps...
 
-## 检查清单
-- [ ] 代码已自检
-- [ ] 文档已更新
-- [ ] 无编译警告
-- [ ] 遵循代码规范
+## Checklist
+- [ ] Code has been self-reviewed
+- [ ] Documentation has been updated
+- [ ] No compilation warnings
+- [ ] Follows code style guidelines
 
-## 截图（如适用）
+## Screenshots (if applicable)
 ```
 
-## 5. CI/CD部署说明
+## 5. CI/CD Deployment
 
-### 5.1 自动触发规则
-- **develop分支**: 
-  - 每次合并后自动构建
-  - 部署到开发/测试环境
-  - 运行完整测试套件
+### 5.1 Automatic Trigger Rules
+- **develop branch**: 
+  - Automatically builds after each merge
+  - Deploys to dev/test environment
+  - Runs complete test suite
 
-- **main分支**:
-  - 每次合并后自动构建
-  - 部署到生产环境
-  - 运行生产环境测试
+- **main branch**:
+  - Automatically builds after each merge
+  - Deploys to production environment
+  - Runs production environment tests
 
-### 5.2 手动部署
-如需手动触发部署，可在GitLab CI/CD流水线页面操作。
+### 5.2 Manual Deployment
+To manually trigger deployment, operate on the GitLab CI/CD pipeline page.
 
-## 6. C++开发注意事项
+## 6. C++ Development Notes
 
-### 6.1 代码规范
-- 遵循项目代码规范（如有）
-- 使用`clang-format`统一格式
-- 禁止提交编译警告
+### 6.1 Code Standards
+- Follow project code style guidelines (if any)
+- Use `clang-format` for consistent formatting
+- Compilation warnings are forbidden
 
-### 6.2 编译检查
+### 6.2 Build Verification
 ```bash
-# 本地预提交检查
+# Local pre-commit check
 mkdir build && cd build
 cmake ..
 make -j$(nproc)
-make test  # 运行测试
+make test  # Run tests
 ```
 
-### 6.3 依赖管理
-- 更新依赖时在PR中说明
-- 重大版本变更需单独评估
+### 6.3 Dependency Management
+- Explain dependency updates in PRs
+- Major version changes require separate evaluation
 
-## 7. 冲突解决
+## 7. Conflict Resolution
 
-### 7.1 基本原则
-- 及时合并上游变更
-- 小步提交，减少冲突
-- 解决冲突后充分测试
+### 7.1 Basic Principles
+- Merge upstream changes in a timely manner
+- Make small commits to reduce conflicts
+- Test thoroughly after resolving conflicts
 
-### 7.2 解决步骤
+### 7.2 Resolution Steps
 ```bash
-# 1. 拉取最新代码
+# 1. Pull latest code
 git fetch origin
 git rebase origin/develop
 
-# 2. 解决冲突
-# 编辑冲突文件...
+# 2. Resolve conflicts
+# Edit conflicting files...
 
-# 3. 继续rebase
+# 3. Continue rebase
 git add .
 git rebase --continue
 
-# 4. 强制推送（功能分支）
+# 4. Force push (feature branch)
 git push origin feature/xxx --force-with-lease
 ```
 
-## 8. 紧急情况处理
+## 8. Emergency Handling
 
-### 8.1 生产问题
-1. 立即创建`hotfix`分支
-2. 优先修复问题
-3. 遵循热修复流程
-4. 事后分析根本原因
+### 8.1 Production Issues
+1. Immediately create a `hotfix` branch
+2. Prioritize fixing the issue
+3. Follow the hotfix workflow
+4. Perform root cause analysis afterwards
 
-### 8.2 CI/CD故障
-1. 检查流水线日志
-2. 回滚有问题的提交
-3. 修复构建脚本
-4. 重新触发部署
+### 8.2 CI/CD Failures
+1. Check pipeline logs
+2. Roll back the problematic commit
+3. Fix the build script
+4. Re-trigger deployment
 
-## 9. 最佳实践
+## 9. Best Practices
 
-### 9.1 分支管理
-- 及时删除已合并的分支
-- 保持分支生命周期短
-- 避免在临时分支堆积大量变更
+### 9.1 Branch Management
+- Delete merged branches promptly
+- Keep branch lifespans short
+- Avoid accumulating large changes on temporary branches
 
-### 9.2 提交策略
-- 原子提交（一次提交一个完整变更）
-- 有意义的提交信息
-- 频繁提交，定期推送
+### 9.2 Commit Strategy
+- Atomic commits (one complete change per commit)
+- Meaningful commit messages
+- Commit frequently, push regularly
 
-### 9.3 代码审查
-- 认真对待审查意见
-- 审查他人代码要仔细
-- 使用GitLab的评论功能讨论
-
----
-
-## 版本记录
-
-| 版本 | 日期 | 说明 | 更新人 |
-|------|------|------|--------|
-| 1.0 | 2026-01-27 | 初始版本 | wzycc |
+### 9.3 Code Review
+- Take review comments seriously
+- Review others' code carefully
+- Use GitLab's comment feature for discussions
 
 ---
 
-**注意**: 本规范为团队协作基础，特殊情况下可灵活调整，但需团队讨论同意。如有疑问，请及时咨询技术负责人。
+## Changelog
+
+| Version | Date | Description | Author |
+|---------|------|-------------|--------|
+| 1.0 | 2026-01-27 | Initial version | wzycc |
+
+---
+
+**Note**: This guideline serves as the foundation for team collaboration. Adjustments can be made flexibly under special circumstances, but must be discussed and agreed upon by the team. If you have any questions, consult the technical lead promptly.
