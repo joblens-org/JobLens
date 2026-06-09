@@ -107,24 +107,40 @@ jobs:
           echo ""
           echo "RPM 大小: $(ls -lh "$RPM" | awk '{print $5}')"
 
-  trigger-check:
-    name: Trigger (Python syntax check)
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: joblens-core-rpm
+          path: build/JobLens-*.rpm
+
+      - name: Upload TGZ artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: joblens-core-tgz
+          path: build/JobLens-*-Linux.tar.gz
+
+
+
+  trigger-rpm:
+    name: Trigger RPM Build
     runs-on: ubuntu-latest
+    container: fedora:latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Check Python syntax
+      - name: Install build tools
         run: |
-          python -m py_compile trigger/app.py
-          python -m py_compile trigger/app_factory.py
-          for f in trigger/core/*.py; do
-            python -m py_compile "$f" || true
-          done
-          for f in trigger/api/*.py; do
-            python -m py_compile "$f" || true
-          done
+          dnf install -y --setopt=tsflags=nodocs \
+            rpm-build rpmdevtools python3 python3-devel \
+            python3-setuptools python3-wheel python3-pip \
+            pyproject-rpm-macros systemd-rpm-macros
+
+      - name: Build RPM
+        run: bash scripts/build-trigger-rpm.sh --install-deps
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: joblens-trigger-rpm
+          path: ~/rpmbuild/RPMS/noarch/joblens-trigger-*.rpm
