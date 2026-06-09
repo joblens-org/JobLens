@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=53"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -19,7 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.13",
 ]
-dynamic = ["version", "dependencies"]
+dynamic = ["dependencies"]
 
 [tool.setuptools.package-dir]
 "trigger" = "."
@@ -28,5 +28,4 @@ dynamic = ["version", "dependencies"]
 packages = ["trigger", "trigger.api", "trigger.core", "trigger.utils"]
 
 [tool.setuptools.dynamic]
-version = {attr = "version.__version__"}
 dependencies = {file = "requirements.txt"}

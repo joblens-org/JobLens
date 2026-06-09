@@ -1,0 +1,22 @@
+[Unit]
+Description=JobLens Trigger Service
+Documentation=https://github.com/joblens-org/JobLens
+After=network.target joblens.service
+Wants=joblens.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/lib/joblens
+Environment=JOBLENS_CONFIG_PATH=/etc/JobLens/config.yaml
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/gunicorn \
+    --config /etc/JobLens/trigger/gunicorn.conf.py \
+    --chdir /var/lib/joblens \
+    trigger.app:app
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
