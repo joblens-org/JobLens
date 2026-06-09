@@ -96,13 +96,14 @@ def safe_handle_exception(self, e):
 flask.Flask.log_exception = safe_log_exception
 flask.Flask.handle_exception = safe_handle_exception
 
-from app_factory import create_application
-from utils.email_notifier import simple_send
+from trigger.app_factory import create_application
+from trigger.utils.email_notifier import simple_send
 
 # 创建应用实例
 # 使用工厂函数创建，所有初始化逻辑在工厂中完成
 try:
-    app = create_application('config.yaml')
+    config_path = os.environ.get('JOBLENS_CONFIG_PATH', '/etc/JobLens/config.yaml')
+    app = create_application(config_path)
 except Exception as e:
     if __name__ != "__main__":
         # 开发环境不告警，生产环境告警

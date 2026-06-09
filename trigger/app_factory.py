@@ -26,13 +26,13 @@ from flask import Flask
 import yaml
 
 from trigger.core.config_manager import ConfigManager
-from core.service_registrar import ServiceRegistrar
-from core.rule_manager import RuleManager
-from core.etcd_client import EtcdClient
-from core.rpc_client import RPCClient
-from api.routes import register_routes
-from utils.email_notifier import simple_send
-from core.tools import restart_joblens
+from trigger.core.service_registrar import ServiceRegistrar
+from trigger.core.rule_manager import RuleManager
+from trigger.core.etcd_client import EtcdClient
+from trigger.core.rpc_client import RPCClient
+from trigger.api.routes import register_routes
+from trigger.utils.email_notifier import simple_send
+from trigger.core.tools import restart_joblens
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -226,7 +226,7 @@ class AppContext:
         """初始化RPC客户端"""
         try:
             rpc_config = self.config.get('lens_config', {})            
-            from core.rpc_client import RPCClient
+            from trigger.core.rpc_client import RPCClient
             self.rpc_client = RPCClient(
                 socket_path=rpc_config['rpc_socket_path'],
                 timeout=rpc_config['rpc_timeout']

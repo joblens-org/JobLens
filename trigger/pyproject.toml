@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "joblens-trigger"
+description = "JobLens Trigger Service - RESTful API gateway for JobLens"
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    {name = "JobLens Team"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.13",
+]
+dynamic = ["version", "dependencies"]
+
+[tool.setuptools.package-dir]
+"trigger" = "."
+
+[tool.setuptools]
+packages = ["trigger", "trigger.api", "trigger.core", "trigger.utils"]
+
+[tool.setuptools.dynamic]
+version = {attr = "version.__version__"}
+dependencies = {file = "requirements.txt"}

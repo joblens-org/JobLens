@@ -12,29 +12,21 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
-#!/usr/bin/env python3
 """
-Minimal setup.py for JobLens Trigger service to allow shiv packaging.
+触发的打包配置。
+
+name/version/packages 在此显式声明以保证 EL9（setuptools < 61）兼容；
+其它元数据由 pyproject.toml 提供。
 """
+from setuptools import setup
 
-from setuptools import setup, find_packages
-from version import __version__
-import os
-
-# Read requirements from requirements.txt
-def read_requirements():
-    with open('requirements.txt', 'r') as f:
-        return [line.strip() for line in f if line.strip() and not line.startswith('#')]
+ns = {}
+with open("version.py") as f:
+    exec(f.read(), ns)
 
 setup(
     name="joblens-trigger",
-    version=__version__,
-    description="JobLens Trigger Service - RESTful API for JobLens",
-    author="JobLens Team",
-    license="MIT",
-    packages=find_packages(),
-    py_modules=['app', 'app_factory', 'entrypoint', 'version'],
-    install_requires=read_requirements(),
-    python_requires='>=3.8',
-    include_package_data=True,
+    version=ns["__version__"],
+    packages=["trigger", "trigger.api", "trigger.core", "trigger.utils"],
+    package_dir={"trigger": "."},
 )

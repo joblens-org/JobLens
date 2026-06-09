@@ -179,7 +179,7 @@ class RuleManager:
             
         with open(full_path, 'wb') as f:
             f.write(content)
-            logger.info(f'{'更新' if is_update else '新建'}路径: {full_path} 下规则')
+            logger.info(f'{"更新" if is_update else "新建"}路径: {full_path} 下规则')
         
         return True
     
