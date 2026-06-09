@@ -19,7 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.13",
 ]
-dynamic = ["dependencies"]
+dynamic = ["version", "dependencies"]
 
 [tool.setuptools.package-dir]
 "trigger" = "."
@@ -28,4 +28,5 @@ dynamic = ["dependencies"]
 packages = ["trigger", "trigger.api", "trigger.core", "trigger.utils"]
 
 [tool.setuptools.dynamic]
+version = {attr = "version.__version__"}
 dependencies = {file = "requirements.txt"}
