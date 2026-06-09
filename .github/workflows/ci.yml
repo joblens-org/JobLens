@@ -48,18 +48,13 @@ jobs:
       - name: Configure & Build (CMakePresets)
         uses: lukka/run-cmake@v10
         with:
-          configurePreset: 'ci-linux'
-          buildPreset: 'ci-linux'
+          configurePreset: 'rpm-system-deps'
+          buildPreset: 'rpm-system-deps'
 
-      - name: Package (CPack TGZ)
+      - name: Package (CPack TGZ + RPM)
         uses: lukka/run-cmake@v10
         with:
-          packagePreset: 'ci-linux-tgz'
-
-      - name: Package (CPack RPM)
-        uses: lukka/run-cmake@v10
-        with:
-          packagePreset: 'ci-linux-rpm'
+          packagePreset: 'rpm-system-deps'
 
       - name: Verify TGZ contents
         run: |
@@ -73,7 +68,7 @@ jobs:
           tar -tzf "$TGZ" | grep -q 'lib/joblens/bpf_obj/.*\.bpf\.o$' && echo "✓ eBPF 对象文件" || echo "⚠ 未找到 bpf_obj"
           tar -tzf "$TGZ" | grep -q 'etc/JobLens/config.yaml$' && echo "✓ 默认配置文件" || { echo "✗ 缺少 config.yaml"; exit 1; }
           tar -tzf "$TGZ" | grep -q 'systemd/system/joblens.service$' && echo "✓ systemd 服务单元" || echo "⚠ 未找到 joblens.service"
-          tar -tzf "$TGZ" | grep -q 'lib/joblens/.*\.so' && echo "✓ 运行时 .so" || echo "⚠ 未收集运行时库"
+          ! tar -tzf "$TGZ" | grep -q 'lib/joblens/.*\.so' && echo "✓ 未捆绑 .so (系统依赖模式)" || { echo "✗ 不应包含 .so"; exit 1; }
           echo "TGZ 大小: $(ls -lh "$TGZ" | awk '{print $5}')"
 
       - name: Verify RPM contents
@@ -94,7 +89,7 @@ jobs:
           rpm -qpl "$RPM" | grep -q '/lib/joblens/bpf_obj/.*\.bpf\.o$' && echo "✓ eBPF 对象文件" || echo "⚠ 未找到 bpf_obj"
           rpm -qpl "$RPM" | grep -q '/etc/JobLens/config.yaml$' && echo "✓ 默认配置文件" || { echo "✗ 缺少 config.yaml"; exit 1; }
           rpm -qpl "$RPM" | grep -q '/systemd/system/joblens.service$' && echo "✓ systemd 服务单元" || echo "⚠ 未找到 joblens.service"
-          rpm -qpl "$RPM" | grep -q '/lib/joblens/.*\.so' && echo "✓ 运行时 .so" || echo "⚠ 未收集运行时库"
+          ! rpm -qpl "$RPM" | grep -q '/lib/joblens/.*\.so' && echo "✓ 未捆绑 .so (系统依赖模式)" || { echo "✗ 不应包含 .so"; exit 1; }
 
           echo ""
           echo "=== RPM 依赖 ==="
