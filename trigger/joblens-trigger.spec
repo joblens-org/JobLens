@@ -91,8 +91,9 @@ done
 find %{buildroot}/usr/lib/joblens-trigger/venv -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 find %{buildroot}/usr/lib/joblens-trigger/venv -name '*.pyc' -delete 2>/dev/null || true
 
-# 5. 安装 gunicorn 配置文件（标记为 noreplace，升级时不覆盖用户修改）
+# 5. 安装配置文件到 /etc/JobLens/trigger/
 install -d -m 755 %{buildroot}%{_sysconfdir}/JobLens/trigger
+install -m 644 config.example.yaml %{buildroot}%{_sysconfdir}/JobLens/trigger/
 install -m 644 gunicorn.conf.py %{buildroot}%{_sysconfdir}/JobLens/trigger/
 
 # 6. 安装 systemd unit
@@ -107,6 +108,7 @@ install -d -m 755 %{buildroot}%{_sharedstatedir}/joblens
 %doc README.md
 /usr/lib/joblens-trigger/venv/
 %config(noreplace) %{_sysconfdir}/JobLens/trigger/gunicorn.conf.py
+%{_sysconfdir}/JobLens/trigger/config.example.yaml
 %config(noreplace) %{_sysconfdir}/JobLens/trigger/config.yaml
 %{_unitdir}/joblens-trigger.service
 %dir %{_sharedstatedir}/joblens

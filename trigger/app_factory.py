@@ -78,10 +78,22 @@ class AppContext:
         self._shutdown_called = False
     
     def _get_default_config_path(self) -> str:
-        """获取默认配置文件路径"""
-        current_file = Path(__file__).resolve()
-        config_dir = current_file.parent / "config"
-        return str(config_dir / "config.yaml")
+        """获取默认配置文件路径
+        
+        查找顺序:
+        1. /etc/JobLens/trigger/config.yaml（生产配置）
+        2. /etc/JobLens/trigger/config.example.yaml（示例配置回退）
+        3. 源码目录中的 config/config.yaml（开发环境）
+        """
+        system_config = Path("/etc/JobLens/trigger/config.yaml")
+        if system_config.exists():
+            return str(system_config)
+
+        example_config = Path("/etc/JobLens/trigger/config.example.yaml")
+        if example_config.exists():
+            return str(example_config)
+
+        raise FileNotFoundError("Cannot find configuration file. Please provide a config.yaml in /etc/JobLens/trigger/ or use the example config.")
     
     def _load_yaml_config(self) -> dict:
         """从YAML文件加载配置"""
