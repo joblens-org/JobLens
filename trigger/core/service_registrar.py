@@ -18,7 +18,7 @@ import time
 import logging
 from typing import Optional, Tuple
 
-from utils import cluster_info
+from trigger.utils import cluster_info
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ class ServiceRegistrar:
     def _get_version(self) -> str:
         """获取版本信息"""
         try:
-            from core.tools import get_joblens_version
+            from trigger.core.tools import get_joblens_version
             joblens_buildinfo = get_joblens_version()
             if joblens_buildinfo['version'] != 'UNKNOWN':
                 return f"{joblens_buildinfo['version']} {joblens_buildinfo['build_id']} {joblens_buildinfo['build_time_local']}"

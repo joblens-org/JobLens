@@ -24,9 +24,9 @@ import subprocess
 from typing import Optional
 
 # 业务操作函数
-from core.tools import joblens_format_metrics, systemd_status, job_opt, add_condorjob, add_slurmjob, restart_joblens
-from core.rpc_client import RPCError
-from utils.hardware_info import hardware_info
+from trigger.core.tools import joblens_format_metrics, systemd_status, job_opt, add_condorjob, add_slurmjob, restart_joblens
+from trigger.core.rpc_client import RPCError
+from trigger.utils.hardware_info import hardware_info
 
 # 兼容两种运行方式：以项目根目录运行或以 trigger 目录运行
 try:
@@ -42,8 +42,8 @@ try:
         VersionResponse, UpgradeResponse, HardwareInfoResponse
     )
 except ImportError:
-    from version import __version__ as trigger_version
-    from api.schemas import (
+    from trigger.version import __version__ as trigger_version
+    from trigger.api.schemas import (
         JobRequest, CondorJobRequest, SlurmJobRequest,
         ErrorResponse, HealthResponse, RPCHealthResponse,
         JobResponse, JobCountResponse, JobsListResponse, JobDetailResponse,

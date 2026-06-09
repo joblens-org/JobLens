@@ -1,5 +1,10 @@
 #!/bin/bash
 # 构建 joblens-trigger RPM 包
+#
+# 采用 Python virtualenv 方案：所有 Python 依赖安装到
+# /usr/lib/joblens-trigger/venv/，与系统 Python 完全隔离。
+# spec 仅需 python3 + python3-pip 作为构建依赖。
+#
 # 用法:
 #   ./scripts/build-trigger-rpm.sh              # 仅构建
 #   ./scripts/build-trigger-rpm.sh --install-deps # 先安装构建依赖，再构建
@@ -46,18 +51,16 @@ install_deps() {
 
     if ! command -v dnf &>/dev/null && ! command -v yum &>/dev/null; then
         if command -v apt &>/dev/null; then
-            log_warn "apt 环境无法安装 Fedora/RHEL 专用 RPM 宏（pyproject-rpm-macros），"
-            log_warn "请在 Fedora/RHEL 容器中运行。仅安装基础工具..."
-            sudo apt-get install -y --no-install-recommends rpm
+            log_warn "apt 环境不支持 RPM 构建，请在 Fedora/RHEL 容器中运行"
+            exit 1
         else
             log_warn "未检测到已知包管理器，跳过依赖安装"
         fi
         return
     fi
 
-    # 启用 EPEL 和 CRB —— RHEL 9 需要 EPEL 才有 pyproject-rpm-macros
     if grep -qi 'Red Hat\|CentOS\|AlmaLinux\|Rocky' /etc/redhat-release 2>/dev/null; then
-        log_info "检测到 RHEL 系列，启用 EPEL..."
+        log_info "检测到 RHEL 系列，启用 EPEL 和 CRB..."
         sudo dnf install -y epel-release 2>/dev/null || true
         sudo dnf config-manager --set-enabled crb 2>/dev/null || \
         sudo dnf config-manager --set-enabled powertools 2>/dev/null || true
@@ -67,26 +70,11 @@ install_deps() {
     sudo dnf install -y rpm-build rpmdevtools python3 python3-devel systemd-rpm-macros \
         python3-setuptools python3-wheel python3-pip
 
-    # Python < 3.11 需要 tomli 才能解析 pyproject.toml
-    if ! rpm -q python3-tomli &>/dev/null; then
-        sudo dnf install -y python3-tomli 2>/dev/null || true
-    fi
-
-    # pyproject-rpm-macros：Fedora 包名 pyproject-rpm-macros，EL 可能叫 python3-pyproject-rpm-macros
-    if ! rpm -q pyproject-rpm-macros &>/dev/null && ! rpm -q python3-pyproject-rpm-macros &>/dev/null; then
-        log_info "安装 pyproject-rpm-macros..."
-        sudo dnf install -y pyproject-rpm-macros 2>/dev/null || \
-        sudo dnf install -y python3-pyproject-rpm-macros 2>/dev/null || {
-            log_error "无法安装 pyproject-rpm-macros"
-            log_error "请确认已启用 EPEL: sudo dnf install -y epel-release"
-            exit 1
-        }
-    fi
-
-    log_info "安装 spec 构建依赖..."
-    if ! sudo dnf builddep -y "$PROJECT_ROOT/trigger/joblens-trigger.spec"; then
-        log_warn "dnf builddep 失败，部分 Python 依赖可能未安装"
-        log_warn "rpmbuild 阶段会再次检查，若缺少依赖请手动安装"
+    log_info "安装 spec 构建依赖（python3, python3-pip）..."
+    if ! sudo dnf builddep -y "$PROJECT_ROOT/trigger/joblens-trigger.spec" 2>&1; then
+        log_warn "=============================================="
+        log_warn "dnf builddep 失败！将尝试以 --nodeps 继续构建"
+        log_warn "=============================================="
     fi
 }
 
@@ -142,32 +130,40 @@ build_rpm() {
 # ---------- 验证 ----------
 verify_rpm() {
     local rpm_file
-    rpm_file=$(ls ~/rpmbuild/RPMS/noarch/joblens-trigger-${TRIGGER_VERSION}*.rpm 2>/dev/null | head -1)
+    rpm_file=$(ls ~/rpmbuild/RPMS/x86_64/joblens-trigger-${TRIGGER_VERSION}*.rpm 2>/dev/null | head -1)
     if [[ -z "$rpm_file" ]]; then
-        log_error "未找到 RPM 产物"
+        log_error "未找到 RPM 产物（搜索路径: ~/rpmbuild/RPMS/x86_64/）"
         log_error "可用包列表:"
         find ~/rpmbuild/RPMS -name '*.rpm' 2>/dev/null || true
         exit 1
     fi
 
     echo ""
-    echo "=== RPM 文件列表 ==="
-    rpm -qpl "$rpm_file" | sort
+    echo "=== RPM 文件列表（前 30 项） ==="
+    rpm -qpl "$rpm_file" | head -30
 
     echo ""
     echo "=== 关键产物检查 ==="
     rpm -qpl "$rpm_file" | grep -q 'joblens-trigger.service' && echo -e "${GREEN}✓${NC} systemd unit" || { echo -e "${RED}✗${NC} 缺少 systemd unit"; exit 1; }
-    rpm -qpl "$rpm_file" | grep -q 'gunicorn.conf.py' && echo -e "${GREEN}✓${NC} gunicorn 配置" || { echo -e "${RED}✗${NC} 缺少 gunicorn.conf.py"; exit 1; }
-    rpm -qpl "$rpm_file" | grep -q '/site-packages/trigger/' && echo -e "${GREEN}✓${NC} Python 包" || { echo -e "${RED}✗${NC} 缺少 trigger Python 包"; exit 1; }
+    rpm -qpl "$rpm_file" | grep -q '/etc/JobLens/trigger/gunicorn.conf.py' && echo -e "${GREEN}✓${NC} gunicorn 配置" || { echo -e "${RED}✗${NC} 缺少 gunicorn.conf.py"; exit 1; }
+    rpm -qpl "$rpm_file" | grep -q '/venv/bin/gunicorn' && echo -e "${GREEN}✓${NC} venv gunicorn" || { echo -e "${RED}✗${NC} 缺少 venv/bin/gunicorn"; exit 1; }
+    rpm -qpl "$rpm_file" | grep -q '/site-packages/flask/__init__' && echo -e "${GREEN}✓${NC} Flask (venv)" || { echo -e "${RED}✗${NC} 缺少 Flask"; exit 1; }
+    rpm -qpl "$rpm_file" | grep -q '/site-packages/trigger/app' && echo -e "${GREEN}✓${NC} trigger 包 (venv)" || { echo -e "${RED}✗${NC} 缺少 trigger 包"; exit 1; }
 
     echo ""
     echo "=== RPM 信息 ==="
     echo "文件: $rpm_file"
     echo "大小: $(ls -lh "$rpm_file" | awk '{print $5}')"
+    echo "文件数: $(rpm -qpl "$rpm_file" | wc -l)"
 
     echo ""
     echo "=== RPM 依赖 ==="
     rpm -qp --requires "$rpm_file" | sort
+
+    echo ""
+    echo "=== venv 内 Python 包 ==="
+    rpm -qpl "$rpm_file" | grep 'site-packages/[^/]*/__init__\.py$' | sed 's|.*site-packages/||;s|/__init__.py||' | sort | head -15
+    echo "    ... ($(rpm -qpl "$rpm_file" | grep 'site-packages/[^/]*/__init__\.py$' | wc -l) 个包总计)"
 
     log_info "构建成功！安装命令:"
     echo "  sudo rpm -ivh $rpm_file"

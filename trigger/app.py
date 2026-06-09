@@ -29,6 +29,7 @@ JobLens触发器入口文件
 2. 停止ConfigManager（监控线程）
 3. 关闭RPC客户端连接
 """
+import os
 import flask
 from flask import has_request_context, request
 from werkzeug.local import LocalProxy

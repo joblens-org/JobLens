@@ -26,7 +26,7 @@ import logging
 import subprocess
 import re
 import shlex
-from core.rpc_client import RPCClient
+from trigger.core.rpc_client import RPCClient
 import yaml
 from datetime import datetime, timezone
 from typing import List, Tuple, Optional
@@ -50,7 +50,7 @@ if USE_MOCK_TOOLS:
         if os.path.exists(mock_dir) and mock_dir not in sys.path:
             sys.path.insert(0, mock_dir)
         
-        from core.mock_tools import (
+        from trigger.core.mock_tools import (
             mock_run,
             mock_systemd_status,
             mock_joblens_format_metrics,

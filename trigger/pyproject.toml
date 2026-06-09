@@ -8,6 +8,18 @@ description = "JobLens Trigger Service - RESTful API gateway for JobLens"
 license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.8"
+dependencies = [
+    "Flask>=3",
+    "gunicorn",
+    "psutil>=5",
+    "pydantic>=2",
+    "PyYAML>=6",
+    "Requests>=2",
+    "setuptools>=53",
+    "watchdog>=4",
+    "grpcio>=1.80",
+    "protobuf<=3.20",
+]
 authors = [
     {name = "JobLens Team"}
 ]
@@ -19,7 +31,7 @@ classifiers = [
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.13",
 ]
-dynamic = ["version", "dependencies"]
+dynamic = ["version"]
 
 [tool.setuptools.package-dir]
 "trigger" = "."
@@ -29,4 +41,3 @@ packages = ["trigger", "trigger.api", "trigger.core", "trigger.utils"]
 
 [tool.setuptools.dynamic]
 version = {attr = "version.__version__"}
-dependencies = {file = "requirements.txt"}

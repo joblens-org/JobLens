@@ -10,7 +10,7 @@ User=root
 WorkingDirectory=/var/lib/joblens
 Environment=JOBLENS_CONFIG_PATH=/etc/JobLens/config.yaml
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/gunicorn \
+ExecStart=/usr/lib/joblens-trigger/venv/bin/gunicorn \
     --config /etc/JobLens/trigger/gunicorn.conf.py \
     --chdir /var/lib/joblens \
     trigger.app:app
