@@ -58,9 +58,11 @@ lens_config:
 | Key | Type | Default | Description | Source Reference |
 |-----|------|---------|-------------|------------------|
 | `rpc_socket_path` | string | none | UNIX Domain Socket path for local RPC communication | `main_utils.cpp:83` → `RPCServer::instance(RPC_Socket)` |
+| `rpc_timeout` | float | 5 | RPC call timeout in seconds | trigger `app_factory.py:183` (used by Trigger) |
 | `lock_path` | string | none | Process lock file, used by `already_running()` to detect if another instance is running | `main_utils.cpp:95`, `distributed_node.cpp:61` |
+| `pid_dir` | string | none | PID file directory, stores per-node process information in distributed mode | `distributed_node.cpp` |
 | `max_collector_threads` | int | none | Thread pool size for the collector timer scheduler | `collector_scheduler.cpp:12` |
-| `log_level` | string |  fallback to info | Log level: trace/debug/info/warn/error/critical/off | `main_utils.cpp:67` |
+| `log_level` | string | fallback to info | Log level: trace/debug/info/warn/error/critical/off | `main_utils.cpp:67` |
 
 ---
 
@@ -68,21 +70,21 @@ lens_config:
 
 ```yaml
 job_registry_config:
-  job_db_path: /var/JobLens/job.db      # SQLite database path for persisting job state
+  job_db_path: /var/JobLens/job.db      # LevelDB database directory path for persisting job state
   auto_add_condorjob: true               # Whether to automatically monitor Condor jobs
   auto_add_slurmjob: true                # Whether to automatically monitor Slurm jobs
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `job_db_path` | string | none | SQLite database path storing `jobs` and `jobs_history` tables. If the database cannot be opened, no exception is thrown; it only degrades operation |
+| `job_db_path` | string | none | LevelDB database directory path. If the database cannot be opened, no exception is thrown; it only degrades operation |
 | `auto_add_condorjob` | bool | false | Automatically start CondorJobWatcher, trace `condor_starter` processes via eBPF, and auto-add Condor jobs |
 | `auto_add_slurmjob` | bool | false | Automatically start SlurmJobWatcher, trace `slurm_stepd` processes via eBPF, and auto-add Slurm jobs |
+| `rules_dir` | string | none | Directory for Lua rule files, used by the rule engine |
 
-**Database table structure** (automatically created):
-- `jobs` — Table of currently active jobs, containing columns `jobid_high`, `jobid_low`, `jobtype`, `subtype`, `pids`, `collectors`, `status`
-- `jobs_history` — Table of historical jobs, same structure as `jobs`, plus an `end_time` timestamp
-- `job_id_counter` — Table with an auto-incrementing ID counter
+**Job data storage** (LevelDB key-value store):
+- Keys use prefixes `job_`, `job_history_`, `counter_` with values serialized as JSON
+- Internally managed by `JobRegistry`; backed by LevelDB for persistence
 
 ---
 
@@ -110,7 +112,6 @@ collectors_config:
 | `perf_window_size` | int | none | Performance window size, affects the number of samples for mean/variance calculation | `collector_registry.cpp:19` |
 | `default_freq` | int | none | Default sampling frequency (Hz) for collectors | `collector_scheduler.cpp:14` |
 | `default_use_writers` | string[] | none | Default list of writers for collectors | `collector_scheduler.cpp:15` |
-| `job_adder_fifo` | string | defined only in header | External processes write JSON to this FIFO to dynamically add jobs | `collector_utils.hpp:22` |
 
 ### `collectors` Array Elements
 
@@ -359,9 +360,10 @@ lens_config:
   log_level: info
 
 job_registry_config:
-  job_db_path: /var/JobLens/job.db
+  job_db_path: /var/JobLens/job.db   # LevelDB database directory path
   auto_add_condorjob: true
   auto_add_slurmjob: false
+  rules_dir: /etc/JobLens/rules/
 
 collectors_config:
   enable_collector_perf: true

@@ -2,8 +2,8 @@
 
 > **文档版本**: v1.0.0  
 > **最后更新**: 2026-04-25  
-> **Agent RPM**: joblens-0.0.16-1.dev.el9.x86_64.rpm  
-> **Trigger RPM**: joblens-trigger-0.0.9-1.dev.el9.x86_64.rpm  
+> **Agent RPM**: joblens-0.0.21-1.el9.x86_64.rpm  
+> **Trigger RPM**: joblens-trigger-0.0.13-1.el9.x86_64.rpm  
 > **状态**: 已在 IHEP 生产环境验证，欢迎跨站点评估
 
 ## 1. 项目简介
@@ -51,7 +51,7 @@ Resource Footprint: Designed for minimal overhead. On a 256-core production node
   - 监听地址与 Trigger 通信方式
   - 日志级别与输出
   - es相关配置
-- Trigger 配置文件概览（`/opt/JobLens/trigger/config.yaml`）
+- Trigger 配置文件概览（`/etc/JobLens/trigger/config.yaml`）
   - 监听端口
 
 ### 5.3 启动与自检
@@ -130,8 +130,8 @@ ps aux | grep joblens
 见文件 configuration_zh.md
 
 ## 8. 数据写入器配置
-- 使用ElasticSearch
-Writers: This release focuses on Elasticsearch validation. The file writers are functional for local testing. Additional backends (Prometheus, Kafka, InfluxDB) are interface-ready and will be validated in upcoming releases based on demand.
+- 当前版本重点验证 Elasticsearch sink。
+- 当前代码中已实现的写入器类型为 Elasticsearch、FileWriter、KafkaWriter 和 PrometheusExporterWriter。不同环境的部署验证状态可能不同，具体配置键以 `configuration_zh.md` 为准。
 
 ## 9. 验证指南
 - 通过condor_submit提交作业
@@ -145,8 +145,8 @@ JobLens is actively evolving toward v1.0 API stability. We welcome:
 - **Trial Feedback**: 我们正在收集各站点的实际部署环境，以构建 v1.0 的兼容性矩阵。
 - **Scheduler Integration**: If you have expertise in SLURM, PBS, or UGE 
   job discovery mechanisms, we would love to collaborate on auto-attachment.
-- **Backend Validation**: Help us verify your existing storage stack 
-  (InfluxDB, Prometheus, or others) as a JobLens sink.
+- **Backend Validation**: Help us verify implemented storage/export paths 
+  such as Kafka and Prometheus in your environment.
 
 The core agent is **production-hardened at IHEP** (~1,000 nodes). 
 Peripheral components (Manager, Web UI) are iterating rapidly based on 

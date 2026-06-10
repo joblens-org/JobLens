@@ -369,8 +369,8 @@ curl -X DELETE http://localhost:8080/unregister/550e8400-e29b-41d4-a716-44665544
 
 ## Version Information
 
-- **Current Version**: v0.0.4
-- **Last Updated**: 2026-02-04
+- **Current Version**: v0.0.13
+- **Last Updated**: 2026-06-10
 - **API Compatibility**: Backward compatible
 
 ---

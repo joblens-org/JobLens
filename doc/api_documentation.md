@@ -17,7 +17,40 @@ Get Prometheus-formatted metrics data from the JobLens writer.
 **Status Codes:**
 - `200` - Success
 - `503` - RPC call failed
-- `500` - Internal error
+- `500` - Unexpected error
+
+### `GET /`
+
+Get basic Trigger service information including version, status, and available endpoints.
+
+**Response body:**
+
+| Field | Type | Description |
+|---|---|---|
+| `service` | string | Service name (e.g., `"JobLens Trigger"`) |
+| `version` | string | Trigger component version |
+| `status` | string | Service status (e.g., `"running"`) |
+| `endpoints` | object | Key API endpoints reference |
+
+**Status Codes:**
+- `200` - Success
+
+### `GET /trigger/health`
+
+Get detailed health status of the Trigger service components, independent of JobLens RPC.
+
+**Response body:**
+
+| Field | Type | Description |
+|---|---|---|
+| `service` | string | Service name |
+| `version` | string | Trigger version |
+| `status` | string | Service status |
+| `components` | object | Health of internal components (`rpc_client`, `service_registrar`, `config_manager`, `rule_manager`) |
+| `joblens` | object | JobLens core version info (`version`, `build_id`, `build_time`) |
+
+**Status Codes:**
+- `200` - Success
 
 ---
 
@@ -70,10 +103,11 @@ Generic job operation (add or remove).
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `opt` | string | **Yes** | Operation type: `"add"` or `"remove"` |
-| `type` | string | **Yes** | Job type: `"job.condor"` or `"job.common"` |
+| `type` | string | **Yes** | Job type: `"job.condor"`, `"job.slurm"`, or `"job.common"` |
 | `JobID` | int | No | Job ID |
 | `JobPIDs` | array[int] | No | List of process PIDs |
-| `Lens` | array[string] | No | Collector list (default: `[""]`) |
+| `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "io_collector", "net_collector"]`) |
+| `sub_attr` | object | No | Sub-attributes: `condor` type needs `cluster_id`/`proc_id`, `slurm` type needs `job_id`/`step_id` |
 
 **Example request:**
 ```json
@@ -111,7 +145,8 @@ Condor job specific operation. Currently only supports `"add"`.
 | `opt` | string | **Yes** | Operation type, only `"add"` is supported |
 | `JobID` | int | No | Job ID |
 | `slot` | string | **Yes** | Slot name, must start with `"slot"` |
-| `Lens` | array[string] | No | Collector list (default: `[""]`) |
+| `Lens` | array[string] | No | Collector list (default: `["proc_collector"]`) |
+| `sub_attr` | object | No | Sub-attributes (e.g., `{"cluster_id": 123456, "proc_id": 0}`) |
 
 **Example request:**
 ```json
@@ -147,7 +182,8 @@ Slurm job specific operation. Currently only supports `"add"`.
 |---|---|---|---|
 | `opt` | string | **Yes** | Operation type, only `"add"` is supported |
 | `JobID` | int | **Yes** | Slurm job ID |
-| `Lens` | array[string] | No | Collector list (default: `[""]`) |
+| `Lens` | array[string] | No | Collector list (default: `["proc_collector"]`) |
+| `sub_attr` | object | No | Sub-attributes (e.g., `{"job_id": 12345, "step_id": 0}`) |
 
 **Example request:**
 ```json
@@ -320,6 +356,22 @@ Get configuration manager status.
 
 **Status Codes:**
 - `200` - Success
+
+### `POST /joblens/config/update`
+
+Manually trigger a configuration reload (invokes the configuration manager's callbacks).
+
+**Response body (ConfigUpdateResponse):**
+
+| Field | Type | Description |
+|---|---|---|
+| `status` | string | Operation status (e.g., `"ok"`) |
+| `message` | string | Status message |
+
+**Status Codes:**
+- `200` - Success
+- `503` - ConfigManager not initialized
+- `500` - Config update failed
 
 ---
 

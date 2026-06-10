@@ -7,12 +7,12 @@
   - Contains only released production code
   - Can only be merged via Pull Request (PR)
   - Protected branch, direct pushes are forbidden
-  - Triggers GitLab CI/CD deployment to production
+  - Triggers the GitHub Actions CI/CD workflow for production validation
 
 - **develop**: Integration branch
   - Daily development integration branch
   - All feature development is merged here upon completion
-  - Triggers GitLab CI/CD deployment to dev/test environment
+  - Triggers the GitHub Actions CI/CD workflow for dev/test validation
 
 ### 1.2 Temporary Branches
 - **feature/***: Feature branches
@@ -141,15 +141,15 @@ Linked issue numbers: #123
 - **develop branch**: 
   - Automatically builds after each merge
   - Deploys to dev/test environment
-  - Runs complete test suite
+  - Runs the configured build and packaging checks
 
 - **main branch**:
   - Automatically builds after each merge
   - Deploys to production environment
-  - Runs production environment tests
+  - Runs production validation checks
 
 ### 5.2 Manual Deployment
-To manually trigger deployment, operate on the GitLab CI/CD pipeline page.
+To manually trigger deployment-related workflows, operate on the GitHub Actions page.
 
 ## 6. C++ Development Notes
 
@@ -162,9 +162,9 @@ To manually trigger deployment, operate on the GitLab CI/CD pipeline page.
 ```bash
 # Local pre-commit check
 mkdir build && cd build
-cmake ..
-make -j$(nproc)
-make test  # Run tests
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+ninja
+cpack -G TGZ  # Minimal packaging verification
 ```
 
 ### 6.3 Dependency Management
@@ -224,7 +224,7 @@ git push origin feature/xxx --force-with-lease
 ### 9.3 Code Review
 - Take review comments seriously
 - Review others' code carefully
-- Use GitLab's comment feature for discussions
+- Use GitHub Pull Request review comments for discussions
 
 ---
 

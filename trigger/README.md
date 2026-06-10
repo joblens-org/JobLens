@@ -37,7 +37,7 @@ The JobLens Trigger Service is a Flask-based RESTful API service that provides H
 ## Quick Start
 
 ### Requirements
-- Python 3.7+
+- Python 3.8+
 - JobLens core service installed and running
 - Optional: etcd v3+ (for distributed configuration management)
 
@@ -53,10 +53,7 @@ pip install -r requirements.txt
 python app.py
 
 # Launch with Gunicorn (production)
-gunicorn --config gunicorn.conf.py app:app
-
-# Use deployment script
-./deploy_trigger.sh
+gunicorn --config gunicorn.conf.py trigger.app:app
 ```
 
 ### Verify the Service
@@ -71,7 +68,12 @@ curl http://localhost:7592/metrics
 ## Configuration
 
 ### Main Config File
-The Trigger service uses the JobLens main configuration file (`../config/config.yaml`). Key configuration items include:
+The Trigger service has its own configuration file (see `trigger/config.example.yaml`).
+When deployed via RPM, the config is at `/etc/JobLens/trigger/config.yaml`.
+The Trigger also reads the JobLens core configuration at `/etc/JobLens/config.yaml`
+(via `JOBLENS_CONFIG_PATH` env var) for `lens_config.rpc_socket_path`.
+
+Key configuration items include:
 
 ```yaml
 lens_config:
@@ -173,30 +175,26 @@ Gets basic information and configuration for a specific writer.
 
 ### System Administration
 
-#### Version Upgrade
-```bash
-POST /joblens/version/upgrade
-Authorization: Bearer <upgrade_token>
-```
-Triggers a remote version upgrade. Requires a valid upgrade token.
-
 #### Configuration Update
 ```bash
-GET /joblens/config/update
+POST /joblens/config/update
 ```
 Manually triggers a configuration update (invokes the configuration manager's callbacks).
 
 ## Deployment Guide
 
-### Using the Deployment Script
+### RPM Deployment (Recommended)
 ```bash
-# Run deployment script
-./deploy_trigger.sh
+# Build the Trigger RPM
+bash scripts/build-trigger-rpm.sh
+
+# Install the RPM
+sudo rpm -ivh ~/rpmbuild/RPMS/x86_64/joblens-trigger-*.rpm
 ```
-The deployment script will:
-1. Create a Python virtual environment
-2. Install dependencies
-3. Create a systemd service file
+The RPM will:
+1. Create a Python virtual environment at `/usr/lib/joblens-trigger/venv/`
+2. Install dependencies into the venv
+3. Install systemd service file and configuration
 4. Enable and start the service
 
 ### Manual Deployment
@@ -210,10 +208,10 @@ After=network.target
 
 [Service]
 User=<username>
-WorkingDirectory=/path/to/JobLens/trigger
-Environment="PATH=/path/to/JobLens/trigger/venv/bin"
-ExecStart=/path/to/JobLens/trigger/venv/bin/gunicorn --config /path/to/JobLens/trigger/gunicorn.conf.py app:app
-Restart=always
+WorkingDirectory=/var/lib/joblens
+Environment="JOBLENS_CONFIG_PATH=/etc/JobLens/config.yaml"
+ExecStart=/usr/lib/joblens-trigger/venv/bin/gunicorn --config /etc/JobLens/trigger/gunicorn.conf.py trigger.app:app
+Restart=on-failure
 RestartSec=3
 StartLimitInterval=0
 
@@ -240,15 +238,33 @@ Gunicorn config file (`gunicorn.conf.py`) key settings:
 ### Project Structure
 ```
 trigger/
-├── app.py                 # Flask main application, contains all API routes
-├── config_manager.py      # Configuration manager, supports local and etcd config
-├── rpc_cilent.py          # RPC client, communicates with JobLens C++ service
-├── tools.py               # Utility functions (job queries, metric formatting, etc.)
-├── user_config.py         # User configuration class
-├── deploy_trigger.sh      # Deployment script
-├── gunicorn.conf.py       # Gunicorn configuration file
-├── requirements.txt       # Python dependency list
-└── README.md              # This document
+├── api/               # Flask route definitions and schemas
+│   ├── routes.py
+│   └── schemas.py
+├── core/              # Core business logic
+│   ├── config_manager.py
+│   ├── etcd_client.py
+│   ├── new_config_manager.py
+│   ├── rpc_client.py
+│   ├── rule_manager.py
+│   ├── service_registrar.py
+│   └── tools.py
+├── utils/             # Utility functions
+│   ├── cluster_info.py
+│   ├── email_notifier.py
+│   └── hardware_info.py
+├── app.py             # Flask application entry point
+├── app_factory.py     # Application factory
+├── entrypoint.py      # Package entry point
+├── gunicorn.conf.py   # Gunicorn configuration
+├── requirements.txt   # Python dependencies
+├── version.py         # Version info
+├── setup.py           # Package setup
+├── config.example.yaml # Trigger configuration example
+├── joblens-trigger.service  # systemd service unit
+├── joblens-trigger.spec     # RPM spec file
+├── regustry_api_doc.md      # Registry API documentation
+└── README.md          # This document
 ```
 
 ### Core Components
@@ -313,11 +329,8 @@ Add functions in `tools.py` supporting async or sync operations.
 # systemd service logs
 sudo journalctl -u joblens-trigger -f
 
-# Gunicorn access logs
-tail -f /var/log/gunicorn-access.log
-
-# Gunicorn error logs
-tail -f /var/log/gunicorn-error.log
+# Gunicorn logs (sent to stdout/stderr, captured by journald)
+sudo journalctl -u joblens-trigger -f | grep gunicorn
 ```
 
 ## Monitoring & Metrics
@@ -352,7 +365,7 @@ Issues and Pull Requests are welcome to improve the Trigger service.
 
 ## License
 
-The JobLens Trigger Service follows the overall JobLens project license (MIT).
+The JobLens Trigger Service follows the overall JobLens project license (Apache-2.0).
 
 ## Related Links
 

@@ -57,7 +57,9 @@ lens_config:
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
 | `rpc_socket_path` | string | 无 | 本地 RPC 通信的 UNIX Domain Socket 路径 |
+| `rpc_timeout` | float | 5 | RPC 调用超时时间（秒），Trigger 端使用 |
 | `lock_path` | string | 无 | 进程锁文件，`already_running()` 用于检测是否已有实例运行 |
+| `pid_dir` | string | 无 | PID 文件目录，分布式模式下存储各节点进程信息 |
 | `max_collector_threads` | int | 无 | 收集器定时调度器的线程池大小 |
 | `log_level` | string | 回退到 info | 日志级别：trace/debug/info/warn/error/critical/off |
 
@@ -67,21 +69,21 @@ lens_config:
 
 ```yaml
 job_registry_config:
-  job_db_path: /var/JobLens/job.db      # 持久化作业状态的 SQLite 数据库路径
+  job_db_path: /var/JobLens/job.db      # 持久化作业状态的 LevelDB 数据库目录路径
   auto_add_condorjob: true               # 是否自动监控 Condor 作业
   auto_add_slurmjob: true                # 是否自动监控 Slurm 作业
 ```
 
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
-| `job_db_path` | string | 无 | SQLite 数据库路径，存储 `jobs` 和 `jobs_history` 表。无法打开数据库时仅降级运行，不抛异常 |
+| `job_db_path` | string | 无 | LevelDB 数据库目录路径。无法打开数据库时仅降级运行，不抛异常 |
 | `auto_add_condorjob` | bool | false | 自动启动 CondorJobWatcher，通过 eBPF 追踪 `condor_starter` 进程并自动添加 Condor 作业 |
 | `auto_add_slurmjob` | bool | false | 自动启动 SlurmJobWatcher，通过 eBPF 追踪 `slurm_stepd` 进程并自动添加 Slurm 作业 |
+| `rules_dir` | string | 无 | Lua 规则文件目录，供规则引擎使用 |
 
-**数据库表结构**（自动创建）：
-- `jobs` — 当前活跃作业表，包含列 `jobid_high`, `jobid_low`, `jobtype`, `subtype`, `pids`, `collectors`, `status`
-- `jobs_history` — 历史作业表，与 `jobs` 结构相同，额外包含 `end_time` 时间戳
-- `job_id_counter` — 自增 ID 计数器表
+**作业数据存储**（LevelDB 键值存储）：
+- 键使用前缀 `job_`、`job_history_`、`counter_`，值以 JSON 序列化
+- 由 `JobRegistry` 内部管理；基于 LevelDB 持久化
 
 ---
 
@@ -109,7 +111,6 @@ collectors_config:
 | `perf_window_size` | int | 无 | 性能窗口大小，影响均值/方差计算的样本数 |
 | `default_freq` | int | 无 | 收集器默认采样频率（Hz） |
 | `default_use_writers` | string[] | 无 | 收集器默认写入器列表 |
-| `job_adder_fifo` | string | 仅在头文件中定义 | 外部进程向此 FIFO 写入 JSON 以动态添加作业 |
 
 ### `collectors` 数组元素
 
@@ -356,9 +357,10 @@ lens_config:
   log_level: info
 
 job_registry_config:
-  job_db_path: /var/JobLens/job.db
+  job_db_path: /var/JobLens/job.db   # LevelDB 数据库目录路径
   auto_add_condorjob: true
   auto_add_slurmjob: false
+  rules_dir: /etc/JobLens/rules/
 
 collectors_config:
   enable_collector_perf: true

@@ -2,8 +2,8 @@
 
 > **Document Version**: v1.0.0  
 > **Last Updated**: 2026-04-25  
-> **Agent RPM**: joblens-0.0.16-1.dev.el9.x86_64.rpm  
-> **Trigger RPM**: joblens-trigger-0.0.9-1.dev.el9.x86_64.rpm  
+> **Agent RPM**: joblens-0.0.21-1.el9.x86_64.rpm  
+> **Trigger RPM**: joblens-trigger-0.0.13-1.el9.x86_64.rpm  
 > **Status**: Production-tested at IHEP, open for cross-site evaluation
 
 ## 1. Project Overview
@@ -74,7 +74,8 @@ Verify installation paths and binaries:
 
 ```bash
 rpm -ql joblens joblens-trigger
-which joblens joblens-trigger
+ls /usr/bin/JobLens
+sudo systemctl status joblens-trigger
 ```
 
 ### 5.2 Basic Configuration
@@ -85,7 +86,7 @@ Default configurations are shipped with the RPMs. Modify them to match your envi
   - Listen address and Trigger communication method
   - Log level and output target
   - Elasticsearch connection parameters
-- **Trigger config**: `/opt/JobLens/trigger/config.yaml`
+- **Trigger config**: `/etc/JobLens/trigger/config.yaml`
   - Listen port for local API
 
 ### 5.3 Start and Health Check
@@ -188,7 +189,7 @@ See `configuration.md` for detailed parameter descriptions.
 
 **Current Release Focus**: **Elasticsearch** sink (validated in production).
 
-The **file writer** is functional for local testing. Additional backends (**Prometheus**, **Kafka**, **InfluxDB**) are interface-ready and will be validated in upcoming releases based on community demand.
+Implemented writer types in the current codebase are **Elasticsearch**, **FileWriter**, **KafkaWriter**, and **PrometheusExporterWriter**. Deployment validation may vary by environment; see `configuration.md` for the exact configuration keys supported by each implemented writer.
 
 ## 9. Validation Guide
 
@@ -205,7 +206,7 @@ JobLens is actively evolving toward **v1.0 API stability**. We welcome your part
 
 - **🧪 Trial Feedback**: Share your deployment environment details (OS, kernel, scheduler) to help us build the v1.0 compatibility matrix.
 - **🔌 Scheduler Integration**: If you have expertise in **SLURM**, **PBS**, **UGE**, or other batch systems, we'd love to collaborate on auto-attachment mechanisms.
-- **💾 Backend Validation**: Help us verify your existing storage stack (InfluxDB, Prometheus, etc.) as a JobLens sink.
+- **💾 Backend Validation**: Help us verify implemented storage/export paths such as Kafka and Prometheus in your environment.
 
 The core Agent is **production-hardened at IHEP** (~1,000 nodes, 50,000+ cores). Peripheral components (Manager, Web UI) are iterating rapidly based on community input. Your participation will help JobLens become a portable, job-native observability foundation for HPC/HTC sites worldwide.
 

@@ -127,7 +127,7 @@ else()
         "systemd, libbpf >= 1.0, libnl3 >= 3.7, openssl-libs >= 1.1, lua-libs >= 5.4, libcurl, librdkafka, zlib, cyrus-sasl-lib, libzstd, lz4-libs, elfutils-libelf, leveldb, xxhash-libs")
 endif()
 message(STATUS "RPM requires: ${CPACK_RPM_PACKAGE_REQUIRES}")
-set(CPACK_RPM_BUILDREQUIRES "cmake >= 3.16, gcc-c++, systemd, libbpf-devel, libnl3-devel, openssl-devel, zlib-devel, lua-devel, clang, libcurl-devel, librdkafka-devel, boost-devel, leveldb-devel, elfutils-libelf-devel, xxhash-devel, spdlog-devel, yaml-cpp-devel, fmt-devel")
+set(CPACK_RPM_BUILDREQUIRES "cmake >= 3.25, gcc-c++, systemd, libbpf-devel, libnl3-devel, openssl-devel, zlib-devel, lua-devel, clang, libcurl-devel, librdkafka-devel, boost-devel, leveldb-devel, elfutils-libelf-devel, xxhash-devel, spdlog-devel, yaml-cpp-devel, fmt-devel")
 
 set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE
     ${CMAKE_CURRENT_SOURCE_DIR}/scripts/rpm/postinstall.sh)

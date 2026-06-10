@@ -7,12 +7,12 @@
   - 只包含已发布的生产代码
   - 只能通过Pull Request（PR）合并
   - 受保护分支，禁止直接推送
-  - 触发GitLab CI/CD部署到生产环境
+  - 触发 GitHub Actions CI/CD 工作流进行生产验证
 
 - **develop**: 集成分支
   - 日常开发集成分支
   - 所有功能开发完成后合并至此
-  - 触发GitLab CI/CD部署到开发/测试环境
+  - 触发 GitHub Actions CI/CD 工作流进行开发/测试验证
 
 ### 1.2 临时分支
 - **feature/\***: 功能分支
@@ -141,15 +141,15 @@ Closes #123
 - **develop分支**: 
   - 每次合并后自动构建
   - 部署到开发/测试环境
-  - 运行完整测试套件
+  - 运行已配置的构建与打包检查
 
 - **main分支**:
   - 每次合并后自动构建
   - 部署到生产环境
-  - 运行生产环境测试
+  - 运行生产验证检查
 
 ### 5.2 手动部署
-如需手动触发部署，可在GitLab CI/CD流水线页面操作。
+如需手动触发部署相关工作流，可在 GitHub Actions 页面操作。
 
 ## 6. C++开发注意事项
 
@@ -162,9 +162,9 @@ Closes #123
 ```bash
 # 本地预提交检查
 mkdir build && cd build
-cmake ..
-make -j$(nproc)
-make test  # 运行测试
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+ninja
+cpack -G TGZ  # 最小打包验证
 ```
 
 ### 6.3 依赖管理
@@ -224,7 +224,7 @@ git push origin feature/xxx --force-with-lease
 ### 9.3 代码审查
 - 认真对待审查意见
 - 审查他人代码要仔细
-- 使用GitLab的评论功能讨论
+- 使用 GitHub Pull Request 审查评论进行讨论
 
 ---
 

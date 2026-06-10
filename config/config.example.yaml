@@ -39,7 +39,7 @@ lens_config:
 # ============================================================
 # Manages persistent storage and auto-discovery of jobs
 job_registry_config:
-  # Job database file path (SQLite format)
+  # Job database directory path (LevelDB format)
   # Used for persistent storage of job information, supports restoring job state after service restart
   job_db_path: /var/JobLens/job.db
   
@@ -139,10 +139,6 @@ collectors_config:
   # Performance monitoring window size
   # Number of samples used for calculating sliding window averages
   perf_window_size: 1000
-  
-  # Job adder FIFO path
-  # Used by external programs to dynamically add/remove jobs via FIFO
-  job_adder_fifo: /var/JobLens/job_adder_fifo
   
   # Default collection frequency (Hz)
   # Default value used when a collector config does not specify freq
@@ -326,26 +322,6 @@ file_writer_config:
   write_timeout: 5
 
 # ============================================================
-# Condor ClassAds Writer Config
-# ============================================================
-# Writes data to Condor's ClassAds system via condor_chirp
-condor_classads_writer_config:
-  # Write timeout (seconds)
-  write_timeout: 5
-  
-  # condor_chirp command path
-  chirp_path: /usr/libexec/condor/condor_chirp
-  
-  # ClassAds file test path
-  classads_path: /tmp/classads_test
-  
-  # chirp configuration directory
-  chirp_config_dir: /tmp/chirp_configs
-  
-  # chirp configuration file path being used
-  chirp_config_path: /tmp/chirp_configs/used_config
-
-# ============================================================
 # Kafka Writer Config
 # ============================================================
 # Sends collected data to Kafka message queue
@@ -393,42 +369,3 @@ kafka_writer_config:
   # The following credentials are only used when security_protocol is not plaintext
   # username: "your_kafka_username"
   # password: "your_kafka_password"
-
-# ============================================================
-# InfluxDB Writer Config
-# ============================================================
-# Writes collected data to InfluxDB time-series database
-influxdb_writer_config:
-  # InfluxDB version
-  # Currently supports version 3
-  version: 3
-  
-  # InfluxDB server address (supports environment variable INFLUXDB_HOST override)
-  host: your-influxdb-host
-  
-  # InfluxDB server port
-  port: 8181
-  
-  # Target database name (supports environment variable INFLUXDB_DATABASE override)
-  database: your_influxdb_database
-  
-  # API token (InfluxDB v3 authentication, supports environment variable INFLUXDB_TOKEN override)
-  token: your_influxdb_token
-  
-  # Connection timeout (seconds)
-  timeout: 5
-  
-  # Write mode
-  # Valid values: sync (synchronous), async (asynchronous)
-  mode: async
-  
-  # Batch write size
-  # Number of data points written per batch
-  batch_size: 1000
-  
-  # Write frequency (seconds)
-  # Time interval for data writes
-  freq: 10
-  
-  # Write timeout (seconds)
-  write_timeout: 5

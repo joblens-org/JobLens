@@ -17,7 +17,40 @@
 **状态码：**
 - `200` - 成功
 - `503` - RPC 调用失败
-- `500` - 内部错误
+- `500` - 未知错误
+
+### `GET /`
+
+获取 Trigger 服务基本信息，包括版本、状态和可用端点。
+
+**响应体：**
+
+| 字段 | 类型 | 描述 |
+|---|---|---|
+| `service` | string | 服务名称（如 `"JobLens Trigger"`） |
+| `version` | string | Trigger 组件版本 |
+| `status` | string | 服务状态（如 `"running"`） |
+| `endpoints` | object | 关键 API 端点参考 |
+
+**状态码：**
+- `200` - 成功
+
+### `GET /trigger/health`
+
+获取 Trigger 服务各组件的详细健康状态，不依赖 JobLens RPC。
+
+**响应体：**
+
+| 字段 | 类型 | 描述 |
+|---|---|---|
+| `service` | string | 服务名称 |
+| `version` | string | Trigger 版本 |
+| `status` | string | 服务状态 |
+| `components` | object | 内部组件健康状态（`rpc_client`、`service_registrar`、`config_manager`、`rule_manager`） |
+| `joblens` | object | JobLens 核心版本信息（`version`、`build_id`、`build_time`） |
+
+**状态码：**
+- `200` - 成功
 
 ---
 
@@ -70,10 +103,11 @@
 | 字段 | 类型 | 必填 | 描述 |
 |---|---|---|---|
 | `opt` | string | **是** | 操作类型：`"add"` 或 `"remove"` |
-| `type` | string | **是** | 作业类型：`"job.condor"` 或 `"job.common"` |
+| `type` | string | **是** | 作业类型：`"job.condor"`、`"job.slurm"` 或 `"job.common"` |
 | `JobID` | int | 否 | 作业 ID |
 | `JobPIDs` | array[int] | 否 | 进程 PID 列表 |
-| `Lens` | array[string] | 否 | 收集器列表（默认：`[""]`） |
+| `Lens` | array[string] | 否 | 收集器列表（默认：`["cpumem_collector", "io_collector", "net_collector"]`） |
+| `sub_attr` | object | 否 | 子属性：`condor` 类型需 `cluster_id`/`proc_id`，`slurm` 类型需 `job_id`/`step_id` |
 
 **示例请求：**
 ```json
@@ -111,7 +145,8 @@ Condor 作业专用操作，目前仅支持 `"add"`。
 | `opt` | string | **是** | 操作类型，仅支持 `"add"` |
 | `JobID` | int | 否 | 作业 ID |
 | `slot` | string | **是** | 槽位名称，必须以 `"slot"` 开头 |
-| `Lens` | array[string] | 否 | 收集器列表（默认：`[""]`） |
+| `Lens` | array[string] | 否 | 收集器列表（默认：`["proc_collector"]`） |
+| `sub_attr` | object | 否 | 子属性（如 `{"cluster_id": 123456, "proc_id": 0}`） |
 
 **示例请求：**
 ```json
@@ -147,7 +182,8 @@ Slurm 作业专用操作，目前仅支持 `"add"`。
 |---|---|---|---|
 | `opt` | string | **是** | 操作类型，仅支持 `"add"` |
 | `JobID` | int | **是** | Slurm 作业 ID |
-| `Lens` | array[string] | 否 | 收集器列表（默认：`[""]`） |
+| `Lens` | array[string] | 否 | 收集器列表（默认：`["proc_collector"]`） |
+| `sub_attr` | object | 否 | 子属性（如 `{"job_id": 12345, "step_id": 0}`） |
 
 **示例请求：**
 ```json
@@ -320,6 +356,22 @@ Slurm 作业专用操作，目前仅支持 `"add"`。
 
 **状态码：**
 - `200` - 成功
+
+### `POST /joblens/config/update`
+
+手动触发配置重新加载（调用配置管理器的回调）。
+
+**响应体（ConfigUpdateResponse）：**
+
+| 字段 | 类型 | 描述 |
+|---|---|---|
+| `status` | string | 操作状态（如 `"ok"`） |
+| `message` | string | 状态消息 |
+
+**状态码：**
+- `200` - 成功
+- `503` - ConfigManager 未初始化
+- `500` - 配置更新失败
 
 ---
 

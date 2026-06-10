@@ -11,7 +11,8 @@ git clone https://github.com/joblens-org/JobLens.git
 cd JobLens
 
 mkdir build && cd build
-cmake .. && make -j$(nproc)
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+ninja
 ```
 
 ## 使用方法
@@ -47,10 +48,9 @@ JobLens/
 ├── include/                    # 头文件（collector/writer/core/ebpf）
 ├── src/                        # 源码实现
 ├── scripts/                    # 脚本工具（安装/部署/CLI）
-├── test/                       # 测试文件
 ├── trigger/                    # 触发器服务（Flask）
 ├── doc/                        # 文档资源
-└── thirdparty/                 # 第三方依赖
+└── thirdparty/                 # 预留第三方源码目录（当前为空）
 ```
 
 ## 许可证
