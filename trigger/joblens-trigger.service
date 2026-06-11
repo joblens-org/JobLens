@@ -1,8 +1,7 @@
 [Unit]
 Description=JobLens Trigger Service
 Documentation=https://github.com/joblens-org/JobLens
-After=network.target joblens.service
-Wants=joblens.service
+After=network.target
 
 [Service]
 Type=simple
