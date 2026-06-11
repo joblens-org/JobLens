@@ -15,6 +15,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include "ebpf/job_fd_rw_stat.h" //一定要放在最后面
+
 // #include <bpf/bpf_core_read.h>
 // #include <linux/bpf.h>
 
@@ -30,9 +31,9 @@ bpf_probe_read_kernel(dst, sizeof(*dst), __p);}
 #define MAX_FD_PER_JOB 1024
 
 
-static __always_inline uint64_t div_uint64_t(uint64_t x, uint64_t d)
+static __always_inline u64 div_u64(u64 x, u64 d)
 {
-    uint64_t q, _d = d;
+    u64 q, _d = d;
     /* 让验证器看到 d>0 */
     if (_d == 0)
         return 0;          /* 走不到，但能让 verifier 闭嘴 */
@@ -41,7 +42,7 @@ static __always_inline uint64_t div_uint64_t(uint64_t x, uint64_t d)
     return q;
 }
 
-static __always_inline int8_t sign_and_abs_int64_t(int64_t* x)
+static __always_inline s8 sign_and_abs_s64(s64* x)
 {
     if (*x >= 0){
         return 1;
@@ -56,7 +57,7 @@ static __always_inline int8_t sign_and_abs_int64_t(int64_t* x)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, u32);
-    __type(value, uint64_t);
+    __type(value, u64);
     __uint(max_entries, MAX_ENTRIES);
 } pid2job SEC(".maps");
 
@@ -94,16 +95,16 @@ static __always_inline void account_rw(u32 pid, u32 fd, ssize_t ret, bool is_wri
         if (!stat) return;
     }
     
-    int64_t diff = ret;
-    int64_t diff2 = 0;
-    int8_t  sign_diff = 1;
+    s64 diff = ret;
+    s64 diff2 = 0;
+    s8  sign_diff = 1;
     if (is_write){
         __sync_fetch_and_add(&stat->write_bytes, ret);
         // 更新平均值
         __sync_fetch_and_add(&stat->write_count, 1);
         __sync_fetch_and_sub(&diff, stat->write_mean);
-        sign_diff = sign_and_abs_int64_t(&diff);
-        uint64_t r = div_uint64_t(diff, stat->write_count);
+        sign_diff = sign_and_abs_s64(&diff);
+        u64 r = div_u64(diff, stat->write_count);
         __sync_fetch_and_add(&stat->write_mean, sign_diff * r);
         // 更新方差
         __sync_fetch_and_sub(&diff2, stat->write_mean);
@@ -115,8 +116,8 @@ static __always_inline void account_rw(u32 pid, u32 fd, ssize_t ret, bool is_wri
         // 更新平均值
         __sync_fetch_and_add(&stat->read_count, 1);
         __sync_fetch_and_sub(&diff, stat->read_mean);
-        sign_diff = sign_and_abs_int64_t(&diff);
-        uint64_t r = div_uint64_t(diff, stat->read_count);
+        sign_diff = sign_and_abs_s64(&diff);
+        u64 r = div_u64(diff, stat->read_count);
         __sync_fetch_and_add(&stat->read_mean, sign_diff * r);
         // 更新方差
         __sync_fetch_and_sub(&diff2, stat->read_mean);
@@ -129,7 +130,7 @@ static __always_inline void account_rw(u32 pid, u32 fd, ssize_t ret, bool is_wri
     
 
     /* 采样通知 */
-    // uint64_t thresh = is_write ? stat->write_bytes : stat->read_bytes;
+    // u64 thresh = is_write ? stat->write_bytes : stat->read_bytes;
     // if ((thresh & SAMPLE_THRESH) == 0) {
     //     struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
     //     if (e) {
@@ -177,7 +178,7 @@ int trace_read_enter(struct trace_event_raw_sys_enter* ctx)
 SEC("tracepoint/syscalls/sys_exit_read")
 int trace_read_exit(struct trace_event_raw_sys_exit* ctx)
 {
-    uint64_t tid = bpf_get_current_pid_tgid();
+    u64 tid = bpf_get_current_pid_tgid();
     u32 pid = tid >> 32;
     u64 *job_id = bpf_map_lookup_elem(&pid2job, &pid);
     if (!job_id) return 0;
@@ -202,7 +203,7 @@ struct {
 SEC("tracepoint/syscalls/sys_enter_write")
 int trace_write_enter(struct trace_event_raw_sys_enter* ctx)
 {
-    uint64_t tid = bpf_get_current_pid_tgid();
+    u64 tid = bpf_get_current_pid_tgid();
     // bpf_trace_printk("test print",11);
     u64 fake = 1;
     u32 pid = tid >> 32;
@@ -223,7 +224,7 @@ int trace_write_enter(struct trace_event_raw_sys_enter* ctx)
 SEC("tracepoint/syscalls/sys_exit_write")
 int trace_write_exit(struct trace_event_raw_sys_exit* ctx)
 {
-    uint64_t tid = bpf_get_current_pid_tgid();
+    u64 tid = bpf_get_current_pid_tgid();
     u32 pid = tid >> 32;
     u64 *job_id = bpf_map_lookup_elem(&pid2job, &pid);
     if (!job_id) return 0;
@@ -251,7 +252,7 @@ struct {
 SEC("tracepoint/syscalls/sys_enter_pread64")
 int trace_pread64_enter(struct trace_event_raw_sys_enter* ctx)
 {
-    uint64_t tid = bpf_get_current_pid_tgid();
+    u64 tid = bpf_get_current_pid_tgid();
     u32 pid = tid >> 32;
     u64 *job_id = bpf_map_lookup_elem(&pid2job, &pid);
     if (!job_id) return 0;
@@ -267,7 +268,7 @@ int trace_pread64_enter(struct trace_event_raw_sys_enter* ctx)
 SEC("tracepoint/syscalls/sys_exit_pread64")
 int trace_pread64_exit(struct trace_event_raw_sys_exit* ctx)
 {
-    uint64_t tid = bpf_get_current_pid_tgid();
+    u64 tid = bpf_get_current_pid_tgid();
     u32 pid = tid >> 32;
     u64 *job_id = bpf_map_lookup_elem(&pid2job, &pid);
     if (!job_id) return 0;
@@ -294,7 +295,7 @@ struct {
 SEC("tracepoint/syscalls/sys_enter_pwrite64")
 int trace_pwrite64_enter(struct trace_event_raw_sys_enter* ctx)
 {
-    uint64_t tid = bpf_get_current_pid_tgid();
+    u64 tid = bpf_get_current_pid_tgid();
     u32 pid = tid >> 32;
     u64 *job_id = bpf_map_lookup_elem(&pid2job, &pid);
     if (!job_id) return 0;
@@ -308,7 +309,7 @@ int trace_pwrite64_enter(struct trace_event_raw_sys_enter* ctx)
 SEC("tracepoint/syscalls/sys_exit_pwrite64")
 int trace_pwrite64_exit(struct trace_event_raw_sys_exit* ctx)
 {
-    uint64_t tid = bpf_get_current_pid_tgid();
+    u64 tid = bpf_get_current_pid_tgid();
     u32 pid = tid >> 32;
     u64 *job_id = bpf_map_lookup_elem(&pid2job, &pid);
     if (!job_id) return 0;
@@ -340,7 +341,7 @@ int trace_pwrite64_exit(struct trace_event_raw_sys_exit* ctx)
 //     int prot = BPF_CORE_READ(args, prot);
 //     if (!(prot & PROT_WRITE)) return 0;
 
-//     uint64_t len = BPF_CORE_READ(args, len);
+//     u64 len = BPF_CORE_READ(args, len);
 //     u32 fd  = (u32)BPF_CORE_READ(args, fd);
 //     struct pid_fd_key key = {.job_id = *job_id, .fd = fd};
 //     struct rw_stat *stat = bpf_map_lookup_elem(&job_fd_stat, &key);
