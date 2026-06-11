@@ -98,8 +98,13 @@ install_deb() {
         libzstd-dev \
         liblz4-dev \
         nlohmann-json3-dev \
-        linux-tools-common \
-        linux-tools-generic
+        linux-tools-common
+    # bpftool 需要与运行内核匹配的 linux-tools 包
+    # 先尝试精确版本匹配，失败则尝试 generic 元包，都失败则跳过（CMake 会给出明确错误）
+    sudo apt-get install -y --no-install-recommends bpftool 2>/dev/null || \
+        sudo apt-get install -y --no-install-recommends linux-tools-$(uname -r) 2>/dev/null || \
+        sudo apt-get install -y --no-install-recommends linux-tools-generic 2>/dev/null || \
+        echo "⚠ bpftool 未通过 apt 安装，请手动安装 bpftool"
     install_sol2
     echo "Done."
 }
