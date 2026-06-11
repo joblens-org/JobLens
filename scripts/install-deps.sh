@@ -99,11 +99,13 @@ install_deb() {
         liblz4-dev \
         nlohmann-json3-dev \
         linux-tools-common
-    # bpftool 需要与运行内核匹配的 linux-tools 包
-    # 先尝试精确版本匹配，失败则尝试 generic 元包，都失败则跳过（CMake 会给出明确错误）
-    sudo apt-get install -y --no-install-recommends bpftool 2>/dev/null || \
-        sudo apt-get install -y --no-install-recommends linux-tools-$(uname -r) 2>/dev/null || \
-        sudo apt-get install -y --no-install-recommends linux-tools-generic 2>/dev/null || \
+    # bpftool 需要与运行内核匹配的 linux-tools 包来提供 BTF 支持
+    # 优先安装内核版本精确匹配的包（包含 bpftool + BTF），
+    # 其次尝试 Azure 内核元包（GitHub Actions runner 通常是 Azure 内核），
+    # 最后回退到 generic 元包 + bpftool，都失败则跳过（CMake 会给出明确错误）
+    sudo apt-get install -y --no-install-recommends linux-tools-$(uname -r) 2>/dev/null || \
+        sudo apt-get install -y --no-install-recommends linux-tools-azure linux-cloud-tools-azure 2>/dev/null || \
+        sudo apt-get install -y --no-install-recommends linux-tools-generic bpftool 2>/dev/null || \
         echo "⚠ bpftool 未通过 apt 安装，请手动安装 bpftool"
     install_sol2
     echo "Done."
