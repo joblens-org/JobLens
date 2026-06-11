@@ -97,7 +97,9 @@ install_deb() {
         libsasl2-dev \
         libzstd-dev \
         liblz4-dev \
-        nlohmann-json3-dev
+        nlohmann-json3-dev \
+        linux-tools-common \
+        linux-tools-generic
     install_sol2
     echo "Done."
 }
@@ -127,7 +129,8 @@ install_rpm() {
         yaml-cpp-devel \
         fmt-devel \
         date-devel \
-        nlohmann-json-devel
+        nlohmann-json-devel \
+        bpftool
     install_sol2
     echo "Done."
 }
@@ -157,7 +160,8 @@ install_arch() {
         yaml-cpp \
         fmt \
         chrono-date \
-        nlohmann-json
+        nlohmann-json \
+        bpftool
     install_sol2
     echo "Done."
 }

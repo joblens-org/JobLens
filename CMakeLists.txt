@@ -56,6 +56,10 @@ find_package(PkgConfig REQUIRED)
 
 # ---- System Libraries ----
 pkg_check_modules(LIBBPF REQUIRED libbpf)
+find_program(BPFTOOL bpftool REQUIRED)
+if(NOT BPFTOOL)
+    message(FATAL_ERROR "bpftool not found. Install it via: bash scripts/install-deps.sh")
+endif()
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(Threads REQUIRED)
@@ -153,14 +157,23 @@ file(GLOB BPF_C_LIST CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/ebpf/*.bpf.c")
 set(BPF_OBJECT_DIR "${CMAKE_BINARY_DIR}/bpf_obj")
 file(MAKE_DIRECTORY ${BPF_OBJECT_DIR})
 
+# 构建时自动生成 vmlinux.h (CO-RE header)
+set(VMLINUX_H_OUT "${CMAKE_BINARY_DIR}/include/ebpf/vmlinux.h")
+add_custom_command(OUTPUT ${VMLINUX_H_OUT}
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/include/ebpf"
+    COMMAND ${BPFTOOL} btf dump file /sys/kernel/btf/vmlinux format c > ${VMLINUX_H_OUT}
+    COMMENT "[eBPF] Generating vmlinux.h via bpftool"
+    VERBATIM)
+
 foreach(bpf_c ${BPF_C_LIST})
     get_filename_component(name ${bpf_c} NAME_WE)
     set(bpf_o "${BPF_OBJECT_DIR}/${name}.bpf.o")
     add_custom_command(OUTPUT ${bpf_o}
         COMMAND ${CLANG} -g -O2 -target bpf
+                -I${CMAKE_BINARY_DIR}/include
                 -I${CMAKE_SOURCE_DIR}/include
                 -c ${bpf_c} -o ${bpf_o}
-        DEPENDS ${bpf_c}
+        DEPENDS ${bpf_c} ${VMLINUX_H_OUT}
         COMMENT "[eBPF] Building ${bpf_o}")
     list(APPEND BPF_O_LIST ${bpf_o})
 endforeach()

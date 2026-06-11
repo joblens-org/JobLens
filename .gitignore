@@ -137,6 +137,7 @@ trigger/joblens_trigger.egg-info/
 trigger/joblens-trigger-py3.pyz
 trigger/config.yaml
 config/config.yaml
+include/ebpf/vmlinux.h
 
 # 备份文件
 *~
