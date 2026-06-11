@@ -70,6 +70,54 @@ install_sol2() {
     fi
 }
 
+install_bpftool_deb() {
+    local BPFTOOL_VERSION="${BPFTOOL_VERSION:-v7.7.0}"
+    local BPFTOOL_ARCH
+    case "$(uname -m)" in
+        x86_64|amd64)
+            BPFTOOL_ARCH="amd64"
+            ;;
+        aarch64|arm64)
+            BPFTOOL_ARCH="arm64"
+            ;;
+        *)
+            echo "Unsupported bpftool binary architecture: $(uname -m)"
+            return 1
+            ;;
+    esac
+
+    sudo apt-get install -y --no-install-recommends bpftool 2>/dev/null || \
+        sudo apt-get install -y --no-install-recommends linux-tools-$(uname -r) 2>/dev/null || \
+        sudo apt-get install -y --no-install-recommends linux-tools-azure linux-cloud-tools-azure 2>/dev/null || \
+        sudo apt-get install -y --no-install-recommends linux-tools-generic 2>/dev/null || \
+        echo "⚠ bpftool 未通过 apt 安装，尝试下载预编译 bpftool"
+
+    if command -v bpftool >/dev/null 2>&1 && bpftool version >/dev/null 2>&1; then
+        echo "✅ bpftool available: $(command -v bpftool)"
+        return 0
+    fi
+
+    local BPFTOOL_TMP_DIR
+    local BPFTOOL_URL="https://github.com/libbpf/bpftool/releases/download/${BPFTOOL_VERSION}/bpftool-${BPFTOOL_VERSION}-${BPFTOOL_ARCH}.tar.gz"
+    BPFTOOL_TMP_DIR=$(mktemp -d)
+    if ! curl -fsSL --retry 3 --retry-delay 5 --retry-max-time 60 \
+        "${BPFTOOL_URL}" -o "${BPFTOOL_TMP_DIR}/bpftool.tar.gz"; then
+        rm -rf "${BPFTOOL_TMP_DIR}"
+        return 1
+    fi
+    if ! tar -xzf "${BPFTOOL_TMP_DIR}/bpftool.tar.gz" -C "${BPFTOOL_TMP_DIR}"; then
+        rm -rf "${BPFTOOL_TMP_DIR}"
+        return 1
+    fi
+    if ! sudo install -m 0755 "${BPFTOOL_TMP_DIR}/bpftool" /usr/local/bin/bpftool; then
+        rm -rf "${BPFTOOL_TMP_DIR}"
+        return 1
+    fi
+    rm -rf "${BPFTOOL_TMP_DIR}"
+    /usr/local/bin/bpftool version >/dev/null
+    echo "✅ bpftool installed: /usr/local/bin/bpftool"
+}
+
 install_deb() {
     echo "Detected Debian/Ubuntu. Installing dependencies..."
     sudo apt-get update
@@ -99,14 +147,7 @@ install_deb() {
         liblz4-dev \
         nlohmann-json3-dev \
         linux-tools-common
-    # bpftool 需要与运行内核匹配的 linux-tools 包来提供 BTF 支持
-    # 优先安装内核版本精确匹配的包（包含 bpftool + BTF），
-    # 其次尝试 Azure 内核元包（GitHub Actions runner 通常是 Azure 内核），
-    # 最后回退到 generic 元包 + bpftool，都失败则跳过（CMake 会给出明确错误）
-    sudo apt-get install -y --no-install-recommends linux-tools-$(uname -r) 2>/dev/null || \
-        sudo apt-get install -y --no-install-recommends linux-tools-azure linux-cloud-tools-azure 2>/dev/null || \
-        sudo apt-get install -y --no-install-recommends linux-tools-generic bpftool 2>/dev/null || \
-        echo "⚠ bpftool 未通过 apt 安装，请手动安装 bpftool"
+    install_bpftool_deb
     install_sol2
     echo "Done."
 }
