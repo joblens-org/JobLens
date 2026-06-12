@@ -16,4 +16,4 @@ Version information for JobLens Trigger service.
 This is the single source of truth for the trigger version.
 """
 
-__version__ = "0.0.13"
+__version__ = "0.1.0"
