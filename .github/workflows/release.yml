@@ -1,23 +1,5 @@
 name: Release
 
-# ============================================================
-# JobLens 自动发布工作流
-# ============================================================
-# 触发条件:
-#   推送 ver-X.Y.Z 格式的 tag → 自动构建并发布 GitHub Release
-#
-# 版本体系（两套独立版本号）:
-#   - JobLens 核心版本: CMakeLists.txt 中的 project(VERSION X.Y.Z)
-#   - Trigger 版本:     trigger/version.py 中的 __version__
-#   - Tag 版本:         仅作发布触发器，必须与 CMakeLists.txt 一致
-#
-# 发布产物:
-#   - JobLens-X.Y.Z-Linux.tar.gz   (C++ 核心通用包)
-#   - joblens-X.Y.Z-*.rpm          (C++ 核心 RPM)
-#   - joblens-trigger-A.B.C-*.rpm  (Trigger 服务 RPM，版本独立)
-#   - SHA256SUMS.txt               (完整性校验)
-# ============================================================
-
 on:
   push:
     tags:
@@ -25,115 +7,104 @@ on:
   workflow_dispatch:
     inputs:
       draft:
-        description: '创建为 Draft Release（发布前需人工审核）'
+        description: 'Create as draft release (review before publishing)'
         type: boolean
         default: false
 
 permissions:
-  contents: write  # 创建 GitHub Release 所需权限
+  contents: write
 
 env:
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 200M
 
 jobs:
-  # ════════════════════════════════════════════════════════════
-  # Job 1: 版本准备与校验
-  #   从 git tag 提取版本号，校验与 CMakeLists.txt 一致
-  # ════════════════════════════════════════════════════════════
   prepare:
-    name: 版本校验
+    name: Version check
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: 提取并校验版本号
+      - name: Extract and validate version
         id: version
         run: |
-          # 从 CMakeLists.txt 提取 JobLens 核心版本号
-          # CMakeLists.txt 中 project() 和 VERSION 在不同行，需先合并行再匹配
+          # project() spans two lines in CMakeLists.txt, join them first
           CMAKE_VERSION=$(tr '\n' ' ' < CMakeLists.txt | grep -oP 'project\(JobLens\s+VERSION\s+\K[\d.]+')
-          echo "CMakeLists.txt 版本: ${CMAKE_VERSION}"
+          echo "CMake version: ${CMAKE_VERSION}"
 
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            # Tag 触发：从 tag 提取版本号并校验与 CMakeLists.txt 一致
             TAG_VERSION="${GITHUB_REF_NAME#ver-}"
-            echo "Tag 版本: ${TAG_VERSION}"
+            echo "Tag version: ${TAG_VERSION}"
             echo "version=${TAG_VERSION}" >> "${GITHUB_OUTPUT}"
 
             if [ "${TAG_VERSION}" != "${CMAKE_VERSION}" ]; then
-              echo "::error::Tag 版本 (${TAG_VERSION}) 与 CMakeLists.txt (${CMAKE_VERSION}) 不匹配！"
-              echo "::error::发布前请确保 CMakeLists.txt 中的 VERSION 与 Tag 一致"
+              echo "::error::Tag version (${TAG_VERSION}) != CMakeLists.txt (${CMAKE_VERSION})"
+              echo "::error::Update CMakeLists.txt VERSION to match the tag before releasing"
               exit 1
             fi
-            echo "✅ Tag 版本校验通过"
+            echo "Version check passed (tag)"
           else
-            # 手动触发 (workflow_dispatch)：版本号直接取自 CMakeLists.txt
             echo "version=${CMAKE_VERSION}" >> "${GITHUB_OUTPUT}"
-            echo "⚠️ 手动触发模式，版本号取自 CMakeLists.txt: ${CMAKE_VERSION}"
+            echo "Manual trigger mode, version from CMakeLists.txt: ${CMAKE_VERSION}"
           fi
 
-  # ════════════════════════════════════════════════════════════
-  # Job 2: 构建 C++ 核心 RPM + TGZ
-  #   复用 CI 预设 rpm-system-deps
-  # ════════════════════════════════════════════════════════════
   build-core:
-    name: 构建 C++ 核心 (RPM + TGZ)
+    name: Build Core (RPM + TGZ)
     needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0  # CMake 用 git describe 生成 BUILD_ID
+          fetch-depth: 0
 
-      - name: 恢复 ccache 缓存
+      - name: Restore ccache
         uses: actions/cache@v4
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'scripts/cmake/Packaging.cmake') }}
           restore-keys: ccache-${{ runner.os }}-
 
-      - name: 安装系统依赖
+      - name: Install system dependencies
         run: |
           sudo bash scripts/install-deps.sh
           sudo apt-get install -y --no-install-recommends rpm
 
-      - name: 获取 CMake & Ninja
+      - name: Setup CMake & Ninja
         uses: lukka/get-cmake@latest
 
-      - name: 配置 & 构建 (CMakePresets)
+      - name: Configure & Build
         uses: lukka/run-cmake@v10
         with:
           configurePreset: 'rpm-system-deps'
           buildPreset: 'rpm-system-deps'
 
-      - name: CPack 打包 (TGZ + RPM)
+      - name: Package (CPack TGZ + RPM)
         uses: lukka/run-cmake@v10
         with:
           packagePreset: 'rpm-system-deps'
 
-      - name: 验证核心产物
+      - name: Verify core artifacts
         run: |
           set -e
-          echo "=== TGZ 包 ==="
+          echo "=== TGZ ==="
           ls -lh build/JobLens-*-Linux.tar.gz
-          echo "=== RPM 包 ==="
+          echo "=== RPM ==="
           ls -lh build/JobLens-*.rpm
 
           tar -tzf build/JobLens-*-Linux.tar.gz | grep -q 'bin/JobLens$' \
-            && echo "✅ TGZ 包含 JobLens 二进制" \
-            || { echo "❌ TGZ 缺少 JobLens"; exit 1; }
+            && echo "OK: JobLens binary" \
+            || { echo "FAIL: missing JobLens binary"; exit 1; }
 
           tar -tzf build/JobLens-*-Linux.tar.gz | grep -q 'etc/JobLens/config.yaml$' \
-            && echo "✅ TGZ 包含默认配置文件" \
-            || { echo "❌ TGZ 缺少 config.yaml"; exit 1; }
+            && echo "OK: default config" \
+            || { echo "FAIL: missing config.yaml"; exit 1; }
 
-          echo "✅ C++ 核心构建完成"
+          echo "Core build completed"
 
-      - name: 上传 C++ 核心制品
+      - name: Upload core artifacts
         uses: actions/upload-artifact@v4
         with:
           name: core-packages
@@ -143,52 +114,47 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # ════════════════════════════════════════════════════════════
-  # Job 3: 构建 Python Trigger RPM
-  #   在 fedora 容器中原生构建，版本号来自 trigger/version.py
-  #   Trigger 拥有独立的版本号，不与 JobLens 核心同步
-  # ════════════════════════════════════════════════════════════
   build-trigger:
-    name: 构建 Trigger RPM
+    name: Build Trigger RPM
     needs: prepare
     runs-on: ubuntu-latest
     container: fedora:latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 RPM 构建工具
+      - name: Install RPM build tools
         run: |
           dnf install -y --setopt=tsflags=nodocs \
             rpm-build rpmdevtools python3 python3-devel \
             python3-setuptools python3-wheel python3-pip \
             pyproject-rpm-macros systemd-rpm-macros
 
-      - name: 确认 Trigger 版本号
+      - name: Show trigger version
         run: |
-          echo "Trigger 版本 (来自 trigger/version.py):"
+          echo "Trigger version (from trigger/version.py):"
           python3 -c "import runpy; ns=runpy.run_path('trigger/version.py'); print(ns['__version__'])"
 
-      - name: 构建 Trigger RPM
+      - name: Build Trigger RPM
         run: bash scripts/build-trigger-rpm.sh --install-deps
 
-      - name: 验证 Trigger 产物
+      - name: Verify trigger artifacts
         run: |
           RPM_FILE=$(ls ~/rpmbuild/RPMS/x86_64/joblens-trigger-*.rpm 2>/dev/null | head -1)
           if [ -z "$RPM_FILE" ]; then
-            echo "❌ 未找到 Trigger RPM 产物"
+            echo "FAIL: trigger RPM not found"
             exit 1
           fi
           echo "=== Trigger RPM ==="
           ls -lh "$RPM_FILE"
           rpm -qpl "$RPM_FILE" | grep -q 'joblens-trigger.service' \
-            && echo "✅ 包含 systemd unit" \
-            || { echo "❌ 缺少 systemd unit"; exit 1; }
+            && echo "OK: systemd unit" \
+            || { echo "FAIL: missing systemd unit"; exit 1; }
           rpm -qpl "$RPM_FILE" | grep -q '/venv/bin/gunicorn' \
-            && echo "✅ 包含 venv gunicorn" \
-            || { echo "❌ 缺少 gunicorn"; exit 1; }
-          echo "✅ Trigger 构建完成"
+            && echo "OK: venv gunicorn" \
+            || { echo "FAIL: missing gunicorn"; exit 1; }
+          echo "Trigger build completed"
 
-      - name: 上传 Trigger RPM
+      - name: Upload trigger RPM
         uses: actions/upload-artifact@v4
         with:
           name: trigger-rpm
@@ -196,111 +162,58 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # ════════════════════════════════════════════════════════════
-  # Job 4: 创建 GitHub Release
-  #   汇总所有构建产物，生成 SHA256 校验和，发布 Release
-  #   Release Notes 中同时展示 JobLens 核心和 Trigger 的版本
-  # ════════════════════════════════════════════════════════════
   release:
-    name: 创建 GitHub Release
+    name: Create GitHub Release
     needs: [prepare, build-core, build-trigger]
     runs-on: ubuntu-latest
     if: success()
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # 完整 git 历史（用于 Release Notes）
 
-      - name: 下载 C++ 核心包
+      - name: Download core packages
         uses: actions/download-artifact@v4
         with:
           name: core-packages
           path: release-assets
 
-      - name: 下载 Trigger RPM
+      - name: Download trigger RPM
         uses: actions/download-artifact@v4
         with:
           name: trigger-rpm
           path: release-assets
 
-      - name: 列出发布产物
+      - name: List assets
         working-directory: release-assets
-        run: |
-          echo "=== 发布产物列表 ==="
-          ls -lh
+        run: ls -lh
 
-      - name: 生成 SHA256 校验和
+      - name: Generate SHA256 checksums
         working-directory: release-assets
         run: |
           sha256sum *.{rpm,tar.gz} 2>/dev/null > SHA256SUMS.txt
-          echo "=== SHA256 校验和 ==="
           cat SHA256SUMS.txt
 
-      - name: 生成 Release Notes
+      - name: Generate release notes
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
-          CURRENT_TAG="ver-${VERSION}"
-
-          # 读取 Trigger 独立版本号
           TRIGGER_VERSION=$(python3 -c "import runpy; ns=runpy.run_path('trigger/version.py'); print(ns['__version__'])")
 
           {
-            echo "# JobLens ${VERSION}"
+            echo "## Packages"
             echo ""
-            echo "| 组件 | 版本 | 说明 |"
-            echo "|------|------|------|"
-            echo "| JobLens 核心 | ${VERSION} | C++ 高性能作业监控 Agent |"
-            echo "| Trigger 服务 | ${TRIGGER_VERSION} |  API 网关 |"
+            echo "| Package | Description |"
+            echo "|---------|-------------|"
+            echo "| JobLens-${VERSION}-Linux.tar.gz | Core binary + config + systemd unit (portable TGZ) |"
+            echo "| JobLens-${VERSION}-Linux.rpm | Core RPM for RHEL/Fedora (systemd-managed service) |"
+            echo "| joblens-trigger-${TRIGGER_VERSION}-*.rpm | Trigger REST API service RPM (Flask + Gunicorn) |"
+            echo "| SHA256SUMS.txt | Checksums for integrity verification |"
             echo ""
-
-            # 尝试从 CHANGELOG.md 提取当前版本变更摘要
-            if [ -f CHANGELOG.md ]; then
-              echo "## 变更摘要"
-              echo ""
-              awk "/^## v${VERSION}/{found=1; next} /^## v/{if(found) exit} found" CHANGELOG.md | head -60
-              echo ""
-            fi
-
-            # 查找上一个 tag，生成 commit 列表
-            PREV_TAG=$(git tag --sort=-v:refname | grep '^ver-' | grep -B1 "^${CURRENT_TAG}$" | head -1 | grep -v "^${CURRENT_TAG}$" || true)
-            if [ -n "${PREV_TAG}" ]; then
-              echo "## 提交记录 (${PREV_TAG} → ${CURRENT_TAG})"
-              echo ""
-              git log --pretty=format:"- %s (%h)" --no-merges "${PREV_TAG}..HEAD" | head -50
-              echo ""
-            fi
-
-            echo ""
-            echo "## 安装"
-            echo ""
-            echo '### C++ 核心 (RHEL/Fedora)'
-            echo '```bash'
-            echo "sudo rpm -ivh joblens-${VERSION}-*.rpm"
-            echo "sudo systemctl status joblens"
-            echo '```'
-            echo ""
-            echo '### C++ 核心 (通用 TGZ)'
-            echo '```bash'
-            echo "tar -xzf JobLens-${VERSION}-Linux.tar.gz"
-            echo "cd usr && sudo cp -r . /"
-            echo '```'
-            echo ""
-            echo '### Trigger 服务'
-            echo '```bash'
-            echo "sudo rpm -ivh joblens-trigger-${TRIGGER_VERSION}-*.rpm"
-            echo "sudo systemctl status joblens-trigger"
-            echo '```'
-            echo ""
-            echo '### 校验完整性'
+            echo "## Verify"
             echo '```bash'
             echo "sha256sum -c SHA256SUMS.txt"
             echo '```'
           } > RELEASE_NOTES.md
 
-          echo "=== Release Notes 预览 ==="
-          cat RELEASE_NOTES.md
-
-      - name: 创建 GitHub Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ format('ver-{0}', needs.prepare.outputs.version) }}
