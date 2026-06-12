@@ -21,7 +21,7 @@ name: Release
 on:
   push:
     tags:
-      - 'ver-[0-9]+.[0-9]+.[0-9]+'
+      - 'ver-[0-9]*.[0-9]*.[0-9]*'
   workflow_dispatch:
     inputs:
       draft:
