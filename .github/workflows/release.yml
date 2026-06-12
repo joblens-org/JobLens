@@ -53,7 +53,8 @@ jobs:
         id: version
         run: |
           # 从 CMakeLists.txt 提取 JobLens 核心版本号
-          CMAKE_VERSION=$(grep -oP 'project\(JobLens\s+VERSION\s+\K[\d.]+' CMakeLists.txt)
+          # CMakeLists.txt 中 project() 和 VERSION 在不同行，需先合并行再匹配
+          CMAKE_VERSION=$(tr '\n' ' ' < CMakeLists.txt | grep -oP 'project\(JobLens\s+VERSION\s+\K[\d.]+')
           echo "CMakeLists.txt 版本: ${CMAKE_VERSION}"
 
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
