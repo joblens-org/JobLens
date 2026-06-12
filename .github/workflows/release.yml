@@ -21,7 +21,7 @@ name: Release
 on:
   push:
     tags:
-      - 'ver-[0-9]*.[0-9]*.[0-9]*'
+      - 'ver-[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
     inputs:
       draft:
@@ -52,24 +52,27 @@ jobs:
       - name: 提取并校验版本号
         id: version
         run: |
-          # 从 tag 提取版本号（去掉 ver- 前缀）
-          # ver-0.1.0 → 0.1.0
-          TAG_VERSION="${GITHUB_REF_NAME#ver-}"
-          echo "version=${TAG_VERSION}" >> "${GITHUB_OUTPUT}"
-
           # 从 CMakeLists.txt 提取 JobLens 核心版本号
           CMAKE_VERSION=$(grep -oP 'project\(JobLens\s+VERSION\s+\K[\d.]+' CMakeLists.txt)
+          echo "CMakeLists.txt 版本: ${CMAKE_VERSION}"
 
-          echo "Tag 版本 (JobLens 核心): ${TAG_VERSION}"
-          echo "CMakeLists.txt 版本:       ${CMAKE_VERSION}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # Tag 触发：从 tag 提取版本号并校验与 CMakeLists.txt 一致
+            TAG_VERSION="${GITHUB_REF_NAME#ver-}"
+            echo "Tag 版本: ${TAG_VERSION}"
+            echo "version=${TAG_VERSION}" >> "${GITHUB_OUTPUT}"
 
-          # 校验：tag 版本必须与 CMakeLists.txt 一致
-          if [ "${TAG_VERSION}" != "${CMAKE_VERSION}" ]; then
-            echo "::error::Tag 版本 (${TAG_VERSION}) 与 CMakeLists.txt (${CMAKE_VERSION}) 不匹配！"
-            echo "::error::发布前请确保 CMakeLists.txt 中的 VERSION 与 Tag 一致"
-            exit 1
+            if [ "${TAG_VERSION}" != "${CMAKE_VERSION}" ]; then
+              echo "::error::Tag 版本 (${TAG_VERSION}) 与 CMakeLists.txt (${CMAKE_VERSION}) 不匹配！"
+              echo "::error::发布前请确保 CMakeLists.txt 中的 VERSION 与 Tag 一致"
+              exit 1
+            fi
+            echo "✅ Tag 版本校验通过"
+          else
+            # 手动触发 (workflow_dispatch)：版本号直接取自 CMakeLists.txt
+            echo "version=${CMAKE_VERSION}" >> "${GITHUB_OUTPUT}"
+            echo "⚠️ 手动触发模式，版本号取自 CMakeLists.txt: ${CMAKE_VERSION}"
           fi
-          echo "✅ 版本校验通过"
 
   # ════════════════════════════════════════════════════════════
   # Job 2: 构建 C++ 核心 RPM + TGZ
@@ -235,7 +238,7 @@ jobs:
       - name: 生成 Release Notes
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
-          CURRENT_TAG="${GITHUB_REF_NAME}"
+          CURRENT_TAG="ver-${VERSION}"
 
           # 读取 Trigger 独立版本号
           TRIGGER_VERSION=$(python3 -c "import runpy; ns=runpy.run_path('trigger/version.py'); print(ns['__version__'])")
@@ -299,7 +302,7 @@ jobs:
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ format('ver-{0}', needs.prepare.outputs.version) }}
           name: "JobLens ${{ needs.prepare.outputs.version }}"
           body_path: RELEASE_NOTES.md
           generate_release_notes: true
