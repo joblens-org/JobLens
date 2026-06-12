@@ -121,7 +121,7 @@ jobs:
           echo "=== TGZ 包 ==="
           ls -lh build/JobLens-*-Linux.tar.gz
           echo "=== RPM 包 ==="
-          ls -lh build/joblens-*.rpm
+          ls -lh build/JobLens-*.rpm
 
           tar -tzf build/JobLens-*-Linux.tar.gz | grep -q 'bin/JobLens$' \
             && echo "✅ TGZ 包含 JobLens 二进制" \
@@ -139,7 +139,7 @@ jobs:
           name: core-packages
           path: |
             build/JobLens-*-Linux.tar.gz
-            build/joblens-*.rpm
+            build/JobLens-*.rpm
           if-no-files-found: error
           retention-days: 7
 
