@@ -88,6 +88,9 @@ jobs:
     container:
       image: ${{ matrix.target.image }}
     steps:
+      - name: Install git
+        run: dnf install -y git
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
