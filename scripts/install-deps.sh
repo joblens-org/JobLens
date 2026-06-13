@@ -12,6 +12,48 @@ fi
 
 source /etc/os-release
 
+install_date() {
+    local DATE_VERSION="${DATE_VERSION:-v3.0.1}"
+    local INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
+
+    # Check if already installed
+    if [ -f "${INSTALL_PREFIX}/include/date/date.h" ]; then
+        echo "    date already installed at ${INSTALL_PREFIX}/include/date/"
+        return 0
+    fi
+
+    echo "==> Installing Howard Hinnant date (${DATE_VERSION}) from source..."
+    local DATE_TMP_DIR
+    DATE_TMP_DIR=$(mktemp -d)
+    trap "rm -rf ${DATE_TMP_DIR}" RETURN
+
+    curl -fsSL --retry 3 --retry-delay 5 --retry-max-time 60 \
+        "https://github.com/HowardHinnant/date/archive/refs/tags/${DATE_VERSION}.tar.gz" \
+        -o "${DATE_TMP_DIR}/date.tar.gz" || {
+        echo "ERROR: Failed to download date"
+        return 1
+    }
+
+    tar -xzf "${DATE_TMP_DIR}/date.tar.gz" -C "${DATE_TMP_DIR}"
+    cd "${DATE_TMP_DIR}/date-${DATE_VERSION#v}"
+
+    # Build and install (provides date::date CMake target + tz library)
+    cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
+        -DBUILD_TZ_LIB=ON \
+        -DUSE_SYSTEM_TZ_DB=ON
+    cmake --build build
+    sudo cmake --install build
+
+    if [ -f "${INSTALL_PREFIX}/include/date/date.h" ]; then
+        echo "✅ date installed successfully"
+    else
+        echo "❌ date installation failed"
+        return 1
+    fi
+}
+
 install_sol2() {
     local SOL2_VERSION="${SOL2_VERSION:-v3.5.0}"
     local INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
@@ -154,11 +196,21 @@ install_deb() {
 
 install_rpm() {
     echo "Detected RHEL/Fedora/AlmaLinux. Installing dependencies..."
+
+    # RHEL-based distros (AlmaLinux, Rocky, CentOS, RHEL) need EPEL + CRB
+    # Fedora already has these packages in its main repositories
+    if [ "$ID" != "fedora" ]; then
+        dnf install -y dnf-plugins-core epel-release
+        dnf config-manager --set-enabled crb 2>/dev/null || \
+        dnf config-manager --set-enabled powertools 2>/dev/null || true
+    fi
+
     sudo dnf install -y \
         clang \
         cmake \
         ninja-build \
         pkgconfig \
+        curl \
         libbpf-devel \
         elfutils-libelf-devel \
         leveldb-devel \
@@ -176,9 +228,14 @@ install_rpm() {
         spdlog-devel \
         yaml-cpp-devel \
         fmt-devel \
-        date-devel \
         nlohmann-json-devel \
         bpftool
+
+    # date-devel (Howard Hinnant) is in Fedora repos but NOT in EPEL 9
+    if ! sudo dnf install -y date-devel 2>/dev/null; then
+        echo "==> date-devel not in repos, installing from source..."
+        install_date
+    fi
     install_sol2
     echo "Done."
 }
