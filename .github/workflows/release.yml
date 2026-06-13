@@ -51,12 +51,19 @@ jobs:
           fi
 
   build-core:
-    name: Build Core (RPM + TGZ)
+    name: Build Core (${{ matrix.target.name }})
     needs: prepare
     runs-on: ubuntu-latest
-    container: fedora:latest
+    strategy:
+      matrix:
+        target:
+          - { name: fedora, image: fedora:latest }
+          - { name: el9,   image: almalinux:9 }
+      fail-fast: false
+    container:
+      image: ${{ matrix.target.image }}
     steps:
-      - name: Install git (container minimal image)
+      - name: Install git
         run: dnf install -y git
 
       - uses: actions/checkout@v4
@@ -70,14 +77,17 @@ jobs:
           bash scripts/install-deps.sh
           dnf install -y rpm-build
 
-      - name: Configure & Build
+      - name: Configure
         run: |
-          cmake --preset rpm-system-deps
-          cmake --build --preset rpm-system-deps
+          DIST_TAG=$(rpm -E '%{?dist}' 2>/dev/null || echo '')
+          echo "Dist tag: ${DIST_TAG}"
+          cmake --preset rpm-system-deps -DCPACK_RPM_PACKAGE_RELEASE="1${DIST_TAG}"
+
+      - name: Build
+        run: cmake --build --preset rpm-system-deps
 
       - name: Package (CPack TGZ + RPM)
-        run: |
-          cpack --preset rpm-system-deps
+        run: cpack --preset rpm-system-deps
 
       - name: Verify core artifacts
         run: |
@@ -100,7 +110,7 @@ jobs:
       - name: Upload core artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: core-packages
+          name: core-packages-${{ matrix.target.name }}
           path: |
             build/joblens-*-Linux-x86_64.tar.gz
             build/joblens-*.rpm
@@ -163,11 +173,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download core packages
+      - name: Download core packages (all distros)
         uses: actions/download-artifact@v4
         with:
-          name: core-packages
+          pattern: core-packages-*
           path: release-assets
+          merge-multiple: true
 
       - name: Download trigger RPM
         uses: actions/download-artifact@v4
@@ -196,7 +207,7 @@ jobs:
             echo "| Package | Description |"
             echo "|---------|-------------|"
             echo "| jobLens-${VERSION}-Linux.tar.gz | Core binary + config + systemd unit (portable TGZ) |"
-            echo "| jobLens-${VERSION}-x86_64.rpm | Core RPM (systemd-managed service) |"
+            echo "| joblens-${VERSION}-1.*.x86_64.rpm (x2) | Core RPM for RHEL 9 / Fedora (systemd-managed) |"
             echo "| joblens-trigger-${TRIGGER_VERSION}-*.rpm | Trigger REST API service RPM (Flask + Gunicorn) |"
             echo "| SHA256SUMS.txt | Checksums for integrity verification |"
             echo ""
