@@ -54,37 +54,27 @@ jobs:
     name: Build Core (RPM + TGZ)
     needs: prepare
     runs-on: ubuntu-latest
+    container: fedora:latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'scripts/cmake/Packaging.cmake') }}
-          restore-keys: ccache-${{ runner.os }}-
-
-      - name: Install system dependencies
+      - name: Install build dependencies
         run: |
-          sudo bash scripts/install-deps.sh
-          sudo apt-get install -y --no-install-recommends rpm
-
-      - name: Setup CMake & Ninja
-        uses: lukka/get-cmake@latest
+          dnf install -y sudo
+          bash scripts/install-deps.sh
+          dnf install -y rpm-build
 
       - name: Configure & Build
-        uses: lukka/run-cmake@v10
-        with:
-          configurePreset: 'rpm-system-deps'
-          buildPreset: 'rpm-system-deps'
+        run: |
+          cmake --preset rpm-system-deps
+          cmake --build --preset rpm-system-deps
 
       - name: Package (CPack TGZ + RPM)
-        uses: lukka/run-cmake@v10
-        with:
-          packagePreset: 'rpm-system-deps'
+        run: |
+          cpack --preset rpm-system-deps
 
       - name: Verify core artifacts
         run: |
