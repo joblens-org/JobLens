@@ -32,7 +32,7 @@
 
 Name:           joblens-trigger
 Version:        %{trigger_version}
-Release:        1%{?dist}
+Release:        1
 Summary:        JobLens Trigger Service - RESTful API gateway
 License:        MIT
 URL:            https://github.com/joblens-org/JobLens

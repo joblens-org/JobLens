@@ -92,11 +92,11 @@ install(CODE "
 ")
 
 # ---- CPack 通用配置 ----
-set(CPACK_PACKAGE_NAME ${PROJECT_NAME})
+set(CPACK_PACKAGE_NAME "joblens")
 set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "High-performance job monitor")
 set(CPACK_PACKAGE_VENDOR "nowzycc")
-set(CPACK_PACKAGE_CONTACT "joblens@example.com")
+set(CPACK_SYSTEM_NAME "${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_SET_DESTDIR ON)
 
 set(CPACK_GENERATOR "TGZ;DEB;RPM")
@@ -110,10 +110,11 @@ set(CPACK_RPM_PACKAGE_RELEASE "1")
 set(CPACK_RPM_PACKAGE_SUMMARY "High-performance job monitoring and profiling system")
 set(CPACK_RPM_PACKAGE_DESCRIPTION ${CPACK_PACKAGE_DESCRIPTION_SUMMARY})
 set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
-set(CPACK_RPM_PACKAGE_GROUP "System Environment/Daemons")
-set(CPACK_RPM_PACKAGE_URL "https://github.com/nowzycc/JobLens")
+set(CPACK_RPM_PACKAGE_URL "https://github.com/joblens-org/JobLens")
 set(CPACK_RPM_PACKAGE_VENDOR ${CPACK_PACKAGE_VENDOR})
-set(CPACK_RPM_PACKAGE_MAINTAINER ${CPACK_PACKAGE_CONTACT})
+
+# Use standard RPM naming: NAME-VERSION-RELEASE.ARCH.rpm
+set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
 
 # ---- RPM 运行时依赖 ----
 # 自包含模式 vs 系统依赖模式

@@ -90,15 +90,15 @@ jobs:
         run: |
           set -e
           echo "=== TGZ ==="
-          ls -lh build/JobLens-*-Linux.tar.gz
+          ls -lh build/joblens-*-Linux-x86_64.tar.gz
           echo "=== RPM ==="
-          ls -lh build/JobLens-*.rpm
+          ls -lh build/joblens-*.rpm
 
-          tar -tzf build/JobLens-*-Linux.tar.gz | grep -q 'bin/JobLens$' \
+          tar -tzf build/joblens-*-Linux-x86_64.tar.gz | grep -q 'bin/JobLens$' \
             && echo "OK: JobLens binary" \
             || { echo "FAIL: missing JobLens binary"; exit 1; }
 
-          tar -tzf build/JobLens-*-Linux.tar.gz | grep -q 'etc/JobLens/config.yaml$' \
+          tar -tzf build/joblens-*-Linux-x86_64.tar.gz | grep -q 'etc/JobLens/config.yaml$' \
             && echo "OK: default config" \
             || { echo "FAIL: missing config.yaml"; exit 1; }
 
@@ -109,8 +109,8 @@ jobs:
         with:
           name: core-packages
           path: |
-            build/JobLens-*-Linux.tar.gz
-            build/JobLens-*.rpm
+            build/joblens-*-Linux-x86_64.tar.gz
+            build/joblens-*.rpm
           if-no-files-found: error
           retention-days: 7
 
@@ -207,7 +207,47 @@ jobs:
             echo "| joblens-trigger-${TRIGGER_VERSION}-*.rpm | Trigger REST API service RPM (Flask + Gunicorn) |"
             echo "| SHA256SUMS.txt | Checksums for integrity verification |"
             echo ""
-            echo "## Verify"
+
+            # 尝试从 CHANGELOG.md 提取当前版本变更摘要
+            if [ -f CHANGELOG.md ]; then
+              echo "## 变更摘要"
+              echo ""
+              awk "/^## v${VERSION}/{found=1; next} /^## v/{if(found) exit} found" CHANGELOG.md | head -60
+              echo ""
+            fi
+
+            # 查找上一个 tag，生成 commit 列表
+            PREV_TAG=$(git tag --sort=-v:refname | grep '^ver-' | grep -B1 "^${CURRENT_TAG}$" | head -1 | grep -v "^${CURRENT_TAG}$" || true)
+            if [ -n "${PREV_TAG}" ]; then
+              echo "## 提交记录 (${PREV_TAG} → ${CURRENT_TAG})"
+              echo ""
+              git log --pretty=format:"- %s (%h)" --no-merges "${PREV_TAG}..HEAD" | head -50
+              echo ""
+            fi
+
+            echo ""
+            echo "## 安装"
+            echo ""
+            echo '### C++ 核心 (RHEL/Fedora)'
+            echo '```bash'
+            echo "sudo rpm -ivh joblens-${VERSION}-*.rpm"
+            echo "sudo systemctl status joblens"
+            echo '```'
+            echo ""
+            echo '### C++ 核心 (通用 TGZ)'
+            echo '```bash'
+            echo "tar -xzf JobLens-${VERSION}-Linux.tar.gz"
+            echo "cd usr && sudo cp -r . /"
+            echo '```'
+            echo ""
+            echo "| Package | Description |"
+            echo "|---------|-------------|"
+            echo "| joblens-${VERSION}-Linux-x86_64.tar.gz | Core binary + config + systemd unit (portable TGZ) |"
+            echo "| joblens-${VERSION}-1.x86_64.rpm | Core RPM for RHEL/Fedora (systemd-managed service) |"
+            echo "| joblens-trigger-${TRIGGER_VERSION}-*.rpm | Trigger REST API service RPM (Flask + Gunicorn) |"
+            echo "| SHA256SUMS.txt | Checksums for integrity verification |"
+            echo ""
+            echo '### 校验完整性'
             echo '```bash'
             echo "sha256sum -c SHA256SUMS.txt"
             echo '```'
