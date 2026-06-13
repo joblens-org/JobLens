@@ -41,10 +41,54 @@ jobs:
           bash scripts/install-deps.sh
           dnf install -y rpm-build
 
+      - name: Diagnose build environment versions
+        run: |
+          echo "=== 容器信息 ==="
+          cat /etc/os-release | head -5
+
+          echo ""
+          echo "=== glibc 版本 ==="
+          ldd --version | head -1
+          strings /lib64/libc.so.6 | grep 'GLIBC_' | sort -V | tail -5
+
+          echo ""
+          echo "=== GCC/libstdc++ 版本 ==="
+          gcc --version | head -1
+          strings /lib64/libstdc++.so.6 | grep 'GLIBCXX_' | sort -V | tail -5
+
+          echo ""
+          echo "=== 关键包版本 ==="
+          rpm -q glibc gcc gcc-c++ fmt-devel spdlog-devel yaml-cpp-devel boost-devel 2>/dev/null || true
+
+          echo ""
+          echo "=== EPEL 仓库 URL ==="
+          grep -r 'baseurl\|mirrorlist' /etc/yum.repos.d/*epel* 2>/dev/null | head -20 || echo "无 EPEL 仓库配置"
+
+          echo ""
+          echo "=== 所有已启用的 DNF 仓库 ==="
+          dnf repolist --enabled 2>/dev/null || microdnf repolist --enabled 2>/dev/null || true
+
       - name: Configure & Build (CMakePresets)
         run: |
           cmake --preset rpm-system-deps -DCPACK_RPM_PACKAGE_RELEASE="1${{ matrix.target.dist }}"
           cmake --build --preset rpm-system-deps
+
+      - name: Diagnose binary dependencies
+        run: |
+          echo "=== 二进制动态链接 ==="
+          ldd build/JobLens | sort
+
+          echo ""
+          echo "=== 二进制需要的 glibc 符号版本 ==="
+          objdump -T build/JobLens | grep -oP 'GLIBC_\S+' | sort -Vu
+
+          echo ""
+          echo "=== 二进制需要的 libstdc++ 符号版本 ==="
+          objdump -T build/JobLens | grep -oP 'GLIBCXX_\S+' | sort -Vu
+
+          echo ""
+          echo "=== 二进制需要的第三方库 SONAME ==="
+          objdump -p build/JobLens | grep NEEDED | sort -u
 
       - name: Package (CPack TGZ + RPM)
         run: |
