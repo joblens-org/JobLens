@@ -56,6 +56,9 @@ jobs:
     runs-on: ubuntu-latest
     container: fedora:latest
     steps:
+      - name: Install git (container minimal image)
+        run: dnf install -y git
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive

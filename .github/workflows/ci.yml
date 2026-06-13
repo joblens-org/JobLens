@@ -18,43 +18,30 @@ jobs:
   build:
     name: Build & Package
     runs-on: ubuntu-latest
-
-    env:
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
-      CCACHE_MAXSIZE: 200M
+    container: fedora:latest
 
     steps:      
+      - name: Install git (container minimal image)
+        run: dnf install -y git
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Setup ccache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'scripts/cmake/Packaging.cmake') }}
-          restore-keys: |
-            ccache-${{ runner.os }}-
-
       - name: Install system dependencies
         run: |
-          sudo bash scripts/install-deps.sh
-          # RPM 打包工具（Ubuntu 上生成 .rpm 需要）
-          sudo apt-get install -y --no-install-recommends rpm
-
-      - name: Get CMake & Ninja
-        uses: lukka/get-cmake@latest
+          dnf install -y sudo
+          bash scripts/install-deps.sh
+          dnf install -y rpm-build
 
       - name: Configure & Build (CMakePresets)
-        uses: lukka/run-cmake@v10
-        with:
-          configurePreset: 'rpm-system-deps'
-          buildPreset: 'rpm-system-deps'
+        run: |
+          cmake --preset rpm-system-deps
+          cmake --build --preset rpm-system-deps
 
       - name: Package (CPack TGZ + RPM)
-        uses: lukka/run-cmake@v10
-        with:
-          packagePreset: 'rpm-system-deps'
+        run: |
+          cpack --preset rpm-system-deps
 
       - name: Verify TGZ contents
         run: |
