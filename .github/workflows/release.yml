@@ -76,42 +76,32 @@ jobs:
   #   复用 CI 预设 rpm-system-deps
   # ════════════════════════════════════════════════════════════
   build-core:
-    name: 构建 C++ 核心 (RPM + TGZ)
+    name: Build Core (RPM + TGZ)
     needs: prepare
     runs-on: ubuntu-latest
+    container: fedora:latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0  # CMake 用 git describe 生成 BUILD_ID
+          fetch-depth: 0
 
-      - name: 恢复 ccache 缓存
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'scripts/cmake/Packaging.cmake') }}
-          restore-keys: ccache-${{ runner.os }}-
-
-      - name: 安装系统依赖
+      - name: Install build dependencies
         run: |
-          sudo bash scripts/install-deps.sh
-          sudo apt-get install -y --no-install-recommends rpm
+          dnf install -y sudo
+          bash scripts/install-deps.sh
+          dnf install -y rpm-build
 
-      - name: 获取 CMake & Ninja
-        uses: lukka/get-cmake@latest
+      - name: Configure & Build
+        run: |
+          cmake --preset rpm-system-deps
+          cmake --build --preset rpm-system-deps
 
-      - name: 配置 & 构建 (CMakePresets)
-        uses: lukka/run-cmake@v10
-        with:
-          configurePreset: 'rpm-system-deps'
-          buildPreset: 'rpm-system-deps'
+      - name: Package (CPack TGZ + RPM)
+        run: |
+          cpack --preset rpm-system-deps
 
-      - name: CPack 打包 (TGZ + RPM)
-        uses: lukka/run-cmake@v10
-        with:
-          packagePreset: 'rpm-system-deps'
-
-      - name: 验证核心产物
+      - name: Verify core artifacts
         run: |
           set -e
           echo "=== TGZ ==="
@@ -127,9 +117,9 @@ jobs:
             && echo "OK: default config" \
             || { echo "FAIL: missing config.yaml"; exit 1; }
 
-          echo "✅ C++ 核心构建完成"
+          echo "Core build completed"
 
-      - name: 上传 C++ 核心制品
+      - name: Upload core artifacts
         uses: actions/upload-artifact@v4
         with:
           name: core-packages
