@@ -57,8 +57,8 @@ jobs:
     strategy:
       matrix:
         target:
-          - { name: fedora, image: fedora:latest }
-          - { name: el9,   image: almalinux:9 }
+          - { name: fedora, image: fedora:latest, dist: .fc41 }
+          - { name: el9,   image: almalinux:9,   dist: .el9  }
       fail-fast: false
     container:
       image: ${{ matrix.target.image }}
@@ -79,9 +79,7 @@ jobs:
 
       - name: Configure
         run: |
-          DIST_TAG=$(rpm -E '%{?dist}' 2>/dev/null || echo '')
-          echo "Dist tag: ${DIST_TAG}"
-          cmake --preset rpm-system-deps -DCPACK_RPM_PACKAGE_RELEASE="1${DIST_TAG}"
+          cmake --preset rpm-system-deps -DCPACK_RPM_PACKAGE_RELEASE="1${{ matrix.target.dist }}"
 
       - name: Build
         run: cmake --build --preset rpm-system-deps

@@ -21,8 +21,8 @@ jobs:
     strategy:
       matrix:
         target:
-          - { name: fedora, image: fedora:latest }
-          - { name: el9,   image: almalinux:9 }
+          - { name: fedora, image: fedora:latest, dist: .fc41 }
+          - { name: el9,   image: almalinux:9,   dist: .el9  }
       fail-fast: false
     container:
       image: ${{ matrix.target.image }}
@@ -43,8 +43,7 @@ jobs:
 
       - name: Configure & Build (CMakePresets)
         run: |
-          DIST_TAG=$(rpm -E '%{?dist}' 2>/dev/null || echo '')
-          cmake --preset rpm-system-deps -DCPACK_RPM_PACKAGE_RELEASE="1${DIST_TAG}"
+          cmake --preset rpm-system-deps -DCPACK_RPM_PACKAGE_RELEASE="1${{ matrix.target.dist }}"
           cmake --build --preset rpm-system-deps
 
       - name: Package (CPack TGZ + RPM)
