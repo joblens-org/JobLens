@@ -210,7 +210,6 @@ install_rpm() {
         cmake \
         ninja-build \
         pkgconfig \
-        curl \
         libbpf-devel \
         elfutils-libelf-devel \
         leveldb-devel \
