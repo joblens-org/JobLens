@@ -16,12 +16,16 @@ on:
 
 jobs:
   build:
-    name: Build & Package
+    name: Build & Package (${{ matrix.target.name }})
     runs-on: ubuntu-latest
-
-    env:
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
-      CCACHE_MAXSIZE: 200M
+    strategy:
+      matrix:
+        target:
+          - { name: fedora, image: fedora:latest }
+          - { name: el9,   image: almalinux:9 }
+      fail-fast: false
+    container:
+      image: ${{ matrix.target.image }}
 
     steps:      
       - uses: actions/checkout@v4
@@ -46,10 +50,10 @@ jobs:
         uses: lukka/get-cmake@latest
 
       - name: Configure & Build (CMakePresets)
-        uses: lukka/run-cmake@v10
-        with:
-          configurePreset: 'rpm-system-deps'
-          buildPreset: 'rpm-system-deps'
+        run: |
+          DIST_TAG=$(rpm -E '%{?dist}' 2>/dev/null || echo '')
+          cmake --preset rpm-system-deps -DCPACK_RPM_PACKAGE_RELEASE="1${DIST_TAG}"
+          cmake --build --preset rpm-system-deps
 
       - name: Package (CPack TGZ + RPM)
         uses: lukka/run-cmake@v10
@@ -105,13 +109,13 @@ jobs:
       - name: Upload RPM artifact
         uses: actions/upload-artifact@v4
         with:
-          name: joblens-core-rpm
+          name: joblens-core-rpm-${{ matrix.target.name }}
           path: build/joblens-*.rpm
 
       - name: Upload TGZ artifact
         uses: actions/upload-artifact@v4
         with:
-          name: joblens-core-tgz
+          name: joblens-core-tgz-${{ matrix.target.name }}
           path: build/joblens-*-Linux-x86_64.tar.gz
 
 
