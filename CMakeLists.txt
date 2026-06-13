@@ -219,7 +219,7 @@ target_link_libraries(JobLens
         ${NETLINK_LIBRARIES}
         LevelDB::LevelDB
         pthread dl
-        lua5.4
+        ${LUA_LIBRARIES}
         $<$<BOOL:${XXHASH_USE_STATIC}>:${XXHASH_STATIC_LIB}>
         $<$<NOT:$<BOOL:${XXHASH_USE_STATIC}>>:PkgConfig::XXHASH>)
 
