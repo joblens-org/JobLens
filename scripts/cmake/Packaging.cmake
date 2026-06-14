@@ -137,6 +137,9 @@ set(CPACK_RPM_PRE_UNINSTALL_SCRIPT_FILE
 set(CPACK_RPM_POST_UNINSTALL_SCRIPT_FILE
     ${CMAKE_CURRENT_SOURCE_DIR}/scripts/rpm/postuninstall.sh)
 
+
+set(CPACK_RPM_USER_FILELIST "%config(noreplace) /etc/JobLens/config.yaml")
+
 # RPM brp-strip 无法处理 eBPF .bpf.o（非标准 ELF 字节码），禁用 strip
 set(CPACK_RPM_SPEC_MORE_DEFINE "%define __strip /bin/true")
 
