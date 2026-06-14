@@ -49,19 +49,16 @@ lens_config:
 lens_config:
   rpc_socket_path: /var/JobLens/rpc.sock   # 本地 RPC 通信的 UNIX Domain Socket 路径
   lock_path: /var/JobLens/JobLens.lock      # 进程锁文件路径，防止多实例运行
-  pid_dir: /var/JobLens/node_pids            # PID 文件目录，分布式节点存储 node_<pid> 文件
   max_collector_threads: 8                   # 收集器调度器最大线程数
   log_level: info                            # 日志级别：trace/debug/info/warn/error/critical/off
 ```
 
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
-| `rpc_socket_path` | string | 无 | 本地 RPC 通信的 UNIX Domain Socket 路径 |
-| `rpc_timeout` | float | 5 | RPC 调用超时时间（秒），Trigger 端使用 |
-| `lock_path` | string | 无 | 进程锁文件，`already_running()` 用于检测是否已有实例运行 |
-| `pid_dir` | string | 无 | PID 文件目录，分布式模式下存储各节点进程信息 |
-| `max_collector_threads` | int | 无 | 收集器定时调度器的线程池大小 |
-| `log_level` | string | 回退到 info | 日志级别：trace/debug/info/warn/error/critical/off |
+| `rpc_socket_path` | string | 无 | 本地 RPC 通信的 UNIX Domain Socket 路径。若为空或缺失，服务抛出运行时异常。 |
+| `lock_path` | string | 无 | 进程锁文件，`already_running()` 用于检测是否已有实例运行。父目录会自动创建。 |
+| `max_collector_threads` | int | 无 | 收集器定时调度器（`TimerScheduler`）的线程池大小。 |
+| `log_level` | string | `"info"`（硬编码回退） | 日志级别：`trace` / `debug` / `info` / `warn` / `error` / `critical` / `off`。若配置值不在映射表中，回退到 `info`。 |
 
 ---
 
@@ -79,7 +76,7 @@ job_registry_config:
 | `job_db_path` | string | 无 | LevelDB 数据库目录路径。无法打开数据库时仅降级运行，不抛异常 |
 | `auto_add_condorjob` | bool | false | 自动启动 CondorJobWatcher，通过 eBPF 追踪 `condor_starter` 进程并自动添加 Condor 作业 |
 | `auto_add_slurmjob` | bool | false | 自动启动 SlurmJobWatcher，通过 eBPF 追踪 `slurm_stepd` 进程并自动添加 Slurm 作业 |
-| `rules_dir` | string | 无 | Lua 规则文件目录，供规则引擎使用 |
+| `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs`（Condor）或 `{JobLensRootDir}/../config/rules/slurm_jobs`（Slurm） | Lua 规则文件目录，CondorJobWatcher 和 SlurmJobWatcher 在 `use_rules` 启用时使用。注意：默认值因 watcher 而异。 |
 
 **作业数据存储**（LevelDB 键值存储）：
 - 键使用前缀 `job_`、`job_history_`、`counter_`，值以 JSON 序列化
@@ -158,15 +155,22 @@ net_sys_collector_config:
 
 ### 各收集器 `init()` JSON 配置参数
 
-收集器的 `init(json_cfg)` 方法接收从 YAML 节点转换的 JSON。以下是各收集器识别的键：
+收集器的 `init(json_cfg)` 方法接收从 YAML 配置节点转换的 JSON 对象。以下是各收集器识别的键：
+
+> **注意**：`freq`、`period` 和 `use_writers` 在**调度器层**（`collector_scheduler.cpp`）解析，所有收集器共享——它们**不**在各收集器的 `init()` 方法内解析。唯一例外是 `GPUUsageCollector`，它在 `init()` 中额外读取 `freq` 用于计算缓存刷新间隔。
 
 | 收集器类型 | 配置参数 | 值类型 | 描述 |
 |-----------|---------|--------|------|
 | **CPUMemCollector** | `summary` | string | 为 `"true"` 时，将所有进程的 CPU/内存数据聚合为一条摘要记录（pid=0） |
-| **IOUsageCollector** | `summary` | string | 为 `"true"` 时，聚合 I/O 数据 |
-| | `use_ebpf` | string | 为 `"true"` 时，使用 eBPF 采集文件级 I/O 数据 |
-| **NetUsageCollector** | `summary` | string | 为 `"true"` 时，聚合网络数据 |
-| | `use_netlink` | string | 为 `"true"` 时，使用 netlink 查询 TCP_INFO（默认 true） |
+| **IOUsageCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的 I/O 数据 |
+| | `use_ebpf` | string | 为 `"true"` 时，使用 eBPF 采集文件级 I/O 数据（需要 root 权限和内核支持） |
+| **NetUsageCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的网络数据 |
+| | `use_netlink` | string | 为 `"true"` 时，使用 netlink 查询 TCP_INFO（RTT、重传次数等） |
+| **BasicInfoCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的 taskstats 数据（TGID 级摘要） |
+| **GPUUsageCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的 GPU 使用数据 |
+| | `freq` | double | 在 `init()` 中额外读取：用于计算 GPU 缓存刷新间隔（`1.0 / (freq * 1.5)`）。这是调度器层 `freq` 之外的额外使用。 |
+| **ProcCollector** | *(无)* | — | 无 init 配置参数。从 `/proc/[pid]/stat`、`/proc/[pid]/status`、`/proc/[pid]/io` 等读取进程信息。**注意**：源码中已标记为将来弃用（`//TODO: 这个模块将会逐步弃用`）。 |
+| **TaskstatsCollector** | *(无)* | — | 无 init 配置参数。使用 Linux taskstats netlink 接口。**注意**：部分实现——`collect()` 方法仅记录 PID，不产生数据输出；`get_writer_parser()` 返回 `nullptr`。 |
 
 ---
 
@@ -263,7 +267,6 @@ kafka_writer_config:
   transactional_id: joblens-txn       # 事务 ID
   batch_rows: 100                     # 批量发送大小
   linger_ms: 10                       # 发送前最大等待毫秒数
-  enable_dlq: false                   # 是否启用死信队列
   enable_transaction: false           # 是否启用 Kafka 事务
   security_protocol: plaintext        # 安全协议：plaintext / sasl_plaintext / ssl / sasl_ssl
   # 以下仅在 security_protocol != "plaintext" 时使用
@@ -281,7 +284,7 @@ kafka_writer_config:
 | `transactional_id` | string | 是 | - | 事务 ID |
 | `batch_rows` | int | 是 | - | 每批次消息数 |
 | `linger_ms` | int | 是 | - | 发送前最大等待时间 |
-| `enable_dlq` | bool | 是 | - | 是否启用死信队列 |
+| `enable_dlq` | bool | 不适用 | `true`（内部默认） | 此键在写入器参数列表中**声明**但**不从配置文件读取**。实际值自动管理：内部默认为 `true`；当 `security_protocol` 为 `"plaintext"` 时自动设为 `false`。 |
 | `enable_transaction` | bool | 是 | - | 是否启用事务 |
 | `security_protocol` | string | 是 | - | 安全协议 |
 | `sasl_mechanism` | string | 是 | security_protocol != "plaintext" | SASL 机制 |
@@ -301,15 +304,49 @@ kafka_writer_config:
 
 ---
 
-## 7. PrometheusExporterWriter 配置
+## 7. FileWriter 配置
 
-**注意：** 当前部署模式未涉及此写入器，尚未经过测试。
+代码位置：`src/writer/file_writer.cpp`
+
+将采集数据以 JSONL（行分隔 JSON）格式写入本地文件。
+
+```yaml
+file_writer_config:
+  path: /var/log/joblens/output.log    # 输出文件路径（追加模式）
+```
+
+| 键 | 类型 | 必填 | 默认值 | 描述 |
+|----|------|------|--------|------|
+| `path` | string | 是 | - | 输出文件路径。以追加模式打开；每次 `flush` 追加一行或多行 JSON。 |
 
 ---
 
-## 8. 作业监听器配置
+## 8. PrometheusExporterWriter 配置
+
+代码位置：`src/writer/prometheus_exporter_writer.cpp`
+
+通过 RPC 端点暴露采集的指标数据供 Prometheus 抓取。此写入器维护一个按 JobID → PID 组织的内存指标表，涵盖 CPU、内存、I/O 和网络指标。
+
+**RPC 端点**（自动注册）：
+
+| 端点 | 描述 |
+|------|------|
+| `/<writer_name>/metrics` | 以 JSON 返回所有作业指标 |
+| `/<writer_name>/info` | 返回写入器元数据 |
+
+```yaml
+prmxs_writer_config: {}    # 当前无配置参数；此节必须存在以供 `config` 字段引用
+```
+
+> **说明**：该写入器完全通过 RPC 暴露指标（不使用 FIFO 或文件输出）。配置节当前为空——所有行为由收集器通过调度器管道推送的数据驱动。
+
+---
+
+## 9. 作业监听器配置
 
 ### `condor_job_watcher`
+
+代码位置：`include/job_watcher/condor_job_watcher.hpp`
 
 ```yaml
 condor_job_watcher:
@@ -318,18 +355,20 @@ condor_job_watcher:
     - net_collector
     - io_collector
   use_rules: false              # 是否启用规则引擎过滤作业
-  rules_dir: /path/to/rules/condor_jobs     # Lua 规则文件目录
   rules_prefix: condor_job_     # Lua 规则文件前缀（默认：condor_job_）
 ```
+
+> **说明**：Lua 规则的 `rules_dir` 从 `job_registry_config.rules_dir` 读取，不在此节中。当 Condor 启用 `use_rules` 时，默认值为 `{JobLensRootDir}/../config/rules/condor_jobs`。
 
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
 | `auto_add_collectors` | string[] | 无 | 自动添加到 Condor 作业的收集器名称列表 |
 | `use_rules` | bool | `false` | 是否使用规则引擎过滤作业（不匹配规则的作业不添加） |
-| `rules_dir` | string | `{InstallDir}/../config/rules/condor_jobs` | Lua 规则文件目录 |
-| `rules_prefix` | string | `condor_job_` | 规则文件前缀 |
+| `rules_prefix` | string | `"condor_job_"` | 规则引擎加载的规则文件前缀 |
 
 ### `slurm_job_watcher`
+
+代码位置：`include/job_watcher/slurm_job_watcher.hpp`
 
 ```yaml
 slurm_job_watcher:
@@ -338,11 +377,16 @@ slurm_job_watcher:
     - net_collector
     - io_collector
   use_rules: false
-  rules_dir: /path/to/rules/slurm_jobs
   rules_prefix: slurm_job_
 ```
 
-参数同上，默认 `rules_dir` 为 `{InstallDir}/../config/rules/slurm_jobs`。
+> **说明**：Lua 规则的 `rules_dir` 从 `job_registry_config.rules_dir` 读取，不在此节中。当 Slurm 启用 `use_rules` 时，默认值为 `{JobLensRootDir}/../config/rules/slurm_jobs`。
+
+| 键 | 类型 | 默认值 | 描述 |
+|----|------|--------|------|
+| `auto_add_collectors` | string[] | 无 | 自动添加到 Slurm 作业的收集器名称列表 |
+| `use_rules` | bool | `false` | 是否使用规则引擎过滤作业 |
+| `rules_prefix` | string | `"slurm_job_"` | 规则引擎加载的规则文件前缀 |
 
 ---
 
@@ -352,7 +396,6 @@ slurm_job_watcher:
 lens_config:
   rpc_socket_path: /var/JobLens/rpc.sock
   lock_path: /var/JobLens/JobLens.lock
-  pid_dir: /var/JobLens/node_pids
   max_collector_threads: 8
   log_level: info
 
@@ -381,6 +424,15 @@ collectors_config:
     - name: basic_info_collector
       type: BasicInfoCollector
       config: basic_info_collector_config
+    - name: gpu_collector
+      type: GPUUsageCollector
+      config: gpu_collector_config
+    - name: proc_collector
+      type: ProcCollector
+      config: proc_collector_config
+    - name: taskstats_collector
+      type: TaskstatsCollector
+      config: taskstats_collector_config
 
 cpumem_collector_config:
   freq: 1
@@ -406,6 +458,16 @@ io_collector_config:
 basic_info_collector_config:
   freq: 0.2
   summary: false
+
+gpu_collector_config:
+  freq: 1
+  summary: true
+
+proc_collector_config:
+  freq: 1
+
+taskstats_collector_config:
+  freq: 1
 
 writers_config:
   enable_writer_perf: true
@@ -435,8 +497,7 @@ ES_writer_config:
     - collector_name: cpumem_collector
       index_name: cpu_mem_metrics
 
-prmxs_writer_config:
-  fifo_path: /tmp/prom_metrics.fifo
+prmxs_writer_config: {}
 
 kafka_writer_config:
   brokers:
@@ -447,7 +508,6 @@ kafka_writer_config:
   transactional_id: joblens-txn
   batch_rows: 100
   linger_ms: 10
-  enable_dlq: false
   enable_transaction: false
   security_protocol: plaintext
 
@@ -475,16 +535,10 @@ JobLens - 作业监控系统
 选项：
   -h, --help                    显示帮助信息
   -c, --config <path>           配置文件路径（默认：config.yaml）
-  -m, --mode <mode>             运行模式（默认：starter）
-  -e, --exec <executable>       要运行的可执行文件路径（starter 模式使用）
-  -a, --args <args>             可执行文件的参数列表
+  -m, --mode <mode>             运行模式（默认：service）
   -v, --version                 显示版本信息
 
 运行模式：
-（注意：这是历史遗留问题。在 JobLens 早期设计阶段，设计目标是针对单个指定作业提供细粒度追踪，因此保留了此模式。
-经过讨论，此模式已废弃，但启动选项尚未移除）
-
-  starter    启动+监控模式：启动子进程并监控其性能（默认）
   service    纯服务模式：启动采集调度器，持续运行直到收到关闭信号
 
 子命令：
@@ -495,14 +549,8 @@ JobLens - 作业监控系统
   SIGINT / SIGTERM              优雅关闭服务
 
 示例：
-  # 基本启动（starter 模式）
-  ./JobLens -c config.yaml
-
-  # 服务模式
+  # 服务模式启动
   ./JobLens -m service -c config.yaml
-
-  # 启动并监控特定进程
-  ./JobLens -c config.yaml -e /path/to/program -a "arg1 arg2"
 
   # 显示版本
   ./JobLens -v

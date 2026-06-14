@@ -50,19 +50,16 @@ lens_config:
 lens_config:
   rpc_socket_path: /var/JobLens/rpc.sock   # UNIX Domain Socket path for local RPC communication
   lock_path: /var/JobLens/JobLens.lock      # Process lock file path to prevent multiple instances (main_utils::already_running)
-  pid_dir: /var/JobLens/node_pids            # PID file directory, distributed nodes store node_<pid> files
   max_collector_threads: 8                   # Maximum threads for collector scheduler (TimerScheduler thread pool size)
   log_level: info                            # Log level: trace/debug/info/warn/error/critical/off
 ```
 
 | Key | Type | Default | Description | Source Reference |
 |-----|------|---------|-------------|------------------|
-| `rpc_socket_path` | string | none | UNIX Domain Socket path for local RPC communication | `main_utils.cpp:83` → `RPCServer::instance(RPC_Socket)` |
-| `rpc_timeout` | float | 5 | RPC call timeout in seconds | trigger `app_factory.py:183` (used by Trigger) |
-| `lock_path` | string | none | Process lock file, used by `already_running()` to detect if another instance is running | `main_utils.cpp:95`, `distributed_node.cpp:61` |
-| `pid_dir` | string | none | PID file directory, stores per-node process information in distributed mode | `distributed_node.cpp` |
-| `max_collector_threads` | int | none | Thread pool size for the collector timer scheduler | `collector_scheduler.cpp:12` |
-| `log_level` | string | fallback to info | Log level: trace/debug/info/warn/error/critical/off | `main_utils.cpp:67` |
+| `rpc_socket_path` | string | none | UNIX Domain Socket path for local RPC communication. If empty or missing, the service throws a runtime exception. | `main_utils.cpp:92`; `RPCServer::instance(RPC_Socket)` |
+| `lock_path` | string | none | Process lock file, used by `already_running()` to detect if another instance is running. The parent directory is created automatically if needed. | `main_utils.cpp:104` |
+| `max_collector_threads` | int | none | Thread pool size for the collector timer scheduler (`TimerScheduler`). | `collector_scheduler.cpp:25` |
+| `log_level` | string | `"info"` (hard-coded fallback) | Log level: `trace` / `debug` / `info` / `warn` / `error` / `critical` / `off`. If the configured value is not in the map, falls back to `info`. | `main_utils.cpp:76-82` |
 
 ---
 
@@ -80,7 +77,7 @@ job_registry_config:
 | `job_db_path` | string | none | LevelDB database directory path. If the database cannot be opened, no exception is thrown; it only degrades operation |
 | `auto_add_condorjob` | bool | false | Automatically start CondorJobWatcher, trace `condor_starter` processes via eBPF, and auto-add Condor jobs |
 | `auto_add_slurmjob` | bool | false | Automatically start SlurmJobWatcher, trace `slurm_stepd` processes via eBPF, and auto-add Slurm jobs |
-| `rules_dir` | string | none | Directory for Lua rule files, used by the rule engine |
+| `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` (Condor) or `{JobLensRootDir}/../config/rules/slurm_jobs` (Slurm) | Directory for Lua rule files, used by CondorJobWatcher and SlurmJobWatcher when `use_rules` is enabled. Note: the default varies by watcher context. |
 
 **Job data storage** (LevelDB key-value store):
 - Keys use prefixes `job_`, `job_history_`, `counter_` with values serialized as JSON
@@ -108,10 +105,10 @@ collectors_config:
 
 | Key | Type | Default | Description | Source Reference |
 |-----|------|---------|-------------|------------------|
-| `enable_collector_perf` | bool | none | When enabled, each `collect` call records its duration; performance statistics can be queried via RPC | `collector_registry.cpp:17` |
-| `perf_window_size` | int | none | Performance window size, affects the number of samples for mean/variance calculation | `collector_registry.cpp:19` |
-| `default_freq` | int | none | Default sampling frequency (Hz) for collectors | `collector_scheduler.cpp:14` |
-| `default_use_writers` | string[] | none | Default list of writers for collectors | `collector_scheduler.cpp:15` |
+| `enable_collector_perf` | bool | none | When enabled, each `collect` call records its duration; performance statistics can be queried via RPC | `collector_registry.cpp:30` |
+| `perf_window_size` | int | none | Performance window size, affects the number of samples for mean/variance calculation | `collector_registry.cpp:32` |
+| `default_freq` | int | none | Default sampling frequency (Hz) for collectors | `collector_scheduler.cpp:27` |
+| `default_use_writers` | string[] | none | Default list of writers for collectors | `collector_scheduler.cpp:28` |
 
 ### `collectors` Array Elements
 
@@ -159,15 +156,22 @@ net_sys_collector_config:
 
 ### Collector‑Specific `init()` JSON Configuration Parameters
 
-The collector's `init(json_cfg)` method receives a JSON converted from the YAML node. Below are the keys recognized by each collector:
+The collector's `init(json_cfg)` method receives a JSON object converted from the YAML config node. Below are the keys recognized by each collector:
 
-| Collector Type | Configuration Parameter | Value Type | Description |
-|----------------|------------------------|------------|-------------|
-| **CPUMemCollector** | `summary` | string | When `"true"`, aggregates CPU/memory data from all processes into a single summary record (pid=0) |
-| **IOUsageCollector** | `summary` | string | When `"true"`, aggregates I/O data |
-| | `use_ebpf` | string | When `"true"`, uses eBPF to collect file‑level I/O data |
-| **NetUsageCollector** | `summary` | string | When `"true"`, aggregates network data |
-| | `use_netlink` | string | When `"true"`, uses netlink to query TCP_INFO (default true) |
+> **Note**: `freq`, `period`, and `use_writers` are parsed at the **scheduler level** (`collector_scheduler.cpp`) and shared by all collectors — they are **not** parsed inside each collector's `init()` method. The only exception is `GPUUsageCollector`, which additionally reads `freq` inside `init()` for cache refresh interval calculation.
+
+| Collector Type | Configuration Parameter | Value Type | Description | Source Reference |
+|----------------|------------------------|------------|-------------|------------------|
+| **CPUMemCollector** | `summary` | string | When `"true"`, aggregates CPU/memory data from all processes into a single summary record (pid=0) | `cpumem_collector.cpp:42` |
+| **IOUsageCollector** | `summary` | string | When `"true"`, aggregates I/O data across all processes | `io_usage_collector.cpp:186` |
+| | `use_ebpf` | string | When `"true"`, uses eBPF to collect file‑level I/O data (requires root + kernel support) | `io_usage_collector.cpp:192` |
+| **NetUsageCollector** | `summary` | string | When `"true"`, aggregates network data across all processes | `net_usage_collector.cpp:477` |
+| | `use_netlink` | string | When `"true"`, uses netlink to query TCP_INFO (RTT, retransmissions, etc.) | `net_usage_collector.cpp:482` |
+| **BasicInfoCollector** | `summary` | string | When `"true"`, aggregates taskstats data across all processes (TGID-level summary) | `basic_info_collector.cpp:45` |
+| **GPUUsageCollector** | `summary` | string | When `"true"`, aggregates GPU usage data across all processes | `gpu_usage_collector.cpp:162` |
+| | `freq` | double | Additionally read in `init()`: used to calculate GPU cache refresh interval (`1.0 / (freq * 1.5)`). This is in addition to the scheduler-level `freq`. | `gpu_usage_collector.cpp:156-197` |
+| **ProcCollector** | *(none)* | — | No init config parameters. Reads process information from `/proc/[pid]/stat`, `/proc/[pid]/status`, `/proc/[pid]/io`, etc. **Note**: source code marks this collector for future deprecation (`//TODO: 这个模块将会逐步弃用`). | `proc_collector_func.cpp:276-285` |
+| **TaskstatsCollector** | *(none)* | — | No init config parameters. Uses Linux taskstats netlink interface. **Note**: partially implemented — `collect()` method logs PIDs but does not produce data output; `get_writer_parser()` returns `nullptr`. | `taskstats_collector.cpp:44-47` |
 
 ---
 
@@ -189,9 +193,9 @@ writers_config:
 
 | Key | Type | Default | Description | Source Reference |
 |-----|------|---------|-------------|------------------|
-| `enable_writer_perf` | bool | none | When enabled, records duration of each `flush`, supports RPC queries | `writer_manager.cpp:15` |
-| `perf_window_size` | int | none | Performance window size | `writer_manager.cpp:17` |
-| `buffer_capacity` | int | none | Maximum number of messages in the BaseWriter's internal ring buffer | `base_writer.cpp:19` |
+| `enable_writer_perf` | bool | `true` | When enabled, records duration of each `flush`, supports RPC queries | `writer_manager.cpp:28` |
+| `perf_window_size` | int | `1000` | Performance window size | `writer_manager.cpp:30` |
+| `buffer_capacity` | int | none | Maximum number of messages in the BaseWriter's internal ring buffer | `base_writer.cpp:32` |
 
 ### `writers` Array Elements
 
@@ -268,7 +272,6 @@ kafka_writer_config:
   transactional_id: joblens-txn       # Transactional ID
   batch_rows: 100                     # Batch send size
   linger_ms: 10                       # Maximum milliseconds to wait before sending
-  enable_dlq: false                   # Whether to enable the dead letter queue
   enable_transaction: false           # Whether to enable Kafka transactions
   security_protocol: plaintext        # Security protocol: plaintext / sasl_plaintext / ssl / sasl_ssl
   # The following are used only when security_protocol != "plaintext"
@@ -286,7 +289,7 @@ kafka_writer_config:
 | `transactional_id` | string | Yes | - | Transactional ID |
 | `batch_rows` | int | Yes | - | Number of messages per batch; `queue.buffering.max.messages` is set to `batch_rows * 10` |
 | `linger_ms` | int | Yes | - | Maximum time to wait before sending messages |
-| `enable_dlq` | bool | Yes | - | Whether to enable dead letter queue; forced to false when `plaintext` is used |
+| `enable_dlq` | bool | N/A | `true` (internal default) | This key is **declared** in the writer's parameter list but **not read from config file**. The actual value is auto-managed: defaults to `true` internally; set to `false` automatically when `security_protocol` is `"plaintext"`. |
 | `enable_transaction` | bool | Yes | - | Whether to enable transactions |
 | `security_protocol` | string | Yes | - | Security protocol |
 | `sasl_mechanism` | string | Yes | security_protocol != "plaintext" | SASL mechanism |
@@ -304,31 +307,67 @@ kafka_writer_config:
 }
 ```
 
-## 7. PrometheusExporterWriter Configuration
+## 7. FileWriter Configuration
 
-**Note:** Since the current deployment model does not involve this writer, it has not been tested yet
+Code location: `src/writer/file_writer.cpp`
 
-## 8. Job Watcher Configuration
+Writes collected data to a local file in JSONL (line-delimited JSON) format.
+
+```yaml
+file_writer_config:
+  path: /var/log/joblens/output.log    # Output file path (appended)
+```
+
+| Key | Type | Required | Default | Description |
+|-----|------|----------|---------|-------------|
+| `path` | string | Yes | - | Output file path. The file is opened in append mode; each `flush` appends one or more JSON lines. |
+
+---
+
+## 8. PrometheusExporterWriter Configuration
+
+Code location: `src/writer/prometheus_exporter_writer.cpp`
+
+Exposes collected metrics via RPC endpoints for Prometheus scraping. This writer maintains an in-memory metrics table organized by JobID → PID, covering CPU, memory, I/O, and network metrics.
+
+**RPC Endpoints** (automatically registered):
+
+| Endpoint | Description |
+|----------|-------------|
+| `/<writer_name>/metrics` | Returns all job metrics as JSON |
+| `/<writer_name>/info` | Returns writer metadata |
+
+```yaml
+prmxs_writer_config: {}    # Currently no config parameters; the section must exist for the `config` field to reference
+```
+
+> **Note**: The writer exposes metrics purely via RPC (no FIFO or file output). The configuration section is currently empty — all behavior is driven by the collector data pushed through the scheduler pipeline.
+
+---
+
+## 9. Job Watcher Configuration
 
 ### `condor_job_watcher`
 
+Code location: `include/job_watcher/condor_job_watcher.hpp`
+
 ```yaml
 condor_job_watcher:
-  auto_add_collectors:          # When use_rules is configured as false, the default collector list is automatically appended upon the discovery of a new Condor job.
+  auto_add_collectors:          # When use_rules is false, the default collector list is automatically appended upon the discovery of a new Condor job.
     - cpumem_collector
     - net_collector
     - io_collector
   use_rules: false              # Whether to enable the rule engine for filtering jobs
-  rules_dir: /path/to/rules/condor_jobs     # Directory for Lua rule files (default: {JobLensRootDir}/../config/rules/condor_jobs)
   rules_prefix: condor_job_     # Prefix for Lua rule files (default: condor_job_)
 ```
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `auto_add_collectors` | string[] | none | List of collector names to automatically add to Condor jobs |
-| `use_rules` | bool | `false` | Whether to filter jobs using the rule engine (jobs not matching the rules are not added) |
-| `rules_dir` | string | `{InstallDir}/../config/rules/condor_jobs` | Directory for Lua rule files |
-| `rules_prefix` | string | `condor_job_` | Prefix for rule files |
+> **Note**: The `rules_dir` for Lua rules is read from `job_registry_config.rules_dir`, not from this section. Its default is `{JobLensRootDir}/../config/rules/condor_jobs` when `use_rules` is enabled for Condor.
+
+| Key | Type | Default | Description | Source Reference |
+|-----|------|---------|-------------|------------------|
+| `auto_add_collectors` | string[] | none | List of collector names to automatically add to Condor jobs | `condor_job_watcher.hpp:28` |
+| `use_rules` | bool | `false` | Whether to filter jobs using the rule engine (jobs not matching the rules are not added) | `condor_job_watcher.hpp:29` |
+| `rules_prefix` | string | `"condor_job_"` | Prefix for rule files loaded by the rule engine | `condor_job_watcher.hpp:34` |
 
 ### `slurm_job_watcher`
 
@@ -341,11 +380,16 @@ slurm_job_watcher:
     - net_collector
     - io_collector
   use_rules: false
-  rules_dir: /path/to/rules/slurm_jobs
   rules_prefix: slurm_job_
 ```
 
-Parameters are the same as above; the default `rules_dir` is `{InstallDir}/../config/rules/slurm_jobs`.
+> **Note**: The `rules_dir` for Lua rules is read from `job_registry_config.rules_dir`, not from this section. Its default is `{JobLensRootDir}/../config/rules/slurm_jobs` when `use_rules` is enabled for Slurm.
+
+| Key | Type | Default | Description | Source Reference |
+|-----|------|---------|-------------|------------------|
+| `auto_add_collectors` | string[] | none | List of collector names to automatically add to Slurm jobs | `slurm_job_watcher.hpp:29` |
+| `use_rules` | bool | `false` | Whether to filter jobs using the rule engine | `slurm_job_watcher.hpp:30` |
+| `rules_prefix` | string | `"slurm_job_"` | Prefix for rule files loaded by the rule engine | `slurm_job_watcher.hpp:35` |
 
 ---
 
@@ -355,7 +399,6 @@ Parameters are the same as above; the default `rules_dir` is `{InstallDir}/../co
 lens_config:
   rpc_socket_path: /var/JobLens/rpc.sock
   lock_path: /var/JobLens/JobLens.lock
-  pid_dir: /var/JobLens/node_pids
   max_collector_threads: 8
   log_level: info
 
@@ -384,6 +427,15 @@ collectors_config:
     - name: basic_info_collector
       type: BasicInfoCollector
       config: basic_info_collector_config
+    - name: gpu_collector
+      type: GPUUsageCollector
+      config: gpu_collector_config
+    - name: proc_collector
+      type: ProcCollector
+      config: proc_collector_config
+    - name: taskstats_collector
+      type: TaskstatsCollector
+      config: taskstats_collector_config
 
 cpumem_collector_config:
   freq: 1
@@ -409,6 +461,16 @@ io_collector_config:
 basic_info_collector_config:
   freq: 0.2
   summary: false
+
+gpu_collector_config:
+  freq: 1
+  summary: true
+
+proc_collector_config:
+  freq: 1
+
+taskstats_collector_config:
+  freq: 1
 
 writers_config:
   enable_writer_perf: true
@@ -438,8 +500,7 @@ ES_writer_config:
     - collector_name: cpumem_collector
       index_name: cpu_mem_metrics
 
-prmxs_writer_config:
-  fifo_path: /tmp/prom_metrics.fifo
+prmxs_writer_config: {}
 
 kafka_writer_config:
   brokers:
@@ -450,7 +511,6 @@ kafka_writer_config:
   transactional_id: joblens-txn
   batch_rows: 100
   linger_ms: 10
-  enable_dlq: false
   enable_transaction: false
   security_protocol: plaintext
 
@@ -478,15 +538,10 @@ Usage:
 Options:
   -h, --help                    Show help information
   -c, --config <path>           Configuration file path (default: config.yaml)
-  -m, --mode <mode>             Running mode (default: starter)
-  -e, --exec <executable>       Path to the executable to run (used in starter mode)
-  -a, --args <args>             Argument list for the executable
+  -m, --mode <mode>             Running mode (default: service)
   -v, --version                 Show version information
 
 Running modes:
-(Note: This is a historical issue. In the early design phase of joblens, the design goal was to provide fine-grained tracking for a single specified job, so this mode was retained. After discussion, this mode has been deprecated, but the startup option has not been removed yet)
-
-  starter    Start + monitor mode: launch a subprocess and monitor its performance (default)
   service    Pure service mode: start the collection scheduler and run continuously until a shutdown signal is received
 
 Subcommands:
@@ -497,14 +552,8 @@ Signal handling:
   SIGINT / SIGTERM              Gracefully shut down the service
 
 Examples:
-  # Basic start (starter mode)
-  ./JobLens -c config.yaml
-
-  # Service mode
+  # Start in service mode
   ./JobLens -m service -c config.yaml
-
-  # Start and monitor a specific process
-  ./JobLens -c config.yaml -e /path/to/program -a "arg1 arg2"
 
   # Show version
   ./JobLens -v

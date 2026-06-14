@@ -1,371 +1,52 @@
-# JobLens Main Configuration File
-# This file configures the functional parameters for the JobLens job monitoring system.
-# Configuration items are organized by functional module, each responsible for specific
-# monitoring or data output functionality.
+# JobLens minimal configuration example
+#
+# This is a template — copy to config.yaml and modify for your environment.
+# Full configuration reference: https://github.com/joblens-org/JobLens/blob/main/doc/configuration.md
+#
+# Start command: ./JobLens -m service -c config/config.yaml
 
 # ============================================================
-# Base Config
+# Core Configuration (required)
 # ============================================================
-# Contains fundamental parameters for JobLens core operation, such as RPC communication,
-# logging, threads, etc.
 lens_config:
-  # Unix Domain Socket path for RPC communication
-  # Used for local inter-process communication; JobLens components interact via this socket
-  rpc_socket_path: /var/JobLens/rpc.sock
-  
-  # RPC call timeout (seconds)
-  # RPC calls that do not respond within this time are considered failed
-  rpc_timeout: 5
-  
-  # Process lock file path
-  # Prevents multiple JobLens instances from running simultaneously, ensuring single-instance operation
-  lock_path: /var/JobLens/JobLens.lock
-  
-  # Node PID file storage directory
-  # Used for storing per-node PID information in distributed mode, supporting primary/standby switchover
-  pid_dir: /var/JobLens/node_pids
-  
-  # Maximum threads for collector thread pool
-  # Determines how many collection tasks can run concurrently; adjust based on system resources
-  max_collector_threads: 8
-  
-  # Log level
-  # Valid values: trace, debug, info, warn, error, critical, off
-  # Recommended: info for production, debug for troubleshooting
-  log_level: info
+  rpc_socket_path: /var/JobLens/rpc.sock   # UNIX Domain Socket path for RPC communication
+  lock_path: /var/JobLens/JobLens.lock     # Process lock file to prevent multiple instances
+  max_collector_threads: 4                   # Thread pool size for collector scheduler
+  log_level: info                            # Log level: trace/debug/info/warn/error/critical/off
 
 # ============================================================
-# Job Registry Config
+# Job Registry Configuration
 # ============================================================
-# Manages persistent storage and auto-discovery of jobs
 job_registry_config:
-  # Job database directory path (LevelDB format)
-  # Used for persistent storage of job information, supports restoring job state after service restart
-  job_db_path: /var/JobLens/job.db
-  
-  # Whether to auto-discover and add Condor jobs
-  # When enabled, uses eBPF to monitor condor_startd fork calls to auto-discover new jobs
-  auto_add_condorjob: false
-  
-  # Whether to auto-discover and add Slurm jobs
-  # When enabled, uses eBPF to monitor slurmstepd fork calls to auto-discover new jobs
-  auto_add_slurmjob: false
-
-  # Rules file storage directory
-  # Stores rule files for matching Condor and Slurm jobs
-  rules_dir: /etc/JobLens/rules/
+  job_db_path: /var/JobLens/job.db          # LevelDB database directory for job persistence
 
 # ============================================================
-# Condor Job Watcher
+# Collector Configuration — cpumem only
 # ============================================================
-# Uses eBPF to listen for condor_startd fork calls, automatically discovering Condor jobs
-condor_job_watcher:
-  # Whether to enable rule filtering
-  # When enabled, only monitors jobs matching rule files
-  use_rules: false
-  
-  # Rule file prefix
-  # Only rule files starting with this prefix will be loaded
-  rules_prefix: rules_condor_
-  
-  # List of collectors to auto-add for newly discovered Condor jobs
-  # These collectors will be automatically attached to newly discovered jobs for data collection
-  auto_add_collectors:
-    - cpumem_collector    # CPU and memory usage collector
-    - net_collector       # Network usage collector
-    - io_collector        # IO usage collector
-
-# ============================================================
-# Slurm Job Watcher Config
-# ============================================================
-# Uses eBPF mechanism to monitor slurmstepd fork calls, automatically discovering Slurm jobs
-slurm_job_watcher:
-  # Whether to enable rule filtering
-  # When enabled, only monitors jobs matching rule files
-  use_rules: true
-  
-  # Rule file prefix
-  # Only rule files starting with this prefix will be loaded
-  rules_prefix: rules_slurm_
-  
-  # List of collectors to auto-add for newly discovered Slurm jobs
-  # These collectors will be automatically attached to newly discovered jobs for data collection
-  auto_add_collectors:
-    - cpumem_collector    # CPU and memory usage collector
-    - net_collector       # Network usage collector
-    - io_collector        # IO usage collector
-
-# ============================================================
-# Writers Config
-# ============================================================
-# Configures data output destinations (e.g., Elasticsearch, Kafka, Prometheus, etc.)
-writers_config:
-  # Whether to enable writer performance monitoring
-  # When enabled, records statistics such as invocation count, error count, and execution time for each writer
-  enable_writer_perf: true
-  
-  # Performance monitoring window size
-  # Number of samples used for calculating sliding window averages
-  perf_window_size: 1000
-  
-  # Writer buffer capacity
-  # Size of the internal buffer queue for each writer; affects memory usage and batch write efficiency
-  buffer_capacity: 4096
-  
-  # Writer instance list
-  # Defines specific data output destinations; each writer has its own configuration
-  writers:
-    - name: es_writer                    # Writer name, used for reference in collectors
-      type: ESWriter                     # Writer type: Elasticsearch writer
-      config: ES_writer_config           # Refer to detailed configuration below
-    - name: prmxs_writer                 # Writer name
-      type: PrometheusExporterWriter     # Writer type: Prometheus exporter
-      config: prmxs_writer_config        # Refer to detailed configuration below
-    - name: kafka_writer                 # Writer name
-      type: KafkaWriter                  # Writer type: Kafka writer
-      config: kafka_writer_config        # Refer to detailed configuration below
-
-# ============================================================
-# Collectors Config
-# ============================================================
-# Configures various monitoring data collectors, responsible for collecting performance data
-# from job processes
 collectors_config:
-  # Whether to enable collector performance monitoring
-  # When enabled, records statistics such as invocation count, error count, and execution time
-  # for each collector
-  enable_collector_perf: true
-  
-  # Performance monitoring window size
-  # Number of samples used for calculating sliding window averages
-  perf_window_size: 1000
-  
-  # Default collection frequency (Hz)
-  # Default value used when a collector config does not specify freq
-  # 1Hz = collect once per second, 0.2Hz = collect every 5 seconds
-  default_freq: 1
-  
-  # Default writers to use
-  # Default value used when a collector's configuration does not specify use_writers
-  default_use_writers:
-    - es_writer
-  
-  # Collector instance list
-  # Defines specific monitoring data collectors; each collector has its own configuration
+  enable_collector_perf: false               # Disable collector performance counters
+  default_freq: 1                            # Default sampling frequency (Hz)
   collectors:
-    - name: proc_collector               # Collector name
-      type: ProcCollector                # Collector type: process information collector
-      config: proc_collector_config      # Reference detailed configuration below
-    - name: cpumem_collector             # Collector name
-      type: CPUMemCollector              # Collector type: CPU/memory collector
-      config: cpumem_collector_config    # Reference detailed configuration below
-    - name: net_collector                # Collector name
-      type: NetUsageCollector            # Collector type: network usage collector
-      config: net_collector_config       # Reference detailed configuration below
-    - name: io_collector                 # Collector name
-      type: IOUsageCollector             # Collector type: IO usage collector
-      config: io_collector_config        # Reference detailed configuration below
-    - name: basic_info_collector         # Collector name
-      type: BasicInfoCollector           # Collector type: basic info collector (using taskstats)
-      config: basic_info_collector_config # Reference detailed configuration below
-    - name: gpu_collector                # Collector name
-      type: GPUUsageCollector            # Collector type: GPU usage collector
-      config: gpu_collector_config       # Reference detailed configuration below
+    - name: cpumem_collector
+      type: CPUMemCollector
+      config: cpumem_collector_config
 
-# ============================================================
-# Base Writer Config
-# ============================================================
-# Common base configuration for all writers
-base_writer_config:
-  # Write operation timeout (seconds)
-  # Write operations not completed within this time will be considered failed
-  write_timeout: 5
-
-# ============================================================
-# ES Writer Config
-# ============================================================
-# Sends collected data to Elasticsearch for storage and retrieval
-ES_writer_config:
-  # ES server address (supports environment variable ES_HOST override)
-  host: your-es-host.example.com
-  
-  # ES server port
-  # Default is 9200 for HTTP, 443 for HTTPS
-  port: 443
-  
-  # Authentication username (supports environment variable ES_USER override)
-  user: your_es_user
-  
-  # Authentication password (supports environment variable ES_PASSWORD override)
-  passwd: your_es_password
-  
-  # Batch write size
-  # Number of records accumulated before performing a batch write; affects write performance
-  # and real-time behavior
-  batch_size: 1
-  
-  # Write timeout (seconds)
-  # Overrides the default value in base_writer_config
-  write_timeout: 1
-  
-  # Collector-to-index mapping configuration
-  # Defines which ES index each collector's data should be written to
-  indexs:
-    - collector_name: cpumem_collector
-      index_name: cpumem_collector
-    - collector_name: net_collector      
-      index_name: net_collector        
-    - collector_name: io_collector      
-      index_name: io_collector       
-    - collector_name: gpu_collector
-      index_name: gpu_collector
-
-# ============================================================
-# Prometheus Exporter Writer Config
-# ============================================================
-# Exports Prometheus-format metrics data via a FIFO file
-prmxs_writer_config:
-  # FIFO file path
-  # Prometheus can read metrics data from this FIFO
-  fifo_path: /var/prom_metrics.fifo
-
-# ============================================================
-# Proc Collector Config
-# ============================================================
-# Collects detailed process information such as command-line arguments, environment variables, etc.
-proc_collector_config:
-  # Collection frequency (Hz)
-  # 1 = collect once per second
-  freq: 1
-  
-  # Collection period (seconds) - optional
-  # Used for sampling over longer intervals; indicates how far back in time to sample data
-  # period: 1
-
-gpu_collector_config:
-  freq: 1
-  summary: true
-
-# ============================================================
-# CPUMem Collector Config
-# ============================================================
-# Collects CPU and memory usage of processes
-# Data sources: /proc/[pid]/stat and /proc/[pid]/status
 cpumem_collector_config:
-  # Collection frequency (Hz)
-  # 1 = collect once per second
-  freq: 1
-  
-  # Whether to aggregate data
-  # true: outputs aggregate statistics across all processes in addition to per-process data
-  # false: outputs only per-process data
-  summary: true
-
-# ============================================================
-# IO Collector Config
-# ============================================================
-# Collects I/O usage of processes, including read/write bytes, file descriptors, etc.
-# Data sources: /proc/[pid]/io and /proc/[pid]/fd/
-io_collector_config:
-  # Collection frequency (Hz)
-  freq: 1
-  
-  # Whether to aggregate data
-  summary: true
-  
-  # Whether to use eBPF for more detailed I/O data collection
-  # Note: requires root privileges and relevant kernel support
-  use_ebpf: true
-
-# ============================================================
-# Net Collector Config
-# ============================================================
-# Collects network connections and traffic usage of processes
-# Data sources: /proc/[pid]/net/tcp, tcp6, udp, udp6
-net_collector_config:
-  # Collection frequency (Hz)
-  freq: 1
-  
-  # Whether to use the Netlink interface for detailed TCP connection info
-  # When enabled, retrieves detailed TCP statistics such as RTT and retransmission count
-  use_netlink: true
-  
-  # Whether to aggregate data
-  summary: true
-
-# ============================================================
-# Basic Info Collector Config
-# ============================================================
-# Uses the Linux taskstats interface to collect basic process statistics
-# Including CPU time, memory usage, IO statistics, context switches, etc.
-basic_info_collector_config:
-  # Collection frequency (Hz)
-  freq: 1
-  
-  # Whether to aggregate data
-  summary: true
-  
-  # List of writers used by this collector
-  # Can override the default default_use_writers
+  freq: 1                                    # Sample once per second
+  summary: false                             # false = per-process, true = aggregate summary
   use_writers:
-    - kafka_writer
+    - file_writer                            # Output to local file
 
 # ============================================================
-# File Writer Config
+# Writer Configuration — FileWriter only
 # ============================================================
-# Writes collected data to local files
+writers_config:
+  enable_writer_perf: false                  # Disable writer performance counters
+  buffer_capacity: 1024                      # Internal ring buffer capacity
+  writers:
+    - name: file_writer
+      type: FileWriter
+      config: file_writer_config
+
 file_writer_config:
-  # Output file path
-  path: /tmp/joblens_test
-  
-  # Write timeout (seconds)
-  write_timeout: 5
-
-# ============================================================
-# Kafka Writer Config
-# ============================================================
-# Sends collected data to Kafka message queue
-kafka_writer_config:
-  # Kafka broker list
-  # Format: host1:port1,host2:port2 (supports environment variable KAFKA_BROKERS override)
-  brokers: [your-kafka-broker:9092]
-  
-  # Topic prefix
-  # Final topic name will be: {topic_prefix}{collector_name}
-  topic_prefix: joblens.jobs_data.
-  
-  # Dead letter queue topic
-  # Used to store messages that cannot be successfully sent
-  topic_dlq: joblens_dlq
-  
-  # Kafka client ID
-  # Used to identify this producer in Kafka
-  client_id: joblens_kafka_writer
-  
-  # Transactional ID
-  # Required when transactions are enabled
-  transactional_id: joblens_txn_1
-  
-  # Whether to enable transactions
-  # When enabled, guarantees exactly-once message semantics
-  enable_transaction: false
-  
-  # Security protocol
-  # Valid values: plaintext, ssl, sasl_plaintext, sasl_ssl
-  security_protocol: plaintext
-  
-  # SASL authentication mechanism
-  # Valid values: plain, scram-sha-256, scram-sha-512
-  sasl_mechanism: plain
-  
-  # Message send delay (milliseconds)
-  # Time the producer waits to accumulate a batch; increasing improves throughput but adds latency
-  linger_ms: 100
-  
-  # Messages per batch
-  # Number of messages sent per batch
-  batch_rows: 10
-  
-  # The following credentials are only used when security_protocol is not plaintext
-  # username: "your_kafka_username"
-  # password: "your_kafka_password"
+  path: /var/log/joblens/output.log          # Local output file path
