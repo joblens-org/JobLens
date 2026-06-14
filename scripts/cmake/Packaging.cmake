@@ -130,6 +130,8 @@ endif()
 message(STATUS "RPM requires: ${CPACK_RPM_PACKAGE_REQUIRES}")
 set(CPACK_RPM_BUILDREQUIRES "cmake >= 3.25, gcc-c++, systemd, libbpf-devel, libnl3-devel, openssl-devel, zlib-devel, lua-devel, clang, libcurl-devel, librdkafka-devel, boost-devel, leveldb-devel, elfutils-libelf-devel, xxhash-devel, spdlog-devel, yaml-cpp-devel, fmt-devel")
 
+set(CPACK_RPM_PRE_INSTALL_SCRIPT_FILE
+    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/rpm/preinstall.sh)
 set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE
     ${CMAKE_CURRENT_SOURCE_DIR}/scripts/rpm/postinstall.sh)
 set(CPACK_RPM_PRE_UNINSTALL_SCRIPT_FILE
