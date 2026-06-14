@@ -4,6 +4,22 @@
 
 rm -f /var/JobLens/JobLens.lock
 
+# ---- 升级时恢复配置备份 ----
+# %pre 脚本将旧配置重命名为 config.yaml.rpmorig，使 RPM 无法根据数据库
+# 记录判定"未修改"而覆盖。此处将备份恢复，确保升级不会丢失用户配置。
+if [ "$1" -eq 2 ] && [ -f /etc/JobLens/config.yaml.rpmorig ]; then
+    if cmp -s /etc/JobLens/config.yaml.rpmorig /etc/JobLens/config.yaml 2>/dev/null; then
+        # 内容相同，删除备份即可
+        rm -f /etc/JobLens/config.yaml.rpmorig
+    else
+        # 内容不同（用户修改过），保留旧配置，新版本存为 .rpmnew
+        mv /etc/JobLens/config.yaml /etc/JobLens/config.yaml.rpmnew
+        mv /etc/JobLens/config.yaml.rpmorig /etc/JobLens/config.yaml
+        echo "info: existing config preserved at /etc/JobLens/config.yaml"
+        echo "info: new default saved as /etc/JobLens/config.yaml.rpmnew"
+    fi
+fi
+
 if [ -x /usr/bin/systemctl ]; then
     /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || :
 fi
