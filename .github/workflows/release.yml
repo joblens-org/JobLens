@@ -109,7 +109,9 @@ jobs:
         run: |
           DIST_TAG=$(rpm -E '%{?dist}' 2>/dev/null || echo '')
           echo "Dist tag: ${DIST_TAG}"
-          cmake --preset ${{ matrix.target.preset }} -DCPACK_RPM_PACKAGE_RELEASE="1${DIST_TAG}"
+          cmake --preset ${{ matrix.target.preset }} \
+            -DBUILD_ID="$(echo '${{ github.sha }}' | cut -c1-7)" \
+            -DCPACK_RPM_PACKAGE_RELEASE="1${DIST_TAG}"
 
       - name: Build
         run: cmake --build --preset ${{ matrix.target.preset }}
