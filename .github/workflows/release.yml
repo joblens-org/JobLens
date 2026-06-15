@@ -57,8 +57,9 @@ jobs:
     strategy:
       matrix:
         target:
-          - { name: fedora, image: fedora:latest, dist: .fc41 }
-          - { name: el9,   image: almalinux:9,   dist: .el9  }
+          - { name: fedora, image: fedora:latest, preset: rpm-system-deps }
+          - { name: el9,   image: almalinux:9,   preset: rpm-system-deps }
+          - { name: fedora-static-epel, image: fedora:latest, preset: rpm-static-epel }
       fail-fast: false
     container:
       image: ${{ matrix.target.image }}
@@ -106,7 +107,9 @@ jobs:
 
       - name: Configure
         run: |
-          cmake --preset rpm-system-deps -DCPACK_RPM_PACKAGE_RELEASE="1${{ matrix.target.dist }}"
+          DIST_TAG=$(rpm -E '%{?dist}' 2>/dev/null || echo '')
+          echo "Dist tag: ${DIST_TAG}"
+          cmake --preset ${{ matrix.target.preset }} -DCPACK_RPM_PACKAGE_RELEASE="1${DIST_TAG}"
 
       - name: Build
         run: cmake --build --preset rpm-system-deps
@@ -129,33 +132,41 @@ jobs:
           objdump -p build/JobLens | grep NEEDED | sort -u
 
       - name: Package (CPack TGZ + RPM)
-        run: cpack --preset rpm-system-deps
+        run: cpack --preset ${{ matrix.target.preset }}
 
       - name: Verify core artifacts
         run: |
           set -e
-          echo "=== TGZ ==="
-          ls -lh build/joblens-*-Linux-x86_64.tar.gz
           echo "=== RPM ==="
           ls -lh build/joblens-*.rpm
 
-          tar -tzf build/joblens-*-Linux-x86_64.tar.gz | grep -q 'bin/JobLens$' \
-            && echo "OK: JobLens binary" \
-            || { echo "FAIL: missing JobLens binary"; exit 1; }
-
-          tar -tzf build/joblens-*-Linux-x86_64.tar.gz | grep -q 'etc/JobLens/config.yaml$' \
-            && echo "OK: default config" \
-            || { echo "FAIL: missing config.yaml"; exit 1; }
+          if [ "${{ matrix.target.preset }}" = "rpm-system-deps" ]; then
+            echo "=== TGZ ==="
+            ls -lh build/joblens-*-Linux-x86_64.tar.gz
+            tar -tzf build/joblens-*-Linux-x86_64.tar.gz | grep -q 'bin/JobLens$' \
+              && echo "OK: JobLens binary in TGZ" \
+              || { echo "FAIL: missing JobLens binary in TGZ"; exit 1; }
+            tar -tzf build/joblens-*-Linux-x86_64.tar.gz | grep -q 'etc/JobLens/config.yaml$' \
+              && echo "OK: default config in TGZ" \
+              || { echo "FAIL: missing config.yaml in TGZ"; exit 1; }
+          fi
 
           echo "Core build completed"
 
-      - name: Upload core artifacts
+      - name: Upload RPM artifact
         uses: actions/upload-artifact@v4
         with:
           name: core-packages-${{ matrix.target.name }}
-          path: |
-            build/joblens-*-Linux-x86_64.tar.gz
-            build/joblens-*.rpm
+          path: build/joblens-*.rpm
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload TGZ artifact
+        if: matrix.target.preset == 'rpm-system-deps'
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-tgz-${{ matrix.target.name }}
+          path: build/joblens-*-Linux-x86_64.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -218,7 +229,7 @@ jobs:
       - name: Download core packages (all distros)
         uses: actions/download-artifact@v4
         with:
-          pattern: core-packages-*
+          pattern: core-*
           path: release-assets
           merge-multiple: true
 
@@ -249,7 +260,7 @@ jobs:
             echo "| Package | Description |"
             echo "|---------|-------------|"
             echo "| jobLens-${VERSION}-Linux.tar.gz | Core binary + config + systemd unit (portable TGZ) |"
-            echo "| joblens-${VERSION}-1.*.x86_64.rpm (x2) | Core RPM for RHEL 9 / Fedora (systemd-managed) |"
+            echo "| joblens-${VERSION}-1.*.x86_64.rpm (x3) | Core RPM for RHEL 9 / Fedora (systemd-managed, + self-contained) |"
             echo "| joblens-trigger-${TRIGGER_VERSION}-*.rpm | Trigger REST API service RPM (Flask + Gunicorn) |"
             echo "| SHA256SUMS.txt | Checksums for integrity verification |"
             echo ""

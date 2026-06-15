@@ -21,8 +21,9 @@ jobs:
     strategy:
       matrix:
         target:
-          - { name: fedora, image: fedora:latest, dist: .fc41 }
-          - { name: el9,   image: almalinux:9,   dist: .el9  }
+          - { name: fedora, image: fedora:latest, preset: rpm-system-deps }
+          - { name: el9,   image: almalinux:9,   preset: rpm-system-deps }
+          - { name: fedora-static-epel, image: fedora:latest, preset: rpm-static-epel }
       fail-fast: false
     container:
       image: ${{ matrix.target.image }}
@@ -70,8 +71,8 @@ jobs:
 
       - name: Configure & Build (CMakePresets)
         run: |
-          cmake --preset rpm-system-deps -DCPACK_RPM_PACKAGE_RELEASE="1${{ matrix.target.dist }}"
-          cmake --build --preset rpm-system-deps
+          cmake --preset ${{ matrix.target.preset }} -DCPACK_RPM_PACKAGE_RELEASE="1${{ matrix.target.dist }}"
+          cmake --build --preset ${{ matrix.target.preset }}
 
       - name: Diagnose binary dependencies
         run: |
@@ -92,9 +93,10 @@ jobs:
 
       - name: Package (CPack TGZ + RPM)
         run: |
-          cpack --preset rpm-system-deps
+          cpack --preset ${{ matrix.target.preset }}
 
       - name: Verify TGZ contents
+        if: matrix.target.preset == 'rpm-system-deps'
         run: |
           echo "=== TGZ 包列表 ==="
           TGZ=$(ls build/joblens-*-Linux-x86_64.tar.gz | head -1)
@@ -127,7 +129,11 @@ jobs:
           rpm -qpl "$RPM" | grep -q '/lib/joblens/bpf_obj/.*\.bpf\.o$' && echo "✓ eBPF 对象文件" || echo "⚠ 未找到 bpf_obj"
           rpm -qpl "$RPM" | grep -q '/etc/JobLens/config.yaml$' && echo "✓ 默认配置文件" || { echo "✗ 缺少 config.yaml"; exit 1; }
           rpm -qpl "$RPM" | grep -q '/systemd/system/joblens.service$' && echo "✓ systemd 服务单元" || echo "⚠ 未找到 joblens.service"
-          ! rpm -qpl "$RPM" | grep -q '/lib/joblens/.*\.so' && echo "✓ 未捆绑 .so (系统依赖模式)" || { echo "✗ 不应包含 .so"; exit 1; }
+          if [ "${{ matrix.target.preset }}" = "rpm-system-deps" ]; then
+            ! rpm -qpl "$RPM" | grep -q '/lib/joblens/.*\.so' && echo "✓ 未捆绑 .so (系统依赖模式)" || { echo "✗ 不应包含 .so"; exit 1; }
+          elif [ "${{ matrix.target.preset }}" = "rpm-static-epel" ]; then
+            rpm -qpl "$RPM" | grep -q '/lib/joblens/.*\.so' && echo "✓ 已捆绑 .so (自包含模式)" || { echo "✗ 缺少捆绑的 .so"; exit 1; }
+          fi
 
           echo ""
           echo "=== RPM 依赖 ==="
@@ -147,6 +153,7 @@ jobs:
           path: build/joblens-*.rpm
 
       - name: Upload TGZ artifact
+        if: matrix.target.preset == 'rpm-system-deps'
         uses: actions/upload-artifact@v4
         with:
           name: joblens-core-tgz-${{ matrix.target.name }}
