@@ -185,12 +185,12 @@ jobs:
           # 1) 必须捆绑 .so — collect_libs.sh 收集的非系统库应打包进 RPM
           rpm -qpl "$RPM" | grep -qE '/lib[0-9]*/joblens/[^/]*\.so' && echo "✓ 已捆绑 .so (自包含离线部署)" || { echo "✗ 缺少捆绑的 .so"; exit 1; }
 
-          # 2) RPM Requires 应仅包含 systemd — EPEL 库已静态链接或捆绑，不声明运行时依赖
+          # 2) RPM Requires 应仅包含 systemd — EPEL 库已随 .so 捆绑（或静态链接），不应声明运行时依赖
           REQS=$(rpm -qp --requires "$RPM")
-          echo "   检查 Requires 中不应包含 leveldb (已静态链接)..."
-          echo "$REQS" | grep -q 'leveldb' && { echo "   ✗ 不应声明 leveldb 依赖 (已静态链接进二进制)"; exit 1; } || echo "   ✓ 未声明 leveldb"
-          echo "   检查 Requires 中不应包含 xxhash (已静态链接)..."
-          echo "$REQS" | grep -q 'xxhash' && { echo "   ✗ 不应声明 xxhash 依赖 (已静态链接进二进制)"; exit 1; } || echo "   ✓ 未声明 xxhash"
+          echo "   检查 Requires 中不应包含 leveldb (已捆绑 .so 或静态链接)..."
+          echo "$REQS" | grep -q 'leveldb' && { echo "   ✗ leveldb 仍被 RPM 声明为依赖 (检查 CPACK_RPM_PACKAGE_AUTOREQ 是否关闭)"; exit 1; } || echo "   ✓ 未声明 leveldb 依赖"
+          echo "   检查 Requires 中不应包含 xxhash (已捆绑 .so 或静态链接)..."
+          echo "$REQS" | grep -q 'xxhash' && { echo "   ✗ xxhash 仍被 RPM 声明为依赖 (检查 CPACK_RPM_PACKAGE_AUTOREQ 是否关闭)"; exit 1; } || echo "   ✓ 未声明 xxhash 依赖"
 
           # 3) 确认捆绑的 .so 列表（信息输出，非硬性检查）
           echo ""

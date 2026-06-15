@@ -191,8 +191,8 @@ jobs:
           REQS=$(rpm -qp --requires "$RPM")
 
           rpm -qpl "$RPM" | grep -qE '/lib[0-9]*/joblens/[^/]*\.so' && echo "OK: bundled .so (self-contained)" || { echo "FAIL: missing bundled .so"; exit 1; }
-          echo "$REQS" | grep -q 'leveldb' && { echo "FAIL: leveldb should be statically linked, not in Requires"; exit 1; } || echo "OK: no leveldb in Requires"
-          echo "$REQS" | grep -q 'xxhash' && { echo "FAIL: xxhash should be statically linked, not in Requires"; exit 1; } || echo "OK: no xxhash in Requires"
+          echo "$REQS" | grep -q 'leveldb' && { echo "FAIL: leveldb should be bundled/static, not in Requires"; exit 1; } || echo "OK: no leveldb in Requires"
+          echo "$REQS" | grep -q 'xxhash' && { echo "FAIL: xxhash should be bundled/static, not in Requires"; exit 1; } || echo "OK: no xxhash in Requires"
 
       - name: Verify complete
         run: echo "Core build completed"
