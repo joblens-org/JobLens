@@ -26,14 +26,17 @@ option(JOBLENS_BUNDLE_LIBS "Bundle runtime .so into RPM" ON)
 option(JOBLENS_STATIC_EPEL "Statically link EPEL-only libraries (leveldb, xxhash)" OFF)
 
 # ---- Version Info ----
-find_package(Git QUIET)
-if(Git_FOUND)
-  execute_process(
-    COMMAND git rev-parse --short=7 HEAD
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    OUTPUT_VARIABLE BUILD_ID
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET)
+# BUILD_ID can be set externally (e.g. -DBUILD_ID=abc1234 from CI)
+if(NOT BUILD_ID)
+  find_package(Git QUIET)
+  if(Git_FOUND)
+    execute_process(
+      COMMAND git rev-parse --short=7 HEAD
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      OUTPUT_VARIABLE BUILD_ID
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+  endif()
 endif()
 if(NOT BUILD_ID)
   set(BUILD_ID "unknown")

@@ -71,7 +71,9 @@ jobs:
 
       - name: Configure & Build (CMakePresets)
         run: |
-          cmake --preset ${{ matrix.target.preset }} -DCPACK_RPM_PACKAGE_RELEASE="1${{ matrix.target.dist }}"
+          cmake --preset ${{ matrix.target.preset }} \
+            -DBUILD_ID="$(echo '${{ github.sha }}' | cut -c1-7)" \
+            -DCPACK_RPM_PACKAGE_RELEASE="1${{ matrix.target.dist }}"
           cmake --build --preset ${{ matrix.target.preset }}
 
       - name: Diagnose binary dependencies
