@@ -95,6 +95,9 @@ jobs:
         run: |
           cpack --preset ${{ matrix.target.preset }}
 
+      # ════════════════════════════════════════════════════════
+      # TGZ 验证（仅 rpm-system-deps 产出 TGZ）
+      # ════════════════════════════════════════════════════════
       - name: Verify TGZ contents
         if: matrix.target.preset == 'rpm-system-deps'
         run: |
@@ -105,13 +108,20 @@ jobs:
           echo ""
           echo "=== TGZ 关键产物检查 ==="
           tar -tzf "$TGZ" | grep -q 'bin/JobLens$' && echo "✓ JobLens 二进制" || { echo "✗ 缺少 JobLens"; exit 1; }
-          tar -tzf "$TGZ" | grep -q 'lib/joblens/bpf_obj/.*\.bpf\.o$' && echo "✓ eBPF 对象文件" || echo "⚠ 未找到 bpf_obj"
+          tar -tzf "$TGZ" | grep -qE 'lib[0-9]*/joblens/bpf_obj/[^/]*\.bpf\.o$' && echo "✓ eBPF 对象文件" || echo "⚠ 未找到 bpf_obj"
           tar -tzf "$TGZ" | grep -q 'etc/JobLens/config.yaml$' && echo "✓ 默认配置文件" || { echo "✗ 缺少 config.yaml"; exit 1; }
           tar -tzf "$TGZ" | grep -q 'systemd/system/joblens.service$' && echo "✓ systemd 服务单元" || echo "⚠ 未找到 joblens.service"
-          ! tar -tzf "$TGZ" | grep -q 'lib/joblens/.*\.so' && echo "✓ 未捆绑 .so (系统依赖模式)" || { echo "✗ 不应包含 .so"; exit 1; }
+
+          echo ""
+          echo "=== TGZ 系统依赖模式专项检查 ==="
+          # 系统依赖模式：不应捆绑任何 .so，运行时依赖系统包管理器提供
+          ! tar -tzf "$TGZ" | grep -qE 'lib[0-9]*/joblens/[^/]*\.so' && echo "✓ 未捆绑 .so (系统依赖模式)" || { echo "✗ 不应包含 .so"; exit 1; }
           echo "TGZ 大小: $(ls -lh "$TGZ" | awk '{print $5}')"
 
-      - name: Verify RPM contents
+      # ════════════════════════════════════════════════════════
+      # RPM 通用检查（两种模式共用）
+      # ════════════════════════════════════════════════════════
+      - name: Verify RPM (common checks)
         run: |
           echo "=== RPM 包信息 ==="
           RPM=$(ls build/joblens-*.rpm 2>/dev/null | head -1)
@@ -124,19 +134,14 @@ jobs:
           rpm -qpl "$RPM"
 
           echo ""
-          echo "=== RPM 关键产物检查 ==="
+          echo "=== RPM 通用产物检查 ==="
           rpm -qpl "$RPM" | grep -q '/bin/JobLens$' && echo "✓ JobLens 二进制" || { echo "✗ 缺少 JobLens"; exit 1; }
-          rpm -qpl "$RPM" | grep -q '/lib/joblens/bpf_obj/.*\.bpf\.o$' && echo "✓ eBPF 对象文件" || echo "⚠ 未找到 bpf_obj"
+          rpm -qpl "$RPM" | grep -qE '/lib[0-9]*/joblens/bpf_obj/[^/]*\.bpf\.o$' && echo "✓ eBPF 对象文件" || echo "⚠ 未找到 bpf_obj"
           rpm -qpl "$RPM" | grep -q '/etc/JobLens/config.yaml$' && echo "✓ 默认配置文件" || { echo "✗ 缺少 config.yaml"; exit 1; }
           rpm -qpl "$RPM" | grep -q '/systemd/system/joblens.service$' && echo "✓ systemd 服务单元" || echo "⚠ 未找到 joblens.service"
-          if [ "${{ matrix.target.preset }}" = "rpm-system-deps" ]; then
-            ! rpm -qpl "$RPM" | grep -q '/lib/joblens/.*\.so' && echo "✓ 未捆绑 .so (系统依赖模式)" || { echo "✗ 不应包含 .so"; exit 1; }
-          elif [ "${{ matrix.target.preset }}" = "rpm-static-epel" ]; then
-            rpm -qpl "$RPM" | grep -q '/lib/joblens/.*\.so' && echo "✓ 已捆绑 .so (自包含模式)" || { echo "✗ 缺少捆绑的 .so"; exit 1; }
-          fi
 
           echo ""
-          echo "=== RPM 依赖 ==="
+          echo "=== RPM 全部运行时依赖 ==="
           rpm -qp --requires "$RPM" | sort
 
           echo ""
@@ -145,6 +150,54 @@ jobs:
 
           echo ""
           echo "RPM 大小: $(ls -lh "$RPM" | awk '{print $5}')"
+
+          # 将 RPM 路径写入 GITHUB_ENV 供后续模式专项步骤使用
+          echo "RPM_FILE=${RPM}" >> "${GITHUB_ENV}"
+
+      # ════════════════════════════════════════════════════════
+      # RPM 系统依赖模式专项检查
+      # ════════════════════════════════════════════════════════
+      - name: Verify RPM (system-deps mode)
+        if: matrix.target.preset == 'rpm-system-deps'
+        run: |
+          RPM="${RPM_FILE}"
+          echo "=== 系统依赖模式专项检查 ==="
+
+          # 1) 不应捆绑 .so — 所有动态库由系统 RPM 包管理器声明
+          ! rpm -qpl "$RPM" | grep -qE '/lib[0-9]*/joblens/[^/]*\.so' && echo "✓ 未捆绑 .so (运行时依赖系统包管理器)" || { echo "✗ 不应包含 .so"; exit 1; }
+
+          # 2) RPM Requires 必须声明完整系统依赖（含 EPEL 来源的 leveldb / xxhash）
+          REQS=$(rpm -qp --requires "$RPM")
+          echo "   检查 Requires 中包含 leveldb..."
+          echo "$REQS" | grep -q 'leveldb' && echo "   ✓ Requires 声明 leveldb" || { echo "   ✗ 缺少 leveldb 依赖声明"; exit 1; }
+          echo "   检查 Requires 中包含 xxhash..."
+          echo "$REQS" | grep -q 'xxhash' && echo "   ✓ Requires 声明 xxhash" || { echo "   ✗ 缺少 xxhash 依赖声明"; exit 1; }
+
+      # ════════════════════════════════════════════════════════
+      # RPM 自包含模式专项检查
+      # ════════════════════════════════════════════════════════
+      - name: Verify RPM (static-epel mode)
+        if: matrix.target.preset == 'rpm-static-epel'
+        run: |
+          RPM="${RPM_FILE}"
+          echo "=== 自包含模式专项检查 ==="
+
+          # 1) 必须捆绑 .so — collect_libs.sh 收集的非系统库应打包进 RPM
+          rpm -qpl "$RPM" | grep -qE '/lib[0-9]*/joblens/[^/]*\.so' && echo "✓ 已捆绑 .so (自包含离线部署)" || { echo "✗ 缺少捆绑的 .so"; exit 1; }
+
+          # 2) RPM Requires 应仅包含 systemd — EPEL 库已静态链接或捆绑，不声明运行时依赖
+          REQS=$(rpm -qp --requires "$RPM")
+          echo "   检查 Requires 中不应包含 leveldb (已静态链接)..."
+          echo "$REQS" | grep -q 'leveldb' && { echo "   ✗ 不应声明 leveldb 依赖 (已静态链接进二进制)"; exit 1; } || echo "   ✓ 未声明 leveldb"
+          echo "   检查 Requires 中不应包含 xxhash (已静态链接)..."
+          echo "$REQS" | grep -q 'xxhash' && { echo "   ✗ 不应声明 xxhash 依赖 (已静态链接进二进制)"; exit 1; } || echo "   ✓ 未声明 xxhash"
+
+          # 3) 确认捆绑的 .so 列表（信息输出，非硬性检查）
+          echo ""
+          echo "=== 捆绑的 .so 列表 ==="
+          rpm -qpl "$RPM" | grep -E '/lib[0-9]*/joblens/[^/]*\.so' | while read so; do
+            echo "   $(basename "$so")"
+          done
 
       - name: Upload RPM artifact
         uses: actions/upload-artifact@v4
