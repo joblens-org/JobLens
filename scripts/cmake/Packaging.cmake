@@ -120,7 +120,10 @@ set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
 # 自包含模式 vs 系统依赖模式
 if(JOBLENS_BUNDLE_LIBS)
     # 自包含模式：.so 已打包进 RPM，RPATH 优先加载自带版本
-    # RPM Requires 最小化，适合无网络离线部署
+    # 禁用 CPack 自动依赖检测 — 所有运行时依赖已随 .so 捆绑
+    # 否则 CPack 会扫描二进制 NEEDED 并自动追加 leveldb/xxhash 等 Requires
+    set(CPACK_RPM_PACKAGE_AUTOREQ OFF)
+    set(CPACK_RPM_PACKAGE_AUTOPROV OFF)
     set(CPACK_RPM_PACKAGE_REQUIRES "systemd")
 else()
     # 系统依赖模式：所有动态库由 RPM 包管理器提供（含 EPEL）
