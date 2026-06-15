@@ -112,7 +112,7 @@ jobs:
           cmake --preset ${{ matrix.target.preset }} -DCPACK_RPM_PACKAGE_RELEASE="1${DIST_TAG}"
 
       - name: Build
-        run: cmake --build --preset rpm-system-deps
+        run: cmake --build --preset ${{ matrix.target.preset }}
 
       - name: Diagnose binary dependencies
         run: |
@@ -134,24 +134,68 @@ jobs:
       - name: Package (CPack TGZ + RPM)
         run: cpack --preset ${{ matrix.target.preset }}
 
-      - name: Verify core artifacts
+      # ════════════════════════════════════════════════════════
+      # TGZ 验证（仅 rpm-system-deps 产出 TGZ）
+      # ════════════════════════════════════════════════════════
+      - name: Verify TGZ contents
+        if: matrix.target.preset == 'rpm-system-deps'
+        run: |
+          set -e
+          echo "=== TGZ ==="
+          TGZ=$(ls build/joblens-*-Linux-x86_64.tar.gz | head -1)
+          ls -lh "$TGZ"
+
+          tar -tzf "$TGZ" | grep -q 'bin/JobLens$' && echo "OK: JobLens binary" || { echo "FAIL: missing JobLens"; exit 1; }
+          tar -tzf "$TGZ" | grep -qE 'lib[0-9]*/joblens/bpf_obj/[^/]*\.bpf\.o$' && echo "OK: eBPF objects" || { echo "FAIL: missing bpf_obj"; exit 1; }
+          tar -tzf "$TGZ" | grep -q 'etc/JobLens/config.yaml$' && echo "OK: config" || { echo "FAIL: missing config"; exit 1; }
+          ! tar -tzf "$TGZ" | grep -qE 'lib[0-9]*/joblens/[^/]*\.so' && echo "OK: no bundled .so (system-deps)" || { echo "FAIL: should not bundle .so"; exit 1; }
+
+      # ════════════════════════════════════════════════════════
+      # RPM 通用检查
+      # ════════════════════════════════════════════════════════
+      - name: Verify RPM (common checks)
         run: |
           set -e
           echo "=== RPM ==="
-          ls -lh build/joblens-*.rpm
+          RPM=$(ls build/joblens-*.rpm 2>/dev/null | head -1)
+          ls -lh "$RPM"
 
-          if [ "${{ matrix.target.preset }}" = "rpm-system-deps" ]; then
-            echo "=== TGZ ==="
-            ls -lh build/joblens-*-Linux-x86_64.tar.gz
-            tar -tzf build/joblens-*-Linux-x86_64.tar.gz | grep -q 'bin/JobLens$' \
-              && echo "OK: JobLens binary in TGZ" \
-              || { echo "FAIL: missing JobLens binary in TGZ"; exit 1; }
-            tar -tzf build/joblens-*-Linux-x86_64.tar.gz | grep -q 'etc/JobLens/config.yaml$' \
-              && echo "OK: default config in TGZ" \
-              || { echo "FAIL: missing config.yaml in TGZ"; exit 1; }
-          fi
+          rpm -qpl "$RPM" | grep -q '/bin/JobLens$' && echo "OK: JobLens binary" || { echo "FAIL: missing JobLens"; exit 1; }
+          rpm -qpl "$RPM" | grep -qE '/lib[0-9]*/joblens/bpf_obj/[^/]*\.bpf\.o$' && echo "OK: eBPF objects" || { echo "FAIL: missing bpf_obj"; exit 1; }
+          rpm -qpl "$RPM" | grep -q '/etc/JobLens/config.yaml$' && echo "OK: config" || { echo "FAIL: missing config"; exit 1; }
 
-          echo "Core build completed"
+          echo "RPM_FILE=${RPM}" >> "${GITHUB_ENV}"
+
+      # ════════════════════════════════════════════════════════
+      # RPM 系统依赖模式专项检查
+      # ════════════════════════════════════════════════════════
+      - name: Verify RPM (system-deps mode)
+        if: matrix.target.preset == 'rpm-system-deps'
+        run: |
+          set -e
+          RPM="${RPM_FILE}"
+          REQS=$(rpm -qp --requires "$RPM")
+
+          ! rpm -qpl "$RPM" | grep -qE '/lib[0-9]*/joblens/[^/]*\.so' && echo "OK: no bundled .so" || { echo "FAIL: should not bundle .so"; exit 1; }
+          echo "$REQS" | grep -q 'leveldb' && echo "OK: Requires leveldb" || { echo "FAIL: missing leveldb dep"; exit 1; }
+          echo "$REQS" | grep -q 'xxhash' && echo "OK: Requires xxhash" || { echo "FAIL: missing xxhash dep"; exit 1; }
+
+      # ════════════════════════════════════════════════════════
+      # RPM 自包含模式专项检查
+      # ════════════════════════════════════════════════════════
+      - name: Verify RPM (static-epel mode)
+        if: matrix.target.preset == 'rpm-static-epel'
+        run: |
+          set -e
+          RPM="${RPM_FILE}"
+          REQS=$(rpm -qp --requires "$RPM")
+
+          rpm -qpl "$RPM" | grep -qE '/lib[0-9]*/joblens/[^/]*\.so' && echo "OK: bundled .so (self-contained)" || { echo "FAIL: missing bundled .so"; exit 1; }
+          echo "$REQS" | grep -q 'leveldb' && { echo "FAIL: leveldb should be statically linked, not in Requires"; exit 1; } || echo "OK: no leveldb in Requires"
+          echo "$REQS" | grep -q 'xxhash' && { echo "FAIL: xxhash should be statically linked, not in Requires"; exit 1; } || echo "OK: no xxhash in Requires"
+
+      - name: Verify complete
+        run: echo "Core build completed"
 
       - name: Upload RPM artifact
         uses: actions/upload-artifact@v4
