@@ -6,7 +6,7 @@
 
 cmake_minimum_required(VERSION 3.25)
 project(JobLens
-        VERSION 0.1.0
+        VERSION 0.1.1
         DESCRIPTION "High-performance job profiler"
         LANGUAGES CXX)
 
