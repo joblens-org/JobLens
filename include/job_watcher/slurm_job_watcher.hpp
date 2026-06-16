@@ -209,7 +209,7 @@ private:
     bool polling_running{false};
     std::unique_ptr<std::thread> poll_thread;
     std::vector<std::string> use_collectors;
-    std::string bpf_o_path = "lib/joblens/bpf_obj/trace_slurm_stepd.bpf.o";
+    std::string bpf_o_path = JOBLENS_INSTALL_LIBDIR "/joblens/bpf_obj/trace_slurm_stepd.bpf.o";
     std::string rb_name = "slurm_exec_events";
     std::function<void(Job)> add_if_;
     std::vector<bpf_link*> bpf_links_;

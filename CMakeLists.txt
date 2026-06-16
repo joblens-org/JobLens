@@ -223,5 +223,8 @@ target_link_libraries(JobLens
         $<$<BOOL:${XXHASH_USE_STATIC}>:${XXHASH_STATIC_LIB}>
         $<$<NOT:$<BOOL:${XXHASH_USE_STATIC}>>:PkgConfig::XXHASH>)
 
+# 将安装时的 lib 目录（lib 或 lib64）作为编译期宏传入，用于运行时拼接 bpf 对象路径
+target_compile_definitions(JobLens PRIVATE JOBLENS_INSTALL_LIBDIR="${CMAKE_INSTALL_LIBDIR}")
+
 # ---- Packaging (install / systemd / CPack) ----
 include(${CMAKE_CURRENT_SOURCE_DIR}/scripts/cmake/Packaging.cmake)
