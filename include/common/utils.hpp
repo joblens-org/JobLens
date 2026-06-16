@@ -177,7 +177,11 @@ namespace Utils
     }
 
     inline std::string parentDir(const std::string& path) {
-        fs::path p(path);
+        // 去除尾随斜杠，防止 parent_path() 将尾随斜杠视为空文件名导致少上一级目录
+        std::string clean = path;
+        while (clean.size() > 1 && clean.back() == '/')
+            clean.pop_back();
+        fs::path p(clean);
         if (p.has_relative_path()) p = fs::absolute(p);
         return p.parent_path().string() + '/';
     }
