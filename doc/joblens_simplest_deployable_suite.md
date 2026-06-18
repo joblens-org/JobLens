@@ -1,9 +1,9 @@
 # JobLens Minimal Deployment Kit (Agent + Agent Trigger)
 
-> **Document Version**: v1.0.0  
-> **Last Updated**: 2026-04-25  
-> **Agent RPM**: joblens-0.0.21-1.el9.x86_64.rpm  
-> **Trigger RPM**: joblens-trigger-0.0.13-1.el9.x86_64.rpm  
+> **Document Version**: v1.1.0  
+> **Last Updated**: 2026-06-17  
+> **Agent RPM**: joblens-0.1.1-1.el9.x86_64.rpm  
+> **Trigger RPM**: joblens-trigger-0.1.0-1.el9.x86_64.rpm  
 > **Status**: Production-tested at IHEP, open for cross-site evaluation
 
 ## 1. Project Overview
@@ -11,7 +11,7 @@
 - **JobLens** is a **Job-Native** observability system. The **Agent** is a collection daemon deployed on compute nodes.
 - **Goal of this kit**: Rapidly deploy the Agent and local control components on evaluation nodes to enable job-level data collection, basic querying, and forwarding.
 - **Target audience**: Site administrators, experiment computing operations teams, and partner institutions evaluating the stack.
-- **Current delivery**: RPM packages only. Open-source release of the codebase is in active preparation.
+- **Current delivery**: RPM packages for convenience, and full source code available at [joblens-org/JobLens](https://github.com/joblens-org/JobLens).
 
 ## 2. Glossary
 
@@ -20,6 +20,7 @@
 | **JobLens Agent** | The collection daemon running on compute nodes. |
 | **JobLens Trigger** | Local control interface for the Agent, responsible for lifecycle management, rule injection, and job metadata registration. *(Internal codename "Trigger" is retained for historical reasons.)* |
 | **JobLens Manager** *(not included in this kit)* | Centralized control plane for unified configuration, rule distribution, and operational monitoring. Planned for future release. |
+| **JobLens TAP** (Trigger & Access Point) | Standalone visualization data hub and query gateway for Elasticsearch backend. Deployed independently. |
 
 ## 3. Architecture at a Glance
 
@@ -42,7 +43,7 @@ Current production deployment at IHEP:
 
 **Resource Footprint**
 
-- Designed for minimal overhead. On a 256-core production node:
+- Designed for minimal overhead. On a 256-core production node monitoring 251 HTCondor jobs:
   - **CPU**: **< 0.15%** of total node capacity (~37% of a single logical core)
   - **Memory**: **~145 MB** RSS
 - Scales roughly linearly with core count due to per-CPU eBPF maps.
@@ -59,7 +60,7 @@ Current production deployment at IHEP:
 
 | Option | Description | Use Case |
 |--------|-------------|----------|
-| **A: Full evaluation (with visualization)** | Deploy your own **Elasticsearch (>= 7.x)** as the data backend. The Python visualization script queries ES. | End-to-end trial with dashboards |
+| **A: Full evaluation (with visualization)** | Deploy your own **Elasticsearch (>= 7.x)** as the data backend. Query and visualize data via [JobLens-TAP](https://github.com/joblens-org/JobLens-TAP). | End-to-end trial with dashboards |
 | **B: Agent-only (no ES required)** | The Agent runs standalone and writes to local files. With config `log_level: debug`, you can observe captured metrics in real time via `journalctl -u joblens -f`.<br><br>⚠️ **Caution**: Writing large volumes of job metrics to local files may cause I/O pressure under heavy load. This mode is intended **only for functional testing**, not production use. | Quick functionality check without backend infrastructure |
 
 ### 5.1 Install the RPMs
@@ -91,11 +92,15 @@ Default configurations are shipped with the RPMs. Modify them to match your envi
 
 ### 5.3 Start and Health Check
 
-The RPM installation automatically starts both services via `systemd`.
+After RPM installation, **the services are not started by default**. You must start them manually.
 
 ```bash
+# Start services
+systemctl start joblens
+systemctl start joblens-trigger
+
 # Check service status
-sudo systemctl status joblens joblens-trigger
+systemctl status joblens joblens-trigger
 
 # Health check
 curl http://localhost:7592/joblens/healthy
@@ -103,60 +108,27 @@ curl http://localhost:7592/joblens/healthy
 
 ### 5.4 Visualization
 
-The production web dashboard at IHEP is tightly coupled with internal business logic and is **not yet available** for general deployment.
+JobLens provides a standalone visualization data hub: [JobLens-TAP](https://github.com/joblens-org/JobLens-TAP) (Telemetry Access Point).
+It is a high-performance, stateless Go-based query gateway that abstracts multiple Elasticsearch clusters and provides a standardized RESTful API:
 
-As an interim solution, we provide a lightweight **Python script** that generates an interactive, auto-refreshing web page using **Plotly**.
+- **Raw data queries** (`/data/raw`): Fetch collector-level raw sampling data
+- **Time-series aggregation** (`/data/timeseries`): Multi-metric time-series aggregation with configurable intervals and grouping
+- **Job summary queries** (`/data/summary`): Job-level aggregated summaries
+- **Schema discovery** (`/schema`): Query field and cluster metadata
+- **Collection triggering** (`/collect`): Remotely trigger JobLens Agent collection on specified nodes
 
-**Dependencies**
-```bash
-pip install plotly requests
-```
-
-**Environment variables**
-```bash
-export ES_HOST=your_es_host
-export ES_PORT=your_es_port
-export ES_SCHEME=http        # or https
-export ES_USERNAME=es_access_username
-export ES_PASSWORD=es_access_password
-```
-
-**Run the script**
-```bash
-python3 joblens-simple-viz.py <jobid>
-```
-
-**Available options**
-```bash
-usage: joblens-simple-viz.py [-h] [--cluster {ihep_condor,ihep_slurm}] [--refresh SEC] [--port PORT] [--hours N] [--no-browser] jobid
-
-positional arguments:
-  jobid                 Job ID (e.g., "12345.0" or "123456")
-
-options:
-  -h, --help            Show this help message and exit
-  --refresh SEC         Auto-refresh interval in seconds (default: 10)
-  --port PORT           Local HTTP port (default: 8765)
-  --hours N             Query data from last N hours (default: 2; set 0 for unlimited)
-  --no-browser          Do not auto-open browser
-  --cluster {ihep_condor,ihep_slurm}  Cluster context for query routing
-
-examples:
-  export ES_USERNAME=readonly
-  export ES_PASSWORD=your_password
-  python3 tools/joblens_viz.py 12345.0
-  python3 tools/joblens_viz.py 12345.0 --cluster ihep_slurm --refresh 15
-  python3 tools/joblens_viz.py 12345.0 --hours 12
-```
+TAP is deployed independently, configured via environment variables, and supports multi-cluster parallel queries,
+field alias mapping, cursor-based pagination, and SIGHUP hot-reloading.
+For detailed deployment and configuration, refer to the [JobLens-TAP repository](https://github.com/joblens-org/JobLens-TAP).
 
 ### 5.5 Uninstall and Rollback
 
 ```bash
 # Stop services
-sudo systemctl stop joblens joblens-trigger
+systemctl stop joblens joblens-trigger
 
 # Remove RPMs (configs are preserved as .rpmsave)
-sudo dnf remove joblens joblens-trigger
+dnf remove joblens joblens-trigger
 
 # Verify no residual processes
 ps aux | grep -i joblens
@@ -178,8 +150,8 @@ The Trigger can be configured with an upstream **Manager** address for service r
 
 | Method | Description |
 |--------|-------------|
-| **Automatic** | Jobs launched by **HTCondor** are discovered and associated automatically via the Starter hook mechanism. |
 | **Manual** | Use the Trigger REST API to inject a `PID → JobID` mapping for workloads not captured by auto-discovery. |
+| **Automatic** | Jobs launched by **HTCondor** are discovered and associated automatically via the Starter hook mechanism. |
 
 ## 7. Configuration Reference
 
@@ -208,7 +180,7 @@ JobLens is actively evolving toward **v1.0 API stability**. We welcome your part
 - **🔌 Scheduler Integration**: If you have expertise in **SLURM**, **PBS**, **UGE**, or other batch systems, we'd love to collaborate on auto-attachment mechanisms.
 - **💾 Backend Validation**: Help us verify implemented storage/export paths such as Kafka and Prometheus in your environment.
 
-The core Agent is **production-hardened at IHEP** (~1,000 nodes, 50,000+ cores). Peripheral components (Manager, Web UI) are iterating rapidly based on community input. Your participation will help JobLens become a portable, job-native observability foundation for HPC/HTC sites worldwide.
+The core Agent is **production-hardened at IHEP** (~1,200 nodes). Peripheral components (Manager, Web UI) are iterating rapidly based on community input. Your participation will help JobLens become a portable, job-native observability foundation for HPC/HTC sites worldwide.
 
 **Contact**:  
 `wangzhenyuan@ihep.ac.cn` (cc: `shijy@ihep.ac.cn`)
