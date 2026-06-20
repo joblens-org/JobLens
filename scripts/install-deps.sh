@@ -230,11 +230,11 @@ install_rpm() {
         nlohmann-json-devel \
         bpftool
 
-    # date-devel (Howard Hinnant) is in Fedora repos but NOT in EPEL 9
-    if ! sudo dnf install -y date-devel 2>/dev/null; then
-        echo "==> date-devel not in repos, installing from source..."
-        install_date
-    fi
+    # date-devel (Howard Hinnant) system package has broken CMake config
+    # on some Fedora versions (references /usr/include/date/date.h as source).
+    # Always build from source for consistent behavior across platforms.
+    echo "==> Building Howard Hinnant date from source..."
+    install_date
     install_sol2
     echo "Done."
 }
