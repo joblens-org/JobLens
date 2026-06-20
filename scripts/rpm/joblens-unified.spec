@@ -236,6 +236,8 @@ if ls build/bpf_obj/*.bpf.o >/dev/null 2>&1; then
 fi
 # 清理 cmake --install 可能遗留的 lib64 bpf_obj 文件
 rm -rf %{buildroot}/usr/lib64/joblens 2>/dev/null || true
+# 清理 cmake --install 可能遗留到 /lib/systemd/ 的文件（Fedora usrmerge 兼容）
+rm -rf %{buildroot}/lib/systemd 2>/dev/null || true
 
 # 17. 安装 core 配置文件（确保权限正确）
 #     cmake --install 已安装 config.example.yaml → /etc/JobLens/config.yaml，
