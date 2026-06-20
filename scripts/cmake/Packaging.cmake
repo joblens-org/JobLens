@@ -69,7 +69,7 @@ endif()
 
 # eBPF 对象文件（非标准 ELF，放到 /usr/lib/joblens/）
 install(DIRECTORY ${BPF_OBJECT_DIR}/
-        DESTINATION /usr/lib64/joblens/bpf_obj/
+        DESTINATION /usr/lib/joblens/bpf_obj/
         FILES_MATCHING PATTERN "*.bpf.o")
 
 # 配置文件

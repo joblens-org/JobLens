@@ -228,10 +228,14 @@ cd ..
 # 16. 手动确保 eBPF 对象文件安装到位
 #     cmake --install 已通过 install(DIRECTORY ...) 安装 .bpf.o，
 #     此处显式创建目录并确认文件存在（双重保障）
+#     注意：cmake --install 可能安装到 lib64/（取决于系统 LIBDIR），
+#       lib64 下的文件不在 %%files 中声明，必须清理。
 install -d -m 755 %{buildroot}/usr/lib/joblens/bpf_obj/
 if ls build/bpf_obj/*.bpf.o >/dev/null 2>&1; then
     cp build/bpf_obj/*.bpf.o %{buildroot}/usr/lib/joblens/bpf_obj/
 fi
+# 清理 cmake --install 可能遗留的 lib64 bpf_obj 文件
+rm -rf %{buildroot}/usr/lib64/joblens 2>/dev/null || true
 
 # 17. 安装 core 配置文件（确保权限正确）
 #     cmake --install 已安装 config.example.yaml → /etc/JobLens/config.yaml，
