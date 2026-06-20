@@ -211,6 +211,7 @@ prepare_sources() {
 #   传递 unified_version 宏给 spec（供未来 spec 中使用 %{unified_version}）。
 # ============================================================================
 build_rpm() {
+    local preset="$1"
     local spec_file="$PROJECT_ROOT/scripts/rpm/joblens-unified.spec"
 
     if [[ ! -f "$spec_file" ]]; then
@@ -218,10 +219,11 @@ build_rpm() {
         exit 1
     fi
 
-    log_info "开始 RPM 构建（rpmbuild -ba）..."
+    log_info "开始 RPM 构建（rpmbuild -ba, preset=${preset}）..."
     echo ""
 
     if rpmbuild -ba \
+        --define "preset ${preset}" \
         --define "unified_version ${VERSION}" \
         "$spec_file"; then
         log_info "rpmbuild 构建成功"
@@ -234,6 +236,7 @@ build_rpm() {
     echo ""
 
     rpmbuild -ba --nodeps \
+        --define "preset ${preset}" \
         --define "unified_version ${VERSION}" \
         "$spec_file"
 }
@@ -344,6 +347,9 @@ usage() {
     echo "                     - build-unified-rpm/ 目录"
     echo "                     - ~/rpmbuild/SOURCES/JobLens-*.tar.gz"
     echo ""
+    echo "  --preset <name>  指定 CMakePresets.json 中的预设（默认: rpm-system-deps）"
+    echo "                   可选: rpm-system-deps, rpm-static-epel"
+    echo ""
     echo "  -h, --help       显示此帮助信息"
     echo ""
     echo "构建流程（默认行为）:"
@@ -374,6 +380,7 @@ usage() {
 main() {
     local do_install_deps=false
     local do_clean=false
+    local preset="rpm-system-deps"
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -384,6 +391,10 @@ main() {
             --clean)
                 do_clean=true
                 shift
+                ;;
+            --preset)
+                preset="$2"
+                shift 2
                 ;;
             -h|--help)
                 usage
@@ -416,7 +427,7 @@ main() {
     setup_rpmbuild
     create_tarball
     prepare_sources
-    build_rpm
+    build_rpm "$preset"
     verify_rpm
 
     echo ""

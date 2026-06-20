@@ -70,7 +70,7 @@ jobs:
       # 统一 RPM 构建（Core C++ Agent + Python Trigger Gateway）
       # ════════════════════════════════════════════════════════
       - name: Build unified RPM
-        run: bash scripts/build-unified-rpm.sh
+        run: bash scripts/build-unified-rpm.sh --preset ${{ matrix.target.preset }}
 
       # ════════════════════════════════════════════════════════
       # 统一 RPM 内容验证

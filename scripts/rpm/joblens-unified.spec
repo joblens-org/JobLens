@@ -151,17 +151,10 @@ cp %{SOURCE2} . 2>/dev/null || :
 # %%build — 构建
 # ============================================================
 %build
-# ===== C++ core 构建 =====
-# 使用系统依赖模式（JOBLENS_BUNDLE_LIBS=OFF），让 RPM 包管理器处理运行时 .so 依赖
-mkdir -p build
-cd build
-cmake .. \
-    -G Ninja \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-    -DCMAKE_INSTALL_PREFIX=%{_prefix} \
-    -DJOBLENS_BUNDLE_LIBS=OFF
-ninja %{?_smp_mflags}
-cd ..
+# ===== C++ core 构建（全部配置来自 CMakePresets.json）=====
+# %{preset} 由 rpmbuild --define "preset <name>" 传入，默认 rpm-system-deps
+cmake --preset %{?preset}%{!?preset:rpm-system-deps}
+cmake --build --preset %{?preset}%{!?preset:rpm-system-deps}
 
 # ===== Python trigger：纯 Python 项目 =====
 # pip install 在 %%install 中直接处理（与旧 trigger spec 策略一致）
@@ -221,9 +214,8 @@ install -d -m 755 %{buildroot}%{_sharedstatedir}/joblens
 
 # 15. cmake --install：安装 JobLens 二进制 + eBPF 对象 + 配置文件 + systemd service
 #     DESTDIR=%%{buildroot} 确保所有产物写入 RPM buildroot
-cd build
-DESTDIR=%{buildroot} cmake --install . --prefix %{_prefix}
-cd ..
+#     使用 CMakePresets 中预设定义的构建目录（build/）
+DESTDIR=%{buildroot} cmake --install build --prefix %{_prefix}
 
 # 16. 手动确保 eBPF 对象文件安装到位
 #     cmake --install 已通过 install(DIRECTORY ...) 安装 .bpf.o，
