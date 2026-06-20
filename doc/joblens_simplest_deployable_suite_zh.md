@@ -1,9 +1,8 @@
 # JobLens 最简可部署套件 (Agent + Agent Trigger)
 
-> **文档版本**: v1.0.0  
-> **最后更新**: 2026-04-25  
-> **Agent RPM**: joblens-0.0.21-1.el9.x86_64.rpm  
-> **Trigger RPM**: joblens-trigger-0.0.13-1.el9.x86_64.rpm  
+> **文档版本**: v1.1.0  
+> **最后更新**: 2026-06-20  
+> **统一 RPM**: joblens-{version}-1.el9.x86_64.rpm (集成 Core + Trigger)  
 > **状态**: 已在 IHEP 生产环境验证，欢迎跨站点评估
 
 ## 1. 项目简介
@@ -41,8 +40,9 @@ Resource Footprint: Designed for minimal overhead. On a 256-core production node
 - **Option B: 仅 Agent 采集（无 ES）**：Agent 可独立运行，输出至本地文件。当loglevel使用debug时，也可以通过 `journalctl -u joblens -f` 实时观测采集指标。需要注意的是，当大量Job的metrics被写入本地文件时，可能会导致io卡顿，影响作业本身，此方法仅用以测试。
 
 ### 5.1 安装 RPM
-- 下载rpm包
-- `dnf install ./joblens-*.el9.x86_64.rpm ./joblens-trigger-*.el9.x86_64.rpm`
+- 下载统一 RPM 包
+- `dnf install ./joblens-*.el9.x86_64.rpm`
+- 统一 RPM 已集成 Core Agent 与 Trigger Gateway，无需单独安装 trigger 包
 - 验证安装路径与二进制
 
 ### 5.2 基础配置
@@ -108,7 +108,7 @@ example:
 systemctl stop joblens joblens-trigger
 
 # 卸载RPM（保留配置备份）
-dnf remove joblens joblens-trigger
+dnf remove joblens
 
 # 验证：确认无残留进程
 ps aux | grep joblens
