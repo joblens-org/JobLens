@@ -13,22 +13,20 @@ dnf install -y condor
 
 echo "[worker] 创建 99-test-cluster.conf (worker 角色)..."
 cat > /etc/condor/config.d/99-test-cluster.conf <<'EOF'
-# 测试集群公共配置 — worker 节点
+# 测试集群 — Worker 节点 (最简配置)
 DAEMON_LIST = MASTER, STARTD
-
-# 指向控制器节点（hostname 由 /etc/hosts 解析）
 CONDOR_HOST = controller
 
-# 测试环境：允许所有主机读写
-ALLOW_WRITE = *.test.local, 192.168.56.*
-ALLOW_READ  = *.test.local, 192.168.56.*
+# 测试环境: 允许所有来源
+ALLOW_WRITE = *
+ALLOW_READ  = *
 
-# 测试环境：关闭所有安全机制
+# 关闭安全
 SEC_DEFAULT_AUTHENTICATION = NEVER
-SEC_DEFAULT_INTEGRITY      = NEVER
-SEC_DEFAULT_ENCRYPTION     = NEVER
+SEC_DEFAULT_ENCRYPTION = NEVER
+SEC_DEFAULT_INTEGRITY = NEVER
 
-# 测试环境：无条件接受所有作业（无资源策略限制）
+# 接受所有作业
 START = TRUE
 EOF
 

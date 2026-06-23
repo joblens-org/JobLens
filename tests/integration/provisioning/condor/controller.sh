@@ -23,20 +23,19 @@ mkdir -p /etc/condor/config.d
 
 echo "==> 写入 HTCondor 集群配置 (99-test-cluster.conf)..."
 cat > /etc/condor/config.d/99-test-cluster.conf << 'EOF'
-# 测试集群配置 — 仅控制器守护进程列表
+# 测试集群 — 控制器节点 (最简配置)
+# 参考: https://htcondor.readthedocs.io/en/lts/getting-htcondor/admin-quick-start.html
 DAEMON_LIST = MASTER, COLLECTOR, NEGOTIATOR, SCHEDD
-
-# 控制器主机名 (由 T3 common.sh 配置 /etc/hosts 解析)
 CONDOR_HOST = controller
 
-# 访问控制: 允许测试域名通配符 + 私有网络 IP 范围
-ALLOW_WRITE = *.test.local, 192.168.56.*
-ALLOW_READ  = *.test.local, 192.168.56.*
+# 测试环境: 允许所有来源 (无需配置具体 IP)
+ALLOW_WRITE = *
+ALLOW_READ  = *
 
-# 安全配置: 测试环境完全禁用安全机制
+# 关闭所有安全机制 (仅测试环境)
 SEC_DEFAULT_AUTHENTICATION = NEVER
-SEC_DEFAULT_INTEGRITY      = NEVER
-SEC_DEFAULT_ENCRYPTION     = NEVER
+SEC_DEFAULT_ENCRYPTION = NEVER
+SEC_DEFAULT_INTEGRITY = NEVER
 EOF
 
 echo "==> 写入 HTCondor 网络配置 (50-network.conf)..."
