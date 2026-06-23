@@ -28,6 +28,9 @@ SEC_DEFAULT_INTEGRITY = NEVER
 
 # 接受所有作业
 START = TRUE
+
+# 禁用 shared_port (25.x 默认启用, 测试池不需要, 且会导致 startd 注册延迟 60s)
+USE_SHARED_PORT = False
 EOF
 
 echo "[worker] 创建 50-network.conf (匹配 192.168.56.* 接口)..."

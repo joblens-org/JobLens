@@ -28,14 +28,17 @@ cat > /etc/condor/config.d/99-test-cluster.conf << 'EOF'
 DAEMON_LIST = MASTER, COLLECTOR, NEGOTIATOR, SCHEDD
 CONDOR_HOST = controller
 
-# 测试环境: 允许所有来源 (无需配置具体 IP)
+# 测试环境: 允许所有来源
 ALLOW_WRITE = *
 ALLOW_READ  = *
 
-# 关闭所有安全机制 (仅测试环境)
+# 关闭安全 (仅测试)
 SEC_DEFAULT_AUTHENTICATION = NEVER
 SEC_DEFAULT_ENCRYPTION = NEVER
 SEC_DEFAULT_INTEGRITY = NEVER
+
+# 禁用 shared_port (25.x 默认启用, 测试池不需要)
+USE_SHARED_PORT = False
 EOF
 
 echo "==> 写入 HTCondor 网络配置 (50-network.conf)..."
