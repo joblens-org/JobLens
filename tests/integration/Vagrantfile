@@ -1,0 +1,63 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# JobLens 集成测试 — 双节点 Vagrant 拓扑 (libvirt)
+#
+# 要求:
+#   - Vagrant >= 2.2
+#   - vagrant-libvirt 插件: vagrant plugin install vagrant-libvirt
+#   - libvirt 宿主机/KVM 可用
+#
+# 使用:
+#   vagrant up --provider=libvirt
+#   vagrant ssh controller
+#   vagrant ssh worker
+#
+# Box 说明:
+#   默认使用 almalinux/9。如果不可用，尝试替换为 generic/almalinux9。
+#
+# 节点角色:
+#   controller (192.168.56.10) — 调度控制节点，运行 HTCondor/Slurm 控制服务
+#   worker     (192.168.56.20) — 作业节点，运行 HTCondor/Slurm worker + JobLens
+
+Vagrant.configure("2") do |config|
+  # ──────────────────────────────────────────────
+  # 全局 SSH 配置 (对所有 VM 生效)
+  # ──────────────────────────────────────────────
+  config.ssh.insert_key = true
+  config.vm.boot_timeout = 600
+
+  # ──────────────────────────────────────────────
+  # VM1: controller (主控节点)
+  # ──────────────────────────────────────────────
+  config.vm.define "controller" do |ctrl|
+    ctrl.vm.box = "almalinux/9"
+    # 如果 almalinux/9 未找到，请尝试: ctrl.vm.box = "generic/almalinux9"
+
+    ctrl.vm.hostname = "controller"
+    ctrl.vm.network "private_network", ip: "192.168.56.10"
+
+    ctrl.vm.provider :libvirt do |libvirt|
+      libvirt.cpus   = 2
+      libvirt.memory = 2048     # MB
+      libvirt.machine_virtual_size = 20  # GB 磁盘
+    end
+  end
+
+  # ──────────────────────────────────────────────
+  # VM2: worker (工作节点)
+  # ──────────────────────────────────────────────
+  config.vm.define "worker" do |wrk|
+    wrk.vm.box = "almalinux/9"
+    # 如果 almalinux/9 未找到，请尝试: wrk.vm.box = "generic/almalinux9"
+
+    wrk.vm.hostname = "worker"
+    wrk.vm.network "private_network", ip: "192.168.56.20"
+
+    wrk.vm.provider :libvirt do |libvirt|
+      libvirt.cpus   = 2
+      libvirt.memory = 3072     # MB
+      libvirt.machine_virtual_size = 20  # GB 磁盘
+    end
+  end
+end
