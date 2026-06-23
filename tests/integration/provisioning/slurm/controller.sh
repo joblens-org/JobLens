@@ -41,7 +41,14 @@ CryptoType=crypto/munge
 ProctrackType=proctrack/linuxproc
 ReturnToService=1
 TaskPlugin=task/none
-NodeName=worker CPUs=2 State=UNKNOWN
+SelectType=select/linear
+SlurmctldPidFile=/var/run/slurmctld.pid
+SlurmdPidFile=/var/run/slurmd.pid
+SlurmdSpoolDir=/var/spool/slurmd
+StateSaveLocation=/var/spool/slurmctld
+SlurmctldLogFile=/var/log/slurm/slurmctld.log
+SlurmdLogFile=/var/log/slurm/slurmd.log
+NodeName=worker NodeAddr=192.168.56.20 CPUs=2 State=UNKNOWN
 PartitionName=debug Nodes=worker Default=YES MaxTime=INFINITE State=UP
 SLURM_EOF
 
