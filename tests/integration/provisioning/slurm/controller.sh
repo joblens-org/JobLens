@@ -57,16 +57,7 @@ SLURM_EOF
 # ---- 6. 启动 slurmctld ----
 systemctl enable --now slurmctld
 
-# ---- 7. 复制配置到共享目录供 worker 使用 ----
-mkdir -p /vagrant/.runtime/slurm
-cp /etc/munge/munge.key /vagrant/.runtime/slurm/munge.key
-cp /etc/slurm/slurm.conf /vagrant/.runtime/slurm/slurm.conf
-chmod 600 /vagrant/.runtime/slurm/munge.key
-chmod 644 /vagrant/.runtime/slurm/slurm.conf
-sync
-echo "[controller] munge key 已写入 /vagrant/.runtime/slurm/"
-
-# ---- 8. 等待就绪 ----
+# ---- 7. 等待就绪 ----
 echo "[controller] 等待 slurmctld 就绪..."
 for i in $(seq 1 6); do
   sleep 5

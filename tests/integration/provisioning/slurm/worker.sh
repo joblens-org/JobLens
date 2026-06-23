@@ -17,22 +17,11 @@ if ! id slurm &>/dev/null; then
   useradd -r -s /bin/false -d /var/spool/slurm slurm
 fi
 
-# ---- 2. 从 Vagrant 共享目录复制 controller 生成的 munge key ----
-echo "==> 从共享目录复制 munge key..."
-for i in $(seq 1 10); do
-  if [ -f /vagrant/.runtime/slurm/munge.key ]; then
-    break
-  fi
-  echo "  等待 munge key (${i}/10)... 当前可见:"
-  sync
-  ls -la /vagrant/.runtime/slurm/ 2>/dev/null || echo "   (目录不存在)"
-  sleep 2
-done
-if [ ! -f /vagrant/.runtime/slurm/munge.key ]; then
-    echo "FATAL: 未找到 munge key — 请先在 controller 执行 slurm/controller.sh" >&2
-    exit 1
-fi
-cp /vagrant/.runtime/slurm/munge.key /etc/munge/munge.key
+# ---- 2. 从 controller 复制 munge key (SCP, 不依赖 Vagrant synced_folder) ----
+echo "==> 从 controller 复制 munge key (SCP)..."
+scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+  controller:/etc/munge/munge.key /tmp/munge.key
+mv /tmp/munge.key /etc/munge/munge.key
 chmod 400 /etc/munge/munge.key
 chown munge:munge /etc/munge/munge.key
 echo "   munge key 已复制并设置权限"
@@ -51,12 +40,9 @@ else
 fi
 
 # ---- 5. 从共享目录复制 slurm.conf ----
-echo "==> 从共享目录复制 slurm.conf..."
-if [ ! -f /vagrant/.runtime/slurm/slurm.conf ]; then
-    echo "FATAL: 未找到 slurm.conf — 请先在 controller 执行 slurm/controller.sh" >&2
-    exit 1
-fi
-cp /vagrant/.runtime/slurm/slurm.conf /etc/slurm/slurm.conf
+echo "==> 从 controller 复制 slurm.conf (SCP)..."
+scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+  controller:/etc/slurm/slurm.conf /etc/slurm/slurm.conf
 echo "   slurm.conf 已复制"
 
 # ---- 6. 创建 slurmd spool 和日志目录 ----
