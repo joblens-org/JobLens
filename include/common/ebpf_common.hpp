@@ -12,6 +12,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #pragma once
+
+// 由 CMake target_compile_definitions 在构建时注入实际路径（lib 或 lib64）
+// clangd / 非 CMake 环境使用默认值 "lib"
+#ifndef JOBLENS_INSTALL_LIBDIR
+#define JOBLENS_INSTALL_LIBDIR "lib64"
+#endif
+
 #include <bpf/bpf.h>
 #include <linux/bpf.h>
 #include <string>

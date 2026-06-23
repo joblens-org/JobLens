@@ -140,7 +140,7 @@ private:
     std::unique_ptr<std::queue<event>> event_front_;
     std::unique_ptr<std::queue<event>> event_back_;
     // std::string bpf_o_path = "bpf_obj/job_fd_basic.bpf.o";
-    std::string bpf_o_path = "lib/joblens/bpf_obj/job_fd_rw_stat.bpf.o";
+    std::string bpf_o_path = JOBLENS_INSTALL_LIBDIR "/joblens/bpf_obj/job_fd_rw_stat.bpf.o";
     std::string rb_name = "event_rb";
     std::string pid2jobid_map_name = "pid2job";
     std::string pid2fdstat_map_name = "job_fd_stat";
