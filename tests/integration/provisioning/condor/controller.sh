@@ -40,9 +40,9 @@ EOF
 
 echo "==> 写入 HTCondor 网络配置 (50-network.conf)..."
 cat > /etc/condor/config.d/50-network.conf << 'EOF'
-# 网络接口配置 — eth1 为 Vagrant private_network 适配器
-NETWORK_INTERFACE    = eth1
-BIND_ALL_INTERFACES  = True
+# 使用 IP 模式而非接口名 (eth1 在 AlmaLinux 9 可能是 ens4/ens5)
+# HTCondor 会自动选择匹配 192.168.56.* 的接口来通信和广播
+NETWORK_INTERFACE = 192.168.56.*
 EOF
 
 echo "==> 启用并启动 HTCondor 服务..."

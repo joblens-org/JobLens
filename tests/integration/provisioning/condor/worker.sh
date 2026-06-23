@@ -30,11 +30,11 @@ SEC_DEFAULT_INTEGRITY = NEVER
 START = TRUE
 EOF
 
-echo "[worker] 创建 50-network.conf (绑定 eth1)..."
+echo "[worker] 创建 50-network.conf (匹配 192.168.56.* 接口)..."
 cat > /etc/condor/config.d/50-network.conf <<'EOF'
-# 网络配置 — 测试环境绑定 eth1
-NETWORK_INTERFACE = eth1
-BIND_ALL_INTERFACES = True
+# 使用 IP 模式匹配 private_network 接口
+# (eth1 在不同系统上可能叫 ens4/ens5)
+NETWORK_INTERFACE = 192.168.56.*
 EOF
 
 echo "[worker] 启用并启动 condor 服务..."
