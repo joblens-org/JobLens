@@ -23,8 +23,9 @@ for i in $(seq 1 10); do
   if [ -f /vagrant/.runtime/slurm/munge.key ]; then
     break
   fi
-  echo "  等待 munge key (${i}/10)..."
+  echo "  等待 munge key (${i}/10)... 当前可见:"
   sync
+  ls -la /vagrant/.runtime/slurm/ 2>/dev/null || echo "   (目录不存在)"
   sleep 2
 done
 if [ ! -f /vagrant/.runtime/slurm/munge.key ]; then
