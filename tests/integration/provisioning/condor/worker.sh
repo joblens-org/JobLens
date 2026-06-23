@@ -55,9 +55,12 @@ condor_config_val NETWORK_INTERFACE 2>/dev/null || true
 condor_config_val CONDOR_HOST 2>/dev/null || true
 echo "[worker] 6) HTCondor 日志 (全部, 最近 50 行):"
 journalctl -u condor --no-pager -n 50 2>/dev/null || true
-echo "[worker] 6b) 筛选错误/startd 相关:"
-journalctl -u condor --no-pager --since "2 minutes ago" \
-  2>/dev/null | grep -iE 'error|fail|denied|startd|DAEMON|register|collector' || true
+echo "[worker] 6b) MasterLog (前 30 行):"
+cat /var/log/condor/MasterLog 2>/dev/null | head -30 || true
+echo "[worker] 6c) StartLog (前 30 行):"
+cat /var/log/condor/StartLog 2>/dev/null | head -30 || true
+echo "[worker] 6d) CollectorLog 存在?:"
+ls -la /var/log/condor/ 2>/dev/null || true
 echo "[worker] 7) 尝试直接连接 collector:"
 condor_status -collector -direct controller 2>&1 || true
 echo "[worker] 7b) condor 进程列表:"
