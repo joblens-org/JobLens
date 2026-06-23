@@ -13,10 +13,12 @@ dnf install -y dnf-plugins-core epel-release
 dnf config-manager --set-enabled crb 2>/dev/null || true
 
 # ---- 2. 安装 Slurm 控制器 + munge ----
-# slurm-slurmctld: 控制器守护进程
-# slurm-perlapi:   Perl API (sinfo 等命令需要)
-# slurm 和 slurm-libs 自动作为依赖安装
 dnf install -y slurm-slurmctld slurm-perlapi munge
+
+# EPEL 包可能不会自动创建 slurm 用户，手动确保存在
+if ! id slurm &>/dev/null; then
+  useradd -r -s /bin/false -d /var/spool/slurm slurm
+fi
 
 # ---- 3. 生成 munge 认证密钥 ----
 echo "[controller] 生成 munge key..."

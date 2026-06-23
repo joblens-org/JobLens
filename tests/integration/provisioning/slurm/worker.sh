@@ -13,6 +13,10 @@ dnf install -y dnf-plugins-core epel-release
 dnf config-manager --set-enabled crb 2>/dev/null || true
 dnf install -y slurm-slurmd munge
 
+if ! id slurm &>/dev/null; then
+  useradd -r -s /bin/false -d /var/spool/slurm slurm
+fi
+
 # ---- 2. 从 Vagrant 共享目录复制 controller 生成的 munge key ----
 echo "==> 从共享目录复制 munge key..."
 if [ ! -f /vagrant/.runtime/slurm/munge.key ]; then
