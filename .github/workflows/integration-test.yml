@@ -55,23 +55,37 @@ jobs:
           echo "PASS: /dev/kvm 可用"
 
       # ─── Step 1: 安装宿主依赖 ────────────────────────────────
-      - name: 安装宿主依赖 (libvirt + Vagrant)
+      - name: 安装宿主依赖 (libvirt + Vagrant + 权限修复)
         run: |
           echo "=== 安装 libvirt + KVM ==="
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             qemu-kvm libvirt-daemon-system libvirt-clients \
             libvirt-dev virtinst bridge-utils cpu-checker
+
+          echo ""
+          echo "=== 配置 libvirt socket 权限 ==="
+          # CI runner 用户不在 libvirt 组 (usermod 需要重登)
+          # 方案: 禁用 auth + 放开 socket 权限
+          sudo sed -i 's/#unix_sock_group = "libvirt"/unix_sock_group = "libvirt"/' \
+            /etc/libvirt/libvirtd.conf
+          sudo sed -i 's/#unix_sock_rw_perms = "0770"/unix_sock_rw_perms = "0777"/' \
+            /etc/libvirt/libvirtd.conf
+          sudo sed -i 's/#unix_sock_ro_perms = "0777"/unix_sock_ro_perms = "0777"/' \
+            /etc/libvirt/libvirtd.conf
+          sudo sed -i 's/#auth_unix_rw = "none"/auth_unix_rw = "none"/' \
+            /etc/libvirt/libvirtd.conf
+          sudo sed -i 's/#auth_unix_ro = "none"/auth_unix_ro = "none"/' \
+            /etc/libvirt/libvirtd.conf
           sudo systemctl enable --now libvirtd
           sudo usermod -aG libvirt "$(whoami)"
 
           echo ""
-          echo "=== 验证 KVM ==="
-          sudo kvm-ok
+          echo "=== 验证 libvirt 连接 ==="
+          virsh -c qemu:///system list
 
           echo ""
           echo "=== 安装 Vagrant ==="
-          # HashiCorp 官方 GPG key + repo
           curl -fsSL https://apt.releases.hashicorp.com/gpg \
             | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
@@ -83,13 +97,12 @@ jobs:
 
           echo ""
           echo "=== 安装 vagrant-libvirt 插件 ==="
-          # 需要 ruby-dev + libvirt-dev 编译原生扩展
           sudo apt-get install -y ruby-dev pkg-config
           vagrant plugin install vagrant-libvirt
           vagrant plugin list
 
           echo ""
-          echo "=== 安装 RPM 构建工具 (apt 版 rpm) ==="
+          echo "=== 安装 RPM 构建工具 ==="
           sudo apt-get install -y rpm
 
       # ─── Step 2: 检出代码 ────────────────────────────────────
