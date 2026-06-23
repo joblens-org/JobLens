@@ -62,7 +62,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             qemu-kvm libvirt-daemon-system libvirt-clients \
             libvirt-dev virtinst bridge-utils cpu-checker \
-            qemu-utils
+            qemu-utils dnsmasq-base
 
           echo ""
           echo "=== 配置 libvirt socket 权限 (CI 环境) ==="
