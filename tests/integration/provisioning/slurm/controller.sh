@@ -10,7 +10,9 @@ set -euo pipefail
 echo "[controller] 开始安装 Slurm 控制器组件..."
 
 # ---- 1. 安装软件包 ----
-dnf install -y slurm-slurmctld munge
+# EPEL 已由 common.sh 安装; Slurm 在 EPEL 9 中的包名可能不同
+dnf install -y slurm-slurmctld slurm-perlapi munge 2>/dev/null || \
+  dnf --enablerepo=crb install -y slurm-slurmctld slurm-perlapi munge
 
 # ---- 2. 生成 munge 认证密钥 ----
 mkdir -p /etc/munge

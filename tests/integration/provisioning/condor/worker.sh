@@ -2,6 +2,11 @@
 # HTCondor worker provisioning — deploys master + startd on worker node (VM2)
 set -euo pipefail
 
+echo "[worker] 添加 HTCondor 官方仓库..."
+curl -fsSL https://htcondor.org/repo/current/htcondor-release-current.el9.noarch.rpm \
+  -o /tmp/htcondor-release.rpm
+rpm -i /tmp/htcondor-release.rpm
+
 echo "[worker] 安装 HTCondor 软件包..."
 dnf install -y condor
 

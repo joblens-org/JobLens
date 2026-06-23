@@ -7,6 +7,11 @@ set -euo pipefail
 # 安全配置: 完全禁用认证/完整性/加密 (仅测试环境)
 # =============================================================================
 
+echo "==> 添加 HTCondor 官方仓库..."
+curl -fsSL https://htcondor.org/repo/current/htcondor-release-current.el9.noarch.rpm \
+  -o /tmp/htcondor-release.rpm
+rpm -i /tmp/htcondor-release.rpm
+
 echo "==> 安装 HTCondor 软件包..."
 dnf install -y condor
 
