@@ -226,6 +226,13 @@ jobs:
 
           echo "PASS: Controller 部署完成"
 
+          echo ""
+          echo "=== 提取 Slurm 运行时文件 (controller → host) ==="
+          mkdir -p .runtime/slurm
+          vagrant ssh controller -c "sudo cat /etc/munge/munge.key" > .runtime/slurm/munge.key
+          vagrant ssh controller -c "sudo cat /etc/slurm/slurm.conf" > .runtime/slurm/slurm.conf
+          echo "   munge key + slurm.conf 已提取到 .runtime/slurm/"
+
       # ─── Step 6: 部署 worker ──────────────────────────────────
       - name: Provision Worker (VM2)
         working-directory: tests/integration
@@ -239,6 +246,18 @@ jobs:
           vagrant ssh worker -c \
             "sudo bash /vagrant/provisioning/condor/worker.sh" \
             || { echo "FATAL: condor 失败"; exit 1; }
+
+          echo "=== Worker: 注入 Slurm 运行时文件 (host → worker) ==="
+          vagrant ssh worker -c \
+            "sudo mkdir -p /var/tmp/slurm_runtime" \
+            || { echo "FATAL: 创建运行时目录失败"; exit 1; }
+          vagrant ssh worker -c \
+            "sudo tee /var/tmp/slurm_runtime/munge.key" < .runtime/slurm/munge.key \
+            > /dev/null || { echo "FATAL: 注入 munge key 失败"; exit 1; }
+          vagrant ssh worker -c \
+            "sudo tee /var/tmp/slurm_runtime/slurm.conf" < .runtime/slurm/slurm.conf \
+            > /dev/null || { echo "FATAL: 注入 slurm.conf 失败"; exit 1; }
+          echo "   munge key + slurm.conf 已注入 worker"
 
           echo "=== Worker: Slurm ==="
           vagrant ssh worker -c \

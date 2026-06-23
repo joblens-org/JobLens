@@ -17,18 +17,19 @@ if ! id slurm &>/dev/null; then
   useradd -r -s /bin/false -d /var/spool/slurm slurm
 fi
 
-# ---- 2. 从 Vagrant synced_folder 读取 controller 共享的 munge key ----
-echo "==> 从 /vagrant/.runtime/slurm/ 读取 munge key..."
-SHARE_DIR="/vagrant/.runtime/slurm"
-if [ ! -f "${SHARE_DIR}/munge.key" ]; then
+# ---- 2. 从运行时注入目录读取 controller 生成的 munge key ----
+echo "==> 从 /var/tmp/slurm_runtime/ 读取 munge key..."
+RUNTIME_DIR="/var/tmp/slurm_runtime"
+if [ ! -f "${RUNTIME_DIR}/munge.key" ]; then
     echo "FATAL: 未找到 munge key — 请确保 controller 的 slurm 部署先于 worker 执行" >&2
-    echo "  预期路径: ${SHARE_DIR}/munge.key" >&2
+    echo "  预期路径: ${RUNTIME_DIR}/munge.key" >&2
+    echo "  提示: CI 环境通过 vagrant ssh 在 host 端提取后注入; 手动环境请参考 Makefile provision" >&2
     exit 1
 fi
-cp "${SHARE_DIR}/munge.key" /etc/munge/munge.key
+cp "${RUNTIME_DIR}/munge.key" /etc/munge/munge.key
 chmod 400 /etc/munge/munge.key
 chown munge:munge /etc/munge/munge.key
-echo "   munge key 已从共享目录读取并设置权限"
+echo "   munge key 已安装并设置权限"
 
 # ---- 3. 启动 munge ----
 echo "==> 启动 munge..."
@@ -43,15 +44,16 @@ else
     exit 1
 fi
 
-# ---- 5. 从共享目录读取 slurm.conf ----
-echo "==> 从 /vagrant/.runtime/slurm/ 读取 slurm.conf..."
-if [ ! -f "${SHARE_DIR}/slurm.conf" ]; then
+# ---- 5. 从运行时注入目录读取 slurm.conf ----
+echo "==> 从 ${RUNTIME_DIR}/ 读取 slurm.conf..."
+if [ ! -f "${RUNTIME_DIR}/slurm.conf" ]; then
     echo "FATAL: 未找到 slurm.conf — 请确保 controller 的 slurm 部署先于 worker 执行" >&2
-    echo "  预期路径: ${SHARE_DIR}/slurm.conf" >&2
+    echo "  预期路径: ${RUNTIME_DIR}/slurm.conf" >&2
+    echo "  提示: CI 环境通过 vagrant ssh 在 host 端提取后注入; 手动环境请参考 Makefile provision" >&2
     exit 1
 fi
-cp "${SHARE_DIR}/slurm.conf" /etc/slurm/slurm.conf
-echo "   slurm.conf 已从共享目录读取"
+cp "${RUNTIME_DIR}/slurm.conf" /etc/slurm/slurm.conf
+echo "   slurm.conf 已安装"
 
 # ---- 6. 创建 slurmd spool 和日志目录 ----
 echo "==> 创建 slurmd 目录..."

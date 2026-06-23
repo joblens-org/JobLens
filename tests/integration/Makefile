@@ -23,6 +23,14 @@ provision: ## 部署所有服务 (common + condor + slurm + joblens)
 	vagrant ssh controller -c "sudo bash /vagrant/provisioning/condor/controller.sh"
 	vagrant ssh worker -c "sudo bash /vagrant/provisioning/condor/worker.sh"
 	vagrant ssh controller -c "sudo bash /vagrant/provisioning/slurm/controller.sh"
+	# 从 controller 提取 slurm 运行时文件（Vagrant synced_folder 不保证 guest→host 同步）
+	mkdir -p .runtime/slurm
+	vagrant ssh controller -c "sudo cat /etc/munge/munge.key" > .runtime/slurm/munge.key
+	vagrant ssh controller -c "sudo cat /etc/slurm/slurm.conf" > .runtime/slurm/slurm.conf
+	# 注入到 worker（先创建目录再传输文件）
+	vagrant ssh worker -c "sudo mkdir -p /var/tmp/slurm_runtime"
+	vagrant ssh worker -c "sudo tee /var/tmp/slurm_runtime/munge.key" < .runtime/slurm/munge.key > /dev/null
+	vagrant ssh worker -c "sudo tee /var/tmp/slurm_runtime/slurm.conf" < .runtime/slurm/slurm.conf > /dev/null
 	vagrant ssh worker -c "sudo bash /vagrant/provisioning/slurm/worker.sh"
 	vagrant ssh worker -c "sudo bash /vagrant/provisioning/joblens/deploy.sh"
 
@@ -42,4 +50,4 @@ logs: ## 查看 JobLens 服务日志
 
 clean: ## 销毁 VM 并清理缓存
 	-vagrant destroy -f
-	rm -rf $(VENV) __pycache__ .pytest_cache .vagrant
+	rm -rf $(VENV) __pycache__ .pytest_cache .vagrant .runtime

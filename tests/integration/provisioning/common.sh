@@ -115,20 +115,30 @@ else
 fi
 
 # ---- 10. 配置 root SSH (VM 之间 SCP 通信) ----
-echo "==> 配置 root SSH (从 vagrant 复制密钥, 授权 vagrant 公钥)"
-if [ -d /home/vagrant/.ssh ]; then
-  mkdir -p /root/.ssh
-  # 复制 vagrant 的私钥到 root (用于 root 发起 SSH/SCP)
-  cp /home/vagrant/.ssh/id_* /root/.ssh/ 2>/dev/null || true
-  # 将 vagrant 的公钥加入 root 的 authorized_keys (允许 vagrant 密钥登录 root)
-  cat /home/vagrant/.ssh/authorized_keys >> /root/.ssh/authorized_keys 2>/dev/null || true
-  cat /home/vagrant/.ssh/*.pub >> /root/.ssh/authorized_keys 2>/dev/null || true
-  chmod 700 /root/.ssh
-  chmod 600 /root/.ssh/*
-  echo "   root SSH 已配置 (VM 间 SCP 可用)"
+echo "==> 配置 root SSH (生成 root 专用密钥对)"
+mkdir -p /root/.ssh
+
+# 生成 root 专用 ED25519 密钥对 (幂等: 已存在则跳过)
+if [ ! -f /root/.ssh/id_ed25519 ]; then
+  ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519 -C "root@${HOSTNAME}"
+  echo "   root ED25519 密钥对已生成"
 else
-  echo "   WARNING: /home/vagrant/.ssh 不存在, 跳过 root SSH 配置"
+  echo "   root 密钥对已存在，跳过生成"
 fi
+
+# 将自己的公钥加入 authorized_keys (允许自己登录自己，也允许其他 VM 的 root 登录)
+cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys 2>/dev/null || true
+
+# 也追加 vagrant 的公钥（允许 vagrant 用户通过其密钥登录 root）
+if [ -f /home/vagrant/.ssh/authorized_keys ]; then
+  cat /home/vagrant/.ssh/authorized_keys >> /root/.ssh/authorized_keys 2>/dev/null || true
+fi
+
+chmod 700 /root/.ssh
+chmod 600 /root/.ssh/id_ed25519      2>/dev/null || true
+chmod 644 /root/.ssh/id_ed25519.pub  2>/dev/null || true
+chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
+echo "   root SSH 已配置 (VM 间 SCP 可用)"
 
 # ---- 完成 ----
 echo "============================================"
