@@ -9,6 +9,10 @@
 #   - GitHub-hosted ubuntu-latest (x86-64, KVM 嵌套虚拟化)
 #   - Guest VM: AlmaLinux 9 (通过 Vagrant libvirt)
 #
+# 构建:
+#   - Core RPM + Trigger RPM 使用 almalinux:9 Docker 容器构建
+#   - 确保 RPM 依赖与目标 VM 的库版本完全匹配
+#
 # 拓扑:
 #   - VM1 controller (192.168.56.10): 调度控制服务
 #   - VM2 worker     (192.168.56.20): Worker + JobLens
@@ -120,42 +124,18 @@ jobs:
         with:
           submodules: recursive
 
-      # ─── Step 3: 构建 RPM 包 (Fedora 容器内) ──────────────────
-      - name: 构建 JobLens RPM (Fedora 容器)
+      # ─── Step 3: 构建 RPM 包 (AlmaLinux 9 容器内) ───────────
+      - name: 构建 JobLens RPM (AlmaLinux 9 容器)
         run: |
-          echo "=== 在 Fedora 容器内构建 Core RPM ==="
+          echo "=== 在 AlmaLinux 9 容器内构建 Core RPM ==="
           docker run --rm --privileged \
             -v "$(pwd)":/workspace -w /workspace \
-            fedora:latest bash -c "
+            almalinux:9 bash -c "
               set -euo pipefail
-              echo '安装构建依赖...'
-              dnf install -y --setopt=tsflags=nodocs \
-                sudo git clang cmake ninja-build pkgconfig \
-                libbpf-devel elfutils-libelf-devel leveldb-devel \
-                libnl3-devel openssl-devel zlib-devel lua-devel \
-                libcurl-devel cyrus-sasl-devel libzstd-devel lz4-devel \
-                librdkafka-devel boost-devel xxhash-devel \
-                spdlog-devel yaml-cpp-devel fmt-devel \
-                nlohmann-json-devel bpftool rpm-build
-
-              echo '安装 sol2 + date (从源码)...'
-              # sol2
-              curl -fsSL https://github.com/ThePhD/sol2/archive/refs/tags/v3.5.0.tar.gz \
-                -o /tmp/sol2.tar.gz
-              tar -xzf /tmp/sol2.tar.gz -C /tmp
-              cp -r /tmp/sol2-3.5.0/include/sol /usr/local/include/
-
-              # howardhinnant-date
-              curl -fsSL \
-                https://github.com/HowardHinnant/date/archive/refs/tags/v3.0.1.tar.gz \
-                -o /tmp/date.tar.gz
-              tar -xzf /tmp/date.tar.gz -C /tmp
-              cd /tmp/date-3.0.1
-              cmake -B build -G Ninja \
-                -DCMAKE_BUILD_TYPE=Release -DBUILD_TZ_LIB=ON -DUSE_SYSTEM_TZ_DB=ON
-              cmake --build build
-              cmake --install build
-              cd /workspace
+              echo '安装构建依赖 (install-deps.sh)...'
+              dnf install -y sudo git
+              bash scripts/install-deps.sh
+              dnf install -y rpm-build
 
               echo '构建 JobLens...'
               cmake --preset rpm-system-deps
@@ -168,13 +148,14 @@ jobs:
               ls -lh tests/integration/rpms/
             "
 
-      - name: 构建 Trigger RPM (Fedora 容器)
+      - name: 构建 Trigger RPM (AlmaLinux 9 容器)
         run: |
-          echo "=== 在 Fedora 容器内构建 Trigger RPM ==="
+          echo "=== 在 AlmaLinux 9 容器内构建 Trigger RPM ==="
           docker run --rm \
             -v "$(pwd)":/workspace -w /workspace \
-            fedora:latest bash -c "
+            almalinux:9 bash -c "
               set -euo pipefail
+              dnf install -y --setopt=tsflags=nodocs epel-release
               dnf install -y --setopt=tsflags=nodocs \
                 rpm-build python3 python3-devel \
                 python3-setuptools python3-wheel python3-pip \
