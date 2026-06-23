@@ -24,20 +24,27 @@ mkdir -p /etc/condor/config.d
 echo "==> 写入 HTCondor 集群配置 (99-test-cluster.conf)..."
 cat > /etc/condor/config.d/99-test-cluster.conf << 'EOF'
 # 测试集群 — 控制器节点 (最简配置)
-# 参考: https://htcondor.readthedocs.io/en/lts/getting-htcondor/admin-quick-start.html
 DAEMON_LIST = MASTER, COLLECTOR, NEGOTIATOR, SCHEDD
 CONDOR_HOST = controller
 
 # 测试环境: 允许所有来源
 ALLOW_WRITE = *
 ALLOW_READ  = *
+ALLOW_ADVERTISE_STARTD = *
+ALLOW_ADVERTISE_SCHEDD = *
+ALLOW_ADVERTISE_MASTER = *
 
-# 关闭安全 (仅测试)
+# 关闭所有安全 (SEC_DEFAULT 不够, 需要逐级显式设置)
 SEC_DEFAULT_AUTHENTICATION = NEVER
+SEC_READ_AUTHENTICATION = NEVER
+SEC_WRITE_AUTHENTICATION = NEVER
+SEC_ADVERTISE_STARTD_AUTHENTICATION = NEVER
+SEC_ADVERTISE_SCHEDD_AUTHENTICATION = NEVER
+SEC_ADVERTISE_MASTER_AUTHENTICATION = NEVER
 SEC_DEFAULT_ENCRYPTION = NEVER
 SEC_DEFAULT_INTEGRITY = NEVER
 
-# 禁用 shared_port (25.x 默认启用, 测试池不需要)
+# 禁用 shared_port (测试池不需要)
 USE_SHARED_PORT = False
 EOF
 
