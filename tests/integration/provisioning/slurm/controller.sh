@@ -28,6 +28,12 @@ chmod 400 /etc/munge/munge.key
 chown munge:munge /etc/munge/munge.key
 systemctl enable --now munge
 
+# 通过 Vagrant synced_folder (/vagrant) 共享 munge key 给 worker
+echo "[controller] 共享 munge key 到 /vagrant/.runtime/slurm/..."
+mkdir -p /vagrant/.runtime/slurm
+cp /etc/munge/munge.key /vagrant/.runtime/slurm/munge.key
+echo "   munge key 已共享到 /vagrant/.runtime/slurm/"
+
 # ---- 4. 创建 spool 和日志目录 ----
 mkdir -p /var/spool/slurmctld /var/spool/slurmd /var/log/slurm
 chown slurm:slurm /var/spool/slurmctld /var/log/slurm
@@ -57,7 +63,12 @@ SLURM_EOF
 # ---- 6. 启动 slurmctld ----
 systemctl enable --now slurmctld
 
-# ---- 7. 等待就绪 ----
+# ---- 7. 共享 slurm.conf 到 worker ----
+echo "[controller] 共享 slurm.conf 到 /vagrant/.runtime/slurm/..."
+cp /etc/slurm/slurm.conf /vagrant/.runtime/slurm/slurm.conf
+echo "   slurm.conf 已共享"
+
+# ---- 8. 等待就绪 ----
 echo "[controller] 等待 slurmctld 就绪..."
 for i in $(seq 1 6); do
   sleep 5
