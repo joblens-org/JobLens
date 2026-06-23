@@ -7,10 +7,13 @@ set -euo pipefail
 # 安全配置: 完全禁用认证/完整性/加密 (仅测试环境)
 # =============================================================================
 
-echo "==> 添加 HTCondor 官方仓库..."
-curl -fsSL https://htcondor.org/repo/current/htcondor-release-current.el9.noarch.rpm \
-  -o /tmp/htcondor-release.rpm
-rpm -i /tmp/htcondor-release.rpm
+echo "==> 添加 HTCondor 官方仓库 (EL9)..."
+# 官方文档: https://htcondor.readthedocs.io/en/lts/getting-htcondor/from-our-repositories.html
+# EL9 需要 EPEL + CRB 仓库
+dnf install -y dnf-plugins-core
+dnf config-manager --set-enabled crb 2>/dev/null || true
+dnf install -y \
+  https://htcss-downloads.chtc.wisc.edu/repo/25.x/htcondor-release-current.el9.noarch.rpm
 
 echo "==> 安装 HTCondor 软件包..."
 dnf install -y condor

@@ -9,8 +9,11 @@ echo "============================================"
 
 # ---- 1. 安装 Slurm worker 和 Munge ----
 echo "==> 安装 slurm-slurmd + munge..."
-dnf install -y slurm-slurmd slurm-perlapi munge 2>/dev/null || \
-  dnf --enablerepo=crb install -y slurm-slurmd slurm-perlapi munge
+dnf install -y slurm-slurmd slurm-perlapi munge 2>/dev/null || {
+  dnf install -y dnf-plugins-core
+  dnf config-manager --set-enabled crb 2>/dev/null || true
+  dnf install -y slurm-slurmd slurm-perlapi munge
+}
 
 # ---- 2. 从 Vagrant 共享目录复制 controller 生成的 munge key ----
 echo "==> 从共享目录复制 munge key..."
