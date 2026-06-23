@@ -41,17 +41,22 @@ echo "[worker] 启用并启动 condor 服务..."
 systemctl enable --now condor
 
 echo "[worker] === 诊断信息 ==="
-echo "[worker] 网络接口:"
+echo "[worker] 1) 网络接口与IP:"
 ip addr show | grep -E 'inet |eth|ens' || true
-echo "[worker] DNS 解析:"
-getent hosts controller || echo "  WARNING: controller 无法解析"
-echo "[worker] 路由表:"
-ip route || true
-echo "[worker] HTCondor 网络配置:"
+echo "[worker] 2) DNS解析 controller:"
+getent hosts controller || echo "  FAIL: controller 无法解析"
+echo "[worker] 3) Ping controller 连通性:"
+ping -c 2 -W 3 controller 2>&1 || echo "  FAIL: ping 不通 controller"
+echo "[worker] 4) TCP端口 9618 连通性:"
+timeout 5 bash -c "echo >/dev/tcp/controller/9618" 2>&1 \
+  && echo "  OK: 9618 可达" || echo "  FAIL: 9618 不可达"
+echo "[worker] 5) HTCondor 配置:"
 condor_config_val NETWORK_INTERFACE 2>/dev/null || true
 condor_config_val CONDOR_HOST 2>/dev/null || true
-echo "[worker] HTCondor 日志 (最近 20 行):"
+echo "[worker] 6) HTCondor 日志 (最近 20 行):"
 journalctl -u condor --no-pager -n 20 2>/dev/null || true
+echo "[worker] 7) 尝试直接连接 collector:"
+condor_status -collector -direct controller 2>&1 || true
 echo "[worker] === 诊断结束 ==="
 
 echo "[worker] 等待 startd 就绪（最长 90s，需要连接远程 collector）..."
