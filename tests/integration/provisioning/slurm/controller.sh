@@ -63,6 +63,8 @@ cp /etc/munge/munge.key /vagrant/.runtime/slurm/munge.key
 cp /etc/slurm/slurm.conf /vagrant/.runtime/slurm/slurm.conf
 chmod 600 /vagrant/.runtime/slurm/munge.key
 chmod 644 /vagrant/.runtime/slurm/slurm.conf
+sync
+echo "[controller] munge key 已写入 /vagrant/.runtime/slurm/"
 
 # ---- 8. 等待就绪 ----
 echo "[controller] 等待 slurmctld 就绪..."

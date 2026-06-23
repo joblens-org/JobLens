@@ -19,6 +19,14 @@ fi
 
 # ---- 2. 从 Vagrant 共享目录复制 controller 生成的 munge key ----
 echo "==> 从共享目录复制 munge key..."
+for i in $(seq 1 10); do
+  if [ -f /vagrant/.runtime/slurm/munge.key ]; then
+    break
+  fi
+  echo "  等待 munge key (${i}/10)..."
+  sync
+  sleep 2
+done
 if [ ! -f /vagrant/.runtime/slurm/munge.key ]; then
     echo "FATAL: 未找到 munge key — 请先在 controller 执行 slurm/controller.sh" >&2
     exit 1
