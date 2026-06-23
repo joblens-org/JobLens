@@ -1,0 +1,45 @@
+# JobLens 集成测试 Makefile
+# 所有目标从 tests/integration/ 目录执行
+SHELL := /bin/bash
+VENV := .venv
+PYTEST := $(VENV)/bin/pytest
+
+.PHONY: help up venv provision test test-condor test-slurm logs clean
+
+help: ## 显示帮助信息
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
+
+up: ## 启动 Vagrant VM (libvirt)
+	vagrant up --provider=libvirt
+
+venv: ## 创建 Python 虚拟环境并安装依赖
+	python3 -m venv $(VENV)
+	$(VENV)/bin/pip install -q -r requirements.txt
+
+provision: ## 部署所有服务 (common + condor + slurm + joblens)
+	vagrant ssh controller -c "sudo bash /vagrant/provisioning/common.sh controller"
+	vagrant ssh worker -c "sudo bash /vagrant/provisioning/common.sh worker"
+	vagrant ssh controller -c "sudo bash /vagrant/provisioning/condor/controller.sh"
+	vagrant ssh worker -c "sudo bash /vagrant/provisioning/condor/worker.sh"
+	vagrant ssh controller -c "sudo bash /vagrant/provisioning/slurm/controller.sh"
+	vagrant ssh worker -c "sudo bash /vagrant/provisioning/slurm/worker.sh"
+	vagrant ssh worker -c "sudo bash /vagrant/provisioning/joblens/deploy.sh"
+
+test: venv ## 运行全部集成测试 (35 个)
+	$(PYTEST) -v --tb=short
+
+test-condor: venv ## 仅 HTCondor 发现测试 (4 个)
+	$(PYTEST) -v --tb=short test_02_htcondor_discovery.py
+
+test-slurm: venv ## 仅 Slurm 发现测试 (4 个)
+	$(PYTEST) -v --tb=short test_03_slurm_discovery.py
+
+logs: ## 查看 JobLens 服务日志
+	vagrant ssh worker -c "sudo journalctl -u joblens --no-pager -n 50"
+	@echo "==="
+	vagrant ssh worker -c "sudo journalctl -u joblens-trigger --no-pager -n 30"
+
+clean: ## 销毁 VM 并清理缓存
+	-vagrant destroy -f
+	rm -rf $(VENV) __pycache__ .pytest_cache .vagrant
