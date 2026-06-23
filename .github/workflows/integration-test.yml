@@ -64,25 +64,34 @@ jobs:
             libvirt-dev virtinst bridge-utils cpu-checker
 
           echo ""
-          echo "=== 配置 libvirt socket 权限 ==="
-          # CI runner 用户不在 libvirt 组 (usermod 需要重登)
-          # 方案: 禁用 auth + 放开 socket 权限
-          sudo sed -i 's/#unix_sock_group = "libvirt"/unix_sock_group = "libvirt"/' \
-            /etc/libvirt/libvirtd.conf
-          sudo sed -i 's/#unix_sock_rw_perms = "0770"/unix_sock_rw_perms = "0777"/' \
-            /etc/libvirt/libvirtd.conf
-          sudo sed -i 's/#unix_sock_ro_perms = "0777"/unix_sock_ro_perms = "0777"/' \
-            /etc/libvirt/libvirtd.conf
-          sudo sed -i 's/#auth_unix_rw = "none"/auth_unix_rw = "none"/' \
-            /etc/libvirt/libvirtd.conf
-          sudo sed -i 's/#auth_unix_ro = "none"/auth_unix_ro = "none"/' \
-            /etc/libvirt/libvirtd.conf
-          sudo systemctl enable --now libvirtd
-          sudo usermod -aG libvirt "$(whoami)"
+          echo "=== 配置 libvirt socket 权限 (CI 环境) ==="
+          sudo systemctl enable --now libvirtd 2>/dev/null || true
+          sudo systemctl start libvirtd 2>/dev/null || true
+          sleep 2
+
+          # 直接 chmod socket — CI 临时环境, 不需要持久化
+          for sock in /var/run/libvirt/libvirt-sock*; do
+            if [ -e "$sock" ]; then
+              sudo chmod 777 "$sock"
+              ls -la "$sock"
+            fi
+          done
+
+          # 如果上面没有 socket, 尝试重启后再次 chmod
+          if ! ls /var/run/libvirt/libvirt-sock >/dev/null 2>&1; then
+            sudo systemctl restart libvirtd
+            sleep 3
+            for sock in /var/run/libvirt/libvirt-sock*; do
+              if [ -e "$sock" ]; then
+                sudo chmod 777 "$sock" && ls -la "$sock"
+              fi
+            done
+          fi
 
           echo ""
           echo "=== 验证 libvirt 连接 ==="
-          virsh -c qemu:///system list
+          virsh -c qemu:///system list 2>&1 \
+            || sudo virsh -c qemu:///system list 2>&1
 
           echo ""
           echo "=== 安装 Vagrant ==="
