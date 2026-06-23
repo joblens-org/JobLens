@@ -48,6 +48,19 @@ EOF
 echo "==> 启用并启动 HTCondor 服务..."
 systemctl enable --now condor
 
+echo "==> 诊断信息 ==="
+echo "网络接口:"
+ip addr show | grep -E 'inet |eth|ens' || true
+echo "HTCondor 使用的接口:"
+condor_config_val NETWORK_INTERFACE 2>/dev/null || true
+echo "CONDOR_HOST:"
+condor_config_val CONDOR_HOST 2>/dev/null || true
+echo "DAEMON_LIST:"
+condor_config_val DAEMON_LIST 2>/dev/null || true
+echo "监听端口:"
+ss -tlnp | grep condor || true
+echo "==> 诊断结束 =="
+
 echo "==> 等待 HTCondor 守护进程上线 (最长 60 秒)..."
 for i in $(seq 1 12); do
     sleep 5

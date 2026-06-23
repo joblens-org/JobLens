@@ -40,6 +40,20 @@ EOF
 echo "[worker] 启用并启动 condor 服务..."
 systemctl enable --now condor
 
+echo "[worker] === 诊断信息 ==="
+echo "[worker] 网络接口:"
+ip addr show | grep -E 'inet |eth|ens' || true
+echo "[worker] DNS 解析:"
+getent hosts controller || echo "  WARNING: controller 无法解析"
+echo "[worker] 路由表:"
+ip route || true
+echo "[worker] HTCondor 网络配置:"
+condor_config_val NETWORK_INTERFACE 2>/dev/null || true
+condor_config_val CONDOR_HOST 2>/dev/null || true
+echo "[worker] HTCondor 日志 (最近 20 行):"
+journalctl -u condor --no-pager -n 20 2>/dev/null || true
+echo "[worker] === 诊断结束 ==="
+
 echo "[worker] 等待 startd 就绪（最长 90s，需要连接远程 collector）..."
 for i in $(seq 1 18); do
     if condor_status -startd 2>/dev/null | tail -n +4 | grep -q .; then
