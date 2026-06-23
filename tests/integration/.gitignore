@@ -1,0 +1,12 @@
+# Vagrant
+.vagrant/
+
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OpenCode evidence
+.omo/evidence/
