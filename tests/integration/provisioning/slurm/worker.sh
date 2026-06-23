@@ -65,32 +65,64 @@ chmod 755 /var/spool/slurmd
 echo "==> 启动 slurmd..."
 systemctl enable --now slurmd
 
-# ---- 8. 激活 worker 节点 ----
-echo "==> 激活 worker 节点..."
-scontrol update NodeName=worker State=RESUME
-echo "   节点激活命令已发送"
+# ---- 8. 诊断: 检查 slurmd 状态和 controller 连通性 ----
+echo "==> 诊断: slurmd + controller 连通性..."
+echo "   slurmd 状态:"
+systemctl status slurmd --no-pager -l 2>/dev/null || true
+echo ""
+echo "   slurmd 日志 (最近 20 行):"
+journalctl -u slurmd --no-pager -n 20 2>/dev/null || true
+echo ""
+echo "   slurmctld 端口连通性 (controller:6817):"
+timeout 5 bash -c "echo >/dev/tcp/controller/6817" 2>&1 \
+  && echo "   PASS: slurmctld 可达" \
+  || echo "   FAIL: slurmctld 不可达"
+echo ""
+echo "   当前 sinfo (controller 视角):"
+sinfo 2>&1 || true
 
-# ---- 9. 等待 worker 进入 idle (最长 30s) ----
-echo "==> 等待 worker 进入 idle 状态..."
-for i in $(seq 1 6); do
-    if sinfo -h -o "%t" -n worker 2>/dev/null | grep -q idle; then
-        echo "   PASS: worker 状态为 idle (第 ${i} 次检查)"
-        break
+# ---- 9. 等待节点注册并进入 idle ----
+echo "==> 等待 worker 注册到 slurmctld 并进入 idle (最长 60s)..."
+NODE_READY=false
+for i in $(seq 1 12); do
+    NODE_STATE=$(sinfo -h -o "%t" -n worker 2>/dev/null || true)
+    if [ -z "${NODE_STATE}" ]; then
+        echo "   等待中... (${i}/12) — 节点尚未出现在 sinfo 中"
+    else
+        echo "   等待中... (${i}/12) — 节点状态: ${NODE_STATE}"
+        if echo "${NODE_STATE}" | grep -qE 'idle|mix|alloc'; then
+            echo "   PASS: worker 状态为 ${NODE_STATE} (第 ${i} 次检查)"
+            NODE_READY=true
+            break
+        fi
+        # 如果节点存在但状态不对，尝试激活
+        if echo "${NODE_STATE}" | grep -qE 'down|drain'; then
+            echo "   尝试激活节点 (scontrol update)..."
+            scontrol update NodeName=worker State=RESUME 2>&1 || true
+        fi
     fi
-    echo "   等待中... (${i}/6)"
     sleep 5
 done
 
 # ---- 10. 最终验证 ----
 echo "==> 最终节点状态:"
-sinfo -n worker || true
+sinfo -n worker 2>&1 || true
+echo ""
+echo "   slurmd 最终状态:"
+systemctl status slurmd --no-pager -l 2>/dev/null || true
 
-if sinfo -h -o "%t" -n worker 2>/dev/null | grep -q idle; then
+if [ "${NODE_READY}" = "true" ]; then
     echo "============================================"
     echo "  Slurm Worker 配置完成: idle ✓"
     echo "============================================"
 else
-    echo "FATAL: worker 未在 30s 内进入 idle" >&2
+    echo "FATAL: worker 未在 60s 内注册到 slurmctld 或进入就绪状态" >&2
+    echo "  完整 sinfo 输出:"
     sinfo 2>&1 || true
+    echo ""
+    echo "  slurmctld 日志 (controller):"
+    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 controller \
+      "sudo journalctl -u slurmctld --no-pager -n 30" 2>/dev/null || \
+      echo "   (无法获取 controller 日志 — SSH 不通)"
     exit 1
 fi
