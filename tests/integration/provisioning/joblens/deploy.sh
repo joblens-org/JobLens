@@ -159,13 +159,36 @@ echo "==> STEP 3.5: 写入 /etc/JobLens/trigger/config.yaml"
 mkdir -p /etc/JobLens/trigger
 
 cat > /etc/JobLens/trigger/config.yaml << 'TRIGGEREOF'
-# JobLens Trigger 集成测试配置 — 单节点，关闭服务注册
+# JobLens Trigger 集成测试配置 — 单节点，关闭所有远程组件
 service:
   host: 0.0.0.0
   port: 7592
 
 service_registry:
-  enabled: false
+  enabled: false                                      # 单节点测试无需服务注册
+  url: "http://localhost:8080"
+  retry_interval: 10
+  max_retries: 3
+  heartbeat_interval: 1800
+
+config_manager:
+  enabled: false                                      # 单节点无需配置管理
+  config_file: "/etc/JobLens/config.yaml"
+  etcd_priority: false
+
+rule_manager:
+  enabled: false                                      # 单节点无需规则引擎
+  etcd_priority: false
+
+lens_config:
+  rpc_timeout: 5.0                                    # RPC 超时 (秒)
+
+email_notifier:
+  smtp_server: ""
+  smtp_port: 587
+  use_tls: true
+  sender_email: ""
+  recipients: []
 TRIGGEREOF
 
 echo "  PASS: Trigger 配置文件已写入"
