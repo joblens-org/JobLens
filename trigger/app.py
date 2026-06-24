@@ -103,7 +103,7 @@ from trigger.utils.email_notifier import simple_send
 # 创建应用实例
 # 使用工厂函数创建，所有初始化逻辑在工厂中完成
 try:
-    config_path = os.environ.get('JOBLENS_CONFIG_PATH', '/etc/JobLens/config.yaml')
+    config_path = os.environ.get('JOBLENS_TRIGGER_CONFIG_PATH', '/etc/JobLens/trigger/config.yaml')
     app = create_application(config_path)
 except Exception as e:
     if __name__ != "__main__":
