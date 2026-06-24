@@ -135,16 +135,6 @@ cpumem_collector_config:
     - file_writer
 
 # ============================================================
-# Trigger Service — 单节点测试，禁用服务注册
-# ============================================================
-service:
-  host: 0.0.0.0
-  port: 7592
-
-service_registry:
-  enabled: false
-
-# ============================================================
 # Writer Configuration — FileWriter only
 # ============================================================
 writers_config:
@@ -160,6 +150,25 @@ file_writer_config:
 YAMLEOF
 
 echo "  PASS: 配置文件已写入"
+
+# ============================================================================
+# STEP 3.5: 写入 Trigger 独立配置文件
+# ============================================================================
+echo "==> STEP 3.5: 写入 /etc/JobLens/trigger/config.yaml"
+
+mkdir -p /etc/JobLens/trigger
+
+cat > /etc/JobLens/trigger/config.yaml << 'TRIGGEREOF'
+# JobLens Trigger 集成测试配置 — 单节点，关闭服务注册
+service:
+  host: 0.0.0.0
+  port: 7592
+
+service_registry:
+  enabled: false
+TRIGGEREOF
+
+echo "  PASS: Trigger 配置文件已写入"
 
 # ============================================================================
 # STEP 4: 启动 systemd 服务 (先 Agent, 再 Trigger)
