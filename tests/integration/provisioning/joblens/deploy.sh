@@ -107,6 +107,7 @@ job_registry_config:
 # ============================================================
 collectors_config:
   enable_collector_perf: true
+  perf_window_size: 1000       # 必填，当 enable_collector_perf=true 时
   default_freq: 1
   default_use_writers:
     - file_writer
