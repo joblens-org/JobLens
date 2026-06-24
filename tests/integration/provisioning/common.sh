@@ -69,6 +69,12 @@ else
     echo "   EPEL 已安装，跳过"
 fi
 
+# 启用 CRB (CodeReady Builder) — EPEL 包的间接依赖需要
+echo "==> 启用 CRB 仓库"
+dnf config-manager --set-enabled crb 2>/dev/null || \
+  dnf config-manager --set-enabled powertools 2>/dev/null || \
+  echo "   WARNING: 无法启用 CRB/powertools (可能已启用或不存在)" 
+
 # ---- 6. 安装基础软件包 ----
 echo "==> 安装基础软件包"
 dnf install -y \

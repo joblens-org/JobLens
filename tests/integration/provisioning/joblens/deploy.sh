@@ -57,12 +57,12 @@ if [ -z "${TRIGGER_RPM}" ]; then
 fi
 echo "  找到 Trigger RPM: $(basename "${TRIGGER_RPM}")"
 
-# 安装 RPM (先装 core, 再装 trigger)
-echo "  安装 Core RPM..."
-rpm -ivh "${CORE_RPM}"
+# 安装 RPM (用 dnf 自动解析依赖, 先装 core, 再装 trigger)
+echo "  安装 Core RPM (dnf 自动解析依赖)..."
+dnf install -y "${CORE_RPM}"
 
 echo "  安装 Trigger RPM..."
-rpm -ivh "${TRIGGER_RPM}"
+dnf install -y "${TRIGGER_RPM}"
 
 echo "  PASS: RPM 安装完成"
 
