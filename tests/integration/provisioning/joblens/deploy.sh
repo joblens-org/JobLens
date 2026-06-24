@@ -103,6 +103,19 @@ job_registry_config:
   auto_add_slurmjob: true
 
 # ============================================================
+# Job Watcher — condor/slurm 自动发现时必填
+# ============================================================
+condor_job_watcher:
+  auto_add_collectors:
+    - cpumem_collector
+  use_rules: false
+
+slurm_job_watcher:
+  auto_add_collectors:
+    - cpumem_collector
+  use_rules: false
+
+# ============================================================
 # Collector Configuration — CPUMemCollector only
 # ============================================================
 collectors_config:
