@@ -135,6 +135,31 @@ cpumem_collector_config:
     - file_writer
 
 # ============================================================
+# Trigger Service — 单节点测试，关闭服务注册
+# 注意: trigger 通过 JOBLENS_CONFIG_PATH 实际读取此文件，
+# /etc/JobLens/trigger/config.yaml 仅作备份
+# ============================================================
+service:
+  host: 0.0.0.0
+  port: 7592
+
+service_registry:
+  enabled: false                                      # 单节点测试无需服务注册
+  url: "http://localhost:8080"
+  retry_interval: 10
+  max_retries: 3
+  heartbeat_interval: 1800
+
+config_manager:
+  enabled: false
+
+rule_manager:
+  enabled: false
+
+lens_config:
+  rpc_timeout: 5.0
+
+# ============================================================
 # Writer Configuration — FileWriter only
 # ============================================================
 writers_config:
