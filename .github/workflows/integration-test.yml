@@ -132,10 +132,36 @@ jobs:
             -v "$(pwd)":/workspace -w /workspace \
             almalinux:9 bash -c "
               set -euo pipefail
-              echo '安装构建依赖 (install-deps.sh)...'
-              dnf install -y sudo git
-              bash scripts/install-deps.sh
-              dnf install -y rpm-build
+              echo '安装构建依赖...'
+              dnf install -y --setopt=tsflags=nodocs epel-release
+              dnf config-manager --set-enabled crb 2>/dev/null || true
+              dnf install -y --setopt=tsflags=nodocs \
+                git clang cmake ninja-build pkgconfig \
+                libbpf-devel elfutils-libelf-devel leveldb-devel \
+                libnl3-devel openssl-devel zlib-devel lua-devel \
+                libcurl-devel cyrus-sasl-devel libzstd-devel lz4-devel \
+                librdkafka-devel boost-devel xxhash-devel \
+                spdlog-devel yaml-cpp-devel fmt-devel \
+                nlohmann-json-devel bpftool rpm-build
+
+              echo '安装 sol2 + date (从源码)...'
+              # sol2 — AlmaLinux 9 仓库无此包
+              curl -fsSL https://github.com/ThePhD/sol2/archive/refs/tags/v3.5.0.tar.gz \
+                -o /tmp/sol2.tar.gz
+              tar -xzf /tmp/sol2.tar.gz -C /tmp
+              cp -r /tmp/sol2-3.5.0/include/sol /usr/local/include/
+
+              # howardhinnant-date — AlmaLinux 9 无 date-devel
+              curl -fsSL \
+                https://github.com/HowardHinnant/date/archive/refs/tags/v3.0.1.tar.gz \
+                -o /tmp/date.tar.gz
+              tar -xzf /tmp/date.tar.gz -C /tmp
+              cd /tmp/date-3.0.1
+              cmake -B build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release -DBUILD_TZ_LIB=ON -DUSE_SYSTEM_TZ_DB=ON
+              cmake --build build
+              cmake --install build
+              cd /workspace
 
               echo '构建 JobLens...'
               cmake --preset rpm-system-deps
