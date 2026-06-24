@@ -145,6 +145,16 @@ echo "==> STEP 4: 启动 systemd 服务"
 # 先启动 JobLens Agent (trigger 依赖其 RPC socket)
 echo "  启动 joblens (Agent)..."
 systemctl enable --now joblens
+sleep 2
+# 立即检查 Agent 是否存活 (crash 通常发生在前 2s)
+if ! systemctl is-active --quiet joblens; then
+    echo "FATAL: joblens Agent 启动后立即退出"
+    echo "  === systemctl status ==="
+    systemctl status joblens --no-pager -l 2>/dev/null || true
+    echo "  === journalctl (最后 50 行) ==="
+    journalctl -u joblens --no-pager -n 50 2>/dev/null || true
+    exit 1
+fi
 
 echo "  启动 joblens-trigger (Trigger)..."
 systemctl enable --now joblens-trigger
@@ -181,11 +191,18 @@ done
 
 if [ "${HEALTH_OK}" != "true" ]; then
     echo "FATAL: 健康检查失败 (已重试 ${MAX_RETRIES} 次)"
-    echo "  调试信息:"
-    echo "  systemctl status joblens:"
+    echo ""
+    echo "  === systemctl status joblens ==="
     systemctl status joblens --no-pager -l 2>/dev/null || true
-    echo "  systemctl status joblens-trigger:"
+    echo ""
+    echo "  === journalctl -u joblens (最后 50 行) ==="
+    journalctl -u joblens --no-pager -n 50 2>/dev/null || true
+    echo ""
+    echo "  === systemctl status joblens-trigger ==="
     systemctl status joblens-trigger --no-pager -l 2>/dev/null || true
+    echo ""
+    echo "  === journalctl -u joblens-trigger (最后 30 行) ==="
+    journalctl -u joblens-trigger --no-pager -n 30 2>/dev/null || true
     exit 1
 fi
 
