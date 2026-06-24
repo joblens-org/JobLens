@@ -108,6 +108,8 @@ job_registry_config:
 collectors_config:
   enable_collector_perf: true
   default_freq: 1
+  default_use_writers:
+    - file_writer
   collectors:
     - name: cpumem_collector
       type: CPUMemCollector
