@@ -764,8 +764,15 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
     core_rpm = resolve_rpm_glob(os.environ["CORE_RPM_PATTERN"])
     trigger_rpm = resolve_rpm_glob(os.environ["TRIGGER_RPM_PATTERN"])
 
-    subprocess.run(["cp", str(core_rpm), str(rpms_dir / core_rpm.name)], check=True)
-    subprocess.run(["cp", str(trigger_rpm), str(rpms_dir / trigger_rpm.name)], check=True)
+    # 如果 RPM 已经在 rpms/ 下 (CI build 已放入), 跳过复制
+    if core_rpm.parent.resolve() != rpms_dir.resolve():
+        subprocess.run(["cp", str(core_rpm), str(rpms_dir / core_rpm.name)], check=True)
+    else:
+        print("  Core RPM 已在 rpms/ 目录, 跳过复制")
+    if trigger_rpm.parent.resolve() != rpms_dir.resolve():
+        subprocess.run(["cp", str(trigger_rpm), str(rpms_dir / trigger_rpm.name)], check=True)
+    else:
+        print("  Trigger RPM 已在 rpms/ 目录, 跳过复制")
     print(f"✓ RPM 文件就绪: rpms/{core_rpm.name}, rpms/{trigger_rpm.name}")
 
     # ── 5e: JobLens 配置注入 ──
