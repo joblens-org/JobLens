@@ -6,7 +6,8 @@
 #   - pull_request: 对 main/develop/feat/* 分支路径过滤触发
 #
 # 运行环境:
-#   - GitHub-hosted ubuntu-latest (x86-64, KVM 嵌套虚拟化)
+#   - Self-hosted runner (x86-64, KVM 嵌套虚拟化)
+#   - 标签: self-hosted, kvm
 #   - Guest VM: AlmaLinux 9 (通过 Vagrant libvirt)
 #
 # 构建 (对齐 CI 流程):
@@ -38,7 +39,8 @@ on:
 jobs:
   integration-test:
     name: Integration Test (KVM + Vagrant)
-    runs-on: ubuntu-latest
+    # 需要真机 KVM 支持 — GitHub-hosted runners 不支持嵌套虚拟化
+    runs-on: [self-hosted, kvm]
     timeout-minutes: 60
 
     env:
