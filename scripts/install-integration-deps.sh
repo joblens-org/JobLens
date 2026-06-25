@@ -89,9 +89,16 @@ fi
 echo ""
 echo "=== Step 2: 配置 libvirt socket 权限 ==="
 
-# 启动 libvirtd (幂等)
-systemctl enable libvirtd 2>/dev/null || true
-systemctl start libvirtd 2>/dev/null || true
+# 启动 libvirtd (幂等, 兼容非 systemd 环境如 GitHub Actions)
+echo "正在启动 libvirtd..."
+if systemctl start libvirtd 2>/dev/null; then
+    echo "  libvirtd started via systemctl"
+elif service libvirtd start 2>/dev/null; then
+    echo "  libvirtd started via service"
+else
+    echo "  systemctl/service 均不可用, 尝试直接启动 libvirtd daemon"
+    libvirtd -d -l 2>/dev/null || true
+fi
 sleep 2
 
 # 直接 chmod socket — CI 临时环境, 不需要持久化
@@ -107,7 +114,7 @@ done
 # 如果上面没有 socket, 尝试重启后再次 chmod
 if [ "$SOCKET_FOUND" != "true" ]; then
     echo "未找到 libvirt socket, 重启 libvirtd..."
-    systemctl restart libvirtd
+    systemctl restart libvirtd 2>/dev/null || libvirtd -d -l 2>/dev/null || true
     sleep 3
     for sock in /var/run/libvirt/libvirt-sock*; do
         if [ -e "$sock" ]; then
@@ -155,14 +162,21 @@ fi
 # 安装 vagrant-libvirt
 echo ""
 echo "=== 安装 vagrant-libvirt 插件 ==="
-apt-get install -y --no-install-recommends ruby-dev pkg-config 2>/dev/null || true
+apt-get install -y --no-install-recommends ruby-dev pkg-config
 
 if vagrant plugin list 2>/dev/null | grep -q 'vagrant-libvirt'; then
     echo "vagrant-libvirt 插件已安装, 跳过"
 else
+    echo "正在安装 vagrant-libvirt..."
     vagrant plugin install vagrant-libvirt
 fi
-vagrant plugin list 2>/dev/null || true
+echo "已安装插件:"
+vagrant plugin list 2>/dev/null
+# 强制验证插件安装成功
+if ! vagrant plugin list 2>/dev/null | grep -q 'vagrant-libvirt'; then
+    echo "FATAL: vagrant-libvirt 插件安装失败!" >&2
+    exit 1
+fi
 
 # ────────────────────────────────────────────────────────────────────────
 echo ""
