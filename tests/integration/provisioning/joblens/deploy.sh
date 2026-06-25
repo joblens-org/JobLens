@@ -3,66 +3,165 @@ set -euo pipefail
 
 # ============================================================================
 # JobLens 部署脚本 — VM2 (worker, 192.168.56.20)
-# 用法: sudo bash deploy.sh
-# 前提: VM2 已完成通用初始化 (common.sh worker)
-#       RPM 包已放置于 /vagrant/rpms/ 目录
+# 用法: sudo bash deploy.sh --rpm-path=<path> --trigger-rpm-path=<path> \
+#         --core-config=<path> --trigger-config=<path> [选项]
 #
 # 功能:
-#   1. 从 /vagrant/rpms/ 安装预编译的 JobLens Core + Trigger RPM
-#   2. 写入 /etc/JobLens/config.yaml (FileWriter 输出)
+#   1. 从参数指定路径安装预编译的 JobLens Core + Trigger RPM
+#   2. 从外部配置文件复制到 /etc/JobLens/ (不再内联生成)
 #   3. 创建运行时目录并启动 systemd 服务
 #   4. 健康检查 + 作业计数验证
 # ============================================================================
+
+# ---- 打印帮助信息 ----
+usage() {
+    cat << 'USAGE'
+JobLens 部署脚本 — 从外部配置文件部署到 worker VM
+
+用法: sudo bash deploy.sh --rpm-path=<path> --trigger-rpm-path=<path> \
+        --core-config=<path> --trigger-config=<path> [选项]
+
+必填参数:
+  --rpm-path <path>            JobLens Core RPM 文件路径
+  --trigger-rpm-path <path>    Trigger RPM 文件路径
+  --core-config <path>         JobLens Core 配置文件路径 (VM 内路径)
+  --trigger-config <path>      Trigger 配置文件路径 (VM 内路径)
+
+可选参数:
+  --config-dest <path>         配置文件安装目标目录 (默认: /etc/JobLens)
+  --output-log <path>          FileWriter JSONL 输出路径
+                               (默认: /var/log/joblens/output.log,
+                                与外部配置文件不同时自动覆盖)
+  --help, -h                   显示此帮助信息
+
+功能:
+  1. 从参数指定路径安装 JobLens Core + Trigger RPM
+  2. 从外部配置文件复制到目标目录 (不再内联生成 YAML)
+  3. 创建运行时目录 (/var/JobLens, /var/log/joblens)
+  4. 启动 systemd 服务 (先 joblens, 再 joblens-trigger)
+  5. 健康检查重试 (最多 3 次, 间隔 5s)
+  6. 作业计数 API 验证
+
+示例:
+  sudo bash deploy.sh \
+    --rpm-path=/vagrant/rpms/joblens-0.3.0.rpm \
+    --trigger-rpm-path=/vagrant/rpms/joblens-trigger-0.3.0.rpm \
+    --core-config=/vagrant/.runtime/joblens_core.yaml \
+    --trigger-config=/vagrant/.runtime/joblens_trigger.yaml
+
+USAGE
+}
+
+# ---- 参数解析 ----
+RPM_PATH=""
+TRIGGER_RPM_PATH=""
+CORE_CONFIG=""
+TRIGGER_CONFIG=""
+CONFIG_DEST="/etc/JobLens"
+OUTPUT_LOG="/var/log/joblens/output.log"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --rpm-path=*)
+            RPM_PATH="${1#*=}"
+            shift
+            ;;
+        --rpm-path)
+            RPM_PATH="$2"
+            shift 2
+            ;;
+        --trigger-rpm-path=*)
+            TRIGGER_RPM_PATH="${1#*=}"
+            shift
+            ;;
+        --trigger-rpm-path)
+            TRIGGER_RPM_PATH="$2"
+            shift 2
+            ;;
+        --core-config=*)
+            CORE_CONFIG="${1#*=}"
+            shift
+            ;;
+        --core-config)
+            CORE_CONFIG="$2"
+            shift 2
+            ;;
+        --trigger-config=*)
+            TRIGGER_CONFIG="${1#*=}"
+            shift
+            ;;
+        --trigger-config)
+            TRIGGER_CONFIG="$2"
+            shift 2
+            ;;
+        --config-dest=*)
+            CONFIG_DEST="${1#*=}"
+            shift
+            ;;
+        --config-dest)
+            CONFIG_DEST="$2"
+            shift 2
+            ;;
+        --output-log=*)
+            OUTPUT_LOG="${1#*=}"
+            shift
+            ;;
+        --output-log)
+            OUTPUT_LOG="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "错误: 未知参数: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# ---- 工具函数 ----
+fatal() {
+    echo "FATAL: $*" >&2
+    exit 1
+}
+
+# ---- 参数校验 ----
+[[ -z "${RPM_PATH}" ]]          && fatal "缺少 --rpm-path 参数 (JobLens Core RPM 文件路径)"
+[[ -z "${TRIGGER_RPM_PATH}" ]]  && fatal "缺少 --trigger-rpm-path 参数 (Trigger RPM 文件路径)"
+[[ -z "${CORE_CONFIG}" ]]       && fatal "缺少 --core-config 参数 (Core 配置文件路径)"
+[[ -z "${TRIGGER_CONFIG}" ]]    && fatal "缺少 --trigger-config 参数 (Trigger 配置文件路径)"
+
+[[ ! -f "${RPM_PATH}" ]]         && fatal "Core RPM 文件不存在: ${RPM_PATH}"
+[[ ! -f "${TRIGGER_RPM_PATH}" ]] && fatal "Trigger RPM 文件不存在: ${TRIGGER_RPM_PATH}"
+[[ ! -f "${CORE_CONFIG}" ]]      && fatal "Core 配置文件不存在: ${CORE_CONFIG}"
+[[ ! -f "${TRIGGER_CONFIG}" ]]   && fatal "Trigger 配置文件不存在: ${TRIGGER_CONFIG}"
+
+# ---- 检查 root 权限 ----
+if [ "$EUID" -ne 0 ]; then
+    fatal "此脚本需要 root 权限运行 (使用 sudo)"
+fi
 
 echo "============================================"
 echo "  JobLens 部署: VM2 (worker)"
 echo "============================================"
 
-# ---- 检查 root 权限 ----
-if [ "$EUID" -ne 0 ]; then
-    echo "FATAL: 此脚本需要 root 权限运行 (使用 sudo)"
-    exit 1
-fi
-
 # ============================================================================
-# STEP 1: 检查并安装 RPM 包
+# STEP 1: 安装 RPM 包
 # ============================================================================
-echo "==> STEP 1: 检查 RPM 包"
+echo "==> STEP 1: 安装 RPM 包"
 
-RPM_DIR="/vagrant/rpms"
-
-if [ ! -d "${RPM_DIR}" ]; then
-    echo "FATAL: RPM 目录不存在: ${RPM_DIR}"
-    echo "  请通过 CI 构建 RPM 包并放置到 ${RPM_DIR}/"
-    exit 1
-fi
-
-# 查找 core RPM (排除 trigger RPM)
-CORE_RPM=$(find "${RPM_DIR}" -maxdepth 1 -name 'joblens-[0-9]*.rpm' ! -name '*-trigger-*' -print -quit 2>/dev/null || true)
-if [ -z "${CORE_RPM}" ]; then
-    echo "FATAL: 未找到 JobLens Core RPM 文件 (joblens-*.rpm)"
-    echo "  路径: ${RPM_DIR}/joblens-*.rpm"
-    echo "  请通过 CI 构建 RPM 包后再运行此脚本。"
-    exit 1
-fi
-echo "  找到 Core RPM: $(basename "${CORE_RPM}")"
-
-# 查找 trigger RPM
-TRIGGER_RPM=$(find "${RPM_DIR}" -maxdepth 1 -name 'joblens-trigger-*.rpm' -print -quit 2>/dev/null || true)
-if [ -z "${TRIGGER_RPM}" ]; then
-    echo "FATAL: 未找到 JobLens Trigger RPM 文件 (joblens-trigger-*.rpm)"
-    echo "  路径: ${RPM_DIR}/joblens-trigger-*.rpm"
-    echo "  请通过 CI 构建 RPM 包后再运行此脚本。"
-    exit 1
-fi
-echo "  找到 Trigger RPM: $(basename "${TRIGGER_RPM}")"
+echo "  Core RPM:    ${RPM_PATH}"
+echo "  Trigger RPM: ${TRIGGER_RPM_PATH}"
 
 # 安装 RPM (用 dnf 自动解析依赖, 先装 core, 再装 trigger)
 echo "  安装 Core RPM (dnf 自动解析依赖)..."
-dnf install -y "${CORE_RPM}"
+dnf install -y "${RPM_PATH}"
 
 echo "  安装 Trigger RPM..."
-dnf install -y "${TRIGGER_RPM}"
+dnf install -y "${TRIGGER_RPM_PATH}"
 
 echo "  PASS: RPM 安装完成"
 
@@ -77,146 +176,27 @@ mkdir -p /var/log/joblens
 echo "  PASS: 目录已创建"
 
 # ============================================================================
-# STEP 3: 写入配置文件
+# STEP 3: 从外部文件安装配置文件
 # ============================================================================
-echo "==> STEP 3: 写入 /etc/JobLens/config.yaml"
+echo "==> STEP 3: 安装配置文件 (从外部文件复制)"
 
-cat > /etc/JobLens/config.yaml << 'YAMLEOF'
-# JobLens 集成测试配置 — VM2 (worker)
-# 使用 FileWriter 输出 JSONL 到 /var/log/joblens/output.log
+# Core 配置
+mkdir -p "${CONFIG_DEST}/"
+cp "${CORE_CONFIG}" "${CONFIG_DEST}/config.yaml"
+echo "  Core 配置已安装:  ${CONFIG_DEST}/config.yaml <- ${CORE_CONFIG}"
 
-# ============================================================
-# Core Configuration
-# ============================================================
-lens_config:
-  rpc_socket_path: /var/JobLens/rpc.sock
-  lock_path: /var/JobLens/JobLens.lock
-  max_collector_threads: 2
-  log_level: debug
+# 如果 --output-log 与外部配置文件中的默认值不同, 覆盖 file_writer_config.path
+if [[ "${OUTPUT_LOG}" != "/var/log/joblens/output.log" ]]; then
+    sed -i "s|^  path: .*|  path: ${OUTPUT_LOG}|" "${CONFIG_DEST}/config.yaml"
+    echo "  INFO: 输出日志路径已覆盖 -> ${OUTPUT_LOG}"
+fi
 
-# ============================================================
-# Job Registry Configuration
-# ============================================================
-job_registry_config:
-  job_db_path: /var/JobLens/job.db
-  auto_add_condorjob: true
-  auto_add_slurmjob: true
+# Trigger 配置
+mkdir -p "${CONFIG_DEST}/trigger/"
+cp "${TRIGGER_CONFIG}" "${CONFIG_DEST}/trigger/config.yaml"
+echo "  Trigger 配置已安装: ${CONFIG_DEST}/trigger/config.yaml <- ${TRIGGER_CONFIG}"
 
-# ============================================================
-# Job Watcher — condor/slurm 自动发现时必填
-# ============================================================
-condor_job_watcher:
-  auto_add_collectors:
-    - cpumem_collector
-  use_rules: false
-
-slurm_job_watcher:
-  auto_add_collectors:
-    - cpumem_collector
-  use_rules: false
-
-# ============================================================
-# Collector Configuration — CPUMemCollector only
-# ============================================================
-collectors_config:
-  enable_collector_perf: true
-  perf_window_size: 1000       # 必填，当 enable_collector_perf=true 时
-  default_freq: 1
-  default_use_writers:
-    - file_writer
-  collectors:
-    - name: cpumem_collector
-      type: CPUMemCollector
-      config: cpumem_collector_config
-
-cpumem_collector_config:
-  freq: 1
-  use_writers:
-    - file_writer
-
-# ============================================================
-# Trigger Service — 单节点测试，关闭服务注册
-# 注意: trigger 通过 JOBLENS_CONFIG_PATH 实际读取此文件，
-# /etc/JobLens/trigger/config.yaml 仅作备份
-# ============================================================
-service:
-  host: 0.0.0.0
-  port: 7592
-
-service_registry:
-  enabled: false                                      # 单节点测试无需服务注册
-  url: "http://localhost:8080"
-  retry_interval: 10
-  max_retries: 3
-  heartbeat_interval: 1800
-
-config_manager:
-  enabled: false
-
-rule_manager:
-  enabled: false
-
-lens_config:
-  rpc_timeout: 5.0
-
-# ============================================================
-# Writer Configuration — FileWriter only
-# ============================================================
-writers_config:
-  enable_writer_perf: true
-  buffer_capacity: 256
-  writers:
-    - name: file_writer
-      type: FileWriter
-      config: file_writer_config
-
-file_writer_config:
-  path: /var/log/joblens/output.log
-YAMLEOF
-
-echo "  PASS: 配置文件已写入"
-
-# ============================================================================
-# STEP 3.5: 写入 Trigger 独立配置文件
-# ============================================================================
-echo "==> STEP 3.5: 写入 /etc/JobLens/trigger/config.yaml"
-
-mkdir -p /etc/JobLens/trigger
-
-cat > /etc/JobLens/trigger/config.yaml << 'TRIGGEREOF'
-# JobLens Trigger 集成测试配置 — 单节点，关闭所有远程组件
-service:
-  host: 0.0.0.0
-  port: 7592
-
-service_registry:
-  enabled: false                                      # 单节点测试无需服务注册
-  url: "http://localhost:8080"
-  retry_interval: 10
-  max_retries: 3
-  heartbeat_interval: 1800
-
-config_manager:
-  enabled: false                                      # 单节点无需配置管理
-  config_file: "/etc/JobLens/config.yaml"
-  etcd_priority: false
-
-rule_manager:
-  enabled: false                                      # 单节点无需规则引擎
-  etcd_priority: false
-
-lens_config:
-  rpc_timeout: 5.0                                    # RPC 超时 (秒)
-
-email_notifier:
-  smtp_server: ""
-  smtp_port: 587
-  use_tls: true
-  sender_email: ""
-  recipients: []
-TRIGGEREOF
-
-echo "  PASS: Trigger 配置文件已写入"
+echo "  PASS: 配置文件安装完成"
 
 # ============================================================================
 # STEP 4: 启动 systemd 服务 (先 Agent, 再 Trigger)
@@ -309,6 +289,6 @@ echo "============================================"
 echo "  JobLens 部署完成: VM2 (worker)"
 echo "  - Agent RPC socket: /var/JobLens/rpc.sock"
 echo "  - LevelDB:          /var/JobLens/job.db"
-echo "  - 输出日志:          /var/log/joblens/output.log"
+echo "  - 输出日志:          ${OUTPUT_LOG}"
 echo "  - 健康检查端口:      7592"
 echo "============================================"
