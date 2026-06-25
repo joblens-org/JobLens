@@ -164,16 +164,24 @@ echo ""
 echo "=== 安装 vagrant-libvirt 插件 ==="
 apt-get install -y --no-install-recommends ruby-dev pkg-config
 
-if vagrant plugin list 2>/dev/null | grep -q 'vagrant-libvirt'; then
+# Vagrant 插件必须用普通用户安装 (sudo 下插件装到 /root/.vagrant.d/, CI 用户不可见)
+# 检测是否通过 sudo 调用, 若是则切回原用户执行 vagrant 命令
+VAGRANT_CMD="vagrant"
+if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+    VAGRANT_CMD="sudo -u ${SUDO_USER} vagrant"
+    echo "  检测到 sudo 环境, vagrant 命令以 ${SUDO_USER} 用户执行"
+fi
+
+if $VAGRANT_CMD plugin list 2>/dev/null | grep -q 'vagrant-libvirt'; then
     echo "vagrant-libvirt 插件已安装, 跳过"
 else
     echo "正在安装 vagrant-libvirt..."
-    vagrant plugin install vagrant-libvirt
+    $VAGRANT_CMD plugin install vagrant-libvirt
 fi
 echo "已安装插件:"
-vagrant plugin list 2>/dev/null
+$VAGRANT_CMD plugin list 2>/dev/null
 # 强制验证插件安装成功
-if ! vagrant plugin list 2>/dev/null | grep -q 'vagrant-libvirt'; then
+if ! $VAGRANT_CMD plugin list 2>/dev/null | grep -q 'vagrant-libvirt'; then
     echo "FATAL: vagrant-libvirt 插件安装失败!" >&2
     exit 1
 fi
