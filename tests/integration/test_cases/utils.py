@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 # ── 2. 路径常量 ─────────────────────────────────────────────────────────
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-INTEGRATION_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+INTEGRATION_ROOT = Path(__file__).resolve().parent.parent
 
 
 # ── 3. 运行时预设环境加载 (必须在第三方 import 之前，确保 fast-fail 先于 ModuleNotFoundError) ──
@@ -32,7 +32,7 @@ def _load_preset_env() -> Dict[str, Any]:
     if not preset_path.is_file():
         print(
             "FATAL: tests/integration/.runtime/preset_env.json 未找到。"
-            "请先运行 run_preset.sh",
+            "请先运行 run_preset.py",
             file=sys.stderr,
         )
         sys.exit(1)

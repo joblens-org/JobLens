@@ -66,10 +66,10 @@ joblens:
 # ============================================================
 tests:
   pytest_files:
-    - test_01_health.py
-    - test_02_htcondor_discovery.py
-    - test_03_slurm_discovery.py
-    - test_04_filewriter_schema.py
-    - test_05_trigger_api.py
-    - test_06_performance_baseline.py
+    - test_cases/test_01_health.py
+    - test_cases/test_02_htcondor_discovery.py
+    - test_cases/test_03_slurm_discovery.py
+    - test_cases/test_04_filewriter_schema.py
+    - test_cases/test_05_trigger_api.py
+    - test_cases/test_06_performance_baseline.py
   pytest_args: "-v --tb=short"

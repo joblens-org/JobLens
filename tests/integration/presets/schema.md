@@ -237,10 +237,11 @@ joblens:
 ```yaml
 tests:
   pytest_files:
-    - test_01_health.py
-    - test_02_htcondor_discovery.py
-    - test_03_slurm_discovery.py
+    - test_cases/test_01_health.py
+    - test_cases/test_02_htcondor_discovery.py
+    - test_cases/test_03_slurm_discovery.py
 ```
+
 
 **错误示例**：
 ```yaml
@@ -296,8 +297,8 @@ joblens:
   trigger_config: /vagrant/rpms/joblens-trigger-config.yaml
 tests:
   pytest_files:
-    - test_01_health.py
-    - test_02_htcondor_discovery.py
+    - test_cases/test_01_health.py
+    - test_cases/test_02_htcondor_discovery.py
 ```
 
 ## 十、校验流程

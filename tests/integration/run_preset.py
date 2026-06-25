@@ -403,6 +403,7 @@ def extract_preset_env(preset_data: dict) -> dict:
             "worker": {"host": "worker", "ip": wrk_ip},
             "nodes": nodes,
             "trigger_url": trigger_url,
+            "schedulers": sched,
         },
     }
 
