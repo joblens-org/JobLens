@@ -35,7 +35,7 @@ provision: ## 部署所有服务 (common + condor + slurm + joblens)
 	vagrant ssh worker -c "sudo bash /vagrant/provisioning/joblens/deploy.sh"
 
 test: venv ## 运行全部集成测试 (alm9-default 预设)
-	./run_preset.sh alm9-default
+	python3 ./run_preset.py alm9-default
 
 test-condor: venv ## 仅 HTCondor 发现测试 (4 个)
 	$(PYTEST) -v --tb=short test_02_htcondor_discovery.py
@@ -44,13 +44,13 @@ test-slurm: venv ## 仅 Slurm 发现测试 (4 个)
 	$(PYTEST) -v --tb=short test_03_slurm_discovery.py
 
 preset: venv ## 运行指定预设 (make preset NAME=alm9-default)
-	./run_preset.sh $(NAME)
+	python3 ./run_preset.py $(NAME)
 
 preset-list: ## 列出所有可用预设
-	./run_preset.sh --list
+	python3 ./run_preset.py --list
 
 preset-match: ## glob 匹配预设 (make preset-match PATTERN="alm9-*")
-	./run_preset.sh --match $(PATTERN)
+	python3 ./run_preset.py --match $(PATTERN)
 
 logs: ## 查看 JobLens 服务日志
 	vagrant ssh worker -c "sudo journalctl -u joblens --no-pager -n 50"
