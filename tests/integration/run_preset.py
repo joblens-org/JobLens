@@ -123,25 +123,38 @@ def vagrant_ssh(node: str, command: str, check: bool = True) -> subprocess.Compl
 
 
 def vagrant_cat(node: str, path: str) -> bytes:
-    """从 VM 节点读取文件内容。"""
+    """从 VM 节点读取文件内容, 失败时打印错误。"""
     proc = subprocess.run(
         ["vagrant", "ssh", node, "-c", f"sudo cat {path}"],
         cwd=SCRIPT_DIR,
         capture_output=True,
-        check=True,
+        text=False,
     )
+    if proc.returncode != 0:
+        print(f"\n--- vagrant cat {node}:{path} 失败 (exit {proc.returncode}) ---")
+        if proc.stderr:
+            stderr_str = proc.stderr.decode(errors="replace")
+            print(f"[stderr]\n{stderr_str}")
+        print("---")
+        proc.check_returncode()
     return proc.stdout
 
 
 def vagrant_write(node: str, path: str, data: bytes) -> None:
-    """通过 sudo tee 将数据写入 VM 节点文件。"""
-    subprocess.run(
+    """通过 sudo tee 将数据写入 VM 节点文件, 失败时打印错误。"""
+    proc = subprocess.run(
         ["vagrant", "ssh", node, "-c", f"sudo tee {path} > /dev/null"],
         cwd=SCRIPT_DIR,
         input=data,
         capture_output=True,
-        check=True,
     )
+    if proc.returncode != 0:
+        print(f"\n--- vagrant write {node}:{path} 失败 (exit {proc.returncode}) ---")
+        if proc.stderr:
+            stderr_str = proc.stderr.decode(errors="replace")
+            print(f"[stderr]\n{stderr_str}")
+        print("---")
+        proc.check_returncode()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -725,7 +738,8 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
             slurm_conf = vagrant_cat("controller", "/etc/slurm/slurm.conf")
             (slurm_runtime / "slurm.conf").write_bytes(slurm_conf)
 
-            vagrant_ssh("controller", "sudo mkdir -p /var/tmp/slurm_runtime")  # type: ignore[checks]  # skip: already caught by outer try
+            # 在 worker 上创建运行时目录, 然后注入文件
+            vagrant_ssh("worker", "sudo mkdir -p /var/tmp/slurm_runtime")
             vagrant_write("worker", "/var/tmp/slurm_runtime/munge.key", munge_key)
             vagrant_write("worker", "/var/tmp/slurm_runtime/slurm.conf", slurm_conf)
 
