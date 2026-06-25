@@ -11,7 +11,7 @@
 #
 # 构建 (对齐 CI 流程):
 #   - Core RPM: almalinux:9 容器 + CMake presets + scripts/install-deps.sh
-#   - Trigger RPM: fedora:latest 容器 + scripts/build-trigger-rpm.sh --install-deps
+#   - Trigger RPM: almalinux:9 容器 + scripts/build-trigger-rpm.sh --install-deps
 #
 # 拓扑:
 #   - VM1 controller (192.168.56.10): 调度控制服务
@@ -88,12 +88,12 @@ jobs:
           rpm -qp tests/integration/rpms/joblens-[0-9]*.rpm 2>/dev/null && echo "✓ Core RPM 格式有效" || true
           echo "==="
 
-      - name: 构建 Trigger RPM (对齐 ci.yml — fedora 容器)
+      - name: 构建 Trigger RPM (对齐 ci.yml — almalinux 9 容器)
         run: |
-          echo "=== 在 Fedora 容器内构建 Trigger RPM ==="
+          echo "=== 在 AlmaLinux 9 容器内构建 Trigger RPM ==="
           docker run --rm \
             -v "$(pwd)":/workspace -w /workspace \
-            fedora:latest bash -c "
+            almalinux:9 bash -c "
               set -euo pipefail
               dnf install -y --setopt=tsflags=nodocs git
               bash scripts/build-trigger-rpm.sh --install-deps
