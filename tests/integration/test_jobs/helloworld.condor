@@ -1,0 +1,9 @@
+# JobLens 集成测试 — Hello World HTCondor demo 作业 (预检用)
+# 用法: condor_submit tests/integration/test_jobs/helloworld.condor
+# 运行时长远小于 sleep.condor，适合快速预检
+
+universe       = vanilla
+executable     = /usr/bin/echo
+arguments      = "hello world from HTCondor"
+output         = /tmp/hw_condor.out
+queue 1

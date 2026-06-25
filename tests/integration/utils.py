@@ -1,33 +1,117 @@
 """JobLens integration test utility functions."""
 
+# ── 1. stdlib imports ──────────────────────────────────────────────────
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
-import requests
-from fabric import Connection
-
-# ── 路径与主机常量 ───────────────────────────────────────────────────
-
+# ── 2. 路径常量 ─────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 INTEGRATION_ROOT = Path(__file__).resolve().parent
 
-CONTROLLER_HOST = "controller"
-WORKER_HOST = "worker"
-CONTROLLER_IP = "192.168.56.10"
-WORKER_IP = "192.168.56.20"
 
-TRIGGER_PORT = 7592
-TRIGGER_BASE_URL = f"http://{WORKER_IP}:{TRIGGER_PORT}"
+# ── 3. 运行时预设环境加载 (必须在第三方 import 之前，确保 fast-fail 先于 ModuleNotFoundError) ──
+
+def _load_preset_env() -> Dict[str, Any]:
+    """从 tests/integration/.runtime/preset_env.json 加载预设环境配置。
+
+    在模块导入时调用，确保所有常量在使用前已初始化。
+    文件不存在或 JSON 解析失败时立即退出，不提供硬编码回退。
+
+    Returns:
+        解析并验证后的预设环境字典。
+
+    Raises:
+        SystemExit: 当环境文件不存在、JSON 解析失败或缺少必要字段时。
+    """
+    preset_path = INTEGRATION_ROOT / ".runtime" / "preset_env.json"
+
+    if not preset_path.is_file():
+        print(
+            "FATAL: tests/integration/.runtime/preset_env.json 未找到。"
+            "请先运行 run_preset.sh",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        with open(preset_path, "r", encoding="utf-8") as f:
+            preset = json.load(f)
+    except json.JSONDecodeError as e:
+        print(
+            f"FATAL: tests/integration/.runtime/preset_env.json JSON 解析失败: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # 验证顶层必要字段
+    required_fields = [
+        "preset_name", "controller", "worker",
+        "trigger_url", "schedulers",
+    ]
+    for field in required_fields:
+        if field not in preset:
+            print(
+                f"FATAL: tests/integration/.runtime/preset_env.json 缺少必要字段: {field}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # 验证 controller/worker 嵌套字段
+    for role in ("controller", "worker"):
+        role_data = preset.get(role, {})
+        for subfield in ("host", "ip"):
+            if subfield not in role_data:
+                print(
+                    f"FATAL: tests/integration/.runtime/preset_env.json "
+                    f"{role} 缺少必要字段: {subfield}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+    return preset
+
+
+# 模块级执行：立即加载并校验环境文件
+_preset = _load_preset_env()
+
+
+# ── 4. 主机常量 (从 .runtime/preset_env.json 加载) ────────────────────────
+
+PRESET_NAME = _preset["preset_name"]
+
+CONTROLLER_HOST = _preset["controller"]["host"]
+WORKER_HOST = _preset["worker"]["host"]
+CONTROLLER_IP = _preset["controller"]["ip"]
+WORKER_IP = _preset["worker"]["ip"]
+
+TRIGGER_BASE_URL = _preset["trigger_url"]
+
+# 从 trigger_url 提取端口号，保持与 TRIGGER_BASE_URL 一致
+_parts = TRIGGER_BASE_URL.rsplit(":", 1)
+if len(_parts) == 2 and _parts[1].isdigit():
+    TRIGGER_PORT = int(_parts[1])
+else:
+    print(
+        f"FATAL: trigger_url 格式无效，无法提取端口号: {TRIGGER_BASE_URL}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 JOBLENS_OUTPUT_LOG = "/var/log/joblens/output.log"
 JOBLENS_DB_PATH = "/var/JobLens/job.db"
 JOBLENS_LOCK_PATH = "/var/JobLens/JobLens.lock"
 
 
-# ── RemoteClient ──────────────────────────────────────────────────────
+# ── 5. 第三方 imports (必须在 fast-fail 路径之后) ────────────────────────
+import requests          # noqa: E402
+from fabric import Connection  # noqa: E402
+
+
+# ── 6. RemoteClient ────────────────────────────────────────────────────
 
 class RemoteClient:
     """基于 fabric.Connection 的远程主机操作封装，默认使用 Vagrant 主机别名."""
@@ -57,7 +141,7 @@ class RemoteClient:
         self._conn.close()
 
 
-# ── JobLensAPI ────────────────────────────────────────────────────────
+# ── 7. JobLensAPI ──────────────────────────────────────────────────────
 
 class JobLensAPI:
     """JobLens Trigger REST API 封装，默认指向 worker VM."""
@@ -111,7 +195,7 @@ class JobLensAPI:
         return self.get("/joblens/writers/perf")
 
 
-# ── retry_with_backoff ────────────────────────────────────────────────
+# ── 8. retry_with_backoff ──────────────────────────────────────────────
 
 class RetryTimeoutError(TimeoutError):
     """重试超时错误，附带最后一次捕获的异常用于诊断."""
@@ -154,7 +238,7 @@ def retry_with_backoff(
             wait = min(wait * 2, max_wait)
 
 
-# ── parse_jsonl ───────────────────────────────────────────────────────
+# ── 9. parse_jsonl ─────────────────────────────────────────────────────
 
 def parse_jsonl(path_or_text: Union[str, Path]) -> List[Dict[str, Any]]:
     """解析 JSONL 文件路径或原始 JSONL 文本.
@@ -180,7 +264,7 @@ def parse_jsonl(path_or_text: Union[str, Path]) -> List[Dict[str, Any]]:
     return records
 
 
-# ── validate_json_schema ──────────────────────────────────────────────
+# ── 10. validate_json_schema ───────────────────────────────────────────
 
 def validate_json_schema(
     data: Dict[str, Any], required_fields: List[str]
@@ -206,7 +290,7 @@ def validate_json_schema(
     return missing
 
 
-# ── 作业提交工具 (供 T11 等测试用例共享) ──────────────────────────────
+# ── 11. 作业提交工具 (供测试用例共享) ────────────────────────────────────
 
 def submit_condor_job(
     controller: RemoteClient, sleep_seconds: int = 60

@@ -1,0 +1,90 @@
+# JobLens C++ Agent 集成测试配置 (Core)
+# 用途: 部署到 worker VM 的 /etc/JobLens/config.yaml
+# 来源: 从 tests/integration/provisioning/joblens/deploy.sh 内联 YAML 提取
+# 涵盖: 基础配置 + 作业发现 + 采集器 + 输出 writer
+#
+# ⚠️ 以下所有字段均为必填 — 缺失任一将导致 SIGABRT 或运行时故障
+# 参见: tests/integration/ARCHITECTURE.md:244-254 陷阱字段表
+
+# ============================================================
+# 基础 Core 配置 (必填)
+# ============================================================
+lens_config:
+  rpc_socket_path: /var/JobLens/rpc.sock       # UNIX Domain Socket RPC 通信路径
+  lock_path: /var/JobLens/JobLens.lock         # 进程锁文件，防止多实例
+  max_collector_threads: 2                       # 采集器调度线程池大小
+  log_level: debug                               # 日志级别: trace/debug/info/warn/error/critical/off
+
+# ============================================================
+# 作业注册表 (必填)
+# ============================================================
+job_registry_config:
+  job_db_path: /var/JobLens/job.db              # LevelDB 数据库目录 (作业持久化)
+  auto_add_condorjob: true                       # 自动发现 HTCondor 作业
+  auto_add_slurmjob: true                        # 自动发现 Slurm 作业
+
+# ============================================================
+# HTCondor 作业监视器 (C3 陷阱: auto_add_condorjob=true 时必填)
+# ============================================================
+condor_job_watcher:
+  auto_add_collectors:                           # 自动附加的采集器列表
+    - cpumem_collector
+  use_rules: false
+
+# ============================================================
+# Slurm 作业监视器 (C4 陷阱: auto_add_slurmjob=true 时必填)
+# ============================================================
+slurm_job_watcher:
+  auto_add_collectors:                           # 自动附加的采集器列表
+    - cpumem_collector
+  use_rules: false
+
+# ============================================================
+# 采集器配置 (C1/C2 陷阱: default_use_writers + perf_window_size 必填)
+# ============================================================
+collectors_config:
+  enable_collector_perf: true                    # 启用采集器性能计数器
+  perf_window_size: 1000                         # 性能窗口大小 (C2: enable_collector_perf=true 时必填)
+  default_freq: 1                                # 默认采样频率 (Hz)
+  default_use_writers:                           # 默认输出 writer 列表 (C1: 缺失→SIGABRT)
+    - file_writer
+  collectors:
+    - name: cpumem_collector
+      type: CPUMemCollector
+      config: cpumem_collector_config
+
+cpumem_collector_config:
+  freq: 1                                        # 每秒采样一次
+  use_writers:
+    - file_writer                                # 输出到本地文件
+
+# ============================================================
+# Writer 配置 — FileWriter 输出 JSONL 到本地文件
+# ============================================================
+writers_config:
+  enable_writer_perf: true                       # 启用 writer 性能计数器
+  buffer_capacity: 256                           # 内部环形缓冲区容量
+  writers:
+    - name: file_writer
+      type: FileWriter
+      config: file_writer_config
+
+file_writer_config:
+  path: /var/log/joblens/output.log              # JSONL 本地输出路径
+
+# ============================================================
+# 单节点服务组件 (全部禁用)
+# C8 陷阱: service_registry.enabled=false 缺失 → trigger 不断重试 → 健康检查失败
+# ============================================================
+service_registry:
+  enabled: false                                 # 单节点测试无需服务注册
+  url: "http://localhost:8080"
+  retry_interval: 10
+  max_retries: 3
+  heartbeat_interval: 1800
+
+config_manager:
+  enabled: false                                 # 单节点无需配置管理
+
+rule_manager:
+  enabled: false                                 # 单节点无需规则引擎

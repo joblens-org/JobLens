@@ -1,0 +1,75 @@
+# alm9-default — AlmaLinux 9 默认集成测试预设
+# 双节点 (controller + worker) Vagrant/libvirt 环境
+# 用途: run_preset.sh alm9-default
+name: alm9-default
+description: "AlmaLinux 9 完整集成测试 — HTCondor + Slurm + JobLens"
+
+# ============================================================
+# 拓扑 — VM 节点定义 (schema §3)
+# ============================================================
+topology:
+  controller:
+    box: almalinux/9
+    hostname: controller
+    ip: 192.168.56.10
+    cpus: 2
+    memory: 2048
+    disk: 20
+  worker:
+    box: almalinux/9
+    hostname: worker
+    ip: 192.168.56.20
+    cpus: 2
+    memory: 3072
+    disk: 20
+
+# ============================================================
+# 网络配置 (schema §4)
+# ============================================================
+network:
+  subnet: 192.168.56.0/24
+
+# ============================================================
+# 调度器配置 (schema §5)
+# ============================================================
+schedulers:
+  htcondor:
+    enabled: true
+    version: "25.0"
+    repo_rpm_url: "https://htcss-downloads.chtc.wisc.edu/repo/25.0/htcondor-release-current.el9.noarch.rpm"
+    setup_scripts:
+      - provisioning/condor/common.sh
+      - provisioning/condor/controller.sh
+      - provisioning/condor/worker.sh
+  slurm:
+    enabled: true
+    version: "23.02"
+    rpm_dir: ../rpms/slurm
+    setup_scripts:
+      - provisioning/slurm/common.sh
+      - provisioning/slurm/controller.sh
+      - provisioning/slurm/worker.sh
+
+# ============================================================
+# JobLens 配置 (schema §6)
+# rpm_path / trigger_rpm_path: 宿主机端 RPM 文件路径/glob 模式
+# core_config / trigger_config: 指向 presets/configs/ 下的配置文件
+# ============================================================
+joblens:
+  rpm_path: rpms/joblens-[0-9]*.rpm
+  trigger_rpm_path: rpms/joblens-trigger-*.rpm
+  core_config: presets/configs/joblens_core_default.yaml
+  trigger_config: presets/configs/joblens_trigger_default.yaml
+
+# ============================================================
+# 测试配置 (schema §7)
+# ============================================================
+tests:
+  pytest_files:
+    - test_01_health.py
+    - test_02_htcondor_discovery.py
+    - test_03_slurm_discovery.py
+    - test_04_filewriter_schema.py
+    - test_05_trigger_api.py
+    - test_06_performance_baseline.py
+  pytest_args: "-v --tb=short"
