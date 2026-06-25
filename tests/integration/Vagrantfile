@@ -1,63 +1,82 @@
 # -*- mode: ruby -*-
 # vi: set ft=ruby :
 #
-# JobLens 集成测试 — 双节点 Vagrant 拓扑 (libvirt)
+# JobLens 集成测试 — 参数化 Vagrant 拓扑模板 (libvirt)
 #
-# 要求:
-#   - Vagrant >= 2.2
-#   - vagrant-libvirt 插件: vagrant plugin install vagrant-libvirt
-#   - libvirt 宿主机/KVM 可用
+# 此模板通过环境变量驱动，与 run_preset.sh 配合使用。
+# 所有参数通过 Ruby ENV.fetch 从环境变量读取（非文本替换）。
 #
-# 使用:
+# 节点列表由 JOBLENS_NODES 环境变量定义（逗号分隔）。
+# 每个节点 <name> 需提供以下环境变量（大写）：
+#   <NAME>_BOX     — Vagrant box 名称
+#   <NAME>_CPUS    — CPU 数量
+#   <NAME>_MEMORY  — 内存 (MB)
+#   <NAME>_DISK    — 磁盘 (GB)
+#   <NAME>_IP      — 私有网络 IP 地址
+#
+# 全局可选变量：
+#   BOOT_TIMEOUT   — 启动超时秒数（默认 600）
+#   BOX_VERSION    — box 版本约束（可选，默认空）
+#
+# 示例：
+#   export JOBLENS_NODES="controller,worker"
+#   export CONTROLLER_BOX=almalinux/9
+#   export CONTROLLER_CPUS=2
+#   export CONTROLLER_MEMORY=2048
+#   export CONTROLLER_DISK=20
+#   export CONTROLLER_IP=192.168.56.10
+#   export WORKER_BOX=almalinux/9
+#   export WORKER_CPUS=2
+#   export WORKER_MEMORY=3072
+#   export WORKER_DISK=20
+#   export WORKER_IP=192.168.56.20
 #   vagrant up --provider=libvirt
-#   vagrant ssh controller
-#   vagrant ssh worker
-#
-# Box 说明:
-#   默认使用 almalinux/9。如果不可用，尝试替换为 generic/almalinux9。
-#
-# 节点角色:
-#   controller (192.168.56.10) — 调度控制节点，运行 HTCondor/Slurm 控制服务
-#   worker     (192.168.56.20) — 作业节点，运行 HTCondor/Slurm worker + JobLens
 
 Vagrant.configure("2") do |config|
-  # ──────────────────────────────────────────────
+  # ══════════════════════════════════════════════════════════
   # 全局 SSH 配置 (对所有 VM 生效)
-  # ──────────────────────────────────────────────
+  # ══════════════════════════════════════════════════════════
   config.ssh.insert_key = true
-  config.vm.boot_timeout = 600
+  config.vm.boot_timeout = ENV.fetch('BOOT_TIMEOUT', '600').to_i
 
-  # ──────────────────────────────────────────────
-  # VM1: controller (主控节点)
-  # ──────────────────────────────────────────────
-  config.vm.define "controller" do |ctrl|
-    ctrl.vm.box = "almalinux/9"
-    # 如果 almalinux/9 未找到，请尝试: ctrl.vm.box = "generic/almalinux9"
+  # ══════════════════════════════════════════════════════════
+  # 节点列表解析
+  # ══════════════════════════════════════════════════════════
+  nodes_raw = ENV.fetch('JOBLENS_NODES', '')
+  nodes = nodes_raw.split(',').map(&:strip).reject(&:empty?)
 
-    ctrl.vm.hostname = "controller"
-    ctrl.vm.network "private_network", ip: "192.168.56.10"
+  # 如果未设置 JOBLENS_NODES，回退到默认双节点拓扑
+  nodes = ['controller', 'worker'] if nodes.empty?
 
-    ctrl.vm.provider :libvirt do |libvirt|
-      libvirt.cpus   = 2
-      libvirt.memory = 2048     # MB
-      libvirt.machine_virtual_size = 20  # GB 磁盘
-    end
-  end
+  # 全局 box 版本约束（可选）
+  box_version = ENV.fetch('BOX_VERSION', '')
 
-  # ──────────────────────────────────────────────
-  # VM2: worker (工作节点)
-  # ──────────────────────────────────────────────
-  config.vm.define "worker" do |wrk|
-    wrk.vm.box = "almalinux/9"
-    # 如果 almalinux/9 未找到，请尝试: wrk.vm.box = "generic/almalinux9"
+  # ══════════════════════════════════════════════════════════
+  # 遍历节点列表，为每个节点生成 VM 定义
+  # ══════════════════════════════════════════════════════════
+  nodes.each do |node|
+    # 大写节点名用于环境变量查找（如 controller → CONTROLLER）
+    node_up = node.upcase
 
-    wrk.vm.hostname = "worker"
-    wrk.vm.network "private_network", ip: "192.168.56.20"
+    config.vm.define node do |vm|
+      # --- Box 配置 ---
+      box = ENV.fetch("#{node_up}_BOX")
+      vm.vm.box = box
+      unless box_version.empty?
+        vm.vm.box_version = box_version
+      end
 
-    wrk.vm.provider :libvirt do |libvirt|
-      libvirt.cpus   = 2
-      libvirt.memory = 3072     # MB
-      libvirt.machine_virtual_size = 20  # GB 磁盘
+      # --- 网络配置 ---
+      vm.vm.hostname = node
+      ip = ENV.fetch("#{node_up}_IP")
+      vm.vm.network "private_network", ip: ip
+
+      # --- Provider 配置 (libvirt) ---
+      vm.vm.provider :libvirt do |libvirt|
+        libvirt.cpus   = ENV.fetch("#{node_up}_CPUS").to_i
+        libvirt.memory = ENV.fetch("#{node_up}_MEMORY").to_i
+        libvirt.machine_virtual_size = ENV.fetch("#{node_up}_DISK").to_i
+      end
     end
   end
 end

@@ -469,6 +469,441 @@ PYEOF
 }
 
 # ─────────────────────────────────────────────────────────────────────
+# run_demo_preflight — Demo job 预检 (存根, Task 12 实现)
+# 校验 demo job 模板, 确认 worker 就绪 (暂不实现)
+# 返回值: 0 (存根, 总是成功)
+# ─────────────────────────────────────────────────────────────────────
+run_demo_preflight() {
+    # TODO: Task 12 — 实现 demo preflight 逻辑
+    # 1. 验证 demo job 文件存在 (test_jobs/helloworld.condor, helloworld.sbatch)
+    # 2. 测试 controller → worker SSH 连通性
+    # 3. 预提交测试作业验证调度器就绪
+    # 当前存根: 直接返回成功
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# run_preset — 主编排函数
+# 完整工作流: 加载预设 → 环境准备 → Vagrantfile → VM 启动 →
+#             provisioning → demo 预检 → 测试 → 清理
+# 参数:
+#   $1 — preset 名称 (不含路径和后缀, 如 alm9-default)
+# 环境变量:
+#   DRY_RUN=1 — 仅生成 env/Vagrantfile, 不执行 vagrant 命令
+#   KEEP_VMS=1 — 测试后保留 VM (跳过 vagrant destroy)
+# ─────────────────────────────────────────────────────────────────────
+run_preset() {
+    local preset_name="$1"
+    local runtime_dir="${SCRIPT_DIR}/.runtime"
+    local phase=1
+
+    # ═══════════════════════════════════════════════════════════════
+    # Phase 1: 预设加载 & 校验
+    # ═══════════════════════════════════════════════════════════════
+    echo "=== Phase ${phase}/9: 预设加载 ==="
+    phase=$((phase + 1))
+
+    local preset_file
+    preset_file=$(find_presets "$preset_name") || {
+        echo "FATAL: 预设加载失败 — 未找到预设 '${preset_name}'" >&2
+        exit 1
+    }
+
+    validate_preset "$preset_file" || {
+        echo "FATAL: 预设 schema 校验失败 — ${preset_file}" >&2
+        exit 1
+    }
+
+    echo "✓ 预设: ${preset_file}"
+
+    # ═══════════════════════════════════════════════════════════════
+    # Phase 2: 解析 YAML → 提取环境变量 & 生成 preset_env.json
+    # ═══════════════════════════════════════════════════════════════
+    echo "=== Phase ${phase}/9: 环境准备 ==="
+    phase=$((phase + 1))
+
+    mkdir -p "$runtime_dir"
+
+    # 步骤 2a: 解析 YAML 为 JSON, 保存到临时文件
+    local json_tmp
+    json_tmp=$(mktemp /tmp/joblens-preset-XXXXXX.json)
+    if ! _yaml_to_dict "$preset_file" > "$json_tmp" 2>/dev/null; then
+        rm -f "$json_tmp"
+        echo "FATAL: YAML 解析失败 — ${preset_file}" >&2
+        _yaml_to_dict "$preset_file"  # 重新执行以输出具体错误
+        exit 1
+    fi
+
+    # 步骤 2b: Python 提取器 — 读取 JSON, 输出 bash export 语句 + 生成 preset_env.json
+    local env_exports
+    if ! env_exports=$(python3 - "$SCRIPT_DIR" "$json_tmp" << 'PYEXTRACT'
+import sys, json, os, glob as py_glob
+
+script_dir = sys.argv[1]
+json_file = sys.argv[2]
+
+with open(json_file) as f:
+    data = json.load(f)
+
+preset_name = data["name"]
+topo = data["topology"]
+sched = data["schedulers"]
+jl = data["joblens"]
+tests = data["tests"]
+
+# 构建节点列表 (按 key 排序以保证一致性)
+nodes = []
+node_names = []
+for node_key in sorted(topo.keys()):
+    node = topo[node_key]
+    nodes.append({
+        "host": node.get("hostname", node_key),
+        "ip": node["ip"],
+        "cpus": node.get("cpus", 1)
+    })
+    node_names.append(node_key)
+
+# 为 common.sh 构建 nodes-json (host + ip)
+nodes_json_common = json.dumps([{"host": n["host"], "ip": n["ip"]} for n in nodes])
+
+# 为 slurm/controller.sh 构建 nodes-json (host + ip + cpus)
+nodes_json_slurm = json.dumps(
+    [{"host": n["host"], "ip": n["ip"], "cpus": n["cpus"]} for n in nodes]
+)
+
+# 提取 controller / worker 信息
+ctrl = topo["controller"]
+wrk = topo["worker"]
+ctrl_ip = ctrl["ip"]
+wrk_ip = wrk["ip"]
+
+# Trigger URL (worker 节点运行 JobLens + Trigger)
+trigger_url = f"http://{wrk_ip}:7592"
+
+# ═══ 生成 .runtime/preset_env.json ═══
+runtime_dir = os.path.join(script_dir, ".runtime")
+os.makedirs(runtime_dir, exist_ok=True)
+env_file = os.path.join(runtime_dir, "preset_env.json")
+preset_env = {
+    "preset_name": preset_name,
+    "controller": {"host": "controller", "ip": ctrl_ip},
+    "worker": {"host": "worker", "ip": wrk_ip},
+    "nodes": nodes,
+    "trigger_url": trigger_url
+}
+with open(env_file, "w") as f:
+    json.dump(preset_env, f, indent=2)
+
+# ═══ RPM 路径 pattern (原始值, 在 Phase 5d 中由 bash glob 解析) ═══
+# 相对于 SCRIPT_DIR 解析为绝对 pattern, 但延迟解析到部署阶段
+rpm_pattern = jl.get("rpm_path", "")
+trigger_rpm_pattern = jl.get("trigger_rpm_path", "")
+
+# ═══ 配置文件路径 (相对于 SCRIPT_DIR) ═══
+core_config_path = os.path.join(script_dir, jl["core_config"])
+trigger_config_path = os.path.join(script_dir, jl["trigger_config"])
+
+# ═══ 调度器配置 ═══
+htcondor_enabled = "true" if sched.get("htcondor", {}).get("enabled", False) \
+                   else "false"
+condor_repo_url = sched.get("htcondor", {}).get("repo_rpm_url", "")
+slurm_enabled = "true" if sched.get("slurm", {}).get("enabled", False) \
+                else "false"
+
+# ═══ 测试配置 ═══
+pytest_files = " ".join(tests.get("pytest_files", []))
+pytest_args = tests.get("pytest_args", "")
+
+# ═══ 输出 bash export 语句 (由调用方 eval 执行) ═══
+print(f'export PRESET_NAME="{preset_name}"')
+print(f'export JOBLENS_NODES="{",".join(node_names)}"')
+for n in nodes:
+    name_up = n["host"].upper()
+    nd = topo[n["host"]]
+    print(f'export {name_up}_BOX="{nd["box"]}"')
+    print(f'export {name_up}_CPUS="{nd["cpus"]}"')
+    print(f'export {name_up}_MEMORY="{nd["memory"]}"')
+    print(f'export {name_up}_DISK="{nd["disk"]}"')
+    print(f'export {name_up}_IP="{n["ip"]}"')
+print(f'export CONTROLLER_IP="{ctrl_ip}"')
+print(f'export WORKER_IP="{wrk_ip}"')
+print(f'export TRIGGER_URL="{trigger_url}"')
+print(f"export NODES_JSON_COMMON='{nodes_json_common}'")
+print(f"export NODES_JSON_SLURM='{nodes_json_slurm}'")
+print(f'export HTCONDOR_ENABLED="{htcondor_enabled}"')
+print(f'export CONDOR_REPO_URL="{condor_repo_url}"')
+print(f'export SLURM_ENABLED="{slurm_enabled}"')
+print(f'export CORE_RPM_PATTERN="{rpm_pattern}"')
+print(f'export TRIGGER_RPM_PATTERN="{trigger_rpm_pattern}"')
+print(f'export CORE_CONFIG_PATH="{core_config_path}"')
+print(f'export TRIGGER_CONFIG_PATH="{trigger_config_path}"')
+print(f'export PYTEST_FILES="{pytest_files}"')
+print(f'export PYTEST_ARGS="{pytest_args}"')
+print(f'export RUNTIME_DIR="{runtime_dir}"')
+print(f'export PRESET_ENV_FILE="{env_file}"')
+PYEXTRACT
+    ); then
+        rm -f "$json_tmp"
+        echo "FATAL: 环境变量提取失败" >&2
+        exit 1
+    fi
+    rm -f "$json_tmp"
+
+    # 注入环境变量到当前 shell
+    eval "$env_exports"
+
+    echo "✓ preset_env.json → ${PRESET_ENV_FILE}"
+    echo "✓ 节点: ${JOBLENS_NODES}"
+    echo "✓ 控制器 IP: ${CONTROLLER_IP}"
+    echo "✓ Worker IP: ${WORKER_IP}"
+    echo "✓ Trigger URL: ${TRIGGER_URL}"
+
+    # ═══════════════════════════════════════════════════════════════
+    # Phase 3: Vagrantfile 生成
+    # ═══════════════════════════════════════════════════════════════
+    echo "=== Phase ${phase}/9: Vagrantfile 生成 ==="
+    phase=$((phase + 1))
+
+    local vagrant_template="${SCRIPT_DIR}/Vagrantfile.template"
+    local vagrantfile="${SCRIPT_DIR}/Vagrantfile"
+
+    if [[ ! -f "$vagrant_template" ]]; then
+        echo "FATAL: Vagrantfile 模板不存在: ${vagrant_template}" >&2
+        exit 1
+    fi
+
+    # 模板使用 Ruby ENV.fetch 从环境变量读取, 直接复制即可
+    cp "$vagrant_template" "$vagrantfile"
+    echo "✓ Vagrantfile: ${vagrantfile}"
+
+    # ── DRY-RUN 提前退出 ──
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        echo ""
+        echo "=== DRY-RUN 模式: 跳过所有 VM 操作 ==="
+        echo "已生成文件:"
+        echo "  - ${PRESET_ENV_FILE}"
+        echo "  - ${vagrantfile}"
+        echo ""
+        echo "导出的环境变量:"
+        env | grep -E '^(JOBLENS_|CONTROLLER_|WORKER_|NODES_|HTCONDOR|SLURM|CONDOR|TRIGGER|CORE_|PYTEST|PRESET_|RUNTIME)' | sort || true
+        return 0
+    fi
+
+    # ═══════════════════════════════════════════════════════════════
+    # Phase 4: VM 启动
+    # ═══════════════════════════════════════════════════════════════
+    echo "=== Phase ${phase}/9: VM 启动 ==="
+    phase=$((phase + 1))
+
+    cd "$SCRIPT_DIR"
+    vagrant up --provider=libvirt || {
+        echo "FATAL: vagrant up 失败" >&2
+        exit 1
+    }
+    echo "✓ VM 启动完成"
+
+    # ═══════════════════════════════════════════════════════════════
+    # Phase 5: Provisioning 编排
+    # ═══════════════════════════════════════════════════════════════
+    echo "=== Phase ${phase}/9: Provisioning 编排 ==="
+    phase=$((phase + 1))
+
+    # ── 5a: 通用初始化 (所有节点) ──
+    echo "--- 5a: common.sh (所有节点) ---"
+    IFS=',' read -ra NODE_LIST <<< "$JOBLENS_NODES"
+    for node in "${NODE_LIST[@]}"; do
+        role="worker"
+        [[ "$node" == "controller" ]] && role="controller"
+        echo "  → ${node} (role=${role})"
+        vagrant ssh "$node" -c "sudo bash /vagrant/provisioning/common.sh --hostname=${node} --role=${role} --nodes-json='${NODES_JSON_COMMON}'" || {
+            echo "FATAL: common.sh 失败 — 节点 ${node}" >&2
+            exit 1
+        }
+    done
+    echo "✓ common.sh 完成"
+
+    # ── 5b: HTCondor (若启用) ──
+    if [[ "$HTCONDOR_ENABLED" == "true" ]]; then
+        echo "--- 5b: HTCondor 部署 ---"
+        echo "  → controller (condor controller)"
+        vagrant ssh controller -c "sudo bash /vagrant/provisioning/condor/controller.sh --repo-url=${CONDOR_REPO_URL} --hostname=controller --controller-ip=${CONTROLLER_IP}" || {
+            echo "FATAL: condor/controller.sh 失败" >&2
+            exit 1
+        }
+        echo "  → worker (condor worker)"
+        vagrant ssh worker -c "sudo bash /vagrant/provisioning/condor/worker.sh --repo-url=${CONDOR_REPO_URL} --hostname=worker --controller-host=controller --controller-ip=${CONTROLLER_IP} --worker-ip=${WORKER_IP}" || {
+            echo "FATAL: condor/worker.sh 失败" >&2
+            exit 1
+        }
+        echo "✓ HTCondor 部署完成"
+    else
+        echo "--- 5b: HTCondor — 跳过 (未启用) ---"
+    fi
+
+    # ── 5c: Slurm (若启用) ──
+    if [[ "$SLURM_ENABLED" == "true" ]]; then
+        echo "--- 5c: Slurm 部署 ---"
+        echo "  → controller (slurm controller)"
+        vagrant ssh controller -c "sudo bash /vagrant/provisioning/slurm/controller.sh --rpm-dir=/vagrant/rpms --hostname=controller --controller-ip=${CONTROLLER_IP} --nodes-json='${NODES_JSON_SLURM}'" || {
+            echo "FATAL: slurm/controller.sh 失败" >&2
+            exit 1
+        }
+
+        # Slurm 文件传输 (munge.key + slurm.conf) — 固化逻辑
+        echo "  → 传输 munge.key & slurm.conf"
+        local slurm_runtime="${runtime_dir}/slurm"
+        mkdir -p "$slurm_runtime"
+        vagrant ssh controller -c "sudo cat /etc/munge/munge.key" > "${slurm_runtime}/munge.key" || {
+            echo "FATAL: 无法从 controller 提取 munge.key" >&2
+            exit 1
+        }
+        vagrant ssh controller -c "sudo cat /etc/slurm/slurm.conf" > "${slurm_runtime}/slurm.conf" || {
+            echo "FATAL: 无法从 controller 提取 slurm.conf" >&2
+            exit 1
+        }
+        vagrant ssh worker -c "sudo mkdir -p /var/tmp/slurm_runtime" || {
+            echo "FATAL: 无法在 worker 创建 /var/tmp/slurm_runtime" >&2
+            exit 1
+        }
+        vagrant ssh worker -c "sudo tee /var/tmp/slurm_runtime/munge.key" < "${slurm_runtime}/munge.key" > /dev/null || {
+            echo "FATAL: 无法传输 munge.key 到 worker" >&2
+            exit 1
+        }
+        vagrant ssh worker -c "sudo tee /var/tmp/slurm_runtime/slurm.conf" < "${slurm_runtime}/slurm.conf" > /dev/null || {
+            echo "FATAL: 无法传输 slurm.conf 到 worker" >&2
+            exit 1
+        }
+
+        echo "  → worker (slurm worker)"
+        vagrant ssh worker -c "sudo bash /vagrant/provisioning/slurm/worker.sh --rpm-dir=/vagrant/rpms --hostname=worker --controller-host=controller --runtime-dir=/var/tmp/slurm_runtime" || {
+            echo "FATAL: slurm/worker.sh 失败" >&2
+            exit 1
+        }
+        echo "✓ Slurm 部署完成"
+    else
+        echo "--- 5c: Slurm — 跳过 (未启用) ---"
+    fi
+
+    # ── 5d: RPM 文件挂载 ──
+    echo "--- 5d: RPM 文件挂载 ---"
+    mkdir -p "${SCRIPT_DIR}/rpms"
+
+    # 解析 RPM glob pattern → 实际文件
+    local core_rpm_path trigger_rpm_path
+    core_rpm_path=$( (cd "${SCRIPT_DIR}" && ls ${CORE_RPM_PATTERN} 2>/dev/null | head -1) ) || true
+    trigger_rpm_path=$( (cd "${SCRIPT_DIR}" && ls ${TRIGGER_RPM_PATTERN} 2>/dev/null | head -1) ) || true
+
+    if [[ -z "$core_rpm_path" ]]; then
+        echo "FATAL: 未找到 JobLens Core RPM — 模式: ${SCRIPT_DIR}/${CORE_RPM_PATTERN}" >&2
+        exit 1
+    fi
+    if [[ -z "$trigger_rpm_path" ]]; then
+        echo "FATAL: 未找到 JobLens Trigger RPM — 模式: ${SCRIPT_DIR}/${TRIGGER_RPM_PATTERN}" >&2
+        exit 1
+    fi
+
+    # 使路径为绝对路径
+    core_rpm_path="${SCRIPT_DIR}/${core_rpm_path}"
+    trigger_rpm_path="${SCRIPT_DIR}/${trigger_rpm_path}"
+
+    cp "${core_rpm_path}" "${SCRIPT_DIR}/rpms/" || {
+        echo "FATAL: 无法复制 Core RPM — ${core_rpm_path}" >&2
+        exit 1
+    }
+    cp "${trigger_rpm_path}" "${SCRIPT_DIR}/rpms/" || {
+        echo "FATAL: 无法复制 Trigger RPM — ${trigger_rpm_path}" >&2
+        exit 1
+    }
+    local core_rpm_filename trigger_rpm_filename
+    core_rpm_filename=$(basename "$core_rpm_path")
+    trigger_rpm_filename=$(basename "$trigger_rpm_path")
+    echo "✓ RPM 文件就绪: rpms/${core_rpm_filename}, rpms/${trigger_rpm_filename}"
+
+    # ── 5e: JobLens 配置注入 ──
+    echo "--- 5e: JobLens 配置注入 ---"
+    if [[ ! -f "$CORE_CONFIG_PATH" ]]; then
+        echo "FATAL: Core 配置文件不存在 — ${CORE_CONFIG_PATH}" >&2
+        exit 1
+    fi
+    if [[ ! -f "$TRIGGER_CONFIG_PATH" ]]; then
+        echo "FATAL: Trigger 配置文件不存在 — ${TRIGGER_CONFIG_PATH}" >&2
+        exit 1
+    fi
+    cp "${CORE_CONFIG_PATH}" "${runtime_dir}/joblens_core.yaml"
+    cp "${TRIGGER_CONFIG_PATH}" "${runtime_dir}/joblens_trigger.yaml"
+    echo "✓ 配置文件就绪: .runtime/joblens_core.yaml, .runtime/joblens_trigger.yaml"
+
+    # ── 5f: JobLens 部署 ──
+    echo "--- 5f: JobLens 部署 ---"
+    vagrant ssh worker -c "sudo bash /vagrant/provisioning/joblens/deploy.sh --rpm-path=/vagrant/rpms/${core_rpm_filename} --trigger-rpm-path=/vagrant/rpms/${trigger_rpm_filename} --core-config=/vagrant/.runtime/joblens_core.yaml --trigger-config=/vagrant/.runtime/joblens_trigger.yaml" || {
+        echo "FATAL: joblens/deploy.sh 失败" >&2
+        exit 1
+    }
+    echo "✓ JobLens 部署完成"
+
+    # ═══════════════════════════════════════════════════════════════
+    # Phase 6: Demo job 预检 (存根)
+    # ═══════════════════════════════════════════════════════════════
+    echo "=== Phase ${phase}/9: Demo job 预检 ==="
+    phase=$((phase + 1))
+
+    run_demo_preflight || {
+        echo "FATAL: demo 预检失败" >&2
+        exit 1
+    }
+    echo "✓ demo 预检完成 (存根)"
+
+    # ═══════════════════════════════════════════════════════════════
+    # Phase 7: 运行测试
+    # ═══════════════════════════════════════════════════════════════
+    echo "=== Phase ${phase}/9: 运行测试 ==="
+    phase=$((phase + 1))
+
+    local test_failed=0
+    if [[ -z "$PYTEST_FILES" ]]; then
+        echo "⚠ 警告: 预设中未定义 pytest_files, 跳过测试" >&2
+    else
+        echo "  pytest ${PYTEST_FILES} ${PYTEST_ARGS} --skip-vagrant-up --skip-vagrant-destroy"
+        cd "$SCRIPT_DIR"
+        # shellcheck disable=SC2086
+        pytest --skip-vagrant-up --skip-vagrant-destroy ${PYTEST_ARGS} ${PYTEST_FILES} || {
+            test_failed=1
+            echo "FATAL: pytest 测试失败 — 将在清理后退出" >&2
+        }
+        if [[ "$test_failed" -eq 0 ]]; then
+            echo "✓ 测试全部通过"
+        fi
+    fi
+
+    # ═══════════════════════════════════════════════════════════════
+    # Phase 8: 清理
+    # ═══════════════════════════════════════════════════════════════
+    echo "=== Phase ${phase}/9: 清理 ==="
+    phase=$((phase + 1))
+
+    if [[ "${KEEP_VMS:-0}" == "1" ]]; then
+        echo "KEEP_VMS=1 — 跳过 VM 销毁"
+    else
+        cd "$SCRIPT_DIR"
+        vagrant destroy -f || {
+            echo "⚠ 警告: vagrant destroy 失败 (可能 VM 已被手动销毁)" >&2
+        }
+        echo "✓ VM 已销毁"
+    fi
+
+    # 若测试失败, 在清理后退出非 0
+    if [[ "$test_failed" -ne 0 ]]; then
+        echo "FATAL: 测试阶段失败, 请检查上述错误" >&2
+        exit 1
+    fi
+
+    echo ""
+    echo "══════════════════════════════════════════"
+    echo "  run_preset '${preset_name}' 完成 ✓"
+    echo "══════════════════════════════════════════"
+}
+
+# ─────────────────────────────────────────────────────────────────────
 # 直接执行脚本时的命令路由
 # ─────────────────────────────────────────────────────────────────────
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -485,7 +920,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             validate_preset "$@"
             ;;
         *)
-            find_presets "$@"
+            run_preset "$@"
             ;;
     esac
 fi
