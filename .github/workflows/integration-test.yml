@@ -64,6 +64,7 @@ jobs:
             -v "$(pwd)":/workspace -w /workspace \
             almalinux:9 bash -c "
               set -euo pipefail
+              dnf install -y sudo
               bash scripts/install-deps.sh
               dnf install -y rpm-build
               cmake --preset rpm-system-deps
@@ -81,7 +82,7 @@ jobs:
             -v "$(pwd)":/workspace -w /workspace \
             fedora:latest bash -c "
               set -euo pipefail
-              dnf install -y --setopt=tsflags=nodocs git
+              dnf install -y --setopt=tsflags=nodocs git sudo
               bash scripts/build-trigger-rpm.sh --install-deps
               mkdir -p tests/integration/rpms
               cp ~/rpmbuild/RPMS/x86_64/joblens-trigger-*.rpm \
