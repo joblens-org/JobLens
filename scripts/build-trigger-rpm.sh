@@ -11,6 +11,11 @@
 #   ./scripts/build-trigger-rpm.sh --clean         # 清理构建产物
 set -e
 
+# Docker 容器内以 root 运行无需提权 (PAM 不可用)
+if [ "$(id -u)" -eq 0 ]; then
+    sudo() { "$@"; }
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TRIGGER_DIR="$PROJECT_ROOT/trigger"
