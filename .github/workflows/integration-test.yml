@@ -47,14 +47,14 @@ jobs:
       VAGRANT_DEFAULT_PROVIDER: libvirt
 
     steps:
-      # ─── Step 0: 安装宿主依赖 (KVM + libvirt + Vagrant) ────
-      - name: 安装宿主依赖
-        run: sudo bash scripts/install-integration-deps.sh
-
-      # ─── Step 1: 检出代码 ────────────────────────────────────
+      # ─── Step 0: 检出代码 ────────────────────────────────────
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      # ─── Step 1: 安装宿主依赖 (KVM + libvirt + Vagrant) ────
+      - name: 安装宿主依赖
+        run: sudo bash scripts/install-integration-deps.sh
 
       # ─── Step 2: 构建 RPM 包 (对齐 ci.yml: CMake presets) ──
       - name: 构建 Core RPM (AlmaLinux 9 容器, CMake presets)
