@@ -469,17 +469,100 @@ PYEOF
 }
 
 # ─────────────────────────────────────────────────────────────────────
-# run_demo_preflight — Demo job 预检 (存根, Task 12 实现)
-# 校验 demo job 模板, 确认 worker 就绪 (暂不实现)
-# 返回值: 0 (存根, 总是成功)
+# run_demo_preflight — Demo job 预检
+# 向所有启用的调度器提交 demo job，通过 JobLens API 轮询验证自动发现
+# 超时保护: 每个调度器 30 秒，每 2 秒轮询一次
+# 返回值: 0 = 全部通过, 1 = 至少一个失败（逐个尝试所有启用的调度器）
+# 依赖变量 (来自 run_preset):
+#   HTCONDOR_ENABLED, SLURM_ENABLED, WORKER_IP
 # ─────────────────────────────────────────────────────────────────────
 run_demo_preflight() {
-    # TODO: Task 12 — 实现 demo preflight 逻辑
-    # 1. 验证 demo job 文件存在 (test_jobs/helloworld.condor, helloworld.sbatch)
-    # 2. 测试 controller → worker SSH 连通性
-    # 3. 预提交测试作业验证调度器就绪
-    # 当前存根: 直接返回成功
-    return 0
+    local total_tests=0
+    local passed=0
+    local timeout=30
+    local interval=2
+    local elapsed resp found_id
+
+    # ── HTCondor demo ──────────────────────────────────────────────
+    if [[ "${HTCONDOR_ENABLED:-false}" == "true" ]]; then
+        total_tests=$((total_tests + 1))
+        echo "  → 提交 HTCondor demo job..."
+        if vagrant ssh controller -c "condor_submit /vagrant/test_jobs/helloworld.condor" >/dev/null 2>&1; then
+            elapsed=0
+            while [[ $elapsed -lt $timeout ]]; do
+                resp=$(curl -sf --max-time 5 "http://${WORKER_IP}:7592/joblens/jobs" 2>/dev/null || true)
+                if [[ -n "$resp" ]]; then
+                    if found_id=$(echo "$resp" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for job in data.get('jobs', []):
+    if 'condor' in job.get('subtype', '').lower():
+        print(job.get('job_id', '?'))
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null); then
+                        echo "PASSED: htcondor demo job discovered (${found_id})"
+                        passed=$((passed + 1))
+                        break
+                    fi
+                fi
+                sleep "$interval"
+                elapsed=$((elapsed + interval))
+            done
+            if [[ $elapsed -ge $timeout ]]; then
+                echo "FAILED: htcondor demo job not discovered (timeout 30s)"
+            fi
+        else
+            echo "FAILED: htcondor demo job submit failed"
+        fi
+    fi
+
+    # ── Slurm demo ─────────────────────────────────────────────────
+    if [[ "${SLURM_ENABLED:-false}" == "true" ]]; then
+        total_tests=$((total_tests + 1))
+        echo "  → 提交 Slurm demo job..."
+        if vagrant ssh controller -c "sbatch /vagrant/test_jobs/helloworld.sbatch" >/dev/null 2>&1; then
+            elapsed=0
+            while [[ $elapsed -lt $timeout ]]; do
+                resp=$(curl -sf --max-time 5 "http://${WORKER_IP}:7592/joblens/jobs" 2>/dev/null || true)
+                if [[ -n "$resp" ]]; then
+                    if found_id=$(echo "$resp" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for job in data.get('jobs', []):
+    if 'slurm' in job.get('subtype', '').lower():
+        print(job.get('job_id', '?'))
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null); then
+                        echo "PASSED: slurm demo job discovered (${found_id})"
+                        passed=$((passed + 1))
+                        break
+                    fi
+                fi
+                sleep "$interval"
+                elapsed=$((elapsed + interval))
+            done
+            if [[ $elapsed -ge $timeout ]]; then
+                echo "FAILED: slurm demo job not discovered (timeout 30s)"
+            fi
+        else
+            echo "FAILED: slurm demo job submit failed"
+        fi
+    fi
+
+    # ── 汇总 ──────────────────────────────────────────────────────
+    if [[ "$total_tests" -eq 0 ]]; then
+        echo "  ℹ 无启用的调度器, 跳过 demo 预检"
+        return 0
+    fi
+    if [[ "$passed" -eq "$total_tests" ]]; then
+        echo "PASSED: all demo jobs discovered"
+        return 0
+    else
+        echo "SUMMARY: ${passed}/${total_tests} demo jobs passed"
+        return 1
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -496,6 +579,7 @@ run_preset() {
     local preset_name="$1"
     local runtime_dir="${SCRIPT_DIR}/.runtime"
     local phase=1
+    local demo_failed=0
 
     # ═══════════════════════════════════════════════════════════════
     # Phase 1: 预设加载 & 校验
@@ -842,16 +926,17 @@ PYEXTRACT
     echo "✓ JobLens 部署完成"
 
     # ═══════════════════════════════════════════════════════════════
-    # Phase 6: Demo job 预检 (存根)
+    # Phase 6: Demo job 预检
     # ═══════════════════════════════════════════════════════════════
     echo "=== Phase ${phase}/9: Demo job 预检 ==="
     phase=$((phase + 1))
 
-    run_demo_preflight || {
-        echo "FATAL: demo 预检失败" >&2
-        exit 1
-    }
-    echo "✓ demo 预检完成 (存根)"
+    run_demo_preflight && demo_failed=0 || demo_failed=1
+    if [[ "$demo_failed" -eq 0 ]]; then
+        echo "✓ demo 预检完成"
+    else
+        echo "⚠ demo 预检失败 (非致命), 继续后续阶段" >&2
+    fi
 
     # ═══════════════════════════════════════════════════════════════
     # Phase 7: 运行测试
@@ -860,7 +945,9 @@ PYEXTRACT
     phase=$((phase + 1))
 
     local test_failed=0
-    if [[ -z "$PYTEST_FILES" ]]; then
+    if [[ "${demo_failed:-0}" -eq 1 ]]; then
+        echo "⚠ demo 预检失败，跳过 pytest" >&2
+    elif [[ -z "$PYTEST_FILES" ]]; then
         echo "⚠ 警告: 预设中未定义 pytest_files, 跳过测试" >&2
     else
         echo "  pytest ${PYTEST_FILES} ${PYTEST_ARGS} --skip-vagrant-up --skip-vagrant-destroy"
