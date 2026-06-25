@@ -787,6 +787,15 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
     subprocess.run(["cp", str(trigger_cfg), str(RUNTIME_DIR / "joblens_trigger.yaml")], check=True)
     print("✓ 配置文件就绪: .runtime/joblens_core.yaml, .runtime/joblens_trigger.yaml")
 
+    # Phase 5e 在 vagrant up (Phase 4) 之后才创建配置文件,
+    # vagrant-libvirt 默认使用 rsync synced_folder, 仅在 vagrant up 时同步一次。
+    # 因此必须手动 rsync 将新文件推送到 VM, 否则 Phase 5f deploy.sh 会报文件不存在。
+    try:
+        subprocess.run(["vagrant", "rsync"], cwd=SCRIPT_DIR, check=True)
+    except subprocess.CalledProcessError:
+        fatal("vagrant rsync 失败 — 配置文件无法同步到 VM")
+    print("  ✓ 配置文件已同步到 VM")
+
     # ── 5f: JobLens 部署 ──
     print("--- 5f: JobLens 部署 ---")
     try:
