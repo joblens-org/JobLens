@@ -599,6 +599,25 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
     if skip_vagrant_up:
         print("--skip-vagrant-up: VM 已由外部启动, 跳过 vagrant up")
     else:
+        # ── 诊断: 输出环境信息便于排查 provider 问题 ──
+        print("--- 环境诊断 ---")
+        subprocess.run(["vagrant", "--version"], cwd=SCRIPT_DIR, check=False)
+        subprocess.run(["vagrant", "plugin", "list"], cwd=SCRIPT_DIR, check=False)
+        subprocess.run("vagrant plugin list 2>&1 | grep -q libvirt && "
+                       "echo '✓ vagrant-libvirt 插件已安装' || "
+                       "echo '✗ vagrant-libvirt 插件未安装!'",
+                       cwd=SCRIPT_DIR, shell=True, check=False)
+        subprocess.run("systemctl is-active libvirtd 2>/dev/null && "
+                       "echo '✓ libvirtd 运行中' || "
+                       "echo '✗ libvirtd 未运行'",
+                       cwd=SCRIPT_DIR, shell=True, check=False)
+        subprocess.run("ls -la /var/run/libvirt/libvirt-sock 2>/dev/null && "
+                       "echo '✓ libvirt socket 存在' || "
+                       "echo '✗ libvirt socket 不存在'",
+                       cwd=SCRIPT_DIR, shell=True, check=False)
+        subprocess.run(["vagrant", "status"], cwd=SCRIPT_DIR, check=False)
+        print("---")
+
         try:
             subprocess.run(
                 ["vagrant", "up", "--provider=libvirt"],

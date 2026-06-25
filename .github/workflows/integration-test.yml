@@ -100,6 +100,15 @@ jobs:
           vagrant box add almalinux/9 --provider=libvirt 2>/dev/null || true
 
           echo ""
+          echo "=== 环境诊断 (排查 provider 问题) ==="
+          vagrant --version
+          vagrant plugin list
+          vagrant plugin list 2>&1 | grep -q libvirt && echo "✓ vagrant-libvirt 已安装" || echo "✗ vagrant-libvirt 未安装!"
+          systemctl is-active libvirtd 2>/dev/null && echo "✓ libvirtd 运行中" || echo "✗ libvirtd 未运行"
+          ls -la /var/run/libvirt/libvirt-sock 2>/dev/null || echo "✗ libvirt socket 不存在"
+          echo "==="
+
+          echo ""
           echo "=== run_preset: vagrant up → provisioning → demo → pytest ==="
           python3 ./run_preset.py alm9-default
 
