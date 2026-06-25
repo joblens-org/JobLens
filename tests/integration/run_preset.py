@@ -97,12 +97,29 @@ def run_vagrant(cmd: str, capture: bool = False, stdin_data: bytes | None = None
 
 
 def vagrant_ssh(node: str, command: str, check: bool = True) -> subprocess.CompletedProcess:
-    """在指定节点上通过 vagrant ssh 执行命令。"""
-    return subprocess.run(
+    """在指定节点上通过 vagrant ssh 执行命令, 失败时打印完整输出。"""
+    proc = subprocess.run(
         ["vagrant", "ssh", node, "-c", command],
         cwd=SCRIPT_DIR,
-        check=check,
+        capture_output=True,
+        text=True,
     )
+    if check and proc.returncode != 0:
+        print(f"\n--- vagrant ssh {node} 失败 (exit {proc.returncode}) ---")
+        if proc.stdout.strip():
+            print(f"[stdout]\n{proc.stdout}")
+        if proc.stderr.strip():
+            # 过滤掉 Vagrant 自身的无关警告 (如 libvirt_ip_command)
+            stderr_filtered = "\n".join(
+                line for line in proc.stderr.splitlines()
+                if "libvirt_ip_command" not in line
+            )
+            if stderr_filtered.strip():
+                print(f"[stderr]\n{stderr_filtered}")
+        print("---")
+    if check:
+        proc.check_returncode()
+    return proc
 
 
 def vagrant_cat(node: str, path: str) -> bytes:
