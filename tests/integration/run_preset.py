@@ -555,6 +555,13 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
     dry_run = os.environ.get("DRY_RUN", "0") == "1"
     keep_vms = os.environ.get("KEEP_VMS", "0") == "1" or skip_vagrant_destroy
     phase = 1
+    phase_start = time.time()
+
+    def _tick(label: str) -> float:
+        """打印阶段耗时并返回当前时间戳。"""
+        elapsed = time.time() - phase_start
+        print(f"  [{label} 耗时 {elapsed:.1f}s]")
+        return time.time()
 
     # ═══ Phase 1: 预设加载 & 校验 ═══════════════════════════════════
     print(f"=== Phase {phase}/9: 预设加载 ===")
@@ -568,16 +575,19 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
     if not validate_preset(preset_file):
         fatal(f"预设 schema 校验失败 — {preset_file}")
     print(f"✓ 预设: {preset_file}")
+    _tick("Phase 1 预设加载")
 
     # ═══ Phase 2: 环境准备 ══════════════════════════════════════════
     print(f"=== Phase {phase}/9: 环境准备 ===")
     phase += 1
     prepare_environment(preset_file)
+    _tick("Phase 2 环境准备")
 
     # ═══ Phase 3: Vagrantfile 生成 ═════════════════════════════════
     print(f"=== Phase {phase}/9: Vagrantfile 生成 ===")
     phase += 1
     generate_vagrantfile()
+    _tick("Phase 3 Vagrantfile 生成")
 
     # ── DRY-RUN 提前退出 ──
     if dry_run:
@@ -626,6 +636,7 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
         except subprocess.CalledProcessError:
             fatal("vagrant up 失败")
         print("✓ VM 启动完成")
+        _tick("Phase 4 VM 启动")
 
     # ═══ Phase 5: Provisioning 编排 ═══════════════════════════════
     print(f"=== Phase {phase}/9: Provisioning 编排 ===")
@@ -651,6 +662,7 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
         except subprocess.CalledProcessError:
             fatal(f"common.sh 失败 — 节点 {node}")
     print("✓ common.sh 完成")
+    _tick("Phase 5a common 初始化")
 
     # ── 5b: HTCondor (若启用) ──
     if htcondor_enabled:
@@ -672,6 +684,7 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
         print("✓ HTCondor 部署完成")
     else:
         print("--- 5b: HTCondor — 跳过 (未启用) ---")
+    _tick("Phase 5b HTCondor")
 
     # ── 5c: Slurm (若启用) ──
     if slurm_enabled:
@@ -710,6 +723,7 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
         print("✓ Slurm 部署完成")
     else:
         print("--- 5c: Slurm — 跳过 (未启用) ---")
+    _tick("Phase 5c Slurm")
 
     # ── 5d: RPM 文件挂载 ──
     print("--- 5d: RPM 文件挂载 ---")
@@ -747,6 +761,7 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
     except subprocess.CalledProcessError:
         fatal("joblens/deploy.sh 失败")
     print("✓ JobLens 部署完成")
+    _tick("Phase 5 Provisioning 编排")
 
     # ═══ Phase 6: Demo job 预检 ═══════════════════════════════════
     print(f"=== Phase {phase}/9: Demo job 预检 ===")
@@ -756,6 +771,7 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
         print("✓ demo 预检完成")
     else:
         print("⚠ demo 预检失败 (非致命), 继续后续阶段", file=sys.stderr)
+    _tick("Phase 6 Demo 预检")
 
     # ═══ Phase 7: 运行测试 ════════════════════════════════════════
     print(f"=== Phase {phase}/9: 运行测试 ===")
@@ -784,6 +800,8 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
         else:
             print("✓ 测试全部通过")
 
+    _tick("Phase 7 运行测试")
+
     # ═══ Phase 8: 清理 ════════════════════════════════════════════
     print(f"=== Phase {phase}/9: 清理 ===")
     phase += 1
@@ -803,6 +821,7 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
     print(f"\n{'═' * 40}")
     print(f"  run_preset '{preset_name}' 完成 ✓")
     print(f"{'═' * 40}")
+    _tick("总耗时")
 
 
 # ══════════════════════════════════════════════════════════════════════════

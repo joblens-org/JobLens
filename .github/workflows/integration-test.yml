@@ -54,7 +54,15 @@ jobs:
 
       # ─── Step 1: 安装宿主依赖 (KVM + libvirt + Vagrant) ────
       - name: 安装宿主依赖
-        run: sudo bash scripts/install-integration-deps.sh
+        run: |
+          sudo bash scripts/install-integration-deps.sh
+          echo ""
+          echo "=== 安装后诊断 ==="
+          kvm-ok 2>/dev/null && echo "✓ KVM 加速可用" || echo "✗ KVM 不可用 (可能影响性能)"
+          vagrant --version
+          vagrant plugin list | grep -q libvirt && echo "✓ vagrant-libvirt 插件已安装" || echo "✗ vagrant-libvirt 插件未安装!"
+          virsh -c qemu:///system list 2>/dev/null && echo "✓ libvirt 连接正常" || echo "✗ libvirt 连接失败"
+          echo "==="
 
       # ─── Step 2: 构建 RPM 包 (对齐 ci.yml: CMake presets) ──
       - name: 构建 Core RPM (AlmaLinux 9 容器, CMake presets)
@@ -74,6 +82,12 @@ jobs:
               ls -lh tests/integration/rpms/
             "
 
+          echo ""
+          echo "=== Core RPM 构建后诊断 ==="
+          ls -lh tests/integration/rpms/joblens-[0-9]*.rpm 2>/dev/null && echo "✓ Core RPM 已生成" || echo "✗ Core RPM 未生成!"
+          rpm -qp tests/integration/rpms/joblens-[0-9]*.rpm 2>/dev/null && echo "✓ Core RPM 格式有效" || true
+          echo "==="
+
       - name: 构建 Trigger RPM (对齐 ci.yml — fedora 容器)
         run: |
           echo "=== 在 Fedora 容器内构建 Trigger RPM ==="
@@ -89,8 +103,10 @@ jobs:
             "
 
           echo ""
-          echo "=== RPM 包清单 ==="
-          ls -lh tests/integration/rpms/
+          echo "=== Trigger RPM 构建后诊断 ==="
+          ls -lh tests/integration/rpms/joblens-trigger-*.rpm 2>/dev/null && echo "✓ Trigger RPM 已生成" || echo "✗ Trigger RPM 未生成!"
+          rpm -qp tests/integration/rpms/joblens-trigger-*.rpm 2>/dev/null && echo "✓ Trigger RPM 格式有效" || true
+          echo "==="
 
       # ─── Step 3: 集成测试 (run_preset — 完整生命周期) ──────
       - name: 集成测试 (run_preset)
@@ -107,10 +123,17 @@ jobs:
           systemctl is-active libvirtd 2>/dev/null && echo "✓ libvirtd 运行中" || echo "✗ libvirtd 未运行"
           ls -la /var/run/libvirt/libvirt-sock 2>/dev/null || echo "✗ libvirt socket 不存在"
           echo "==="
-
           echo ""
+
           echo "=== run_preset: vagrant up → provisioning → demo → pytest ==="
           python3 ./run_preset.py alm9-default
+
+          echo ""
+          echo "=== 集成测试后诊断 ==="
+          echo "工作目录: $(pwd)"
+          ls -lh test-results.xml 2>/dev/null && echo "✓ test-results.xml 已生成" || echo "✗ test-results.xml 未生成 (测试可能失败)"
+          ls -lh pytest.log 2>/dev/null && echo "✓ pytest.log 已生成" || echo "✗ pytest.log 未生成"
+          echo "==="
 
       # ─── Step 4: 上传结果 (总是执行) ──────────────────────────
       - name: 上传测试结果
