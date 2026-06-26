@@ -42,6 +42,8 @@ jobs:
 
     env:
       KEEP_VMS: ${{ vars.KEEP_VMS || '0' }}
+      # 默认值: 0 表示成功, 会在 Step 3 中被 run_preset 退出码覆盖
+      PRESET_EXIT: '0'
       # Vagrant 默认使用 libvirt provider
       VAGRANT_DEFAULT_PROVIDER: libvirt
 
@@ -100,7 +102,10 @@ jobs:
 
       # ─── Step 3: 集成测试 (run_preset — 完整生命周期) ──────
       - name: 集成测试 (run_preset)
+        id: run_preset
         working-directory: tests/integration
+        # 使用 --keep-vms 保留 VM 供后续诊断, 即使 run_preset 失败也不立即停止 workflow
+        continue-on-error: true
         run: |
           echo "=== 预下载 Vagrant box (加速首次启动) ==="
           vagrant box add almalinux/9 --provider=libvirt 2>/dev/null || true
@@ -116,7 +121,9 @@ jobs:
           echo ""
 
           echo "=== run_preset: vagrant up → provisioning → demo → pytest ==="
-          python3 ./run_preset.py alm9-default
+          # 使用 --keep-vms 确保即使测试失败也不会销毁 VM, 以便后续诊断步骤捕获日志
+          python3 ./run_preset.py alm9-default --keep-vms
+          PRESET_EXIT=$?
 
           echo ""
           echo "=== 集成测试后诊断 ==="
@@ -124,6 +131,99 @@ jobs:
           ls -lh test-results.xml 2>/dev/null && echo "✓ test-results.xml 已生成" || echo "✗ test-results.xml 未生成 (测试可能失败)"
           ls -lh pytest.log 2>/dev/null && echo "✓ pytest.log 已生成" || echo "✗ pytest.log 未生成"
           echo "==="
+
+          # 保存退出码供后续步骤判断
+          echo "PRESET_EXIT=${PRESET_EXIT}" >> "${GITHUB_ENV}"
+
+      # ─── Step 3b: 捕获 VM 级诊断 (run_preset 失败时, VM 仍保留) ──
+      - name: VM 级诊断 (失败时)
+        if: env.PRESET_EXIT != '0'
+        working-directory: tests/integration
+        run: |
+          echo "=== VM 状态 ==="
+          vagrant status 2>/dev/null || echo "  (vagrant 不可用)"
+          echo ""
+
+          # 收集 Slurm 诊断
+          echo "=== Slurm sinfo (controller) ==="
+          vagrant ssh controller -c "sinfo 2>&1 || true" 2>/dev/null || echo "  (controller 不可达)"
+          echo ""
+
+          echo "=== Slurm scontrol show node (controller) ==="
+          vagrant ssh controller -c "scontrol show node 2>&1 | head -30 || true" 2>/dev/null || echo "  (controller 不可达)"
+          echo ""
+
+          echo "=== slurmctld 日志 (controller, 最后 30 行) ==="
+          vagrant ssh controller -c "sudo journalctl -u slurmctld --no-pager -n 30 2>&1 || true" 2>/dev/null || echo "  (controller 不可达)"
+          echo ""
+
+          echo "=== slurmd 日志 (worker, 最后 30 行) ==="
+          vagrant ssh worker -c "sudo journalctl -u slurmd --no-pager -n 30 2>&1 || true" 2>/dev/null || echo "  (worker 不可达)"
+          echo ""
+
+          # 收集 HTCondor 诊断
+          echo "=== HTCondor 守护进程状态 (controller) ==="
+          vagrant ssh controller -c "systemctl is-active condor 2>&1 || true; condor_q 2>&1 || true" 2>/dev/null || echo "  (controller 不可达)"
+          echo ""
+
+          # 收集 JobLens 诊断
+          echo "=== JobLens 日志 (worker, 最后 50 行) ==="
+          vagrant ssh worker -c "sudo journalctl -u joblens --no-pager -n 50 2>&1 || true" 2>/dev/null || echo "  (worker 不可达)"
+          echo ""
+
+          echo "=== eBPF 程序列表 (worker) ==="
+          vagrant ssh worker -c "sudo bpftool prog list 2>&1 | grep -i joblens || echo '(未找到 joblens eBPF 程序)'" 2>/dev/null || echo "  (worker 不可达)"
+          echo ""
+
+          echo "=== Slurm 配置文件 (controller) ==="
+          vagrant ssh controller -c "sudo cat /etc/slurm/slurm.conf 2>&1 || true" 2>/dev/null || echo "  (controller 不可达)"
+          echo ""
+
+          echo "=== munge 密钥一致性检查 ==="
+          echo "controller md5:"
+          vagrant ssh controller -c "sudo md5sum /etc/munge/munge.key 2>&1 || true" 2>/dev/null || echo "  (不可达)"
+          echo "worker md5:"
+          vagrant ssh worker -c "sudo md5sum /etc/munge/munge.key 2>&1 || true" 2>/dev/null || echo "  (不可达)"
+          echo ""
+
+          # 保存诊断日志到文件供 artifact 上传
+          mkdir -p /tmp/integration-diagnostics
+          {
+            echo "=== VM 状态 ==="
+            vagrant status 2>/dev/null || true
+            echo ""
+            echo "=== sinfo ==="
+            vagrant ssh controller -c "sinfo 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== scontrol show node ==="
+            vagrant ssh controller -c "scontrol show node 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== slurmctld 日志 ==="
+            vagrant ssh controller -c "sudo journalctl -u slurmctld --no-pager -n 50 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== slurmd 日志 ==="
+            vagrant ssh worker -c "sudo journalctl -u slurmd --no-pager -n 50 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== HTCondor 状态 ==="
+            vagrant ssh controller -c "systemctl is-active condor 2>&1; condor_q 2>&1; condor_status -any 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== JobLens 日志 ==="
+            vagrant ssh worker -c "sudo journalctl -u joblens --no-pager -n 50 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== eBPF 程序 ==="
+            vagrant ssh worker -c "sudo bpftool prog list 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== slurm.conf ==="
+            vagrant ssh controller -c "sudo cat /etc/slurm/slurm.conf 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== munge 密钥 md5 ==="
+            echo "controller: $(vagrant ssh controller -c 'sudo md5sum /etc/munge/munge.key 2>&1' 2>/dev/null || echo 'N/A')"
+            echo "worker: $(vagrant ssh worker -c 'sudo md5sum /etc/munge/munge.key 2>&1' 2>/dev/null || echo 'N/A')"
+            echo ""
+            echo "=== JobLens API 响应 ==="
+            curl -s http://192.168.56.20:7592/joblens/jobs 2>/dev/null || echo '(JobLens API 不可达)'
+          } > /tmp/integration-diagnostics/diagnostics.log 2>&1
+          echo "✓ 诊断日志已保存: /tmp/integration-diagnostics/diagnostics.log"
 
       # ─── Step 4: 上传结果 (总是执行) ──────────────────────────
       - name: 上传测试结果
@@ -136,12 +236,23 @@ jobs:
             tests/integration/pytest.log
           retention-days: 7
 
+      # ─── Step 4b: 上传诊断日志 (仅在失败时) ────────────────────
+      - name: 上传诊断日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-diagnostics
+          path: /tmp/integration-diagnostics/diagnostics.log
+          retention-days: 7
+          # 诊断日志可能不存在 (如果 run_preset 完全成功), 允许丢失
+          if-no-files-found: warn
+
       # ─── Step 5: 清理 VM (总是执行) ───────────────────────────
       - name: 清理 VM
         if: always()
         working-directory: tests/integration
         run: |
-          echo "=== 诊断 ==="
+          echo "=== VM 状态 ==="
           vagrant status 2>/dev/null || echo "  (vagrant 不可用)"
 
           if [ "${KEEP_VMS}" = "1" ]; then
@@ -151,6 +262,7 @@ jobs:
           fi
 
           echo "=== 销毁 VM ==="
+          # run_preset 使用 --keep-vms 不会自行销毁, 此处显式执行
           vagrant destroy -f 2>/dev/null \
-            || echo "  WARNING: 销毁失败"
+            || echo "  WARNING: 销毁失败 (可能 VM 已被手动销毁或未启动)"
           echo "VM 已清理"
