@@ -48,7 +48,7 @@ JobLens/
 ├── include/                    # Headers (collector/writer/core/ebpf)
 ├── src/                        # Source implementation
 ├── scripts/                    # Scripts (install/deploy/CLI)
-├── trigger/                    # Trigger service (Flask)
+├── trigger/                    # Trigger service (Flask) — included in unified joblens RPM
 ├── doc/                        # Documentation
 └── thirdparty/                 # Reserved for third-party sources (currently empty)
 ```
