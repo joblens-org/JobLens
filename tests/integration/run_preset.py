@@ -1183,6 +1183,35 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
     else:
         pytest_files = os.environ["PYTEST_FILES"]
         pytest_args = os.environ["PYTEST_ARGS"]
+
+        # ── 生成 Vagrant SSH config (fabric.Connection 需要通过 SSH config 找到 VM) ──
+        print("  → 生成 Vagrant SSH config...")
+        ssh_config_path = os.path.expanduser("~/.ssh/config")
+        os.makedirs(os.path.dirname(ssh_config_path), exist_ok=True)
+        nodes = os.environ["JOBLENS_NODES"].split(",")
+        for node in nodes:
+            try:
+                ssh_config = subprocess.run(
+                    ["vagrant", "ssh-config", node],
+                    cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=10,
+                )
+                if ssh_config.returncode == 0 and ssh_config.stdout.strip():
+                    # 追加到 ~/.ssh/config，去重避免重复条目
+                    existing = ""
+                    if os.path.exists(ssh_config_path):
+                        with open(ssh_config_path, "r") as f:
+                            existing = f.read()
+                    if f"Host {node}" not in existing:
+                        with open(ssh_config_path, "a") as f:
+                            f.write(f"\n# Vagrant: {node}\n{ssh_config.stdout}\n")
+                        print(f"    ✓ ssh-config 已添加: {node}")
+                    else:
+                        print(f"    → ssh-config 已存在 (跳过): {node}")
+                else:
+                    print(f"    ⚠ vagrant ssh-config {node} 失败: {ssh_config.stderr.strip()[:100]}")
+            except Exception as e:
+                print(f"    ⚠ 无法生成 ssh-config for {node}: {e}")
+
         # CI 环境自动添加 --junitxml
         junit_part = ""
         if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):

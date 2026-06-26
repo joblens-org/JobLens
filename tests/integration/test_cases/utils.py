@@ -114,24 +114,14 @@ from fabric import Connection  # noqa: E402
 # ── 6. RemoteClient ────────────────────────────────────────────────────
 
 class RemoteClient:
-    """基于 fabric.Connection 的远程主机操作封装.
+    """基于 fabric.Connection 的远程主机操作封装，通过 SSH config 解析 Vagrant 连接.
 
-    host: 逻辑主机名（用于日志标识）
-    connect_host: 实际连接的 IP 地址（可选，不指定则用 host 做 DNS 解析）
+    前置条件：CI/workflow 需在执行 pytest 前运行:
+        vagrant ssh-config <host> >> ~/.ssh/config
     """
 
-    def __init__(self, host: str, connect_host: str = "", **kwargs: Any) -> None:
-        actual_host = connect_host if connect_host else host
-        ck = kwargs.pop("connect_kwargs", {})
-        # 禁用 host key 校验（测试环境 VM 密钥不固定）
-        ck.setdefault("look_for_keys", False)
-        ck.setdefault("allow_agent", False)
-        # 尝试 Vagrant 默认私钥
-        if "key_filename" not in ck and "pkey" not in ck:
-            vagrant_key = os.path.expanduser("~/.vagrant.d/insecure_private_key")
-            if os.path.exists(vagrant_key):
-                ck["key_filename"] = vagrant_key
-        self._conn = Connection(actual_host, connect_kwargs=ck, **kwargs)
+    def __init__(self, host: str, **kwargs: Any) -> None:
+        self._conn = Connection(host, **kwargs)
 
     def run(self, command: str, **kwargs: Any) -> Any:
         """在远程主机上运行命令."""
