@@ -364,7 +364,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         """列出所有作业（不包含彩蛋任务 JobID=0）"""
         try:
             result = rpc_client.call("JobRegistry/list_jobs")
-            response = JobsListResponse(jobs=result if isinstance(result, list) else [result])
+            response = JobsListResponse(status="ok", jobs=result if isinstance(result, list) else [result])
             return jsonify(response.model_dump())
         except RPCError as e:
             return abort(503, description=f"Failed to list jobs: {str(e)}")
