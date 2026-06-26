@@ -67,19 +67,13 @@ pip install -r requirements.txt
 
 ### 1. 准备 RPM 包
 
-JobLens 通过 RPM 部署到 worker VM。将以下 RPM 放到 `tests/integration/rpms/` 目录:
+JobLens 通过统一 RPM 部署到 worker VM。将 RPM 放到 `tests/integration/rpms/` 目录:
 
 ```bash
-# 构建 Core RPM
+# 构建统一 RPM (Core C++ Agent + Python Trigger 合一)
 bash scripts/install-deps.sh
-cmake --preset rpm-system-deps
-cmake --build --preset rpm-system-deps
-cpack --preset rpm-system-deps
-cp build/joblens-[0-9]*.rpm tests/integration/rpms/
-
-# 构建 Trigger RPM
-bash scripts/build-trigger-rpm.sh --install-deps
-cp ~/rpmbuild/RPMS/x86_64/joblens-trigger-*.rpm tests/integration/rpms/
+bash scripts/build-unified-rpm.sh --preset rpm-system-deps
+cp ~/rpmbuild/RPMS/x86_64/joblens-*.rpm tests/integration/rpms/
 ```
 
 或用环境变量指定预构建 RPM 路径 (见下方 [环境变量](#环境变量))。
@@ -138,7 +132,7 @@ vagrant suspend
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `JOBLENS_RPM_PATH` | 预构建 RPM 目录路径 (CI 使用, 包含 `joblens-*.rpm` 和 `joblens-trigger-*.rpm`) | 无 (从源码构建) |
+| `JOBLENS_RPM_PATH` | 预构建统一 RPM 目录路径 (CI 使用, 包含 `joblens-*.rpm`) | 无 (从源码构建) |
 | `KEEP_VMS` | 设为 `1` 时测试结束后保留 VM (调试用, 不销毁) | 无 (自动销毁) |
 
 ### pytest CLI 选项

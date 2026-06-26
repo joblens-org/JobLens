@@ -406,8 +406,7 @@ def extract_preset_env(preset_data: dict) -> dict:
         "HTCONDOR_ENABLED": str(sched.get("htcondor", {}).get("enabled", False)).lower(),
         "CONDOR_REPO_URL": sched.get("htcondor", {}).get("repo_rpm_url", ""),
         "SLURM_ENABLED": str(sched.get("slurm", {}).get("enabled", False)).lower(),
-        "CORE_RPM_PATTERN": jl.get("rpm_path", ""),
-        "TRIGGER_RPM_PATTERN": jl.get("trigger_rpm_path", ""),
+        "UNIFIED_RPM_PATTERN": jl.get("rpm_path", ""),
         "CORE_CONFIG_PATH": str(SCRIPT_DIR / jl["core_config"]),
         "TRIGGER_CONFIG_PATH": str(SCRIPT_DIR / jl["trigger_config"]),
         "PYTEST_FILES": " ".join(tests.get("pytest_files", [])),
@@ -940,19 +939,13 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
     rpms_dir = SCRIPT_DIR / "rpms"
     rpms_dir.mkdir(exist_ok=True)
 
-    core_rpm = resolve_rpm_glob(os.environ["CORE_RPM_PATTERN"])
-    trigger_rpm = resolve_rpm_glob(os.environ["TRIGGER_RPM_PATTERN"])
+    unified_rpm = resolve_rpm_glob(os.environ["UNIFIED_RPM_PATTERN"])
 
-    # 如果 RPM 已经在 rpms/ 下 (CI build 已放入), 跳过复制
-    if core_rpm.parent.resolve() != rpms_dir.resolve():
-        subprocess.run(["cp", str(core_rpm), str(rpms_dir / core_rpm.name)], check=True)
+    if unified_rpm.parent.resolve() != rpms_dir.resolve():
+        subprocess.run(["cp", str(unified_rpm), str(rpms_dir / unified_rpm.name)], check=True)
     else:
-        print("  Core RPM 已在 rpms/ 目录, 跳过复制")
-    if trigger_rpm.parent.resolve() != rpms_dir.resolve():
-        subprocess.run(["cp", str(trigger_rpm), str(rpms_dir / trigger_rpm.name)], check=True)
-    else:
-        print("  Trigger RPM 已在 rpms/ 目录, 跳过复制")
-    print(f"✓ RPM 文件就绪: rpms/{core_rpm.name}, rpms/{trigger_rpm.name}")
+        print("  统一 RPM 已在 rpms/ 目录, 跳过复制")
+    print(f"✓ RPM 文件就绪: rpms/{unified_rpm.name}")
 
     # ── 5e: JobLens 配置注入 ──
     print("--- 5e: JobLens 配置注入 ---")
@@ -980,8 +973,7 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
     try:
         vagrant_ssh("worker",
                     f"sudo bash /vagrant/provisioning/joblens/deploy.sh"
-                    f" --rpm-path=/vagrant/rpms/{core_rpm.name}"
-                    f" --trigger-rpm-path=/vagrant/rpms/{trigger_rpm.name}"
+                    f" --rpm-path=/vagrant/rpms/{unified_rpm.name}"
                     f" --core-config=/vagrant/.runtime/joblens_core.yaml"
                     f" --trigger-config=/vagrant/.runtime/joblens_trigger.yaml")
     except subprocess.CalledProcessError:

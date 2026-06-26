@@ -3,12 +3,12 @@ set -euo pipefail
 
 # ============================================================================
 # JobLens 部署脚本 — VM2 (worker, 192.168.56.20)
-# 用法: sudo bash deploy.sh --rpm-path=<path> --trigger-rpm-path=<path> \
+# 用法: sudo bash deploy.sh --rpm-path=<path> \
 #         --core-config=<path> --trigger-config=<path> [选项]
 #
 # 功能:
-#   1. 从参数指定路径安装预编译的 JobLens Core + Trigger RPM
-#   2. 从外部配置文件复制到 /etc/JobLens/ (不再内联生成)
+#   1. 从参数指定路径安装统一 JobLens RPM (Core C++ Agent + Python Trigger 合一)
+#   2. 从外部配置文件复制到 /etc/JobLens/
 #   3. 创建运行时目录并启动 systemd 服务
 #   4. 健康检查 + 作业计数验证
 # ============================================================================
@@ -18,12 +18,11 @@ usage() {
     cat << 'USAGE'
 JobLens 部署脚本 — 从外部配置文件部署到 worker VM
 
-用法: sudo bash deploy.sh --rpm-path=<path> --trigger-rpm-path=<path> \
+用法: sudo bash deploy.sh --rpm-path=<path> \
         --core-config=<path> --trigger-config=<path> [选项]
 
 必填参数:
-  --rpm-path <path>            JobLens Core RPM 文件路径
-  --trigger-rpm-path <path>    Trigger RPM 文件路径
+  --rpm-path <path>            统一 JobLens RPM 文件路径 (Core + Trigger 合一)
   --core-config <path>         JobLens Core 配置文件路径 (VM 内路径)
   --trigger-config <path>      Trigger 配置文件路径 (VM 内路径)
 
@@ -35,8 +34,8 @@ JobLens 部署脚本 — 从外部配置文件部署到 worker VM
   --help, -h                   显示此帮助信息
 
 功能:
-  1. 从参数指定路径安装 JobLens Core + Trigger RPM
-  2. 从外部配置文件复制到目标目录 (不再内联生成 YAML)
+  1. 从参数指定路径安装统一 JobLens RPM
+  2. 从外部配置文件复制到目标目录
   3. 创建运行时目录 (/var/JobLens, /var/log/joblens)
   4. 启动 systemd 服务 (先 joblens, 再 joblens-trigger)
   5. 健康检查重试 (最多 3 次, 间隔 5s)
@@ -45,7 +44,6 @@ JobLens 部署脚本 — 从外部配置文件部署到 worker VM
 示例:
   sudo bash deploy.sh \
     --rpm-path=/vagrant/rpms/joblens-0.3.0.rpm \
-    --trigger-rpm-path=/vagrant/rpms/joblens-trigger-0.3.0.rpm \
     --core-config=/vagrant/.runtime/joblens_core.yaml \
     --trigger-config=/vagrant/.runtime/joblens_trigger.yaml
 
@@ -54,7 +52,6 @@ USAGE
 
 # ---- 参数解析 ----
 RPM_PATH=""
-TRIGGER_RPM_PATH=""
 CORE_CONFIG=""
 TRIGGER_CONFIG=""
 CONFIG_DEST="/etc/JobLens"
@@ -68,14 +65,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --rpm-path)
             RPM_PATH="$2"
-            shift 2
-            ;;
-        --trigger-rpm-path=*)
-            TRIGGER_RPM_PATH="${1#*=}"
-            shift
-            ;;
-        --trigger-rpm-path)
-            TRIGGER_RPM_PATH="$2"
             shift 2
             ;;
         --core-config=*)
@@ -129,13 +118,11 @@ fatal() {
 }
 
 # ---- 参数校验 ----
-[[ -z "${RPM_PATH}" ]]          && fatal "缺少 --rpm-path 参数 (JobLens Core RPM 文件路径)"
-[[ -z "${TRIGGER_RPM_PATH}" ]]  && fatal "缺少 --trigger-rpm-path 参数 (Trigger RPM 文件路径)"
+[[ -z "${RPM_PATH}" ]]          && fatal "缺少 --rpm-path 参数 (统一 JobLens RPM 文件路径)"
 [[ -z "${CORE_CONFIG}" ]]       && fatal "缺少 --core-config 参数 (Core 配置文件路径)"
 [[ -z "${TRIGGER_CONFIG}" ]]    && fatal "缺少 --trigger-config 参数 (Trigger 配置文件路径)"
 
-[[ ! -f "${RPM_PATH}" ]]         && fatal "Core RPM 文件不存在: ${RPM_PATH}"
-[[ ! -f "${TRIGGER_RPM_PATH}" ]] && fatal "Trigger RPM 文件不存在: ${TRIGGER_RPM_PATH}"
+[[ ! -f "${RPM_PATH}" ]]         && fatal "RPM 文件不存在: ${RPM_PATH}"
 [[ ! -f "${CORE_CONFIG}" ]]      && fatal "Core 配置文件不存在: ${CORE_CONFIG}"
 [[ ! -f "${TRIGGER_CONFIG}" ]]   && fatal "Trigger 配置文件不存在: ${TRIGGER_CONFIG}"
 
@@ -149,19 +136,13 @@ echo "  JobLens 部署: VM2 (worker)"
 echo "============================================"
 
 # ============================================================================
-# STEP 1: 安装 RPM 包
+# STEP 1: 安装统一 RPM 包 (Core C++ Agent + Python Trigger 合一)
 # ============================================================================
-echo "==> STEP 1: 安装 RPM 包"
+echo "==> STEP 1: 安装统一 RPM 包"
 
-echo "  Core RPM:    ${RPM_PATH}"
-echo "  Trigger RPM: ${TRIGGER_RPM_PATH}"
+echo "  统一 RPM: ${RPM_PATH}"
 
-# 安装 RPM (用 dnf 自动解析依赖, 先装 core, 再装 trigger)
-echo "  安装 Core RPM (dnf 自动解析依赖)..."
 dnf install -y "${RPM_PATH}"
-
-echo "  安装 Trigger RPM..."
-dnf install -y "${TRIGGER_RPM_PATH}"
 
 echo "  PASS: RPM 安装完成"
 

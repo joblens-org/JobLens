@@ -52,12 +52,12 @@ schedulers:
 
 # ============================================================
 # JobLens 配置 (schema §6)
-# rpm_path / trigger_rpm_path: 宿主机端 RPM 文件路径/glob 模式
+# rpm_path: 宿主机端统一 RPM 文件路径/glob 模式 (Core + Trigger 合一)
 # core_config / trigger_config: 指向 presets/configs/ 下的配置文件
+# (统一 RPM 安装时两个配置均写入 /etc/JobLens/, 此处供 deploy.sh 显式覆盖)
 # ============================================================
 joblens:
   rpm_path: rpms/joblens-[0-9]*.rpm
-  trigger_rpm_path: rpms/joblens-trigger-*.rpm
   core_config: presets/configs/joblens_core_default.yaml
   trigger_config: presets/configs/joblens_trigger_default.yaml
 

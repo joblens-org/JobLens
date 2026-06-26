@@ -10,8 +10,7 @@
 #   - Guest VM: AlmaLinux 9 (通过 Vagrant libvirt)
 #
 # 构建 (对齐 CI 流程):
-#   - Core RPM: almalinux:9 容器 + CMake presets + scripts/install-deps.sh
-#   - Trigger RPM: almalinux:9 容器 + scripts/build-trigger-rpm.sh --install-deps
+#   - 统一 RPM: almalinux:9 容器 + scripts/build-unified-rpm.sh (Core C++ Agent + Python Trigger 合一)
 #
 # 拓扑:
 #   - VM1 controller (192.168.56.10): 调度控制服务
@@ -64,48 +63,39 @@ jobs:
           virsh -c qemu:///system list 2>/dev/null && echo "✓ libvirt 连接正常" || echo "✗ libvirt 连接失败"
           echo "==="
 
-      # ─── Step 2: 构建 RPM 包 (对齐 ci.yml: CMake presets) ──
-      - name: 构建 Core RPM (AlmaLinux 9 容器, CMake presets)
+      # ─── Step 2: 构建统一 RPM 包 (Core C++ Agent + Python Trigger 合一) ──
+      - name: 构建统一 RPM (AlmaLinux 9 容器, build-unified-rpm.sh)
         run: |
-          echo "=== 在 AlmaLinux 9 容器内构建 Core RPM ==="
+          echo "=== 在 AlmaLinux 9 容器内构建统一 RPM (Core + Trigger) ==="
           docker run --rm --privileged \
             -v "$(pwd)":/workspace -w /workspace \
             almalinux:9 bash -c "
               set -euo pipefail
+              # 安装构建依赖 (install-deps.sh + unified RPM 额外依赖)
               bash scripts/install-deps.sh
-              dnf install -y rpm-build
-              cmake --preset rpm-system-deps
-              cmake --build --preset rpm-system-deps
-              cpack --preset rpm-system-deps
+              dnf install -y rpm-build rpmdevtools python3 python3-devel python3-pip python3-setuptools python3-wheel systemd-rpm-macros
+              dnf install -y epel-release 2>/dev/null || true
+              dnf config-manager --set-enabled crb 2>/dev/null || \
+                dnf config-manager --set-enabled powertools 2>/dev/null || true
+              # 构建统一 RPM
+              bash scripts/build-unified-rpm.sh --preset rpm-system-deps
               mkdir -p tests/integration/rpms
-              cp build/joblens-[0-9]*.rpm tests/integration/rpms/
+              cp ~/rpmbuild/RPMS/x86_64/joblens-*.rpm tests/integration/rpms/
               ls -lh tests/integration/rpms/
             "
 
           echo ""
-          echo "=== Core RPM 构建后诊断 ==="
-          ls -lh tests/integration/rpms/joblens-[0-9]*.rpm 2>/dev/null && echo "✓ Core RPM 已生成" || echo "✗ Core RPM 未生成!"
-          rpm -qp tests/integration/rpms/joblens-[0-9]*.rpm 2>/dev/null && echo "✓ Core RPM 格式有效" || true
-          echo "==="
-
-      - name: 构建 Trigger RPM (对齐 ci.yml — almalinux 9 容器)
-        run: |
-          echo "=== 在 AlmaLinux 9 容器内构建 Trigger RPM ==="
-          docker run --rm \
-            -v "$(pwd)":/workspace -w /workspace \
-            almalinux:9 bash -c "
-              set -euo pipefail
-              dnf install -y --setopt=tsflags=nodocs git
-              bash scripts/build-trigger-rpm.sh --install-deps
-              mkdir -p tests/integration/rpms
-              cp ~/rpmbuild/RPMS/x86_64/joblens-trigger-*.rpm \
-                tests/integration/rpms/
-            "
-
+          echo "=== 统一 RPM 构建后诊断 ==="
+          RPM=$(ls tests/integration/rpms/joblens-*.rpm 2>/dev/null | head -1)
+          if [ -z "$RPM" ]; then
+            echo "✗ 未找到统一 RPM 包"
+            exit 1
+          fi
+          ls -lh "$RPM" && echo "✓ 统一 RPM 已生成"
+          rpm -qp "$RPM" 2>/dev/null && echo "✓ RPM 格式有效"
           echo ""
-          echo "=== Trigger RPM 构建后诊断 ==="
-          ls -lh tests/integration/rpms/joblens-trigger-*.rpm 2>/dev/null && echo "✓ Trigger RPM 已生成" || echo "✗ Trigger RPM 未生成!"
-          rpm -qp tests/integration/rpms/joblens-trigger-*.rpm 2>/dev/null && echo "✓ Trigger RPM 格式有效" || true
+          echo "=== RPM 内容清单 ==="
+          rpm -qpl "$RPM" | grep -E '/usr/bin/JobLens|gunicorn|\.service$|config\.yaml' || true
           echo "==="
 
       # ─── Step 3: 集成测试 (run_preset — 完整生命周期) ──────
