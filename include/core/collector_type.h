@@ -283,6 +283,9 @@ inline nlohmann::json dump_job(const Job& job) {
     for (const auto& name : job.CollectorNames) {
         j["CollectorNames"].push_back(name);
     }
+    std::visit([&j](const auto& obj) {
+        j["sub_attr"] = nlohmann::json(obj);
+    }, job.sub_attr);
     return j;
 }
 

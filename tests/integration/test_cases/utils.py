@@ -320,14 +320,16 @@ queue
     return "unknown"
 
 
-def submit_slurm_job(controller: RemoteClient) -> str:
+def submit_slurm_job(
+    controller: RemoteClient, sleep_seconds: int = 180,
+) -> str:
     """在 controller 节点上通过 sbatch 提交最小 Slurm 作业，返回 JobID.
 
     sbatch 必须在 Slurm 控制器节点 (controller VM, 192.168.56.10) 上执行，
     因为只有 controller 运行了 slurmctld 守护进程。
     """
     result = controller.run(
-        "sbatch --wrap='sleep 60' --output=/tmp/slurm_test.out",
+        f"sbatch --wrap='sleep {sleep_seconds}' --output=/tmp/slurm_test.out",
         hide=True,
     )
     for line in result.stdout.splitlines():

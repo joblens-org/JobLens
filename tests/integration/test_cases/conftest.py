@@ -103,7 +103,9 @@ def _cleanup_condor(controller: RemoteClient) -> None:
 def _cleanup_slurm(controller: RemoteClient) -> None:
     try:
         controller.run(
-            "scancel -u root 2>/dev/null || true", hide=True, warn=True
+            "scancel -u vagrant 2>/dev/null || true; sudo scancel -u root 2>/dev/null || true",
+            hide=True,
+            warn=True,
         )
     except Exception:
         pass
