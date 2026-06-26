@@ -171,8 +171,11 @@ cmake --build --preset %{?preset}%{!?preset:rpm-system-deps}
 # ===== Trigger 安装 =====
 
 # 8. 创建 Python 虚拟环境（新路径：/usr/lib/joblens/trigger-venv/）
-#     --copies: 复制 Python 解释器，避免绝对符号链接（防止 RPM 打包警告）
-%{__python3} -m venv --copies %{buildroot}/usr/lib/joblens/trigger-venv
+#    不使用 --copies：复制 Python 解释器会导致 ELF build-id 与系统 python3 包冲突
+#    （RPM find-debuginfo.sh 会为复制的 python 二进制生成 .build-id 条目）
+#    使用默认 symlink 模式：解释器符号链接到系统 /usr/bin/python3
+#    Requires: python3 >= 3.8 确保运行时解释器一定存在
+%{__python3} -m venv %{buildroot}/usr/lib/joblens/trigger-venv
 
 # 9. 安装运行时 Python 依赖 + trigger 包本身
 #    --no-compile: 不生成 .pyc，避免嵌入 buildroot 路径被 check-buildroot 拦截
