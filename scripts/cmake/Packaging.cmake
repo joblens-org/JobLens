@@ -67,9 +67,10 @@ if(JOBLENS_BUNDLE_LIBS)
         INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}/joblens")
 endif()
 
-# eBPF 对象文件（非标准 ELF，放到 /usr/lib/joblens/）
+# eBPF 对象文件（非标准 ELF，放到 ${CMAKE_INSTALL_LIBDIR}/joblens/bpf_obj/）
+# 路径必须与 CMakeLists.txt 中的 JOBLENS_INSTALL_LIBDIR 编译宏一致
 install(DIRECTORY ${BPF_OBJECT_DIR}/
-        DESTINATION /usr/lib/joblens/bpf_obj/
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/joblens/bpf_obj/
         FILES_MATCHING PATTERN "*.bpf.o")
 
 # 配置文件

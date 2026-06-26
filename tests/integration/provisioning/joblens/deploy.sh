@@ -264,6 +264,56 @@ else
 fi
 
 # ============================================================================
+# STEP 7: 验证 eBPF 程序加载
+# ============================================================================
+echo "==> STEP 7: 验证 eBPF 程序加载"
+
+# 7a. 检查 bpf_obj 文件是否存在（尝试 lib64 和 lib 路径以兼容不同系统）
+echo "  → 检查 bpf_obj 文件..."
+BPF_OBJ_DIR=""
+for candidate in "/usr/lib64/joblens/bpf_obj" "/usr/lib/joblens/bpf_obj"; do
+    if ls "${candidate}"/*.bpf.o >/dev/null 2>&1; then
+        BPF_OBJ_DIR="${candidate}"
+        break
+    fi
+done
+if [ -n "${BPF_OBJ_DIR}" ]; then
+    echo "    PASS: bpf_obj 文件存在: ${BPF_OBJ_DIR}"
+    ls -la "${BPF_OBJ_DIR}"/*.bpf.o 2>/dev/null || true
+else
+    echo "    FATAL: bpf_obj 文件不存在"
+    echo "    已检查路径: /usr/lib64/joblens/bpf_obj/   /usr/lib/joblens/bpf_obj/"
+    echo "    提示: RPM 安装可能未正确包含 eBPF 对象文件"
+    exit 1
+fi
+
+# 7b. 检查 eBPF 程序是否已加载到内核
+echo "  → 检查 eBPF 程序加载状态..."
+sleep 2  # 给 JobLens 一点时间加载 eBPF 程序
+BPF_LIST=$(bpftool prog list 2>/dev/null | grep -i joblens || true)
+if [ -n "${BPF_LIST}" ]; then
+    echo "    PASS: joblens eBPF 程序已加载:"
+    echo "${BPF_LIST}"
+else
+    echo "    FATAL: joblens eBPF 程序未加载到内核"
+    echo ""
+    echo "    诊断信息:"
+    echo "    === bpf_obj 目录内容 ==="
+    ls -laR "${BPF_OBJ_DIR}/" 2>/dev/null || echo "    (目录不存在)"
+    echo "    === bpftool prog list (全部) ==="
+    bpftool prog list 2>/dev/null | head -20 || echo "    (bpftool 不可用)"
+    echo "    === journalctl joblens (最近 30 行, 搜索 error/warn/bpf) ==="
+    journalctl -u joblens --no-pager -n 30 2>/dev/null | grep -iE "error|warn|bpf|ebpf|fail" || echo "    (无相关日志)"
+    echo ""
+    echo "    可能原因:"
+    echo "      1. JOBLENS_INSTALL_LIBDIR 编译宏与 RPM 安装路径不匹配 (lib vs lib64)"
+    echo "      2. 内核缺少 BTF 支持 (检查 /sys/kernel/btf/vmlinux)"
+    echo "      3. eBPF 对象文件损坏或架构不匹配"
+    echo "      4. JobLens 启动时 eBPF 加载失败 (检查 journalctl -u joblens)"
+    exit 1
+fi
+
+# ============================================================================
 # 完成
 # ============================================================================
 echo "============================================"

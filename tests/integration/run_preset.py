@@ -713,7 +713,7 @@ def run_demo_preflight() -> bool:
     slurm_enabled = os.environ.get("SLURM_ENABLED", "false") == "true"
     worker_ip = os.environ["WORKER_IP"]
 
-    # ── 预检前诊断：API 可达性 + 初始作业计数 ──
+    # ── 预检前诊断：API 可达性 + 初始作业计数 + eBPF 状态 ──
     api_url = f"http://{worker_ip}:7592/joblens/jobs"
     print(f"  → 预检 API 可达性: {api_url}", flush=True)
     try:
@@ -728,6 +728,20 @@ def run_demo_preflight() -> bool:
         print(f"    ✗ API 请求超时: {api_url}", flush=True)
     except Exception as e:
         print(f"    ✗ API 请求异常: {e}", flush=True)
+
+    # ── eBPF 程序加载状态检查 (早期预警) ──
+    stdout, _ = _vagrant_capture("worker",
+        "echo '=== bpf_obj 文件 ==='; "
+        "(ls -la /usr/lib64/joblens/bpf_obj/*.bpf.o 2>&1 || ls -la /usr/lib/joblens/bpf_obj/*.bpf.o 2>&1 || echo '(未找到 bpf_obj 文件)'); "
+        "echo '=== eBPF 程序 ==='; sudo bpftool prog list 2>&1 | grep -i joblens || echo '(未找到 joblens eBPF 程序)'")
+    if stdout.strip():
+        # 缩进输出以匹配其他诊断格式
+        for line in stdout.strip().splitlines():
+            print(f"    {line}", flush=True)
+        if "joblens" in stdout.lower():
+            print("    ✓ eBPF 程序已加载", flush=True)
+        else:
+            print("    ⚠ eBPF 程序未加载 — 作业自动发现将无法工作!", flush=True)
 
     # ── HTCondor demo ──────────────────────────────────────────────────
     if htcondor_enabled:

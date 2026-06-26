@@ -225,17 +225,18 @@ install -d -m 755 %{buildroot}%{_sharedstatedir}/joblens
 #     使用 CMakePresets 中预设定义的构建目录（build/）
 DESTDIR=%{buildroot} cmake --install build --prefix %{_prefix}
 
-# 16. 手动确保 eBPF 对象文件安装到位
-#     cmake --install 已通过 install(DIRECTORY ...) 安装 .bpf.o，
-#     此处显式创建目录并确认文件存在（双重保障）
-#     注意：cmake --install 可能安装到 lib64/（取决于系统 LIBDIR），
-#       lib64 下的文件不在 %%files 中声明，必须清理。
-install -d -m 755 %{buildroot}/usr/lib/joblens/bpf_obj/
-if ls build/bpf_obj/*.bpf.o >/dev/null 2>&1; then
-    cp build/bpf_obj/*.bpf.o %{buildroot}/usr/lib/joblens/bpf_obj/
+# 16. 验证 eBPF 对象文件已由 cmake --install 安装到位
+#     cmake --install 通过 Packaging.cmake 的 install(DIRECTORY ...) 安装 .bpf.o
+#     到 ${CMAKE_INSTALL_LIBDIR}/joblens/bpf_obj/（64-bit 系统为 lib64）。
+#     路径必须与 CMakeLists.txt 的 JOBLENS_INSTALL_LIBDIR 编译宏一致，
+#     否则运行时 JobLens 无法找到 eBPF 程序。
+if ! ls %{buildroot}%{_libdir}/joblens/bpf_obj/*.bpf.o >/dev/null 2>&1; then
+    echo "FATAL: eBPF 对象文件未在预期路径找到"
+    echo "  预期: %{buildroot}%{_libdir}/joblens/bpf_obj/*.bpf.o"
+    echo "  提示: 检查 Packaging.cmake 的 install(DIRECTORY ... DESTINATION ...) 配置"
+    exit 1
 fi
-# 清理 cmake --install 可能遗留的 lib64 bpf_obj 文件
-rm -rf %{buildroot}/usr/lib64/joblens 2>/dev/null || true
+echo "✓ eBPF 对象文件已安装到 %{_libdir}/joblens/bpf_obj/"
 # 清理 cmake --install 可能遗留到 /lib/systemd/ 的文件（Fedora usrmerge 兼容）
 rm -rf %{buildroot}/lib/systemd 2>/dev/null || true
 
@@ -272,10 +273,10 @@ rm -rf %{buildroot}%{_libdir}/cmake/date 2>/dev/null || :
 
 # ===== 二进制 & 库 =====
 /usr/bin/JobLens
-%dir /usr/lib/joblens/bpf_obj/
-/usr/lib/joblens/bpf_obj/*.bpf.o
+%dir %{_libdir}/joblens/bpf_obj/
+%{_libdir}/joblens/bpf_obj/*.bpf.o
 
-# ===== Python venv（整个目录树）=====
+# ===== Python venv（整个目录树，架构无关，固定 /usr/lib/）=====
 /usr/lib/joblens/trigger-venv/
 
 # ===== 配置文件 =====
