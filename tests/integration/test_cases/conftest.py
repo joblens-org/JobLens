@@ -1,6 +1,7 @@
 """JobLens integration test fixtures and shared configuration."""
 
 import subprocess
+import time
 from pathlib import Path
 from typing import Generator
 
@@ -108,8 +109,19 @@ def _cleanup_slurm(controller: RemoteClient) -> None:
         pass
 
 
+def _wait_ebpf_ready(worker: RemoteClient, timeout: float = 15.0) -> None:
+    """等待 eBPF 程序加载完成 (bpftool prog list 包含 joblens)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = worker.sudo("bpftool prog list", hide=True, warn=True)
+        if "joblens" in result.stdout.lower():
+            return
+        time.sleep(0.5)
+    raise RuntimeError(f"eBPF 未在 {timeout}s 内就绪")
+
+
 def _reset_joblens(worker: RemoteClient) -> None:
-    """停止 JobLens → 清理 LevelDB/锁/日志 → 重新启动 (最佳努力)."""
+    """停止 JobLens → 清理 LevelDB/锁/日志 → 重新启动 → 等待 eBPF 就绪."""
     try:
         worker.sudo(
             "systemctl stop joblens-trigger 2>/dev/null || true",
@@ -166,6 +178,8 @@ def _reset_joblens(worker: RemoteClient) -> None:
         )
     except Exception:
         pass
+
+    _wait_ebpf_ready(worker)
 
 
 def _ebpf_cleanup() -> None:

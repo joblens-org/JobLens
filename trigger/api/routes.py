@@ -104,6 +104,9 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         """获取Prometheus格式的指标数据"""
         try:
             metrics = rpc_client.call("prmxs_writer/metrics")
+            # 防御检查: C++ 返回 JSON 数组表示方法不存在/错误
+            if not isinstance(metrics, dict):
+                return Response("", mimetype="text/plain")
             return Response(joblens_format_metrics(metrics), mimetype="text/plain")
         except HTTPException:
             raise

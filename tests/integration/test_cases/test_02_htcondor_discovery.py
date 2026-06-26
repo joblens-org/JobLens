@@ -66,12 +66,14 @@ def _discover_condor_job(
         jobs_data = jobs_resp.json()
         jobs_list: list = jobs_data.get("jobs", [])
 
-        # 3. 第一轮：依赖列表项自带的 type/job_type 字段快速匹配
+        # 3. 第一轮：依赖列表项自带的 type/subtype 字段快速匹配
+        # dump_job() 返回: {"JobID": 1, "jobtype": "Job", "subtype": "Condor", ...}
         for job in jobs_list:
             job_type = (
                 job.get("type", "")
                 or job.get("job_type", "")
                 or job.get("jobtype", "")
+                or job.get("subtype", "")  # ← 添加 subtype 检查
             )
             if "condor" in str(job_type).lower():
                 job_id = job.get("JobID")
@@ -80,7 +82,7 @@ def _discover_condor_job(
                     if detail_resp.status_code == 200:
                         return detail_resp.json()
 
-        # 4. 第二轮：逐个查询 job_detail 检查 job_info.subtype
+        # 4. 第二轮：逐个查询 job_detail 检查 subtype（API 直接返回 dump_job 输出）
         for job in jobs_list:
             job_id = job.get("JobID")
             if job_id is None:
@@ -89,10 +91,11 @@ def _discover_condor_job(
             if detail_resp.status_code != 200:
                 continue
             detail = detail_resp.json()
-            job_info = detail.get("job_info", {})
+            # API 返回 dump_job() 直接输出，subtype 在顶层而非 job_info 包裹
             subtype = (
-                job_info.get("type", "")
-                or job_info.get("subtype", "")
+                detail.get("type", "")
+                or detail.get("subtype", "")
+                or detail.get("job_info", {}).get("subtype", "")
             )
             if "condor" in str(subtype).lower():
                 return detail
@@ -126,15 +129,15 @@ def test_condor_auto_discovery(
 
     job = _discover_condor_job(joblens_api, timeout=60.0)
 
-    # 检查 job_info 中的类型标识字段
-    job_info = job.get("job_info", {})
+    # API 返回 dump_job() 直接输出，字段在顶层
     subtype = (
-        job_info.get("type", "")
-        or job_info.get("subtype", "")
+        job.get("type", "")
+        or job.get("subtype", "")
+        or job.get("job_info", {}).get("subtype", "")
     )
     assert "condor" in str(subtype).lower(), (
         f"期望 type/subtype 包含 'condor'，实际 subtype='{subtype}'，"
-        f"job_info keys={list(job_info.keys())}"
+        f"job keys={list(job.keys())}"
     )
 
 
@@ -154,14 +157,14 @@ def test_condor_job_has_pids(
     )
 
     job = _discover_condor_job(joblens_api, timeout=60.0)
-    job_info = job.get("job_info", {})
-    pids = job_info.get("pids", [])
+    # API 返回 dump_job() 直接输出，JobPIDs 在顶层
+    pids = job.get("JobPIDs", [])
 
     assert isinstance(pids, list), (
-        f"期望 pids 为 list 类型，实际 {type(pids).__name__}"
+        f"期望 JobPIDs 为 list 类型，实际 {type(pids).__name__}"
     )
     assert len(pids) > 0, (
-        f"期望 pids 非空（至少包含作业进程 PID），实际 pids={pids}"
+        f"期望 JobPIDs 非空（至少包含作业进程 PID），实际 JobPIDs={pids}"
     )
 
 
@@ -181,10 +184,11 @@ def test_condor_job_has_collectors(
     )
 
     job = _discover_condor_job(joblens_api, timeout=60.0)
-    job_info = job.get("job_info", {})
+    # API 返回 dump_job() 直接输出，字段在顶层
     collectors = (
-        job_info.get("collectors", [])
-        or job_info.get("Lens", [])
+        job.get("CollectorNames", [])
+        or job.get("collectors", [])
+        or job.get("Lens", [])
     )
 
     assert isinstance(collectors, list), (
@@ -212,8 +216,8 @@ def test_condor_job_sub_attr(
     )
 
     job = _discover_condor_job(joblens_api, timeout=60.0)
-    job_info = job.get("job_info", {})
-    sub_attr = job_info.get("sub_attr", {})
+    # API 返回 dump_job() 直接输出，sub_attr 在顶层
+    sub_attr = job.get("sub_attr", {})
 
     assert isinstance(sub_attr, dict), (
         f"期望 sub_attr 为 dict 类型，实际 {type(sub_attr).__name__}"

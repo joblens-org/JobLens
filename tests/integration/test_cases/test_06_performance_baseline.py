@@ -153,7 +153,7 @@ def test_ebpf_programs_loaded(
     bpftool 不可用或计数为 0 均为 FAIL。
     """
     result = worker.sudo(
-        "bpftool prog show 2>/dev/null | grep -c joblens || echo 0",
+        "bpftool prog show 2>/dev/null | grep -c joblens",
         hide=True, warn=True,
     )
     count_str = result.stdout.strip()

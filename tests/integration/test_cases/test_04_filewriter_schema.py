@@ -97,10 +97,10 @@ def test_timestamp_format(worker) -> None:
 # ── data 字段验证 ──────────────────────────────────────────────────────
 
 def test_cpu_data_fields(worker) -> None:
-    """验证 data 字段包含 cpu_usage_percent 和 mem_usage_percent (float 类型).
+    """验证 data 字段包含 process_data 数组, 每个进程有 cpuPercent/memoryPercent (float).
 
-    仅验证字段存在和类型, 不验证具体数值.
-    当前仅启用 CPUMemCollector, 因此不检查 IO/Network/GPU 字段.
+    FileWriter 输出的结构: data.process_data[i].cpuPercent / memoryPercent,
+    而非顶层 data.cpu_usage_percent.
     """
     text = worker.read_text(JOBLENS_OUTPUT_LOG)
     records = parse_jsonl(text)
@@ -111,24 +111,30 @@ def test_cpu_data_fields(worker) -> None:
             f"记录[{i}] data 不是 dict 类型, 实际 {type(data)}"
         )
 
-        cpu = data.get("cpu_usage_percent")
-        assert isinstance(cpu, float), (
-            f"记录[{i}] cpu_usage_percent 不是 float, 实际 {type(cpu).__name__}={cpu!r}"
+        process_data = data.get("process_data", [])
+        assert isinstance(process_data, list) and len(process_data) > 0, (
+            f"记录[{i}] process_data 不是非空 list, 实际 {type(process_data).__name__}={process_data!r}"
         )
 
-        mem = data.get("mem_usage_percent")
-        assert isinstance(mem, float), (
-            f"记录[{i}] mem_usage_percent 不是 float, 实际 {type(mem).__name__}={mem!r}"
-        )
+        # 检查每个进程的 CPU/内存字段
+        for j, proc in enumerate(process_data):
+            cpu = proc.get("cpuPercent")
+            assert isinstance(cpu, (int, float)), (
+                f"记录[{i}] process_data[{j}] cpuPercent 不是 float, 实际 {type(cpu).__name__}={cpu!r}"
+            )
+            mem = proc.get("memoryPercent")
+            assert isinstance(mem, (int, float)), (
+                f"记录[{i}] process_data[{j}] memoryPercent 不是 float, 实际 {type(mem).__name__}={mem!r}"
+            )
 
 
 # ── job_info 字段验证 ──────────────────────────────────────────────────
 
 def test_job_info_fields(worker) -> None:
-    """验证 job_info 包含 jobtype (str) 和 pids (list) 且类型正确.
+    """验证 job_info 包含 jobtype (str) 和 JobPIDs (list) 且类型正确.
 
-    jobtype 标识作业调度器类型 (如 "condor", "slurm", "local"),
-    pids 是 eBPF 追踪到的进程 PID 列表.
+    jobtype 标识作业调度器类型 (如 "Job"), 
+    JobPIDs 是 eBPF 追踪到的进程 PID 列表.
     """
     text = worker.read_text(JOBLENS_OUTPUT_LOG)
     records = parse_jsonl(text)
@@ -147,9 +153,9 @@ def test_job_info_fields(worker) -> None:
             f"记录[{i}] jobtype 为空字符串"
         )
 
-        pids = job_info.get("pids")
+        pids = job_info.get("JobPIDs")
         assert isinstance(pids, list), (
-            f"记录[{i}] pids 不是 list, 实际 {type(pids).__name__}={pids!r}"
+            f"记录[{i}] JobPIDs 不是 list, 实际 {type(pids).__name__}={pids!r}"
         )
 
 
