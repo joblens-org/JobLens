@@ -9,3 +9,4 @@
 #SBATCH --time=1:00
 
 echo "hello world from Slurm"
+sleep 5

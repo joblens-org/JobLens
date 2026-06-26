@@ -1,9 +1,11 @@
-# JobLens 集成测试 — Hello World HTCondor demo 作业 (预检用)
+# JobLens 集成测试 — HTCondor demo 作业 (预检用)
 # 用法: condor_submit tests/integration/test_jobs/helloworld.condor
-# 运行时长远小于 sleep.condor，适合快速预检
+# 使用 sleep 而非 echo：echo 瞬间完成导致 HTCondor 清理 job ad 文件，
+# CondorJob::getJobID 中的 parse_job_id 读不到文件，作业发现失败。
+# sleep 5s 保证 JobLens 有足够时间读取 ad 文件。
 
 universe       = vanilla
-executable     = /usr/bin/echo
-arguments      = "hello world from HTCondor"
+executable     = /usr/bin/sleep
+arguments      = 5
 output         = /tmp/hw_condor.out
 queue 1
