@@ -22,6 +22,7 @@ import logging
 import time
 import subprocess
 from typing import Optional
+from werkzeug.exceptions import HTTPException
 
 # 业务操作函数
 from trigger.core.tools import joblens_format_metrics, systemd_status, job_opt, add_condorjob, add_slurmjob, restart_joblens
@@ -104,6 +105,8 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         try:
             metrics = rpc_client.call("prmxs_writer/metrics")
             return Response(joblens_format_metrics(metrics), mimetype="text/plain")
+        except HTTPException:
+            raise
         except RPCError as e:
             return abort(503, description=f"RPC调用失败: {str(e)}")
         except Exception as e:
@@ -382,6 +385,8 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
                 return abort(404, description=result["error"])
             response = JobDetailResponse.model_validate(result)
             return jsonify(response.model_dump())
+        except HTTPException:
+            raise
         except RPCError as e:
             return abort(503, description=f"Failed to get job: {str(e)}")
         except Exception as e:
