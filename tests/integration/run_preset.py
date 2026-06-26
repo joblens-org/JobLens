@@ -585,11 +585,11 @@ def _diagnose_scheduler(htcondor_enabled: bool, slurm_enabled: bool) -> None:
         except Exception as e:
             print(f"  condor_status 失败: {e}", flush=True)
 
-        print("  --- HTCondor 日志 (controller, 最后 10 行) ---", flush=True)
+        print("  --- HTCondor 日志 (controller) ---", flush=True)
         try:
             proc = subprocess.run(
                 ["vagrant", "ssh", "controller", "-c",
-                 "sudo journalctl -u condor --no-pager -n 10 2>&1 || true"],
+                 "sudo journalctl -u condor --no-pager --since '30 minutes ago' 2>&1 || true"],
                 cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=15,
             )
             if proc.stdout.strip():
@@ -629,11 +629,11 @@ def _diagnose_scheduler(htcondor_enabled: bool, slurm_enabled: bool) -> None:
         except Exception as e:
             print(f"  squeue 失败: {e}", flush=True)
 
-        print("  --- slurmctld 日志 (controller, 最后 20 行) ---", flush=True)
+        print("  --- slurmctld 日志 (controller) ---", flush=True)
         try:
             proc = subprocess.run(
                 ["vagrant", "ssh", "controller", "-c",
-                 "sudo journalctl -u slurmctld --no-pager -n 20 2>&1 || true"],
+                 "sudo journalctl -u slurmctld --no-pager --since '30 minutes ago' 2>&1 || true"],
                 cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=15,
             )
             if proc.stdout.strip():
@@ -643,11 +643,11 @@ def _diagnose_scheduler(htcondor_enabled: bool, slurm_enabled: bool) -> None:
         except Exception as e:
             print(f"  slurmctld journalctl 失败: {e}", flush=True)
 
-        print("  --- slurmd 日志 (worker, 最后 20 行) ---", flush=True)
+        print("  --- slurmd 日志 (worker) ---", flush=True)
         try:
             proc = subprocess.run(
                 ["vagrant", "ssh", "worker", "-c",
-                 "sudo journalctl -u slurmd --no-pager -n 20 2>&1 || true"],
+                 "sudo journalctl -u slurmd --no-pager --since '30 minutes ago' 2>&1 || true"],
                 cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=15,
             )
             if proc.stdout.strip():
@@ -676,10 +676,10 @@ def _diagnose_scheduler(htcondor_enabled: bool, slurm_enabled: bool) -> None:
         proc = subprocess.run(
             ["vagrant", "ssh", "worker", "-c",
              "echo '=== systemctl ==='; systemctl is-active joblens joblens-trigger 2>&1 || true; "
-             "echo '=== journalctl joblens (最后 30 行) ==='; "
-             "sudo journalctl -u joblens --no-pager -n 30 2>&1 || true; "
-             "echo '=== journalctl joblens-trigger (最后 15 行) ==='; "
-             "sudo journalctl -u joblens-trigger --no-pager -n 15 2>&1 || true"],
+             "echo '=== journalctl joblens (全部) ==='; "
+             "sudo journalctl -u joblens --no-pager --since '30 minutes ago' 2>&1 || true; "
+             "echo '=== journalctl joblens-trigger (全部) ==='; "
+             "sudo journalctl -u joblens-trigger --no-pager --since '30 minutes ago' 2>&1 || true"],
             cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=15,
         )
         if proc.stdout.strip():
@@ -873,15 +873,15 @@ def run_demo_preflight() -> bool:
             else:
                 print(f"  FAILED: slurm demo job not discovered (timeout 30s, elapsed {elapsed:.1f}s)",
                       flush=True)
-                # 失败时额外诊断: 获取 slurmctld/slurmd 日志
+                # 失败时额外诊断: 获取 slurmctld/slurmd 完整日志
                 stdout, _ = _vagrant_capture("controller",
-                    "echo '=== slurmctld 日志 (最后 15 行) ==='; "
-                    "sudo journalctl -u slurmctld --no-pager -n 15 2>&1 || true")
+                    "echo '=== slurmctld 日志 ==='; "
+                    "sudo journalctl -u slurmctld --no-pager --since '30 minutes ago' 2>&1 || true")
                 if stdout.strip():
                     print(f"    [诊断] slurmctld 日志:\n{stdout}", flush=True)
                 stdout, _ = _vagrant_capture("worker",
-                    "echo '=== slurmd 日志 (最后 15 行) ==='; "
-                    "sudo journalctl -u slurmd --no-pager -n 15 2>&1 || true")
+                    "echo '=== slurmd 日志 ==='; "
+                    "sudo journalctl -u slurmd --no-pager --since '30 minutes ago' 2>&1 || true")
                 if stdout.strip():
                     print(f"    [诊断] slurmd 日志:\n{stdout}", flush=True)
         except subprocess.CalledProcessError as e:

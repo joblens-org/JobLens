@@ -262,14 +262,14 @@ if [ "${HEALTH_OK}" != "true" ]; then
     echo "  === systemctl status joblens ==="
     systemctl status joblens --no-pager -l 2>/dev/null || true
     echo ""
-    echo "  === journalctl -u joblens (最后 50 行) ==="
-    journalctl -u joblens --no-pager -n 50 2>/dev/null || true
+    echo "  === journalctl -u joblens (全部) ==="
+    journalctl -u joblens --no-pager --since "30 minutes ago" 2>/dev/null || journalctl -u joblens --no-pager -n 100 2>/dev/null || true
     echo ""
     echo "  === systemctl status joblens-trigger ==="
     systemctl status joblens-trigger --no-pager -l 2>/dev/null || true
     echo ""
-    echo "  === journalctl -u joblens-trigger (最后 30 行) ==="
-    journalctl -u joblens-trigger --no-pager -n 30 2>/dev/null || true
+    echo "  === journalctl -u joblens-trigger (全部) ==="
+    journalctl -u joblens-trigger --no-pager --since "30 minutes ago" 2>/dev/null || journalctl -u joblens-trigger --no-pager -n 50 2>/dev/null || true
     exit 1
 fi
 
@@ -327,8 +327,8 @@ else
     ls -laR "${BPF_OBJ_DIR}/" 2>/dev/null || echo "    (目录不存在)"
     echo "    === bpftool prog list (全部) ==="
     bpftool prog list 2>/dev/null | head -20 || echo "    (bpftool 不可用)"
-    echo "    === journalctl joblens (最近 30 行, 搜索 error/warn/bpf) ==="
-    journalctl -u joblens --no-pager -n 30 2>/dev/null | grep -iE "error|warn|bpf|ebpf|fail" || echo "    (无相关日志)"
+    echo "    === journalctl joblens (全部, 搜索 error/warn/bpf) ==="
+    journalctl -u joblens --no-pager --since "30 minutes ago" 2>/dev/null | grep -iE "error|warn|bpf|ebpf|fail" || echo "    (无相关日志)"
     echo ""
     echo "    可能原因:"
     echo "      1. JOBLENS_INSTALL_LIBDIR 编译宏与 RPM 安装路径不匹配 (lib vs lib64)"
