@@ -114,10 +114,26 @@ from fabric import Connection  # noqa: E402
 # ── 6. RemoteClient ────────────────────────────────────────────────────
 
 class RemoteClient:
-    """基于 fabric.Connection 的远程主机操作封装，默认使用 Vagrant 主机别名."""
+    """基于 fabric.Connection 的远程主机操作封装.
 
-    def __init__(self, host: str, **kwargs: Any) -> None:
-        self._conn = Connection(host, **kwargs)
+    host: 逻辑主机名（用于 SSH config 查找和日志）
+    connect_host: 实际连接的 IP 地址（可选，不指定则用 host 做 DNS 解析）
+    """
+
+    def __init__(self, host: str, connect_host: str = "", **kwargs: Any) -> None:
+        # 构建 connect_kwargs：用 IP 直连绕过 DNS 解析
+        ck = kwargs.pop("connect_kwargs", {})
+        if connect_host:
+            ck["hostname"] = connect_host
+        # 禁用 host key 校验（测试环境 VM 密钥不固定）
+        ck.setdefault("look_for_keys", False)
+        ck.setdefault("allow_agent", False)
+        if "key_filename" not in ck and "pkey" not in ck:
+            # 尝试 Vagrant 默认私钥
+            vagrant_key = os.path.expanduser("~/.vagrant.d/insecure_private_key")
+            if os.path.exists(vagrant_key):
+                ck["key_filename"] = vagrant_key
+        self._conn = Connection(host, connect_kwargs=ck, **kwargs)
 
     def run(self, command: str, **kwargs: Any) -> Any:
         """在远程主机上运行命令."""

@@ -8,6 +8,7 @@ import pytest
 
 from utils import (
     CONTROLLER_HOST,
+    CONTROLLER_IP,
     INTEGRATION_ROOT,
     JOBLENS_DB_PATH,
     JOBLENS_LOCK_PATH,
@@ -67,14 +68,14 @@ def integration_root() -> Path:
 
 @pytest.fixture(scope="session")
 def controller() -> RemoteClient:
-    """controller VM 的 RemoteClient 连接."""
-    return RemoteClient(CONTROLLER_HOST)
+    """controller VM 的 RemoteClient 连接 (通过 IP 直连绕过 DNS 解析)."""
+    return RemoteClient(CONTROLLER_HOST, connect_host=CONTROLLER_IP)
 
 
 @pytest.fixture(scope="session")
 def worker() -> RemoteClient:
-    """worker VM 的 RemoteClient 连接."""
-    return RemoteClient(WORKER_HOST)
+    """worker VM 的 RemoteClient 连接 (通过 IP 直连绕过 DNS 解析)."""
+    return RemoteClient(WORKER_HOST, connect_host=WORKER_IP)
 
 
 # ── API fixture ───────────────────────────────────────────────────────
