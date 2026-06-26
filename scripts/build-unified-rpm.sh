@@ -225,6 +225,7 @@ build_rpm() {
     if rpmbuild -ba \
         --define "preset ${preset}" \
         --define "unified_version ${VERSION}" \
+        --define "version ${VERSION}" \
         "$spec_file"; then
         log_info "rpmbuild 构建成功"
         return 0
@@ -238,6 +239,7 @@ build_rpm() {
     rpmbuild -ba --nodeps \
         --define "preset ${preset}" \
         --define "unified_version ${VERSION}" \
+        --define "version ${VERSION}" \
         "$spec_file"
 }
 
