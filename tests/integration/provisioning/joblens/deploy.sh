@@ -203,6 +203,31 @@ systemctl enable --now joblens-trigger
 
 echo "  PASS: 服务已启动"
 
+# STEP 4b: 捕获 JobLens 启动日志（包括 eBPF 加载信息）
+echo "==> STEP 4b: 捕获 JobLens 启动日志"
+JOBLENS_LOG=$(journalctl -u joblens --no-pager --since "1 min ago" 2>/dev/null || true)
+if [ -n "${JOBLENS_LOG}" ]; then
+    echo "    JobLens 启动日志 (最近 1 分钟):"
+    echo "${JOBLENS_LOG}" | while IFS= read -r line; do
+        echo "      ${line}"
+    done
+    echo ""
+    # 检查是否有 eBPF 加载相关日志
+    if echo "${JOBLENS_LOG}" | grep -qi "bpf\|ebpf"; then
+        echo "    ✓ 启动日志中包含 eBPF 相关消息"
+    else
+        echo "    ⚠ 启动日志中未发现 eBPF 相关消息 — 可能 eBPF 初始化未执行或日志级别过高"
+    fi
+    # 检查是否有 error 级别日志
+    if echo "${JOBLENS_LOG}" | grep -q "error\|Error\|ERROR\|fatal\|FATAL"; then
+        echo "    ⚠ 启动日志中包含 error 级别消息:"
+        echo "${JOBLENS_LOG}" | grep -i "error\|fatal" || true
+    fi
+else
+    echo "    ⚠ Journal 中无 JobLens 日志"
+fi
+echo "  PASS: 日志捕获完成"
+
 # ============================================================================
 # STEP 5: 等待并验证服务健康状态
 # ============================================================================
