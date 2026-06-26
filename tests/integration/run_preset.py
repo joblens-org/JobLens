@@ -1216,7 +1216,7 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
         junit_part = ""
         if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
             junit_part = " --junitxml=test-results.xml"
-        cmd = (f"pytest --skip-vagrant-up --skip-vagrant-destroy"
+        cmd = (f"pytest -s --skip-vagrant-up --skip-vagrant-destroy"
                f"{junit_part} {pytest_args} {pytest_files}")
         print(f"  {cmd}")
         try:

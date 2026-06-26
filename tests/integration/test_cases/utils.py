@@ -311,7 +311,7 @@ error  = /tmp/condor_test.err
 log    = /tmp/condor_test.log
 queue
 """
-    controller.sudo("cat > /tmp/test_job.sub", stdin=submit_text)
+    controller.sudo("cat > /tmp/test_job.sub", in_stream=submit_text)
     result = controller.run("condor_submit /tmp/test_job.sub", hide=True)
     for line in result.stdout.splitlines():
         if "submitted to cluster" in line:
