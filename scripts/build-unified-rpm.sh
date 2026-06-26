@@ -207,8 +207,11 @@ prepare_sources() {
 
 # ============================================================================
 # 阶段 6: 构建 RPM
-#   运行 rpmbuild -ba，失败时自动回退 --nodeps 重试。
-#   传递 unified_version 宏给 spec（供未来 spec 中使用 %{unified_version}）。
+#   通过 --define "_version X.Y.Z" 将 CMakeLists.txt 提取的版本号传入 spec。
+#   spec 中使用 %%{!?_version: %%define _version 0.0.0} 模式：
+#     - 传参时 → %%{_version} = 传入值
+#     - 未传参时 → 回退占位值 0.0.0（本地调试用）
+#   失败时自动回退 --nodeps 重试。
 # ============================================================================
 build_rpm() {
     local preset="$1"
@@ -219,13 +222,13 @@ build_rpm() {
         exit 1
     fi
 
-    log_info "开始 RPM 构建（rpmbuild -ba, preset=${preset}）..."
+    log_info "开始 RPM 构建（rpmbuild -ba, preset=${preset}, _version=${VERSION}）..."
     echo ""
 
     if rpmbuild -ba \
         --define "preset ${preset}" \
         --define "unified_version ${VERSION}" \
-        --define "version ${VERSION}" \
+        --define "_version ${VERSION}" \
         "$spec_file"; then
         log_info "rpmbuild 构建成功"
         return 0
@@ -239,7 +242,7 @@ build_rpm() {
     rpmbuild -ba --nodeps \
         --define "preset ${preset}" \
         --define "unified_version ${VERSION}" \
-        --define "version ${VERSION}" \
+        --define "_version ${VERSION}" \
         "$spec_file"
 }
 

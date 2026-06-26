@@ -47,7 +47,12 @@
 # 包元数据
 # ============================================================
 Name:           joblens
-Version:        0.1.0
+
+# 版本号通过 rpmbuild --define "_version X.Y.Z" 动态传入，以 CMakeLists.txt 为准。
+# 未传参时回退到占位值 0.0.0（直接 rpmbuild 本地调试用）。
+%{!?_version: %define _version 0.0.0 }
+Version:        %{_version}
+
 Release:        1%{?dist}
 Summary:        JobLens — high-performance job monitoring agent with RESTful trigger gateway
 
