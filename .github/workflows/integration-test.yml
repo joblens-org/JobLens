@@ -124,7 +124,7 @@ jobs:
           # 安装 Python 测试依赖（pytest, requests, fabric, pyyaml）
           pip install -q -r requirements.txt
           # 使用 --keep-vms 确保即使测试失败也不会销毁 VM, 以便后续诊断步骤捕获日志
-          python3 ./run_preset.py alm9-default --keep-vms
+          python3 ./run_preset.py --match 'alm9-*' --keep-vms
           PRESET_EXIT=$?
 
           echo ""
