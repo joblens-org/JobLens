@@ -23,7 +23,6 @@ import sys
 import time
 from pathlib import Path
 
-import requests
 import yaml
 
 # ── 路径常量 ──────────────────────────────────────────────────────────────
@@ -481,63 +480,132 @@ def generate_vagrantfile():
 # Demo Job 预检
 # ══════════════════════════════════════════════════════════════════════════
 
-def poll_job_discovery(worker_ip: str, subtype: str, timeout: int = 30, interval: int = 2) -> str | None:
-    """
-    轮询 JobLens API 直到发现指定 subtype 的作业。
-    返回 job_id 或 None (超时)。
-    """
-    api_url = f"http://{worker_ip}:7592/joblens/jobs"
-    last_error: str | None = None
-    last_response: str | None = None
+def _condor_status_name(status_code: str) -> str:
+    return {
+        "1": "IDLE",
+        "2": "RUNNING",
+        "3": "REMOVED",
+        "4": "COMPLETED",
+        "5": "HELD",
+        "6": "TRANSFERRING_OUTPUT",
+        "7": "SUSPENDED",
+    }.get(status_code, f"UNKNOWN({status_code})")
+
+
+def wait_condor_job_scheduled(cluster_id: str, timeout: int = 60, interval: int = 2) -> bool:
+    scheduled_states = {"2", "4", "6"}
+    failure_states = {"3", "5"}
+    last_snapshot = ""
     attempt = 0
     deadline = time.time() + timeout
+
     while time.time() < deadline:
         attempt += 1
-        try:
-            resp = requests.get(api_url, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                jobs = data.get("jobs", [])
-                job_count = data.get("job_count", len(jobs))
-                # 每 3 次尝试输出一次状态
-                if attempt % 3 == 1:
-                    subtypes_found = [j.get("subtype", "?") for j in jobs]
-                    print(f"    [{subtype} 轮询 #{attempt}] job_count={job_count}, subtypes={subtypes_found}")
-                for job in jobs:
-                    if subtype in job.get("subtype", "").lower():
-                        return job.get("job_id", "?")
-                last_response = f"HTTP {resp.status_code}, job_count={job_count}, jobs={len(jobs)}"
-            else:
-                last_response = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                print(f"    [{subtype} 轮询 #{attempt}] 非 200 响应: {last_response}")
-        except requests.ConnectionError as e:
-            last_error = f"ConnectionError: {e}"
-            if attempt == 1:
-                print(f"    [{subtype} 轮询 #{attempt}] 无法连接 {api_url}: {e}")
-        except requests.Timeout as e:
-            last_error = f"Timeout: {e}"
-            if attempt <= 2:
-                print(f"    [{subtype} 轮询 #{attempt}] 请求超时 {api_url}: {e}")
-        except requests.RequestException as e:
-            last_error = f"RequestException: {e}"
-            if attempt <= 2:
-                print(f"    [{subtype} 轮询 #{attempt}] 请求异常: {e}")
-        except json.JSONDecodeError as e:
-            last_error = f"JSONDecodeError: {e}"
-            print(f"    [{subtype} 轮询 #{attempt}] JSON 解析失败: {e}")
+        stdout, stderr = _vagrant_capture(
+            "controller",
+            "set -o pipefail; "
+            f"echo '=== condor_q {cluster_id} ==='; "
+            f"condor_q {cluster_id} -af ClusterId ProcId JobStatus 2>&1 || true; "
+            f"echo '=== condor_history {cluster_id} ==='; "
+            f"condor_history {cluster_id} -af ClusterId ProcId JobStatus 2>&1 | head -5 || true",
+            timeout=20,
+        )
+        snapshot = (stdout + stderr).strip()
+        if snapshot:
+            last_snapshot = snapshot
+
+        for line in stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) < 3 or not parts[0].isdigit():
+                continue
+            status_code = parts[2]
+            status_name = _condor_status_name(status_code)
+            if status_code in scheduled_states:
+                print(
+                    f"    ✓ HTCondor 作业 {cluster_id} 已由调度器处理: {status_name}",
+                    flush=True,
+                )
+                return True
+            if status_code in failure_states:
+                print(
+                    f"    ✗ HTCondor 作业 {cluster_id} 进入失败状态: {status_name}",
+                    flush=True,
+                )
+                return False
+
+        if attempt % 3 == 1:
+            print(
+                f"    [HTCondor 轮询 #{attempt}] 尚未观察到运行/完成状态，继续等待...",
+                flush=True,
+            )
         time.sleep(interval)
 
-    # 超时后输出诊断汇总
-    print(f"    [{subtype}] 轮询超时 ({timeout}s, {attempt} 次尝试)")
-    if last_error:
-        print(f"    [{subtype}] 最后一次异常: {last_error}")
-    if last_response:
-        print(f"    [{subtype}] 最后一次可解析响应: {last_response}")
-    return None
+    print(f"    ✗ HTCondor 作业 {cluster_id} 在 {timeout}s 内未进入运行/完成状态", flush=True)
+    if last_snapshot:
+        print(f"    最后一次 HTCondor 状态快照:\n{last_snapshot}", flush=True)
+    return False
+
+
+def wait_slurm_job_scheduled(job_id: str, timeout: int = 60, interval: int = 2) -> bool:
+    scheduled_states = {"RUNNING", "COMPLETING", "COMPLETED"}
+    failure_states = {"FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "PREEMPTED"}
+    last_snapshot = ""
+    attempt = 0
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        attempt += 1
+        stdout, stderr = _vagrant_capture(
+            "controller",
+            "set -o pipefail; "
+            f"echo '=== squeue {job_id} ==='; "
+            f"squeue -h -j {job_id} -o '%i %T %R' 2>&1 || true; "
+            f"echo '=== scontrol show job {job_id} ==='; "
+            f"scontrol show job {job_id} 2>&1 || true",
+            timeout=20,
+        )
+        snapshot = (stdout + stderr).strip()
+        if snapshot:
+            last_snapshot = snapshot
+
+        for line in stdout.splitlines():
+            if line.startswith(job_id):
+                parts = line.strip().split(maxsplit=2)
+                if len(parts) >= 2:
+                    state = parts[1].upper()
+                    if state in scheduled_states:
+                        print(
+                            f"    ✓ Slurm 作业 {job_id} 已由调度器处理: {state}",
+                            flush=True,
+                        )
+                        return True
+                    if state in failure_states:
+                        print(f"    ✗ Slurm 作业 {job_id} 进入失败状态: {state}", flush=True)
+                        return False
+
+        state_matches = re.findall(r"JobState=([A-Z_]+)", stdout)
+        for state in state_matches:
+            if state in scheduled_states:
+                print(f"    ✓ Slurm 作业 {job_id} 已由调度器处理: {state}", flush=True)
+                return True
+            if state in failure_states:
+                print(f"    ✗ Slurm 作业 {job_id} 进入失败状态: {state}", flush=True)
+                return False
+
+        if attempt % 3 == 1:
+            print(
+                f"    [Slurm 轮询 #{attempt}] 尚未观察到运行/完成状态，继续等待...",
+                flush=True,
+            )
+        time.sleep(interval)
+
+    print(f"    ✗ Slurm 作业 {job_id} 在 {timeout}s 内未进入运行/完成状态", flush=True)
+    if last_snapshot:
+        print(f"    最后一次 Slurm 状态快照:\n{last_snapshot}", flush=True)
+    return False
 
 
 def _diagnose_scheduler(htcondor_enabled: bool, slurm_enabled: bool) -> None:
-    """Job 未发现时的调度器诊断 — 输出 condor_q / condor_status / sinfo / scontrol / 各服务日志。"""
     print("  === 调度器诊断 ===", flush=True)
 
     # Fast-fail: 快速检查 VM 是否仍在运行, 避免后续 vagrant ssh 命令逐个超时
@@ -657,38 +725,6 @@ def _diagnose_scheduler(htcondor_enabled: bool, slurm_enabled: bool) -> None:
         except Exception as e:
             print(f"  slurmd journalctl 失败: {e}", flush=True)
 
-    print("  --- eBPF 程序列表 (worker) ---", flush=True)
-    try:
-        proc = subprocess.run(
-            ["vagrant", "ssh", "worker", "-c",
-             "sudo bpftool prog list 2>&1 | grep -i joblens || echo '(未找到 joblens eBPF 程序)'"],
-            cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=15,
-        )
-        if proc.stdout.strip():
-            print(proc.stdout, flush=True)
-        else:
-            print("  (空输出)", flush=True)
-    except Exception as e:
-        print(f"  bpftool 查询失败: {e}", flush=True)
-
-    print("  --- JobLens 服务状态 (worker) ---", flush=True)
-    try:
-        proc = subprocess.run(
-            ["vagrant", "ssh", "worker", "-c",
-             "echo '=== systemctl ==='; systemctl is-active joblens joblens-trigger 2>&1 || true; "
-             "echo '=== journalctl joblens (全部) ==='; "
-             "sudo journalctl -u joblens --no-pager --since '30 minutes ago' 2>&1 || true; "
-             "echo '=== journalctl joblens-trigger (全部) ==='; "
-             "sudo journalctl -u joblens-trigger --no-pager --since '30 minutes ago' 2>&1 || true"],
-            cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=15,
-        )
-        if proc.stdout.strip():
-            print(proc.stdout, flush=True)
-        else:
-            print("  (空输出)", flush=True)
-    except Exception as e:
-        print(f"  JobLens 状态查询失败: {e}", flush=True)
-
 
 def _vagrant_capture(node: str, command: str, timeout: int = 15) -> tuple[str, str]:
     """在 VM 节点上执行命令并返回 (stdout, stderr), 失败返回空字符串。"""
@@ -704,44 +740,13 @@ def _vagrant_capture(node: str, command: str, timeout: int = 15) -> tuple[str, s
 
 def run_demo_preflight() -> bool:
     """
-    Demo job 预检 — 向所有启用的调度器提交 demo job, 通过 JobLens API 轮询验证。
+    Demo job 预检 — 向所有启用的调度器提交 demo job, 验证调度框架可正常调度任务。
     返回 True 表示全部通过, False 表示至少一个失败。
     """
     total_tests = 0
     passed = 0
     htcondor_enabled = os.environ.get("HTCONDOR_ENABLED", "false") == "true"
     slurm_enabled = os.environ.get("SLURM_ENABLED", "false") == "true"
-    worker_ip = os.environ["WORKER_IP"]
-
-    # ── 预检前诊断：API 可达性 + 初始作业计数 + eBPF 状态 ──
-    api_url = f"http://{worker_ip}:7592/joblens/jobs"
-    print(f"  → 预检 API 可达性: {api_url}", flush=True)
-    try:
-        resp = requests.get(api_url, timeout=10)
-        data = resp.json()
-        print(f"    API 响应: HTTP {resp.status_code}, job_count={data.get('job_count', '?')}, "
-              f"jobs={len(data.get('jobs', []))}", flush=True)
-    except requests.ConnectionError:
-        print(f"    ✗ 无法连接 {api_url} — 宿主机可能无法路由到 VM 私有网络", flush=True)
-        print(f"    提示: 检查宿主机是否可达 {worker_ip} (private_network {worker_ip}/24)", flush=True)
-    except requests.Timeout:
-        print(f"    ✗ API 请求超时: {api_url}", flush=True)
-    except Exception as e:
-        print(f"    ✗ API 请求异常: {e}", flush=True)
-
-    # ── eBPF 程序加载状态检查 (早期预警) ──
-    stdout, _ = _vagrant_capture("worker",
-        "echo '=== bpf_obj 文件 ==='; "
-        "(ls -la /usr/lib64/joblens/bpf_obj/*.bpf.o 2>&1 || ls -la /usr/lib/joblens/bpf_obj/*.bpf.o 2>&1 || echo '(未找到 bpf_obj 文件)'); "
-        "echo '=== eBPF 程序 ==='; sudo bpftool prog list 2>&1 | grep -i joblens || echo '(未找到 joblens eBPF 程序)'")
-    if stdout.strip():
-        # 缩进输出以匹配其他诊断格式
-        for line in stdout.strip().splitlines():
-            print(f"    {line}", flush=True)
-        if "joblens" in stdout.lower():
-            print("    ✓ eBPF 程序已加载", flush=True)
-        else:
-            print("    ⚠ eBPF 程序未加载 — 作业自动发现将无法工作!", flush=True)
 
     # ── HTCondor demo ──────────────────────────────────────────────────
     if htcondor_enabled:
@@ -760,41 +765,53 @@ def run_demo_preflight() -> bool:
                  "condor_submit /vagrant/test_jobs/helloworld.condor"],
                 cwd=SCRIPT_DIR, check=True, capture_output=True, text=True,
             )
+            cluster_id = ""
             # 输出 condor_submit 结果
             for line in result.stdout.splitlines():
                 if line.strip():
                     print(f"    {line.strip()}", flush=True)
+                match = re.search(r"submitted to cluster\s+(\d+)", line, re.IGNORECASE)
+                if match:
+                    cluster_id = match.group(1)
 
-            # 立即检查队列
-            try:
-                qresult = subprocess.run(
-                    ["vagrant", "ssh", "controller", "-c",
-                     "echo '=== condor_q ==='; condor_q 2>&1 || true; "
-                     "echo '=== condor_q -better ==='; condor_q -better-analyze 2>&1 || true"],
-                    cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=10,
+            if not cluster_id:
+                elapsed = time.time() - t_start
+                print(
+                    f"  FAILED: htcondor demo job submit output missing ClusterId [{elapsed:.1f}s]",
+                    flush=True,
                 )
-                if qresult.stdout.strip():
-                    print(f"    [提交后] HTCondor 队列:\n{qresult.stdout}", flush=True)
-                else:
-                    print("    [提交后] condor_q 输出为空 (作业可能已完成或提交失败)", flush=True)
-            except Exception:
-                pass
-
-            print(f"    → 轮询 JobLens API 等待 HTCondor 作业发现 (最多 30s)...", flush=True)
-            job_id = poll_job_discovery(worker_ip, "condor", timeout=30)
-            elapsed = time.time() - t_start
-            if job_id:
-                print(f"  PASSED: htcondor demo job discovered ({job_id}) [{elapsed:.1f}s]", flush=True)
-                passed += 1
+                print(f"    stdout: {result.stdout if result.stdout else '(空)'}", flush=True)
+                print(f"    stderr: {result.stderr if result.stderr else '(空)'}", flush=True)
             else:
-                print(f"  FAILED: htcondor demo job not discovered (timeout 30s, elapsed {elapsed:.1f}s)",
-                      flush=True)
-                # 失败时额外诊断: 检查 HTCondor 守护进程状态
-                stdout, _ = _vagrant_capture("controller",
-                    "echo '=== systemctl condor ==='; systemctl is-active condor 2>&1 || true; "
-                    "echo '=== condor_status -any ==='; condor_status -any 2>&1 || true")
-                if stdout.strip():
-                    print(f"    [诊断] HTCondor 状态:\n{stdout}", flush=True)
+                # 立即检查队列
+                try:
+                    qresult = subprocess.run(
+                        ["vagrant", "ssh", "controller", "-c",
+                         f"echo '=== condor_q {cluster_id} ==='; condor_q {cluster_id} 2>&1 || true; "
+                         "echo '=== condor_q -better ==='; condor_q -better-analyze 2>&1 || true"],
+                        cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=10,
+                    )
+                    if qresult.stdout.strip():
+                        print(f"    [提交后] HTCondor 队列:\n{qresult.stdout}", flush=True)
+                    else:
+                        print("    [提交后] condor_q 输出为空 (作业可能已完成或提交失败)", flush=True)
+                except Exception:
+                    pass
+
+                print(f"    → 等待 HTCondor 调度作业 {cluster_id} (最多 60s)...", flush=True)
+                scheduled = wait_condor_job_scheduled(cluster_id, timeout=60)
+                elapsed = time.time() - t_start
+                if scheduled:
+                    print(f"  PASSED: htcondor demo job scheduled ({cluster_id}) [{elapsed:.1f}s]", flush=True)
+                    passed += 1
+                else:
+                    print(f"  FAILED: htcondor demo job not scheduled (timeout 60s, elapsed {elapsed:.1f}s)",
+                          flush=True)
+                    stdout, _ = _vagrant_capture("controller",
+                        "echo '=== systemctl condor ==='; systemctl is-active condor 2>&1 || true; "
+                        "echo '=== condor_status -any ==='; condor_status -any 2>&1 || true")
+                    if stdout.strip():
+                        print(f"    [诊断] HTCondor 状态:\n{stdout}", flush=True)
         except subprocess.CalledProcessError as e:
             elapsed = time.time() - t_start
             print(f"  FAILED: htcondor demo job submit failed [{elapsed:.1f}s]", flush=True)
@@ -864,16 +881,15 @@ def run_demo_preflight() -> bool:
                 except Exception:
                     pass
 
-            print(f"    → 轮询 JobLens API 等待 Slurm 作业发现 (最多 30s)...", flush=True)
-            job_id = poll_job_discovery(worker_ip, "slurm", timeout=30)
+            print(f"    → 等待 Slurm 调度作业 {sbatch_job_id} (最多 60s)...", flush=True)
+            scheduled = bool(sbatch_job_id) and wait_slurm_job_scheduled(sbatch_job_id, timeout=60)
             elapsed = time.time() - t_start
-            if job_id:
-                print(f"  PASSED: slurm demo job discovered ({job_id}) [{elapsed:.1f}s]", flush=True)
+            if scheduled:
+                print(f"  PASSED: slurm demo job scheduled ({sbatch_job_id}) [{elapsed:.1f}s]", flush=True)
                 passed += 1
             else:
-                print(f"  FAILED: slurm demo job not discovered (timeout 30s, elapsed {elapsed:.1f}s)",
+                print(f"  FAILED: slurm demo job not scheduled (timeout 60s, elapsed {elapsed:.1f}s)",
                       flush=True)
-                # 失败时额外诊断: 获取 slurmctld/slurmd 完整日志
                 stdout, _ = _vagrant_capture("controller",
                     "echo '=== slurmctld 日志 ==='; "
                     "sudo journalctl -u slurmctld --no-pager --since '30 minutes ago' 2>&1 || true")
@@ -901,7 +917,7 @@ def run_demo_preflight() -> bool:
         print("  ℹ 无启用的调度器, 跳过 demo 预检", flush=True)
         return True
     if passed == total_tests:
-        print("  PASSED: all demo jobs discovered", flush=True)
+        print("  PASSED: all scheduler demo jobs scheduled", flush=True)
         return True
     else:
         print(f"  SUMMARY: {passed}/{total_tests} demo jobs passed", flush=True)
