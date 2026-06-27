@@ -1,0 +1,45 @@
+name: alm9-manual-trigger
+description: "AlmaLinux 9 manual Trigger tracking test with auto discovery disabled"
+
+topology:
+  controller:
+    box: almalinux/9
+    hostname: controller
+    ip: 192.168.56.10
+    cpus: 2
+    memory: 2048
+    disk: 20
+  worker:
+    box: almalinux/9
+    hostname: worker
+    ip: 192.168.56.20
+    cpus: 2
+    memory: 3072
+    disk: 20
+
+network:
+  subnet: 192.168.56.0/24
+
+schedulers:
+  htcondor:
+    enabled: false
+  slurm:
+    enabled: true
+    version: "23.02"
+    rpm_dir: ../rpms/slurm
+    setup_scripts:
+      - provisioning/slurm/common.sh
+      - provisioning/slurm/controller.sh
+      - provisioning/slurm/worker.sh
+
+joblens:
+  rpm_path: rpms/joblens-[0-9]*.rpm
+  core_config: presets/configs/joblens_core_manual_trigger.yaml
+  trigger_config: presets/configs/joblens_trigger_default.yaml
+
+tests:
+  pytest_files:
+    - test_cases/test_01_health.py
+    - test_cases/test_05_trigger_api.py
+    - test_cases/test_07_manual_trigger_tracking.py
+  pytest_args: "-v --tb=short"

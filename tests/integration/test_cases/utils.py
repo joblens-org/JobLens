@@ -159,6 +159,11 @@ class JobLensAPI:
         """通用 GET 请求."""
         return self._session.get(f"{self.base_url}{path}", **kwargs)
 
+    def post_json(
+        self, path: str, payload: Dict[str, Any], **kwargs: Any,
+    ) -> requests.Response:
+        return self._session.post(f"{self.base_url}{path}", json=payload, **kwargs)
+
     def health_check(self) -> requests.Response:
         """GET /joblens/healthy — JobLens systemd 健康状态."""
         return self.get("/joblens/healthy")
@@ -178,6 +183,28 @@ class JobLensAPI:
     def jobs(self) -> requests.Response:
         """GET /joblens/jobs — 已注册作业列表."""
         return self.get("/joblens/jobs")
+
+    def add_slurm_job(self, job_id: int) -> requests.Response:
+        return self.post_json(
+            "/joblens/slurm_job",
+            {
+                "opt": "add",
+                "JobID": job_id,
+                "Lens": ["cpumem_collector"],
+                "sub_attr": {"job_id": job_id, "step_id": 0},
+            },
+        )
+
+    def remove_slurm_job(self, job_id: int) -> requests.Response:
+        return self.post_json(
+            "/joblens/job",
+            {
+                "opt": "remove",
+                "type": "job.slurm",
+                "JobID": job_id,
+                "sub_attr": {"job_id": job_id, "step_id": 0},
+            },
+        )
 
     def job_detail(self, job_id: int) -> requests.Response:
         """GET /joblens/jobs/{job_id} — 指定作业详情."""
