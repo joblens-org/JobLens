@@ -2,6 +2,7 @@
 
 # ── 1. stdlib imports ──────────────────────────────────────────────────
 import io
+import importlib
 import json
 import os
 import sys
@@ -109,7 +110,6 @@ JOBLENS_LOCK_PATH = "/var/JobLens/JobLens.lock"
 
 # ── 5. 第三方 imports (必须在 fast-fail 路径之后) ────────────────────────
 import requests          # noqa: E402
-from fabric import Connection  # noqa: E402
 
 
 # ── 6. RemoteClient ────────────────────────────────────────────────────
@@ -122,7 +122,8 @@ class RemoteClient:
     """
 
     def __init__(self, host: str, **kwargs: Any) -> None:
-        self._conn = Connection(host, **kwargs)
+        connection_cls = importlib.import_module("fabric").Connection
+        self._conn = connection_cls(host, **kwargs)
 
     def run(self, command: str, **kwargs: Any) -> Any:
         """在远程主机上运行命令."""
@@ -183,6 +184,20 @@ class JobLensAPI:
     def jobs(self) -> requests.Response:
         """GET /joblens/jobs — 已注册作业列表."""
         return self.get("/joblens/jobs")
+
+    def add_condor_job(
+        self, cluster_id: int, proc_id: int = 0, slot: str = "slot1",
+    ) -> requests.Response:
+        return self.post_json(
+            "/joblens/condor_job",
+            {
+                "opt": "add",
+                "JobID": cluster_id,
+                "slot": slot,
+                "Lens": ["cpumem_collector"],
+                "sub_attr": {"cluster_id": cluster_id, "proc_id": proc_id},
+            },
+        )
 
     def add_slurm_job(self, job_id: int) -> requests.Response:
         return self.post_json(

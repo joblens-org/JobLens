@@ -22,7 +22,13 @@ network:
 
 schedulers:
   htcondor:
-    enabled: false
+    enabled: true
+    version: "25.0"
+    repo_rpm_url: "https://htcss-downloads.chtc.wisc.edu/repo/25.0/htcondor-release-current.el9.noarch.rpm"
+    setup_scripts:
+      - provisioning/condor/common.sh
+      - provisioning/condor/controller.sh
+      - provisioning/condor/worker.sh
   slurm:
     enabled: true
     version: "23.02"
