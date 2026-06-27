@@ -5,7 +5,7 @@ JobLens 集成测试 — 预设驱动的编排器 (纯 Python 实现)
 用法:
     ./run_preset.py <name>             精确匹配预设
     ./run_preset.py --list             列出所有预设
-    ./run_preset.py --match <glob>     glob 匹配预设
+    ./run_preset.py --match <glob>     运行 glob 匹配的预设
     ./run_preset.py validate <file>    YAML schema 校验
 
 环境变量:
@@ -14,7 +14,6 @@ JobLens 集成测试 — 预设驱动的编排器 (纯 Python 实现)
 """
 
 import argparse
-import glob as py_glob
 import json
 import os
 import re
@@ -22,6 +21,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -43,17 +43,17 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-    ./run_preset.py alm9-default              # 运行 alm9-default 预设
-    ./run_preset.py --list                    # 列出所有可用预设
-    ./run_preset.py --match "alm9-*"          # glob 匹配预设
-    ./run_preset.py validate presets/alm9-default.yaml  # schema 校验
+    运行单个预设: ./run_preset.py alm9-default
+    列出所有预设: ./run_preset.py --list
+    运行匹配预设: ./run_preset.py --match "alm9-*"
+    校验预设文件: ./run_preset.py validate presets/alm9-default.yaml
     ./run_preset.py alm9-default --skip-vagrant-up --skip-vagrant-destroy
         """,
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("name", nargs="?", help="精确 preset 名称 (不含 .yaml)")
     group.add_argument("--list", "-l", action="store_true", help="列出所有可用预设")
-    group.add_argument("--match", "-m", metavar="PATTERN", help="glob 匹配预设 (如 alm9-*)")
+    group.add_argument("--match", "-m", metavar="PATTERN", help="运行 glob 匹配的预设 (如 alm9-*)")
 
     parser.add_argument("--skip-vagrant-up", action="store_true",
                         help="跳过 vagrant up (VM 已由外部启动)")
@@ -75,7 +75,7 @@ def fatal(msg: str) -> None:
     sys.exit(1)
 
 
-def run_vagrant(cmd: str, capture: bool = False, stdin_data: bytes | None = None) -> subprocess.CompletedProcess:
+def run_vagrant(cmd: str, capture: bool = False, stdin_data: bytes | None = None) -> subprocess.CompletedProcess[Any]:
     """在 tests/integration/ 目录下运行 vagrant 命令。"""
     proc = subprocess.run(
         ["vagrant"] + cmd.split(),
@@ -95,7 +95,7 @@ def run_vagrant(cmd: str, capture: bool = False, stdin_data: bytes | None = None
     return proc
 
 
-def vagrant_ssh(node: str, command: str, check: bool = True) -> subprocess.CompletedProcess:
+def vagrant_ssh(node: str, command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     """在指定节点上通过 vagrant ssh 执行命令, 失败时打印完整输出。"""
     proc = subprocess.run(
         ["vagrant", "ssh", node, "-c", command],
@@ -362,7 +362,7 @@ def validate_preset(yaml_path: Path) -> bool:
 # 环境准备 — 从 YAML 提取参数, 生成 preset_env.json
 # ══════════════════════════════════════════════════════════════════════════
 
-def extract_preset_env(preset_data: dict) -> dict:
+def extract_preset_env(preset_data: dict[str, Any]) -> dict[str, Any]:
     """从预设 YAML 解析后的数据中提取环境变量和运行时配置。"""
     preset_name = preset_data["name"]
     topo = preset_data["topology"]
@@ -439,7 +439,7 @@ def extract_preset_env(preset_data: dict) -> dict:
     }
 
 
-def prepare_environment(preset_file: Path) -> dict:
+def prepare_environment(preset_file: Path) -> dict[str, Any]:
     """Phase 2: 解析 YAML, 生成 preset_env.json, 导出环境变量。"""
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1295,8 +1295,28 @@ def main():
         matches = find_presets(pattern=args.match)
         if not matches:
             sys.exit(1)
+        failed: list[str] = []
         for p in matches:
-            print(p)
+            preset_name = p.stem
+            print(f"\n{'#' * 60}")
+            print(f"# 运行匹配预设: {preset_name}")
+            print(f"{'#' * 60}\n")
+            try:
+                run_preset(
+                    preset_name,
+                    skip_vagrant_up=args.skip_vagrant_up,
+                    skip_vagrant_destroy=args.skip_vagrant_destroy or args.keep_vms,
+                )
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 1
+                if code != 0:
+                    failed.append(preset_name)
+                    print(f"✗ 匹配预设失败: {preset_name} (exit={code})", file=sys.stderr)
+                else:
+                    print(f"✓ 匹配预设完成: {preset_name}")
+        if failed:
+            print(f"FATAL: {len(failed)} 个匹配预设失败: {', '.join(failed)}", file=sys.stderr)
+            sys.exit(1)
     elif args.name:
         run_preset(args.name,
                    skip_vagrant_up=args.skip_vagrant_up,
