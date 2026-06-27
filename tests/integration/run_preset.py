@@ -1220,7 +1220,11 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
                f"{junit_part} {pytest_args} {pytest_files}")
         print(f"  {cmd}")
         try:
-            subprocess.run(cmd.split(), cwd=SCRIPT_DIR, check=True)
+            subprocess.run(
+                ["bash", "-o", "pipefail", "-c", f"{cmd} 2>&1 | tee pytest.log"],
+                cwd=SCRIPT_DIR,
+                check=True,
+            )
         except subprocess.CalledProcessError:
             test_failed = True
             print("FATAL: pytest 测试失败 — 将在清理后退出", file=sys.stderr)
