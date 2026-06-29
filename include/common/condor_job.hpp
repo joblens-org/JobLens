@@ -16,16 +16,13 @@
 #include "common/utils.hpp"
 #include <unistd.h>
 #include <fstream>
-#include <sstream>
 #include <string>
 #include <vector>
 #include <filesystem>
-#include <iostream>
-#include <variant>
+#include <algorithm>
+#include <cctype>
 #include <spdlog/spdlog.h>
 #include <fmt/core.h>
-
-namespace fs = std::filesystem;
 
 namespace CondorJob
 {
@@ -37,19 +34,87 @@ using Utils::get_env_field;
 using Utils::v2_cgroup_absolute_path;
 using Utils::get_pids_in_cgroup;
 
+inline bool looks_like_condor_cgroup(const std::string& path)
+{
+    std::string lower = path;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    return lower.find("condor") != std::string::npos ||
+           lower.find("htcondor") != std::string::npos;
+}
+
+inline std::vector<pid_t> get_all_condor_job_pids_from_cgroups()
+{
+    std::vector<pid_t> pids;
+    for (const auto& dir : Utils::scan_cgroup2_dirs()) {
+        if (!looks_like_condor_cgroup(dir)) {
+            continue;
+        }
+        auto result = get_pids_in_cgroup(dir);
+        if (result.ok() && !result.pids.empty()) {
+            pids.insert(pids.end(), result.pids.begin(), result.pids.end());
+        }
+    }
+    return pids;
+}
+
+inline bool refresh_cgroup_metadata(Job& job){
+    auto& condor_attr = std::get<CondorJobAttr>(job.sub_attr);
+    pid_t source_pid = condor_attr.starter_pid;
+    if (source_pid == 0 && !job.JobPIDs.empty()) {
+        source_pid = get_ppid_of(job.JobPIDs[0]);
+        condor_attr.starter_pid = source_pid;
+    }
+    if (source_pid <= 0) {
+        return false;
+    }
+
+    auto cgroup_path = v2_cgroup_absolute_path(source_pid);
+    if (cgroup_path.empty()) {
+        return false;
+    }
+    condor_attr.slots_cgroup_path = std::move(cgroup_path);
+    return true;
+}
+
 inline void update_job_pids(Job& job){
     auto& condor_attr = std::get<CondorJobAttr>(job.sub_attr);
     if(condor_attr.starter_pid == 0){
-        //初始化相关内容
+        if(job.JobPIDs.empty()){
+            spdlog::warn("CondorJob: cannot update pids for job {} without starter pid or job pids", job.JobID);
+            return;
+        }
         if(job.JobPIDs.size()>1){
             spdlog::warn("CondorJob: multi pids, use first");
         }
         condor_attr.starter_pid = get_ppid_of(job.JobPIDs[0]);
         condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(job.JobPIDs[0]);
-    }   
+    }
+    if (condor_attr.slots_cgroup_path.empty() && !refresh_cgroup_metadata(job)) {
+        spdlog::warn("CondorJob: cannot refresh cgroup path for job {}", job.JobID);
+        return;
+    }
+
     auto pid_slots_cgroup = get_pids_in_cgroup(condor_attr.slots_cgroup_path);
-    std::remove(pid_slots_cgroup.begin(), pid_slots_cgroup.end(), condor_attr.starter_pid);
-    job.JobPIDs = std::move(pid_slots_cgroup);
+    if (!pid_slots_cgroup.ok()) {
+        spdlog::warn("CondorJob: failed to read cgroup pids from {}: {}, try refresh",
+                     condor_attr.slots_cgroup_path,
+                     Utils::cgroup_procs_status_name(pid_slots_cgroup.status));
+        if (!refresh_cgroup_metadata(job)) {
+            return;
+        }
+        pid_slots_cgroup = get_pids_in_cgroup(condor_attr.slots_cgroup_path);
+        if (!pid_slots_cgroup.ok()) {
+            spdlog::warn("CondorJob: failed to read refreshed cgroup pids from {}: {}",
+                         condor_attr.slots_cgroup_path,
+                         Utils::cgroup_procs_status_name(pid_slots_cgroup.status));
+            return;
+        }
+    }
+    pid_slots_cgroup.pids.erase(
+        std::remove(pid_slots_cgroup.pids.begin(), pid_slots_cgroup.pids.end(), condor_attr.starter_pid),
+        pid_slots_cgroup.pids.end());
+    job.JobPIDs = std::move(pid_slots_cgroup.pids);
 }
 
 /* 解析 GlobalJobId */
@@ -190,6 +255,10 @@ inline void update_job_info(Job& job){
 
     // 确保 starter_pid 已知 (其他字段依赖它)
     if (condor_attr.starter_pid == 0) {
+        if (job.JobPIDs.empty()) {
+            spdlog::warn("CondorJob: cannot update info for job {} without starter pid or job pids", job.JobID);
+            return;
+        }
         condor_attr.starter_pid = get_ppid_of(job.JobPIDs[0]);
     }
 
@@ -203,7 +272,7 @@ inline void update_job_info(Job& job){
     job.clusterTag = condor_attr.scheduler_name;
 
     if (condor_attr.slots_cgroup_path.empty()) {
-        condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(condor_attr.starter_pid);
+        refresh_cgroup_metadata(job);
     }
     if (condor_attr.collector_host.empty()) {
         condor_attr.collector_host = Utils::get_condor_collector_host();

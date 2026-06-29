@@ -15,19 +15,15 @@
 #include "core/collector_type.h"
 #include "common/utils.hpp"
 #include <unistd.h>
-#include <fstream>
-#include <sstream>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
-#include <iostream>
-#include <variant>
 #include <spdlog/spdlog.h>
 #include <unordered_set>
+#include <set>
 #include <fmt/core.h>
-
-namespace fs = std::filesystem;
 
 namespace SlurmJob
 {
@@ -39,20 +35,106 @@ using Utils::get_env_field;
 using Utils::v2_cgroup_absolute_path;
 using Utils::get_pids_in_cgroup;
 
+inline bool looks_like_slurm_cgroup(const std::string& path)
+{
+    std::string lower = path;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    return lower.find("slurm") != std::string::npos ||
+           lower.find("/step_") != std::string::npos ||
+           lower.find("/job_") != std::string::npos;
+}
+
+inline std::string normalize_to_slurm_step_cgroup(const std::string& path)
+{
+    auto pos = path.find("/step_");
+    if (pos == std::string::npos) {
+        return path;
+    }
+    auto next = path.find('/', pos + 1);
+    if (next == std::string::npos) {
+        return path;
+    }
+    return path.substr(0, next);
+}
+
+inline std::vector<pid_t> get_all_slurm_job_pids_from_cgroups()
+{
+    std::vector<pid_t> pids;
+    std::set<std::string> seen_step_paths;
+    for (const auto& dir : Utils::scan_cgroup2_dirs()) {
+        if (!looks_like_slurm_cgroup(dir)) {
+            continue;
+        }
+        auto step_path = normalize_to_slurm_step_cgroup(dir);
+        if (!seen_step_paths.insert(step_path).second) {
+            continue;
+        }
+        auto result = get_pids_in_cgroup(step_path);
+        if (result.ok() && !result.pids.empty()) {
+            pids.insert(pids.end(), result.pids.begin(), result.pids.end());
+        }
+    }
+    return pids;
+}
+
+inline bool refresh_cgroup_metadata(Job& job){
+    auto& slurm_attr = std::get<SlurmJobAttr>(job.sub_attr);
+    pid_t source_pid = slurm_attr.stepd_pid;
+    if (source_pid == 0 && !job.JobPIDs.empty()) {
+        source_pid = get_ppid_of(job.JobPIDs[0]);
+        slurm_attr.stepd_pid = source_pid;
+    }
+    if (source_pid <= 0) {
+        return false;
+    }
+
+    auto cgroup_path = v2_cgroup_absolute_path(source_pid);
+    if (cgroup_path.empty()) {
+        return false;
+    }
+    slurm_attr.cgroup_path = std::move(cgroup_path);
+    return true;
+}
+
 inline void update_job_pids(Job& job){
     auto& slurm_attr = std::get<SlurmJobAttr>(job.sub_attr);
     if(slurm_attr.stepd_pid == 0){
-        //初始化相关内容
+        if(job.JobPIDs.empty()){
+            spdlog::warn("SlurmJob: cannot update pids for job {} without stepd pid or job pids", job.JobID);
+            return;
+        }
         if(job.JobPIDs.size() > 1){
             spdlog::warn("SlurmJob: multi pids, use first");
         }
         slurm_attr.stepd_pid = get_ppid_of(job.JobPIDs[0]);
         slurm_attr.cgroup_path = v2_cgroup_absolute_path(job.JobPIDs[0]);
-    }   
+    }
+    if (slurm_attr.cgroup_path.empty() && !refresh_cgroup_metadata(job)) {
+        spdlog::warn("SlurmJob: cannot refresh cgroup path for job {}", job.JobID);
+        return;
+    }
+
     auto pid_cgroup = get_pids_in_cgroup(slurm_attr.cgroup_path);
-    // 移除stepd_pid本身
-    std::remove(pid_cgroup.begin(), pid_cgroup.end(), slurm_attr.stepd_pid);
-    job.JobPIDs = std::move(pid_cgroup);
+    if (!pid_cgroup.ok()) {
+        spdlog::warn("SlurmJob: failed to read cgroup pids from {}: {}, try refresh",
+                     slurm_attr.cgroup_path,
+                     Utils::cgroup_procs_status_name(pid_cgroup.status));
+        if (!refresh_cgroup_metadata(job)) {
+            return;
+        }
+        pid_cgroup = get_pids_in_cgroup(slurm_attr.cgroup_path);
+        if (!pid_cgroup.ok()) {
+            spdlog::warn("SlurmJob: failed to read refreshed cgroup pids from {}: {}",
+                         slurm_attr.cgroup_path,
+                         Utils::cgroup_procs_status_name(pid_cgroup.status));
+            return;
+        }
+    }
+    pid_cgroup.pids.erase(
+        std::remove(pid_cgroup.pids.begin(), pid_cgroup.pids.end(), slurm_attr.stepd_pid),
+        pid_cgroup.pids.end());
+    job.JobPIDs = std::move(pid_cgroup.pids);
 }
 
 /* 获取Slurm Job ID */
@@ -196,6 +278,9 @@ inline void update_job_info(Job& job){
     // stepd_pid 取 JobPIDs 中最小的 PID (slurmstepd 通常为父进程, PID 最小)
     if (slurm_attr.stepd_pid == 0) {
         slurm_attr.stepd_pid = *std::min_element(job.JobPIDs.begin(), job.JobPIDs.end());
+    }
+    if (slurm_attr.cgroup_path.empty()) {
+        refresh_cgroup_metadata(job);
     }
 
     return;
