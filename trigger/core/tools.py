@@ -26,10 +26,10 @@ import logging
 import subprocess
 import re
 import shlex
-from trigger.core.rpc_client import RPCClient
+from trigger.core.rpc_client import RPCClient  # pyright: ignore[reportMissingImports]
 import yaml
 from datetime import datetime, timezone
-from typing import List, Tuple, Optional
+from typing import Any, List, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +39,20 @@ import sys
 
 # 检查是否启用 mock 模式
 MOCK_MODE = os.environ.get('JOBLENS_MOCK_MODE', 'none').lower()
-USE_MOCK_TOOLS = MOCK_MODE in ('tools', 'all')
+use_mock_tools = MOCK_MODE in ('tools', 'all')
+
+def _mock_unavailable(*args: Any, **kwargs: Any) -> Any:
+    raise RuntimeError("mock tools are not available")
+
+mock_run = _mock_unavailable
+mock_systemd_status = _mock_unavailable
+mock_joblens_format_metrics = _mock_unavailable
+mock_job_opt = _mock_unavailable
+mock_add_condorjob = _mock_unavailable
+mock_get_joblens_version = _mock_unavailable
 
 # 如果需要 mock 工具，导入 mock 函数
-if USE_MOCK_TOOLS:
+if use_mock_tools:
     try:
         # 将 trigger-mock 目录添加到 Python 路径
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -50,24 +60,23 @@ if USE_MOCK_TOOLS:
         if os.path.exists(mock_dir) and mock_dir not in sys.path:
             sys.path.insert(0, mock_dir)
         
-        from trigger.core.mock_tools import (
+        from trigger.core.mock_tools import (  # pyright: ignore[reportMissingImports]
             mock_run,
             mock_systemd_status,
             mock_joblens_format_metrics,
             mock_job_opt,
             mock_add_condorjob,
-            mock_restart_joblens,
             mock_get_joblens_version
         )
         print(f"已启用 tools mock 模式，MOCK_MODE={MOCK_MODE}")
     except ImportError as e:
         print(f"警告: 无法导入 mock 工具函数: {e}")
-        USE_MOCK_TOOLS = False
+        use_mock_tools = False
 
 
 
 def systemd_status(unit: str):
-    if 'USE_MOCK_TOOLS' in globals() and USE_MOCK_TOOLS:
+    if use_mock_tools:
         # 使用 mock 版本
         return mock_systemd_status(unit)
     
@@ -115,7 +124,7 @@ def use_rpc_opt():
     r = RPCClient(socket_path, timeout)
     return 'JobRegistry/job_opt' in r.get_function_list()
 def job_opt(data):
-    if 'USE_MOCK_TOOLS' in globals() and USE_MOCK_TOOLS:
+    if use_mock_tools:
         # 使用 mock 版本
         return mock_job_opt(data)
     
@@ -141,7 +150,7 @@ def job_opt(data):
         return True
     
 def run(cmd, check=True):
-    if 'USE_MOCK_TOOLS' in globals() and USE_MOCK_TOOLS:
+    if use_mock_tools:
         # 使用 mock 版本
         return mock_run(cmd, check)
     
@@ -151,23 +160,70 @@ def run(cmd, check=True):
         raise RuntimeError(f"命令失败: {cmd}\n{cp.stdout}")
     return cp.stdout.strip()
 
+def _cgroup2_mount_point() -> str:
+    with open('/proc/self/mountinfo', 'r', encoding='utf-8') as mountinfo:
+        for line in mountinfo:
+            fields = line.split()
+            if '-' not in fields:
+                continue
+            sep = fields.index('-')
+            if sep + 1 < len(fields) and fields[sep + 1] == 'cgroup2':
+                return fields[4]
+    raise RuntimeError('未找到 cgroup2 挂载点')
+
+def _cgroup2_path_of_pid(pid: int) -> str:
+    mount_point = _cgroup2_mount_point()
+    with open(f'/proc/{pid}/cgroup', 'r', encoding='utf-8') as cgroup_file:
+        for line in cgroup_file:
+            line = line.strip()
+            if line.startswith('0::'):
+                relative = line[3:]
+                deleted_suffix = ' (deleted)'
+                if relative.endswith(deleted_suffix):
+                    relative = relative[:-len(deleted_suffix)]
+                return os.path.normpath(os.path.join(mount_point, relative.lstrip('/')))
+    raise RuntimeError(f'PID {pid} 不在 cgroup v2 统一层级中')
+
+def _pids_in_cgroup(cgroup_path: str) -> List[int]:
+    procs_path = os.path.join(cgroup_path, 'cgroup.procs')
+    try:
+        with open(procs_path, 'r', encoding='utf-8') as procs_file:
+            pids = sorted({int(line.strip()) for line in procs_file if line.strip()})
+    except FileNotFoundError as exc:
+        raise RuntimeError(f'cgroup 不存在: {cgroup_path}') from exc
+    except PermissionError as exc:
+        raise RuntimeError(f'无权限读取 cgroup.procs: {procs_path}') from exc
+    except ValueError as exc:
+        raise RuntimeError(f'cgroup.procs 包含非法 PID: {procs_path}') from exc
+    return pids
+
+def _find_first_process_by_cmd(pattern: str) -> int:
+    for entry in os.scandir('/proc'):
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            with open(os.path.join(entry.path, 'cmdline'), 'rb') as cmdline_file:
+                cmdline = cmdline_file.read().replace(b'\0', b' ').decode(errors='ignore')
+        except OSError:
+            continue
+        if re.search(pattern, cmdline):
+            return pid
+    raise RuntimeError(f'未找到匹配进程: {pattern}')
+
+def _read_cmdline(pid: int) -> str:
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as cmdline_file:
+            return cmdline_file.read().replace(b'\0', b' ').decode(errors='ignore').strip()
+    except OSError:
+        return ''
+
 def find_pids_by_slot(slot: str):
-    """返回 slot 对应 condor_starter 下的真实子进程 PID 列表（排除 starter 自身）。"""
     if not slot.startswith('slot'):
         raise ValueError("slot 名必须以 'slot' 开头")
     num = slot[4:]
-    ps_out = run(f"/usr/bin/ps -ax -o pid,cmd --no-headers | "
-                 f"/usr/bin/grep -E 'condor_starter.*[s]lot{num}'")
-    if not ps_out:
-        raise RuntimeError(f"未找到 {slot} 对应的 condor_starter")
-    starter_pid = int(ps_out.split()[0])
-
-    # 获取进程树中所有 PID
-    tree = run(f"/usr/bin/pstree -pT {starter_pid}")
-    all_pids = {int(x) for x in re.findall(r'\((\d+)\)', tree)}
-
-    # 排除 condor_starter 自身，只返回实际作业子进程
-    child_pids = sorted(all_pids - {starter_pid})
+    starter_pid = _find_first_process_by_cmd(rf'condor_starter.*slot{re.escape(num)}')
+    child_pids = [pid for pid in _pids_in_cgroup(_cgroup2_path_of_pid(starter_pid)) if pid != starter_pid]
 
     if not child_pids:
         raise RuntimeError(f"slot {slot} 的 condor_starter 下未找到子进程")
@@ -176,7 +232,7 @@ def find_pids_by_slot(slot: str):
 
 
 def add_condorjob(data):
-    if 'USE_MOCK_TOOLS' in globals() and USE_MOCK_TOOLS:
+    if use_mock_tools:
         # 使用 mock 版本
         return mock_add_condorjob(data)
     
@@ -259,7 +315,7 @@ def get_joblens_version():
     }
     如果解析失败抛出 ValueError。
     """
-    if 'USE_MOCK_TOOLS' in globals() and USE_MOCK_TOOLS:
+    if use_mock_tools:
         # 使用 mock 版本
         return mock_get_joblens_version()
     
@@ -294,8 +350,8 @@ def get_joblens_version():
     }
 
 
-def joblens_format_metrics(jobs: dict) -> str:
-    if 'USE_MOCK_TOOLS' in globals() and USE_MOCK_TOOLS:
+def joblens_format_metrics(jobs: dict[str, Any]) -> str:
+    if use_mock_tools:
         # 使用 mock 版本
         return mock_joblens_format_metrics(jobs)
     
@@ -471,77 +527,10 @@ def _expand_nodelist(nodelist_str: str) -> List[str]:
 
 
 def get_job_processes(job_id: str) -> List[Tuple[str, str, str]]:
-    """
-    功能2: 给定 JobID 返回该作业下的进程信息
-    
-    返回: [(node_id, pid, command), ...]
-    
-    实现逻辑 (按优先级):
-    1. sstat: 适用于运行中的作业，直接查询 PID (需要权限)
-    2. scontrol listpids: Slurm 内置的 PID 查询 (部分版本支持)
-    """
-    pids = []
-    
-    # 方法1: 使用 sstat 查询 (仅运行中作业，且需要适当权限)
-    cmd = f"sstat -j {job_id}.0 --format=PID -h -n"
-    output = run_command(cmd)
-    if output:
-        for line in output.split('\n'):
-            pid = line.strip()
-            if pid and pid.isdigit():
-                pids.append(("sstat-query", pid, "unknown"))
-        if pids:
-            return pids
-    
-    # 方法2: 使用 scontrol listpids (如果 Slurm 配置支持)
-    cmd = f"scontrol listpids {job_id}"
-    output = run_command(cmd)
-    if output and "PID" in output:
-        for line in output.split('\n')[1:]:  # 跳过表头
-            cols = line.split()
-            if len(cols) >= 2 and cols[0].isdigit():
-                pid, step_id = cols[0], cols[1]
-                pids.append(("scontrol-query", pid, f"step:{step_id}"))
-        if pids:
-            return pids
-    
-    # 方法3: 到计算节点上查找 (通用方法)
-    nodes = get_job_nodes(job_id)
-    if not nodes:
-        return []
-    
-    for node in nodes:
-        # 查找 slurmstepd 进程 (它是所有作业进程的父进程/管理进程)
-        # 然后通过 /proc/<pid>/status 的 PPid 找到其子进程
-        cmd = f"ps -eo pid,ppid,comm,args | grep slurmstepd"
-        output = run_command(cmd)
-        
-        if not output:
-            continue
-            
-        # 解析 slurmstepd 行，找到对应 job_id 的进程
-        slurm_pids = []
-        for line in output.split('\n'):
-            if job_id in line and 'grep' not in line:
-                parts = line.split()
-                if len(parts) >= 4:
-                    pid, ppid, comm = parts[0], parts[1], parts[2]
-                    # slurmstepd 命令行通常包含 job_id 和 step_id
-                    slurm_pids.append(pid)
-                    pids.append((node, pid, "slurmstepd"))
-        
-        # 查找这些 slurmstepd 的子进程 (实际的作业进程)
-        for slurm_pid in slurm_pids:
-            # 查找 PPID 匹配 slurmstepd 的进程
-            cmd = f"ps --ppid {slurm_pid} -o pid,comm"
-            child_output = run_command(cmd)
-            if child_output:
-                for line in child_output.split('\n')[1:]:  # 跳过标题
-                    parts = line.split()
-                    if parts:
-                        child_pid = parts[0]
-                        cmd_name = parts[1] if len(parts) > 1 else "unknown"
-                        pids.append((node, child_pid, cmd_name))
-    
-    return pids
-
+    stepd_pid = _find_first_process_by_cmd(rf'slurmstepd.*{re.escape(job_id)}')
+    node_id = os.uname().nodename
+    return [
+        (node_id, str(pid), (_read_cmdline(pid).split() or ['unknown'])[0])
+        for pid in _pids_in_cgroup(_cgroup2_path_of_pid(stepd_pid))
+        if pid != stepd_pid
+    ]
