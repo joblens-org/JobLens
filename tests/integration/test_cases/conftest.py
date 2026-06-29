@@ -1,25 +1,31 @@
 """JobLens integration test fixtures and shared configuration."""
 
+import importlib
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Generator
 
 import pytest
 
-from utils import (
-    CONTROLLER_HOST,
-    INTEGRATION_ROOT,
-    JOBLENS_DB_PATH,
-    JOBLENS_LOCK_PATH,
-    JOBLENS_OUTPUT_LOG,
-    PROJECT_ROOT,
-    TRIGGER_PORT,
-    WORKER_HOST,
-    WORKER_IP,
-    JobLensAPI,
-    RemoteClient,
-)
+try:
+    utils = importlib.import_module("test_cases.utils")
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    utils = importlib.import_module("utils")
+
+CONTROLLER_HOST = utils.CONTROLLER_HOST
+INTEGRATION_ROOT = utils.INTEGRATION_ROOT
+JOBLENS_DB_PATH = utils.JOBLENS_DB_PATH
+JOBLENS_LOCK_PATH = utils.JOBLENS_LOCK_PATH
+JOBLENS_OUTPUT_LOG = utils.JOBLENS_OUTPUT_LOG
+PROJECT_ROOT = utils.PROJECT_ROOT
+TRIGGER_PORT = utils.TRIGGER_PORT
+WORKER_HOST = utils.WORKER_HOST
+WORKER_IP = utils.WORKER_IP
+JobLensAPI = utils.JobLensAPI
+RemoteClient = utils.RemoteClient
 
 
 # ── CLI 选项 ──────────────────────────────────────────────────────────
@@ -103,7 +109,11 @@ def _cleanup_condor(controller: RemoteClient) -> None:
 def _cleanup_slurm(controller: RemoteClient) -> None:
     try:
         controller.run(
-            "scancel -u vagrant 2>/dev/null || true; sudo scancel -u root 2>/dev/null || true",
+            "sudo scancel -u vagrant 2>/dev/null || true; "
+            "sudo scancel -u root 2>/dev/null || true; "
+            "for job_id in $(squeue -h -o '%A' 2>/dev/null | sort -u); "
+            "do sudo scancel ${job_id} 2>/dev/null || true; done; "
+            "sleep 2",
             hide=True,
             warn=True,
         )
@@ -191,7 +201,7 @@ def _ebpf_cleanup() -> None:
             ["vagrant", "ssh", "worker", "-c",
              "sudo bpftool prog detach pinned /sys/fs/bpf/* 2>/dev/null || true; "
              "sudo rm -rf /sys/fs/bpf/joblens* 2>/dev/null || true"],
-            cwd=PROJECT_ROOT,
+            cwd=INTEGRATION_ROOT,
             capture_output=True,
             timeout=15,
         )
@@ -237,7 +247,7 @@ def vagrant_environment(
         try:
             subprocess.run(
                 ["vagrant", "up"],
-                cwd=PROJECT_ROOT,
+                cwd=INTEGRATION_ROOT,
                 capture_output=True,
                 timeout=300,
             )
@@ -253,7 +263,7 @@ def vagrant_environment(
         try:
             subprocess.run(
                 ["vagrant", "suspend"],
-                cwd=PROJECT_ROOT,
+                cwd=INTEGRATION_ROOT,
                 capture_output=True,
                 timeout=120,
             )
@@ -263,7 +273,7 @@ def vagrant_environment(
         try:
             subprocess.run(
                 ["vagrant", "destroy", "-f"],
-                cwd=PROJECT_ROOT,
+                cwd=INTEGRATION_ROOT,
                 capture_output=True,
                 timeout=120,
             )
