@@ -11,20 +11,24 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-#ifndef TRACE_CONDOR_STARTER
-#define TRACE_CONDOR_STARTER
-// 用于给用户态程序共享数据结构
+#ifndef TRACE_CGROUP_MKDIR
+#define TRACE_CGROUP_MKDIR
+
 #ifndef __VMLINUX_H__
-#include "bpf_types.h"
 #include <linux/bpf.h>
 #endif
 
 #define TASK_COMM_LEN 16
+#define CGROUP_MKDIR_PATH_LEN 256
 
-struct event {
+struct cgroup_mkdir_event {
     __u32 pid;
-    __u32 ppid;
-    char  comm[TASK_COMM_LEN];
+    __u32 tgid;
+    __u32 hierarchy_id;
+    __u32 level;
+    __u64 cgroup_id;
+    char comm[TASK_COMM_LEN];
+    char path[CGROUP_MKDIR_PATH_LEN];
 };
 
 #endif

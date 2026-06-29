@@ -180,6 +180,13 @@ foreach(bpf_c ${BPF_C_LIST})
         COMMENT "[eBPF] Building ${bpf_o}")
     list(APPEND BPF_O_LIST ${bpf_o})
 endforeach()
+file(GLOB EXISTING_BPF_OBJECTS CONFIGURE_DEPENDS "${BPF_OBJECT_DIR}/*.bpf.o")
+foreach(existing_bpf_o ${EXISTING_BPF_OBJECTS})
+    list(FIND BPF_O_LIST ${existing_bpf_o} existing_bpf_o_index)
+    if(existing_bpf_o_index EQUAL -1)
+        file(REMOVE ${existing_bpf_o})
+    endif()
+endforeach()
 add_custom_target(ebpf_objects ALL DEPENDS ${BPF_O_LIST})
 
 # ---- Main Executable ----
