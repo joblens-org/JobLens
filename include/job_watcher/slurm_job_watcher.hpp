@@ -93,6 +93,7 @@ private:
         job.sub_attr = SlurmJobAttr{
             .auto_update_child = true,
             .stepd_pid = SlurmJob::get_ppid_of(pid),
+            .job_id = JobID,
             .step_id = SlurmJob::getStepID(pid),
             .cluster_name = SlurmJob::get_cluster_name(pid),
             .cgroup_path = SlurmJob::v2_cgroup_absolute_path(pid),

@@ -1,0 +1,13 @@
+# JobLens 集成测试 — 最小 HTCondor sleep 作业模板
+# 用法: condor_submit tests/integration/test_jobs/sleep.condor
+# 必须在 controller VM (192.168.56.10) 上执行
+
+universe       = vanilla
+executable     = /usr/bin/sleep
+arguments      = 60
+output         = /tmp/sleep_condor_$(Cluster).out
+error          = /tmp/sleep_condor_$(Cluster).err
+log            = /tmp/sleep_condor_$(Cluster).log
+request_cpus   = 1
+request_memory = 64
+queue 1

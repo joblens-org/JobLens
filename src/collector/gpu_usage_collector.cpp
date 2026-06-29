@@ -521,6 +521,52 @@ CollectDataParseFunc GPUUsageCollector::get_writer_parser(const std::string& wri
         };
     }
 
+    if (writer_type.compare("FileWriter") == 0) {
+        func = [this](std::any data) -> std::any {
+            nlohmann::json ret;
+            if (!data.has_value()) {
+                spdlog::warn("GPUUsageCollector: error FileWriter parser, empty data");
+                ret["error"] = "empty data";
+                return ret;
+            }
+            ret["process_data"] = nlohmann::json::array();
+            auto parsed = std::any_cast<std::vector<GPUProcessUsage>>(data);
+            for (const auto& pu : parsed) {
+                nlohmann::json j;
+                j["pid"] = pu.pid;
+                j["gpu_count"] = pu.gpu_count;
+                j["total_mem_used_bytes"] = pu.total_mem_used_bytes;
+                j["total_mem_used_mb"] = pu.total_mem_used_bytes / (1024.0 * 1024.0);
+                j["avg_sm_util"] = pu.avg_sm_util;
+                j["avg_mem_bw_util"] = pu.avg_mem_bw_util;
+                j["avg_gpu_util"] = pu.avg_gpu_util;
+                j["avg_gpu_mem_bw_util"] = pu.avg_gpu_mem_bw_util;
+                j["total_gpu_mem_bytes"] = pu.total_gpu_mem_bytes;
+                j["devices"] = nlohmann::json::array();
+                for (const auto& d : pu.devices) {
+                    nlohmann::json dj;
+                    dj["gpu_index"] = d.gpu_index;
+                    dj["gpu_name"] = d.gpu_name;
+                    dj["mem_used_bytes"] = d.mem_used_bytes;
+                    dj["mem_used_mb"] = d.mem_used_bytes / (1024.0 * 1024.0);
+                    dj["sm_util"] = d.sm_util;
+                    dj["mem_bw_util"] = d.mem_bw_util;
+                    dj["gpu_util"] = d.gpu_util;
+                    dj["gpu_mem_bw_util"] = d.gpu_mem_bw_util;
+                    dj["gpu_mem_total_bytes"] = d.gpu_mem_total_bytes;
+                    dj["process_type"] = d.process_type;
+                    j["devices"].push_back(dj);
+                }
+                if (pu.pid == 0 && summary) {
+                    ret["summary"] = j;
+                } else {
+                    ret["process_data"].push_back(j);
+                }
+            }
+            return ret;
+        };
+    }
+
     if (writer_type.compare("PrometheusExporterWriter") == 0) {
         func = [this](std::any data) -> std::any {
             PrometheusExporterWriter::prometheus_job_state ret;

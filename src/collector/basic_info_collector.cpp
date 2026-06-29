@@ -449,6 +449,46 @@ CollectDataParseFunc BasicInfoCollector::get_writer_parser(const std::string& wr
         };
     }
     
+    if (writer_type.compare("FileWriter") == 0) {
+        func = [this](std::any data) -> std::any {
+            nlohmann::json ret;
+            if (!data.has_value()) {
+                spdlog::warn("BasicInfoCollector: error FileWriter parser, empty data");
+                ret["error"] = "empty data";
+                return ret;
+            }
+            ret["process_data"] = nlohmann::json::array();
+            auto parsed = std::any_cast<std::vector<BasicInfo>>(data);
+            for (const auto& info : parsed) {
+                nlohmann::json j;
+                j["pid"] = info.pid;
+                j["name"] = info.name;
+                j["cpu_percent"] = info.cpuPercent;
+                j["cpu_user_ns"] = info.cpuUserNs;
+                j["cpu_system_ns"] = info.cpuSystemNs;
+                j["cpu_total_ns"] = info.cpuTotalNs;
+                j["mem_rss_bytes"] = info.memRssBytes;
+                j["mem_vm_bytes"] = info.memVmBytes;
+                j["mem_percent"] = info.memoryPercent;
+                j["io_read_speed_bps"] = info.readSpeed;
+                j["io_write_speed_bps"] = info.writeSpeed;
+                j["io_read_bytes_total"] = info.readBytes;
+                j["io_write_bytes_total"] = info.writeBytes;
+                j["io_read_ops_total"] = info.readOps;
+                j["io_write_ops_total"] = info.writeOps;
+                j["num_threads"] = info.numThreads;
+                j["ctx_sw_voluntary"] = info.voluntaryCtxSw;
+                j["ctx_sw_nonvoluntary"] = info.nonvoluntaryCtxSw;
+                if (info.pid == 0) {
+                    ret["summary"] = j;
+                } else {
+                    ret["process_data"].push_back(j);
+                }
+            }
+            return ret;
+        };
+    }
+    
     if (writer_type.compare("PrometheusExporterWriter") == 0) {
         func = [this](std::any data) -> std::any {
             PrometheusExporterWriter::prometheus_job_state ret;

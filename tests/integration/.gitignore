@@ -1,0 +1,15 @@
+# Vagrant
+.vagrant/
+
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Slurm runtime shared data (controller → worker via Vagrant synced_folder)
+.runtime/
+
+# OpenCode evidence
+.omo/evidence/
