@@ -372,6 +372,7 @@ namespace Utils
         if (ec) {
             spdlog::warn("Utils: cgroup2 scan stopped early at {}: {}", mount, ec.message());
         }
+        spdlog::debug("Utils: scanned cgroup2 mount {}, dirs={}", mount, dirs.size());
         return dirs;
     }
 

@@ -53,6 +53,7 @@ bool CgroupMkdirEventSource::start()
             }
         }
     });
+    spdlog::info("CgroupMkdirEventSource: started, mount={}", cgroup2_mount_);
     return true;
 }
 
@@ -63,6 +64,7 @@ void CgroupMkdirEventSource::stop()
         return;
     }
     running_ = false;
+    spdlog::info("CgroupMkdirEventSource: stopping");
     queue_cv_.notify_all();
     if (poll_thread_ && poll_thread_->joinable()) {
         poll_thread_->join();
@@ -96,6 +98,7 @@ bool CgroupMkdirEventSource::init_ebpf()
         auto* event = static_cast<cgroup_mkdir_event*>(data);
         auto normalized = self->normalize_event_path(event->path);
         if (!normalized.empty()) {
+            spdlog::debug("CgroupMkdirEventSource: enqueued mkdir event path={}", normalized);
             self->enqueue_path(std::move(normalized));
         }
         return 0;
@@ -115,10 +118,12 @@ void CgroupMkdirEventSource::deinit_ebpf()
 std::string CgroupMkdirEventSource::normalize_event_path(const char* path) const
 {
     if (path == nullptr || path[0] == '\0') {
+        spdlog::debug("CgroupMkdirEventSource: event dropped, empty cgroup path");
         return {};
     }
     std::string raw(path);
     if (cgroup2_mount_.empty()) {
+        spdlog::debug("CgroupMkdirEventSource: event dropped, cgroup v2 mount unknown path={}", raw);
         return {};
     }
     if (raw.rfind(cgroup2_mount_, 0) == 0) {
@@ -158,6 +163,7 @@ void CgroupMkdirEventSource::worker_loop()
             std::lock_guard<std::mutex> lock(callbacks_mutex_);
             callbacks = callbacks_;
         }
+        spdlog::debug("CgroupMkdirEventSource: dispatching cgroup={} to {} callbacks", path, callbacks.size());
         for (auto& cb : callbacks) {
             cb(path);
         }

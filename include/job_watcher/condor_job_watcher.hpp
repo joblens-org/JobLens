@@ -115,6 +115,7 @@ private:
         auto pids = get_cgroup_pids_with_retry(cgroup_path);
         if (!pids || pids->empty()) return std::nullopt;
 
+        spdlog::debug("CondorJobWatcher: building job from cgroup {}, pids={}", cgroup_path, fmt::join(*pids, ", "));
         for (auto pid : *pids) {
             auto job_opt = buildCondorJob(pid);
             if (!job_opt) continue;
@@ -124,6 +125,7 @@ private:
             condor_attr.slots_cgroup_path = cgroup_path;
             return job;
         }
+        spdlog::debug("CondorJobWatcher: no valid job from any pid in cgroup {}", cgroup_path);
         return std::nullopt;
     }
 
@@ -150,17 +152,24 @@ private:
     std::optional<std::vector<pid_t>> get_cgroup_pids_with_retry(const std::string& cgroup_path){
         for (int attempt = 0; attempt < 3; ++attempt) {
             if (attempt > 0) {
+                spdlog::debug("CondorJobWatcher: retry reading cgroup {} (attempt {})", cgroup_path, attempt + 1);
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
             auto result = Utils::get_pids_in_cgroup(cgroup_path);
             if (result.status == Utils::CgroupProcsReadStatus::Success && !result.pids.empty()) {
+                spdlog::debug("CondorJobWatcher: read {} pids from cgroup {} on attempt {}",
+                              result.pids.size(), cgroup_path, attempt + 1);
                 return result.pids;
             }
+            spdlog::debug("CondorJobWatcher: cgroup {} read attempt {} status={} pids={}",
+                          cgroup_path, attempt + 1,
+                          Utils::cgroup_procs_status_name(result.status), result.pids.size());
             if (result.status == Utils::CgroupProcsReadStatus::Missing ||
                 result.status == Utils::CgroupProcsReadStatus::PermissionDenied) {
                 return std::nullopt;
             }
         }
+        spdlog::debug("CondorJobWatcher: failed to read pids from cgroup {} after 3 attempts", cgroup_path);
         return std::nullopt;
     }
 

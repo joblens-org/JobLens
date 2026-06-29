@@ -168,6 +168,7 @@ def _cgroup2_mount_point() -> str:
                 continue
             sep = fields.index('-')
             if sep + 1 < len(fields) and fields[sep + 1] == 'cgroup2':
+                logger.debug("cgroup2 mount point found: %s", fields[4])
                 return fields[4]
     raise RuntimeError('未找到 cgroup2 挂载点')
 
@@ -181,7 +182,9 @@ def _cgroup2_path_of_pid(pid: int) -> str:
                 deleted_suffix = ' (deleted)'
                 if relative.endswith(deleted_suffix):
                     relative = relative[:-len(deleted_suffix)]
-                return os.path.normpath(os.path.join(mount_point, relative.lstrip('/')))
+                cgroup_full_path = os.path.normpath(os.path.join(mount_point, relative.lstrip('/')))
+                logger.debug("PID %d cgroup path: %s (mount=%s, relative=%s)", pid, cgroup_full_path, mount_point, relative)
+                return cgroup_full_path
     raise RuntimeError(f'PID {pid} 不在 cgroup v2 统一层级中')
 
 def _pids_in_cgroup(cgroup_path: str) -> List[int]:
@@ -189,6 +192,8 @@ def _pids_in_cgroup(cgroup_path: str) -> List[int]:
     try:
         with open(procs_path, 'r', encoding='utf-8') as procs_file:
             pids = sorted({int(line.strip()) for line in procs_file if line.strip()})
+        logger.debug("cgroup %s contains %d PIDs: %s", cgroup_path, len(pids),
+                     pids[:20] if len(pids) > 20 else pids)
     except FileNotFoundError as exc:
         raise RuntimeError(f'cgroup 不存在: {cgroup_path}') from exc
     except PermissionError as exc:
@@ -208,6 +213,7 @@ def _find_first_process_by_cmd(pattern: str) -> int:
         except OSError:
             continue
         if re.search(pattern, cmdline):
+            logger.debug("process matched pattern '%s': PID=%d", pattern, pid)
             return pid
     raise RuntimeError(f'未找到匹配进程: {pattern}')
 
@@ -223,7 +229,11 @@ def find_pids_by_slot(slot: str):
         raise ValueError("slot 名必须以 'slot' 开头")
     num = slot[4:]
     starter_pid = _find_first_process_by_cmd(rf'condor_starter.*slot{re.escape(num)}')
+    logger.debug("found condor_starter for slot %s: PID=%d", slot, starter_pid)
     child_pids = [pid for pid in _pids_in_cgroup(_cgroup2_path_of_pid(starter_pid)) if pid != starter_pid]
+    logger.debug("slot %s child PIDs (excl. starter %d): count=%d, pids=%s",
+                 slot, starter_pid, len(child_pids),
+                 child_pids[:20] if len(child_pids) > 20 else child_pids)
 
     if not child_pids:
         raise RuntimeError(f"slot {slot} 的 condor_starter 下未找到子进程")
@@ -528,9 +538,14 @@ def _expand_nodelist(nodelist_str: str) -> List[str]:
 
 def get_job_processes(job_id: str) -> List[Tuple[str, str, str]]:
     stepd_pid = _find_first_process_by_cmd(rf'slurmstepd.*{re.escape(job_id)}')
+    logger.debug("found slurmstepd for job %s: PID=%d", job_id, stepd_pid)
     node_id = os.uname().nodename
+    cgroup_pids = _pids_in_cgroup(_cgroup2_path_of_pid(stepd_pid))
+    logger.debug("job %s cgroup PIDs (excl. stepd %d): count=%d, pids=%s",
+                 job_id, stepd_pid, len(cgroup_pids),
+                 cgroup_pids[:20] if len(cgroup_pids) > 20 else cgroup_pids)
     return [
         (node_id, str(pid), (_read_cmdline(pid).split() or ['unknown'])[0])
-        for pid in _pids_in_cgroup(_cgroup2_path_of_pid(stepd_pid))
+        for pid in cgroup_pids
         if pid != stepd_pid
     ]

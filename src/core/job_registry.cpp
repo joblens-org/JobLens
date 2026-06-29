@@ -231,6 +231,7 @@ void JobRegistry::init_job_watcher() {
                     }
                 }
             );
+            spdlog::debug("JobRegistry: registered condor cgroup mkdir callback");
         }
         spdlog::info("JobRegistry: enabled auto add condor job");
     }
@@ -250,6 +251,7 @@ void JobRegistry::init_job_watcher() {
                     }
                 }
             );
+            spdlog::debug("JobRegistry: registered slurm cgroup mkdir callback");
         }
         spdlog::info("JobRegistry: enabled auto add slurm job");
     }
