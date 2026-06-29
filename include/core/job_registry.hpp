@@ -16,18 +16,16 @@
 #include <unordered_map>
 #include <shared_mutex>
 #include <vector>
-#include <functional>
 #include <optional>
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
-#include <thread>
+#include <memory>
+#include <mutex>
 
 
-#include "common/streamer_watcher.hpp"
 #include "core/collector_type.h"
+#include "core/cgroup_mkdir_event_source.hpp"
 #include "job_lifecycle_event.h"
-#include "ebpf/trace_condor_starter.h"
-#include "common/ebpf_common.hpp"
 
 #include "job_watcher/condor_job_watcher.hpp"
 #include "job_watcher/slurm_job_watcher.hpp"
@@ -102,4 +100,5 @@ private:
     // Slurm作业自动添加
     bool enable_auto_add_slurm_job{false};
     std::unique_ptr<SlurmJobWatcher> slurm_job_watcher_;
+    std::unique_ptr<CgroupMkdirEventSource> cgroup_mkdir_event_source_;
 };

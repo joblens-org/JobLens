@@ -14,18 +14,15 @@
 // job_registry.cpp
 #include "core/job_registry.hpp"
 #include <spdlog/spdlog.h>
-#include "common/streamer_watcher.hpp"
 #include <date/date.h>
 #include "common/config.hpp"
 #include <signal.h>
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
-#include <thread>
 #include <chrono>
 #include <filesystem>
 
-#include "common/utils.hpp"
 #include "common/condor_job.hpp"
 #include "common/slurm_job.hpp"
 #include "common/common_job.hpp"
@@ -134,30 +131,38 @@ std::string json2JobOpt(const nlohmann::json& obj, Job& job) {
     if (subtype.compare("condor") == 0){
         job.subtype = JobSubType::Condor;
         auto sub = obj.value("sub_attr", nlohmann::json::object());
-        auto cid = sub.value("cluster_id", nlohmann::json(0u)).get<size_t>();
-        auto proc = sub.value("proc_id", nlohmann::json(0u)).get<size_t>();
-        if (!obj.contains("sub_attr")) {
-            spdlog::info("JobRegistry: condor job sub_attr not provided, using defaults cluster_id={}, proc_id={}", cid, proc);
-        }
         job.sub_attr = CondorJobAttr{
-            .auto_update_child = obj.value("auto_update_child", true),
-            .cluster_id = cid,
-            .proc_id = proc,
+            .auto_update_child = sub.value("auto_update_child", obj.value("auto_update_child", true)),
+            .starter_pid = sub.value("starter_pid", nlohmann::json(0)).get<pid_t>(),
+            .cluster_id = sub.value("cluster_id", nlohmann::json(0u)).get<size_t>(),
+            .proc_id = sub.value("proc_id", nlohmann::json(0u)).get<size_t>(),
+            .scheduler_host = sub.value("scheduler_host", ""),
+            .scheduler_name = sub.value("scheduler_name", ""),
+            .slots_cgroup_path = sub.value("slots_cgroup_path", ""),
+            .owner = sub.value("owner", ""),
+            .job_ad_path = sub.value("job_ad_path", ""),
+            .collector_host = sub.value("collector_host", "")
         };
+        auto& condor_attr = std::get<CondorJobAttr>(job.sub_attr);
+        auto cid = condor_attr.cluster_id;
+        auto proc = condor_attr.proc_id;
         job.NativeJobID = fmt::format("{}.{}", cid, proc);
     }else if (subtype.compare("slurm") == 0){
         job.subtype = JobSubType::Slurm;
         auto sub = obj.value("sub_attr", nlohmann::json::object());
-        auto jid = sub.value("job_id", nlohmann::json(0u)).get<size_t>();
-        auto sid = sub.value("step_id", nlohmann::json(0u)).get<uint32_t>();
-        if (!obj.contains("sub_attr")) {
-            spdlog::info("JobRegistry: slurm job sub_attr not provided, using defaults job_id={}, step_id={}", jid, sid);
-        }
         job.sub_attr = SlurmJobAttr{
-            .auto_update_child = obj.value("auto_update_child", true),
-            .job_id = jid,
-            .step_id = sid
+            .auto_update_child = sub.value("auto_update_child", obj.value("auto_update_child", true)),
+            .stepd_pid = sub.value("stepd_pid", nlohmann::json(0)).get<pid_t>(),
+            .job_id = sub.value("job_id", nlohmann::json(0u)).get<size_t>(),
+            .step_id = sub.value("step_id", nlohmann::json(0u)).get<uint32_t>(),
+            .cluster_name = sub.value("cluster_name", ""),
+            .cgroup_path = sub.value("cgroup_path", ""),
+            .user = sub.value("user", ""),
+            .job_name = sub.value("job_name", ""),
+            .partition = sub.value("partition", "")
         };
+        auto& slurm_attr = std::get<SlurmJobAttr>(job.sub_attr);
+        auto jid = slurm_attr.job_id;
         job.NativeJobID = fmt::format("{}", jid);
     }else if (subtype.compare("common") == 0){
         job.subtype = JobSubType::Common;
@@ -200,6 +205,17 @@ JobRegistry::JobRegistry(){
 
 void JobRegistry::init_job_watcher() {
     enable_auto_add_condor_job = Config::instance().getBool("job_registry_config", "auto_add_condorjob", false);
+    enable_auto_add_slurm_job = Config::instance().getBool("job_registry_config", "auto_add_slurmjob", false);
+
+    if (enable_auto_add_condor_job || enable_auto_add_slurm_job) {
+        cgroup_mkdir_event_source_ = std::make_unique<CgroupMkdirEventSource>();
+        if (!cgroup_mkdir_event_source_->start()) {
+            spdlog::warn("JobRegistry: failed to start cgroup mkdir event source");
+        } else {
+            spdlog::info("JobRegistry: enabled cgroup mkdir event source");
+        }
+    }
+
     if (enable_auto_add_condor_job) {
         condor_job_watcher_ = std::make_unique<CondorJobWatcher>();
         condor_job_watcher_->register_add_if(
@@ -207,10 +223,18 @@ void JobRegistry::init_job_watcher() {
                 this->addJob(job);
             }
         );
+        if (cgroup_mkdir_event_source_) {
+            cgroup_mkdir_event_source_->register_callback(
+                [this](const std::string& path) {
+                    if (condor_job_watcher_) {
+                        condor_job_watcher_->on_cgroup_mkdir(path);
+                    }
+                }
+            );
+        }
         spdlog::info("JobRegistry: enabled auto add condor job");
     }
 
-    enable_auto_add_slurm_job = Config::instance().getBool("job_registry_config", "auto_add_slurmjob", false);
     if (enable_auto_add_slurm_job) {
         slurm_job_watcher_ = std::make_unique<SlurmJobWatcher>();
         slurm_job_watcher_->register_add_if(
@@ -218,6 +242,15 @@ void JobRegistry::init_job_watcher() {
                 this->addJob(job);
             }
         );
+        if (cgroup_mkdir_event_source_) {
+            cgroup_mkdir_event_source_->register_callback(
+                [this](const std::string& path) {
+                    if (slurm_job_watcher_) {
+                        slurm_job_watcher_->on_cgroup_mkdir(path);
+                    }
+                }
+            );
+        }
         spdlog::info("JobRegistry: enabled auto add slurm job");
     }
 }
@@ -501,11 +534,11 @@ inline bool is_process_running(pid_t pid) {
 inline void JobRegistry::update_job(Job& job){
     if(job.subtype == JobSubType::Condor){
         CondorJob::update_job_info(job);
-        CommonJob::update_job_child_process(job);   
+        CondorJob::update_job_pids(job);
     }
     if(job.subtype == JobSubType::Slurm){
         SlurmJob::update_job_info(job);
-        CommonJob::update_job_child_process(job);
+        SlurmJob::update_job_pids(job);
     }
     if(job.subtype == JobSubType::Common){
         if (std::get<CommonJobAttr>(job.sub_attr).auto_update_child){
@@ -530,18 +563,19 @@ std::optional<Job> JobRegistry::findJob(uint64_t jobID) {
         result = it->second;  // 先拷贝
     }
 
+    update_job(result);
+    result.JobPIDs.erase(
+        std::remove_if(result.JobPIDs.begin(), result.JobPIDs.end(),
+                       [](pid_t pid){ return !is_process_running(pid); }),
+        result.JobPIDs.end());
+
     {
         std::unique_lock lg(mtx_);
         // 使用find代替at，避免读锁与写锁间隙中job被其他线程删除导致out_of_range
         auto it = jobs_.find(jobID);
         if (it == jobs_.end()) return std::nullopt;
         auto& job = it->second;
-        update_job(job);
-
-        job.JobPIDs.erase(
-            std::remove_if(job.JobPIDs.begin(), job.JobPIDs.end(),
-                           [](pid_t pid){ return !is_process_running(pid); }),
-            job.JobPIDs.end());
+        job = result;
 
         if (job.JobPIDs.empty()) {
             toDelete.push_back(jobID);

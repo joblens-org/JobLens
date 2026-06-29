@@ -15,12 +15,11 @@
 #include "common/slurm_job.hpp"
 #include <spdlog/spdlog.h>
 #include <fmt/ranges.h>
-#include "common/ebpf_common.hpp"
 #include "common/utils.hpp"
 #include "rule_engine/rules_manager.hpp"
 #include "common/config.hpp"
-#include <filesystem>
-#include "ebpf/trace_slurm_stepd.h"
+#include <chrono>
+#include <thread>
 
 
 class SlurmJobWatcher{
@@ -37,21 +36,9 @@ public:
             spdlog::info("SlurmJobWatcher: use rules engine to filter slurm jobs");
         }
         use_collectors = collectors;
-        if(!init_ebpf()){
-            spdlog::warn("SlurmJobWatcher: init ebpf error, deinit now");
-            deinit_ebpf();
-        }else{
-            spdlog::info("SlurmJobWatcher: inited auto add slurm job");
-        }
+        spdlog::info("SlurmJobWatcher: inited auto add slurm job");
     }
-    ~SlurmJobWatcher(){
-        polling_running = false;
-        if(poll_thread && poll_thread->joinable()){
-            poll_thread->join();
-        }
-        
-        deinit_ebpf();
-    }
+    ~SlurmJobWatcher() = default;
 
     void register_add_if(std::function<void(Job)> add_if){
         add_if_ = add_if;
@@ -59,7 +46,7 @@ public:
 
     size_t add_all_slurm_job(bool use_rules = true){
         size_t added_count = 0;
-        auto slurm_pids = SlurmJob::get_all_slurm_job_pids();
+        auto slurm_pids = SlurmJob::get_all_slurm_job_pids_from_cgroups();
         for(auto pid: slurm_pids){
             auto job_opt = buildSlurmJob(pid);
             if(!job_opt) continue;
@@ -77,6 +64,19 @@ public:
         }
         spdlog::info("SlurmJobWatcher: added {} slurm jobs", added_count);
         return added_count;
+    }
+
+    void on_cgroup_mkdir(const std::string& cgroup_path){
+        if (!SlurmJob::looks_like_slurm_cgroup(cgroup_path)) {
+            return;
+        }
+        auto step_path = SlurmJob::normalize_to_slurm_step_cgroup(cgroup_path);
+        auto job_opt = buildSlurmJobFromCgroup(step_path);
+        if (!job_opt) {
+            spdlog::debug("SlurmJobWatcher: no pid in cgroup {} after retry", step_path);
+            return;
+        }
+        addBuiltJob(std::move(job_opt.value()), rules_manager_ != nullptr, use_collectors);
     }
 
 private:
@@ -109,11 +109,30 @@ private:
         return job;
     }
 
+    std::optional<Job> buildSlurmJobFromCgroup(const std::string& cgroup_path){
+        auto pids = get_cgroup_pids_with_retry(cgroup_path);
+        if (!pids || pids->empty()) return std::nullopt;
+
+        for (auto pid : *pids) {
+            auto job_opt = buildSlurmJob(pid);
+            if (!job_opt) continue;
+            Job job = std::move(job_opt.value());
+            job.JobPIDs = *pids;
+            auto& slurm_attr = std::get<SlurmJobAttr>(job.sub_attr);
+            slurm_attr.cgroup_path = cgroup_path;
+            return job;
+        }
+        return std::nullopt;
+    }
+
     void buildAndAddJob(pid_t pid, bool use_rules, std::vector<std::string> default_collectors){
         auto job_opt = buildSlurmJob(pid);
         if(!job_opt) return;
 
-        Job job = std::move(job_opt.value());
+        addBuiltJob(std::move(job_opt.value()), use_rules, std::move(default_collectors));
+    }
+
+    void addBuiltJob(Job job, bool use_rules, std::vector<std::string> default_collectors){
         // 将规则返回的采集器名称添加到Job对象中
         if(!evaluate_rules(job)){
             spdlog::info("SlurmJobWatcher: job ID {} did not pass rules, skip adding", job.JobID);
@@ -126,51 +145,21 @@ private:
         add_if_(job);
     }
 
-    bool init_ebpf(){
-        auto path = Utils::JobLensRootDir() + bpf_o_path;
-        bpf_obj_ = EbpfCommon::load_bpf_obj(path, bpf_links_);
-
-        ring_buffer_sample_fn fn  = [](void *ctx, void *data, size_t size){
-            auto ptr = static_cast<SlurmJobWatcher*>(ctx);
-            auto event_ptr = static_cast<struct slurm_event*>(data);
-            bool use_rules = false;
-            auto default_collectors = ptr->use_collectors;
-            if (ptr->rules_manager_) {
-                use_rules = true;
+    std::optional<std::vector<pid_t>> get_cgroup_pids_with_retry(const std::string& cgroup_path){
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (attempt > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-            Job job;
-            spdlog::debug("SlurmJobWatcher: ebpf got exec event pid {} ppid {} comm {}",
-                        event_ptr->pid, event_ptr->ppid, event_ptr->comm);
-            ptr->buildAndAddJob(event_ptr->pid, use_rules, default_collectors);
-            return 0;
-        };
-
-        bpf_rb_ = EbpfCommon::new_rb(bpf_obj_, rb_name, fn, static_cast<void*>(this));
-        
-        if(!bpf_obj_ || !bpf_rb_){
-            return false;
+            auto result = Utils::get_pids_in_cgroup(cgroup_path);
+            if (result.status == Utils::CgroupProcsReadStatus::Success && !result.pids.empty()) {
+                return result.pids;
+            }
+            if (result.status == Utils::CgroupProcsReadStatus::Missing ||
+                result.status == Utils::CgroupProcsReadStatus::PermissionDenied) {
+                return std::nullopt;
+            }
         }
-        polling_running = true;
-        poll_thread = std::make_unique<std::thread>([this](){
-            while(polling_running){
-                int err = ring_buffer__poll(bpf_rb_, 100 /* ms */);
-                if (err == -EINTR){
-                    spdlog::error("SlurmJobWatcher: error EINTR");
-                    break;
-                }
-                if (err < 0){
-                    spdlog::error("SlurmJobWatcher: error {}", err);
-                }
-            }
-        });
-
-        return true;
-    }
-
-    void deinit_ebpf(){
-        EbpfCommon::free_rb(bpf_rb_);
-        EbpfCommon::unload_bpf_obj(bpf_obj_, bpf_links_);
-        spdlog::info("SlurmJobWatcher: deinit_ebpf");
+        return std::nullopt;
     }
 
     // 评估规则并返回采集器名称
@@ -206,13 +195,6 @@ private:
     
     std::unique_ptr<RulesManager> rules_manager_;
     bool enable_auto_add_slurm_job{false};
-    bool polling_running{false};
-    std::unique_ptr<std::thread> poll_thread;
     std::vector<std::string> use_collectors;
-    std::string bpf_o_path = JOBLENS_INSTALL_LIBDIR "/joblens/bpf_obj/trace_slurm_stepd.bpf.o";
-    std::string rb_name = "slurm_exec_events";
     std::function<void(Job)> add_if_;
-    std::vector<bpf_link*> bpf_links_;
-    bpf_object* bpf_obj_{nullptr};
-    ring_buffer* bpf_rb_{nullptr};
 };

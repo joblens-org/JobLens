@@ -15,12 +15,11 @@
 #include "common/condor_job.hpp"
 #include <spdlog/spdlog.h>
 #include <fmt/ranges.h>
-#include "common/ebpf_common.hpp"
 #include "common/utils.hpp"
 #include "rule_engine/rules_manager.hpp"
 #include "common/config.hpp"
-#include <filesystem>
-#include "ebpf/trace_condor_starter.h"
+#include <chrono>
+#include <thread>
 
 class CondorJobWatcher{
 public:
@@ -36,19 +35,9 @@ public:
             spdlog::info("CondorJobWatcher: use rules engine to filter condor jobs");
         }
         use_collectors = collectors;
-        if(!init_ebpf()){
-            spdlog::warn("CondorJobWatcher: init ebpf error, deinit now");
-            deinit_ebpf();
-        }else{
-            spdlog::info("CondorJobWatcher: inited auto add condor job");
-        }
+        spdlog::info("CondorJobWatcher: inited auto add condor job");
     }
-    ~CondorJobWatcher(){
-        polling_running = false;
-        poll_thread->join();
-        
-        deinit_ebpf();
-    }
+    ~CondorJobWatcher() = default;
 
     void register_add_if(std::function<void(Job)> add_if){
         add_if_ = add_if;
@@ -56,7 +45,7 @@ public:
 
     size_t add_all_condor_job(bool use_rules = true){
         size_t added_count = 0;
-        auto condor_pids = CondorJob::get_all_condor_job_pids();
+        auto condor_pids = CondorJob::get_all_condor_job_pids_from_cgroups();
         for(auto pid: condor_pids){
             auto job_opt = buildCondorJob(pid);
             if(!job_opt) continue;
@@ -74,6 +63,18 @@ public:
         }
         spdlog::info("CondorJobWatcher: added {} condor jobs", added_count);
         return added_count;
+    }
+
+    void on_cgroup_mkdir(const std::string& cgroup_path){
+        if (!CondorJob::looks_like_condor_cgroup(cgroup_path)) {
+            return;
+        }
+        auto job_opt = buildCondorJobFromCgroup(cgroup_path);
+        if (!job_opt) {
+            spdlog::debug("CondorJobWatcher: no pid in cgroup {} after retry", cgroup_path);
+            return;
+        }
+        addBuiltJob(std::move(job_opt.value()), rules_manager_ != nullptr, use_collectors);
     }
 
 private:
@@ -110,11 +111,30 @@ private:
         return job;
     }
 
+    std::optional<Job> buildCondorJobFromCgroup(const std::string& cgroup_path){
+        auto pids = get_cgroup_pids_with_retry(cgroup_path);
+        if (!pids || pids->empty()) return std::nullopt;
+
+        for (auto pid : *pids) {
+            auto job_opt = buildCondorJob(pid);
+            if (!job_opt) continue;
+            Job job = std::move(job_opt.value());
+            job.JobPIDs = *pids;
+            auto& condor_attr = std::get<CondorJobAttr>(job.sub_attr);
+            condor_attr.slots_cgroup_path = cgroup_path;
+            return job;
+        }
+        return std::nullopt;
+    }
+
     void buildAndAddJob(pid_t pid, bool use_rules, std::vector<std::string> default_collectors){
         auto job_opt = buildCondorJob(pid);
         if(!job_opt) return;
 
-        Job job = std::move(job_opt.value());
+        addBuiltJob(std::move(job_opt.value()), use_rules, std::move(default_collectors));
+    }
+
+    void addBuiltJob(Job job, bool use_rules, std::vector<std::string> default_collectors){
         // 将规则返回的采集器名称添加到Job对象中
         if(!evaluate_rules(job)){
             spdlog::info("CondorJobWatcher: job ID {} did not pass rules, skip adding", job.JobID);
@@ -127,53 +147,21 @@ private:
         add_if_(job);
     }
 
-    bool init_ebpf(){
-        auto path = Utils::JobLensRootDir() + bpf_o_path;
-        bpf_obj_ = EbpfCommon::load_bpf_obj(path, bpf_links_);
-
-        ring_buffer_sample_fn fn  = [](void *ctx, void *data, size_t size){
-            auto ptr = static_cast<CondorJobWatcher*>(ctx);
-            auto event_ptr = static_cast<struct event*>(data);
-            bool use_rules = false;
-            auto default_collectors = ptr->use_collectors;
-            if (ptr->rules_manager_) {
-                use_rules = true;
+    std::optional<std::vector<pid_t>> get_cgroup_pids_with_retry(const std::string& cgroup_path){
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (attempt > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-            Job job;
-            spdlog::debug("CondorJobWatcher: ebpf got exec event pid {} ppid {} comm {}",
-                        event_ptr->pid, event_ptr->ppid, event_ptr->comm);
-            
-            ptr->buildAndAddJob(event_ptr->pid, use_rules, default_collectors);
-            
-            return 0;
-        };
-
-        bpf_rb_ = EbpfCommon::new_rb(bpf_obj_, rb_name, fn, static_cast<void*>(this));
-        
-        if(!bpf_obj_ || !bpf_rb_){
-            return false;
+            auto result = Utils::get_pids_in_cgroup(cgroup_path);
+            if (result.status == Utils::CgroupProcsReadStatus::Success && !result.pids.empty()) {
+                return result.pids;
+            }
+            if (result.status == Utils::CgroupProcsReadStatus::Missing ||
+                result.status == Utils::CgroupProcsReadStatus::PermissionDenied) {
+                return std::nullopt;
+            }
         }
-        polling_running = true;
-        poll_thread = std::make_unique<std::thread>([this](){
-            while(polling_running){
-                int err = ring_buffer__poll(bpf_rb_, 100 /* ms */);
-                if (err == -EINTR){
-                    spdlog::error("CondorJobWatcher: error EINTR");
-                    break;
-                }
-                if (err < 0){
-                    spdlog::error("CondorJobWatcher: error {}", err);
-                }
-            }
-        });
-
-        return true;
-    }
-
-    void deinit_ebpf(){
-        EbpfCommon::free_rb(bpf_rb_);
-        EbpfCommon::unload_bpf_obj(bpf_obj_, bpf_links_);
-        spdlog::info("CondorJobWatcher: deinit_ebpf");
+        return std::nullopt;
     }
 
     // 评估规则并返回采集器名称
@@ -209,14 +197,6 @@ private:
     
     std::unique_ptr<RulesManager> rules_manager_;
     bool enable_auto_add_condor_job{false};
-    bool polling_running;
-    std::unique_ptr<std::thread> poll_thread;
     std::vector<std::string> use_collectors;
-    std::string bpf_o_path = JOBLENS_INSTALL_LIBDIR "/joblens/bpf_obj/trace_condor_starter.bpf.o";
-    std::string rb_name = "exec_events";
     std::function<void(Job)> add_if_;
-    std::vector<bpf_link*> bpf_links_;
-    bpf_object* bpf_obj_;
-    ring_buffer* bpf_rb_;
 };
-
