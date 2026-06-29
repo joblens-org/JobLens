@@ -74,9 +74,15 @@ job_registry_config:
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
 | `job_db_path` | string | 无 | LevelDB 数据库目录路径。无法打开数据库时仅降级运行，不抛异常 |
-| `auto_add_condorjob` | bool | false | 自动启动 CondorJobWatcher，通过 eBPF 追踪 `condor_starter` 进程并自动添加 Condor 作业 |
-| `auto_add_slurmjob` | bool | false | 自动启动 SlurmJobWatcher，通过 eBPF 追踪 `slurm_stepd` 进程并自动添加 Slurm 作业 |
+| `auto_add_condorjob` | bool | false | 自动启动 CondorJobWatcher，并自动添加从 cgroup v2 创建事件发现的 Condor 作业 |
+| `auto_add_slurmjob` | bool | false | 自动启动 SlurmJobWatcher，并自动添加从 cgroup v2 创建事件发现的 Slurm 作业 |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs`（Condor）或 `{JobLensRootDir}/../config/rules/slurm_jobs`（Slurm） | Lua 规则文件目录，CondorJobWatcher 和 SlurmJobWatcher 在 `use_rules` 启用时使用。注意：默认值因 watcher 而异。 |
+
+### cgroup v2 进程发现
+
+对于 HTCondor 和 Slurm 作业，JobLens 使用单个 eBPF `raw_tracepoint/cgroup_mkdir` hook 作为自动发现触发源，并使用 cgroup v2 的 `cgroup.procs` 作为作业进程成员的主要来源。cgroup v2 挂载点从 `/proc/self/mountinfo` 发现；cgroup 事件路径会通过该挂载点归一化，调度器元数据仍然通过代表性 PID 走现有调度器元数据路径解析。现有 Trigger 和 RPC 请求保持兼容，不要求调用方传入 cgroup 字段。
+
+首轮仅支持 HTCondor 和 Slurm 的 cgroup v2 unified hierarchy。不支持 cgroup v1/hybrid、容器运行时特定 cgroup namespace、systemd D-Bus 集成，也不支持 CommonJob 的 cgroup 发现。
 
 **作业数据存储**（LevelDB 键值存储）：
 - 键使用前缀 `job_`、`job_history_`、`counter_`，值以 JSON 序列化

@@ -109,6 +109,8 @@ Generic job operation (add or remove).
 | `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "io_collector", "net_collector"]`) |
 | `sub_attr` | object | No | Sub-attributes: `condor` type needs `cluster_id`/`proc_id`, `slurm` type needs `job_id`/`step_id` |
 
+For `job.condor` and `job.slurm`, cgroup fields are optional. The C++ core resolves cgroup v2 membership internally from scheduler metadata and existing PID/starter/stepd information when available.
+
 **Example request:**
 ```json
 {
@@ -148,6 +150,8 @@ Condor job specific operation. Currently only supports `"add"`.
 | `Lens` | array[string] | No | Collector list (default: `["proc_collector"]`) |
 | `sub_attr` | object | No | Sub-attributes (e.g., `{"cluster_id": 123456, "proc_id": 0}`) |
 
+The endpoint keeps the existing payload shape. PID discovery is cgroup-v2 based and no longer depends on `pstree`; callers do not need to provide cgroup fields.
+
 **Example request:**
 ```json
 {
@@ -184,6 +188,8 @@ Slurm job specific operation. Currently only supports `"add"`.
 | `JobID` | int | **Yes** | Slurm job ID |
 | `Lens` | array[string] | No | Collector list (default: `["proc_collector"]`) |
 | `sub_attr` | object | No | Sub-attributes (e.g., `{"job_id": 12345, "step_id": 0}`) |
+
+The endpoint keeps the existing payload shape. PID discovery is compatible with cgroup-v2 membership; callers do not need to provide cgroup fields.
 
 **Example request:**
 ```json

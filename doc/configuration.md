@@ -75,9 +75,15 @@ job_registry_config:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `job_db_path` | string | none | LevelDB database directory path. If the database cannot be opened, no exception is thrown; it only degrades operation |
-| `auto_add_condorjob` | bool | false | Automatically start CondorJobWatcher, trace `condor_starter` processes via eBPF, and auto-add Condor jobs |
-| `auto_add_slurmjob` | bool | false | Automatically start SlurmJobWatcher, trace `slurm_stepd` processes via eBPF, and auto-add Slurm jobs |
+| `auto_add_condorjob` | bool | false | Automatically start CondorJobWatcher and auto-add Condor jobs discovered from cgroup v2 creation events |
+| `auto_add_slurmjob` | bool | false | Automatically start SlurmJobWatcher and auto-add Slurm jobs discovered from cgroup v2 creation events |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` (Condor) or `{JobLensRootDir}/../config/rules/slurm_jobs` (Slurm) | Directory for Lua rule files, used by CondorJobWatcher and SlurmJobWatcher when `use_rules` is enabled. Note: the default varies by watcher context. |
+
+### cgroup v2 process discovery
+
+For HTCondor and Slurm jobs, JobLens uses a single eBPF `raw_tracepoint/cgroup_mkdir` hook as the automatic discovery trigger and uses cgroup v2 `cgroup.procs` as the primary source for job process membership. The cgroup v2 mount point is discovered from `/proc/self/mountinfo`; cgroup event paths are normalized through that mount point, and scheduler metadata is still resolved from representative PIDs through existing scheduler metadata paths. Existing Trigger and RPC request payloads remain compatible and do not require cgroup fields.
+
+First-round support is limited to the cgroup v2 unified hierarchy for HTCondor and Slurm. cgroup v1/hybrid setups, container-runtime-specific cgroup namespaces, systemd D-Bus integration, and CommonJob cgroup discovery are not supported in this mode.
 
 **Job data storage** (LevelDB key-value store):
 - Keys use prefixes `job_`, `job_history_`, `counter_` with values serialized as JSON
