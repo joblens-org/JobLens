@@ -84,7 +84,7 @@ BuildRequires:  cmake >= 3.25
 BuildRequires:  gcc-c++
 BuildRequires:  clang
 BuildRequires:  bpftool
-BuildRequires:  systemd
+BuildRequires:  systemd-rpm-macros
 BuildRequires:  libbpf-devel
 BuildRequires:  libnl3-devel
 BuildRequires:  openssl-devel
@@ -273,6 +273,10 @@ rm -rf %{buildroot}%{_libdir}/cmake/date 2>/dev/null || :
 
 # ===== 二进制 & 库 =====
 /usr/bin/JobLens
+%dir %{_libdir}/joblens/
+%if 0%{?with_bundled_libs}
+%{_libdir}/joblens/*.so*
+%endif
 %dir %{_libdir}/joblens/bpf_obj/
 %{_libdir}/joblens/bpf_obj/*.bpf.o
 

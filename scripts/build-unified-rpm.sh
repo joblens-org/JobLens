@@ -216,19 +216,25 @@ prepare_sources() {
 build_rpm() {
     local preset="$1"
     local spec_file="$PROJECT_ROOT/scripts/rpm/joblens-unified.spec"
+    local with_bundled_libs=0
 
     if [[ ! -f "$spec_file" ]]; then
         log_error "spec 文件不存在: $spec_file"
         exit 1
     fi
 
-    log_info "开始 RPM 构建（rpmbuild -ba, preset=${preset}, _version=${VERSION}）..."
+    if [[ "$preset" == "rpm-static-epel" ]]; then
+        with_bundled_libs=1
+    fi
+
+    log_info "开始 RPM 构建（rpmbuild -ba, preset=${preset}, _version=${VERSION}, with_bundled_libs=${with_bundled_libs}）..."
     echo ""
 
     if rpmbuild -ba \
         --define "preset ${preset}" \
         --define "unified_version ${VERSION}" \
         --define "_version ${VERSION}" \
+        --define "with_bundled_libs ${with_bundled_libs}" \
         "$spec_file"; then
         log_info "rpmbuild 构建成功"
         return 0
@@ -243,6 +249,7 @@ build_rpm() {
         --define "preset ${preset}" \
         --define "unified_version ${VERSION}" \
         --define "_version ${VERSION}" \
+        --define "with_bundled_libs ${with_bundled_libs}" \
         "$spec_file"
 }
 
