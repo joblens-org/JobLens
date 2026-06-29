@@ -23,17 +23,23 @@
 #include <string>
 #include <vector>
 #include <fstream>
+#include <sstream>
+#include <mutex>
+#include <sys/stat.h>
+#include <cstring>
+#include <cstdlib>
+#include <limits>
 #include <xxhash.h>
 #include <signal.h>
 #include <execinfo.h>
 #include <spdlog/spdlog.h>
-#include <exception>
 #include <memory>
 #include <yaml-cpp/yaml.h>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <system_error>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -125,6 +131,120 @@ namespace Utils
         return "";
     }
 
+    inline std::string error_message_from_errno(int errnum) {
+        char buf[256];
+        char* msg = strerror_r(errnum, buf, sizeof(buf));
+        return std::string(msg);
+    }
+
+    enum class CgroupProcsReadStatus {
+        Success,
+        Empty,
+        Missing,
+        PermissionDenied,
+        Unsupported,
+        Malformed,
+        ReadError
+    };
+
+    struct CgroupPidsResult {
+        CgroupProcsReadStatus status = CgroupProcsReadStatus::ReadError;
+        std::vector<pid_t> pids;
+        int errnum = 0;
+        std::string message;
+
+        bool ok() const {
+            return status == CgroupProcsReadStatus::Success || status == CgroupProcsReadStatus::Empty;
+        }
+    };
+
+    inline std::string cgroup_procs_status_name(CgroupProcsReadStatus status)
+    {
+        switch (status) {
+            case CgroupProcsReadStatus::Success: return "success";
+            case CgroupProcsReadStatus::Empty: return "empty";
+            case CgroupProcsReadStatus::Missing: return "missing";
+            case CgroupProcsReadStatus::PermissionDenied: return "permission_denied";
+            case CgroupProcsReadStatus::Unsupported: return "unsupported";
+            case CgroupProcsReadStatus::Malformed: return "malformed";
+            case CgroupProcsReadStatus::ReadError: return "read_error";
+        }
+        return "read_error";
+    }
+
+    /**
+     * @brief 发现 cgroup v2 挂载点
+     * @return cgroup2 挂载点绝对路径，失败返回空串
+     */
+    inline std::string discover_cgroup2_mount()
+    {
+        struct Cgroup2MountCache {
+            std::string mount_point;
+            time_t mountinfo_mtime = 0;
+            bool loaded = false;
+            std::mutex mutex;
+        };
+
+        static Cgroup2MountCache cache;
+
+        struct stat st{};
+        if (stat("/proc/self/mountinfo", &st) != 0) {
+            spdlog::warn("Utils: failed to stat /proc/self/mountinfo: {}", error_message_from_errno(errno));
+            return {};
+        }
+
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.loaded && cache.mountinfo_mtime == st.st_mtime) {
+            return cache.mount_point;
+        }
+
+        std::ifstream fin("/proc/self/mountinfo");
+        if (!fin) {
+            spdlog::warn("Utils: failed to open /proc/self/mountinfo: {}", error_message_from_errno(errno));
+            cache.loaded = true;
+            cache.mountinfo_mtime = st.st_mtime;
+            cache.mount_point.clear();
+            return {};
+        }
+
+        std::string line;
+        while (std::getline(fin, line)) {
+            std::istringstream iss(line);
+            int mount_id = 0;
+            int parent_id = 0;
+            std::string major_minor;
+            std::string root;
+            std::string mount_point;
+            std::string mount_options;
+            if (!(iss >> mount_id >> parent_id >> major_minor >> root >> mount_point >> mount_options)) {
+                continue;
+            }
+
+            std::string token;
+            while (iss >> token && token != "-") {}
+            if (token != "-") {
+                continue;
+            }
+
+            std::string fs_type;
+            if (!(iss >> fs_type)) {
+                continue;
+            }
+            if (fs_type == "cgroup2") {
+                cache.mount_point = mount_point;
+                cache.mountinfo_mtime = st.st_mtime;
+                cache.loaded = true;
+                return cache.mount_point;
+            }
+        }
+
+        spdlog::warn("Utils: cgroup2 mount point not found in /proc/self/mountinfo");
+        cache.mount_point.clear();
+        cache.mountinfo_mtime = st.st_mtime;
+        cache.loaded = true;
+        return {};
+    }
+
     /**
      * @brief 获取指定进程的cgroup v2绝对路径
      * @param pid 进程ID，默认为0表示当前进程
@@ -143,9 +263,23 @@ namespace Utils
             // v2 统一层级格式：0::/relative/path
             if (line.compare(0,3,"0::") == 0){
                 std::string rel = line.substr(3);          // "/system.slice/xxx"
-                // 拼到挂载点即可。v2 统一层级挂载点 99% 是 /sys/fs/cgroup
-                fs::path mount = "/sys/fs/cgroup";
-                return (mount / fs::path(rel).lexically_normal()).string();
+                constexpr std::string_view deleted_suffix = " (deleted)";
+                if (rel.size() >= deleted_suffix.size() &&
+                    rel.compare(rel.size() - deleted_suffix.size(), deleted_suffix.size(), deleted_suffix) == 0) {
+                    rel.resize(rel.size() - deleted_suffix.size());
+                }
+
+                auto mount = discover_cgroup2_mount();
+                if (mount.empty()) {
+                    spdlog::warn("Utils: cannot resolve cgroup2 mount for pid {}", pid);
+                    return {};
+                }
+
+                fs::path relative_path(rel);
+                if (relative_path.is_absolute()) {
+                    relative_path = relative_path.relative_path();
+                }
+                return (fs::path(mount) / relative_path.lexically_normal()).string();
             }
         }
         return {};   // 不是 v2 或没找到
@@ -156,18 +290,91 @@ namespace Utils
      * @param cgroup_dir cgroup目录路径
      * @return PID列表
      */
-    inline std::vector<pid_t> get_pids_in_cgroup(const std::string& cgroup_dir){
-        std::vector<pid_t> pids;
+    inline CgroupPidsResult get_pids_in_cgroup(const std::string& cgroup_dir){
+        CgroupPidsResult result;
         fs::path procs = fs::path(cgroup_dir) / "cgroup.procs";
-        std::ifstream fin(procs);
-        if (!fin)
-            return pids;   // 文件不存在或权限不足
+        if (cgroup_dir.empty()) {
+            result.status = CgroupProcsReadStatus::Missing;
+            result.errnum = ENOENT;
+            result.message = "empty cgroup path";
+            spdlog::warn("Utils: failed to read {}: {}", procs.string(), result.message);
+            return result;
+        }
 
-        pid_t pid;
-        while (fin >> pid)          // 每行一个 PID
-            pids.push_back(pid);
-        return pids;
+        errno = 0;
+        std::ifstream fin(procs);
+        if (!fin) {
+            result.errnum = errno;
+            if (result.errnum == ENOENT) {
+                result.status = CgroupProcsReadStatus::Missing;
+            } else if (result.errnum == EACCES || result.errnum == EPERM) {
+                result.status = CgroupProcsReadStatus::PermissionDenied;
+            } else if (result.errnum == EOPNOTSUPP) {
+                result.status = CgroupProcsReadStatus::Unsupported;
+            } else {
+                result.status = CgroupProcsReadStatus::ReadError;
+            }
+            result.message = error_message_from_errno(result.errnum);
+            spdlog::warn("Utils: failed to open {}: {}", procs.string(), result.message);
+            return result;
+        }
+
+        std::string line;
+        while (std::getline(fin, line)) {
+            if (line.empty()) {
+                continue;
+            }
+            char* end = nullptr;
+            errno = 0;
+            long value = std::strtol(line.c_str(), &end, 10);
+            if (errno != 0 || end == line.c_str() || *end != '\0' || value < 0 || value > std::numeric_limits<pid_t>::max()) {
+                result.status = CgroupProcsReadStatus::Malformed;
+                result.errnum = errno;
+                result.message = line;
+                spdlog::warn("Utils: malformed pid '{}' in {}", line, procs.string());
+                return result;
+            }
+            result.pids.push_back(static_cast<pid_t>(value));
+        }
+
+        if (fin.bad()) {
+            result.status = CgroupProcsReadStatus::ReadError;
+            result.errnum = EIO;
+            result.message = error_message_from_errno(result.errnum);
+            spdlog::warn("Utils: failed while reading {}: {}", procs.string(), result.message);
+            return result;
+        }
+
+        result.status = result.pids.empty() ? CgroupProcsReadStatus::Empty : CgroupProcsReadStatus::Success;
+        return result;
     }
+
+    inline std::vector<std::string> scan_cgroup2_dirs()
+    {
+        std::vector<std::string> dirs;
+        auto mount = discover_cgroup2_mount();
+        if (mount.empty()) {
+            return dirs;
+        }
+
+        std::error_code ec;
+        fs::recursive_directory_iterator it(
+            mount,
+            fs::directory_options::skip_permission_denied,
+            ec);
+        fs::recursive_directory_iterator end;
+        while (!ec && it != end) {
+            if (it->is_directory(ec) && !ec) {
+                dirs.push_back(it->path().string());
+            }
+            it.increment(ec);
+        }
+        if (ec) {
+            spdlog::warn("Utils: cgroup2 scan stopped early at {}: {}", mount, ec.message());
+        }
+        return dirs;
+    }
+
     inline std::string executableDir() {
         char buf[PATH_MAX + 1] = {};
         ssize_t len = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -223,12 +430,6 @@ namespace Utils
         }
         
         return result;
-    }
-
-    inline std::string error_message_from_errno(int errnum) {
-        char buf[256];
-        char* msg = strerror_r(errnum, buf, sizeof(buf));
-        return std::string(msg);
     }
 
     /// 惰性获取 HTCondor COLLECTOR_HOST 作为集群名称。
