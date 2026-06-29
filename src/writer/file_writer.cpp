@@ -77,13 +77,24 @@ bool FileWriter::flush_impl(const std::vector<write_data>& batch)
 
         json parsed_data;
         auto parser_func = CollectorRegistry::instance().getCollectorParser(collect_name, type_);
-        try {
-            auto parsed = parser_func(any_data);
-            parsed_data = std::any_cast<json>(parsed);
-        } catch (const std::exception& e) {
-            spdlog::error("file_writer: failed to parse data for collector '{}': {}", collect_name, e.what());
-            parsed_data["error"] = std::string(e.what());
-            all_success = false;
+        if (!parser_func) {
+            // 如果 collector 没有为当前 writer 注册 parser，直接将数据转为 JSON 字符串
+            spdlog::debug("file_writer: no parser registered for collector '{}', using raw data dump", collect_name);
+            try {
+                auto raw = std::any_cast<std::string>(any_data);
+                parsed_data["raw"] = raw;
+            } catch (const std::bad_any_cast&) {
+                parsed_data["raw"] = "(non-string data)";
+            }
+        } else {
+            try {
+                auto parsed = parser_func(any_data);
+                parsed_data = std::any_cast<json>(parsed);
+            } catch (const std::exception& e) {
+                spdlog::error("file_writer: failed to parse data for collector '{}': {}", collect_name, e.what());
+                parsed_data["error"] = std::string(e.what());
+                all_success = false;
+            }
         }
 
         doc["data"] = parsed_data;

@@ -632,6 +632,55 @@ CollectDataParseFunc NetUsageCollector::get_writer_parser(const std::string& wri
         };
     }
 
+    if(writer_type.compare("FileWriter") == 0){
+        func = [this](std::any data)->std::any{
+            nlohmann::json ret;
+            if(data.has_value() == false) {
+                spdlog::warn("NetUsageCollector: error FileWriter parser, empty data");
+                ret["error"] = "empty data";
+                return ret;
+            }
+            ret["process_data"] = nlohmann::json::array();
+            auto parsed = std::any_cast<std::vector<NetInfo>>(data);
+            for (const auto& info : parsed) {
+                nlohmann::json j;
+                j["pid"] = info.pid;
+                j["connections"] = nlohmann::json::array();
+                for (const auto& c : info.connections) {
+                    nlohmann::json cj;
+                    cj["proto"] = (c.proto == L4Proto::TCP) ? "TCP" : "UDP";
+                    cj["state"] = static_cast<int>(c.state);
+                    cj["local_addr"] = c.local.addr;
+                    cj["local_port"] = c.local.port;
+                    cj["peer_addr"]  = c.peer.addr;
+                    cj["peer_port"]  = c.peer.port;
+                    cj["recv_q"]    = c.recv_q;
+                    cj["send_q"]    = c.send_q;
+                    cj["sent"]      = c.sent;
+                    cj["recv"]      = c.recv;
+                    cj["send_rate"] = c.send_rate;
+                    cj["recv_rate"] = c.recv_rate;
+                    cj["delivery_rate"] = c.delivery_rate;
+                    cj["uid"]       = c.uid;
+                    cj["inode"]     = c.inode;
+                    cj["fd"]        = c.fd;
+                    cj["retrans"]   = c.retrans;
+                    cj["rto"]       = c.rto;
+                    cj["rtt"]       = c.rtt;
+                    cj["rtt_var"]   = c.rtt_var;
+                    cj["fd_path"]   = fd_to_path(info.pid, c.fd);
+                    j["connections"].push_back(std::move(cj));
+                }
+                if (info.pid == 0){
+                    if (summary) ret["summary"] = j;
+                }else{
+                    ret["process_data"].push_back(j);
+                }
+            }
+            return ret;
+        };
+    }
+
     if(writer_type.compare("PrometheusExporterWriter") == 0){
         func = [this](std::any data)->std::any{
             PrometheusExporterWriter::prometheus_job_state ret;

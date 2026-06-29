@@ -25,7 +25,10 @@ job_registry_config:
 # ============================================================
 collectors_config:
   enable_collector_perf: false               # Disable collector performance counters
+  perf_window_size: 1000                     # Required when enable_collector_perf=true
   default_freq: 1                            # Default sampling frequency (Hz)
+  default_use_writers:                       # Default writer list, used when collector doesn't specify
+    - file_writer
   collectors:
     - name: cpumem_collector
       type: CPUMemCollector

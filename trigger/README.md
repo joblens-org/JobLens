@@ -184,18 +184,21 @@ Manually triggers a configuration update (invokes the configuration manager's ca
 ## Deployment Guide
 
 ### RPM Deployment (Recommended)
-```bash
-# Build the Trigger RPM
-bash scripts/build-trigger-rpm.sh
 
-# Install the RPM
-sudo rpm -ivh ~/rpmbuild/RPMS/x86_64/joblens-trigger-*.rpm
+The Trigger is now packaged together with the JobLens Core Agent in a **unified RPM** built by `scripts/build-unified-rpm.sh`.
+
+```bash
+# Build the unified RPM (contains both Core Agent + Trigger)
+bash scripts/build-unified-rpm.sh
+
+# Install the unified RPM
+sudo rpm -ivh ~/rpmbuild/RPMS/x86_64/joblens-*.rpm
 ```
-The RPM will:
-1. Create a Python virtual environment at `/usr/lib/joblens-trigger/venv/`
-2. Install dependencies into the venv
-3. Install systemd service file and configuration
-4. Enable and start the service
+The unified RPM will:
+1. Install the JobLens Core binary and eBPF objects
+2. Create a Python virtual environment at `/usr/lib/joblens/trigger-venv/` for the Trigger
+3. Install systemd service files for both `joblens` and `joblens-trigger`
+4. Enable and start both services
 
 ### Manual Deployment
 
@@ -210,7 +213,7 @@ After=network.target
 User=<username>
 WorkingDirectory=/var/lib/joblens
 Environment="JOBLENS_CONFIG_PATH=/etc/JobLens/config.yaml"
-ExecStart=/usr/lib/joblens-trigger/venv/bin/gunicorn --config /etc/JobLens/trigger/gunicorn.conf.py trigger.app:app
+ExecStart=/usr/lib/joblens/trigger-venv/bin/gunicorn --config /etc/JobLens/trigger/gunicorn.conf.py trigger.app:app
 Restart=on-failure
 RestartSec=3
 StartLimitInterval=0
@@ -261,8 +264,7 @@ trigger/
 ├── version.py         # Version info
 ├── setup.py           # Package setup
 ├── config.example.yaml # Trigger configuration example
-├── joblens-trigger.service  # systemd service unit
-├── joblens-trigger.spec     # RPM spec file
+├── joblens-trigger.service  # systemd service unit (included in unified RPM)
 ├── regustry_api_doc.md      # Registry API documentation
 └── README.md          # This document
 ```

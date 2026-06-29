@@ -13,8 +13,8 @@
  * limitations under the License. */
 #pragma once
 
-// 由 CMake target_compile_definitions 在构建时注入实际路径（lib 或 lib64）
-// clangd / 非 CMake 环境使用默认值 "lib"
+// 由 CMake target_compile_definitions 在构建时注入实际路径
+// clangd / 非 CMake 环境使用默认值 "lib64"
 #ifndef JOBLENS_INSTALL_LIBDIR
 #define JOBLENS_INSTALL_LIBDIR "lib64"
 #endif
