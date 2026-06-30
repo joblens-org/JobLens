@@ -71,6 +71,24 @@ struct PowerSnapshot {
     double total_weighted_ns;    // denominator =  t × Σ freq
     double system_overhead_j;    // RAPL energy not attributed to any job
     std::vector<PowerPerJob> jobs;
+
+    /* ── WLCG standard metrics ───────────────────────────────────────── */
+    double avg_power_w = 0.0;        // ΔE_pkg / interval_s  (average package watts)
+    double pue_corrected_j = 0.0;    // ΔE_pkg × PUE  (total facility energy estimate)
+    double co2_equivalent_g = 0.0;   // facility energy → CO₂  (g)
+    double hs23_per_watt = 0.0;      // HS23 score / watt  (if HS23 score provided)
+};
+
+/* ── power_bench calibration reference (optional validation baseline) ───── */
+struct CalibrationRef {
+    bool     valid = false;
+    double   rapl_idle_w = 0.0;      // RAPL idle power (W)
+    double   ipmi_idle_w = 0.0;      // IPMI idle power (W)
+    double   static_overhead_w = 0.0; // IPMI − RAPL gap
+    double   per_core_w = 0.0;       // (full − idle) / cores
+    double   full_rapl_w = 0.0;      // RAPL full load power (W)
+    int      core_count = 0;
+    std::string source_path;         // path to the summary.json that was loaded
 };
 
 class PowerCollector : public ICollector {
@@ -124,4 +142,14 @@ private:
 
     /* timing */
     std::chrono::steady_clock::time_point last_collect_ts_;
+
+    /* ── WLCG / site-level parameters ──────────────────────────────── */
+    double pue_ = 1.0;                      // Power Usage Effectiveness (default: 1.0 = no correction)
+    double carbon_intensity_g_per_kwh_ = 0.0; // grid carbon intensity (g CO₂/kWh)
+    double hs23_score_ = 0.0;              // HS23 benchmark score (0 = not available)
+
+    /* ── power_bench calibration reference ────────────────────────── */
+    CalibrationRef cal_ref_;
+    void load_calibration_ref(const nlohmann::json& cfg);
+    void validate_against_baseline(const PowerSnapshot& snap);
 };

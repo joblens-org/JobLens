@@ -35,6 +35,7 @@
 #include "core/job_registry.hpp"
 #include "common/ebpf_common.hpp"
 #include "common/utils.hpp"
+#include "writer/prometheus_exporter_writer.hpp"
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -45,6 +46,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <unistd.h>
@@ -58,9 +60,12 @@ AUTO_REGISTER_SYSTEM_COLLECTOR(
     "proportional to frequency-weighted CPU time: "
     "E_job =  E_pkg ×  (t_c × f_c)_job /  (t_c × f_c)_all.",
     ConfigParams{
-        {"freq",         "Sampling frequency in Hz (default 1.0 = 1s intervals)"},
-        {"use_writers",  "Writer names for output (e.g. file_writer)"},
-        {"auto_start",   "Auto-start on daemon launch (true/false, default true)"},
+        {"freq",                      "Sampling frequency in Hz (default 1.0 = 1s intervals)"},
+        {"use_writers",               "Writer names for output (e.g. file_writer, PrometheusExporterWriter)"},
+        {"auto_start",                "Auto-start on daemon launch (true/false, default true)"},
+        {"pue",                       "Power Usage Effectiveness for facility-level correction (default 1.0)"},
+        {"carbon_intensity_g_per_kwh","Grid carbon intensity in g CO₂/kWh for emissions estimation (default 0)"},
+        {"hs23_score",                "HS23 benchmark score for HS23/Watt metric (default 0 = not available)"},
     }
 )
 
@@ -429,10 +434,153 @@ PowerSnapshot PowerCollector::compute_energy(
     }
     if (snap.system_overhead_j < 0.0) snap.system_overhead_j = 0.0;
 
+    /* ── WLCG standard metrics ──────────────────────────────────────── */
+    snap.avg_power_w = (interval_s > 0.0)
+        ? snap.delta_rapl_j / interval_s
+        : 0.0;
+    snap.pue_corrected_j = snap.delta_rapl_j * pue_;
+    /* ΔE_pkg(J) → kWh → CO₂(g): delta_rapl_j / 3.6e6 * carbon_intensity_g_per_kwh_ */
+    snap.co2_equivalent_g = snap.delta_rapl_j / 3.6e6 * carbon_intensity_g_per_kwh_;
+    /* HS23/watt = hs23_score / avg_power_w */
+    snap.hs23_per_watt = (hs23_score_ > 0.0 && snap.avg_power_w > 0.0)
+        ? hs23_score_ / snap.avg_power_w
+        : 0.0;
+
     spdlog::debug("PowerCollector: computed energy —  E={:.2f} J, jobs={}, overhead={:.2f} J, interval={:.3f} s",
                   snap.delta_rapl_j, snap.jobs.size(), snap.system_overhead_j, interval_s);
 
     return snap;
+}
+
+/* ── power_bench calibration reference ───────────────────────────────────── */
+
+void PowerCollector::load_calibration_ref(const nlohmann::json& cfg)
+{
+    if (!cfg.contains("calibration_ref")) return;
+
+    const auto& cr = cfg["calibration_ref"];
+    if (!cr.is_object()) return;
+
+    /* Check if calibration is explicitly disabled */
+    if (cr.contains("enabled")) {
+        bool enabled = false;
+        if (cr["enabled"].is_boolean()) enabled = cr["enabled"].get<bool>();
+        else if (cr["enabled"].is_string()) {
+            auto s = cr["enabled"].get<std::string>();
+            enabled = (s == "true" || s == "1");
+        }
+        if (!enabled) {
+            spdlog::info("PowerCollector: calibration_ref disabled in config");
+            return;
+        }
+    }
+
+    /* Try loading from bench_summary file path */
+    if (cr.contains("bench_summary") && cr["bench_summary"].is_string()) {
+        std::string path = cr["bench_summary"].get<std::string>();
+        std::ifstream f(path);
+        if (f.is_open()) {
+            try {
+                json summary = json::parse(f);
+                // power_bench summary.json structure:
+                // {"idle": {"pkg": {"avg": 66.2, ...}, "ipmi": {"avg": 118, ...}}, "full": {...}}
+                auto parse_stats = [&summary](const std::string& label,
+                                               const std::string& kind) -> double {
+                    if (summary.contains(label) && summary[label].contains(kind)
+                        && summary[label][kind].contains("avg"))
+                        return summary[label][kind]["avg"].get<double>();
+                    return 0.0;
+                };
+                cal_ref_.rapl_idle_w = parse_stats("idle", "pkg");
+                cal_ref_.ipmi_idle_w = parse_stats("idle", "ipmi");
+                cal_ref_.full_rapl_w = parse_stats("full", "pkg");
+                cal_ref_.static_overhead_w = cal_ref_.ipmi_idle_w - cal_ref_.rapl_idle_w;
+                int bench_cores = 0;
+                if (summary.contains("idle") && summary["idle"].contains("pkg")
+                    && summary["idle"]["pkg"].contains("n"))
+                    bench_cores = core_count_; // use current core count as fallback
+                // Infer per_core from full - idle delta
+                cal_ref_.per_core_w = (bench_cores > 0 && cal_ref_.full_rapl_w > 0.0)
+                    ? (cal_ref_.full_rapl_w - cal_ref_.rapl_idle_w) / bench_cores
+                    : 0.0;
+                cal_ref_.core_count = bench_cores;
+                cal_ref_.source_path = path;
+                cal_ref_.valid = (cal_ref_.rapl_idle_w > 0.0);
+            } catch (const std::exception& e) {
+                spdlog::warn("PowerCollector: failed to parse calibration_ref summary '{}': {}",
+                             path, e.what());
+                return;
+            }
+        } else {
+            spdlog::warn("PowerCollector: calibration_ref bench_summary '{}' not found", path);
+            return;
+        }
+    }
+
+    /* Allow inline override/addition of specific values */
+    auto try_get = [&cr](const char* key) -> std::optional<double> {
+        if (!cr.contains(key)) return std::nullopt;
+        const auto& v = cr[key];
+        if (v.is_number()) return v.get<double>();
+        if (v.is_string()) {
+            try { return std::stod(v.get<std::string>()); }
+            catch (...) { return std::nullopt; }
+        }
+        return std::nullopt;
+    };
+    if (auto v = try_get("rapl_idle_w"))    cal_ref_.rapl_idle_w = *v;
+    if (auto v = try_get("ipmi_idle_w"))    cal_ref_.ipmi_idle_w = *v;
+    if (auto v = try_get("static_overhead_w")) cal_ref_.static_overhead_w = *v;
+    if (auto v = try_get("per_core_w"))     cal_ref_.per_core_w = *v;
+    if (auto v = try_get("full_rapl_w"))    cal_ref_.full_rapl_w = *v;
+    if (auto v = try_get("core_count"))     cal_ref_.core_count = static_cast<int>(*v);
+
+    /* Mark valid if at least RAPL idle baseline is set */
+    if (cal_ref_.rapl_idle_w > 0.0) cal_ref_.valid = true;
+
+    if (cal_ref_.valid) {
+        spdlog::info("PowerCollector: calibration_ref loaded — "
+                     "RAPL_idle={:.1f}W IPMI_idle={:.1f}W static={:.1f}W per_core={:.1f}W source={}",
+                     cal_ref_.rapl_idle_w, cal_ref_.ipmi_idle_w,
+                     cal_ref_.static_overhead_w, cal_ref_.per_core_w,
+                     cal_ref_.source_path.empty() ? "(inline)" : cal_ref_.source_path);
+    }
+}
+
+void PowerCollector::validate_against_baseline(const PowerSnapshot& snap)
+{
+    if (!cal_ref_.valid || snap.interval_s < 0.5) return; // skip first short sample
+
+    double current_w = snap.avg_power_w;
+    double baseline_w = cal_ref_.rapl_idle_w;
+
+    if (baseline_w <= 0.0) return;
+
+    double deviation_pct = 100.0 * std::abs(current_w - baseline_w) / baseline_w;
+
+    /* Warn if idle-like power deviates >30% from power_bench baseline */
+    if (deviation_pct > 30.0) {
+        spdlog::warn("PowerCollector: avg_power={:.1f}W deviates {:.0f}% from power_bench "
+                     "baseline RAPL_idle={:.1f}W — possible hardware change or misconfiguration",
+                     current_w, deviation_pct, baseline_w);
+    }
+
+    /* Also check per_core increment if jobs are running */
+    if (cal_ref_.per_core_w > 0.0 && !snap.jobs.empty()) {
+        for (const auto& job : snap.jobs) {
+            double job_w = (snap.interval_s > 0.0) ? job.energy_j / snap.interval_s : 0.0;
+            int pid_count = static_cast<int>(job.pids.size());
+            if (pid_count == 0) continue;
+            double per_pid_w = job_w / pid_count;
+
+            /* Range check: per-PID watt should be within [0.1×, 5×] of baseline per-core */
+            if (per_pid_w > cal_ref_.per_core_w * 5.0) {
+                spdlog::warn("PowerCollector: Job {} per-PID power {:.1f}W > 5× baseline "
+                             "per_core {:.1f}W — possible frequency anomaly",
+                             job.job_id, per_pid_w, cal_ref_.per_core_w);
+            }
+        }
+    }
 }
 
 /* ── ICollector lifecycle ───────────────────────────────────────────────── */
@@ -459,6 +607,25 @@ bool PowerCollector::init(const nlohmann::json& cfg)
     core_count_ = detect_core_count();
     spdlog::info("PowerCollector: {} CPU cores detected", core_count_);
 
+    /* ── WLCG / site-level config ─────────────────────────────────── */
+    auto try_get_double = [&cfg](const char* key) -> std::optional<double> {
+        if (!cfg.contains(key)) return std::nullopt;
+        const auto& v = cfg[key];
+        if (v.is_number()) return v.get<double>();
+        if (v.is_string()) {
+            try { return std::stod(v.get<std::string>()); }
+            catch (...) { return std::nullopt; }
+        }
+        return std::nullopt;
+    };
+
+    if (auto v = try_get_double("pue")) pue_ = *v;
+    if (auto v = try_get_double("carbon_intensity_g_per_kwh")) carbon_intensity_g_per_kwh_ = *v;
+    if (auto v = try_get_double("hs23_score")) hs23_score_ = *v;
+
+    spdlog::info("PowerCollector: WLCG params — PUE={:.2f}, carbon={:.0f} g/kWh, HS23={:.0f}",
+                 pue_, carbon_intensity_g_per_kwh_, hs23_score_);
+
     /* Load eBPF */
     if (!load_ebpf()) {
         spdlog::error("PowerCollector: eBPF load failed");
@@ -469,6 +636,9 @@ bool PowerCollector::init(const nlohmann::json& cfg)
     if (rapl_valid_) {
         last_rapl_uj_ = read_rapl_uj();
     }
+
+    /* Load power_bench calibration reference (optional) */
+    load_calibration_ref(cfg);
 
     last_collect_ts_ = std::chrono::steady_clock::now();
 
@@ -526,6 +696,9 @@ CollectResult PowerCollector::collect()
     /* ── 5. Compute per-job energy ── */
     snap = compute_energy(tasks, delta_uj, interval_s, freqs);
 
+    /* ── 6. Validate against power_bench baseline (if loaded) ── */
+    validate_against_baseline(snap);
+
     return snap;
 }
 
@@ -534,7 +707,7 @@ CollectResult PowerCollector::collect()
 CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer_type)
 {
     if (writer_type == "FileWriter") {
-        return [](std::any data) -> std::any {
+        return [this](std::any data) -> std::any {
             if (!data.has_value()) {
                 json err;
                 err["error"] = "empty data";
@@ -557,6 +730,23 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
             j["core_count"]        = snap.core_count;
             j["total_weighted_ns"] = snap.total_weighted_ns;
             j["system_overhead_j"] = snap.system_overhead_j;
+
+            /* ── WLCG standard metrics ── */
+            j["avg_power_w"]       = snap.avg_power_w;
+            j["pue_corrected_j"]   = snap.pue_corrected_j;
+            j["co2_equivalent_g"]  = snap.co2_equivalent_g;
+            j["hs23_per_watt"]     = snap.hs23_per_watt;
+
+            /* calibration reference (if loaded) */
+            if (cal_ref_.valid) {
+                json cr;
+                cr["rapl_idle_w"]      = cal_ref_.rapl_idle_w;
+                cr["ipmi_idle_w"]      = cal_ref_.ipmi_idle_w;
+                cr["static_overhead_w"] = cal_ref_.static_overhead_w;
+                cr["per_core_w"]       = cal_ref_.per_core_w;
+                cr["source"]           = cal_ref_.source_path;
+                j["calibration_ref"]  = cr;
+            }
 
             /* average core frequency */
             if (!snap.core_freqs_mhz.empty()) {
@@ -591,11 +781,63 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
         };
     }
 
-    if (writer_type == "ESWriter") {
+    if (writer_type == "PrometheusExporterWriter") {
         return [](std::any data) -> std::any {
-            /* Reuse the same JSON formatter as FileWriter */
-            auto file_parser = PowerCollector().get_writer_parser("FileWriter");
-            return file_parser(data);
+            if (!data.has_value()) {
+                PrometheusExporterWriter::prometheus_job_state empty;
+                return empty;
+            }
+
+            PowerSnapshot snap;
+            try {
+                snap = std::any_cast<PowerSnapshot>(data);
+            } catch (const std::bad_any_cast& e) {
+                spdlog::error("PowerCollector: Prometheus parser bad any_cast — {}", e.what());
+                PrometheusExporterWriter::prometheus_job_state empty;
+                return empty;
+            }
+
+            PrometheusExporterWriter::prometheus_job_state ret;
+            ret.JobID = 0;  // system-scoped, no single JobID
+
+            double total_energy = snap.delta_rapl_j;
+            for (const auto& job : snap.jobs) {
+                PrometheusExporterWriter::prometheus_process_state state = {};
+                /* Semantic field mapping for power metrics:
+                 *   job_id / pid → job identifier
+                 *   name         → native_job_id (scheduler-native ID string)
+                 *   cpu_usage_percent → energy_j  (attributed energy in Joules)
+                 *   mem_usage_percent → energy_share (this job's fraction of total)
+                 *   mem_rss_kb    → avg_power_w (J / interval_s)
+                 *   mem_vm_kb     → weighted_ns (ns·MHz total for this job)
+                 *   threads_cnt   → pid_count (number of processes in this job)
+                 */
+                state.job_id = static_cast<uint32_t>(job.job_id);
+                state.pid    = static_cast<pid_t>(job.job_id);
+                state.name   = job.native_job_id.empty()
+                                   ? "job_" + std::to_string(job.job_id)
+                                   : job.native_job_id;
+                state.cpu_usage_percent = job.energy_j;
+                state.mem_usage_percent = (total_energy > 0.0)
+                    ? 100.0 * job.energy_j / total_energy
+                    : 0.0;
+                state.mem_rss_kb = (snap.interval_s > 0.0)
+                    ? static_cast<int64_t>(job.energy_j / snap.interval_s)
+                    : 0;
+                state.mem_vm_kb   = static_cast<int64_t>(job.weighted_ns_total);
+                state.threads_cnt = static_cast<int32_t>(job.pids.size());
+
+                ret.processes_state.push_back(state);
+            }
+
+            return ret;
+        };
+    }
+
+    if (writer_type == "ESWriter") {
+        return [this](std::any data) -> std::any {
+            /* Reuse the FileWriter JSON formatter from this instance */
+            return get_writer_parser("FileWriter")(data);
         };
     }
 

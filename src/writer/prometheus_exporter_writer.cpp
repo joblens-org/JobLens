@@ -47,6 +47,7 @@ enum class PrmxsCollectorType{
     CPUMem,
     IO,
     Net,
+    Power,
     UNKNOWN
 };
 
@@ -54,7 +55,8 @@ static inline PrmxsCollectorType type2enum(const std::string& type){
     static const std::unordered_map<std::string, PrmxsCollectorType> map = {
         {"CPUMemCollector", PrmxsCollectorType::CPUMem},
         {"NetUsageCollector", PrmxsCollectorType::Net},
-        {"IOUsageCollector", PrmxsCollectorType::IO}
+        {"IOUsageCollector", PrmxsCollectorType::IO},
+        {"PowerCollector", PrmxsCollectorType::Power}
     };
     auto it = map.find(type);
     return (it != map.end()) ? it->second : PrmxsCollectorType::UNKNOWN;
@@ -115,6 +117,21 @@ void PrometheusExporterWriter::update_job_metrics(const prometheus_job_state& da
                 update_ref->net_sent_bytes_total = s.net_sent_bytes_total;
                 update_ref->tcp_retrans_total = s.tcp_retrans_total;
                 update_ref->tcp_rtt_us = s.tcp_rtt_us;
+                break;
+            case PrmxsCollectorType::Power:
+                /* Reuse existing fields with power semantics:
+                 *   cpu_usage_percent → energy_j (Joules attributed to this job)
+                 *   mem_usage_percent → energy_pct (this job's share of total RAPL)
+                 *   mem_rss_kb        → avg_power_w (J / interval_s)
+                 *   mem_vm_kb         → weighted_ns (ns·MHz total)
+                 *   threads_cnt       → pid_count (processes in this job)
+                 */
+                update_ref->name = s.name;
+                update_ref->cpu_usage_percent = s.cpu_usage_percent;
+                update_ref->mem_usage_percent = s.mem_usage_percent;
+                update_ref->mem_rss_kb = s.mem_rss_kb;
+                update_ref->mem_vm_kb = s.mem_vm_kb;
+                update_ref->threads_cnt = s.threads_cnt;
                 break;
             case PrmxsCollectorType::UNKNOWN:
                 spdlog::warn("PrometheusExporterWriter: type2enum get UNKNOW for {}", type);
