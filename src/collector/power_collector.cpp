@@ -41,8 +41,12 @@
 #include <bpf/libbpf.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
@@ -446,6 +450,48 @@ PowerSnapshot PowerCollector::compute_energy(
         ? hs23_score_ / snap.avg_power_w
         : 0.0;
 
+    /* ── Gap 2: Cumulative kWh accumulator (对标 GLASGOW power_plus.py) ── */
+    /* ΔE_pkg (J) → kWh */
+    double delta_kwh = snap.delta_rapl_j / 3.6e6;
+    cumulative_kwh_total_ += delta_kwh;
+    snap.cumulative_kwh_total = cumulative_kwh_total_;
+    for (auto& job : snap.jobs) {
+        double job_kwh = job.energy_j / 3.6e6;
+        cumulative_kwh_by_job_[job.job_id] += job_kwh;
+        snap.cumulative_kwh_by_job[job.job_id] = cumulative_kwh_by_job_[job.job_id];
+    }
+
+    /* ── Gap 2: Extract VO from job metadata ──────────────────────────── */
+    /* (re-invoke JobRegistry to get full Job objects with scheduler metadata) */
+    {
+        auto jobs = JobRegistry::instance().snapshot();
+        std::unordered_map<uint64_t, const Job*> job_map;
+        for (const auto& j : jobs) job_map[j.JobID] = &j;
+
+        for (auto& job : snap.jobs) {
+            auto it = job_map.find(job.job_id);
+            if (it != job_map.end()) {
+                job.vo = extract_vo_from_job(*it->second);
+            } else {
+                job.vo = "unknown";
+            }
+        }
+    }
+
+    /* ── Gap 3: IPMI cross-validation log ─────────────────────────────── */
+    /* (the actual IPMI value is set in collect() → snap.ipmi_power_w;
+     *   here we just log the comparison as a soft validation) */
+    if (snap.ipmi_power_w > 0.0 && snap.avg_power_w > 0.0) {
+        double ratio = snap.ipmi_power_w / snap.avg_power_w;
+        if (ratio < 0.8 || ratio > 2.5) {
+            spdlog::warn("PowerCollector: IPMI/RAPL ratio={:.2f} (IPMI={:.0f}W, RAPL_avg={:.1f}W) — "
+                         "possible IPMI stale reading or RAPL counter issue",
+                         ratio, snap.ipmi_power_w, snap.avg_power_w);
+        }
+        spdlog::debug("PowerCollector: IPMI cross-check — IPMI={:.0f}W, RAPL_avg={:.1f}W, ratio={:.2f}",
+                      snap.ipmi_power_w, snap.avg_power_w, ratio);
+    }
+
     spdlog::debug("PowerCollector: computed energy —  E={:.2f} J, jobs={}, overhead={:.2f} J, interval={:.3f} s",
                   snap.delta_rapl_j, snap.jobs.size(), snap.system_overhead_j, interval_s);
 
@@ -583,6 +629,130 @@ void PowerCollector::validate_against_baseline(const PowerSnapshot& snap)
     }
 }
 
+/* ── CPU governor (Gap 1, 对标 DESY) ─────────────────────────────────────── */
+
+std::vector<std::string> PowerCollector::read_cpu_governors()
+{
+    std::vector<std::string> governors;
+    governors.reserve(core_count_);
+
+    for (int cpu = 0; cpu < core_count_; ++cpu) {
+        std::string path = "/sys/devices/system/cpu/cpu"
+                         + std::to_string(cpu)
+                         + "/cpufreq/scaling_governor";
+        std::ifstream f(path);
+        std::string gov = "unknown";
+        if (f.is_open()) {
+            std::getline(f, gov);
+            if (gov.empty()) gov = "unknown";
+        }
+        governors.push_back(gov);
+    }
+    return governors;
+}
+
+/* ── IPMI cross-validation (Gap 3, 对标 GLASGOW power_plus.py) ───────────── */
+
+bool PowerCollector::detect_ipmi()
+{
+    /* Try ipmi-dcmi first (newer, better output), then ipmitool */
+    if (system("which ipmi-dcmi >/dev/null 2>&1") == 0) {
+        ipmi_cmd_ = "ipmi-dcmi --get-system-power-statistics";
+        ipmi_available_ = true;
+    } else if (system("which ipmitool >/dev/null 2>&1") == 0) {
+        ipmi_cmd_ = "ipmitool dcmi power reading";
+        ipmi_available_ = true;
+    } else {
+        ipmi_available_ = false;
+    }
+
+    spdlog::info("PowerCollector: IPMI {} (cmd={})",
+                 ipmi_available_ ? "available" : "unavailable",
+                 ipmi_available_ ? ipmi_cmd_ : "n/a");
+    return ipmi_available_;
+}
+
+double PowerCollector::read_ipmi_watts()
+{
+    if (!ipmi_available_) return 0.0;
+
+    double w = 0.0;
+    std::string cmd = ipmi_cmd_ + " 2>/dev/null";
+    FILE* fp = popen(cmd.c_str(), "r");
+    if (!fp) return 0.0;
+
+    char buf[256];
+    std::string output;
+    while (fgets(buf, sizeof(buf), fp)) output += buf;
+    pclose(fp);
+
+    /* Parse: "Current Power : 285 Watts" or "Instantaneous power reading: 285 Watts" */
+    if (ipmi_cmd_.find("ipmi-dcmi") != std::string::npos) {
+        auto pos = output.find("Current Power");
+        if (pos != std::string::npos) {
+            /* Find digits after "Current Power" */
+            const char* p = output.c_str() + pos + 13; // skip "Current Power"
+            while (*p && !std::isdigit(*p)) ++p;
+            w = std::atof(p);
+        }
+    } else {
+        auto pos = output.find("Instantaneous power reading");
+        if (pos != std::string::npos) {
+            /* Split by spaces, 4th token is the number */
+            std::istringstream iss(output.substr(pos));
+            std::string token;
+            for (int i = 0; i < 4; ++i) iss >> token;
+            w = std::atof(token.c_str());
+        }
+    }
+    return w;
+}
+
+/* ── VO extraction (Gap 2, 对标 GLASGOW node_get_condorinfo.sh) ─────────── */
+
+std::string PowerCollector::extract_vo_from_job(const Job& job)
+{
+    /* GLASGOW approach: infer VO from HTCondor RemoteUser pattern.
+     * In JobLens, the CondorJobAttr has an 'owner' field (user identity)
+     * and SlurmJobAttr has a 'user' field.
+     *
+     * Pattern matching based on GLASGOW's node_get_condorinfo.sh:
+     *   atlas* → ATLAS, cms* → CMS, alice* → ALICE, lhcb* → LHCb
+     */
+    std::string user;
+
+    std::visit([&user](const auto& attr) {
+        using T = std::decay_t<decltype(attr)>;
+        if constexpr (std::is_same_v<T, CondorJobAttr>) {
+            user = attr.owner;
+        } else if constexpr (std::is_same_v<T, SlurmJobAttr>) {
+            user = attr.user;
+        }
+    }, job.sub_attr);
+
+    if (user.empty()) return "unknown";
+
+    /* VO inference from username pattern */
+    std::string lower = user;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+    if (lower.find("atlas") != std::string::npos || lower.find("atl") != std::string::npos)
+        return "ATLAS";
+    if (lower.find("cms") != std::string::npos)
+        return "CMS";
+    if (lower.find("alice") != std::string::npos)
+        return "ALICE";
+    if (lower.find("lhcb") != std::string::npos || lower.find("lhc") != std::string::npos)
+        return "LHCb";
+    if (lower.find("dune") != std::string::npos)
+        return "DUNE";
+    if (lower.find("juno") != std::string::npos)
+        return "JUNO";
+
+    /* Return raw user as VO for non-LHC experiments */
+    return user;
+}
+
 /* ── ICollector lifecycle ───────────────────────────────────────────────── */
 
 bool PowerCollector::init(const nlohmann::json& cfg)
@@ -631,6 +801,9 @@ bool PowerCollector::init(const nlohmann::json& cfg)
         spdlog::error("PowerCollector: eBPF load failed");
         return false;
     }
+
+    /* Detect IPMI for cross-validation (Gap 3) */
+    detect_ipmi();
 
     /* Seed first RAPL reading */
     if (rapl_valid_) {
@@ -687,16 +860,22 @@ CollectResult PowerCollector::collect()
     }
     last_rapl_uj_ = rapl_now;
 
-    /* ── 3. Read CPU frequencies ── */
+    /* ── 3. Read CPU frequencies & governors (Gap 1) ── */
     auto freqs = read_cpu_freqs_mhz();
+    auto governors = read_cpu_governors();
 
-    /* ── 4. Dump eBPF task runtime ── */
+    /* ── 4. IPMI cross-validation snapshot (Gap 3) ── */
+    double ipmi_w = ipmi_available_ ? read_ipmi_watts() : 0.0;
+
+    /* ── 5. Dump eBPF task runtime ── */
     auto tasks = dump_task_cpu_time();
 
-    /* ── 5. Compute per-job energy ── */
+    /* ── 6. Compute per-job energy ── */
     snap = compute_energy(tasks, delta_uj, interval_s, freqs);
+    snap.core_governors = std::move(governors);
+    snap.ipmi_power_w = ipmi_w;
 
-    /* ── 6. Validate against power_bench baseline (if loaded) ── */
+    /* ── 7. Validate against power_bench baseline (if loaded) ── */
     validate_against_baseline(snap);
 
     return snap;
@@ -737,6 +916,32 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
             j["co2_equivalent_g"]  = snap.co2_equivalent_g;
             j["hs23_per_watt"]     = snap.hs23_per_watt;
 
+            /* ── Gap 1: CPU governors ── */
+            if (!snap.core_governors.empty()) {
+                j["core_governors"] = snap.core_governors;
+                /* summary: count unique governor modes */
+                std::unordered_map<std::string, int> gov_count;
+                for (const auto& g : snap.core_governors) gov_count[g]++;
+                json jg = json::object();
+                for (const auto& [gov, cnt] : gov_count) jg[gov] = cnt;
+                j["governor_summary"] = jg;
+            }
+
+            /* ── Gap 2: Cumulative kWh ── */
+            j["cumulative_kwh_total"] = snap.cumulative_kwh_total;
+            if (!snap.cumulative_kwh_by_job.empty()) {
+                json ck = json::object();
+                for (const auto& [jid, kwh] : snap.cumulative_kwh_by_job) {
+                    ck[std::to_string(jid)] = kwh;
+                }
+                j["cumulative_kwh_by_job"] = ck;
+            }
+
+            /* ── Gap 3: IPMI cross-validation ── */
+            if (snap.ipmi_power_w > 0.0) {
+                j["ipmi_power_w"] = snap.ipmi_power_w;
+            }
+
             /* calibration reference (if loaded) */
             if (cal_ref_.valid) {
                 json cr;
@@ -760,6 +965,7 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
                 json jj;
                 jj["job_id"]            = job.job_id;
                 jj["native_job_id"]     = job.native_job_id;
+                jj["vo"]                = job.vo;
                 jj["energy_j"]          = job.energy_j;
                 jj["weighted_ns_total"] = job.weighted_ns_total;
 

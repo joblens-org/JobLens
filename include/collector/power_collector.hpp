@@ -57,6 +57,7 @@ struct PowerPerJob {
     std::string native_job_id;
     double energy_j;
     double weighted_ns_total;
+    std::string vo;              // Virtual Organization (Gap 2: from scheduler metadata)
     std::vector<PowerPerPid> pids;
 };
 
@@ -77,6 +78,16 @@ struct PowerSnapshot {
     double pue_corrected_j = 0.0;    // ΔE_pkg × PUE  (total facility energy estimate)
     double co2_equivalent_g = 0.0;   // facility energy → CO₂  (g)
     double hs23_per_watt = 0.0;      // HS23 score / watt  (if HS23 score provided)
+
+    /* ── Gap 1: CPU governor (对标 DESY) ─────────────────────────────── */
+    std::vector<std::string> core_governors;
+
+    /* ── Gap 2: Cumulative kWh accumulator (对标 GLASGOW) ────────────── */
+    double cumulative_kwh_total = 0.0;       // running total energy (kWh)
+    std::unordered_map<uint64_t, double> cumulative_kwh_by_job;  // per-job kWh
+
+    /* ── Gap 3: IPMI cross-validation (对标 GLASGOW power_plus.py) ───── */
+    double ipmi_power_w = 0.0;               // concurrent IPMI reading (W)
 };
 
 /* ── power_bench calibration reference (optional validation baseline) ───── */
@@ -115,9 +126,17 @@ private:
     std::string detect_rapl_base();
     uint64_t read_rapl_uj();
 
-    /* ── CPU frequency ─────────────────────────────────────────────── */
+    /* ── CPU frequency & governor ──────────────────────────────────── */
     std::vector<double> read_cpu_freqs_mhz();
+    std::vector<std::string> read_cpu_governors();
     int detect_core_count();
+
+    /* ── IPMI cross-validation (Gap 3) ──────────────────────────────── */
+    bool detect_ipmi();
+    double read_ipmi_watts();
+
+    /* ── VO extraction (Gap 2) ──────────────────────────────────────── */
+    std::string extract_vo_from_job(const Job& job);
 
     /* ── Energy computation ────────────────────────────────────────── */
     PowerSnapshot compute_energy(const std::vector<task_cpu_runtime>& tasks,
@@ -152,4 +171,12 @@ private:
     CalibrationRef cal_ref_;
     void load_calibration_ref(const nlohmann::json& cfg);
     void validate_against_baseline(const PowerSnapshot& snap);
+
+    /* ── Gap 2: Cumulative kWh ─────────────────────────────────────── */
+    double cumulative_kwh_total_ = 0.0;
+    std::unordered_map<uint64_t, double> cumulative_kwh_by_job_;
+
+    /* ── Gap 3: IPMI ────────────────────────────────────────────────── */
+    bool    ipmi_available_ = false;
+    std::string ipmi_cmd_;   // "ipmi-dcmi ..." or "ipmitool dcmi power reading"
 };
