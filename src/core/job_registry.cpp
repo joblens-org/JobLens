@@ -143,6 +143,7 @@ std::string json2JobOpt(const nlohmann::json& obj, Job& job) {
             .auto_update_child = obj.value("auto_update_child", true),
             .cluster_id = cid,
             .proc_id = proc,
+            .owner = sub.value("owner", ""),
         };
         job.NativeJobID = fmt::format("{}.{}", cid, proc);
     }else if (subtype.compare("slurm") == 0){
@@ -156,7 +157,8 @@ std::string json2JobOpt(const nlohmann::json& obj, Job& job) {
         job.sub_attr = SlurmJobAttr{
             .auto_update_child = obj.value("auto_update_child", true),
             .job_id = jid,
-            .step_id = sid
+            .step_id = sid,
+            .user = sub.value("user", ""),
         };
         job.NativeJobID = fmt::format("{}", jid);
     }else if (subtype.compare("common") == 0){
