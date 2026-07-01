@@ -129,6 +129,10 @@ private:
 
     bool init_ebpf(){
         auto path = Utils::JobLensRootDir() + bpf_o_path;
+        /* Dev-build fallback: try build directory's bpf_obj/ first */
+        if (access(path.c_str(), R_OK) != 0) {
+            path = "bpf_obj/trace_condor_starter.bpf.o";
+        }
         bpf_obj_ = EbpfCommon::load_bpf_obj(path, bpf_links_);
 
         ring_buffer_sample_fn fn  = [](void *ctx, void *data, size_t size){
