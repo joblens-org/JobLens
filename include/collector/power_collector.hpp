@@ -57,7 +57,6 @@ struct PowerPerJob {
     std::string native_job_id;
     double energy_j;
     double weighted_ns_total;
-    std::string vo;              // Virtual Organization (Gap 2: from scheduler metadata)
     std::vector<PowerPerPid> pids;
 };
 
@@ -134,9 +133,6 @@ private:
     /* ── IPMI cross-validation (Gap 3) ──────────────────────────────── */
     bool detect_ipmi();
     double read_ipmi_watts();
-
-    /* ── VO extraction (Gap 2) ──────────────────────────────────────── */
-    std::string extract_vo_from_job(const Job& job);
 
     /* ── Energy computation ────────────────────────────────────────── */
     PowerSnapshot compute_energy(const std::vector<task_cpu_runtime>& tasks,

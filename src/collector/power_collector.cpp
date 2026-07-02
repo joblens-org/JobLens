@@ -41,8 +41,6 @@
 #include <bpf/libbpf.h>
 #include <nlohmann/json.hpp>
 
-#include <algorithm>
-#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -461,23 +459,6 @@ PowerSnapshot PowerCollector::compute_energy(
         snap.cumulative_kwh_by_job[job.job_id] = cumulative_kwh_by_job_[job.job_id];
     }
 
-    /* ── Gap 2: Extract VO from job metadata ──────────────────────────── */
-    /* (re-invoke JobRegistry to get full Job objects with scheduler metadata) */
-    {
-        auto jobs = JobRegistry::instance().snapshot();
-        std::unordered_map<uint64_t, size_t> job_index;
-        for (size_t i = 0; i < jobs.size(); ++i) job_index[jobs[i].JobID] = i;
-
-        for (auto& job : snap.jobs) {
-            auto it = job_index.find(job.job_id);
-            if (it != job_index.end()) {
-                job.vo = extract_vo_from_job(jobs[it->second]);
-            } else {
-                job.vo = "unknown";
-            }
-        }
-    }
-
     /* ── Gap 3: IPMI cross-validation log ─────────────────────────────── */
     /* (the actual IPMI value is set in collect() → snap.ipmi_power_w;
      *   here we just log the comparison as a soft validation) */
@@ -708,51 +689,6 @@ double PowerCollector::read_ipmi_watts()
     return w;
 }
 
-/* ── VO extraction (Gap 2, 对标 GLASGOW node_get_condorinfo.sh) ─────────── */
-
-std::string PowerCollector::extract_vo_from_job(const Job& job)
-{
-    /* GLASGOW approach: infer VO from HTCondor RemoteUser pattern.
-     * In JobLens, the CondorJobAttr has an 'owner' field (user identity)
-     * and SlurmJobAttr has a 'user' field.
-     *
-     * Pattern matching based on GLASGOW's node_get_condorinfo.sh:
-     *   atlas* → ATLAS, cms* → CMS, alice* → ALICE, lhcb* → LHCb
-     */
-    std::string user;
-
-    std::visit([&user](const auto& attr) {
-        using T = std::decay_t<decltype(attr)>;
-        if constexpr (std::is_same_v<T, CondorJobAttr>) {
-            user = attr.owner;
-        } else if constexpr (std::is_same_v<T, SlurmJobAttr>) {
-            user = attr.user;
-        }
-    }, job.sub_attr);
-
-    if (user.empty()) return "unknown";
-
-    /* VO inference from username pattern */
-    std::string lower = user;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-
-    if (lower.find("atlas") != std::string::npos || lower.find("atl") != std::string::npos)
-        return "ATLAS";
-    if (lower.find("cms") != std::string::npos)
-        return "CMS";
-    if (lower.find("alice") != std::string::npos)
-        return "ALICE";
-    if (lower.find("lhcb") != std::string::npos || lower.find("lhc") != std::string::npos)
-        return "LHCb";
-    if (lower.find("dune") != std::string::npos)
-        return "DUNE";
-    if (lower.find("juno") != std::string::npos)
-        return "JUNO";
-
-    /* Return raw user as VO for non-LHC experiments */
-    return user;
-}
-
 /* ── ICollector lifecycle ───────────────────────────────────────────────── */
 
 bool PowerCollector::init(const nlohmann::json& cfg)
@@ -965,7 +901,6 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
                 json jj;
                 jj["job_id"]            = job.job_id;
                 jj["native_job_id"]     = job.native_job_id;
-                jj["vo"]                = job.vo;
                 jj["energy_j"]          = job.energy_j;
                 jj["weighted_ns_total"] = job.weighted_ns_total;
 
