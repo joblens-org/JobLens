@@ -12,20 +12,24 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * PowerCollector — eBPF sched_switch + RAPL per-job energy attribution
+ * PowerCollector — eBPF sched_switch + RAPL 逐作业能耗归因
  *
- * Collector life-cycle:
- *   init()      → load eBPF, detect RAPL, seed last-energy counter
- *   collect()   → dump eBPF runtime maps, read  E_pkg, read CPU freqs,
- *                  compute E_job =  E_pkg × Σ(time×freq)_job / Σ(time×freq)_all
- *   deinit()    → unload eBPF
+ * 采集生命周期:
+ *   init()      → 加载eBPF程序、探测RAPL硬件、读取初始能量计数器基准
+ *   collect()   → 导出eBPF任务运行时数据、读RAPL ΔE_pkg、读CPU频率、
+ *                  用频率加权公式计算每个Job的归因能耗
+ *   deinit()    → 卸载eBPF程序、清理资源
  *
- * Energy formula (user-space):
- *   For each job J:
- *     weighted_J = Σ_{p  J} Σ_{cpu} runtime_ns(p,cpu) × freq_mhz(cpu)
- *   total_weighted = interval_s × Σ_{cpu} freq_mhz(cpu)
+ * 归因公式 (用户态计算):
+ *   对每个作业J:
+ *     weighted_J = Σ_{p∈J} Σ_{cpu} runtime_ns(p,cpu) × freq_mhz(cpu)
+ *   total_weighted = interval_s × 1e9 × Σ_{cpu} freq_mhz(cpu)
  *   E_job = ΔE_pkg × weighted_J / total_weighted
- *   System overhead = ΔE_pkg − Σ E_job
+ *   system_overhead = ΔE_pkg − Σ E_job
+ *
+ * 数据流:
+ *   内核eBPF (每上下文切换) → task_cpu_time map
+ *   用户态collect() (每ΔT) → dump map → 读RAPL → 读频率 → 归因计算 → Writer输出
  */
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
@@ -70,8 +74,13 @@ AUTO_REGISTER_SYSTEM_COLLECTOR(
 
 using json = nlohmann::json;
 
-/* ── RAPL helpers ───────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * RAPL (Running Average Power Limit) 硬件接口
+ * 读取CPU Package的能量计数器: /sys/class/powercap/intel-rapl:N/energy_uj
+ * 只读顶层package域 (intel-rapl:\d+$)，避免子域(cores/uncore)重复计数
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* 自动探测Intel/AMD RAPL路径 */
 std::string PowerCollector::detect_rapl_base()
 {
     /* Probe for Intel or AMD RAPL. ARM / unknown → empty. */
@@ -126,8 +135,13 @@ uint64_t PowerCollector::read_rapl_uj()
     return total;
 }
 
-/* ── CPU helpers ────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * CPU频率与调速器采集
+ * 读取每个核心的瞬时频率(scaling_cur_freq)和调速器模式(scaling_governor)
+ * 回退链: cur_freq → cpuinfo_max_freq → 2000MHz默认值
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* 检测CPU核心数 (sysconf _SC_NPROCESSORS_ONLN) */
 int PowerCollector::detect_core_count()
 {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -167,7 +181,11 @@ std::vector<double> PowerCollector::read_cpu_freqs_mhz()
     return freqs;
 }
 
-/* ── eBPF management ───────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * eBPF 程序管理
+ * RPM安装路径: /usr/lib64/joblens/bpf_obj/power_collect.bpf.o
+ * 开发构建:    build/bpf_obj/power_collect.bpf.o (fallback)
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 bool PowerCollector::load_ebpf()
 {
@@ -295,7 +313,15 @@ std::vector<task_cpu_runtime> PowerCollector::dump_task_cpu_time()
     return result;
 }
 
-/* ── Energy computation ─────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 能耗归因核心计算
+ * 1. 分母: total_weighted_ns = Δt × 1e9 × Σ freq_mhz (理论最大加权时间)
+ * 2. 按pid_tgid聚合eBPF运行时 → weighted_ns = runtime_ns × freq_mhz
+ * 3. 通过pid2job分组 → job_weighted = Σ pid_weighted
+ * 4. E_job = ΔE_pkg × job_weighted / total_weighted_ns
+ * 5. E_pid = E_job × pid_weighted / job_weighted (二级分配)
+ * 6. system_overhead = ΔE_pkg - Σ E_job
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 PowerSnapshot PowerCollector::compute_energy(
     const std::vector<task_cpu_runtime>& tasks,
@@ -598,7 +624,11 @@ void PowerCollector::validate_against_baseline(const PowerSnapshot& snap)
     }
 }
 
-/* ── CPU governor (Gap 1, 对标 DESY) ─────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Gap 1: CPU调速器记录 (对标DESY log-power-consumption.sh)
+ * DESY每次IPMI采样时同时记录cpu0的scaling_governor。
+ * 我们遍历所有CPU核心读取governor，输出各模式的数量分布。
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 std::vector<std::string> PowerCollector::read_cpu_governors()
 {
@@ -620,7 +650,13 @@ std::vector<std::string> PowerCollector::read_cpu_governors()
     return governors;
 }
 
-/* ── IPMI cross-validation (Gap 3, 对标 GLASGOW power_plus.py) ───────────── */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Gap 3: IPMI在线交叉验证 (对标GLASGOW power_plus.py)
+ * GLASGOW用离线脚本对比估算功率vs真实IPMI。
+ * 我们每个采集周期同时读一次IPMI瞬时功率，在线比较IPMI/RAPL ratio。
+ * 比例超出[0.8, 2.5]范围时发WARN日志。
+ * IPMI通过BMC读取，~1s响应延迟，对毫秒级负载波动不敏感。
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 bool PowerCollector::detect_ipmi()
 {
