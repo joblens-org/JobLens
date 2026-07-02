@@ -356,11 +356,11 @@ PowerSnapshot PowerCollector::compute_energy(
 
     /* ── Build pid2job lookup from JobRegistry ── */
     std::unordered_map<pid_t, uint64_t> pid2job;
-    std::unordered_map<uint64_t, const Job*> job_by_id;
+    std::unordered_map<uint64_t, std::string> job_native_ids;
     {
         auto jobs = JobRegistry::instance().snapshot();
         for (const auto& job : jobs) {
-            job_by_id[job.JobID] = &job;
+            job_native_ids[job.JobID] = job.NativeJobID;
             for (pid_t p : job.JobPIDs) {
                 pid2job[p] = job.JobID;
             }
@@ -385,9 +385,9 @@ PowerSnapshot PowerCollector::compute_energy(
         auto it_j = pid2job.find(acc.pid);
         if (it_j != pid2job.end()) {
             jid = it_j->second;
-            auto it_jb = job_by_id.find(jid);
-            if (it_jb != job_by_id.end()) {
-                native_jid = it_jb->second->NativeJobID;
+            auto it_nj = job_native_ids.find(jid);
+            if (it_nj != job_native_ids.end()) {
+                native_jid = it_nj->second;
             }
         }
 
@@ -465,13 +465,13 @@ PowerSnapshot PowerCollector::compute_energy(
     /* (re-invoke JobRegistry to get full Job objects with scheduler metadata) */
     {
         auto jobs = JobRegistry::instance().snapshot();
-        std::unordered_map<uint64_t, const Job*> job_map;
-        for (const auto& j : jobs) job_map[j.JobID] = &j;
+        std::unordered_map<uint64_t, size_t> job_index;
+        for (size_t i = 0; i < jobs.size(); ++i) job_index[jobs[i].JobID] = i;
 
         for (auto& job : snap.jobs) {
-            auto it = job_map.find(job.job_id);
-            if (it != job_map.end()) {
-                job.vo = extract_vo_from_job(*it->second);
+            auto it = job_index.find(job.job_id);
+            if (it != job_index.end()) {
+                job.vo = extract_vo_from_job(jobs[it->second]);
             } else {
                 job.vo = "unknown";
             }
