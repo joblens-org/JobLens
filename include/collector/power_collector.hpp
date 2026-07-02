@@ -72,12 +72,6 @@ struct PowerSnapshot {
     double system_overhead_j;    // RAPL energy not attributed to any job
     std::vector<PowerPerJob> jobs;
 
-    /* ── WLCG standard metrics ───────────────────────────────────────── */
-    double avg_power_w = 0.0;        // ΔE_pkg / interval_s  (average package watts)
-    double pue_corrected_j = 0.0;    // ΔE_pkg × PUE  (total facility energy estimate)
-    double co2_equivalent_g = 0.0;   // facility energy → CO₂  (g)
-    double hs23_per_watt = 0.0;      // HS23 score / watt  (if HS23 score provided)
-
     /* ── Gap 1: CPU governor (对标 DESY) ─────────────────────────────── */
     std::vector<std::string> core_governors;
 
@@ -87,6 +81,9 @@ struct PowerSnapshot {
 
     /* ── Gap 3: IPMI cross-validation (对标 GLASGOW power_plus.py) ───── */
     double ipmi_power_w = 0.0;               // concurrent IPMI reading (W)
+
+    /* ── Basic metric ────────────────────────────────────────────────── */
+    double avg_power_w = 0.0;               // ΔE_pkg / interval_s
 };
 
 /* ── power_bench calibration reference (optional validation baseline) ───── */
@@ -157,11 +154,6 @@ private:
 
     /* timing */
     std::chrono::steady_clock::time_point last_collect_ts_;
-
-    /* ── WLCG / site-level parameters ──────────────────────────────── */
-    double pue_ = 1.0;                      // Power Usage Effectiveness (default: 1.0 = no correction)
-    double carbon_intensity_g_per_kwh_ = 0.0; // grid carbon intensity (g CO₂/kWh)
-    double hs23_score_ = 0.0;              // HS23 benchmark score (0 = not available)
 
     /* ── power_bench calibration reference ────────────────────────── */
     CalibrationRef cal_ref_;

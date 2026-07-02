@@ -65,9 +65,6 @@ AUTO_REGISTER_SYSTEM_COLLECTOR(
         {"freq",                      "Sampling frequency in Hz (default 1.0 = 1s intervals)"},
         {"use_writers",               "Writer names for output (e.g. file_writer, PrometheusExporterWriter)"},
         {"auto_start",                "Auto-start on daemon launch (true/false, default true)"},
-        {"pue",                       "Power Usage Effectiveness for facility-level correction (default 1.0)"},
-        {"carbon_intensity_g_per_kwh","Grid carbon intensity in g CO₂/kWh for emissions estimation (default 0)"},
-        {"hs23_score",                "HS23 benchmark score for HS23/Watt metric (default 0 = not available)"},
     }
 )
 
@@ -436,17 +433,8 @@ PowerSnapshot PowerCollector::compute_energy(
     }
     if (snap.system_overhead_j < 0.0) snap.system_overhead_j = 0.0;
 
-    /* ── WLCG standard metrics ──────────────────────────────────────── */
-    snap.avg_power_w = (interval_s > 0.0)
-        ? snap.delta_rapl_j / interval_s
-        : 0.0;
-    snap.pue_corrected_j = snap.delta_rapl_j * pue_;
-    /* ΔE_pkg(J) → kWh → CO₂(g): delta_rapl_j / 3.6e6 * carbon_intensity_g_per_kwh_ */
-    snap.co2_equivalent_g = snap.delta_rapl_j / 3.6e6 * carbon_intensity_g_per_kwh_;
-    /* HS23/watt = hs23_score / avg_power_w */
-    snap.hs23_per_watt = (hs23_score_ > 0.0 && snap.avg_power_w > 0.0)
-        ? hs23_score_ / snap.avg_power_w
-        : 0.0;
+    /* ── Basic metric ──────────────────────────────────────────────────── */
+    snap.avg_power_w = (interval_s > 0.0) ? snap.delta_rapl_j / interval_s : 0.0;
 
     /* ── Gap 2: Cumulative kWh accumulator (对标 GLASGOW power_plus.py) ── */
     /* ΔE_pkg (J) → kWh */
@@ -713,25 +701,6 @@ bool PowerCollector::init(const nlohmann::json& cfg)
     core_count_ = detect_core_count();
     spdlog::info("PowerCollector: {} CPU cores detected", core_count_);
 
-    /* ── WLCG / site-level config ─────────────────────────────────── */
-    auto try_get_double = [&cfg](const char* key) -> std::optional<double> {
-        if (!cfg.contains(key)) return std::nullopt;
-        const auto& v = cfg[key];
-        if (v.is_number()) return v.get<double>();
-        if (v.is_string()) {
-            try { return std::stod(v.get<std::string>()); }
-            catch (...) { return std::nullopt; }
-        }
-        return std::nullopt;
-    };
-
-    if (auto v = try_get_double("pue")) pue_ = *v;
-    if (auto v = try_get_double("carbon_intensity_g_per_kwh")) carbon_intensity_g_per_kwh_ = *v;
-    if (auto v = try_get_double("hs23_score")) hs23_score_ = *v;
-
-    spdlog::info("PowerCollector: WLCG params — PUE={:.2f}, carbon={:.0f} g/kWh, HS23={:.0f}",
-                 pue_, carbon_intensity_g_per_kwh_, hs23_score_);
-
     /* Load eBPF */
     if (!load_ebpf()) {
         spdlog::error("PowerCollector: eBPF load failed");
@@ -846,11 +815,7 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
             j["total_weighted_ns"] = snap.total_weighted_ns;
             j["system_overhead_j"] = snap.system_overhead_j;
 
-            /* ── WLCG standard metrics ── */
             j["avg_power_w"]       = snap.avg_power_w;
-            j["pue_corrected_j"]   = snap.pue_corrected_j;
-            j["co2_equivalent_g"]  = snap.co2_equivalent_g;
-            j["hs23_per_watt"]     = snap.hs23_per_watt;
 
             /* ── Gap 1: CPU governors ── */
             if (!snap.core_governors.empty()) {
