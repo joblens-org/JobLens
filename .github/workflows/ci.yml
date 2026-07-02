@@ -2,13 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, feat/one-rpm]
     paths-ignore:
       - '**.md'
       - '.gitignore'
       - 'LICENSE'
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, feat/one-rpm]
     paths-ignore:
       - '**.md'
       - '.gitignore'
@@ -21,8 +21,9 @@ jobs:
     strategy:
       matrix:
         target:
-          - { name: fedora, image: fedora:latest, dist: .fc41 }
-          - { name: el9,   image: almalinux:9,   dist: .el9  }
+          - { name: fedora, image: fedora:latest, preset: rpm-system-deps }
+          - { name: el9,   image: almalinux:9,   preset: rpm-system-deps }
+          - { name: fedora-static-epel, image: fedora:latest, preset: rpm-static-epel }
       fail-fast: false
     container:
       image: ${{ matrix.target.image }}
@@ -39,7 +40,14 @@ jobs:
         run: |
           dnf install -y sudo
           bash scripts/install-deps.sh
-          dnf install -y rpm-build
+          # RHEL 系列启用 EPEL + CRB/PowerTools（unified RPM 构建需要）
+          if [ -f /etc/redhat-release ]; then
+            dnf install -y epel-release 2>/dev/null || true
+            dnf config-manager --set-enabled crb 2>/dev/null || \
+              dnf config-manager --set-enabled powertools 2>/dev/null || true
+          fi
+          # unified RPM 构建额外依赖
+          dnf install -y rpm-build rpmdevtools python3 python3-devel python3-pip python3-setuptools python3-wheel systemd-rpm-macros
 
       - name: Diagnose build environment versions
         run: |
@@ -49,52 +57,118 @@ jobs:
           echo ""
           echo "=== glibc 版本 ==="
           ldd --version | head -1
-          strings /lib64/libc.so.6 | grep 'GLIBC_' | sort -V | tail -5
 
           echo ""
-          echo "=== GCC/libstdc++ 版本 ==="
+          echo "=== GCC 版本 ==="
           gcc --version | head -1
-          strings /lib64/libstdc++.so.6 | grep 'GLIBCXX_' | sort -V | tail -5
-
-          echo ""
-          echo "=== 关键包版本 ==="
-          rpm -q glibc gcc gcc-c++ fmt-devel spdlog-devel yaml-cpp-devel boost-devel 2>/dev/null || true
-
-          echo ""
-          echo "=== EPEL 仓库 URL ==="
-          grep -r 'baseurl\|mirrorlist' /etc/yum.repos.d/*epel* 2>/dev/null | head -20 || echo "无 EPEL 仓库配置"
 
           echo ""
           echo "=== 所有已启用的 DNF 仓库 ==="
-          dnf repolist --enabled 2>/dev/null || microdnf repolist --enabled 2>/dev/null || true
+          dnf repolist --enabled 2>/dev/null || true
 
-      - name: Configure & Build (CMakePresets)
-        run: |
-          cmake --preset rpm-system-deps -DCPACK_RPM_PACKAGE_RELEASE="1${{ matrix.target.dist }}"
-          cmake --build --preset rpm-system-deps
+      # ════════════════════════════════════════════════════════
+      # 统一 RPM 构建（Core C++ Agent + Python Trigger Gateway）
+      # ════════════════════════════════════════════════════════
+      - name: Build unified RPM
+        run: bash scripts/build-unified-rpm.sh --preset ${{ matrix.target.preset }}
 
-      - name: Diagnose binary dependencies
+      # ════════════════════════════════════════════════════════
+      # 统一 RPM 内容验证
+      # ════════════════════════════════════════════════════════
+      - name: Verify unified RPM contents
         run: |
-          echo "=== 二进制动态链接 ==="
-          ldd build/JobLens | sort
+          RPM=$(ls ~/rpmbuild/RPMS/x86_64/joblens-*.rpm 2>/dev/null | head -1)
+          if [ -z "$RPM" ]; then
+            echo "✗ 未找到 unified RPM 包"
+            exit 1
+          fi
+
+          echo "=== RPM 文件列表 ==="
+          rpm -qpl "$RPM" | sort
 
           echo ""
-          echo "=== 二进制需要的 glibc 符号版本 ==="
-          objdump -T build/JobLens | grep -oP 'GLIBC_\S+' | sort -Vu
+          echo "=== Core 关键文件检查 ==="
+          rpm -qpl "$RPM" | grep -q '/usr/bin/JobLens$' && echo "✓ JobLens 二进制" || { echo "✗ 缺少 JobLens"; exit 1; }
+          rpm -qpl "$RPM" | grep -qE '/lib[0-9]*/joblens/bpf_obj/[^/]*\.bpf\.o$' && echo "✓ eBPF 对象文件" || echo "⚠ 未找到 bpf_obj"
+          rpm -qpl "$RPM" | grep -q '/etc/JobLens/config.yaml$' && echo "✓ Core 配置文件" || { echo "✗ 缺少 config.yaml"; exit 1; }
+          rpm -qpl "$RPM" | grep -q '/systemd/system/joblens.service$' && echo "✓ joblens.service" || { echo "✗ 缺少 joblens.service"; exit 1; }
 
           echo ""
-          echo "=== 二进制需要的 libstdc++ 符号版本 ==="
-          objdump -T build/JobLens | grep -oP 'GLIBCXX_\S+' | sort -Vu
+          echo "=== Trigger 关键文件检查 ==="
+          rpm -qpl "$RPM" | grep -q '/usr/lib/joblens/trigger-venv/bin/gunicorn' && echo "✓ Trigger gunicorn (venv)" || { echo "✗ 缺少 trigger gunicorn"; exit 1; }
+          rpm -qpl "$RPM" | grep -q '/systemd/system/joblens-trigger.service$' && echo "✓ joblens-trigger.service" || { echo "✗ 缺少 joblens-trigger.service"; exit 1; }
+          rpm -qpl "$RPM" | grep -q '/etc/JobLens/trigger/config.yaml$' && echo "✓ Trigger 配置文件" || echo "⚠ 未找到 trigger config.yaml"
 
           echo ""
-          echo "=== 二进制需要的第三方库 SONAME ==="
-          objdump -p build/JobLens | grep NEEDED | sort -u
+          echo "RPM 大小: $(ls -lh "$RPM" | awk '{print $5}')"
 
-      - name: Package (CPack TGZ + RPM)
+          # 写入 GITHUB_ENV 供后续步骤使用
+          echo "RPM_FILE=${RPM}" >> "${GITHUB_ENV}"
+
+      # ════════════════════════════════════════════════════════
+      # 统一 RPM 依赖检查 — 确认无 venv 依赖泄漏
+      # ════════════════════════════════════════════════════════
+      - name: Verify unified RPM requires (no venv leak)
         run: |
-          cpack --preset rpm-system-deps
+          RPM="${RPM_FILE}"
+          echo "=== 全部 Requires ==="
+          rpm -qp --requires "$RPM" | sort
+
+          echo ""
+          echo "=== venv 依赖泄漏检查（python3dist() 格式）==="
+          REQS=$(rpm -qp --requires "$RPM")
+          if echo "$REQS" | grep -q 'python3dist('; then
+            echo "✗ 发现 python3dist() venv 依赖泄漏！以下依赖不应出现："
+            echo "$REQS" | grep 'python3dist('
+            exit 1
+          fi
+          echo "✓ 无 python3dist() venv 依赖泄漏"
+
+          echo ""
+          echo "=== 确认核心系统依赖 ==="
+          echo "$REQS" | grep -q 'systemd' && echo "✓ Requires: systemd" || echo "⚠ 未声明 systemd 依赖"
+          echo "$REQS" | grep -q 'python3' && echo "✓ Requires: python3" || echo "⚠ 未声明 python3 依赖"
+
+      # ════════════════════════════════════════════════════════
+      # 统一 RPM 维护脚本检查
+      # ════════════════════════════════════════════════════════
+      - name: Verify unified RPM scripts (systemd)
+        run: |
+          RPM="${RPM_FILE}"
+          echo "=== 维护脚本 ==="
+          rpm -qp --scripts "$RPM"
+
+          echo ""
+          SCRIPTS=$(rpm -qp --scripts "$RPM")
+          if echo "$SCRIPTS" | grep -q 'systemctl'; then
+            echo "✓ 包含 systemd 维护脚本（post/preun/postun）"
+          else
+            echo "⚠ 未检测到 systemctl，可能缺少 systemd %post/%preun/%postun 集成"
+          fi
+
+      - name: Upload unified RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: joblens-unified-rpm-${{ matrix.target.name }}
+          path: ~/rpmbuild/RPMS/x86_64/joblens-*.rpm
+
+      # ════════════════════════════════════════════════════════
+      # TGZ 构建与验证（仅 rpm-system-deps 模式，独立于 unified RPM）
+      # ════════════════════════════════════════════════════════
+      - name: Configure & Build (CMake for TGZ)
+        if: matrix.target.preset == 'rpm-system-deps'
+        run: |
+          cmake --preset ${{ matrix.target.preset }} \
+            -DBUILD_ID="$(echo '${{ github.sha }}' | cut -c1-7)" \
+            -DCPACK_RPM_PACKAGE_RELEASE="1${{ matrix.target.dist }}"
+          cmake --build --preset ${{ matrix.target.preset }}
+
+      - name: Package TGZ
+        if: matrix.target.preset == 'rpm-system-deps'
+        run: cpack --preset ${{ matrix.target.preset }}
 
       - name: Verify TGZ contents
+        if: matrix.target.preset == 'rpm-system-deps'
         run: |
           echo "=== TGZ 包列表 ==="
           TGZ=$(ls build/joblens-*-Linux-x86_64.tar.gz | head -1)
@@ -103,50 +177,18 @@ jobs:
           echo ""
           echo "=== TGZ 关键产物检查 ==="
           tar -tzf "$TGZ" | grep -q 'bin/JobLens$' && echo "✓ JobLens 二进制" || { echo "✗ 缺少 JobLens"; exit 1; }
-          tar -tzf "$TGZ" | grep -q 'lib/joblens/bpf_obj/.*\.bpf\.o$' && echo "✓ eBPF 对象文件" || echo "⚠ 未找到 bpf_obj"
+          tar -tzf "$TGZ" | grep -qE 'lib[0-9]*/joblens/bpf_obj/[^/]*\.bpf\.o$' && echo "✓ eBPF 对象文件" || echo "⚠ 未找到 bpf_obj"
           tar -tzf "$TGZ" | grep -q 'etc/JobLens/config.yaml$' && echo "✓ 默认配置文件" || { echo "✗ 缺少 config.yaml"; exit 1; }
           tar -tzf "$TGZ" | grep -q 'systemd/system/joblens.service$' && echo "✓ systemd 服务单元" || echo "⚠ 未找到 joblens.service"
-          ! tar -tzf "$TGZ" | grep -q 'lib/joblens/.*\.so' && echo "✓ 未捆绑 .so (系统依赖模式)" || { echo "✗ 不应包含 .so"; exit 1; }
+
+          echo ""
+          echo "=== TGZ 系统依赖模式专项检查 ==="
+          # 系统依赖模式：不应捆绑任何 .so，运行时依赖系统包管理器提供
+          ! tar -tzf "$TGZ" | grep -qE 'lib[0-9]*/joblens/[^/]*\.so' && echo "✓ 未捆绑 .so (系统依赖模式)" || { echo "✗ 不应包含 .so"; exit 1; }
           echo "TGZ 大小: $(ls -lh "$TGZ" | awk '{print $5}')"
 
-      - name: Verify RPM contents
-        run: |
-          echo "=== RPM 包信息 ==="
-          RPM=$(ls build/joblens-*.rpm 2>/dev/null | head -1)
-          if [ -z "$RPM" ]; then
-            echo "✗ 未找到 RPM 包"
-            exit 1
-          fi
-
-          echo "文件列表:"
-          rpm -qpl "$RPM"
-
-          echo ""
-          echo "=== RPM 关键产物检查 ==="
-          rpm -qpl "$RPM" | grep -q '/bin/JobLens$' && echo "✓ JobLens 二进制" || { echo "✗ 缺少 JobLens"; exit 1; }
-          rpm -qpl "$RPM" | grep -q '/lib/joblens/bpf_obj/.*\.bpf\.o$' && echo "✓ eBPF 对象文件" || echo "⚠ 未找到 bpf_obj"
-          rpm -qpl "$RPM" | grep -q '/etc/JobLens/config.yaml$' && echo "✓ 默认配置文件" || { echo "✗ 缺少 config.yaml"; exit 1; }
-          rpm -qpl "$RPM" | grep -q '/systemd/system/joblens.service$' && echo "✓ systemd 服务单元" || echo "⚠ 未找到 joblens.service"
-          ! rpm -qpl "$RPM" | grep -q '/lib/joblens/.*\.so' && echo "✓ 未捆绑 .so (系统依赖模式)" || { echo "✗ 不应包含 .so"; exit 1; }
-
-          echo ""
-          echo "=== RPM 依赖 ==="
-          rpm -qp --requires "$RPM" | sort
-
-          echo ""
-          echo "=== RPM 维护脚本 ==="
-          rpm -qp --scripts "$RPM"
-
-          echo ""
-          echo "RPM 大小: $(ls -lh "$RPM" | awk '{print $5}')"
-
-      - name: Upload RPM artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: joblens-core-rpm-${{ matrix.target.name }}
-          path: build/joblens-*.rpm
-
       - name: Upload TGZ artifact
+        if: matrix.target.preset == 'rpm-system-deps'
         uses: actions/upload-artifact@v4
         with:
           name: joblens-core-tgz-${{ matrix.target.name }}
@@ -154,26 +196,3 @@ jobs:
 
 
 
-  trigger-rpm:
-    name: Trigger RPM Build
-    runs-on: ubuntu-latest
-    container: fedora:latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install build tools
-        run: |
-          dnf install -y --setopt=tsflags=nodocs \
-            rpm-build rpmdevtools python3 python3-devel \
-            python3-setuptools python3-wheel python3-pip \
-            pyproject-rpm-macros systemd-rpm-macros
-
-      - name: Build RPM
-        run: bash scripts/build-trigger-rpm.sh --install-deps
-
-      - name: Upload RPM artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: joblens-trigger-rpm
-          path: ~/rpmbuild/RPMS/x86_64/joblens-trigger-*.rpm

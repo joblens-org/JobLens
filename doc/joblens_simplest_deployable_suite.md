@@ -1,9 +1,8 @@
 # JobLens Minimal Deployment Kit (Agent + Agent Trigger)
 
 > **Document Version**: v1.1.0  
-> **Last Updated**: 2026-06-17  
-> **Agent RPM**: joblens-0.1.1-1.el9.x86_64.rpm  
-> **Trigger RPM**: joblens-trigger-0.1.0-1.el9.x86_64.rpm  
+> **Last Updated**: 2026-06-20  
+> **Unified RPM**: joblens-{version}-1.el9.x86_64.rpm (Core + Trigger bundled)  
 > **Status**: Production-tested at IHEP, open for cross-site evaluation
 
 ## 1. Project Overview
@@ -63,20 +62,22 @@ Current production deployment at IHEP:
 | **A: Full evaluation (with visualization)** | Deploy your own **Elasticsearch (>= 7.x)** as the data backend. Query and visualize data via [JobLens-TAP](https://github.com/joblens-org/JobLens-TAP). | End-to-end trial with dashboards |
 | **B: Agent-only (no ES required)** | The Agent runs standalone and writes to local files. With config `log_level: debug`, you can observe captured metrics in real time via `journalctl -u joblens -f`.<br><br>⚠️ **Caution**: Writing large volumes of job metrics to local files may cause I/O pressure under heavy load. This mode is intended **only for functional testing**, not production use. | Quick functionality check without backend infrastructure |
 
-### 5.1 Install the RPMs
+### 5.1 Install the RPM
 
-Download the RPM packages, then install:
+Download the unified RPM package, then install:
 
 ```bash
-sudo dnf install ./joblens-*.el9.x86_64.rpm ./joblens-trigger-*.el9.x86_64.rpm
+sudo dnf install ./joblens-*.el9.x86_64.rpm
 ```
+
+The unified RPM bundles both the Core Agent and Trigger Gateway. No separate trigger package is needed.
 
 Verify installation paths and binaries:
 
 ```bash
-rpm -ql joblens joblens-trigger
+rpm -ql joblens
 ls /usr/bin/JobLens
-sudo systemctl status joblens-trigger
+sudo systemctl status joblens joblens-trigger
 ```
 
 ### 5.2 Basic Configuration
@@ -89,6 +90,7 @@ Default configurations are shipped with the RPMs. Modify them to match your envi
   - Elasticsearch connection parameters
 - **Trigger config**: `/etc/JobLens/trigger/config.yaml`
   - Listen port for local API
+  - Trigger venv at `/usr/lib/joblens/trigger-venv/`
 
 ### 5.3 Start and Health Check
 
@@ -127,8 +129,8 @@ For detailed deployment and configuration, refer to the [JobLens-TAP repository]
 # Stop services
 systemctl stop joblens joblens-trigger
 
-# Remove RPMs (configs are preserved as .rpmsave)
-dnf remove joblens joblens-trigger
+# Remove RPM (configs are preserved as .rpmsave)
+sudo dnf remove joblens
 
 # Verify no residual processes
 ps aux | grep -i joblens

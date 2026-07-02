@@ -34,9 +34,9 @@ lens_config:
 | Top-level Key | Type | Description | Required |
 |---------------|------|-------------|----------|
 | `lens_config` | Map | Core system configuration | Yes |
-| `job_registry_config` | Map | Job registry configuration | No |
-| `collectors_config` | Map | Collector global configuration and collector list | No |
-| `writers_config` | Map | Writer global configuration and writer list | No |
+| `job_registry_config` | Map | Job registry configuration | Yes (service mode) |
+| `collectors_config` | Map | Collector global configuration and collector list | Yes (service mode) |
+| `writers_config` | Map | Writer global configuration and writer list | Yes (service mode) |
 | `condor_job_watcher` | Map | Condor job watcher configuration | No |
 | `slurm_job_watcher` | Map | Slurm job watcher configuration | No |
 | `{collector/writer}_config` | Map | Specific configuration sections for each collector/writer (name specified by the `config` field) | As needed |

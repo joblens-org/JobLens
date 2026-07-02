@@ -51,14 +51,14 @@ jobs:
           fi
 
   build-core:
-    name: Build Core (${{ matrix.target.name }})
+    name: Build Unified RPM (${{ matrix.target.name }})
     needs: prepare
     runs-on: ubuntu-latest
     strategy:
       matrix:
         target:
-          - { name: fedora, image: fedora:latest, dist: .fc41 }
-          - { name: el9,   image: almalinux:9,   dist: .el9  }
+          - { name: fedora, image: fedora:latest }
+          - { name: el9,   image: almalinux:9 }
       fail-fast: false
     container:
       image: ${{ matrix.target.image }}
@@ -71,162 +71,113 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Install build dependencies
-        run: |
-          dnf install -y sudo
-          bash scripts/install-deps.sh
-          dnf install -y rpm-build
+      - name: Build unified RPM (core + trigger)
+        run: bash scripts/build-unified-rpm.sh --install-deps
 
-      - name: Diagnose build environment versions
-        run: |
-          echo "=== 容器信息 ==="
-          cat /etc/os-release | head -5
-
-          echo ""
-          echo "=== glibc 版本 ==="
-          ldd --version | head -1
-          strings /lib64/libc.so.6 | grep 'GLIBC_' | sort -V | tail -5
-
-          echo ""
-          echo "=== GCC/libstdc++ 版本 ==="
-          gcc --version | head -1
-          strings /lib64/libstdc++.so.6 | grep 'GLIBCXX_' | sort -V | tail -5
-
-          echo ""
-          echo "=== 关键包版本 ==="
-          rpm -q glibc gcc gcc-c++ fmt-devel spdlog-devel yaml-cpp-devel boost-devel 2>/dev/null || true
-
-          echo ""
-          echo "=== EPEL 仓库 URL ==="
-          grep -r 'baseurl\|mirrorlist' /etc/yum.repos.d/*epel* 2>/dev/null | head -20 || echo "无 EPEL 仓库配置"
-
-          echo ""
-          echo "=== 所有已启用的 DNF 仓库 ==="
-          dnf repolist --enabled 2>/dev/null || microdnf repolist --enabled 2>/dev/null || true
-
-      - name: Configure
-        run: |
-          cmake --preset rpm-system-deps -DCPACK_RPM_PACKAGE_RELEASE="1${{ matrix.target.dist }}"
-
-      - name: Build
-        run: cmake --build --preset rpm-system-deps
-
+      # ════════════════════════════════════════════════════════
+      # 二进制诊断（从 rpmbuild BUILD 目录）
+      # ════════════════════════════════════════════════════════
       - name: Diagnose binary dependencies
         run: |
+          set -e
+          BUILD_DIR=$(ls -d ~/rpmbuild/BUILD/JobLens-*/build | head -1)
+          echo "Build dir: ${BUILD_DIR}"
+
           echo "=== 二进制动态链接 ==="
-          ldd build/JobLens | sort
+          ldd "${BUILD_DIR}/JobLens" | sort
 
           echo ""
           echo "=== 二进制需要的 glibc 符号版本 ==="
-          objdump -T build/JobLens | grep -oP 'GLIBC_\S+' | sort -Vu
+          objdump -T "${BUILD_DIR}/JobLens" | grep -oP 'GLIBC_\S+' | sort -Vu
 
           echo ""
           echo "=== 二进制需要的 libstdc++ 符号版本 ==="
-          objdump -T build/JobLens | grep -oP 'GLIBCXX_\S+' | sort -Vu
+          objdump -T "${BUILD_DIR}/JobLens" | grep -oP 'GLIBCXX_\S+' | sort -Vu
 
           echo ""
           echo "=== 二进制需要的第三方库 SONAME ==="
-          objdump -p build/JobLens | grep NEEDED | sort -u
+          objdump -p "${BUILD_DIR}/JobLens" | grep NEEDED | sort -u
 
-      - name: Package (CPack TGZ + RPM)
-        run: cpack --preset rpm-system-deps
-
-      - name: Verify core artifacts
+      # ════════════════════════════════════════════════════════
+      # TGZ 便携包制作（从 rpmbuild BUILD 产物）
+      # ════════════════════════════════════════════════════════
+      - name: Create portable TGZ
         run: |
           set -e
-          echo "=== TGZ ==="
-          ls -lh build/joblens-*-Linux-x86_64.tar.gz
-          echo "=== RPM ==="
-          ls -lh build/joblens-*.rpm
+          VERSION="${{ needs.prepare.outputs.version }}"
+          BUILD_ROOT=$(ls -d ~/rpmbuild/BUILD/JobLens-* | head -1)
+          BUILD_DIR="${BUILD_ROOT}/build"
 
-          tar -tzf build/joblens-*-Linux-x86_64.tar.gz | grep -q 'bin/JobLens$' \
-            && echo "OK: JobLens binary" \
-            || { echo "FAIL: missing JobLens binary"; exit 1; }
+          TGZ_DIR="joblens-${VERSION}-Linux-x86_64"
+          mkdir -p "${TGZ_DIR}/bin" "${TGZ_DIR}/lib/joblens/bpf_obj" "${TGZ_DIR}/etc/JobLens"
+          cp "${BUILD_DIR}/JobLens" "${TGZ_DIR}/bin/"
+          cp "${BUILD_DIR}/bpf_obj/"*.bpf.o "${TGZ_DIR}/lib/joblens/bpf_obj/"
+          cp config/config.example.yaml "${TGZ_DIR}/etc/JobLens/config.yaml"
 
-          tar -tzf build/joblens-*-Linux-x86_64.tar.gz | grep -q 'etc/JobLens/config.yaml$' \
-            && echo "OK: default config" \
-            || { echo "FAIL: missing config.yaml"; exit 1; }
+          tar -czf "build/joblens-${VERSION}-Linux-x86_64.tar.gz" "${TGZ_DIR}"
+          ls -lh "build/joblens-${VERSION}-Linux-x86_64.tar.gz"
 
-          echo "Core build completed"
+      # ════════════════════════════════════════════════════════
+      # 统一 RPM 验证（含 core + trigger 全套产物）
+      # ════════════════════════════════════════════════════════
+      - name: Verify unified RPM
+        run: |
+          set -e
+          RPM=$(ls ~/rpmbuild/RPMS/x86_64/joblens-*.rpm 2>/dev/null | head -1)
+          echo "=== Unified RPM ==="
+          ls -lh "$RPM"
 
-      - name: Upload core artifacts
+          # Core 产物检查
+          rpm -qpl "$RPM" | grep -q '/bin/JobLens$' && echo "OK: JobLens binary" || { echo "FAIL: missing JobLens"; exit 1; }
+          rpm -qpl "$RPM" | grep -q '/lib/joblens/bpf_obj/' && echo "OK: eBPF objects" || { echo "FAIL: missing bpf_obj"; exit 1; }
+          rpm -qpl "$RPM" | grep -q '/etc/JobLens/config.yaml$' && echo "OK: core config" || { echo "FAIL: missing core config"; exit 1; }
+          rpm -qpl "$RPM" | grep -q '/joblens.service$' && echo "OK: core systemd unit" || { echo "FAIL: missing core systemd unit"; exit 1; }
+
+          # Trigger 产物检查
+          rpm -qpl "$RPM" | grep -q '/trigger-venv/' && echo "OK: trigger venv" || { echo "FAIL: missing trigger venv"; exit 1; }
+          rpm -qpl "$RPM" | grep -q '/joblens-trigger.service$' && echo "OK: trigger systemd unit" || { echo "FAIL: missing trigger systemd unit"; exit 1; }
+          rpm -qpl "$RPM" | grep -q '/etc/JobLens/trigger/config.yaml$' && echo "OK: trigger config" || { echo "FAIL: missing trigger config"; exit 1; }
+
+          # 系统依赖检查（统一包使用 JOBLENS_BUNDLE_LIBS=OFF）
+          REQS=$(rpm -qp --requires "$RPM")
+          echo "$REQS" | grep -q 'leveldb' && echo "OK: Requires leveldb" || { echo "FAIL: missing leveldb dep"; exit 1; }
+          echo "$REQS" | grep -q 'xxhash' && echo "OK: Requires xxhash" || { echo "FAIL: missing xxhash dep"; exit 1; }
+
+          # 确认旧包替换声明
+          echo "$REQS" | grep -q 'joblens-trigger' && echo "OK: Obsoletes/Provides old trigger" || echo "WARN: no old trigger replacement"
+
+          echo "Unified RPM verification passed"
+
+      - name: Upload RPM artifact
         uses: actions/upload-artifact@v4
         with:
-          name: core-packages-${{ matrix.target.name }}
-          path: |
-            build/joblens-*-Linux-x86_64.tar.gz
-            build/joblens-*.rpm
+          name: unified-rpm-${{ matrix.target.name }}
+          path: ~/rpmbuild/RPMS/x86_64/joblens-*.rpm
           if-no-files-found: error
           retention-days: 7
 
-  build-trigger:
-    name: Build Trigger RPM
-    needs: prepare
-    runs-on: ubuntu-latest
-    container: fedora:latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install RPM build tools
-        run: |
-          dnf install -y --setopt=tsflags=nodocs \
-            rpm-build rpmdevtools python3 python3-devel \
-            python3-setuptools python3-wheel python3-pip \
-            pyproject-rpm-macros systemd-rpm-macros
-
-      - name: Show trigger version
-        run: |
-          echo "Trigger version (from trigger/version.py):"
-          python3 -c "import runpy; ns=runpy.run_path('trigger/version.py'); print(ns['__version__'])"
-
-      - name: Build Trigger RPM
-        run: bash scripts/build-trigger-rpm.sh --install-deps
-
-      - name: Verify trigger artifacts
-        run: |
-          RPM_FILE=$(ls ~/rpmbuild/RPMS/x86_64/joblens-trigger-*.rpm 2>/dev/null | head -1)
-          if [ -z "$RPM_FILE" ]; then
-            echo "FAIL: trigger RPM not found"
-            exit 1
-          fi
-          echo "=== Trigger RPM ==="
-          ls -lh "$RPM_FILE"
-          rpm -qpl "$RPM_FILE" | grep -q 'joblens-trigger.service' \
-            && echo "OK: systemd unit" \
-            || { echo "FAIL: missing systemd unit"; exit 1; }
-          rpm -qpl "$RPM_FILE" | grep -q '/venv/bin/gunicorn' \
-            && echo "OK: venv gunicorn" \
-            || { echo "FAIL: missing gunicorn"; exit 1; }
-          echo "Trigger build completed"
-
-      - name: Upload trigger RPM
+      - name: Upload TGZ artifact
         uses: actions/upload-artifact@v4
         with:
-          name: trigger-rpm
-          path: ~/rpmbuild/RPMS/x86_64/joblens-trigger-*.rpm
+          name: unified-tgz-${{ matrix.target.name }}
+          path: build/joblens-*-Linux-x86_64.tar.gz
           if-no-files-found: error
           retention-days: 7
 
   release:
     name: Create GitHub Release
-    needs: [prepare, build-core, build-trigger]
+    needs: [prepare, build-core]
     runs-on: ubuntu-latest
     if: success()
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download core packages (all distros)
+      - name: Download unified packages (all distros)
         uses: actions/download-artifact@v4
         with:
-          pattern: core-packages-*
+          pattern: unified-*
           path: release-assets
           merge-multiple: true
-
-      - name: Download trigger RPM
-        uses: actions/download-artifact@v4
-        with:
-          name: trigger-rpm
-          path: release-assets
 
       - name: List assets
         working-directory: release-assets
@@ -241,16 +192,14 @@ jobs:
       - name: Generate release notes
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
-          TRIGGER_VERSION=$(python3 -c "import runpy; ns=runpy.run_path('trigger/version.py'); print(ns['__version__'])")
 
           {
             echo "## Packages"
             echo ""
             echo "| Package | Description |"
             echo "|---------|-------------|"
-            echo "| jobLens-${VERSION}-Linux.tar.gz | Core binary + config + systemd unit (portable TGZ) |"
-            echo "| joblens-${VERSION}-1.*.x86_64.rpm (x2) | Core RPM for RHEL 9 / Fedora (systemd-managed) |"
-            echo "| joblens-trigger-${TRIGGER_VERSION}-*.rpm | Trigger REST API service RPM (Flask + Gunicorn) |"
+            echo "| joblens-${VERSION}-Linux.tar.gz | Core binary + config (portable TGZ) |"
+            echo "| joblens-${VERSION}-1.*.x86_64.rpm | Unified RPM (core C++ Agent + Python Trigger Gateway, systemd-managed) |"
             echo "| SHA256SUMS.txt | Checksums for integrity verification |"
             echo ""
             echo "## Verify"

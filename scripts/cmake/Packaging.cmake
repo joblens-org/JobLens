@@ -67,7 +67,8 @@ if(JOBLENS_BUNDLE_LIBS)
         INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}/joblens")
 endif()
 
-# eBPF 对象文件（非标准 ELF，放到 /usr/lib/joblens/）
+# eBPF 对象文件（非标准 ELF，放到 ${CMAKE_INSTALL_LIBDIR}/joblens/bpf_obj/）
+# 路径必须与 CMakeLists.txt 中的 JOBLENS_INSTALL_LIBDIR 编译宏一致
 install(DIRECTORY ${BPF_OBJECT_DIR}/
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/joblens/bpf_obj/
         FILES_MATCHING PATTERN "*.bpf.o")
@@ -120,7 +121,10 @@ set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
 # 自包含模式 vs 系统依赖模式
 if(JOBLENS_BUNDLE_LIBS)
     # 自包含模式：.so 已打包进 RPM，RPATH 优先加载自带版本
-    # RPM Requires 最小化，适合无网络离线部署
+    # 禁用 CPack 自动依赖检测 — 所有运行时依赖已随 .so 捆绑
+    # 否则 CPack 会扫描二进制 NEEDED 并自动追加 leveldb/xxhash 等 Requires
+    set(CPACK_RPM_PACKAGE_AUTOREQ OFF)
+    set(CPACK_RPM_PACKAGE_AUTOPROV OFF)
     set(CPACK_RPM_PACKAGE_REQUIRES "systemd")
 else()
     # 系统依赖模式：所有动态库由 RPM 包管理器提供（含 EPEL）
@@ -128,7 +132,7 @@ else()
         "systemd, libbpf >= 1.0, libnl3 >= 3.7, openssl-libs >= 1.1, lua-libs >= 5.4, libcurl, librdkafka, zlib, cyrus-sasl-lib, libzstd, lz4-libs, elfutils-libelf, leveldb, xxhash-libs")
 endif()
 message(STATUS "RPM requires: ${CPACK_RPM_PACKAGE_REQUIRES}")
-set(CPACK_RPM_BUILDREQUIRES "cmake >= 3.25, gcc-c++, systemd, libbpf-devel, libnl3-devel, openssl-devel, zlib-devel, lua-devel, clang, libcurl-devel, librdkafka-devel, boost-devel, leveldb-devel, elfutils-libelf-devel, xxhash-devel, spdlog-devel, yaml-cpp-devel, fmt-devel")
+set(CPACK_RPM_BUILDREQUIRES "cmake >= 3.25, gcc-c++, systemd-rpm-macros, libbpf-devel, libnl3-devel, openssl-devel, zlib-devel, lua-devel, clang, libcurl-devel, librdkafka-devel, boost-devel, leveldb-devel, elfutils-libelf-devel, xxhash-devel, spdlog-devel, yaml-cpp-devel, fmt-devel")
 
 set(CPACK_RPM_PRE_INSTALL_SCRIPT_FILE
     ${CMAKE_CURRENT_SOURCE_DIR}/scripts/rpm/preinstall.sh)

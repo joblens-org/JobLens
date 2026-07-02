@@ -1,0 +1,270 @@
+---
+# JobLens 集成测试 — GitHub-hosted KVM 双节点端到端测试
+#
+# 触发条件:
+#   - workflow_dispatch: 手动触发
+#   - pull_request: 对 main/develop/feat/* 分支路径过滤触发
+#
+# 运行环境:
+#   - GitHub-hosted ubuntu-latest (x86-64, KVM 嵌套虚拟化)
+#   - Guest VM: AlmaLinux 9 (通过 Vagrant libvirt)
+#
+# 构建 (对齐 CI 流程):
+#   - 统一 RPM: almalinux:9 容器 + scripts/build-unified-rpm.sh (Core C++ Agent + Python Trigger 合一)
+#
+# 拓扑:
+#   - VM1 controller (192.168.56.10): 调度控制服务
+#   - VM2 worker     (192.168.56.20): Worker + JobLens
+#
+# 超时: 60 分钟 (首次 box 下载较慢)
+
+name: Integration Test
+
+# yamllint disable rule:truthy
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'CMakeLists.txt'
+      - 'tests/integration/**'
+      - '.github/workflows/integration-test.yml'
+  push:
+    branches: [feat/*]
+
+jobs:
+  integration-test:
+    name: Integration Test (KVM + Vagrant)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      KEEP_VMS: ${{ vars.KEEP_VMS || '0' }}
+      # 默认值: 0 表示成功, 会在 Step 3 中被 run_preset 退出码覆盖
+      PRESET_EXIT: '0'
+      # Vagrant 默认使用 libvirt provider
+      VAGRANT_DEFAULT_PROVIDER: libvirt
+
+    steps:
+      # ─── Step 0: 检出代码 ────────────────────────────────────
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ─── Step 1: 安装宿主依赖 (KVM + libvirt + Vagrant) ────
+      - name: 安装宿主依赖
+        run: |
+          sudo bash scripts/install-integration-deps.sh
+          echo ""
+          echo "=== 安装后诊断 ==="
+          kvm-ok 2>/dev/null && echo "✓ KVM 加速可用" || echo "✗ KVM 不可用 (可能影响性能)"
+          vagrant --version
+          vagrant plugin list | grep -q libvirt && echo "✓ vagrant-libvirt 插件已安装" || echo "✗ vagrant-libvirt 插件未安装!"
+          virsh -c qemu:///system list 2>/dev/null && echo "✓ libvirt 连接正常" || echo "✗ libvirt 连接失败"
+          echo "==="
+
+      # ─── Step 2: 构建统一 RPM 包 (Core C++ Agent + Python Trigger 合一) ──
+      - name: 构建统一 RPM (AlmaLinux 9 容器, build-unified-rpm.sh)
+        run: |
+          echo "=== 在 AlmaLinux 9 容器内构建统一 RPM (Core + Trigger) ==="
+          docker run --rm --privileged \
+            -v "$(pwd)":/workspace -w /workspace \
+            almalinux:9 bash -c "
+              set -euo pipefail
+              # 安装构建依赖 (install-deps.sh + unified RPM 额外依赖)
+              bash scripts/install-deps.sh
+              dnf install -y rpm-build rpmdevtools python3 python3-devel python3-pip python3-setuptools python3-wheel systemd-rpm-macros
+              dnf install -y epel-release 2>/dev/null || true
+              dnf config-manager --set-enabled crb 2>/dev/null || \
+                dnf config-manager --set-enabled powertools 2>/dev/null || true
+              # 构建统一 RPM
+              bash scripts/build-unified-rpm.sh --preset rpm-system-deps
+              mkdir -p tests/integration/rpms
+              cp ~/rpmbuild/RPMS/x86_64/joblens-*.rpm tests/integration/rpms/
+              ls -lh tests/integration/rpms/
+            "
+
+          echo ""
+          echo "=== 统一 RPM 构建后诊断 ==="
+          RPM=$(ls tests/integration/rpms/joblens-*.rpm 2>/dev/null | head -1)
+          if [ -z "$RPM" ]; then
+            echo "✗ 未找到统一 RPM 包"
+            exit 1
+          fi
+          ls -lh "$RPM" && echo "✓ 统一 RPM 已生成"
+          rpm -qp "$RPM" 2>/dev/null && echo "✓ RPM 格式有效"
+          echo ""
+          echo "=== RPM 内容清单 ==="
+          rpm -qpl "$RPM" | grep -E '/usr/bin/JobLens|gunicorn|\.service$|config\.yaml' || true
+          echo "==="
+
+      # ─── Step 3: 集成测试 (run_preset — 完整生命周期) ──────
+      - name: 集成测试 (run_preset)
+        id: run_preset
+        working-directory: tests/integration
+        # 使用 --keep-vms 保留 VM 供后续诊断, 即使 run_preset 失败也不立即停止 workflow
+        continue-on-error: true
+        run: |
+          echo "=== 预下载 Vagrant box (加速首次启动) ==="
+          vagrant box add almalinux/9 --provider=libvirt 2>/dev/null || true
+
+          echo ""
+          echo "=== 环境诊断 (排查 provider 问题) ==="
+          vagrant --version
+          vagrant plugin list
+          vagrant plugin list 2>&1 | grep -q libvirt && echo "✓ vagrant-libvirt 已安装" || echo "✗ vagrant-libvirt 未安装!"
+          systemctl is-active libvirtd 2>/dev/null && echo "✓ libvirtd 运行中" || echo "✗ libvirtd 未运行"
+          ls -la /var/run/libvirt/libvirt-sock 2>/dev/null || echo "✗ libvirt socket 不存在"
+          echo "==="
+          echo ""
+
+          echo "=== run_preset: vagrant up → provisioning → demo → pytest ==="
+          # 安装 Python 测试依赖（pytest, requests, fabric, pyyaml）
+          pip install -q -r requirements.txt
+          # 使用 --keep-vms 确保即使测试失败也不会销毁 VM, 以便后续诊断步骤捕获日志
+          python3 ./run_preset.py --match 'alm9-*' --keep-vms
+          PRESET_EXIT=$?
+
+          echo ""
+          echo "=== 集成测试后诊断 ==="
+          echo "工作目录: $(pwd)"
+          ls -lh test-results.xml 2>/dev/null && echo "✓ test-results.xml 已生成" || echo "✗ test-results.xml 未生成 (测试可能失败)"
+          ls -lh pytest.log 2>/dev/null && echo "✓ pytest.log 已生成" || echo "✗ pytest.log 未生成"
+          echo "==="
+
+          # 保存退出码供后续步骤判断
+          echo "PRESET_EXIT=${PRESET_EXIT}" >> "${GITHUB_ENV}"
+
+      # ─── Step 3b: 捕获 VM 级诊断 (run_preset 失败时, VM 仍保留) ──
+      - name: VM 级诊断 (失败时)
+        if: env.PRESET_EXIT != '0'
+        working-directory: tests/integration
+        run: |
+          echo "=== VM 状态 ==="
+          vagrant status 2>/dev/null || echo "  (vagrant 不可用)"
+          echo ""
+
+          # 收集 Slurm 诊断
+          echo "=== Slurm sinfo (controller) ==="
+          vagrant ssh controller -c "sinfo 2>&1 || true" 2>/dev/null || echo "  (controller 不可达)"
+          echo ""
+
+          echo "=== Slurm scontrol show node (controller) ==="
+          vagrant ssh controller -c "scontrol show node 2>&1 | head -30 || true" 2>/dev/null || echo "  (controller 不可达)"
+          echo ""
+
+          echo "=== slurmctld 日志 (controller, 最后 30 行) ==="
+          vagrant ssh controller -c "sudo journalctl -u slurmctld --no-pager -n 30 2>&1 || true" 2>/dev/null || echo "  (controller 不可达)"
+          echo ""
+
+          echo "=== slurmd 日志 (worker, 最后 30 行) ==="
+          vagrant ssh worker -c "sudo journalctl -u slurmd --no-pager -n 30 2>&1 || true" 2>/dev/null || echo "  (worker 不可达)"
+          echo ""
+
+          # 收集 HTCondor 诊断
+          echo "=== HTCondor 守护进程状态 (controller) ==="
+          vagrant ssh controller -c "systemctl is-active condor 2>&1 || true; condor_q 2>&1 || true" 2>/dev/null || echo "  (controller 不可达)"
+          echo ""
+
+          # 收集 JobLens 诊断
+          echo "=== JobLens 日志 (worker, 最后 50 行) ==="
+          vagrant ssh worker -c "sudo journalctl -u joblens --no-pager -n 50 2>&1 || true" 2>/dev/null || echo "  (worker 不可达)"
+          echo ""
+
+          echo "=== eBPF 程序列表 (worker) ==="
+          vagrant ssh worker -c "sudo bpftool prog list 2>&1 | grep -i joblens || echo '(未找到 joblens eBPF 程序)'" 2>/dev/null || echo "  (worker 不可达)"
+          echo ""
+
+          echo "=== Slurm 配置文件 (controller) ==="
+          vagrant ssh controller -c "sudo cat /etc/slurm/slurm.conf 2>&1 || true" 2>/dev/null || echo "  (controller 不可达)"
+          echo ""
+
+          echo "=== munge 密钥一致性检查 ==="
+          echo "controller md5:"
+          vagrant ssh controller -c "sudo md5sum /etc/munge/munge.key 2>&1 || true" 2>/dev/null || echo "  (不可达)"
+          echo "worker md5:"
+          vagrant ssh worker -c "sudo md5sum /etc/munge/munge.key 2>&1 || true" 2>/dev/null || echo "  (不可达)"
+          echo ""
+
+          # 保存诊断日志到文件供 artifact 上传
+          mkdir -p /tmp/integration-diagnostics
+          {
+            echo "=== VM 状态 ==="
+            vagrant status 2>/dev/null || true
+            echo ""
+            echo "=== sinfo ==="
+            vagrant ssh controller -c "sinfo 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== scontrol show node ==="
+            vagrant ssh controller -c "scontrol show node 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== slurmctld 日志 ==="
+            vagrant ssh controller -c "sudo journalctl -u slurmctld --no-pager -n 50 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== slurmd 日志 ==="
+            vagrant ssh worker -c "sudo journalctl -u slurmd --no-pager -n 50 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== HTCondor 状态 ==="
+            vagrant ssh controller -c "systemctl is-active condor 2>&1; condor_q 2>&1; condor_status -any 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== JobLens 日志 ==="
+            vagrant ssh worker -c "sudo journalctl -u joblens --no-pager -n 50 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== eBPF 程序 ==="
+            vagrant ssh worker -c "sudo bpftool prog list 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== slurm.conf ==="
+            vagrant ssh controller -c "sudo cat /etc/slurm/slurm.conf 2>&1" 2>/dev/null || true
+            echo ""
+            echo "=== munge 密钥 md5 ==="
+            echo "controller: $(vagrant ssh controller -c 'sudo md5sum /etc/munge/munge.key 2>&1' 2>/dev/null || echo 'N/A')"
+            echo "worker: $(vagrant ssh worker -c 'sudo md5sum /etc/munge/munge.key 2>&1' 2>/dev/null || echo 'N/A')"
+            echo ""
+            echo "=== JobLens API 响应 ==="
+            curl -s http://192.168.56.20:7592/joblens/jobs 2>/dev/null || echo '(JobLens API 不可达)'
+          } > /tmp/integration-diagnostics/diagnostics.log 2>&1
+          echo "✓ 诊断日志已保存: /tmp/integration-diagnostics/diagnostics.log"
+
+      # ─── Step 4: 上传结果 (总是执行) ──────────────────────────
+      - name: 上传测试结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: |
+            tests/integration/test-results.xml
+            tests/integration/pytest.log
+          retention-days: 7
+
+      # ─── Step 4b: 上传诊断日志 (仅在失败时) ────────────────────
+      - name: 上传诊断日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-diagnostics
+          path: /tmp/integration-diagnostics/diagnostics.log
+          retention-days: 7
+          # 诊断日志可能不存在 (如果 run_preset 完全成功), 允许丢失
+          if-no-files-found: warn
+
+      # ─── Step 5: 清理 VM (总是执行) ───────────────────────────
+      - name: 清理 VM
+        if: always()
+        working-directory: tests/integration
+        run: |
+          echo "=== VM 状态 ==="
+          vagrant status 2>/dev/null || echo "  (vagrant 不可用)"
+
+          if [ "${KEEP_VMS}" = "1" ]; then
+            echo "KEEP_VMS=1, 保留 VM 供调试"
+            vagrant status
+            exit 0
+          fi
+
+          echo "=== 销毁 VM ==="
+          # run_preset 使用 --keep-vms 不会自行销毁, 此处显式执行
+          vagrant destroy -f 2>/dev/null \
+            || echo "  WARNING: 销毁失败 (可能 VM 已被手动销毁或未启动)"
+          echo "VM 已清理"

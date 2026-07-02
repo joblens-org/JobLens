@@ -4,6 +4,11 @@
 
 set -e
 
+# Docker 容器内以 root 运行无需提权 (PAM 不可用)
+if [ "$(id -u)" -eq 0 ]; then
+    sudo() { "$@"; }
+fi
+
 if [ ! -f /etc/os-release ]; then
     echo "Cannot detect OS. Please install dependencies manually:"
     echo "  - Debian/Ubuntu: apt-get install clang libbpf-dev libelf-dev cmake ninja-build pkg-config libssl-dev zlib1g-dev libcurl4-openssl-dev libsasl2-dev libzstd-dev liblz4-dev librdkafka-dev libleveldb-dev libnl-3-dev libnl-genl-3-dev lua5.4-dev libspdlog-dev libyaml-cpp-dev libfmt-dev libboost-all-dev libxxhash-dev libhowardhinnant-date-dev"
@@ -230,11 +235,11 @@ install_rpm() {
         nlohmann-json-devel \
         bpftool
 
-    # date-devel (Howard Hinnant) is in Fedora repos but NOT in EPEL 9
-    if ! sudo dnf install -y date-devel 2>/dev/null; then
-        echo "==> date-devel not in repos, installing from source..."
-        install_date
-    fi
+    # date-devel (Howard Hinnant) system package has broken CMake config
+    # on some Fedora versions (references /usr/include/date/date.h as source).
+    # Always build from source for consistent behavior across platforms.
+    echo "==> Building Howard Hinnant date from source..."
+    install_date
     install_sol2
     echo "Done."
 }

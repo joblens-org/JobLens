@@ -26,14 +26,17 @@ option(JOBLENS_BUNDLE_LIBS "Bundle runtime .so into RPM" ON)
 option(JOBLENS_STATIC_EPEL "Statically link EPEL-only libraries (leveldb, xxhash)" OFF)
 
 # ---- Version Info ----
-find_package(Git QUIET)
-if(Git_FOUND)
-  execute_process(
-    COMMAND git rev-parse --short=7 HEAD
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    OUTPUT_VARIABLE BUILD_ID
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET)
+# BUILD_ID can be set externally (e.g. -DBUILD_ID=abc1234 from CI)
+if(NOT BUILD_ID)
+  find_package(Git QUIET)
+  if(Git_FOUND)
+    execute_process(
+      COMMAND git rev-parse --short=7 HEAD
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      OUTPUT_VARIABLE BUILD_ID
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+  endif()
 endif()
 if(NOT BUILD_ID)
   set(BUILD_ID "unknown")
@@ -223,7 +226,8 @@ target_link_libraries(JobLens
         $<$<BOOL:${XXHASH_USE_STATIC}>:${XXHASH_STATIC_LIB}>
         $<$<NOT:$<BOOL:${XXHASH_USE_STATIC}>>:PkgConfig::XXHASH>)
 
-# 将安装时的 lib 目录（lib 或 lib64）作为编译期宏传入，用于运行时拼接 bpf 对象路径
+# 将安装时的 lib 目录作为编译期宏传入，用于运行时拼接 bpf 对象路径。
+# 注意：RPM spec 必须使用相同的 %{_libdir} 安装 bpf_obj 文件以保持路径一致。
 target_compile_definitions(JobLens PRIVATE JOBLENS_INSTALL_LIBDIR="${CMAKE_INSTALL_LIBDIR}")
 
 # ---- Packaging (install / systemd / CPack) ----

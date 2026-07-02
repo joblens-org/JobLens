@@ -22,6 +22,7 @@ import logging
 import time
 import subprocess
 from typing import Optional
+from werkzeug.exceptions import HTTPException
 
 # 业务操作函数
 from trigger.core.tools import joblens_format_metrics, systemd_status, job_opt, add_condorjob, add_slurmjob, restart_joblens
@@ -103,7 +104,12 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         """获取Prometheus格式的指标数据"""
         try:
             metrics = rpc_client.call("prmxs_writer/metrics")
+            # 防御检查: C++ 返回 JSON 数组表示方法不存在/错误
+            if not isinstance(metrics, dict):
+                return Response("", mimetype="text/plain")
             return Response(joblens_format_metrics(metrics), mimetype="text/plain")
+        except HTTPException:
+            raise
         except RPCError as e:
             return abort(503, description=f"RPC调用失败: {str(e)}")
         except Exception as e:
@@ -364,7 +370,9 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         """列出所有作业（不包含彩蛋任务 JobID=0）"""
         try:
             result = rpc_client.call("JobRegistry/list_jobs")
-            response = JobsListResponse(jobs=result if isinstance(result, list) else [result])
+            # RPC 返回 {"status": "ok", "jobs": [...]}，需提取 jobs 数组
+            jobs = result.get("jobs", []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
+            response = JobsListResponse(status="ok", jobs=jobs)
             return jsonify(response.model_dump())
         except RPCError as e:
             return abort(503, description=f"Failed to list jobs: {str(e)}")
@@ -380,6 +388,8 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
                 return abort(404, description=result["error"])
             response = JobDetailResponse.model_validate(result)
             return jsonify(response.model_dump())
+        except HTTPException:
+            raise
         except RPCError as e:
             return abort(503, description=f"Failed to get job: {str(e)}")
         except Exception as e:
