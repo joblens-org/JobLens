@@ -102,6 +102,7 @@ ESWriter::ESWriter(std::string name, std::string type, std::string config_name)
     opt_.passwd = Config::instance().getString(config_name, "passwd", "");
     write_timeout = Config::instance().getInt(config_name, "write_timeout", 5);
     opt_.index_prefix = Config::instance().getString(config_name, "index_prefix", "collector");
+    opt_.insecure = Config::instance().getBool(config_name, "insecure", false);
     
     spdlog::debug("elasticsearch_writer {}: options - host={} port={} user='{}' index_prefix='{}' batch_size={} write_timeout={}",
                  name, opt_.host, opt_.port, opt_.user, opt_.index_prefix, opt_.batch_size, write_timeout);
@@ -144,6 +145,10 @@ bool ESWriter::test_server()
     curl_easy_setopt(curl_, CURLOPT_USERPWD, userpwd.c_str());
     curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, discard_cb); // 丢弃响应体
     curl_easy_setopt(curl_, CURLOPT_TIMEOUT, write_timeout); // 设置超时
+    if (opt_.insecure) {
+        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
 
     CURLcode res = curl_easy_perform(curl_);
     
@@ -323,6 +328,10 @@ bool ESWriter::post_bulk(const std::string& bulk)
     curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, bulk.c_str());
     curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, bulk.size());
     curl_easy_setopt(curl_, CURLOPT_TIMEOUT, write_timeout); // 设置超时
+    if (opt_.insecure) {
+        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
 
     struct curl_slist* hdrs = nullptr;
     hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
