@@ -70,12 +70,16 @@ public:
         if (!CondorJob::looks_like_condor_cgroup(cgroup_path)) {
             return;
         }
+        spdlog::debug("CondorJobWatcher: cgroup mkdir matched path={}, building job", cgroup_path);
         auto job_opt = buildCondorJobFromCgroup(cgroup_path);
         if (!job_opt) {
             spdlog::debug("CondorJobWatcher: no pid in cgroup {} after retry", cgroup_path);
             return;
         }
-        addBuiltJob(std::move(job_opt.value()), rules_manager_ != nullptr, use_collectors);
+        auto job = std::move(job_opt.value());
+        spdlog::debug("CondorJobWatcher: built cgroup job JobID={} NativeJobID={} cgroup={} pids=[{}]",
+                      job.JobID, job.NativeJobID, cgroup_path, fmt::join(job.JobPIDs, ", "));
+        addBuiltJob(std::move(job), rules_manager_ != nullptr, use_collectors);
     }
 
     void on_trigger_event(const TriggerEvent& event)
@@ -136,6 +140,9 @@ private:
             job.JobPIDs = *pids;
             auto& condor_attr = std::get<CondorJobAttr>(job.sub_attr);
             condor_attr.slots_cgroup_path = cgroup_path;
+            spdlog::debug("CondorJobWatcher: buildCondorJobFromCgroup selected pid={} JobID={} NativeJobID={} starter_pid={} cgroup={} all_pids=[{}]",
+                          pid, job.JobID, job.NativeJobID, condor_attr.starter_pid,
+                          cgroup_path, fmt::join(job.JobPIDs, ", "));
             return job;
         }
         spdlog::debug("CondorJobWatcher: no valid job from any pid in cgroup {}", cgroup_path);

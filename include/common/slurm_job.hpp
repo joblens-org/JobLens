@@ -24,6 +24,7 @@
 #include <unordered_set>
 #include <set>
 #include <fmt/core.h>
+#include <fmt/ranges.h>
 
 namespace SlurmJob
 {
@@ -99,6 +100,9 @@ inline bool refresh_cgroup_metadata(Job& job){
 
 inline void update_job_pids(Job& job){
     auto& slurm_attr = std::get<SlurmJobAttr>(job.sub_attr);
+    spdlog::debug("SlurmJob: update_job_pids begin JobID={} NativeJobID={} stepd_pid={} cgroup_path={} current_pids=[{}]",
+                  job.JobID, job.NativeJobID, slurm_attr.stepd_pid,
+                  slurm_attr.cgroup_path, fmt::join(job.JobPIDs, ", "));
     if(slurm_attr.stepd_pid == 0){
         if(job.JobPIDs.empty()){
             spdlog::warn("SlurmJob: cannot update pids for job {} without stepd pid or job pids", job.JobID);
@@ -109,6 +113,9 @@ inline void update_job_pids(Job& job){
         }
         slurm_attr.stepd_pid = get_ppid_of(job.JobPIDs[0]);
         slurm_attr.cgroup_path = v2_cgroup_absolute_path(job.JobPIDs[0]);
+        spdlog::debug("SlurmJob: inferred stepd_pid={} cgroup_path={} from pid={} for job {}",
+                      slurm_attr.stepd_pid, slurm_attr.cgroup_path,
+                      job.JobPIDs[0], job.JobID);
     }
     if (slurm_attr.cgroup_path.empty() && !refresh_cgroup_metadata(job)) {
         spdlog::warn("SlurmJob: cannot refresh cgroup path for job {}", job.JobID);
@@ -116,6 +123,10 @@ inline void update_job_pids(Job& job){
     }
 
     auto pid_cgroup = get_pids_in_cgroup(slurm_attr.cgroup_path);
+    spdlog::debug("SlurmJob: cgroup read JobID={} path={} status={} raw_pids=[{}]",
+                  job.JobID, slurm_attr.cgroup_path,
+                  Utils::cgroup_procs_status_name(pid_cgroup.status),
+                  fmt::join(pid_cgroup.pids, ", "));
     if (!pid_cgroup.ok()) {
         spdlog::warn("SlurmJob: failed to read cgroup pids from {}: {}, try refresh",
                      slurm_attr.cgroup_path,
@@ -123,7 +134,13 @@ inline void update_job_pids(Job& job){
         if (!refresh_cgroup_metadata(job)) {
             return;
         }
+        spdlog::debug("SlurmJob: refreshed cgroup metadata JobID={} stepd_pid={} cgroup_path={}",
+                      job.JobID, slurm_attr.stepd_pid, slurm_attr.cgroup_path);
         pid_cgroup = get_pids_in_cgroup(slurm_attr.cgroup_path);
+        spdlog::debug("SlurmJob: refreshed cgroup read JobID={} path={} status={} raw_pids=[{}]",
+                      job.JobID, slurm_attr.cgroup_path,
+                      Utils::cgroup_procs_status_name(pid_cgroup.status),
+                      fmt::join(pid_cgroup.pids, ", "));
         if (!pid_cgroup.ok()) {
             spdlog::warn("SlurmJob: failed to read refreshed cgroup pids from {}: {}",
                          slurm_attr.cgroup_path,
@@ -131,10 +148,14 @@ inline void update_job_pids(Job& job){
             return;
         }
     }
+    auto raw_pids = pid_cgroup.pids;
     pid_cgroup.pids.erase(
         std::remove(pid_cgroup.pids.begin(), pid_cgroup.pids.end(), slurm_attr.stepd_pid),
         pid_cgroup.pids.end());
     job.JobPIDs = std::move(pid_cgroup.pids);
+    spdlog::debug("SlurmJob: update_job_pids end JobID={} stepd_pid={} raw_pids=[{}] final_pids=[{}]",
+                  job.JobID, slurm_attr.stepd_pid,
+                  fmt::join(raw_pids, ", "), fmt::join(job.JobPIDs, ", "));
 }
 
 /* 获取Slurm Job ID */

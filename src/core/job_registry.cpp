@@ -392,8 +392,11 @@ JobRegistry& JobRegistry::instance() {
 
 
 bool JobRegistry::addJob(const Job& job) {
-    spdlog::info("JobRegistry: addJob entry JobID={}, type={}, collectors={}, PIDs={}",
-                 job.JobID, job.NativeJobID, job.CollectorNames.size(), job.JobPIDs.size());
+    spdlog::info("JobRegistry: addJob entry JobID={}, type={}, subtype={}, collectors={}, PIDs={}",
+                 job.JobID, job.NativeJobID, to_string(job.subtype), job.CollectorNames.size(), job.JobPIDs.size());
+    spdlog::debug("JobRegistry: addJob input JobID={} NativeJobID={} pids=[{}] collectors=[{}]",
+                  job.JobID, job.NativeJobID,
+                  fmt::join(job.JobPIDs, ", "), fmt::join(job.CollectorNames, ", "));
     // 错误检查
     if (job.CollectorNames.empty()) {
         spdlog::warn("JobRegistry: job with JobID {} has empty CollectorNames", job.JobID);
@@ -475,6 +478,9 @@ void JobRegistry::delJob(uint64_t jobID) {
         removed = std::move(it->second);
         jobs_.erase(it);
     }
+    spdlog::debug("JobRegistry: delJob removing JobID={} NativeJobID={} subtype={} last_pids=[{}]",
+                  removed.JobID, removed.NativeJobID, to_string(removed.subtype),
+                  fmt::join(removed.JobPIDs, ", "));
     for (const auto& cb : cbs_) cb(JobEvent::Removed, removed);
     spdlog::info("JobRegistry: remove job with JobID {}", removed.JobID);
     end_job_in_db(removed.JobID);
@@ -610,11 +616,26 @@ std::optional<Job> JobRegistry::findJob(uint64_t jobID) {
         result = it->second;  // 先拷贝
     }
 
+    auto pids_before_update = result.JobPIDs;
+    spdlog::debug("JobRegistry: findJob begin JobID={} NativeJobID={} subtype={} pids_before_update=[{}]",
+                  result.JobID, result.NativeJobID, to_string(result.subtype),
+                  fmt::join(pids_before_update, ", "));
     update_job(result);
+    spdlog::debug("JobRegistry: findJob after update_job JobID={} pids_after_update=[{}]",
+                  result.JobID, fmt::join(result.JobPIDs, ", "));
+
+    auto pids_before_running_filter = result.JobPIDs;
+    for (pid_t pid : pids_before_running_filter) {
+        spdlog::debug("JobRegistry: findJob pid liveness JobID={} pid={} running={}",
+                      result.JobID, pid, is_process_running(pid));
+    }
     result.JobPIDs.erase(
         std::remove_if(result.JobPIDs.begin(), result.JobPIDs.end(),
                        [](pid_t pid){ return !is_process_running(pid); }),
         result.JobPIDs.end());
+    spdlog::debug("JobRegistry: findJob after running filter JobID={} pids_before_filter=[{}] pids_after_filter=[{}]",
+                  result.JobID, fmt::join(pids_before_running_filter, ", "),
+                  fmt::join(result.JobPIDs, ", "));
 
     {
         std::unique_lock lg(mtx_);
@@ -626,7 +647,10 @@ std::optional<Job> JobRegistry::findJob(uint64_t jobID) {
 
         if (job.JobPIDs.empty()) {
             toDelete.push_back(jobID);
-            spdlog::info("JobRegistry: job {} has no running process, delete it", job.JobID);
+            spdlog::info("JobRegistry: job {} has no running process, delete it (NativeJobID={}, subtype={}, pids_before_update=[{}], pids_before_filter=[{}])",
+                         job.JobID, job.NativeJobID, to_string(job.subtype),
+                         fmt::join(pids_before_update, ", "),
+                         fmt::join(result.JobPIDs, ", "));
         }
         result = job;  // 更新拷贝以反映最新状态
     }

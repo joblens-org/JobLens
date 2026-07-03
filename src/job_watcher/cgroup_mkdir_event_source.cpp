@@ -98,7 +98,8 @@ bool CgroupMkdirEventSource::init_ebpf()
         auto* event = static_cast<cgroup_mkdir_event*>(data);
         auto normalized = self->normalize_event_path(event->path);
         if (!normalized.empty()) {
-            spdlog::debug("CgroupMkdirEventSource: enqueued mkdir event path={}", normalized);
+            spdlog::debug("CgroupMkdirEventSource: enqueued mkdir event path={} pid={} tgid={} cgroup_id={} level={} comm={}",
+                          normalized, event->pid, event->tgid, event->cgroup_id, event->level, event->comm);
             self->enqueue_path(std::move(normalized));
         }
         return 0;

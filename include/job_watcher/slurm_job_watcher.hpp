@@ -72,12 +72,16 @@ public:
             return;
         }
         auto step_path = SlurmJob::normalize_to_slurm_step_cgroup(cgroup_path);
+        spdlog::debug("SlurmJobWatcher: cgroup mkdir matched path={} normalized_step_path={}, building job", cgroup_path, step_path);
         auto job_opt = buildSlurmJobFromCgroup(step_path);
         if (!job_opt) {
             spdlog::debug("SlurmJobWatcher: no pid in cgroup {} after retry", step_path);
             return;
         }
-        addBuiltJob(std::move(job_opt.value()), rules_manager_ != nullptr, use_collectors);
+        auto job = std::move(job_opt.value());
+        spdlog::debug("SlurmJobWatcher: built cgroup job JobID={} NativeJobID={} cgroup={} pids=[{}]",
+                      job.JobID, job.NativeJobID, step_path, fmt::join(job.JobPIDs, ", "));
+        addBuiltJob(std::move(job), rules_manager_ != nullptr, use_collectors);
     }
 
     void on_trigger_event(const TriggerEvent& event)
@@ -135,6 +139,9 @@ private:
             job.JobPIDs = *pids;
             auto& slurm_attr = std::get<SlurmJobAttr>(job.sub_attr);
             slurm_attr.cgroup_path = cgroup_path;
+            spdlog::debug("SlurmJobWatcher: buildSlurmJobFromCgroup selected pid={} JobID={} NativeJobID={} stepd_pid={} cgroup={} all_pids=[{}]",
+                          pid, job.JobID, job.NativeJobID, slurm_attr.stepd_pid,
+                          cgroup_path, fmt::join(job.JobPIDs, ", "));
             return job;
         }
         spdlog::debug("SlurmJobWatcher: no valid job from any pid in cgroup {}", cgroup_path);

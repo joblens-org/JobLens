@@ -23,6 +23,7 @@
 #include <cctype>
 #include <spdlog/spdlog.h>
 #include <fmt/core.h>
+#include <fmt/ranges.h>
 
 namespace CondorJob
 {
@@ -79,6 +80,9 @@ inline bool refresh_cgroup_metadata(Job& job){
 
 inline void update_job_pids(Job& job){
     auto& condor_attr = std::get<CondorJobAttr>(job.sub_attr);
+    spdlog::debug("CondorJob: update_job_pids begin JobID={} NativeJobID={} starter_pid={} cgroup_path={} current_pids=[{}]",
+                  job.JobID, job.NativeJobID, condor_attr.starter_pid,
+                  condor_attr.slots_cgroup_path, fmt::join(job.JobPIDs, ", "));
     if(condor_attr.starter_pid == 0){
         if(job.JobPIDs.empty()){
             spdlog::warn("CondorJob: cannot update pids for job {} without starter pid or job pids", job.JobID);
@@ -89,6 +93,9 @@ inline void update_job_pids(Job& job){
         }
         condor_attr.starter_pid = get_ppid_of(job.JobPIDs[0]);
         condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(job.JobPIDs[0]);
+        spdlog::debug("CondorJob: inferred starter_pid={} cgroup_path={} from pid={} for job {}",
+                      condor_attr.starter_pid, condor_attr.slots_cgroup_path,
+                      job.JobPIDs[0], job.JobID);
     }
     if (condor_attr.slots_cgroup_path.empty() && !refresh_cgroup_metadata(job)) {
         spdlog::warn("CondorJob: cannot refresh cgroup path for job {}", job.JobID);
@@ -96,6 +103,10 @@ inline void update_job_pids(Job& job){
     }
 
     auto pid_slots_cgroup = get_pids_in_cgroup(condor_attr.slots_cgroup_path);
+    spdlog::debug("CondorJob: cgroup read JobID={} path={} status={} raw_pids=[{}]",
+                  job.JobID, condor_attr.slots_cgroup_path,
+                  Utils::cgroup_procs_status_name(pid_slots_cgroup.status),
+                  fmt::join(pid_slots_cgroup.pids, ", "));
     if (!pid_slots_cgroup.ok()) {
         spdlog::warn("CondorJob: failed to read cgroup pids from {}: {}, try refresh",
                      condor_attr.slots_cgroup_path,
@@ -103,7 +114,13 @@ inline void update_job_pids(Job& job){
         if (!refresh_cgroup_metadata(job)) {
             return;
         }
+        spdlog::debug("CondorJob: refreshed cgroup metadata JobID={} starter_pid={} cgroup_path={}",
+                      job.JobID, condor_attr.starter_pid, condor_attr.slots_cgroup_path);
         pid_slots_cgroup = get_pids_in_cgroup(condor_attr.slots_cgroup_path);
+        spdlog::debug("CondorJob: refreshed cgroup read JobID={} path={} status={} raw_pids=[{}]",
+                      job.JobID, condor_attr.slots_cgroup_path,
+                      Utils::cgroup_procs_status_name(pid_slots_cgroup.status),
+                      fmt::join(pid_slots_cgroup.pids, ", "));
         if (!pid_slots_cgroup.ok()) {
             spdlog::warn("CondorJob: failed to read refreshed cgroup pids from {}: {}",
                          condor_attr.slots_cgroup_path,
@@ -111,10 +128,14 @@ inline void update_job_pids(Job& job){
             return;
         }
     }
+    auto raw_pids = pid_slots_cgroup.pids;
     pid_slots_cgroup.pids.erase(
         std::remove(pid_slots_cgroup.pids.begin(), pid_slots_cgroup.pids.end(), condor_attr.starter_pid),
         pid_slots_cgroup.pids.end());
     job.JobPIDs = std::move(pid_slots_cgroup.pids);
+    spdlog::debug("CondorJob: update_job_pids end JobID={} starter_pid={} raw_pids=[{}] final_pids=[{}]",
+                  job.JobID, condor_attr.starter_pid,
+                  fmt::join(raw_pids, ", "), fmt::join(job.JobPIDs, ", "));
 }
 
 /* 解析 GlobalJobId */

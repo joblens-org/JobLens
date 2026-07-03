@@ -114,10 +114,14 @@ void CollectorScheduler::startCollector(std::string collector_name){
 
                 for(auto jobid: jobids_snapshot){
                     //TODO:当压力过高时，这里应该改为非阻塞执行
+                    spdlog::debug("CollectorScheduler: collector {} refreshing job {} via JobRegistry::findJob", collector_name, jobid);
                     auto job = JobRegistry::instance().findJob(jobid);
                     std::lock_guard lg(collector_job.m_);
                     if(!collector_job.running) return; //采集器已经deinit
-                    if(!job.has_value())continue;
+                    if(!job.has_value()){
+                        spdlog::debug("CollectorScheduler: collector {} findJob({}) returned nullopt", collector_name, jobid);
+                        continue;
+                    }
                     {
                         std::any ret;
                         try
