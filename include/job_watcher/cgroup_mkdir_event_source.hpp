@@ -13,27 +13,25 @@
  * limitations under the License. */
 #pragma once
 
+#include "job_watcher/job_trigger_source.hpp"
 #include <atomic>
 #include <bpf/libbpf.h>
 #include <condition_variable>
 #include <deque>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
-class CgroupMkdirEventSource {
+class CgroupMkdirEventSource : public IJobTriggerSource {
 public:
-    using Callback = std::function<void(const std::string& cgroup_path)>;
-
     CgroupMkdirEventSource();
-    ~CgroupMkdirEventSource();
+    ~CgroupMkdirEventSource() override;
 
-    bool start();
-    void stop();
-    void register_callback(Callback cb);
+    bool start() override;
+    void stop() override;
+    void register_callback(TriggerEventCallback cb) override;
 
 private:
     bool init_ebpf();
@@ -50,7 +48,7 @@ private:
     std::vector<bpf_link*> bpf_links_;
 
     std::mutex callbacks_mutex_;
-    std::vector<Callback> callbacks_;
+    std::vector<TriggerEventCallback> callbacks_;
 
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;

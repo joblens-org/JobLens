@@ -11,7 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-#include "core/cgroup_mkdir_event_source.hpp"
+#include "job_watcher/cgroup_mkdir_event_source.hpp"
 #include "common/ebpf_common.hpp"
 #include "common/utils.hpp"
 #include "ebpf/trace_cgroup_mkdir.h"
@@ -75,7 +75,7 @@ void CgroupMkdirEventSource::stop()
     deinit_ebpf();
 }
 
-void CgroupMkdirEventSource::register_callback(Callback cb)
+void CgroupMkdirEventSource::register_callback(TriggerEventCallback cb)
 {
     std::lock_guard<std::mutex> lock(callbacks_mutex_);
     callbacks_.push_back(std::move(cb));
@@ -158,14 +158,19 @@ void CgroupMkdirEventSource::worker_loop()
             path = std::move(pending_paths_.front());
             pending_paths_.pop_front();
         }
-        std::vector<Callback> callbacks;
+        std::vector<TriggerEventCallback> callbacks;
         {
             std::lock_guard<std::mutex> lock(callbacks_mutex_);
             callbacks = callbacks_;
         }
         spdlog::debug("CgroupMkdirEventSource: dispatching cgroup={} to {} callbacks", path, callbacks.size());
+        TriggerEvent trigger_event = CgroupMkdirTriggerEvent{std::move(path)};
         for (auto& cb : callbacks) {
-            cb(path);
+            try {
+                cb(trigger_event);
+            } catch (const std::exception& e) {
+                spdlog::warn("CgroupMkdirEventSource: callback exception: {}", e.what());
+            }
         }
     }
 }
