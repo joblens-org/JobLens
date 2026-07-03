@@ -65,15 +65,16 @@ namespace Utils
         if (!std::getline(stat, line))
             return -1;
 
-        // 从右括号后开始找第 4 个字段
         std::size_t last_rparen = line.rfind(')');
         if (last_rparen == std::string::npos)
             return -1;
 
         std::istringstream iss(line.substr(last_rparen + 1));
         pid_t ppid;
-        std::string dummy;
-        iss >> dummy >> dummy >> ppid;   // skip state, then ppid
+        std::string state;
+        if (!(iss >> state >> ppid)) {
+            return -1;
+        }
         return ppid;
     }
 

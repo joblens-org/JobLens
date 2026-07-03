@@ -129,9 +129,15 @@ inline void update_job_pids(Job& job){
         }
     }
     auto raw_pids = pid_slots_cgroup.pids;
-    pid_slots_cgroup.pids.erase(
-        std::remove(pid_slots_cgroup.pids.begin(), pid_slots_cgroup.pids.end(), condor_attr.starter_pid),
-        pid_slots_cgroup.pids.end());
+    if (condor_attr.starter_pid > 0) {
+        pid_slots_cgroup.pids.erase(
+            std::remove(pid_slots_cgroup.pids.begin(), pid_slots_cgroup.pids.end(), condor_attr.starter_pid),
+            pid_slots_cgroup.pids.end());
+        if (pid_slots_cgroup.pids.empty() && !raw_pids.empty()) {
+            spdlog::warn("CondorJob: filtering starter_pid {} would empty cgroup pids for job {}, keep raw pids", condor_attr.starter_pid, job.JobID);
+            pid_slots_cgroup.pids = raw_pids;
+        }
+    }
     job.JobPIDs = std::move(pid_slots_cgroup.pids);
     spdlog::debug("CondorJob: update_job_pids end JobID={} starter_pid={} raw_pids=[{}] final_pids=[{}]",
                   job.JobID, condor_attr.starter_pid,
