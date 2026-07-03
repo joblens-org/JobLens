@@ -13,6 +13,7 @@
  * limitations under the License. */
 #pragma once
 #include "common/condor_job.hpp"
+#include "job_watcher/job_trigger_event.hpp"
 #include <spdlog/spdlog.h>
 #include <fmt/ranges.h>
 #include "common/utils.hpp"
@@ -77,6 +78,18 @@ public:
         addBuiltJob(std::move(job_opt.value()), rules_manager_ != nullptr, use_collectors);
     }
 
+    void on_trigger_event(const TriggerEvent& event)
+    {
+        std::visit([this](const auto& e) {
+            using T = std::decay_t<decltype(e)>;
+            if constexpr (std::is_same_v<T, CgroupMkdirTriggerEvent>) {
+                on_cgroup_mkdir(e.cgroup_path);
+            } else if constexpr (std::is_same_v<T, ExecveTriggerEvent>) {
+                on_execve(static_cast<pid_t>(e.pid), static_cast<pid_t>(e.ppid), e.comm);
+            }
+        }, event);
+    }
+
 private:
     std::optional<Job> buildCondorJob(pid_t pid){
         auto JobID = CondorJob::getJobID(pid);
@@ -134,6 +147,23 @@ private:
         if(!job_opt) return;
 
         addBuiltJob(std::move(job_opt.value()), use_rules, std::move(default_collectors));
+    }
+
+    void on_execve(pid_t pid, pid_t /*ppid*/, const std::string& /*comm*/)
+    {
+        auto job_opt = buildCondorJob(pid);
+        if (!job_opt) {
+            spdlog::debug("CondorJobWatcher: execve pid {} not a valid condor job", pid);
+            return;
+        }
+        Job job = std::move(job_opt.value());
+        // 尝试从 proc/cgroup 读取完整 PID 列表（增强模式）
+        auto pids = get_cgroup_pids_with_retry(
+            std::get<CondorJobAttr>(job.sub_attr).slots_cgroup_path);
+        if (pids && !pids->empty()) {
+            job.JobPIDs = *pids;
+        }
+        addBuiltJob(std::move(job), rules_manager_ != nullptr, use_collectors);
     }
 
     void addBuiltJob(Job job, bool use_rules, std::vector<std::string> default_collectors){

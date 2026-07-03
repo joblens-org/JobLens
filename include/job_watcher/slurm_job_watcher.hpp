@@ -13,6 +13,7 @@
  * limitations under the License. */
 #pragma once
 #include "common/slurm_job.hpp"
+#include "job_watcher/job_trigger_event.hpp"
 #include <spdlog/spdlog.h>
 #include <fmt/ranges.h>
 #include "common/utils.hpp"
@@ -79,6 +80,18 @@ public:
         addBuiltJob(std::move(job_opt.value()), rules_manager_ != nullptr, use_collectors);
     }
 
+    void on_trigger_event(const TriggerEvent& event)
+    {
+        std::visit([this](const auto& e) {
+            using T = std::decay_t<decltype(e)>;
+            if constexpr (std::is_same_v<T, CgroupMkdirTriggerEvent>) {
+                on_cgroup_mkdir(e.cgroup_path);
+            } else if constexpr (std::is_same_v<T, ExecveTriggerEvent>) {
+                on_execve(static_cast<pid_t>(e.pid), static_cast<pid_t>(e.ppid), e.comm);
+            }
+        }, event);
+    }
+
 private:
     std::optional<Job> buildSlurmJob(pid_t pid){
         auto JobID = SlurmJob::getJobID(pid);
@@ -133,6 +146,22 @@ private:
         if(!job_opt) return;
 
         addBuiltJob(std::move(job_opt.value()), use_rules, std::move(default_collectors));
+    }
+
+    void on_execve(pid_t pid, pid_t /*ppid*/, const std::string& /*comm*/)
+    {
+        auto job_opt = buildSlurmJob(pid);
+        if (!job_opt) {
+            spdlog::debug("SlurmJobWatcher: execve pid {} not a valid slurm job", pid);
+            return;
+        }
+        Job job = std::move(job_opt.value());
+        auto pids = get_cgroup_pids_with_retry(
+            std::get<SlurmJobAttr>(job.sub_attr).cgroup_path);
+        if (pids && !pids->empty()) {
+            job.JobPIDs = *pids;
+        }
+        addBuiltJob(std::move(job), rules_manager_ != nullptr, use_collectors);
     }
 
     void addBuiltJob(Job job, bool use_rules, std::vector<std::string> default_collectors){

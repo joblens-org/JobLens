@@ -13,6 +13,8 @@
  * limitations under the License. */
 // job_registry.cpp
 #include "core/job_registry.hpp"
+#include "job_watcher/cgroup_mkdir_event_source.hpp"
+#include "job_watcher/execve_event_source.hpp"
 #include <spdlog/spdlog.h>
 #include <date/date.h>
 #include "common/config.hpp"
@@ -207,12 +209,37 @@ void JobRegistry::init_job_watcher() {
     enable_auto_add_condor_job = Config::instance().getBool("job_registry_config", "auto_add_condorjob", false);
     enable_auto_add_slurm_job = Config::instance().getBool("job_registry_config", "auto_add_slurmjob", false);
 
-    if (enable_auto_add_condor_job || enable_auto_add_slurm_job) {
-        cgroup_mkdir_event_source_ = std::make_unique<CgroupMkdirEventSource>();
-        if (!cgroup_mkdir_event_source_->start()) {
+    condor_trigger_type_ = Config::instance().getString("condor_job_watcher", "discovery_trigger", "cgroup_mkdir");
+    slurm_trigger_type_  = Config::instance().getString("slurm_job_watcher", "discovery_trigger", "cgroup_mkdir");
+
+    auto validate_trigger = [](const std::string& val, const std::string& watcher) -> std::string {
+        if (val == "cgroup_mkdir" || val == "syscall_execve") {
+            return val;
+        }
+        spdlog::warn("JobRegistry: {} discovery_trigger '{}' is invalid, falling back to cgroup_mkdir", watcher, val);
+        return "cgroup_mkdir";
+    };
+    condor_trigger_type_ = validate_trigger(condor_trigger_type_, "condor_job_watcher");
+    slurm_trigger_type_  = validate_trigger(slurm_trigger_type_, "slurm_job_watcher");
+
+    bool need_cgroup = (condor_trigger_type_ == "cgroup_mkdir") || (slurm_trigger_type_ == "cgroup_mkdir");
+    bool need_execve = (condor_trigger_type_ == "syscall_execve") || (slurm_trigger_type_ == "syscall_execve");
+
+    if ((enable_auto_add_condor_job || enable_auto_add_slurm_job) && need_cgroup) {
+        cgroup_trigger_source_ = std::make_unique<CgroupMkdirEventSource>();
+        if (!cgroup_trigger_source_->start()) {
             spdlog::warn("JobRegistry: failed to start cgroup mkdir event source");
         } else {
             spdlog::info("JobRegistry: enabled cgroup mkdir event source");
+        }
+    }
+
+    if ((enable_auto_add_condor_job || enable_auto_add_slurm_job) && need_execve) {
+        execve_trigger_source_ = std::make_unique<ExecveEventSource>();
+        if (!execve_trigger_source_->start()) {
+            spdlog::warn("JobRegistry: failed to start execve event source");
+        } else {
+            spdlog::info("JobRegistry: enabled execve event source");
         }
     }
 
@@ -223,17 +250,26 @@ void JobRegistry::init_job_watcher() {
                 this->addJob(job);
             }
         );
-        if (cgroup_mkdir_event_source_) {
-            cgroup_mkdir_event_source_->register_callback(
-                [this](const std::string& path) {
+        if (condor_trigger_type_ == "cgroup_mkdir" && cgroup_trigger_source_) {
+            cgroup_trigger_source_->register_callback(
+                [this](const TriggerEvent& event) {
                     if (condor_job_watcher_) {
-                        condor_job_watcher_->on_cgroup_mkdir(path);
+                        condor_job_watcher_->on_trigger_event(event);
                     }
                 }
             );
             spdlog::debug("JobRegistry: registered condor cgroup mkdir callback");
+        } else if (condor_trigger_type_ == "syscall_execve" && execve_trigger_source_) {
+            execve_trigger_source_->register_callback(
+                [this](const TriggerEvent& event) {
+                    if (condor_job_watcher_) {
+                        condor_job_watcher_->on_trigger_event(event);
+                    }
+                }
+            );
+            spdlog::debug("JobRegistry: registered condor execve callback");
         }
-        spdlog::info("JobRegistry: enabled auto add condor job");
+        spdlog::info("JobRegistry: enabled auto add condor job (trigger={})", condor_trigger_type_);
     }
 
     if (enable_auto_add_slurm_job) {
@@ -243,17 +279,26 @@ void JobRegistry::init_job_watcher() {
                 this->addJob(job);
             }
         );
-        if (cgroup_mkdir_event_source_) {
-            cgroup_mkdir_event_source_->register_callback(
-                [this](const std::string& path) {
+        if (slurm_trigger_type_ == "cgroup_mkdir" && cgroup_trigger_source_) {
+            cgroup_trigger_source_->register_callback(
+                [this](const TriggerEvent& event) {
                     if (slurm_job_watcher_) {
-                        slurm_job_watcher_->on_cgroup_mkdir(path);
+                        slurm_job_watcher_->on_trigger_event(event);
                     }
                 }
             );
             spdlog::debug("JobRegistry: registered slurm cgroup mkdir callback");
+        } else if (slurm_trigger_type_ == "syscall_execve" && execve_trigger_source_) {
+            execve_trigger_source_->register_callback(
+                [this](const TriggerEvent& event) {
+                    if (slurm_job_watcher_) {
+                        slurm_job_watcher_->on_trigger_event(event);
+                    }
+                }
+            );
+            spdlog::debug("JobRegistry: registered slurm execve callback");
         }
-        spdlog::info("JobRegistry: enabled auto add slurm job");
+        spdlog::info("JobRegistry: enabled auto add slurm job (trigger={})", slurm_trigger_type_);
     }
 }
 

@@ -24,7 +24,7 @@
 
 
 #include "core/collector_type.h"
-#include "core/cgroup_mkdir_event_source.hpp"
+#include "job_watcher/job_trigger_source.hpp"
 #include "job_lifecycle_event.h"
 
 #include "job_watcher/condor_job_watcher.hpp"
@@ -100,5 +100,8 @@ private:
     // Slurm作业自动添加
     bool enable_auto_add_slurm_job{false};
     std::unique_ptr<SlurmJobWatcher> slurm_job_watcher_;
-    std::unique_ptr<CgroupMkdirEventSource> cgroup_mkdir_event_source_;
+    std::unique_ptr<IJobTriggerSource> cgroup_trigger_source_;
+    std::unique_ptr<IJobTriggerSource> execve_trigger_source_;
+    std::string condor_trigger_type_;
+    std::string slurm_trigger_type_;
 };
