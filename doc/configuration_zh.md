@@ -394,6 +394,35 @@ slurm_job_watcher:
 | `use_rules` | bool | `false` | 是否使用规则引擎过滤作业 |
 | `rules_prefix` | string | `"slurm_job_"` | 规则引擎加载的规则文件前缀 |
 
+### `discovery_trigger`（按 Watcher 配置，可选）
+
+控制用于检测新 Condor/Slurm 作业的内核机制。
+
+**键路径**: `condor_job_watcher.discovery_trigger` / `slurm_job_watcher.discovery_trigger`
+
+**类型**: 字符串枚举
+
+**允许的值**:
+| 值 | 说明 |
+|-------|-------------|
+| `cgroup_mkdir` | 通过 cgroup v2 `mkdir` tracepoint 事件发现作业（默认）。需要内核启用 cgroup v2 且 Condor/Slurm 配置为使用 cgroups。 |
+| `syscall_execve` | 通过 `execve` 系统调用 tracepoint 发现作业，过滤 `condor_starter` / `slurmstepd` 子进程。无需 cgroup v2 配置即可工作。 |
+
+**默认值**: `cgroup_mkdir`（当键不存在时保持原有行为）。
+
+**示例**:
+```yaml
+condor_job_watcher:
+  discovery_trigger: cgroup_mkdir
+
+slurm_job_watcher:
+  discovery_trigger: syscall_execve
+```
+
+**限制**:
+- `syscall_execve` 仅发现 JobLens 服务启动后新执行的进程，不会自动发现启动前已运行的作业。
+- 如果 Condor/Slurm 未配置 cgroup 支持，建议切换到 `syscall_execve`。
+
 ---
 
 ## 完整配置文件示例

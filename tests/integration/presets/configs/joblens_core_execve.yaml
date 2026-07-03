@@ -1,0 +1,89 @@
+# JobLens 集成测试配置 — syscall_execve 触发源
+# 用于验证 execve 追踪在 Condor/Slurm 环境下正确发现作业
+# 来源: 基于 joblens_core_default.yaml，将 discovery_trigger 设为 syscall_execve
+#
+# ⚠️ 以下所有字段均为必填 — 缺失任一将导致 SIGABRT 或运行时故障
+
+# ============================================================
+# 基础 Core 配置 (必填)
+# ============================================================
+lens_config:
+  rpc_socket_path: /var/JobLens/rpc.sock
+  lock_path: /var/JobLens/JobLens.lock
+  max_collector_threads: 2
+  log_level: debug
+
+# ============================================================
+# 作业注册表 (必填)
+# ============================================================
+job_registry_config:
+  job_db_path: /var/JobLens/job.db
+  auto_add_condorjob: true
+  auto_add_slurmjob: true
+
+# ============================================================
+# HTCondor 作业监视器 — syscall_execve 触发
+# ============================================================
+condor_job_watcher:
+  discovery_trigger: syscall_execve
+  auto_add_collectors:
+    - cpumem_collector
+  use_rules: false
+
+# ============================================================
+# Slurm 作业监视器 — syscall_execve 触发
+# ============================================================
+slurm_job_watcher:
+  discovery_trigger: syscall_execve
+  auto_add_collectors:
+    - cpumem_collector
+  use_rules: false
+
+# ============================================================
+# 采集器配置
+# ============================================================
+collectors_config:
+  enable_collector_perf: true
+  perf_window_size: 1000
+  default_freq: 1
+  default_use_writers:
+    - file_writer
+  collectors:
+    - name: cpumem_collector
+      type: CPUMemCollector
+      config: cpumem_collector_config
+
+cpumem_collector_config:
+  freq: 1
+  use_writers:
+    - file_writer
+
+# ============================================================
+# Writer 配置 — FileWriter 输出 JSONL 到本地文件
+# ============================================================
+writers_config:
+  enable_writer_perf: true
+  buffer_capacity: 256
+  writers:
+    - name: file_writer
+      type: FileWriter
+      config: file_writer_config
+
+file_writer_config:
+  path: /var/log/joblens/output.log
+
+# ============================================================
+# 单节点服务组件 (全部禁用)
+# ============================================================
+service_registry:
+  enabled: false
+  url: "http://localhost:8080"
+  retry_interval: 10
+  max_retries: 3
+  heartbeat_interval: 1800
+
+config_manager:
+  enabled: false
+
+rule_manager:
+  enabled: false

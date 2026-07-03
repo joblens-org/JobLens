@@ -397,6 +397,35 @@ slurm_job_watcher:
 | `use_rules` | bool | `false` | Whether to filter jobs using the rule engine | `slurm_job_watcher.hpp:30` |
 | `rules_prefix` | string | `"slurm_job_"` | Prefix for rule files loaded by the rule engine | `slurm_job_watcher.hpp:35` |
 
+### `discovery_trigger` (per-watcher, optional)
+
+Controls which kernel mechanism is used to detect new Condor/Slurm jobs.
+
+**Key path**: `condor_job_watcher.discovery_trigger` / `slurm_job_watcher.discovery_trigger`
+
+**Type**: string enum
+
+**Allowed values**:
+| Value | Description |
+|-------|-------------|
+| `cgroup_mkdir` | Detect jobs via cgroup v2 `mkdir` tracepoint events (default). Requires cgroup v2 enabled in kernel and Condor/Slurm configured to use cgroups. |
+| `syscall_execve` | Detect jobs via `execve` syscall tracepoint, filtering for `condor_starter` / `slurmstepd` child processes. Works without cgroup v2 configuration. |
+
+**Default**: `cgroup_mkdir` (preserves pre-existing behavior when the key is absent).
+
+**Example**:
+```yaml
+condor_job_watcher:
+  discovery_trigger: cgroup_mkdir
+
+slurm_job_watcher:
+  discovery_trigger: syscall_execve
+```
+
+**Limitations**:
+- `syscall_execve` only discovers processes that exec *after* JobLens service starts. Pre-existing jobs will not be auto-discovered.
+- If Condor/Slurm is configured without cgroup support, switching to `syscall_execve` is recommended.
+
 ---
 
 ## Complete Configuration File Example

@@ -53,3 +53,30 @@ writers_config:
 
 file_writer_config:
   path: /var/log/joblens/output.log          # Local output file path
+
+# ============================================================
+# Condor Job Watcher Configuration
+# ============================================================
+condor_job_watcher:
+  # 作业自动发现触发源: cgroup_mkdir | syscall_execve
+  # cgroup_mkdir:   通过内核 cgroup v2 mkdir 事件发现（需要内核 5.7+，cgroup v2 挂载）
+  # syscall_execve: 通过 execve 系统调用发现 condor_starter 子进程（兼容非 cgroup 环境）
+  # 默认: cgroup_mkdir（不设置此键时行为不变）
+  # discovery_trigger: cgroup_mkdir
+  auto_add_collectors:
+    - cpumem_collector
+  use_rules: false
+
+# ============================================================
+# Slurm Job Watcher Configuration
+# ============================================================
+slurm_job_watcher:
+  # 作业自动发现触发源: cgroup_mkdir | syscall_execve
+  # 同上
+  # 默认: cgroup_mkdir
+  # discovery_trigger: cgroup_mkdir
+  # 注意: syscall_execve 仅发现 JobLens 启动后新执行的进程，
+  #       不会发现启动前已运行的 Slurm 作业。
+  auto_add_collectors:
+    - cpumem_collector
+  use_rules: false
