@@ -236,6 +236,7 @@ jobs:
           path: |
             tests/integration/test-results.xml
             tests/integration/pytest.log
+            tests/integration/.runtime/joblens-output-logs/
           retention-days: 7
 
       # ─── Step 4b: 上传诊断日志 (仅在失败时) ────────────────────

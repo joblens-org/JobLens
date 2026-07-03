@@ -1,25 +1,77 @@
 """JobLens integration test fixtures and shared configuration."""
 
+import importlib
+import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Generator
 
 import pytest
 
-from utils import (
-    CONTROLLER_HOST,
-    INTEGRATION_ROOT,
-    JOBLENS_DB_PATH,
-    JOBLENS_LOCK_PATH,
-    JOBLENS_OUTPUT_LOG,
-    PROJECT_ROOT,
-    TRIGGER_PORT,
-    WORKER_HOST,
-    WORKER_IP,
-    JobLensAPI,
-    RemoteClient,
-)
+try:
+    utils = importlib.import_module("test_cases.utils")
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    utils = importlib.import_module("utils")
+
+CONTROLLER_HOST = utils.CONTROLLER_HOST
+INTEGRATION_ROOT = utils.INTEGRATION_ROOT
+JOBLENS_DB_PATH = utils.JOBLENS_DB_PATH
+JOBLENS_LOCK_PATH = utils.JOBLENS_LOCK_PATH
+JOBLENS_OUTPUT_LOG = utils.JOBLENS_OUTPUT_LOG
+PROJECT_ROOT = utils.PROJECT_ROOT
+TRIGGER_PORT = utils.TRIGGER_PORT
+WORKER_HOST = utils.WORKER_HOST
+WORKER_IP = utils.WORKER_IP
+JobLensAPI = utils.JobLensAPI
+RemoteClient = utils.RemoteClient
+
+JOBLENS_OUTPUT_EXPORT_DIR = INTEGRATION_ROOT / ".runtime" / "joblens-output-logs"
+
+
+def _safe_test_log_name(nodeid: str) -> str:
+    """将 pytest nodeid 转成适合作为目录名的日志名。"""
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", nodeid).strip("_")
+    return safe_name or "unknown-test"
+
+
+def _write_export_file(target: Path, content: str) -> None:
+    """写入导出文件，确保空日志也留下占位说明。"""
+    target.write_text(content if content else "(空日志)\n", encoding="utf-8")
+
+
+def _export_remote_command(worker: RemoteClient, command: str, target: Path) -> None:
+    """执行远程命令并将 stdout/stderr 最佳努力写入本地文件。"""
+    try:
+        result = worker.sudo(command, hide=True, warn=True)
+        content = result.stdout or result.stderr
+        _write_export_file(target, content)
+    except Exception as e:
+        _write_export_file(target, f"导出远程日志失败: {e}\n")
+
+
+def _export_joblens_logs(worker: RemoteClient, nodeid: str) -> None:
+    """每个测试结束后导出 JobLens FileWriter 与 systemd journal 日志。"""
+    test_log_dir = JOBLENS_OUTPUT_EXPORT_DIR / _safe_test_log_name(nodeid)
+    test_log_dir.mkdir(parents=True, exist_ok=True)
+
+    _export_remote_command(
+        worker,
+        f"test -f {JOBLENS_OUTPUT_LOG} && cat {JOBLENS_OUTPUT_LOG} || true",
+        test_log_dir / "output.log",
+    )
+    _export_remote_command(
+        worker,
+        "journalctl -u joblens --no-pager --since '30 minutes ago' 2>&1 || true",
+        test_log_dir / "joblens-journal.log",
+    )
+    _export_remote_command(
+        worker,
+        "journalctl -u joblens-trigger --no-pager --since '30 minutes ago' 2>&1 || true",
+        test_log_dir / "joblens-trigger-journal.log",
+    )
 
 
 # ── CLI 选项 ──────────────────────────────────────────────────────────
@@ -103,7 +155,11 @@ def _cleanup_condor(controller: RemoteClient) -> None:
 def _cleanup_slurm(controller: RemoteClient) -> None:
     try:
         controller.run(
-            "scancel -u vagrant 2>/dev/null || true; sudo scancel -u root 2>/dev/null || true",
+            "sudo scancel -u vagrant 2>/dev/null || true; "
+            "sudo scancel -u root 2>/dev/null || true; "
+            "for job_id in $(squeue -h -o '%A' 2>/dev/null | sort -u); "
+            "do sudo scancel ${job_id} 2>/dev/null || true; done; "
+            "sleep 2",
             hide=True,
             warn=True,
         )
@@ -191,7 +247,7 @@ def _ebpf_cleanup() -> None:
             ["vagrant", "ssh", "worker", "-c",
              "sudo bpftool prog detach pinned /sys/fs/bpf/* 2>/dev/null || true; "
              "sudo rm -rf /sys/fs/bpf/joblens* 2>/dev/null || true"],
-            cwd=PROJECT_ROOT,
+            cwd=INTEGRATION_ROOT,
             capture_output=True,
             timeout=15,
         )
@@ -200,6 +256,15 @@ def _ebpf_cleanup() -> None:
 
 
 # ── 测试级清理 fixture ────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def export_joblens_logs(
+    request: pytest.FixtureRequest, worker: RemoteClient
+) -> Generator[None, None, None]:
+    """每个测试结束后导出 JobLens FileWriter 与 journalctl 日志。"""
+    yield
+    _export_joblens_logs(worker, request.node.nodeid)
+
 
 @pytest.fixture
 def clean_test_state(
@@ -237,7 +302,7 @@ def vagrant_environment(
         try:
             subprocess.run(
                 ["vagrant", "up"],
-                cwd=PROJECT_ROOT,
+                cwd=INTEGRATION_ROOT,
                 capture_output=True,
                 timeout=300,
             )
@@ -253,7 +318,7 @@ def vagrant_environment(
         try:
             subprocess.run(
                 ["vagrant", "suspend"],
-                cwd=PROJECT_ROOT,
+                cwd=INTEGRATION_ROOT,
                 capture_output=True,
                 timeout=120,
             )
@@ -263,7 +328,7 @@ def vagrant_environment(
         try:
             subprocess.run(
                 ["vagrant", "destroy", "-f"],
-                cwd=PROJECT_ROOT,
+                cwd=INTEGRATION_ROOT,
                 capture_output=True,
                 timeout=120,
             )

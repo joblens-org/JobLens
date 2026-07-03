@@ -156,6 +156,137 @@ def vagrant_write(node: str, path: str, data: bytes) -> None:
         proc.check_returncode()
 
 
+def vagrant_command(node: str, command: str, timeout: int = 30) -> subprocess.CompletedProcess[str] | None:
+    """执行最佳努力 VM 命令，失败时返回 None 并保留主流程。"""
+    try:
+        return subprocess.run(
+            ["vagrant", "ssh", node, "-c", command],
+            cwd=SCRIPT_DIR,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError) as e:
+        print(f"  ⚠ vagrant ssh {node} 执行失败: {e}", flush=True)
+        return None
+
+
+def _vms_running() -> bool:
+    """快速判断 Vagrant VM 是否处于可诊断/可清理状态。"""
+    try:
+        proc = subprocess.run(
+            ["vagrant", "status"],
+            cwd=SCRIPT_DIR,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
+        return False
+    return "running" in proc.stdout
+
+
+def _print_vm_section(node: str, title: str, command: str, timeout: int = 20) -> None:
+    """打印 VM 诊断段落，命令失败也继续输出可用信息。"""
+    print(f"  --- {title} ({node}) ---", flush=True)
+    proc = vagrant_command(node, command, timeout=timeout)
+    if proc is None:
+        return
+    output = proc.stdout.strip() or proc.stderr.strip()
+    if output:
+        print(output, flush=True)
+    else:
+        print("  (空输出)", flush=True)
+
+
+def _diagnose_joblens() -> None:
+    """收集 JobLens core/trigger/eBPF/FileWriter 诊断日志。"""
+    print("  === JobLens 诊断 ===", flush=True)
+    _print_vm_section(
+        "worker",
+        "JobLens 服务状态",
+        "echo '=== joblens ==='; systemctl is-active joblens 2>&1 || true; "
+        "echo '=== joblens-trigger ==='; systemctl is-active joblens-trigger 2>&1 || true; "
+        "echo '=== listening ports ==='; sudo ss -tlnp 2>/dev/null | grep -E '7592|JobLens|gunicorn' || true",
+        timeout=20,
+    )
+    _print_vm_section(
+        "worker",
+        "JobLens core 日志",
+        "sudo journalctl -u joblens --no-pager --since '30 minutes ago' 2>&1 || true",
+        timeout=20,
+    )
+    _print_vm_section(
+        "worker",
+        "JobLens trigger 日志",
+        "sudo journalctl -u joblens-trigger --no-pager --since '30 minutes ago' 2>&1 || true",
+        timeout=20,
+    )
+    _print_vm_section(
+        "worker",
+        "JobLens eBPF 快照",
+        "echo '=== bpftool joblens programs ==='; sudo bpftool prog list 2>&1 | grep -i joblens || true; "
+        "echo '=== watcher init/error logs ==='; "
+        "sudo journalctl -u joblens --no-pager --since '30 minutes ago' 2>&1 "
+        "| grep -Ei 'CondorJobWatcher|SlurmJobWatcher|init ebpf|inited auto add|ebpf got exec|built job|added .* jobs|error|warn' "
+        "|| true",
+        timeout=20,
+    )
+    _print_vm_section(
+        "worker",
+        "JobLens FileWriter 输出",
+        "echo '=== /var/log/joblens/output.log tail ==='; "
+        "sudo test -f /var/log/joblens/output.log "
+        "&& sudo tail -n 80 /var/log/joblens/output.log "
+        "|| echo '/var/log/joblens/output.log 不存在'",
+        timeout=20,
+    )
+
+
+def cleanup_runtime_state(reason: str) -> None:
+    """预设间最佳努力清理，避免 KEEP_VMS 复用 VM 时残留作业污染下一轮。"""
+    print(f"  === 运行时状态清理: {reason} ===", flush=True)
+    if not _vms_running():
+        print("  ℹ VM 不在运行状态，跳过运行时清理", flush=True)
+        return
+
+    _print_vm_section(
+        "controller",
+        "清理 HTCondor 队列",
+        "echo '=== before condor_q ==='; condor_q -all 2>&1 || true; "
+        "condor_rm -all 2>&1 || true; sleep 2; "
+        "echo '=== after condor_q ==='; condor_q -all 2>&1 || true",
+        timeout=30,
+    )
+    _print_vm_section(
+        "controller",
+        "清理 Slurm 队列",
+        "echo '=== before squeue ==='; squeue 2>&1 || true; "
+        "sudo scancel -u vagrant 2>&1 || true; "
+        "sudo scancel -u root 2>&1 || true; "
+        "for job_id in $(squeue -h -o '%A' 2>/dev/null | sort -u); do sudo scancel ${job_id} 2>&1 || true; done; "
+        "sleep 2; echo '=== after squeue ==='; squeue 2>&1 || true",
+        timeout=30,
+    )
+    _print_vm_section(
+        "worker",
+        "重置 JobLens 运行时状态",
+        "sudo systemctl stop joblens-trigger 2>/dev/null || true; "
+        "sudo systemctl stop joblens 2>/dev/null || true; "
+        "sudo rm -rf /var/JobLens/job.db 2>/dev/null || true; "
+        "sudo rm -f /var/JobLens/JobLens.lock 2>/dev/null || true; "
+        "sudo bpftool prog detach pinned /sys/fs/bpf/* 2>/dev/null || true; "
+        "sudo rm -rf /sys/fs/bpf/joblens* 2>/dev/null || true; "
+        "sudo mkdir -p /var/log/joblens; "
+        "sudo truncate -s 0 /var/log/joblens/output.log 2>/dev/null || true; "
+        "sudo systemctl start joblens 2>/dev/null || true; "
+        "sudo systemctl start joblens-trigger 2>/dev/null || true; "
+        "echo '=== services ==='; systemctl is-active joblens 2>&1 || true; "
+        "systemctl is-active joblens-trigger 2>&1 || true",
+        timeout=40,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 预设发现与校验
 # ══════════════════════════════════════════════════════════════════════════
@@ -609,17 +740,8 @@ def _diagnose_scheduler(htcondor_enabled: bool, slurm_enabled: bool) -> None:
     print("  === 调度器诊断 ===", flush=True)
 
     # Fast-fail: 快速检查 VM 是否仍在运行, 避免后续 vagrant ssh 命令逐个超时
-    try:
-        status_proc = subprocess.run(
-            ["vagrant", "status"], cwd=SCRIPT_DIR,
-            capture_output=True, text=True, timeout=10,
-        )
-        if "running" not in status_proc.stdout:
-            print("  ℹ VM 不在运行状态, 跳过调度器诊断", flush=True)
-            print(f"  vagrant status:\n{status_proc.stdout.strip()[:500]}", flush=True)
-            return
-    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError) as e:
-        print(f"  ℹ 无法获取 VM 状态 ({e}), 跳过调度器诊断", flush=True)
+    if not _vms_running():
+        print("  ℹ VM 不在运行状态, 跳过调度器诊断", flush=True)
         return
 
     if htcondor_enabled:
@@ -724,6 +846,11 @@ def _diagnose_scheduler(htcondor_enabled: bool, slurm_enabled: bool) -> None:
                 print("  (空输出)", flush=True)
         except Exception as e:
             print(f"  slurmd journalctl 失败: {e}", flush=True)
+
+    try:
+        _diagnose_joblens()
+    except Exception as e:
+        print(f"  JobLens 诊断失败: {e}", flush=True)
 
 
 def _vagrant_capture(node: str, command: str, timeout: int = 15) -> tuple[str, str]:
@@ -1243,7 +1370,14 @@ def run_preset(preset_name: str, skip_vagrant_up: bool = False,
             )
         except subprocess.CalledProcessError:
             test_failed = True
-            print("FATAL: pytest 测试失败 — 将在清理后退出", file=sys.stderr)
+            print("FATAL: pytest 测试失败 — 输出诊断后将在清理后退出", file=sys.stderr)
+            try:
+                _diagnose_scheduler(
+                    os.environ.get("HTCONDOR_ENABLED", "false") == "true",
+                    os.environ.get("SLURM_ENABLED", "false") == "true",
+                )
+            except Exception as e:
+                print(f"⚠ pytest 失败诊断异常 (非致命, 已跳过): {e}", file=sys.stderr)
         else:
             print("✓ 测试全部通过")
 
@@ -1296,15 +1430,21 @@ def main():
         if not matches:
             sys.exit(1)
         failed: list[str] = []
-        for p in matches:
+        keep_between_presets = (
+            args.keep_vms
+            or args.skip_vagrant_destroy
+            or os.environ.get("KEEP_VMS", "0") == "1"
+        )
+        for index, p in enumerate(matches):
             preset_name = p.stem
+            skip_vagrant_up = args.skip_vagrant_up or (keep_between_presets and index > 0)
             print(f"\n{'#' * 60}")
             print(f"# 运行匹配预设: {preset_name}")
             print(f"{'#' * 60}\n")
             try:
                 run_preset(
                     preset_name,
-                    skip_vagrant_up=args.skip_vagrant_up,
+                    skip_vagrant_up=skip_vagrant_up,
                     skip_vagrant_destroy=args.skip_vagrant_destroy or args.keep_vms,
                 )
             except SystemExit as e:
@@ -1314,6 +1454,12 @@ def main():
                     print(f"✗ 匹配预设失败: {preset_name} (exit={code})", file=sys.stderr)
                 else:
                     print(f"✓ 匹配预设完成: {preset_name}")
+            finally:
+                if keep_between_presets and index < len(matches) - 1:
+                    try:
+                        cleanup_runtime_state(f"预设 {preset_name} 结束，准备运行下一个匹配预设")
+                    except Exception as e:
+                        print(f"⚠ 预设间运行时清理异常 (非致命, 已跳过): {e}", file=sys.stderr)
         if failed:
             print(f"FATAL: {len(failed)} 个匹配预设失败: {', '.join(failed)}", file=sys.stderr)
             sys.exit(1)
