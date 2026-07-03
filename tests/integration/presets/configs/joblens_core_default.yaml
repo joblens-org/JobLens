@@ -27,6 +27,7 @@ job_registry_config:
 # HTCondor 作业监视器 (C3 陷阱: auto_add_condorjob=true 时必填)
 # ============================================================
 condor_job_watcher:
+  discovery_trigger: cgroup_mkdir
   auto_add_collectors:                           # 自动附加的采集器列表
     - cpumem_collector
   use_rules: false
@@ -35,6 +36,7 @@ condor_job_watcher:
 # Slurm 作业监视器 (C4 陷阱: auto_add_slurmjob=true 时必填)
 # ============================================================
 slurm_job_watcher:
+  discovery_trigger: cgroup_mkdir
   auto_add_collectors:                           # 自动附加的采集器列表
     - cpumem_collector
   use_rules: false
