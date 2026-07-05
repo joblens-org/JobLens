@@ -35,7 +35,7 @@
 
 #include "core/collector_type.h"
 #include "icollector.h"
-#include "ebpf/power_collect.h"
+#include "ebpf/trace_sched_runtime.h"
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>

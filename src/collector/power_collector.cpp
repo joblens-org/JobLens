@@ -195,11 +195,11 @@ bool PowerCollector::load_ebpf()
      * and the installed RPM places them under /usr/<lib>/joblens/bpf_obj/.
      */
     std::string bpf_path = std::string("/usr/") + JOBLENS_INSTALL_LIBDIR
-                         + "/joblens/bpf_obj/power_collect.bpf.o";
+                         + "/joblens/bpf_obj/trace_sched_runtime.bpf.o";
     /* If we're running from a build tree, try the build directory first */
     if (access(bpf_path.c_str(), R_OK) != 0) {
         /* Fallback: running from build directory (development) */
-        bpf_path = "bpf_obj/power_collect.bpf.o";
+        bpf_path = "bpf_obj/trace_sched_runtime.bpf.o";
     }
 
     bpf_obj_ = EbpfCommon::load_bpf_obj(bpf_path, bpf_links_);

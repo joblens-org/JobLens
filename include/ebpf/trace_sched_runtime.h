@@ -12,12 +12,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * power_collect.h — eBPF 功耗采集共享数据结构
+ * trace_sched_runtime.h — sched_switch 运行时追踪共享数据结构
  * 内核态(eBPF程序)和用户态(PowerCollector)共同引用的结构体定义。
  * 通过 #include 同一份头文件保证二进制布局一致。
  */
-#ifndef POWER_COLLECT_H
-#define POWER_COLLECT_H
+#ifndef TRACE_SCHED_RUNTIME_H
+#define TRACE_SCHED_RUNTIME_H
 
 // 用于给用户态程序共享数据结构
 #ifndef __VMLINUX_H__

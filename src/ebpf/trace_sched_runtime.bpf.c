@@ -12,7 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * power_collect.bpf.c — eBPF sched_switch 功耗追踪
+ * trace_sched_runtime.bpf.c — eBPF sched_switch 进程运行时追踪
  *
  * 钩住内核调度器的上下文切换事件，以纳秒精度记录每个(tgid,pid)
  * 在每个CPU核心上的实际运行时间。
@@ -36,7 +36,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
-#include "ebpf/power_collect.h"
+#include "ebpf/trace_sched_runtime.h"
 
 /* ── BPF Maps ───────────────────────────────────────────────────────────── */
 
