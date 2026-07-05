@@ -58,7 +58,7 @@
 #include <unistd.h>
 
 /* ── Auto-registration ─────────────────────────────────────────────────── */
-AUTO_REGISTER_SYSTEM_COLLECTOR(
+AUTO_REGISTER_JOB_COLLECTOR(
     PowerCollector,
     "Per-job energy attribution via eBPF sched_switch + RAPL. "
     "Tracks per-task per-CPU runtime at ns precision, reads RAPL package "
@@ -768,57 +768,105 @@ void PowerCollector::deinit() noexcept
     spdlog::info("PowerCollector: deinit complete");
 }
 
-CollectResult PowerCollector::collect()
+/* ── 刷新全局缓存 (对标 IO/Net: 全量读一次, 后续 collect(Job) 切片取) ── */
+void PowerCollector::refresh_global_cache()
 {
-    PowerSnapshot snap;
-
-    if (!inited_) {
-        spdlog::warn("PowerCollector: collect() called before init");
-        return snap;
-    }
+    update_pid2job_map();
 
     auto now = std::chrono::steady_clock::now();
     double interval_s = std::chrono::duration<double>(now - last_collect_ts_).count();
     last_collect_ts_ = now;
+    if (interval_s > 60.0 || interval_s <= 0.0) interval_s = 1.0;
 
-    /* Clamp interval to reasonable range (avoid giant values on first call) */
-    if (interval_s > 60.0 || interval_s <= 0.0) {
-        interval_s = 1.0;  // default 1s for first call or after long pause
-    }
-
-    /* ── 1. Update pid2job map ── */
-    update_pid2job_map();
-
-    /* ── 2. Read RAPL delta ── */
+    cached_rapl_start_uj_ = last_rapl_uj_;
     uint64_t rapl_now = rapl_valid_ ? read_rapl_uj() : 0;
-    uint64_t delta_uj = 0;
-    if (rapl_valid_ && rapl_now >= last_rapl_uj_) {
-        delta_uj = rapl_now - last_rapl_uj_;
-    } else if (rapl_valid_) {
-        /* Wraparound — skip this round */
-        spdlog::debug("PowerCollector: RAPL counter wraparound detected, resetting baseline");
-        delta_uj = 0;
+    cached_rapl_end_uj_ = rapl_now;
+    if (!(rapl_valid_ && rapl_now >= last_rapl_uj_)) {
+        spdlog::debug("PowerCollector: RAPL wraparound");
     }
     last_rapl_uj_ = rapl_now;
 
-    /* ── 3. Read CPU frequencies & governors (Gap 1) ── */
-    auto freqs = read_cpu_freqs_mhz();
-    auto governors = read_cpu_governors();
+    cached_interval_s_ = interval_s;
+    cached_freqs_ = read_cpu_freqs_mhz();
+    cached_tasks_ = dump_task_cpu_time();
+    cache_ts_ = now;
+    processed_in_cycle_.clear();
+}
 
-    /* ── 4. IPMI cross-validation snapshot (Gap 3) ── */
+/* ── 从全局缓存中提取单个Job的能耗 ── */
+PowerSnapshot PowerCollector::extract_job_energy(
+    const std::vector<task_cpu_runtime>& tasks, uint64_t delta_uj,
+    double interval_s, const std::vector<double>& freqs, uint64_t target_job_id)
+{
+    PowerSnapshot full = compute_energy(tasks, delta_uj, interval_s, freqs);
+
+    PowerSnapshot snap;
+    snap.ts                = full.ts;
+    snap.interval_s         = full.interval_s;
+    snap.delta_rapl_uj      = full.delta_rapl_uj;
+    snap.delta_rapl_j       = full.delta_rapl_j;
+    snap.core_count         = full.core_count;
+    snap.core_freqs_mhz     = full.core_freqs_mhz;
+    snap.total_weighted_ns  = full.total_weighted_ns;
+    snap.avg_power_w        = full.avg_power_w;
+    snap.cumulative_kwh_total = full.cumulative_kwh_total;
+    snap.ipmi_power_w       = full.ipmi_power_w;
+    snap.core_governors     = full.core_governors;
+
+    double extracted_j = 0.0;
+    for (auto& j : full.jobs) {
+        if (j.job_id == target_job_id) {
+            extracted_j = j.energy_j;
+            snap.jobs.push_back(std::move(j));
+        }
+    }
+    snap.system_overhead_j = snap.delta_rapl_j - extracted_j;
+    if (snap.system_overhead_j < 0.0) snap.system_overhead_j = 0.0;
+
+    return snap;
+}
+
+/* ── Job-scoped collect: 缓存过期刷新, 提取当前Job归因 ── */
+CollectResult PowerCollector::collect(const Job& job)
+{
+    if (!inited_) {
+        spdlog::warn("PowerCollector: collect(job) called before init");
+        return PowerSnapshot{};
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    double age = std::chrono::duration<double>(now - cache_ts_).count();
+
+    /* 缓存过期 → 刷新全局数据 */
+    if (age >= CACHE_TTL_S || cached_tasks_.empty()) {
+        refresh_global_cache();
+    }
+
+    /* 去重: 本周期已处理过 → 跳过 */
+    if (processed_in_cycle_.count(job.JobID)) {
+        spdlog::debug("PowerCollector: collect(job#{}) skipped (already processed)", job.JobID);
+        return PowerSnapshot{};
+    }
+    processed_in_cycle_.insert(job.JobID);
+
+    /* 从缓存提取本 Job 的能耗 */
+    uint64_t delta_uj = 0;
+    if (cached_rapl_end_uj_ >= cached_rapl_start_uj_) {
+        delta_uj = cached_rapl_end_uj_ - cached_rapl_start_uj_;
+    }
+
+    PowerSnapshot snap = extract_job_energy(cached_tasks_, delta_uj,
+                                            cached_interval_s_, cached_freqs_,
+                                            job.JobID);
+
     double ipmi_w = ipmi_available_ ? read_ipmi_watts() : 0.0;
-
-    /* ── 5. Dump eBPF task runtime ── */
-    auto tasks = dump_task_cpu_time();
-
-    /* ── 6. Compute per-job energy ── */
-    snap = compute_energy(tasks, delta_uj, interval_s, freqs);
-    snap.core_governors = std::move(governors);
     snap.ipmi_power_w = ipmi_w;
-
-    /* ── 7. Validate against power_bench baseline (if loaded) ── */
     validate_against_baseline(snap);
 
+    spdlog::debug("PowerCollector: collect(job#{}) age={:.1f}s E={:.2f}J cache={} entries",
+                  job.JobID, age,
+                  snap.jobs.empty() ? 0.0 : snap.jobs[0].energy_j,
+                  cached_tasks_.size());
     return snap;
 }
 

@@ -46,6 +46,7 @@
 #include <chrono>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <fstream>
 
@@ -112,9 +113,8 @@ public:
     bool init(const nlohmann::json& cfg) override;   // 加载eBPF、检测RAPL、配置参数
     void deinit() noexcept override;                  // 卸载eBPF、清理资源
 
-    /* System-scoped collector: 忽略传入的Job参数，统一走全局采集 */
-    CollectResult collect(const Job& /*job*/) override { return collect(); }
-    CollectResult collect() override;                 // 执行一次完整采集管线
+    /* Job-scoped: 全局缓存后按Job逐个归因 (对标IO/Net Collector) */
+    CollectResult collect(const Job& job) override;   // 读缓存→归因单个Job
 
     /* Writer适配器: 将PowerSnapshot转成各Writer可消费的格式 */
     CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
@@ -138,6 +138,13 @@ private:
     /* ── IPMI交叉验证 ──────────────────────────────────────────────── */
     bool detect_ipmi();           // 检测ipmi-dcmi或ipmitool是否可用
     double read_ipmi_watts();     // 读IPMI整机瞬时功率 (W)
+
+    /* ── 全局缓存 (对标IO/Net: 全量读一次, 按Job切片) ───────────── */
+    void refresh_global_cache();  // 刷新缓存: RAPL + BPF dump + CPU freq
+    PowerSnapshot extract_job_energy(const std::vector<task_cpu_runtime>& tasks,
+                                     uint64_t delta_uj, double interval_s,
+                                     const std::vector<double>& freqs,
+                                     uint64_t target_job_id);
 
     /* ── 能耗计算核心 ──────────────────────────────────────────────── */
     PowerSnapshot compute_energy(const std::vector<task_cpu_runtime>& tasks,
@@ -175,4 +182,14 @@ private:
     /* ── Gap 3: IPMI ──────────────────────────────────────────────── */
     bool    ipmi_available_ = false;   // IPMI是否可用
     std::string ipmi_cmd_;             // IPMI命令 (ipmi-dcmi或ipmitool)
+
+    /* ── Job-scoped 全局缓存 ─────────────────────────────────────── */
+    std::vector<task_cpu_runtime> cached_tasks_;
+    uint64_t cached_rapl_start_uj_ = 0;
+    uint64_t cached_rapl_end_uj_   = 0;
+    double   cached_interval_s_    = 0.0;
+    std::vector<double> cached_freqs_;
+    std::chrono::steady_clock::time_point cache_ts_;
+    std::unordered_set<uint64_t> processed_in_cycle_;
+    static constexpr double CACHE_TTL_S = 2.0;
 };
