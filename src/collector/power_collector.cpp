@@ -49,6 +49,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
@@ -259,57 +260,78 @@ std::vector<task_cpu_runtime> PowerCollector::dump_task_cpu_time()
 
     size_t key_sz = bpf_map__key_size(map);
     size_t val_sz = bpf_map__value_size(map);
+    size_t max_entries = bpf_map__max_entries(map);
 
-    /* Collect keys and values, then batch-delete */
-    std::vector<std::vector<uint8_t>> keys;
-    std::vector<u64> values;
+    /* 批量读取: bpf_map_lookup_batch 一次系统调用拿全部 */
+    std::vector<uint8_t> keys_buf(max_entries * key_sz, 0);
+    std::vector<uint8_t> vals_buf(max_entries * val_sz, 0);
+    uint32_t count = max_entries;
 
-    std::vector<uint8_t> cur_key(key_sz, 0);
-    std::vector<uint8_t> next_key(key_sz, 0);
-
-    bool first = true;
-    while (true) {
-        int ret;
-        if (first) {
-            ret = bpf_map_get_next_key(fd, nullptr, next_key.data());
-            first = false;
-        } else {
-            ret = bpf_map_get_next_key(fd, cur_key.data(), next_key.data());
-        }
-        if (ret != 0) break;  // no more keys
-
-        /* Read value */
-        u64 val = 0;
-        std::vector<uint8_t> val_buf(val_sz, 0);
-        int lookup_ret = bpf_map_lookup_elem(fd, next_key.data(), val_buf.data());
-        if (lookup_ret == 0) {
-            std::memcpy(&val, val_buf.data(), sizeof(val));
-        }
-
-        keys.push_back(next_key);
-        values.push_back(val);
-
-        cur_key = next_key;
+    int ret = bpf_map_lookup_batch(fd, nullptr, nullptr,
+                                    keys_buf.data(), vals_buf.data(),
+                                    &count, nullptr);
+    if (ret != 0 && ret != -ENOENT) {
+        /* batch not supported, fallback to single-key dump */
+        spdlog::debug("PowerCollector: batch lookup not supported (ret={}), using single-key fallback", ret);
+        return dump_task_cpu_time_single(fd, map, key_sz, val_sz);
     }
 
-    /* Delete all entries we've read */
-    for (const auto& k : keys) {
-        bpf_map_delete_elem(fd, k.data());
-    }
-
-    /* Parse keys into task_cpu_runtime structs */
-    for (size_t i = 0; i < keys.size(); ++i) {
+    /* 解析读取到的 entry */
+    for (uint32_t i = 0; i < count; ++i) {
         struct task_cpu_key tck;
-        std::memcpy(&tck, keys[i].data(), sizeof(tck));
+        std::memcpy(&tck, keys_buf.data() + i * key_sz, sizeof(tck));
+
+        u64 val = 0;
+        std::memcpy(&val, vals_buf.data() + i * val_sz, sizeof(val));
 
         task_cpu_runtime tcr;
         tcr.pid_tgid   = tck.pid_tgid;
         tcr.cpu        = tck.cpu;
-        tcr.runtime_ns = values[i];
+        tcr.runtime_ns = val;
         result.push_back(tcr);
     }
 
-    spdlog::debug("PowerCollector: dumped {} task-cpu runtime entries", result.size());
+    /* 批量删除 */
+    if (count > 0) {
+        bpf_map_delete_batch(fd, keys_buf.data(), &count, nullptr);
+    }
+
+    spdlog::debug("PowerCollector: dumped {} task-cpu runtime entries (batch)", result.size());
+    return result;
+}
+
+/* 逐条读取 fallback (batch 不支持时使用) */
+std::vector<task_cpu_runtime> PowerCollector::dump_task_cpu_time_single(
+    int fd, struct bpf_map* map, size_t key_sz, size_t val_sz)
+{
+    std::vector<task_cpu_runtime> result;
+    std::vector<std::vector<uint8_t>> keys;
+    std::vector<u64> values;
+    std::vector<uint8_t> cur_key(key_sz, 0);
+    std::vector<uint8_t> next_key(key_sz, 0);
+
+    while (bpf_map_get_next_key(fd, cur_key.data(), next_key.data()) == 0) {
+        u64 val = 0;
+        std::vector<uint8_t> val_buf(val_sz, 0);
+        if (bpf_map_lookup_elem(fd, next_key.data(), val_buf.data()) == 0) {
+            std::memcpy(&val, val_buf.data(), sizeof(val));
+        }
+        keys.push_back(next_key);
+        values.push_back(val);
+        cur_key = next_key;
+    }
+
+    for (const auto& k : keys) bpf_map_delete_elem(fd, k.data());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        struct task_cpu_key tck;
+        std::memcpy(&tck, keys[i].data(), sizeof(tck));
+        task_cpu_runtime tcr;
+        tcr.pid_tgid = tck.pid_tgid;
+        tcr.cpu = tck.cpu;
+        tcr.runtime_ns = values[i];
+        result.push_back(tcr);
+    }
     return result;
 }
 
