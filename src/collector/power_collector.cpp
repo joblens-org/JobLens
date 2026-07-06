@@ -881,14 +881,14 @@ CollectResult PowerCollector::collect(const Job& job)
                                             cached_interval_s_, cached_freqs_,
                                             job.JobID);
 
-    /* IPMI 异常检测: BMC缓存延迟导致读数滞后, ratio超出合理范围则丢弃 */
+    /* IPMI 异常检测: BMC缓存延迟导致读数滞后, 保留原值但日志告警 */
     double ipmi_w = ipmi_available_ ? read_ipmi_watts() : 0.0;
     if (ipmi_w > 0.0 && snap.avg_power_w > 0.0) {
         double ratio = ipmi_w / snap.avg_power_w;
         if (ratio < 0.5 || ratio > 4.0) {
-            spdlog::debug("PowerCollector: IPMI anomaly — ipmi={:.0f}W rapl={:.1f}W ratio={:.2f} (dropped)",
-                          ipmi_w, snap.avg_power_w, ratio);
-            ipmi_w = 0.0;  // 标记为无效, 不输出到 JSON
+            spdlog::warn("PowerCollector: IPMI anomaly — ipmi={:.0f}W rapl={:.1f}W ratio={:.2f} "
+                         "(BMC cache lag suspected, raw value kept)",
+                         ipmi_w, snap.avg_power_w, ratio);
         }
     }
     snap.ipmi_power_w = ipmi_w;
