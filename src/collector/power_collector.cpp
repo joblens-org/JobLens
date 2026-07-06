@@ -776,6 +776,15 @@ bool PowerCollector::init(const nlohmann::json& cfg)
     /* Load power_bench calibration reference (optional) */
     load_calibration_ref(cfg);
 
+    /* Cache TTL = 1/freq, 对齐Scheduler采集周期 */
+    if (cfg.contains("freq")) {
+        double freq = 1.0;
+        const auto& fv = cfg["freq"];
+        if (fv.is_number()) freq = fv.get<double>();
+        else if (fv.is_string()) { try { freq = std::stod(fv.get<std::string>()); } catch(...) {} }
+        cache_ttl_s_ = 1.0 / freq;
+    }
+
     last_collect_ts_ = std::chrono::steady_clock::now();
 
     inited_ = true;
@@ -860,7 +869,7 @@ CollectResult PowerCollector::collect(const Job& job)
     double age = std::chrono::duration<double>(now - cache_ts_).count();
 
     /* 缓存过期 → 刷新全局数据 */
-    if (age >= CACHE_TTL_S || cached_tasks_.empty()) {
+    if (age >= cache_ttl_s_ || cached_tasks_.empty()) {
         refresh_global_cache();
     }
 

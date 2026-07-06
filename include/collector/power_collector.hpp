@@ -192,5 +192,5 @@ private:
     std::vector<double> cached_freqs_;
     std::chrono::steady_clock::time_point cache_ts_;
     std::unordered_set<uint64_t> processed_in_cycle_;
-    static constexpr double CACHE_TTL_S = 2.0;
+    double cache_ttl_s_ = 2.0;  // = 1/freq, init时根据配置计算
 };
