@@ -241,7 +241,7 @@ void PowerCollector::update_pid2job_map()
                   total_pids, jobs.size());
 }
 
-std::vector<task_cpu_runtime> PowerCollector::dump_task_cpu_time()
+std::vector<task_cpu_runtime> PowerCollector::read_task_cpu_time()
 {
     std::vector<task_cpu_runtime> result;
 
@@ -269,12 +269,10 @@ std::vector<task_cpu_runtime> PowerCollector::dump_task_cpu_time()
                                     keys_buf.data(), vals_buf.data(),
                                     &count, nullptr);
     if (ret != 0 && ret != -ENOENT) {
-        /* batch not supported, fallback to single-key dump */
         spdlog::debug("PowerCollector: batch lookup not supported (ret={}), using single-key fallback", ret);
-        return dump_task_cpu_time_single(fd, map, key_sz, val_sz);
+        return read_task_cpu_time_single(fd, map, key_sz, val_sz);
     }
 
-    /* 解析读取到的 entry */
     for (uint32_t i = 0; i < count; ++i) {
         struct task_cpu_key tck;
         std::memcpy(&tck, keys_buf.data() + i * key_sz, sizeof(tck));
@@ -289,17 +287,17 @@ std::vector<task_cpu_runtime> PowerCollector::dump_task_cpu_time()
         result.push_back(tcr);
     }
 
-    /* 批量删除 */
+    /* 批量清空 */
     if (count > 0) {
         bpf_map_delete_batch(fd, keys_buf.data(), &count, nullptr);
     }
 
-    spdlog::debug("PowerCollector: dumped {} task-cpu runtime entries (batch)", result.size());
+    spdlog::debug("PowerCollector: read {} task-cpu runtime entries (batch)", result.size());
     return result;
 }
 
-/* 逐条读取 fallback (batch 不支持时使用) */
-std::vector<task_cpu_runtime> PowerCollector::dump_task_cpu_time_single(
+/* 逐条读取 fallback (内核不支持 batch 时使用) */
+std::vector<task_cpu_runtime> PowerCollector::read_task_cpu_time_single(
     int fd, struct bpf_map* map, size_t key_sz, size_t val_sz)
 {
     std::vector<task_cpu_runtime> result;
@@ -817,7 +815,7 @@ void PowerCollector::refresh_global_cache()
 
     cached_interval_s_ = interval_s;
     cached_freqs_ = read_cpu_freqs_mhz();
-    cached_tasks_ = dump_task_cpu_time();
+    cached_tasks_ = read_task_cpu_time();
     cache_ts_ = now;
     processed_in_cycle_.clear();
 }
