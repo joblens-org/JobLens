@@ -947,6 +947,12 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
                 return ret;
             }
 
+            /* ── 跳过空快照 (Job已退出或无运行中PID) ──
+             * 抛异常让调度器catch, 不写入ES, 避免污染 */
+            if (snap.interval_s <= 0.0 && snap.delta_rapl_j <= 0.0) {
+                throw std::runtime_error("PowerCollector: empty snapshot, skipping write");
+            }
+
             /* ── 快照级字段 (顶层) ── */
             ret["interval_s"]        = snap.interval_s;
             ret["delta_rapl_j"]      = snap.delta_rapl_j;
