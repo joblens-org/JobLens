@@ -30,6 +30,7 @@ public:
         std::size_t batch_size   = 500;   // 达到多少条就打包
         std::string user         = "";
         std::string passwd       = "";
+        bool        insecure     = false; // skip SSL verification
     };
 
     explicit ESWriter(std::string name, std::string type, std::string config_name);
