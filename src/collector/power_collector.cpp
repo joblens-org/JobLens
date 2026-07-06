@@ -778,7 +778,7 @@ bool PowerCollector::init(const nlohmann::json& cfg)
         const auto& fv = cfg["freq"];
         if (fv.is_number()) freq = fv.get<double>();
         else if (fv.is_string()) { try { freq = std::stod(fv.get<std::string>()); } catch(...) {} }
-        cache_ttl_s_ = 1.0 / freq;
+        cache_ttl_s_ = 0.9 / freq;  // 90% of timer interval, 避免浮点/jitter导致缓存过期检查失败
     }
 
     last_collect_ts_ = std::chrono::steady_clock::now();
