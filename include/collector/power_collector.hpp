@@ -64,8 +64,10 @@ struct PowerPerPid {
 struct PowerPerJob {
     uint64_t job_id;            // JobLens内部JobID
     std::string native_job_id;  // 调度器原生作业ID (如Condor "123.0")
-    double energy_j;            // 归因到这个Job的总能耗 (J)
-    double weighted_ns_total;   // 这个Job的频率加权时间和
+    double energy_j;            // RAPL归因能耗 (J)
+    double power_watt;          // RAPL归因平均功率 (W) = energy_j / interval_s
+    double ipmi_power_watt;     // IPMI按比例分摊功率 (W) = ipmi_total × 占比
+    double weighted_ns_total;   // 内部: 加权时间和 (ns·MHz)
     std::vector<PowerPerPid> pids; // 每个进程的详细能耗
 };
 

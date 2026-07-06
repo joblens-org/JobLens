@@ -39,7 +39,6 @@
 #include "core/job_registry.hpp"
 #include "common/ebpf_common.hpp"
 #include "common/utils.hpp"
-#include "writer/prometheus_exporter_writer.hpp"
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -68,8 +67,7 @@ AUTO_REGISTER_JOB_COLLECTOR(
     "E_job =  E_pkg ×  (t_c × f_c)_job /  (t_c × f_c)_all.",
     ConfigParams{
         {"freq",                      "Sampling frequency in Hz (default 1.0 = 1s intervals)"},
-        {"use_writers",               "Writer names for output (e.g. file_writer, PrometheusExporterWriter)"},
-        {"auto_start",                "Auto-start on daemon launch (true/false, default true)"},
+        {"use_writers",               "Writer names for output (e.g. file_writer, ESWriter)"},
     }
 )
 
@@ -848,6 +846,8 @@ PowerSnapshot PowerCollector::extract_job_energy(
     for (auto& j : full.jobs) {
         if (j.job_id == target_job_id) {
             extracted_j = j.energy_j;
+            j.power_watt = (interval_s > 0.0) ? j.energy_j / interval_s : 0.0;
+            /* ipmi_power_watt 在 collect(Job) 中 IPMI 读取后补充 */
             snap.jobs.push_back(std::move(j));
         }
     }
@@ -901,6 +901,13 @@ CollectResult PowerCollector::collect(const Job& job)
         }
     }
     snap.ipmi_power_w = ipmi_w;
+
+    /* IPMI按RAPL占比分摊到本Job: ipmi_job = ipmi_total × (job_rapl / total_rapl) */
+    for (auto& j : snap.jobs) {
+        j.ipmi_power_watt = (snap.delta_rapl_j > 0.0 && ipmi_w > 0.0)
+            ? ipmi_w * j.energy_j / snap.delta_rapl_j : 0.0;
+    }
+
     validate_against_baseline(snap);
 
     spdlog::debug("PowerCollector: collect(job#{}) age={:.1f}s E={:.2f}J cache={} entries",
@@ -941,8 +948,10 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
             j["jobs"] = json::array();
             for (const auto& job : snap.jobs) {
                 json jj;
-                jj["job_id"]   = job.job_id;
-                jj["energy_j"] = job.energy_j;
+                jj["job_id"]          = job.job_id;
+                jj["energy_j"]        = job.energy_j;
+                jj["power_watt"]      = job.power_watt;
+                jj["ipmi_power_watt"] = job.ipmi_power_watt;
                 jj["pids"] = json::array();
                 for (const auto& pp : job.pids) {
                     jj["pids"].push_back({
@@ -955,59 +964,6 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
             }
 
             return j;
-        };
-    }
-
-    if (writer_type == "PrometheusExporterWriter") {
-        return [](std::any data) -> std::any {
-            if (!data.has_value()) {
-                PrometheusExporterWriter::prometheus_job_state empty;
-                return empty;
-            }
-
-            PowerSnapshot snap;
-            try {
-                snap = std::any_cast<PowerSnapshot>(data);
-            } catch (const std::bad_any_cast& e) {
-                spdlog::error("PowerCollector: Prometheus parser bad any_cast — {}", e.what());
-                PrometheusExporterWriter::prometheus_job_state empty;
-                return empty;
-            }
-
-            PrometheusExporterWriter::prometheus_job_state ret;
-            ret.JobID = 0;  // system-scoped, no single JobID
-
-            double total_energy = snap.delta_rapl_j;
-            for (const auto& job : snap.jobs) {
-                PrometheusExporterWriter::prometheus_process_state state = {};
-                /* Semantic field mapping for power metrics:
-                 *   job_id / pid → job identifier
-                 *   name         → native_job_id (scheduler-native ID string)
-                 *   cpu_usage_percent → energy_j  (attributed energy in Joules)
-                 *   mem_usage_percent → energy_share (this job's fraction of total)
-                 *   mem_rss_kb    → avg_power_w (J / interval_s)
-                 *   mem_vm_kb     → weighted_ns (ns·MHz total for this job)
-                 *   threads_cnt   → pid_count (number of processes in this job)
-                 */
-                state.job_id = static_cast<uint32_t>(job.job_id);
-                state.pid    = static_cast<pid_t>(job.job_id);
-                state.name   = job.native_job_id.empty()
-                                   ? "job_" + std::to_string(job.job_id)
-                                   : job.native_job_id;
-                state.cpu_usage_percent = job.energy_j;
-                state.mem_usage_percent = (total_energy > 0.0)
-                    ? 100.0 * job.energy_j / total_energy
-                    : 0.0;
-                state.mem_rss_kb = (snap.interval_s > 0.0)
-                    ? static_cast<int64_t>(job.energy_j / snap.interval_s)
-                    : 0;
-                state.mem_vm_kb   = static_cast<int64_t>(job.weighted_ns_total);
-                state.threads_cnt = static_cast<int32_t>(job.pids.size());
-
-                ret.processes_state.push_back(state);
-            }
-
-            return ret;
         };
     }
 
