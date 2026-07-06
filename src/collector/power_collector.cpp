@@ -873,7 +873,7 @@ CollectResult PowerCollector::collect(const Job& job)
 
     /* 去重: 本周期已处理过 → 跳过 */
     if (processed_in_cycle_.count(job.JobID)) {
-        spdlog::warn("PowerCollector: collect(job#{}) PATH=dedup", job.JobID);
+        spdlog::debug("PowerCollector: collect(job#{}) dedup — jobid already processed this cycle", job.JobID);
         return PowerSnapshot{};
     }
     processed_in_cycle_.insert(job.JobID);
