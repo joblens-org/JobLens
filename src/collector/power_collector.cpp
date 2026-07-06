@@ -924,76 +924,23 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
 
             json j;
             j["interval_s"]        = snap.interval_s;
-            j["delta_rapl_uj"]     = snap.delta_rapl_uj;
             j["delta_rapl_j"]      = snap.delta_rapl_j;
-            j["core_count"]        = snap.core_count;
-            j["total_weighted_ns"] = snap.total_weighted_ns;
-            j["system_overhead_j"] = snap.system_overhead_j;
-
             j["avg_power_w"]       = snap.avg_power_w;
-
-            /* ── Gap 1: CPU governors ── */
-            if (!snap.core_governors.empty()) {
-                j["core_governors"] = snap.core_governors;
-                /* summary: count unique governor modes */
-                std::unordered_map<std::string, int> gov_count;
-                for (const auto& g : snap.core_governors) gov_count[g]++;
-                json jg = json::object();
-                for (const auto& [gov, cnt] : gov_count) jg[gov] = cnt;
-                j["governor_summary"] = jg;
-            }
-
-            /* ── Gap 2: Cumulative kWh ── */
-            j["cumulative_kwh_total"] = snap.cumulative_kwh_total;
-            if (!snap.cumulative_kwh_by_job.empty()) {
-                json ck = json::object();
-                for (const auto& [jid, kwh] : snap.cumulative_kwh_by_job) {
-                    ck[std::to_string(jid)] = kwh;
-                }
-                j["cumulative_kwh_by_job"] = ck;
-            }
-
-            /* ── Gap 3: IPMI cross-validation ── */
-            if (snap.ipmi_power_w > 0.0) {
-                j["ipmi_power_w"] = snap.ipmi_power_w;
-            }
-
-            /* calibration reference (if loaded) */
-            if (cal_ref_.valid) {
-                json cr;
-                cr["rapl_idle_w"]      = cal_ref_.rapl_idle_w;
-                cr["ipmi_idle_w"]      = cal_ref_.ipmi_idle_w;
-                cr["static_overhead_w"] = cal_ref_.static_overhead_w;
-                cr["per_core_w"]       = cal_ref_.per_core_w;
-                cr["source"]           = cal_ref_.source_path;
-                j["calibration_ref"]  = cr;
-            }
-
-            /* average core frequency */
-            if (!snap.core_freqs_mhz.empty()) {
-                double avg = 0.0;
-                for (double f : snap.core_freqs_mhz) avg += f;
-                j["avg_core_freq_mhz"] = avg / snap.core_freqs_mhz.size();
-            }
+            j["system_overhead_j"] = snap.system_overhead_j;
+            if (snap.ipmi_power_w > 0.0) j["ipmi_power_w"] = snap.ipmi_power_w;
 
             j["jobs"] = json::array();
             for (const auto& job : snap.jobs) {
                 json jj;
-                jj["job_id"]            = job.job_id;
-                jj["native_job_id"]     = job.native_job_id;
-                jj["energy_j"]          = job.energy_j;
-                jj["weighted_ns_total"] = job.weighted_ns_total;
-
+                jj["job_id"]   = job.job_id;
+                jj["energy_j"] = job.energy_j;
                 jj["pids"] = json::array();
                 for (const auto& pp : job.pids) {
-                    json jp;
-                    jp["pid"]              = pp.pid;
-                    jp["tgid"]             = pp.tgid;
-                    jp["runtime_ns_total"] = pp.runtime_ns_total;
-                    jp["weighted_ns_total"]= pp.weighted_ns_total;
-                    jp["energy_j"]         = pp.energy_j;
-                    jp["cpu_pct"]          = pp.cpu_pct;
-                    jj["pids"].push_back(jp);
+                    jj["pids"].push_back({
+                        {"pid",      pp.pid},
+                        {"energy_j", pp.energy_j},
+                        {"cpu_pct",  pp.cpu_pct}
+                    });
                 }
                 j["jobs"].push_back(jj);
             }
