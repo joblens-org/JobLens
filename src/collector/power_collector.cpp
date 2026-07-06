@@ -922,53 +922,10 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
     spdlog::debug("PowerCollector: get_writer_parser for writer_type: {}", writer_type);
 
     if (writer_type == "ESWriter") {
-        return [this](std::any data) -> std::any {
-            nlohmann::json ret;
-            if (!data.has_value()) {
-                spdlog::warn("PowerCollector: error ESWriter parser, empty data");
-                ret["error"] = "empty data";
-                return ret;
-            }
-
-            PowerSnapshot snap;
-            try {
-                snap = std::any_cast<PowerSnapshot>(data);
-            } catch (const std::bad_any_cast& e) {
-                spdlog::warn("PowerCollector: bad any_cast in ESWriter parser — {}", e.what());
-                ret["error"] = std::string("bad any_cast: ") + e.what();
-                return ret;
-            }
-
-            /* ── 快照级字段 (顶层) ── */
-            ret["interval_s"]        = snap.interval_s;
-            ret["delta_rapl_j"]      = snap.delta_rapl_j;
-            ret["avg_power_w"]       = snap.avg_power_w;
-            ret["system_overhead_j"] = snap.system_overhead_j;
-            if (snap.ipmi_power_w > 0.0) ret["ipmi_power_w"] = snap.ipmi_power_w;
-
-            /* ── Job信息放到顶层 (collect(Job)每次只返回单个Job) ── */
-            if (!snap.jobs.empty()) {
-                const auto& job = snap.jobs[0];
-                ret["job_id"]          = job.job_id;
-                ret["native_job_id"]   = job.native_job_id;
-                ret["energy_j"]        = job.energy_j;
-                ret["power_watt"]      = job.power_watt;
-                ret["ipmi_power_watt"] = job.ipmi_power_watt;
-
-                ret["pids"] = nlohmann::json::array();
-                for (const auto& pp : job.pids) {
-                    ret["pids"].push_back({
-                        {"pid",      pp.pid},
-                        {"energy_j", pp.energy_j},
-                        {"cpu_pct",  pp.cpu_pct}
-                    });
-                }
-
-                spdlog::debug("PowerCollector: ESWriter parsed job#{} E={:.4f}J P={:.2f}W pids={}",
-                              job.job_id, job.energy_j, job.power_watt, job.pids.size());
-            }
-
-            return ret;
+        /* ESWriter 复用 FileWriter 的 JSON 格式化 (格式完全一致) */
+        auto file_parser = get_writer_parser("FileWriter");
+        return [this, file_parser](std::any data) -> std::any {
+            return file_parser(data);
         };
     }
 
