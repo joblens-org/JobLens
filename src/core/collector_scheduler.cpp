@@ -153,7 +153,11 @@ void CollectorScheduler::startCollector(std::string collector_name){
 void CollectorScheduler::addJob2Collector(size_t jobid, std::string collector){
     auto& state = collector_state_dict[collector];
     std::lock_guard lg(state.m_);
-    state.jobid_list.push_back(jobid); 
+    /* 去重: 避免同一JobID被重复push导致collect(Job) dedup命中返回空快照 */
+    if (std::find(state.jobid_list.begin(), state.jobid_list.end(), jobid) != state.jobid_list.end()) {
+        return;
+    }
+    state.jobid_list.push_back(jobid);
     if(!state.running){
         startCollector(collector);
     }

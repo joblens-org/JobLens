@@ -778,7 +778,7 @@ bool PowerCollector::init(const nlohmann::json& cfg)
         const auto& fv = cfg["freq"];
         if (fv.is_number()) freq = fv.get<double>();
         else if (fv.is_string()) { try { freq = std::stod(fv.get<std::string>()); } catch(...) {} }
-        cache_ttl_s_ = 1.0 / freq;
+        cache_ttl_s_ = 0.9 / freq;  // 90% of timer interval, 避免浮点/jitter导致缓存过期检查失败
     }
 
     last_collect_ts_ = std::chrono::steady_clock::now();
@@ -873,7 +873,7 @@ CollectResult PowerCollector::collect(const Job& job)
 
     /* 去重: 本周期已处理过 → 跳过 */
     if (processed_in_cycle_.count(job.JobID)) {
-        spdlog::debug("PowerCollector: collect(job#{}) skipped (already processed)", job.JobID);
+        spdlog::debug("PowerCollector: collect(job#{}) dedup — jobid already processed this cycle", job.JobID);
         return PowerSnapshot{};
     }
     processed_in_cycle_.insert(job.JobID);
@@ -908,9 +908,10 @@ CollectResult PowerCollector::collect(const Job& job)
 
     validate_against_baseline(snap);
 
-    spdlog::debug("PowerCollector: collect(job#{}) age={:.1f}s E={:.2f}J cache={} entries",
+    spdlog::debug("PowerCollector: collect(job#{}) age={:.1f}s E={:.2f}J RAPL={:.0f}J int={:.2f}s cache={} entries PATH=extract",
                   job.JobID, age,
                   snap.jobs.empty() ? 0.0 : snap.jobs[0].energy_j,
+                  snap.delta_rapl_j, snap.interval_s,
                   cached_tasks_.size());
     return snap;
 }
