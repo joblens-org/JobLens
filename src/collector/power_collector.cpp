@@ -960,9 +960,9 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
                 nlohmann::json jobj;
                 jobj["id"]           = j.job_id;
                 jobj["native_id"]    = j.native_job_id;
-                jobj["energy_j"]     = j.energy_j;
-                jobj["power_w"]      = j.power_watt;
-                jobj["ipmi_power_w"] = j.ipmi_power_watt;
+                jobj["rapl_energy_j"] = j.energy_j;
+                jobj["rapl_power_w"]  = j.power_watt;
+                jobj["ipmi_power_w"]  = j.ipmi_power_watt;
 
                 jobj["pids"] = nlohmann::json::array();
                 for (const auto& pp : j.pids) {
