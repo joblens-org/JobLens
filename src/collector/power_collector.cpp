@@ -948,33 +948,34 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
                 return ret;
             }
 
-            /* ── 快照级字段 (顶层) ── */
-            ret["interval_s"]        = snap.interval_s;
-            ret["delta_rapl_j"]      = snap.delta_rapl_j;
-            ret["avg_power_w"]       = snap.avg_power_w;
-            ret["system_overhead_j"] = snap.system_overhead_j;
-            if (snap.ipmi_power_w > 0.0) ret["ipmi_power_w"] = snap.ipmi_power_w;
+            /* ── 整机字段 (sys_ 前缀，data 顶层) ── */
+            ret["sys_interval_s"]    = snap.interval_s;
+            ret["sys_rapl_energy_j"] = snap.delta_rapl_j;
+            ret["sys_rapl_power_w"]  = snap.avg_power_w;
+            if (snap.ipmi_power_w > 0.0) ret["sys_ipmi_power_w"] = snap.ipmi_power_w;
 
-            /* ── Job信息放到顶层 ── */
+            /* ── 单作业字段 (嵌套在 data.job 下) ── */
             if (!snap.jobs.empty()) {
-                const auto& job = snap.jobs[0];
-                ret["job_id"]          = job.job_id;
-                ret["native_job_id"]   = job.native_job_id;
-                ret["energy_j"]        = job.energy_j;
-                ret["power_watt"]      = job.power_watt;
-                ret["ipmi_power_watt"] = job.ipmi_power_watt;
+                const auto& j = snap.jobs[0];
+                nlohmann::json jobj;
+                jobj["id"]           = j.job_id;
+                jobj["native_id"]    = j.native_job_id;
+                jobj["energy_j"]     = j.energy_j;
+                jobj["power_w"]      = j.power_watt;
+                jobj["ipmi_power_w"] = j.ipmi_power_watt;
 
-                ret["pids"] = nlohmann::json::array();
-                for (const auto& pp : job.pids) {
-                    ret["pids"].push_back({
+                jobj["pids"] = nlohmann::json::array();
+                for (const auto& pp : j.pids) {
+                    jobj["pids"].push_back({
                         {"pid",      pp.pid},
                         {"energy_j", pp.energy_j},
                         {"cpu_pct",  pp.cpu_pct}
                     });
                 }
+                ret["job"] = std::move(jobj);
 
-                spdlog::debug("PowerCollector: FileWriter parsed job#{} E={:.4f}J P={:.2f}W pids={}",
-                              job.job_id, job.energy_j, job.power_watt, job.pids.size());
+                spdlog::debug("PowerCollector: FileWriter parsed id={} E={:.4f}J P={:.2f}W pids={}",
+                              j.job_id, j.energy_j, j.power_watt, j.pids.size());
             }
 
             return ret;
