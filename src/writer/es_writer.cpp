@@ -251,7 +251,7 @@ bool ESWriter::try_parse_data(const std::string& collector_name, const std::any&
         out = std::move(std::any_cast<json>(parsed_data));
     }
     catch(const std::exception& e){
-        spdlog::debug("elasticsearch_writer: parse skipped for collector '{}': {}", collector_name, e.what());
+        spdlog::error("elasticsearch_writer: bad_any_cast for collector '{}': {}", collector_name, e.what());
         out["error"] = std::string(e.what());
         return false;
     }
@@ -288,10 +288,6 @@ bool ESWriter::flush_impl(const std::vector<write_data>& batch)
         }
         json jobj;
         parse_ret = try_parse_data(collect_name, any_data, jobj);
-        if (!parse_ret) {
-            spdlog::debug("elasticsearch_writer: skipping document for {} (parse failed)", collect_name);
-            continue;  // ← 关键: 跳过这条, 不写ES
-        }
         src["data"] = jobj;
         spdlog::debug("elasticsearch_writer: document to index: {}", src.dump());
         body << action.dump() << '\n';
