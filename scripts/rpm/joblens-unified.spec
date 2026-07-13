@@ -316,6 +316,16 @@ rm -rf %{buildroot}%{_libdir}/cmake/date 2>/dev/null || :
 # 防止 RPM 因数据库记录"未修改"而覆盖用户配置。
 # %%post 脚本会将备份恢复（如内容不同则保留旧版）。
 
+if [ -x /usr/bin/systemctl ]; then
+    if /usr/bin/systemctl list-unit-files joblens-trigger.service >/dev/null 2>&1 || \
+       /usr/bin/systemctl status joblens-trigger.service >/dev/null 2>&1; then
+        /usr/bin/systemctl stop joblens-trigger.service >/dev/null 2>&1 || :
+        /usr/bin/systemctl disable joblens-trigger.service >/dev/null 2>&1 || :
+        /usr/bin/systemctl reset-failed joblens-trigger.service >/dev/null 2>&1 || :
+        /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || :
+    fi
+fi
+
 if [ "$1" -eq 2 ]; then
     # core 配置备份
     if [ -f %{_sysconfdir}/JobLens/config.yaml ]; then

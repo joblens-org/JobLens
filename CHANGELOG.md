@@ -1,5 +1,19 @@
 # JobLens Changelog
 
+## v0.2.1 (2026-07)
+
+### Patch Release - Unified RPM Release and Upgrade Fixes
+- Fixed release workflow compatibility with unified RPM packaging:
+  - Added root-container `sudo` compatibility for Fedora/AlmaLinux release builds without requiring `sudo` to be installed
+  - Generated TGZ artifacts from the built RPM install tree instead of stale build directories, with distro-specific names for matrix builds
+  - Moved binary dependency diagnostics to the RPM-extracted tree so release jobs no longer depend on rpmbuild's temporary `BUILD` directory after cleanup
+  - Tightened RPM verification for `/usr/bin/JobLens` and real `.bpf.o` objects under `lib`/`lib64` paths
+  - Hardened checksum generation to fail when release artifacts are missing instead of producing an empty `SHA256SUMS.txt`
+- Fixed unified RPM upgrade migration from the old two-package layout by stopping and disabling any pre-existing `joblens-trigger.service` in `%pre` before installing the unified package
+- Kept the legacy `scripts/rpm/preinstall.sh` free of duplicate trigger migration logic; the unified RPM's actual install behavior remains defined in `scripts/rpm/joblens-unified.spec`
+
+---
+
 ## v0.2.0 (2026-07)
 
 ### Power Monitoring

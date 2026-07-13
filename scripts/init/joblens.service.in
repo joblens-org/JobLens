@@ -17,8 +17,6 @@ ExecStopPost=-/bin/rm -f /var/JobLens/JobLens.lock
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536
-StandardOutput=journal
-StandardError=journal
 SyslogIdentifier=joblens
 
 [Install]
