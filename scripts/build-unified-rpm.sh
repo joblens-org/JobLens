@@ -16,6 +16,10 @@
 # 注意: 请在 Fedora/RHEL 环境（或兼容容器）中运行，不支持 apt/deb 系发行版。
 set -e
 
+if [[ "$(id -u)" -eq 0 ]]; then
+    sudo() { "$@"; }
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/build-unified-rpm"
