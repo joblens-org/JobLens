@@ -60,6 +60,7 @@ class AppContext:
         """
         self.config_path = config_path or self._get_default_config_path()
         self.config = {}
+        self.config_file_exists: bool = False
         
         # 核心组件（必须初始化）
         self.rpc_client: Optional[RPCClient] = None
@@ -94,6 +95,7 @@ class AppContext:
         """从YAML文件加载配置"""
         config = {}
         if os.path.exists(self.config_path):
+            self.config_file_exists = True
             try:
                 with open(self.config_path, 'r', encoding='utf-8') as f:
                     config = yaml.safe_load(f) or {}
@@ -101,6 +103,7 @@ class AppContext:
             except Exception as e:
                 logger.warning(f"加载配置文件失败: {e}")
         else:
+            self.config_file_exists = False
             logger.warning(f"配置文件不存在: {self.config_path}")
         return config
     
@@ -148,7 +151,7 @@ class AppContext:
         # 设置服务注册配置
         self.config.setdefault('service_registry', {})
         self.config['service_registry']['enabled'] = self._get_config_value(
-            'service_registry.enabled', True
+            'service_registry.enabled', self.config_file_exists
         )
         self.config['service_registry']['url'] = os.environ.get(
             'REGISTRY_URL',
@@ -181,7 +184,7 @@ class AppContext:
         # 规则管理器配置
         self.config.setdefault('rule_manager', {})
         self.config['rule_manager']['enabled'] = self._get_config_value(
-            'rule_manager.enabled', True
+            'rule_manager.enabled', self.config_file_exists
         )
         self.config['rule_manager']['local_rules_dir'] = joblens_config.get(
             'job_registry_config', {}
@@ -193,7 +196,7 @@ class AppContext:
         # 配置管理器设置
         self.config.setdefault('config_manager', {})
         self.config['config_manager']['enabled'] = self._get_config_value(
-            'config_manager.enabled', True
+            'config_manager.enabled', self.config_file_exists
         )
         self.config['config_manager']['config_file'] = self._get_config_value(
             'config_manager.config_file', '/etc/JobLens/config.yaml'
