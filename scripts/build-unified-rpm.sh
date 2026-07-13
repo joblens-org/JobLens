@@ -96,10 +96,11 @@ install_deps() {
         fi
     fi
 
-    log_info "安装: rpm-build rpmdevtools python3 python3-devel python3-pip python3-setuptools python3-wheel systemd-rpm-macros"
+    log_info "安装: rpm-build rpmdevtools cpio python3 python3-devel python3-pip python3-setuptools python3-wheel systemd-rpm-macros"
     sudo dnf install -y \
         rpm-build \
         rpmdevtools \
+        cpio \
         python3 \
         python3-devel \
         python3-pip \

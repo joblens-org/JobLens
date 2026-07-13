@@ -99,22 +99,25 @@ jobs:
           objdump -p "${BUILD_DIR}/JobLens" | grep NEEDED | sort -u
 
       # ════════════════════════════════════════════════════════
-      # TGZ 便携包制作（从 rpmbuild BUILDROOT 安装树）
+      # TGZ 便携包制作（从 RPM 解包树）
       # ════════════════════════════════════════════════════════
       - name: Create portable TGZ
         run: |
           set -e
           VERSION="${{ needs.prepare.outputs.version }}"
-          BUILDROOT=$(ls -d ~/rpmbuild/BUILDROOT/joblens-${VERSION}-*.x86_64 2>/dev/null | head -1)
-          if [ -z "${BUILDROOT}" ]; then
-            echo "Missing rpmbuild BUILDROOT for version ${VERSION}"
-            find ~/rpmbuild/BUILDROOT -maxdepth 1 -type d -print 2>/dev/null || true
+          RPM=$(ls ~/rpmbuild/RPMS/x86_64/joblens-${VERSION}-*.rpm 2>/dev/null | head -1)
+          if [ -z "${RPM}" ]; then
+            echo "Missing RPM for version ${VERSION}"
+            find ~/rpmbuild/RPMS -name '*.rpm' -print 2>/dev/null || true
             exit 1
           fi
 
           TGZ_NAME="joblens-${VERSION}-Linux-x86_64-${{ matrix.target.name }}.tar.gz"
-          mkdir -p build
-          tar -czf "build/${TGZ_NAME}" -C "${BUILDROOT}" .
+          TGZ_ROOT="build/tgz-root-${{ matrix.target.name }}"
+          rm -rf "${TGZ_ROOT}"
+          mkdir -p build "${TGZ_ROOT}"
+          (cd "${TGZ_ROOT}" && rpm2cpio "${RPM}" | cpio -idm --quiet)
+          tar -czf "build/${TGZ_NAME}" -C "${TGZ_ROOT}" .
           ls -lh "build/${TGZ_NAME}"
 
       # ════════════════════════════════════════════════════════
@@ -198,7 +201,7 @@ jobs:
             echo ""
             echo "| Package | Description |"
             echo "|---------|-------------|"
-            echo "| joblens-${VERSION}-Linux-x86_64-*.tar.gz | Unified install tree TGZ from RPM BUILDROOT |"
+            echo "| joblens-${VERSION}-Linux-x86_64-*.tar.gz | Unified install tree TGZ extracted from RPM |"
             echo "| joblens-${VERSION}-1.*.x86_64.rpm | Unified RPM (core C++ Agent + Python Trigger Gateway, systemd-managed) |"
             echo "| SHA256SUMS.txt | Checksums for integrity verification |"
             echo ""
