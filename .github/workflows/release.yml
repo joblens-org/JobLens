@@ -75,36 +75,6 @@ jobs:
         run: bash scripts/build-unified-rpm.sh --install-deps --preset "${{ matrix.target.preset }}"
 
       # ════════════════════════════════════════════════════════
-      # 二进制诊断（从 rpmbuild BUILD 目录）
-      # ════════════════════════════════════════════════════════
-      - name: Diagnose binary dependencies
-        run: |
-          set -e
-          VERSION="${{ needs.prepare.outputs.version }}"
-          BUILD_DIR="$HOME/rpmbuild/BUILD/JobLens-${VERSION}/build"
-          if [ ! -f "${BUILD_DIR}/JobLens" ]; then
-            echo "::error::Missing JobLens binary at ${BUILD_DIR}/JobLens"
-            find ~/rpmbuild/BUILD -maxdepth 3 -name JobLens -print 2>/dev/null || true
-            exit 1
-          fi
-          echo "Build dir: ${BUILD_DIR}"
-
-          echo "=== 二进制动态链接 ==="
-          ldd "${BUILD_DIR}/JobLens" | sort
-
-          echo ""
-          echo "=== 二进制需要的 glibc 符号版本 ==="
-          objdump -T "${BUILD_DIR}/JobLens" | grep -oP 'GLIBC_\S+' | sort -Vu
-
-          echo ""
-          echo "=== 二进制需要的 libstdc++ 符号版本 ==="
-          objdump -T "${BUILD_DIR}/JobLens" | grep -oP 'GLIBCXX_\S+' | sort -Vu
-
-          echo ""
-          echo "=== 二进制需要的第三方库 SONAME ==="
-          objdump -p "${BUILD_DIR}/JobLens" | grep NEEDED | sort -u
-
-      # ════════════════════════════════════════════════════════
       # TGZ 便携包制作（从 RPM 解包树）
       # ════════════════════════════════════════════════════════
       - name: Create portable TGZ
@@ -125,6 +95,35 @@ jobs:
           (cd "${TGZ_ROOT}" && rpm2cpio "${RPM}" | cpio -idm --quiet)
           tar -czf "build/${TGZ_NAME}" -C "${TGZ_ROOT}" .
           ls -lh "build/${TGZ_NAME}"
+
+      # ════════════════════════════════════════════════════════
+      # 二进制诊断（从 RPM 解包树）
+      # ════════════════════════════════════════════════════════
+      - name: Diagnose binary dependencies
+        run: |
+          set -e
+          BIN="build/tgz-root-${{ matrix.target.name }}/usr/bin/JobLens"
+          if [ ! -f "${BIN}" ]; then
+            echo "::error::Missing JobLens binary at ${BIN}"
+            find "build/tgz-root-${{ matrix.target.name }}" -name JobLens -print 2>/dev/null || true
+            exit 1
+          fi
+          echo "Binary: ${BIN}"
+
+          echo "=== 二进制动态链接 ==="
+          ldd "${BIN}" | sort
+
+          echo ""
+          echo "=== 二进制需要的 glibc 符号版本 ==="
+          objdump -T "${BIN}" | grep -oP 'GLIBC_\S+' | sort -Vu
+
+          echo ""
+          echo "=== 二进制需要的 libstdc++ 符号版本 ==="
+          objdump -T "${BIN}" | grep -oP 'GLIBCXX_\S+' | sort -Vu
+
+          echo ""
+          echo "=== 二进制需要的第三方库 SONAME ==="
+          objdump -p "${BIN}" | grep NEEDED | sort -u
 
       # ════════════════════════════════════════════════════════
       # 统一 RPM 验证（含 core + trigger 全套产物）
