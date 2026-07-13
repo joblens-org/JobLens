@@ -16,7 +16,6 @@
 #include <sol/sol.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
-#include "common/struct2ltable.hpp"
 
 // RuleEngine 构造函数实现
 RuleEngine::RuleEngine() : L(nullptr) {
@@ -250,8 +249,11 @@ void RuleEngine::create_sandbox() {
             return require_func(modname);
         };
         
-        // 禁用io.write和io.popen
+        // 规则脚本只允许读取入参，不允许通过 io 库写出沙箱。
         sol::table io = (*L)["io"].get_or(L->create_table());
+        io["open"] = sol::nil;
+        io["output"] = sol::nil;
+        io["tmpfile"] = sol::nil;
         io["write"] = sol::nil;
         io["popen"] = sol::nil;
         (*L)["io"] = io;
@@ -290,5 +292,3 @@ bool RuleEngine::check_lua_syntax(const std::string& lua_code) {
         return false;
     }
 }
-
-

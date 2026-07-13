@@ -1,0 +1,63 @@
+lens_config:
+  rpc_socket_path: /var/JobLens/rpc.sock
+  lock_path: /var/JobLens/JobLens.lock
+  max_collector_threads: 2
+  log_level: debug
+
+job_registry_config:
+  job_db_path: /var/JobLens/job.db
+  auto_add_condorjob: true
+  auto_add_slurmjob: true
+  rules_dir: /var/JobLens/integration-rules
+
+condor_job_watcher:
+  auto_add_collectors:
+    - cpumem_collector
+  use_rules: true
+  rules_prefix: condor_job_
+
+slurm_job_watcher:
+  auto_add_collectors:
+    - cpumem_collector
+  use_rules: true
+  rules_prefix: slurm_job_
+
+collectors_config:
+  enable_collector_perf: true
+  perf_window_size: 1000
+  default_freq: 1
+  default_use_writers:
+    - file_writer
+  collectors:
+    - name: cpumem_collector
+      type: CPUMemCollector
+      config: cpumem_collector_config
+
+cpumem_collector_config:
+  freq: 1
+  use_writers:
+    - file_writer
+
+writers_config:
+  enable_writer_perf: true
+  buffer_capacity: 256
+  writers:
+    - name: file_writer
+      type: FileWriter
+      config: file_writer_config
+
+file_writer_config:
+  path: /var/log/joblens/output.log
+
+service_registry:
+  enabled: false
+  url: "http://localhost:8080"
+  retry_interval: 10
+  max_retries: 3
+  heartbeat_interval: 1800
+
+config_manager:
+  enabled: false
+
+rule_manager:
+  enabled: false

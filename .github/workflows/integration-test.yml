@@ -23,6 +23,17 @@ name: Integration Test
 # yamllint disable rule:truthy
 on:
   workflow_dispatch:
+    inputs:
+      preset:
+        description: 'Preset name or glob pattern passed to run_preset.py'
+        required: false
+        default: 'alm9-*'
+        type: choice
+        options:
+          - 'alm9-*'
+          - alm9-default
+          - alm9-manual-trigger
+          - alm9-rule-engine
   pull_request:
     branches: [main, develop]
     paths:
@@ -124,7 +135,13 @@ jobs:
           # 安装 Python 测试依赖（pytest, requests, fabric, pyyaml）
           pip install -q -r requirements.txt
           # 使用 --keep-vms 确保即使测试失败也不会销毁 VM, 以便后续诊断步骤捕获日志
-          python3 ./run_preset.py --match 'alm9-*' --keep-vms
+          PRESET_SELECTOR="${{ github.event.inputs.preset || 'alm9-*' }}"
+          echo "Preset selector: ${PRESET_SELECTOR}"
+          if [[ "${PRESET_SELECTOR}" == *"*"* || "${PRESET_SELECTOR}" == *"?"* || "${PRESET_SELECTOR}" == *"["* ]]; then
+            python3 ./run_preset.py --match "${PRESET_SELECTOR}" --keep-vms
+          else
+            python3 ./run_preset.py "${PRESET_SELECTOR}" --keep-vms
+          fi
           PRESET_EXIT=$?
 
           echo ""
