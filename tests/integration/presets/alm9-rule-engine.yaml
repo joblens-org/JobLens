@@ -1,0 +1,50 @@
+name: alm9-rule-engine
+description: "AlmaLinux 9 rule engine integration test"
+
+topology:
+  controller:
+    box: almalinux/9
+    hostname: controller
+    ip: 192.168.56.10
+    cpus: 2
+    memory: 2048
+    disk: 20
+  worker:
+    box: almalinux/9
+    hostname: worker
+    ip: 192.168.56.20
+    cpus: 2
+    memory: 3072
+    disk: 20
+
+network:
+  subnet: 192.168.56.0/24
+
+schedulers:
+  htcondor:
+    enabled: true
+    version: "25.0"
+    repo_rpm_url: "https://htcss-downloads.chtc.wisc.edu/repo/25.0/htcondor-release-current.el9.noarch.rpm"
+    setup_scripts:
+      - provisioning/condor/common.sh
+      - provisioning/condor/controller.sh
+      - provisioning/condor/worker.sh
+  slurm:
+    enabled: true
+    version: "23.02"
+    rpm_dir: ../rpms/slurm
+    setup_scripts:
+      - provisioning/slurm/common.sh
+      - provisioning/slurm/controller.sh
+      - provisioning/slurm/worker.sh
+
+joblens:
+  rpm_path: rpms/joblens-[0-9]*.rpm
+  core_config: presets/configs/joblens_core_rule_engine.yaml
+  trigger_config: presets/configs/joblens_trigger_default.yaml
+
+tests:
+  pytest_files:
+    - test_cases/test_01_health.py
+    - test_cases/test_08_rule_engine_template.py
+  pytest_args: "-v --tb=short"
