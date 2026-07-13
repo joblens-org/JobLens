@@ -99,23 +99,23 @@ jobs:
           objdump -p "${BUILD_DIR}/JobLens" | grep NEEDED | sort -u
 
       # ════════════════════════════════════════════════════════
-      # TGZ 便携包制作（从 rpmbuild BUILD 产物）
+      # TGZ 便携包制作（从 rpmbuild BUILDROOT 安装树）
       # ════════════════════════════════════════════════════════
       - name: Create portable TGZ
         run: |
           set -e
           VERSION="${{ needs.prepare.outputs.version }}"
-          BUILD_ROOT=$(ls -d ~/rpmbuild/BUILD/JobLens-* | head -1)
-          BUILD_DIR="${BUILD_ROOT}/build"
+          BUILDROOT=$(ls -d ~/rpmbuild/BUILDROOT/joblens-${VERSION}-*.x86_64 2>/dev/null | head -1)
+          if [ -z "${BUILDROOT}" ]; then
+            echo "Missing rpmbuild BUILDROOT for version ${VERSION}"
+            find ~/rpmbuild/BUILDROOT -maxdepth 1 -type d -print 2>/dev/null || true
+            exit 1
+          fi
 
-          TGZ_DIR="joblens-${VERSION}-Linux-x86_64"
-          mkdir -p "${TGZ_DIR}/bin" "${TGZ_DIR}/lib/joblens/bpf_obj" "${TGZ_DIR}/etc/JobLens"
-          cp "${BUILD_DIR}/JobLens" "${TGZ_DIR}/bin/"
-          cp "${BUILD_DIR}/bpf_obj/"*.bpf.o "${TGZ_DIR}/lib/joblens/bpf_obj/"
-          cp config/config.example.yaml "${TGZ_DIR}/etc/JobLens/config.yaml"
-
-          tar -czf "build/joblens-${VERSION}-Linux-x86_64.tar.gz" "${TGZ_DIR}"
-          ls -lh "build/joblens-${VERSION}-Linux-x86_64.tar.gz"
+          TGZ_NAME="joblens-${VERSION}-Linux-x86_64-${{ matrix.target.name }}.tar.gz"
+          mkdir -p build
+          tar -czf "build/${TGZ_NAME}" -C "${BUILDROOT}" .
+          ls -lh "build/${TGZ_NAME}"
 
       # ════════════════════════════════════════════════════════
       # 统一 RPM 验证（含 core + trigger 全套产物）
@@ -160,7 +160,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: unified-tgz-${{ matrix.target.name }}
-          path: build/joblens-*-Linux-x86_64.tar.gz
+          path: build/joblens-*-Linux-x86_64-*.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -198,7 +198,7 @@ jobs:
             echo ""
             echo "| Package | Description |"
             echo "|---------|-------------|"
-            echo "| joblens-${VERSION}-Linux.tar.gz | Core binary + config (portable TGZ) |"
+            echo "| joblens-${VERSION}-Linux-x86_64-*.tar.gz | Unified install tree TGZ from RPM BUILDROOT |"
             echo "| joblens-${VERSION}-1.*.x86_64.rpm | Unified RPM (core C++ Agent + Python Trigger Gateway, systemd-managed) |"
             echo "| SHA256SUMS.txt | Checksums for integrity verification |"
             echo ""
