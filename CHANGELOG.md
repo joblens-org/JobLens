@@ -1,5 +1,121 @@
 # JobLens Changelog
 
+## v0.2.0 (2026-07)
+
+### Power Monitoring
+- **PowerCollector**: Added per-job power and energy attribution based on eBPF `sched_switch` tracing and RAPL energy counters (`c7fa630`)
+  - Added `trace_sched_runtime` eBPF program and collector-side runtime accounting for job-scoped CPU time attribution (`0703e37`, `3bb8af2`)
+  - Added IPMI-based `ipmi_power_watt` reporting for per-job power context (`6c5b10b`)
+  - Added anomaly detection for stale BMC/IPMI readings while preserving measured values with warning logs (`ce16c28`, `ec39114`)
+  - Switched BPF map dumping to `bpf_map_lookup_batch` for lower overhead (`43092c9`)
+  - Introduced global cache with TTL derived from collector frequency; reduced TTL to 90% of interval to avoid stale deduplication (`132fbbe`, `61270c9`, `957955e`)
+  - Fixed use-after-free crash in power energy computation (`dbfdf96`)
+
+### Unified Packaging and Release Flow
+- **Unified RPM package**: Consolidated Core and Trigger into one `joblens` RPM package (`cf19376`, `60966bd`)
+  - Added unified RPM spec and build/verification scripts (`scripts/rpm/joblens-unified.spec`, `scripts/build-unified-rpm.sh`, `scripts/verify-unified-rpm.sh`)
+  - Removed deprecated standalone Trigger RPM packaging files (`5d599bf`)
+  - Switched CI/CD and deployment documentation to the unified RPM workflow (`fae27c9`, `1101bac`)
+  - Used CMake presets for package builds and improved Fedora/AlmaLinux build environment compatibility (`af28d48`, `11fc00e`)
+  - Fixed `bpf_obj` installation paths and systemd path leftovers to avoid `/lib`/`lib64` packaging residue (`f4d29f0`, `e30adbc`, `b9afc68`)
+  - Added dynamic version injection for `rpmbuild` and fixed Python virtualenv ELF build-id conflicts (`13bc5a4`, `2b83c54`, `b6884ec`)
+
+### Integration Test Infrastructure
+- **AlmaLinux 9 integration framework**: Added Vagrant/libvirt-based dual-node integration test topology for HTCondor, Slurm, Trigger API, FileWriter schema, and performance baseline coverage (`c1fa1e5`, `39c821d`, `617ce92`)
+  - Added VM provisioning scripts for common system setup, HTCondor, Slurm, and JobLens deployment (`7a319f0`)
+  - Added pytest fixtures, SSH/API helpers, retry utilities, demo jobs, and orchestration Makefile targets (`f431481`, `83c2a52`)
+  - Added preset schema, runtime environment loader, Vagrantfile template, and demo-job preflight (`53037f0`, `11d7e5f`)
+  - Rewrote `run_preset` as a pure Python orchestrator with preset listing/matching, optional preset selection, diagnostics, log export, and cleanup support (`582230c`, `9917780`, `523d9cf`, `83626a5`)
+  - Added manual Trigger tracking tests for HTCondor and Slurm jobs (`14d3c6a`, `7d5ace4`)
+  - Added AlmaLinux 9 rule-engine integration preset and core config (`56cf871`)
+
+### Collector and Writer Output
+- **FileWriter parser**: Added parser support for multiple collector outputs with structured JSONL records and parser error handling (`7675f71`)
+- **Writer parser de-duplication**: Consolidated ESWriter/FileWriter parser logic by delegating common parsing to FileWriter (`bb3bf92`)
+- **Flattened writer JSON schema**: Moved job metadata fields to top-level JSON output for easier downstream indexing and validation (`709f501`)
+- **Elasticsearch internal TLS option**: Added insecure SSL option for internal Elasticsearch deployments (`9c949d1`)
+- **Parser failure handling**: Introduced ES parser-failure skip behavior, then reverted the change to preserve release behavior after validation (`0e8a758`, `d6304fa`)
+
+### Trigger, Configuration, and Runtime Behavior
+- **Trigger default behavior**: Added config-file existence checks so service registration and rule manager are enabled only when their required configuration is present (`0d6ad7c`)
+- **Trigger route clarity**: Included `status` in `JobsListResponse` for clearer API responses (`848e18c`)
+- **Trigger config path fix**: Corrected Trigger configuration path usage (`532d6fb`, `9eaa351`)
+- **Core config templates**: Added missing `perf_window_size` and `default_use_writers` defaults to prevent service-mode startup/config errors (`8326909`)
+- **Job owner propagation**: Populated job `owner`/`user` from `sub_attr` when adding jobs through RPC (`bcbb512`)
+- **Condor BPF path fallback**: Added development-build BPF object path fallback for local Condor runs, later removed from RPM deployment path after unified packaging alignment (`143cc70`, `fb38f99`)
+- **Scheduler deduplication**: Deduplicated `jobid` in `addJob2Collector` to avoid empty snapshots (`4a34590`)
+
+### Rule Engine Security
+- **Sandbox hardening**: Removed unnecessary headers and strengthened rule-engine sandbox behavior (`3942aa1`)
+
+### CI, Diagnostics, and Developer Experience
+- Added comprehensive GitHub Actions integration-test workflow and CI diagnostics for KVM/libvirt, Vagrant, RPM build, and runtime startup failures (`ab4ed16`, `28feba7`, `0a69a9d`, `533ef8c`)
+- Added eBPF program loading verification and diagnostics for package/runtime validation (`9d0ea5a`)
+- Added JobLens startup and journal log capture for deployment troubleshooting (`8339701`, `7e8cba3`)
+- Improved RPM/TGZ verification coverage for system-dependency and self-contained build modes (`b356fb0`, `3f9e3cf`, `1721b1e`, `6040297`)
+- Added `BUILD_ID` support to CI/release metadata (`751d847`, `c97ddab`)
+- Made dependency/build helper scripts more container-friendly for CI and RPM build environments (`710d873`)
+
+### Documentation
+- Updated minimal deployment documentation for unified RPM installation and clarified configuration requirements (`1101bac`, `3376e76`)
+- Added Chinese power solution comparison documentation for power attribution design references (`doc/power_solution_comparison_zh.md`)
+- Updated project overview, RPM information, and resource requirements in README/deployment docs (`e5eb5bb`)
+
+---
+
+## v0.1.1 (2026-06)
+
+### Patch Release
+- Updated project version to `0.1.1` as a focused fix release (`63b6915`)
+
+### Packaging and Upgrade Fixes
+- Fixed runtime lookup path for `bpf_obj` files so installed packages can locate eBPF objects correctly (`aa590ce`)
+- Fixed CMake packaging logic for install/package generation (`035f5f2`)
+- Corrected RPM config-file attributes and upgrade handling so user-managed configuration is preserved during RPM upgrades (`fcc37fd`, `e82db68`)
+- Added pre/post-install diagnostic handling for package installation and upgrade troubleshooting (`efd3fc1`)
+
+### Configuration and Documentation
+- Simplified `config.example.yaml` to a minimal default example for clearer first-time deployment (`49158db`)
+- Updated configuration documentation to match the simplified example and current runtime behavior (`49158db`)
+
+---
+
+## v0.1.0 (2026-06)
+
+### Open Source Release Preparation
+- **Open source baseline**: Prepared JobLens for public release with Apache-2.0 license, refreshed English/Chinese README files, and aligned documentation with the open-source project structure (`72ab52d`, `ad1b706`, `30cdc2d`, `649ad11`)
+- Removed legacy/private deployment scripts, old test utilities, GitLab-only CI config, and obsolete packaging files from the public tree (`e86863c`, `4dc3c37`)
+- Switched default project documentation to English while keeping Chinese documentation available (`23f3588`, `426c649`, `1f03912`)
+
+### Build and Dependency System
+- **CMake packaging migration**: Migrated build and packaging flow to CMake/CPack with dedicated install and packaging logic (`75bdfb5`, `8bb4e3b`)
+- Added `CMakePresets.json` and standardized local/CI build presets (`75bdfb5`, `8bb4e3b`)
+- Replaced SQLite persistence dependency with LevelDB and removed SQLite-related dependency paths from the open-source build (`4dc3c37`)
+- Added environment dependency installation script and fixed Ubuntu/AlmaLinux dependency gaps, including LevelDB and `nlohmann_json` discovery (`d9c3768`, `5c0840c`, `3e49c2d`, `9a198ea`)
+- Added bpftool-based automatic `vmlinux.h` generation and removed generated `vmlinux.h` from git tracking to reduce repository size (`7b5b596`)
+- Fixed CI build type/variable handling and bpftool installation robustness (`bdd7462`, `21127e2`, `76b50df`)
+
+### RPM and Release Automation
+- Added GitHub Actions CI/release workflows for building, packaging, uploading, and publishing release artifacts (`481b214`, `cb71539`, `a685ec8`)
+- Standardized RPM packaging for Core and Trigger packages, including Python Trigger RPM packaging and RPM-compliant package metadata (`e74cdc2`, `864ff26`, `686f4a6`)
+- Packaged default configuration into RPM artifacts and aligned package names/paths with the new naming convention (`c50f28f`, `705b4fc`)
+- Added download retry support and release workflow fixes for artifact naming, release content, and package publishing (`c3b88c9`, `062f3b1`, `6b87f36`)
+- Added multi-version dependency support in release/CI workflows (`5db12f4`)
+
+### Trigger and Runtime Configuration
+- Standardized Trigger startup configuration discovery so Trigger resolves its config path consistently across packaged and local runs (`ae32c04`)
+- Updated Trigger README and runtime documentation to match the public package layout (`1f03912`, `1f1446b`)
+- Added default config packaging and refreshed example configuration for service-mode deployment (`c50f28f`)
+
+### Documentation
+- Added and updated API documentation, configuration manuals, development guide, and minimal deployment suite docs for the open-source release (`30cdc2d`, `649ad11`, `1f1446b`)
+- Added architecture and data-flow documentation assets for public project overview (`30cdc2d`)
+
+### CI Stabilization
+- Fixed multiple CI/release workflow issues across Ubuntu and AlmaLinux build environments, including package install, artifact verification, release upload, and rerun stability (`5897de5`, `34533f7`, `481537e`, `71e35f1`, `2ca05f6`, `bc322c5`, `e7c7356`, `f45b730`, `8ea9d36`, `bc4daac`)
+
+---
+
 ## v0.0.19 (2026-05)
 
 ### Bug Fix - Missing sub_attr in requests causing silent collector failure
