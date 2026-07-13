@@ -57,8 +57,8 @@ jobs:
     strategy:
       matrix:
         target:
-          - { name: fedora, image: fedora:latest }
-          - { name: el9,   image: almalinux:9 }
+          - { name: fedora, image: fedora:latest, preset: rpm-system-deps }
+          - { name: el9,   image: almalinux:9,   preset: rpm-system-deps }
       fail-fast: false
     container:
       image: ${{ matrix.target.image }}
@@ -72,7 +72,7 @@ jobs:
           fetch-depth: 0
 
       - name: Build unified RPM (core + trigger)
-        run: bash scripts/build-unified-rpm.sh --install-deps
+        run: bash scripts/build-unified-rpm.sh --install-deps --preset "${{ matrix.target.preset }}"
 
       # ════════════════════════════════════════════════════════
       # 二进制诊断（从 rpmbuild BUILD 目录）
@@ -80,7 +80,13 @@ jobs:
       - name: Diagnose binary dependencies
         run: |
           set -e
-          BUILD_DIR=$(ls -d ~/rpmbuild/BUILD/JobLens-*/build | head -1)
+          VERSION="${{ needs.prepare.outputs.version }}"
+          BUILD_DIR="$HOME/rpmbuild/BUILD/JobLens-${VERSION}/build"
+          if [ ! -f "${BUILD_DIR}/JobLens" ]; then
+            echo "::error::Missing JobLens binary at ${BUILD_DIR}/JobLens"
+            find ~/rpmbuild/BUILD -maxdepth 3 -name JobLens -print 2>/dev/null || true
+            exit 1
+          fi
           echo "Build dir: ${BUILD_DIR}"
 
           echo "=== 二进制动态链接 ==="
@@ -131,8 +137,8 @@ jobs:
           ls -lh "$RPM"
 
           # Core 产物检查
-          rpm -qpl "$RPM" | grep -q '/bin/JobLens$' && echo "OK: JobLens binary" || { echo "FAIL: missing JobLens"; exit 1; }
-          rpm -qpl "$RPM" | grep -q '/lib/joblens/bpf_obj/' && echo "OK: eBPF objects" || { echo "FAIL: missing bpf_obj"; exit 1; }
+          rpm -qpl "$RPM" | grep -q '/usr/bin/JobLens$' && echo "OK: JobLens binary" || { echo "FAIL: missing JobLens"; exit 1; }
+          rpm -qpl "$RPM" | grep -qE '/lib[0-9]*/joblens/bpf_obj/[^/]*\.bpf\.o$' && echo "OK: eBPF objects" || { echo "FAIL: missing bpf_obj"; exit 1; }
           rpm -qpl "$RPM" | grep -q '/etc/JobLens/config.yaml$' && echo "OK: core config" || { echo "FAIL: missing core config"; exit 1; }
           rpm -qpl "$RPM" | grep -q '/joblens.service$' && echo "OK: core systemd unit" || { echo "FAIL: missing core systemd unit"; exit 1; }
 
@@ -189,7 +195,13 @@ jobs:
       - name: Generate SHA256 checksums
         working-directory: release-assets
         run: |
-          sha256sum *.{rpm,tar.gz} 2>/dev/null > SHA256SUMS.txt
+          shopt -s nullglob
+          files=(*.rpm *.tar.gz)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::No release assets found for checksum generation"
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Generate release notes
@@ -201,7 +213,7 @@ jobs:
             echo ""
             echo "| Package | Description |"
             echo "|---------|-------------|"
-            echo "| joblens-${VERSION}-Linux-x86_64-*.tar.gz | Unified install tree TGZ extracted from RPM |"
+            echo "| joblens-${VERSION}-Linux-x86_64-{fedora,el9}.tar.gz | Unified install tree TGZ extracted from RPM |"
             echo "| joblens-${VERSION}-1.*.x86_64.rpm | Unified RPM (core C++ Agent + Python Trigger Gateway, systemd-managed) |"
             echo "| SHA256SUMS.txt | Checksums for integrity verification |"
             echo ""
