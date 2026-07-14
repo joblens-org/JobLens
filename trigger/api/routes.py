@@ -31,7 +31,6 @@ from trigger.utils.hardware_info import hardware_info
 
 # 兼容两种运行方式：以项目根目录运行或以 trigger 目录运行
 try:
-    from trigger.version import __version__ as trigger_version
     from trigger.api.schemas import (
         JobRequest, CondorJobRequest, SlurmJobRequest,
         ErrorResponse, HealthResponse, RPCHealthResponse,
@@ -43,7 +42,6 @@ try:
         VersionResponse, UpgradeResponse, HardwareInfoResponse
     )
 except ImportError:
-    from trigger.version import __version__ as trigger_version
     from trigger.api.schemas import (
         JobRequest, CondorJobRequest, SlurmJobRequest,
         ErrorResponse, HealthResponse, RPCHealthResponse,
@@ -96,6 +94,13 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         service_registrar: 服务注册器（可选）
         rule_manager: 规则管理器（可选）
     """
+
+    def current_joblens_version() -> str:
+        try:
+            from trigger.core.tools import get_joblens_version
+            return get_joblens_version().get('version', 'UNKNOWN')
+        except Exception:
+            return 'UNKNOWN'
     
     # ==================== 指标接口 ====================
     
@@ -122,7 +127,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         """根路径，返回 Trigger 基本信息"""
         return jsonify({
             "service": "JobLens Trigger",
-            "version": trigger_version,
+            "version": current_joblens_version(),
             "status": "running",
             "endpoints": {
                 "trigger_health": "/trigger/health",
@@ -144,7 +149,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             pass
         return jsonify({
             "service": "JobLens Trigger",
-            "version": trigger_version,
+            "version": joblens_info.get('version', 'UNKNOWN'),
             "status": "running",
             "components": {
                 "rpc_client": rpc_client is not None,
@@ -628,7 +633,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             from trigger.core.tools import get_joblens_version
             joblens_info = get_joblens_version()
             response = VersionResponse(
-                trigger_version=trigger_version,
+                trigger_version=joblens_info.get('version', 'UNKNOWN'),
                 joblens_version=joblens_info.get('version', 'UNKNOWN'),
                 build_id=joblens_info.get('build_id', 'UNKNOWN'),
                 build_time=joblens_info.get('build_time_local', 'UNKNOWN')
@@ -636,7 +641,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             return jsonify(response.model_dump())
         except Exception as e:
             response = VersionResponse(
-                trigger_version=trigger_version,
+                trigger_version="UNKNOWN",
                 joblens_version="UNKNOWN",
                 build_id="UNKNOWN",
                 build_time=str(e)

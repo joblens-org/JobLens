@@ -19,14 +19,15 @@ name/version/packages 在此显式声明以保证 EL9（setuptools < 61）兼容
 其它元数据由 pyproject.toml 提供。
 """
 from setuptools import setup
+import os
 
-ns = {}
-with open("version.py") as f:
-    exec(f.read(), ns)
 
-setup(
+def read_project_version() -> str:
+    return os.environ.get("JOBLENS_VERSION", "0.0.0")
+
+_ = setup(
     name="joblens-trigger",
-    version=ns["__version__"],
+    version=read_project_version(),
     packages=["trigger", "trigger.api", "trigger.core", "trigger.utils"],
     package_dir={"trigger": "."},
 )

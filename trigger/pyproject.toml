@@ -38,6 +38,3 @@ dynamic = ["version"]
 
 [tool.setuptools]
 packages = ["trigger", "trigger.api", "trigger.core", "trigger.utils"]
-
-[tool.setuptools.dynamic]
-version = {attr = "version.__version__"}

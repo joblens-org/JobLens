@@ -261,7 +261,6 @@ trigger/
 ├── entrypoint.py      # Package entry point
 ├── gunicorn.conf.py   # Gunicorn configuration
 ├── requirements.txt   # Python dependencies
-├── version.py         # Version info
 ├── setup.py           # Package setup
 ├── config.example.yaml # Trigger configuration example
 ├── joblens-trigger.service  # systemd service unit (included in unified RPM)

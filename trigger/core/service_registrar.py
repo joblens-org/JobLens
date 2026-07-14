@@ -75,8 +75,7 @@ class ServiceRegistrar:
         except Exception as e:
             logger.warning(f"获取JobLens版本失败: {e}")
         
-        # 回退到触发器版本
-        return '0.0.8'
+        return 'UNKNOWN'
     
     def _fetch_etcd_path(self) -> Optional[str]:
         """
