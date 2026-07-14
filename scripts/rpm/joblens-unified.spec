@@ -179,6 +179,7 @@ cmake --build --preset %{?preset}%{!?preset:rpm-system-deps}
 
 # 9. 安装运行时 Python 依赖 + trigger 包本身
 #    --no-compile: 不生成 .pyc，避免嵌入 buildroot 路径被 check-buildroot 拦截
+export JOBLENS_VERSION="%{_version}"
 %{buildroot}/usr/lib/joblens/trigger-venv/bin/pip install \
     --no-input --no-cache-dir --no-compile \
     -r trigger/requirements.txt trigger/
