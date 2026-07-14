@@ -59,6 +59,7 @@ jobs:
         target:
           - { name: fedora, image: fedora:latest, preset: rpm-system-deps }
           - { name: el9,   image: almalinux:9,   preset: rpm-system-deps }
+          - { name: fedora-static-epel, image: fedora:latest, preset: rpm-static-epel }
       fail-fast: false
     container:
       image: ${{ matrix.target.image }}
@@ -146,21 +147,39 @@ jobs:
           rpm -qpl "$RPM" | grep -q '/joblens-trigger.service$' && echo "OK: trigger systemd unit" || { echo "FAIL: missing trigger systemd unit"; exit 1; }
           rpm -qpl "$RPM" | grep -q '/etc/JobLens/trigger/config.yaml$' && echo "OK: trigger config" || { echo "FAIL: missing trigger config"; exit 1; }
 
-          # 系统依赖检查（统一包使用 JOBLENS_BUNDLE_LIBS=OFF）
           REQS=$(rpm -qp --requires "$RPM")
-          echo "$REQS" | grep -q 'leveldb' && echo "OK: Requires leveldb" || { echo "FAIL: missing leveldb dep"; exit 1; }
-          echo "$REQS" | grep -q 'xxhash' && echo "OK: Requires xxhash" || { echo "FAIL: missing xxhash dep"; exit 1; }
+          if [ "${{ matrix.target.preset }}" = "rpm-system-deps" ]; then
+            echo "$REQS" | grep -q 'leveldb' && echo "OK: Requires leveldb" || { echo "FAIL: missing leveldb dep"; exit 1; }
+            echo "$REQS" | grep -q 'xxhash' && echo "OK: Requires xxhash" || { echo "FAIL: missing xxhash dep"; exit 1; }
+          else
+            echo "OK: ${{ matrix.target.preset }} uses bundled/static EPEL dependencies; skipping leveldb/xxhash runtime Requires check"
+          fi
 
           # 确认旧包替换声明
           echo "$REQS" | grep -q 'joblens-trigger' && echo "OK: Obsoletes/Provides old trigger" || echo "WARN: no old trigger replacement"
 
           echo "Unified RPM verification passed"
 
+      - name: Prepare RPM artifact
+        run: |
+          set -e
+          VERSION="${{ needs.prepare.outputs.version }}"
+          RPM=$(ls ~/rpmbuild/RPMS/x86_64/joblens-${VERSION}-*.rpm 2>/dev/null | head -1)
+          if [ -z "${RPM}" ]; then
+            echo "Missing RPM for version ${VERSION}"
+            find ~/rpmbuild/RPMS -name '*.rpm' -print 2>/dev/null || true
+            exit 1
+          fi
+
+          mkdir -p build/release-rpm
+          cp "${RPM}" "build/release-rpm/joblens-${VERSION}-${{ matrix.target.name }}.x86_64.rpm"
+          ls -lh build/release-rpm/
+
       - name: Upload RPM artifact
         uses: actions/upload-artifact@v4
         with:
           name: unified-rpm-${{ matrix.target.name }}
-          path: ~/rpmbuild/RPMS/x86_64/joblens-*.rpm
+          path: build/release-rpm/joblens-*.rpm
           if-no-files-found: error
           retention-days: 7
 
@@ -205,15 +224,34 @@ jobs:
 
       - name: Generate release notes
         run: |
+          set -euo pipefail
           VERSION="${{ needs.prepare.outputs.version }}"
+          CHANGELOG_BODY=$(awk -v ver="v${VERSION}" '
+            $0 ~ "^## " ver " " { found=1; next }
+            found && /^---$/ { exit }
+            found { print }
+          ' CHANGELOG.md)
+
+          if [ -z "${CHANGELOG_BODY}" ]; then
+            echo "::error::No CHANGELOG.md section found for v${VERSION}"
+            exit 1
+          fi
 
           {
+            echo "## Changes in v${VERSION}"
+            echo ""
+            printf '%s\n' "${CHANGELOG_BODY}"
+            echo ""
             echo "## Packages"
             echo ""
             echo "| Package | Description |"
             echo "|---------|-------------|"
-            echo "| joblens-${VERSION}-Linux-x86_64-{fedora,el9}.tar.gz | Unified install tree TGZ extracted from RPM |"
-            echo "| joblens-${VERSION}-1.*.x86_64.rpm | Unified RPM (core C++ Agent + Python Trigger Gateway, systemd-managed) |"
+            echo "| joblens-${VERSION}-Linux-x86_64-fedora.tar.gz | Fedora unified install tree TGZ extracted from system-deps RPM |"
+            echo "| joblens-${VERSION}-Linux-x86_64-el9.tar.gz | AlmaLinux 9 unified install tree TGZ extracted from system-deps RPM |"
+            echo "| joblens-${VERSION}-Linux-x86_64-fedora-static-epel.tar.gz | Fedora self-contained unified install tree TGZ extracted from bundled-deps RPM |"
+            echo "| joblens-${VERSION}-fedora.x86_64.rpm | Fedora system-deps unified RPM |"
+            echo "| joblens-${VERSION}-el9.x86_64.rpm | AlmaLinux 9 system-deps unified RPM |"
+            echo "| joblens-${VERSION}-fedora-static-epel.x86_64.rpm | Fedora self-contained unified RPM |"
             echo "| SHA256SUMS.txt | Checksums for integrity verification |"
             echo ""
             echo "## Verify"
