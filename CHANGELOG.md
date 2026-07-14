@@ -1,5 +1,16 @@
 # JobLens Changelog
 
+## v0.2.2 (2026-07)
+
+### Patch Release - Trigger Gunicorn Fork-Safety Fix
+- Fixed intermittent Trigger health-check failures caused by gRPC/etcd fork-safety issues in Gunicorn preload mode:
+  - Disabled Gunicorn application preloading for `joblens-trigger` so etcd3/grpcio resources are initialized inside the worker process instead of being inherited from the master process after `fork()`
+  - Avoided gRPC EventEngine `epoll_wait` `Bad file descriptor` errors leaking into `/joblens/healthy` responses when the health endpoint invokes `systemctl` via subprocess
+  - Reduced risk of Gunicorn worker aborts caused by grpcio EventEngine state inherited across fork boundaries
+- Unified runtime version reporting on `JobLens -v` and passed the packaging version into the Trigger Python package from the RPM spec build flow
+
+---
+
 ## v0.2.1 (2026-07)
 
 ### Patch Release - Unified RPM Release and Upgrade Fixes
