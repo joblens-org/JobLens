@@ -29,7 +29,7 @@ keepalive = 5
 
 # Application preloading
 # When True, the app is loaded in the master process before forking workers
-preload_app = True
+preload_app = False
 
 # Logging
 accesslog = "-"
