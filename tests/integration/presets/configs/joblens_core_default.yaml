@@ -59,7 +59,7 @@ cpumem_collector_config:
     - file_writer                                # 输出到本地文件
 
 # ============================================================
-# Writer 配置 — FileWriter 输出 JSONL 到本地文件
+# Writer 配置 — FileWriter 输出纯文本到本地文件
 # ============================================================
 writers_config:
   enable_writer_perf: true                       # 启用 writer 性能计数器
@@ -70,7 +70,7 @@ writers_config:
       config: file_writer_config
 
 file_writer_config:
-  path: /var/log/joblens/output.log              # JSONL 本地输出路径
+  path: /var/log/joblens/output.log              # 纯文本本地输出路径
 
 # ============================================================
 # 单节点服务组件 (全部禁用)
