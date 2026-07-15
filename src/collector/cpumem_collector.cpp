@@ -323,38 +323,33 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
     }
     if(writer_type.compare("FileWriter") == 0){
         func = [this](std::any data)->std::any{
-            nlohmann::json ret;
             if(data.has_value() == false) {
                 spdlog::warn("CPUMemCollector: error FileWriter parser, empty data");
-                ret["error"] = "empty data";
-                return ret;
+                return std::string("CPUMemCollector error=empty_data\n");
             }
-            ret["process_data"] = nlohmann::json::array();
             auto parsed = std::any_cast<std::vector<CPUMemInfo>>(data);
             spdlog::debug("CPUMemCollector: parsing data for FileWriter, data length={}", parsed.size());
+            std::ostringstream out;
             for (const auto& info : parsed) {
-                nlohmann::json j;
-                j["pid"] = info.pid;
-                j["ppid"] = info.ppid;
-                j["name"] = info.name;
-                j["cpuPercent"] = info.cpuPercent;
-                j["utime"] = info.utime;
-                j["stime"] = info.stime;
-                j["starttime"] = info.starttime;
-                j["hz"] = info.hz;
-                j["mem_vm_kb"] = info.mem_vm_kb;
-                j["mem_rss_kb"] = info.mem_rss_kb;
-                j["mem_swap_kb"] = info.mem_swap_kb;
-                j["mem_peak_rss_kb"] = info.mem_peak_rss_kb;
-                j["memoryPercent"] = info.memoryPercent;
-                j["numThreads"] = info.numThreads;
-                if(info.pid == 0){
-                    ret["summary"] = j;
-                }else{
-                    ret["process_data"].push_back(j);
-                }
+                out << "CPUMemCollector"
+                    << " type=" << (info.pid == 0 ? "summary" : "process")
+                    << " pid=" << info.pid
+                    << " ppid=" << info.ppid
+                    << " name=" << info.name
+                    << " cpuPercent=" << info.cpuPercent
+                    << " utime=" << info.utime
+                    << " stime=" << info.stime
+                    << " starttime=" << info.starttime
+                    << " hz=" << info.hz
+                    << " mem_vm_kb=" << info.mem_vm_kb
+                    << " mem_rss_kb=" << info.mem_rss_kb
+                    << " mem_swap_kb=" << info.mem_swap_kb
+                    << " mem_peak_rss_kb=" << info.mem_peak_rss_kb
+                    << " memoryPercent=" << info.memoryPercent
+                    << " numThreads=" << info.numThreads
+                    << '\n';
             }
-            return ret;
+            return out.str();
         };
     }
     if(writer_type.compare("PrometheusExporterWriter") == 0){

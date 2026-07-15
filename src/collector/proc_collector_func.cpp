@@ -329,29 +329,29 @@ CollectDataParseFunc ProcCollector::get_writer_parser(const std::string& writer_
     
     if(writer_type.compare("FileWriter") == 0){
         func = [](std::any data)->std::any{
-            nlohmann::json ret;
             if(data.has_value() == false) {
                 spdlog::warn("ProcCollector: error FileWriter parser, empty data");
-                return ret;
+                return std::string("ProcCollector error=empty_data\n");
             }
             auto parsed = std::any_cast<std::vector<std::shared_ptr<proc_collector::proc_info>>>(data);
+            std::ostringstream out;
             for (const auto& info : parsed) {
-                nlohmann::json j;
-                j["type"] = info->type;
-                j["pid"] = info->pid;
-                j["name"] = info->name;
-                j["ppid"] = info->ppid;
-                j["cpuPercent"] = info->cpuPercent;
-                j["memoryRss"] = info->memoryRss;
-                j["memoryPercent"] = info->memoryPercent;
-                j["numThreads"] = info->numThreads;
-                j["ioReadCount"] = info->ioReadCount;
-                j["ioWriteCount"] = info->ioWriteCount;
-                j["netConnCount"] = info->netConnCount;
-                j["status"] = info->status;
-                ret.push_back(j);
+                out << "ProcCollector"
+                    << " type=" << info->type
+                    << " pid=" << info->pid
+                    << " name=" << info->name
+                    << " ppid=" << info->ppid
+                    << " cpuPercent=" << info->cpuPercent
+                    << " memoryRss=" << info->memoryRss
+                    << " memoryPercent=" << info->memoryPercent
+                    << " numThreads=" << info->numThreads
+                    << " ioReadCount=" << info->ioReadCount
+                    << " ioWriteCount=" << info->ioWriteCount
+                    << " netConnCount=" << info->netConnCount
+                    << " status=" << info->status
+                    << '\n';
             }
-            return ret;
+            return out.str();
         };
     }
     
