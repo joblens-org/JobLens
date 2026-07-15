@@ -923,18 +923,10 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
     spdlog::debug("PowerCollector: get_writer_parser for writer_type: {}", writer_type);
 
     if (writer_type == "ESWriter") {
-        /* ESWriter 复用 FileWriter 的 JSON 格式化 (格式完全一致) */
-        auto file_parser = get_writer_parser("FileWriter");
-        return [this, file_parser](std::any data) -> std::any {
-            return file_parser(data);
-        };
-    }
-
-    if (writer_type == "FileWriter") {
         return [this](std::any data) -> std::any {
             nlohmann::json ret;
             if (!data.has_value()) {
-                spdlog::warn("PowerCollector: error FileWriter parser, empty data");
+                spdlog::warn("PowerCollector: error ESWriter parser, empty data");
                 ret["error"] = "empty data";
                 return ret;
             }
@@ -943,19 +935,17 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
             try {
                 snap = std::any_cast<PowerSnapshot>(data);
             } catch (const std::bad_any_cast& e) {
-                spdlog::warn("PowerCollector: bad any_cast in FileWriter parser — {}", e.what());
+                spdlog::warn("PowerCollector: bad any_cast in ESWriter parser — {}", e.what());
                 ret["error"] = std::string("bad any_cast: ") + e.what();
                 return ret;
             }
 
-            /* ── 快照级字段 (顶层) ── */
             ret["interval_s"]        = snap.interval_s;
             ret["delta_rapl_j"]      = snap.delta_rapl_j;
             ret["avg_power_w"]       = snap.avg_power_w;
             ret["system_overhead_j"] = snap.system_overhead_j;
             if (snap.ipmi_power_w > 0.0) ret["ipmi_power_w"] = snap.ipmi_power_w;
 
-            /* ── Job信息放到顶层 ── */
             if (!snap.jobs.empty()) {
                 const auto& job = snap.jobs[0];
                 ret["job_id"]          = job.job_id;
@@ -972,12 +962,62 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
                         {"cpu_pct",  pp.cpu_pct}
                     });
                 }
+            }
+
+            return ret;
+        };
+    }
+
+    if (writer_type == "FileWriter") {
+        return [this](std::any data) -> std::any {
+            if (!data.has_value()) {
+                spdlog::warn("PowerCollector: error FileWriter parser, empty data");
+                return std::string("PowerCollector error=empty_data\n");
+            }
+
+            PowerSnapshot snap;
+            try {
+                snap = std::any_cast<PowerSnapshot>(data);
+            } catch (const std::bad_any_cast& e) {
+                spdlog::warn("PowerCollector: bad any_cast in FileWriter parser — {}", e.what());
+                return std::string("PowerCollector error=bad_any_cast detail=") + e.what() + "\n";
+            }
+
+            std::ostringstream out;
+            out << "PowerCollector"
+                << " interval_s=" << snap.interval_s
+                << " delta_rapl_j=" << snap.delta_rapl_j
+                << " avg_power_w=" << snap.avg_power_w
+                << " system_overhead_j=" << snap.system_overhead_j;
+            if (snap.ipmi_power_w > 0.0) {
+                out << " ipmi_power_w=" << snap.ipmi_power_w;
+            }
+            out << '\n';
+
+            if (!snap.jobs.empty()) {
+                const auto& job = snap.jobs[0];
+                out << "PowerCollector job"
+                    << " job_id=" << job.job_id
+                    << " native_job_id=" << job.native_job_id
+                    << " energy_j=" << job.energy_j
+                    << " power_watt=" << job.power_watt
+                    << " ipmi_power_watt=" << job.ipmi_power_watt
+                    << '\n';
+
+                for (const auto& pp : job.pids) {
+                    out << "PowerCollector pid"
+                        << " job_id=" << job.job_id
+                        << " pid=" << pp.pid
+                        << " energy_j=" << pp.energy_j
+                        << " cpu_pct=" << pp.cpu_pct
+                        << '\n';
+                }
 
                 spdlog::debug("PowerCollector: FileWriter parsed job#{} E={:.4f}J P={:.2f}W pids={}",
                               job.job_id, job.energy_j, job.power_watt, job.pids.size());
             }
 
-            return ret;
+            return out.str();
         };
     }
 

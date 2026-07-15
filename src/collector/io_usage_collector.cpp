@@ -546,57 +546,51 @@ CollectDataParseFunc IOUsageCollector::get_writer_parser(const std::string& writ
 
     if(writer_type.compare("FileWriter") == 0){
         func = [this](std::any data)->std::any{
-            nlohmann::json ret;
             if(data.has_value() == false) {
                 spdlog::warn("IOUsageInfo: error FileWriter parser, empty data");
-                ret["error"] = "empty data";
-                return ret;
+                return std::string("IOUsageCollector error=empty_data\n");
             }
-            ret["process_data"] = nlohmann::json::array();
             auto parsed = std::any_cast<std::vector<IOUsageInfo>>(data);
+            std::ostringstream out;
             for (const auto& info : parsed) {
-                nlohmann::json j;
-                j["pid"] = info.pid;
-                j["read_bytes"] = info.read_bytes;
-                j["writer_bytes"] = info.write_bytes;
-                j["read_speed"] = info.read_speed;
-                j["write_speed"] = info.write_speed;
-                j["rchar"] = info.rchar;
-                j["wchar"] = info.wchar;
-                j["rchar_speed"] = info.rchar_speed;
-                j["wchar_speed"] = info.wchar_speed;
-                j["syscr"] = info.syscr;
-                j["syscw"] = info.syscw;
-                nlohmann::json files = nlohmann::json::array();
+                out << "IOUsageCollector"
+                    << " type=" << (info.pid == 0 ? "summary" : "process")
+                    << " pid=" << info.pid
+                    << " read_bytes=" << info.read_bytes
+                    << " write_bytes=" << info.write_bytes
+                    << " read_speed=" << info.read_speed
+                    << " write_speed=" << info.write_speed
+                    << " rchar=" << info.rchar
+                    << " wchar=" << info.wchar
+                    << " rchar_speed=" << info.rchar_speed
+                    << " wchar_speed=" << info.wchar_speed
+                    << " syscr=" << info.syscr
+                    << " syscw=" << info.syscw
+                    << '\n';
                 for (const auto& [fd, finfo] : info.file_info) {
-                    nlohmann::json fj;
-                    fj["fd"] = fd;
-                    fj["path"] = finfo.path;
-                    fj["mount_point"] = finfo.mount_point;
-                    fj["fs_type"] = finfo.fs_type;
-                    fj["pos"] = finfo.pos;
+                    out << "IOUsageCollector file"
+                        << " pid=" << info.pid
+                        << " fd=" << fd
+                        << " path=" << finfo.path
+                        << " mount_point=" << finfo.mount_point
+                        << " fs_type=" << finfo.fs_type
+                        << " pos=" << finfo.pos;
                     if (use_ebpf) {
-                        fj["read_bytes"] = finfo.read_bytes;
-                        fj["read_speed"] = finfo.read_speed;
-                        fj["write_bytes"] = finfo.write_bytes;
-                        fj["write_speed"] = finfo.write_speed;
-                        fj["read_mean"] = finfo.read_mean;
-                        fj["write_mean"] = finfo.write_mean;
-                        fj["read_variance"] = finfo.read_variance;
-                        fj["write_variance"] = finfo.write_variance;
-                        fj["write_count"] = finfo.write_count;
-                        fj["read_count"] = finfo.read_count;
+                        out << " read_bytes=" << finfo.read_bytes
+                            << " read_speed=" << finfo.read_speed
+                            << " write_bytes=" << finfo.write_bytes
+                            << " write_speed=" << finfo.write_speed
+                            << " read_mean=" << finfo.read_mean
+                            << " write_mean=" << finfo.write_mean
+                            << " read_variance=" << finfo.read_variance
+                            << " write_variance=" << finfo.write_variance
+                            << " write_count=" << finfo.write_count
+                            << " read_count=" << finfo.read_count;
                     }
-                    files.push_back(fj);
-                }
-                j["files"] = files;
-                if (info.pid == 0){
-                    if (summary) ret["summary"] = j;
-                }else{
-                    ret["process_data"].push_back(j);
+                    out << '\n';
                 }
             }
-            return ret;
+            return out.str();
         };
     }
 
