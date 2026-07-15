@@ -1,0 +1,89 @@
+# JobLens C++ Agent 集成测试配置 — FileWriter 优雅关闭 (Task 11)
+# 用途: 部署到 worker VM 的 /etc/JobLens/config.yaml
+# 特点: flush_on_shutdown: true, 追加模式, 测试优雅关闭后记录完整性
+
+# ============================================================
+# 基础 Core 配置 (必填)
+# ============================================================
+lens_config:
+  rpc_socket_path: /var/JobLens/rpc.sock
+  lock_path: /var/JobLens/JobLens.lock
+  max_collector_threads: 2
+  log_level: debug
+
+# ============================================================
+# 作业注册表 (必填)
+# ============================================================
+job_registry_config:
+  job_db_path: /var/JobLens/job.db
+  auto_add_condorjob: true
+  auto_add_slurmjob: true
+
+# ============================================================
+# HTCondor 作业监视器
+# ============================================================
+condor_job_watcher:
+  auto_add_collectors:
+    - cpumem_collector
+  use_rules: false
+
+# ============================================================
+# Slurm 作业监视器
+# ============================================================
+slurm_job_watcher:
+  auto_add_collectors:
+    - cpumem_collector
+  use_rules: false
+
+# ============================================================
+# 采集器配置
+# ============================================================
+collectors_config:
+  enable_collector_perf: true
+  perf_window_size: 1000
+  default_freq: 1
+  default_use_writers:
+    - file_writer
+  collectors:
+    - name: cpumem_collector
+      type: CPUMemCollector
+      config: cpumem_collector_config
+
+cpumem_collector_config:
+  freq: 1
+  use_writers:
+    - file_writer
+
+# ============================================================
+# Writer 配置 — FileWriter 追加模式 + flush_on_shutdown
+# 不启用旋转，聚焦 shutdown 行为验证
+# ============================================================
+writers_config:
+  enable_writer_perf: true
+  buffer_capacity: 256
+  writers:
+    - name: file_writer
+      type: FileWriter
+      config: file_writer_config
+
+file_writer_config:
+  path: /var/log/joblens/output.log
+  write_mode: append
+  flush_on_shutdown: true
+  enable_rotation: false
+
+# ============================================================
+# 单节点服务组件 (全部禁用)
+# ============================================================
+service_registry:
+  enabled: false
+  url: "http://localhost:8080"
+  retry_interval: 10
+  max_retries: 3
+  heartbeat_interval: 1800
+
+config_manager:
+  enabled: false
+
+rule_manager:
+  enabled: false
