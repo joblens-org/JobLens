@@ -28,7 +28,7 @@ JobLens 部署脚本 — 从外部配置文件部署到 worker VM
 
 可选参数:
   --config-dest <path>         配置文件安装目标目录 (默认: /etc/JobLens)
-  --output-log <path>          FileWriter JSONL 输出路径
+  --output-log <path>          FileWriter 纯文本输出路径
                                (默认: /var/log/joblens/output.log,
                                 与外部配置文件不同时自动覆盖)
   --help, -h                   显示此帮助信息

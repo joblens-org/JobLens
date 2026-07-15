@@ -1,6 +1,6 @@
 # JobLens 集成测试
 
-双节点 Vagrant/libvirt 集成测试框架, 覆盖 HTCondor/Slurm 作业自动发现、Trigger REST API、FileWriter JSONL 输出和性能基线检查。共 6 个测试文件, 35 个测试用例。
+双节点 Vagrant/libvirt 集成测试框架, 覆盖 HTCondor/Slurm 作业自动发现、Trigger REST API、FileWriter 纯文本输出和性能基线检查。共 6 个测试文件, 35 个测试用例。
 
 ## 架构概览
 
@@ -124,7 +124,7 @@ vagrant suspend
 | `test_01_health.py` | 6 | systemd 服务状态、Trigger 健康端点、RPC 健康、初始作业计数为零 |
 | `test_02_htcondor_discovery.py` | 4 | HTCondor 作业自动发现、PID 捕获、采集器附加、sub_attr 验证 |
 | `test_03_slurm_discovery.py` | 4 | Slurm 作业自动发现、PID 捕获、采集器附加、sub_attr 验证 |
-| `test_04_filewriter_schema.py` | 8 | JSONL 文件存在性、可解析性、字段完整性、时间戳格式、CPU/内存数据 |
+| `test_04_filewriter_schema.py` | 8 | 纯文本文件存在性、非 JSONL wrapper、CPU/内存字段文本输出 |
 | `test_05_trigger_api.py` | 8 | REST API 端点: `/`, `/metrics`, `/joblens/jobs`, 详情/404、config/status、RPC functions |
 | `test_06_performance_baseline.py` | 5 | 收集延迟、RPC 延迟 (<100ms)、内存 (<256MB)、CPU (<5%)、eBPF 程序加载 |
 
@@ -178,7 +178,7 @@ curl http://192.168.56.20:7592/joblens/jobs/count
 # 从 worker VM 内
 sudo systemctl status joblens joblens-trigger
 sudo bpftool prog list | grep joblens   # eBPF 程序是否加载
-cat /var/log/joblens/output.log          # FileWriter JSONL 输出
+cat /var/log/joblens/output.log          # FileWriter 纯文本输出
 ```
 
 ### 保留 VM 调试
@@ -277,7 +277,7 @@ vagrant box add almalinux/9 --provider=libvirt
 |------|------|---------|
 | `test_condor_auto_discovery` 超时 | condor_schedd 未运行或作业未调度 | `ssh controller` → `systemctl status condor` → `condor_q` |
 | `test_slurm_auto_discovery` 超时 | slurmctld/slurmd 未运行或节点未注册 | `ssh controller` → `sinfo`; `ssh worker` → `systemctl status slurmd` |
-| `test_jsonl_file_exists_and_nonempty` 失败 | cpumem_collector 未启用或 FileWriter 未输出 | 检查 `/etc/JobLens/config.yaml` 中 `enable_collector_perf` |
+| `test_text_file_exists_and_nonempty` 失败 | cpumem_collector 未启用或 FileWriter 未输出 | 检查 `/etc/JobLens/config.yaml` 中 `enable_collector_perf` |
 | `test_ebpf_programs_loaded` 失败 | eBPF 程序加载失败 | `ssh worker` → `sudo bpftool prog list` → 检查 `dmesg` |
 | `ConnectionRefusedError` 或 `HTTP 503` | joblens-trigger 未启动或端口冲突 | `ssh worker` → `sudo systemctl status joblens-trigger` → `sudo ss -tlnp \| grep 7592` |
 

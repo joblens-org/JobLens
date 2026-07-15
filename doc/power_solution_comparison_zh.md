@@ -121,51 +121,12 @@ power_collector_config:
     bench_summary: /path/to/power_bench/summary.json
 ```
 
-### JSONL 输出示例
+### FileWriter 纯文本输出示例
 
-```json
-{
-  "@timestamp": "2026-06-30T20:25:14+0800",
-  "collector_name": "power_collector",
-  "data": {
-    "interval_s": 1.000,
-    "delta_rapl_j": 61.3,
-    "delta_rapl_uj": 61300000.0,
-    "core_count": 24,
-    "avg_core_freq_mhz": 3212.3,
-    "avg_power_w": 61.3,
-    "total_weighted_ns": 7.71e13,
-    "system_overhead_j": 61.3,
-    "pue_corrected_j": 91.95,
-    "co2_equivalent_g": 0.0085,
-    "hs23_per_watt": 20.14,
-    "calibration_ref": {
-      "rapl_idle_w": 66.2,
-      "ipmi_idle_w": 118.3,
-      "static_overhead_w": 52.1,
-      "per_core_w": 6.3,
-      "source": "/path/to/power_bench/summary.json"
-    },
-    "jobs": [
-      {
-        "job_id": 1,
-        "native_job_id": "123.0",
-        "energy_j": 45.3,
-        "weighted_ns_total": 2.1e13,
-        "pids": [
-          {
-            "pid": 12345,
-            "tgid": 12345,
-            "runtime_ns_total": 4000000000,
-            "weighted_ns_total": 1.28e13,
-            "energy_j": 27.6,
-            "cpu_pct": 200.0
-          }
-        ]
-      }
-    ]
-  }
-}
+```text
+PowerCollector interval_s=1 delta_rapl_j=61.3 avg_power_w=61.3 system_overhead_j=16
+PowerCollector job job_id=1 native_job_id=123.0 energy_j=45.3 power_watt=45.3 ipmi_power_watt=0
+PowerCollector pid job_id=1 pid=12345 energy_j=27.6 cpu_pct=200
 ```
 
 ## 相关文件
