@@ -311,16 +311,118 @@ kafka_writer_config:
 
 Code location: `src/writer/file_writer.cpp`
 
-Writes collected data to a local file in JSONL (line-delimited JSON) format.
+Writes collector-formatted plain text to local files. The collector parser for `FileWriter` returns the complete text chunk, including any required newline characters, and FileWriter writes that text verbatim. Supports append and atomic overwrite modes, size-based file rotation, and per-collector output routing.
+
+### Basic Configuration
 
 ```yaml
 file_writer_config:
-  path: /var/log/joblens/output.log    # Output file path (appended)
+  path: /var/log/joblens/output.log    # Default output file path (required)
 ```
+
+### Full Configuration with All Options
+
+```yaml
+file_writer_config:
+  path: /var/log/joblens/output.log          # Default output file path (required)
+  write_mode: append                         # Write mode: 'append' or 'overwrite'
+  flush_on_shutdown: true                    # Flush remaining records on graceful shutdown
+  enable_rotation: false                     # Enable size-based rotation (append only)
+  max_file_size_bytes: 104857600             # Rotation threshold in bytes (100 MB)
+  max_files: 5                               # Maximum rotated files to retain
+  outputs:                                   # Per-collector file routing (optional)
+    - collector_name: cpumem_collector
+      file_path: /var/log/joblens/cpumem.log
+    - collector_name: io_usage_collector
+      file_path: /var/log/joblens/io.log
+```
+
+### Option Reference
 
 | Key | Type | Required | Default | Description |
 |-----|------|----------|---------|-------------|
-| `path` | string | Yes | - | Output file path. The file is opened in append mode; each `flush` appends one or more JSON lines. |
+| `path` | string | **Yes** | - | Default output file path. Records from collectors not listed in `outputs` are written to this file. |
+| `write_mode` | string | No | `"append"` | Write mode. `"append"` opens the file in append mode and preserves all history. `"overwrite"` atomically replaces the target file with each flush batch using a same-directory temp file and rename. |
+| `flush_on_shutdown` | bool | No | `true` | When `true`, any remaining buffered records are flushed to all destination files during graceful shutdown. When `false`, FileWriter-level explicit `flush()` is skipped during shutdown, but BaseWriter final buffer flush still occurs before streams are closed. |
+| `enable_rotation` | bool | No | `false` | When `true`, size-based rotation is applied to destination files. Only supported in append mode. |
+| `max_file_size_bytes` | int | No | `104857600` (100 MB) | Rotation threshold. When the active file would exceed this size after writing the next batch, rotation is triggered before the write. |
+| `max_files` | int | No | `5` | Maximum number of rotated files to retain. Rotated files use the naming pattern `path.1` (newest), `path.2`, ..., `path.N` (oldest). The oldest file is deleted when the count exceeds `max_files`. |
+| `outputs` | array | No | `[]` | List of collector-to-file routing entries. Each entry has `collector_name` and `file_path`. When empty or omitted, all collectors write to `path`. |
+
+### Collector-to-File Routing
+
+The `outputs` list maps specific collector instances to dedicated output files. Each entry contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `collector_name` | string | Name of the collector instance (must match the `name` field in `collectors_config.collectors`). |
+| `file_path` | string | Target file path for this collector's output. |
+
+**Fallback behavior**: When a collector is not listed in `outputs`, its records are written to the default `path`. A warning is emitted once per unmapped collector when that collector first writes data at runtime, to help catch configuration mistakes.
+
+**Example**: Route `cpumem_collector` to a dedicated file while other collectors fall back to the default path:
+
+```yaml
+file_writer_config:
+  path: /var/log/joblens/output.log
+  outputs:
+    - collector_name: cpumem_collector
+      file_path: /var/log/joblens/cpumem.log
+```
+
+### Conflict Rules
+
+The following configurations are rejected at startup with a clear error message:
+
+| Conflict | Applies To | Error Message |
+|----------|------------|---------------|
+| `write_mode: overwrite` + `enable_rotation: true` | All modes | "write_mode 'overwrite' is incompatible with enable_rotation" |
+| Duplicate `collector_name` in `outputs` | All modes | "duplicate collector_name 'X' in 'outputs'" |
+| Duplicate `file_path` in `outputs` | Overwrite mode only | "duplicate file_path 'X' in 'outputs' (forbidden in overwrite mode)" |
+| `outputs` entry `file_path` equals default `path` | Overwrite mode only | "'outputs' entry for collector 'X' resolves to default path 'Y', which is forbidden in overwrite mode" |
+
+**Allowed in append mode**:
+- Multiple collectors can share the same output file path. Text chunks from both collectors are appended in flush order, producing a combined plain-text file.
+- An `outputs` entry can point to the same path as the default `path`. Shared collectors and fallback collectors both append to the same file.
+
+### Write Mode Details
+
+**Append mode** (`write_mode: append`):
+- Each destination file is opened in append mode.
+- Text chunks are appended to the file in flush order. The file grows monotonically.
+- Supports size-based rotation when `enable_rotation: true`.
+- Multiple collectors can share the same destination path.
+
+**Overwrite mode** (`write_mode: overwrite`):
+- Each flush batch is written to a temporary file in the same directory as the target, then atomically renamed over the target.
+- The target file contains only the latest flush batch. No history is preserved.
+- Rotation is disabled; configuring both `overwrite` and `enable_rotation: true` causes a fast-fail.
+- Duplicate output paths across `outputs` entries are forbidden.
+- On failure, the previous target file is preserved where possible, the temp file is cleaned up, and the error is logged.
+
+> **Note**: Atomic overwrite uses same-directory temp files (`target.tmp.<pid>.<timestamp>`) to ensure rename atomicity. Temp files are automatically removed after a successful rename. If the process crashes mid-write, orphan temp files may remain; these are harmless and can be cleaned up manually.
+
+### Rotation Naming and Retention
+
+Rotation is size-only and uses the following naming scheme:
+
+| File | Description |
+|------|-------------|
+| `path` | Active file (always the newest data) |
+| `path.1` | Most recent rotated file |
+| `path.2` | Second most recent |
+| ... | ... |
+| `path.N` | Oldest rotated file (N = max_files) |
+
+When rotation is triggered:
+1. If `path.N` exists, it is deleted.
+2. `path.(N-1)` is renamed to `path.N`, cascading down to `path.1` → `path.2`.
+3. The active `path` is renamed to `path.1`.
+4. A new active `path` is opened for writing.
+
+The entire rotation cascade happens before the triggering batch is written, so the batch is always written to the new active file. No batch is split across rotation boundaries.
+
+> **Note**: Rotation is disabled by default. Only size-based rotation is available in this version.
 
 ---
 
@@ -516,6 +618,14 @@ kafka_writer_config:
 
 file_writer_config:
   path: /var/log/joblens/output.log
+  # write_mode: append
+  # flush_on_shutdown: true
+  # enable_rotation: false
+  # max_file_size_bytes: 104857600
+  # max_files: 5
+  # outputs:
+  #   - collector_name: cpumem_collector
+  #     file_path: /var/log/joblens/cpumem.log
 
 condor_job_watcher:
   auto_add_collectors:

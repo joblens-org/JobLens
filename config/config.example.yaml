@@ -52,4 +52,15 @@ writers_config:
       config: file_writer_config
 
 file_writer_config:
-  path: /var/log/joblens/output.log          # Local output file path
+  path: /var/log/joblens/output.log          # Default output file path (required)
+  # --- Optional controls (all have defaults, shown below are the defaults) ---
+  # write_mode: append                       # Write mode: 'append' (default) or 'overwrite'
+  # flush_on_shutdown: true                  # Flush remaining records on graceful shutdown
+  # enable_rotation: false                   # Enable size-based file rotation (append mode only)
+  # max_file_size_bytes: 104857600           # Rotation threshold in bytes (100 MB)
+  # max_files: 5                             # Maximum rotated files to retain
+  # --- Collector-to-file routing (optional; parser output is written as plain text) ---
+  # outputs: []                              # Empty or omitted means all collectors use 'path'
+  # outputs:
+  #   - collector_name: cpumem_collector
+  #     file_path: /var/log/joblens/cpumem.log

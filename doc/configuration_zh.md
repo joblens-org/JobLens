@@ -308,16 +308,118 @@ kafka_writer_config:
 
 代码位置：`src/writer/file_writer.cpp`
 
-将采集数据以 JSONL（行分隔 JSON）格式写入本地文件。
+将收集器格式化后的纯文本写入本地文件。`FileWriter` 对应的收集器 parser 返回完整文本块（包括需要的换行符），FileWriter 按原样写入。支持追加和原子覆盖两种写入模式、基于大小的文件轮转以及按收集器的输出路由。
+
+### 基本配置
 
 ```yaml
 file_writer_config:
-  path: /var/log/joblens/output.log    # 输出文件路径（追加模式）
+  path: /var/log/joblens/output.log    # 默认输出文件路径（必填）
 ```
+
+### 完整配置（含所有选项）
+
+```yaml
+file_writer_config:
+  path: /var/log/joblens/output.log          # 默认输出文件路径（必填）
+  write_mode: append                         # 写入模式：'append' 或 'overwrite'
+  flush_on_shutdown: true                    # 优雅关闭时刷新剩余记录
+  enable_rotation: false                     # 启用基于大小的文件轮转（仅追加模式）
+  max_file_size_bytes: 104857600             # 轮转阈值（字节，100 MB）
+  max_files: 5                               # 最多保留的轮转文件数
+  outputs:                                   # 按收集器路由文件（可选）
+    - collector_name: cpumem_collector
+      file_path: /var/log/joblens/cpumem.log
+    - collector_name: io_usage_collector
+      file_path: /var/log/joblens/io.log
+```
+
+### 选项参考
 
 | 键 | 类型 | 必填 | 默认值 | 描述 |
 |----|------|------|--------|------|
-| `path` | string | 是 | - | 输出文件路径。以追加模式打开；每次 `flush` 追加一行或多行 JSON。 |
+| `path` | string | **是** | - | 默认输出文件路径。未在 `outputs` 中列出的收集器记录写入此文件。 |
+| `write_mode` | string | 否 | `"append"` | 写入模式。`"append"` 以追加模式打开文件，保留所有历史记录。`"overwrite"` 使用同目录临时文件加重命名的方式原子替换目标文件。 |
+| `flush_on_shutdown` | bool | 否 | `true` | 为 `true` 时，优雅关闭期间将所有缓冲记录刷新到各目标文件。为 `false` 时，关闭期间跳过 FileWriter 层面的显式 `flush()` 调用，但 BaseWriter 的最终缓冲区刷新仍会在流关闭前执行。 |
+| `enable_rotation` | bool | 否 | `false` | 为 `true` 时对目标文件启用基于大小的轮转。仅追加模式支持。 |
+| `max_file_size_bytes` | int | 否 | `104857600`（100 MB） | 轮转阈值。当写入下一批次后活动文件将超过此大小时，写入前触发轮转。 |
+| `max_files` | int | 否 | `5` | 最多保留的轮转文件数。轮转文件命名规则为 `path.1`（最新）、`path.2`、...、`path.N`（最旧）。超出 `max_files` 时删除最旧文件。 |
+| `outputs` | array | 否 | `[]` | 收集器到文件的路由映射列表。每项包含 `collector_name` 和 `file_path`。为空或省略时，所有收集器均写入 `path`。 |
+
+### 收集器到文件的路由
+
+`outputs` 列表将特定收集器实例映射到专用输出文件。每项包含：
+
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| `collector_name` | string | 收集器实例名称（须与 `collectors_config.collectors` 中的 `name` 字段一致）。 |
+| `file_path` | string | 此收集器输出对应的目标文件路径。 |
+
+**回退行为**：当收集器未在 `outputs` 中列出时，其记录写入默认 `path`。每个未映射的收集器在首次写入数据时仅发出一次警告，便于发现配置遗漏。
+
+**示例**：将 `cpumem_collector` 路由到专用文件，其他收集器回退到默认路径：
+
+```yaml
+file_writer_config:
+  path: /var/log/joblens/output.log
+  outputs:
+    - collector_name: cpumem_collector
+      file_path: /var/log/joblens/cpumem.log
+```
+
+### 冲突规则
+
+以下配置会在启动时被拒绝，并给出明确的错误信息：
+
+| 冲突 | 适用模式 | 错误信息 |
+|------|---------|---------|
+| `write_mode: overwrite` + `enable_rotation: true` | 所有模式 | "write_mode 'overwrite' is incompatible with enable_rotation" |
+| `outputs` 中存在重复的 `collector_name` | 所有模式 | "duplicate collector_name 'X' in 'outputs'" |
+| `outputs` 中存在重复的 `file_path` | 仅覆盖模式 | "duplicate file_path 'X' in 'outputs' (forbidden in overwrite mode)" |
+| `outputs` 条目中的 `file_path` 等于默认 `path` | 仅覆盖模式 | "'outputs' entry for collector 'X' resolves to default path 'Y', which is forbidden in overwrite mode" |
+
+**追加模式下允许**：
+- 多个收集器可以共享同一输出文件路径。两个收集器的文本块按刷新顺序追加，生成合并的纯文本文件。
+- `outputs` 条目可以指向与默认 `path` 相同的路径。共享收集器和回退收集器均追加到同一文件。
+
+### 写入模式详解
+
+**追加模式**（`write_mode: append`）：
+- 每个目标文件以追加模式打开。
+- 文本块按刷新顺序追加到文件中。文件单调增长。
+- 当 `enable_rotation: true` 时支持基于大小的轮转。
+- 多个收集器可以共享同一目标路径。
+
+**覆盖模式**（`write_mode: overwrite`）：
+- 每次刷新批次写入目标目录下的临时文件，然后原子重命名覆盖目标文件。
+- 目标文件仅包含最新刷新批次的内容。不保留历史记录。
+- 轮转被禁用；同时配置 `overwrite` 和 `enable_rotation: true` 会导致快速失败。
+- `outputs` 条目中不允许重复的输出路径。
+- 失败时，尽可能保留原目标文件，清理临时文件，并记录错误。
+
+> **说明**：原子覆盖使用同目录临时文件（`target.tmp.<pid>.<timestamp>`）以确保重命名的原子性。成功重命名后临时文件自动删除。如果进程在写入过程中崩溃，可能残留孤儿临时文件，这些文件无害，可手动清理。
+
+### 轮转命名与保留策略
+
+轮转仅基于大小，使用以下命名规则：
+
+| 文件 | 描述 |
+|------|------|
+| `path` | 活动文件（始终为最新数据） |
+| `path.1` | 最近的轮转文件 |
+| `path.2` | 第二近的轮转文件 |
+| ... | ... |
+| `path.N` | 最旧的轮转文件（N = max_files） |
+
+轮转触发时：
+1. 若 `path.N` 存在，则删除。
+2. `path.(N-1)` 重命名为 `path.N`，逐级向下，直至 `path.1` 重命名为 `path.2`。
+3. 活动文件 `path` 重命名为 `path.1`。
+4. 打开新的活动文件 `path` 用于写入。
+
+整个轮转级联在触发批次的写入之前完成，因此批次始终写入新的活动文件。不会跨轮转边界拆分批次。
+
+> **说明**：轮转默认关闭。此版本仅提供基于大小的轮转。
 
 ---
 
@@ -513,6 +615,14 @@ kafka_writer_config:
 
 file_writer_config:
   path: /var/log/joblens/output.log
+  # write_mode: append
+  # flush_on_shutdown: true
+  # enable_rotation: false
+  # max_file_size_bytes: 104857600
+  # max_files: 5
+  # outputs:
+  #   - collector_name: cpumem_collector
+  #     file_path: /var/log/joblens/cpumem.log
 
 condor_job_watcher:
   auto_add_collectors:
