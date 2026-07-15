@@ -398,3 +398,187 @@ def wait_for_job_discovery(
     return retry_with_backoff(
         _check, timeout=timeout, initial=initial, max_wait=max_wait
     )
+
+
+# ── 12. FileWriter 输出路径管理与清理工具 ────────────────────────────────
+
+import dataclasses  # noqa: E402
+
+
+@dataclasses.dataclass(frozen=True)
+class FileWriterOutputPaths:
+    """FileWriter 可能产生的所有输出路径集合。
+
+    包含活动文件、路由输出文件、旋转文件路径、临时文件 glob 模式。
+    所有路径均为远程 worker VM 上的绝对路径。
+
+    Attributes:
+        active_paths: 活动输出文件路径列表（含默认路径和路由路径）。
+        rotated_globs: 旋转文件显式路径列表，
+                       如 ["/var/log/joblens/output.log.1",
+                           "/var/log/joblens/output.log.2"]。
+        tmp_globs: 临时文件 glob 模式列表，
+                   如 ["/var/log/joblens/output.log.tmp.*"]。
+    """
+
+    active_paths: List[str] = dataclasses.field(default_factory=list)
+    rotated_globs: List[str] = dataclasses.field(default_factory=list)
+    tmp_globs: List[str] = dataclasses.field(default_factory=list)
+
+
+DEFAULT_FILEWRITER_OUTPUT_DIR = "/var/log/joblens"
+
+
+def build_filewriter_paths(
+    output_basenames: Optional[List[str]] = None,
+    max_rotated_files: int = 5,
+    tmp_suffix: str = ".tmp.",
+) -> FileWriterOutputPaths:
+    """从输出文件名列表构建 FileWriterOutputPaths。
+
+    对每个 basename，自动生成：
+    - 活动文件路径: {DEFAULT_FILEWRITER_OUTPUT_DIR}/{basename}
+    - 旋转文件路径: {DEFAULT_FILEWRITER_OUTPUT_DIR}/{basename}.1
+                     ... {basename}.{max_rotated_files}
+    - 临时文件 glob: {DEFAULT_FILEWRITER_OUTPUT_DIR}/{basename}{tmp_suffix}*
+
+    Args:
+        output_basenames: 输出文件名列表（如 ["output.log", "cpumem.log"]）。
+                          为 None 时使用默认值 ["output.log"]。
+        max_rotated_files: 旋转文件保留数量上限，必须 > 0，默认 5。
+        tmp_suffix: 临时文件后缀模式，原子覆写临时文件匹配此模式。
+
+    Returns:
+        FileWriterOutputPaths 实例，包含所有路径。
+
+    Raises:
+        ValueError: 当 max_rotated_files <= 0 时。
+
+    Example:
+        >>> paths = build_filewriter_paths(["output.log"], max_rotated_files=2)
+        >>> paths.active_paths
+        ['/var/log/joblens/output.log']
+        >>> paths.rotated_globs
+        ['/var/log/joblens/output.log.1', '/var/log/joblens/output.log.2']
+        >>> paths.tmp_globs
+        ['/var/log/joblens/output.log.tmp.*']
+    """
+    if max_rotated_files <= 0:
+        raise ValueError(
+            f"max_rotated_files 必须 > 0，实际值: {max_rotated_files}"
+        )
+
+    if output_basenames is None:
+        output_basenames = ["output.log"]
+
+    active_paths: List[str] = []
+    rotated_globs: List[str] = []
+    tmp_globs: List[str] = []
+
+    for basename in output_basenames:
+        full_path = f"{DEFAULT_FILEWRITER_OUTPUT_DIR}/{basename}"
+        active_paths.append(full_path)
+        for i in range(1, max_rotated_files + 1):
+            rotated_globs.append(f"{full_path}.{i}")
+        tmp_globs.append(f"{full_path}{tmp_suffix}*")
+
+    return FileWriterOutputPaths(
+        active_paths=active_paths,
+        rotated_globs=rotated_globs,
+        tmp_globs=tmp_globs,
+    )
+
+
+def build_cleanup_cmds(paths: FileWriterOutputPaths) -> str:
+    """生成用于清理 FileWriter 所有输出文件的 shell 命令。
+
+    对活动文件执行 truncate（清空），对旋转和临时文件执行 rm -f。
+    命令使用 `|| true` 保证即使某些文件不存在也不失败。
+
+    Args:
+        paths: FileWriter 输出路径配置。
+
+    Returns:
+        可传给 RemoteClient.sudo() 或 vagrant ssh 的 shell 命令字符串。
+
+    Example:
+        >>> paths = build_filewriter_paths(["output.log"])
+        >>> cmd = build_cleanup_cmds(paths)
+        >>> "truncate -s 0" in cmd
+        True
+        >>> "rm -f" in cmd
+        True
+    """
+    parts: List[str] = []
+
+    for ap in paths.active_paths:
+        parts.append(f"truncate -s 0 {ap} 2>/dev/null || true")
+
+    for rp in paths.rotated_globs:
+        parts.append(f"rm -f {rp} 2>/dev/null || true")
+
+    for tg in paths.tmp_globs:
+        parts.append(f"rm -f {tg} 2>/dev/null || true")
+
+    return "; ".join(parts)
+
+
+def build_export_cmds(paths: FileWriterOutputPaths) -> str:
+    """生成用于导出 FileWriter 所有输出文件内容的 shell 命令。
+
+    对每个活动文件执行 cat，对旋转和临时文件 glob 执行 ls + cat。
+    输出包含文件名标记，便于后续解析。
+
+    Args:
+        paths: FileWriter 输出路径配置。
+
+    Returns:
+        可传给 RemoteClient.run() 或 vagrant ssh 的 shell 命令字符串。
+    """
+    parts: List[str] = []
+
+    for ap in paths.active_paths:
+        parts.append(
+            f"echo '=== {ap} ==='; "
+            f"test -f {ap} && cat {ap} || echo '(文件不存在)'"
+        )
+
+    for rp in paths.rotated_globs:
+        parts.append(
+            f"echo '=== {rp} ==='; "
+            f"test -f {rp} && cat {rp} || echo '(文件不存在)'"
+        )
+
+    for tg in paths.tmp_globs:
+        parts.append(
+            f"echo '=== 临时文件: {tg} ==='; "
+            f"ls {tg} 2>/dev/null || echo '(无临时文件)'; "
+            f"for f in $(ls {tg} 2>/dev/null); do "
+            f"echo \"--- $f ---\"; cat \"$f\" 2>/dev/null || true; done"
+        )
+
+    return "; ".join(parts)
+
+
+def read_filewriter_outputs(
+    worker: RemoteClient, paths: FileWriterOutputPaths
+) -> Dict[str, str]:
+    """从远程 worker 读取所有 FileWriter 输出文件内容。
+
+    返回字典，key 为文件路径，value 为文件内容。
+    不存在的文件对应的 value 为空字符串。
+
+    Args:
+        worker: 指向 worker VM 的 RemoteClient 连接。
+        paths: FileWriter 输出路径配置。
+
+    Returns:
+        文件路径到内容的映射字典。
+    """
+    content: Dict[str, str] = {}
+    for ap in paths.active_paths:
+        try:
+            content[ap] = worker.read_text(ap)
+        except Exception:
+            content[ap] = ""
+    return content

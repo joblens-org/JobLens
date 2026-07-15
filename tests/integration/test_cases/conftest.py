@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Optional
 
 import pytest
 
@@ -17,6 +17,7 @@ except ModuleNotFoundError:
     utils = importlib.import_module("utils")
 
 CONTROLLER_HOST = utils.CONTROLLER_HOST
+FILEWRITER_OUTPUT_PATHS = utils.build_filewriter_paths
 INTEGRATION_ROOT = utils.INTEGRATION_ROOT
 JOBLENS_DB_PATH = utils.JOBLENS_DB_PATH
 JOBLENS_LOCK_PATH = utils.JOBLENS_LOCK_PATH
@@ -25,8 +26,11 @@ PROJECT_ROOT = utils.PROJECT_ROOT
 TRIGGER_PORT = utils.TRIGGER_PORT
 WORKER_HOST = utils.WORKER_HOST
 WORKER_IP = utils.WORKER_IP
+FileWriterOutputPaths = utils.FileWriterOutputPaths
 JobLensAPI = utils.JobLensAPI
 RemoteClient = utils.RemoteClient
+build_cleanup_cmds = utils.build_cleanup_cmds
+build_filewriter_paths = utils.build_filewriter_paths
 
 JOBLENS_OUTPUT_EXPORT_DIR = INTEGRATION_ROOT / ".runtime" / "joblens-output-logs"
 
@@ -52,8 +56,16 @@ def _export_remote_command(worker: RemoteClient, command: str, target: Path) -> 
         _write_export_file(target, f"导出远程日志失败: {e}\n")
 
 
-def _export_joblens_logs(worker: RemoteClient, nodeid: str) -> None:
-    """每个测试结束后导出 JobLens FileWriter 与 systemd journal 日志。"""
+def _export_joblens_logs(
+    worker: RemoteClient,
+    nodeid: str,
+    extra_paths: Optional[FileWriterOutputPaths] = None,
+) -> None:
+    """每个测试结束后导出 JobLens FileWriter 与 systemd journal 日志。
+
+    除了默认的 output.log 外，还导出 extra_paths 中配置的
+    活动文件、旋转文件和临时文件。
+    """
     test_log_dir = JOBLENS_OUTPUT_EXPORT_DIR / _safe_test_log_name(nodeid)
     test_log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -62,6 +74,28 @@ def _export_joblens_logs(worker: RemoteClient, nodeid: str) -> None:
         f"test -f {JOBLENS_OUTPUT_LOG} && cat {JOBLENS_OUTPUT_LOG} || true",
         test_log_dir / "output.log",
     )
+    if extra_paths is not None:
+        for ap in extra_paths.active_paths:
+            if ap == JOBLENS_OUTPUT_LOG:
+                continue
+            safe_name = Path(ap).name
+            _export_remote_command(
+                worker,
+                f"test -f {ap} && cat {ap} || true",
+                test_log_dir / safe_name,
+            )
+        for rg in extra_paths.rotated_globs:
+            _export_remote_command(
+                worker,
+                f"test -f {rg} && cat {rg} || echo '(文件不存在)'",
+                test_log_dir / Path(rg).name,
+            )
+        for tg in extra_paths.tmp_globs:
+            _export_remote_command(
+                worker,
+                f"ls {tg} 2>/dev/null || echo '(无临时文件)'",
+                test_log_dir / f"temp_{Path(tg).name}.ls",
+            )
     _export_remote_command(
         worker,
         "journalctl -u joblens --no-pager --since '30 minutes ago' 2>&1 || true",
@@ -178,8 +212,15 @@ def _wait_ebpf_ready(worker: RemoteClient, timeout: float = 15.0) -> None:
     raise RuntimeError(f"eBPF 未在 {timeout}s 内就绪")
 
 
-def _reset_joblens(worker: RemoteClient) -> None:
-    """停止 JobLens → 清理 LevelDB/锁/日志 → 重新启动 → 等待 eBPF 就绪."""
+def _reset_joblens(
+    worker: RemoteClient,
+    extra_paths: Optional[FileWriterOutputPaths] = None,
+) -> None:
+    """停止 JobLens → 清理 LevelDB/锁/输出文件 → 重新启动 → 等待 eBPF 就绪.
+
+    除了默认的 JOBLENS_OUTPUT_LOG 外，还通过 extra_paths 清理
+    路由输出、旋转文件和临时文件。
+    """
     try:
         worker.sudo(
             "systemctl stop joblens-trigger 2>/dev/null || true",
@@ -220,6 +261,15 @@ def _reset_joblens(worker: RemoteClient) -> None:
         )
     except Exception:
         pass
+    if extra_paths is not None:
+        try:
+            worker.sudo(
+                build_cleanup_cmds(extra_paths),
+                hide=True,
+                warn=True,
+            )
+        except Exception:
+            pass
     try:
         worker.sudo(
             "systemctl start joblens 2>/dev/null || true",
@@ -259,16 +309,30 @@ def _ebpf_cleanup() -> None:
 
 @pytest.fixture(autouse=True)
 def export_joblens_logs(
-    request: pytest.FixtureRequest, worker: RemoteClient
+    request: pytest.FixtureRequest,
+    worker: RemoteClient,
+    filewriter_output_paths: FileWriterOutputPaths,
 ) -> Generator[None, None, None]:
     """每个测试结束后导出 JobLens FileWriter 与 journalctl 日志。"""
     yield
-    _export_joblens_logs(worker, request.node.nodeid)
+    _export_joblens_logs(worker, request.node.nodeid, filewriter_output_paths)
+
+
+@pytest.fixture
+def filewriter_output_paths() -> FileWriterOutputPaths:
+    """默认 FileWriter 输出路径集合 fixture。
+
+    返回包含默认 output.log 及其旋转/临时文件模式的路径配置。
+    需要自定义路径的测试可覆盖此 fixture。
+    """
+    return build_filewriter_paths(["output.log"])
 
 
 @pytest.fixture
 def clean_test_state(
-    controller: RemoteClient, worker: RemoteClient
+    controller: RemoteClient,
+    worker: RemoteClient,
+    filewriter_output_paths: FileWriterOutputPaths,
 ) -> Generator[None, None, None]:
     """每个测试前后的最佳努力状态清理.
 
@@ -277,7 +341,7 @@ def clean_test_state(
     """
     _cleanup_condor(controller)
     _cleanup_slurm(controller)
-    _reset_joblens(worker)
+    _reset_joblens(worker, filewriter_output_paths)
     yield
     _cleanup_condor(controller)
     _cleanup_slurm(controller)
