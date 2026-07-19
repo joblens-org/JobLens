@@ -243,19 +243,29 @@ std::string ESWriter::try_get_index_name(const std::string& collector_name)
     return default_index;
 }
 
-bool ESWriter::try_parse_data(const std::string& collector_name, const std::any& data, json& out)
+bool ESWriter::try_parse_data(const std::string& collector_name, const std::any& data,
+                               const Job& job, std::chrono::system_clock::time_point ts, json& out)
 {
-    auto parser_func = CollectorRegistry::instance().getCollectorParser(collector_name, type_);
-    try{
-        auto parsed_data = parser_func(data);
+    WriterParseContext ctx{name_, type_, config_name_, collector_name, job, ts};
+
+    auto parser_func = CollectorRegistry::instance().resolveBestParserV2(collector_name, type_);
+    if (!parser_func) {
+        spdlog::debug("elasticsearch_writer: no parser for collector '{}', writer '{}'", collector_name, type_);
+        out["error"] = "no parser registered";
+        return false;
+    }
+
+    spdlog::debug("elasticsearch_writer: using parser for collector '{}', writer '{}'", collector_name, type_);
+    try {
+        auto parsed_data = parser_func(ctx, data);
         out = std::move(std::any_cast<json>(parsed_data));
     }
-    catch(const std::exception& e){
+    catch (const std::exception& e) {
         spdlog::error("elasticsearch_writer: bad_any_cast for collector '{}': {}", collector_name, e.what());
         out["error"] = std::string(e.what());
         return false;
     }
-    
+
     return true;
 }
 
@@ -287,7 +297,7 @@ bool ESWriter::flush_impl(const std::vector<write_data>& batch)
             spdlog::debug("elasticsearch_writer: rendered index name '{}'", action["index"]["_index"].get<std::string>());
         }
         json jobj;
-        parse_ret = try_parse_data(collect_name, any_data, jobj);
+        parse_ret = try_parse_data(collect_name, any_data, job, ts, jobj);
         src["data"] = jobj;
         spdlog::debug("elasticsearch_writer: document to index: {}", src.dump());
         body << action.dump() << '\n';

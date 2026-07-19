@@ -180,28 +180,37 @@ retry:
 // -------------------------- serialize --------------------------
 json KafkaWriter::serialize(const write_data& w) {
     const auto& [collector_name, job, data_any, tp] = w;
-    std::any parser = CollectorRegistry::instance().getCollectorParser(collector_name, type_);
-    if (parser.type() == typeid(std::function<std::any(const std::any&)>) ) {
-        auto& func = std::any_cast<std::function<std::any(const std::any&)>&>(parser);
-        try {
-            std::any parsed = func(data_any);   // 业务自己返回 json string
-            auto parsed_data = std::any_cast<json>(parsed);
-            // 2. 再包一层元数据
-            json wrap = {
-                {"collector_name", collector_name},
-                {"hostname",      collector_utils::get_hostname()},
-                {"@timestamp",  std::chrono::duration_cast<std::chrono::milliseconds>(
-                                tp.time_since_epoch()).count()},
-                {"job_info",  job_to_json(job)},
-                {"data",      parsed_data}   // 保证是 object
-            };
-            return wrap.dump();
-        } catch (const std::exception& ex) {
-            spdlog::error("KafkaWriter: error parsing data for collector '{}', writer '{}': {}", collector_name, type_, ex.what());
-            throw;
-        }
-    } else {
-        spdlog::error("KafkaWriter: parser type mismatch for collector '{}', writer '{}'", collector_name, type_);
-        throw std::runtime_error("parser type mismatch");
+
+    // 使用 V2 parser：resolveBestParserV2() 按 V2 → V1 → nullptr 回退，返回类型安全的 CollectDataParseFuncV2
+    CollectDataParseFuncV2 parser_func = CollectorRegistry::instance()
+        .resolveBestParserV2(collector_name, type_);
+    if (!parser_func) {
+        spdlog::debug("KafkaWriter: no parser for collector '{}', writer '{}'", collector_name, type_);
+        throw std::runtime_error("no parser available");
+    }
+
+    spdlog::debug("KafkaWriter: using parser for collector '{}', writer '{}'", collector_name, type_);
+
+    // 构造 WriterParseContext，传递 writer 上下文供 V2 parser 使用
+    WriterParseContext ctx{name_, type_, config_name_, collector_name, job, tp};
+
+    try {
+        std::any parsed = parser_func(ctx, data_any);
+        auto parsed_data = std::any_cast<json>(parsed);
+
+        // 包装 Kafka message envelope（元数据 + 业务数据）
+        json wrap = {
+            {"collector_name", collector_name},
+            {"hostname",      collector_utils::get_hostname()},
+            {"@timestamp",  std::chrono::duration_cast<std::chrono::milliseconds>(
+                            tp.time_since_epoch()).count()},
+            {"job_info",  job_to_json(job)},
+            {"data",      parsed_data}
+        };
+        return wrap.dump();
+    } catch (const std::exception& ex) {
+        spdlog::error("KafkaWriter: error parsing data for collector '{}', writer '{}': {}",
+                      collector_name, type_, ex.what());
+        throw;
     }
 }

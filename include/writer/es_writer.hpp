@@ -47,7 +47,8 @@ private:
     bool post_bulk(const std::string& bulk_body);
     bool test_server();
     std::string try_get_index_name(const std::string& collector_name);
-    bool try_parse_data(const std::string& collector_name, const std::any& data, nlohmann::json& out);
+    bool try_parse_data(const std::string& collector_name, const std::any& data, const Job& job,
+                        std::chrono::system_clock::time_point ts, nlohmann::json& out);
     int write_timeout;
     options opt_;
     std::vector<write_data> local_buf_;   // 子类私有缓冲

@@ -152,9 +152,11 @@ bool PrometheusExporterWriter::flush_impl(const std::vector<write_data>& batch){
     for (const auto& [collect_name, job, any_data, ts] : batch)
     {
         spdlog::debug("PrometheusExporterWriter: get in flush");
-        auto parser_func = CollectorRegistry::instance().getCollectorParser(collect_name, type_);
+        WriterParseContext ctx{name_, type_, config_name_, collect_name, job, ts};
+        auto parser_func = CollectorRegistry::instance().resolveBestParserV2(collect_name, type_);
+        spdlog::debug("PrometheusExporterWriter: using parser for collector '{}', writer '{}'", collect_name, type_);
         auto collector_type = CollectorRegistry::instance().getCollectorType(collect_name);
-        auto parsed = std::any_cast<PrometheusExporterWriter::prometheus_job_state>(parser_func(any_data));
+        auto parsed = std::any_cast<PrometheusExporterWriter::prometheus_job_state>(parser_func(ctx, any_data));
         spdlog::debug("PrometheusExporterWriter: size of parsed: {}", parsed.processes_state.size());
         parsed.JobID = job.JobID;
         update_job_metrics(parsed, collector_type);
