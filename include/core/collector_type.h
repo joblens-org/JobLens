@@ -317,6 +317,25 @@ using CollectDeinitFunc = std::function<void()>;
 
 using CollectDataParseFunc = std::function<std::any(std::any)>;
 
+// ============================================================================
+// V2 Parser Context API — 为 writer parser 提供更丰富的上下文信息
+// 替代旧版 std::any 单参数签名，writer parser 可以通过 context 获取
+// writer 名称、类型、配置名、collector 名称、Job 信息和时间戳
+// ============================================================================
+
+/// Writer 解析上下文 — 传递给 V2 parser 函数的上下文参数
+struct WriterParseContext {
+    std::string writer_name;          // writer 实例名称（如 "file_writer"）
+    std::string writer_type;          // writer 类型标识（如 "file"）
+    std::string writer_config_name;   // writer 配置节名称（如 "output"）
+    std::string collector_name;       // 触发此 writer 的 collector 名称
+    Job job;                          // 当前解析的 Job 对象
+    std::chrono::system_clock::time_point timestamp;  // 解析触发时间戳
+};
+
+/// V2 解析函数签名 — 接收 WriterParseContext + 解析数据，返回 std::any 结果
+using CollectDataParseFuncV2 = std::function<std::any(const WriterParseContext&, std::any)>;
+
 struct CollectorHandle {
     CollectInitFunc        init;   
     CollectFunc            collect;

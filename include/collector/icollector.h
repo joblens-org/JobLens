@@ -31,6 +31,19 @@ public:
     }                        
     virtual void deinit() noexcept                       = 0;
     virtual CollectDataParseFunc get_writer_parser(const std::string& writer_type) = 0;
+
+    /// V2 解析器适配器 — 提供默认实现，将旧 V1 parser 包装为 V2 兼容格式
+    /// 子类可覆写以提供原生 V2 实现；默认实现忽略 WriterParseContext，仅委托给 V1 parser
+    virtual CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type) {
+        auto legacy = get_writer_parser(writer_type);
+        if (!legacy) {
+            return nullptr;
+        }
+        return [legacy](const WriterParseContext& /*ctx*/, std::any data) {
+            return legacy(data);
+        };
+    }
+
     void set_type(std::string type){
         type_ = type;
     }

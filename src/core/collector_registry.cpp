@@ -183,6 +183,47 @@ CollectDataParseFunc CollectorRegistry::getCollectorParser(const std::string& co
     return collector_instances_[collector_name]->get_writer_parser(writer_type);
 }
 
+// 根据 collector 名称和 writer 类型获取 V2 parser（支持 WriterParseContext）
+// 回退顺序: V2 parser → V1 parser → nullptr（writer 自行处理）
+// - ICollector::get_writer_parser_v2() 内部已封装 V2→V1 默认适配器
+// - 若返回空，调用方应使用 resolveBestParserV2() 做显式 V1 回退
+CollectDataParseFuncV2 CollectorRegistry::getCollectorParserV2(const std::string& collector_name, const std::string& writer_type){
+    if(!collector_instances_.count(collector_name)){
+        spdlog::error("CollectorRegistry: no such collector instance: {}", collector_name);
+        return nullptr;
+    }
+    return collector_instances_[collector_name]->get_writer_parser_v2(writer_type);
+}
+
+// 便捷方法：按 V2 → V1 → nullptr 回退顺序解析最佳 parser
+// 步骤:
+//   1. 优先调用 getCollectorParserV2() — ICollector 内部已通过默认适配器支持 V2→V1 回退
+//   2. V2 返回空时，显式调用 getCollectorParser() 作为 V1 防御性回退（覆盖 ICollector 未正确实现适配器的极端情况）
+//   3. V1 也返回空时，返回 nullptr — 由各 writer 自行处理 writer-specific fallback（如 FileWriter raw string）
+// 注意: writer 调用点应使用此方法，避免因 FileWriter raw string fallback 绕过 V2-only parser
+CollectDataParseFuncV2 CollectorRegistry::resolveBestParserV2(const std::string& collector_name, const std::string& writer_type){
+    // 步骤 1: 优先 V2（内部已通过 ICollector 默认适配器支持 V2→V1 回退）
+    auto v2_parser = getCollectorParserV2(collector_name, writer_type);
+    if (v2_parser) {
+        spdlog::debug("resolveBestParserV2: V2 parser found for collector '{}', writer '{}'", collector_name, writer_type);
+        return v2_parser;
+    }
+
+    // 步骤 2: 显式 V1 回退（防御性编程，覆盖 ICollector 未正确实现适配器的极端情况）
+    auto v1_parser = getCollectorParser(collector_name, writer_type);
+    if (v1_parser) {
+        spdlog::debug("resolveBestParserV2: V1 fallback for collector '{}', writer '{}'", collector_name, writer_type);
+        // 将 V1 parser 包装为 V2 签名（丢弃 WriterParseContext）
+        return [v1_parser](const WriterParseContext& /*ctx*/, std::any raw_data) -> std::any {
+            return v1_parser(raw_data);
+        };
+    }
+
+    // 步骤 3: 返回 nullptr，由 writer 自行处理 writer-specific fallback
+    spdlog::debug("resolveBestParserV2: no parser for collector '{}', writer '{}'", collector_name, writer_type);
+    return nullptr;
+}
+
 std::string CollectorRegistry::getCollectorType(const std::string& collector_name){
     if(!collector_instances_.count(collector_name)){
         spdlog::error("CollectorRegistry: no such collector instance: {}", collector_name);

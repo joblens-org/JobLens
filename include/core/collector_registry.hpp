@@ -94,6 +94,12 @@ public:
 
     CollectDataParseFunc getCollectorParser(const std::string& collector_name, const std::string& writer_type);
 
+    CollectDataParseFuncV2 getCollectorParserV2(const std::string& collector_name, const std::string& writer_type);
+
+    // 便捷方法：按 V2 → V1 → nullptr 回退顺序解析最佳 parser
+    // writer 调用点应使用此方法，避免因 FileWriter raw string fallback 绕过 V2-only parser
+    CollectDataParseFuncV2 resolveBestParserV2(const std::string& collector_name, const std::string& writer_type);
+
     std::string getCollectorType(const std::string& collector_name);
 
     void shutdown() {
