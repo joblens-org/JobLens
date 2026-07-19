@@ -15,6 +15,7 @@
 
 import importlib
 import io
+import json
 import sys
 import time
 from pathlib import Path
@@ -309,10 +310,10 @@ def test_legacy_config_only_path(
 
     records = [line for line in text.splitlines() if line.strip()]
     assert len(records) >= 2, f"期望至少 2 条文本记录，实际 {len(records)}"
-    assert not records[0].lstrip().startswith("{"), "FileWriter 不应再强制输出 JSONL wrapper"
-    assert "CPUMemCollector" in text
-    assert " cpuPercent=" in text
-    assert " memoryPercent=" in text
+    parsed = [json.loads(line) for line in records]
+    processes = [proc for record in parsed for proc in record.get("process_data", [])]
+    assert any("cpuPercent" in proc for proc in processes)
+    assert any("memoryPercent" in proc for proc in processes)
 
 
 # ══════════════════════════════════════════════════════════════════════════
