@@ -43,6 +43,7 @@ public:
     CollectResult collect(const Job& job) override;
     void deinit() noexcept override;
     CollectDataParseFunc get_writer_parser(const std::string& writer_type);
+    CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type) override;
 
 private:
     bool CPUOf(int pid, CPUMemInfo& info);

@@ -296,11 +296,14 @@ bool FileWriter::flush_impl(const std::vector<write_data>& batch)
         const auto& collect_name = std::get<0>(w);
         const auto& any_data     = std::get<2>(w);
 
+        // 构造 V2 parser 上下文，传递 writer 元信息、collector 名称、Job 和时间戳
+        WriterParseContext ctx{name_, type_, config_name_, collect_name, std::get<1>(w), std::get<3>(w)};
+
         std::string payload;
-        auto parser_func = CollectorRegistry::instance().getCollectorParser(collect_name, type_);
+        auto parser_func = CollectorRegistry::instance().resolveBestParserV2(collect_name, type_);
         if (!parser_func) {
             // 如果 collector 没有为当前 writer 注册 parser，仅支持原始 std::string 数据回退。
-            spdlog::debug("file_writer: no parser registered for collector '{}', using raw text data", collect_name);
+            spdlog::debug("file_writer: no parser for collector '{}', using raw string fallback", collect_name);
             try {
                 payload = std::any_cast<std::string>(any_data);
             } catch (const std::bad_any_cast&) {
@@ -310,8 +313,9 @@ bool FileWriter::flush_impl(const std::vector<write_data>& batch)
                 continue;
             }
         } else {
+            spdlog::debug("file_writer: using parser for collector '{}'", collect_name);
             try {
-                auto parsed = parser_func(any_data);
+                auto parsed = parser_func(ctx, any_data);
                 payload = std::any_cast<std::string>(parsed);
             } catch (const std::exception& e) {
                 spdlog::error("file_writer: failed to parse data for collector '{}': {}", collect_name, e.what());

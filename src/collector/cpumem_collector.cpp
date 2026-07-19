@@ -323,33 +323,38 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
     }
     if(writer_type.compare("FileWriter") == 0){
         func = [this](std::any data)->std::any{
+            nlohmann::json ret;
             if(data.has_value() == false) {
                 spdlog::warn("CPUMemCollector: error FileWriter parser, empty data");
-                return std::string("CPUMemCollector error=empty_data\n");
+                ret["error"] = "empty data";
+                return ret.dump() + "\n";
             }
+            ret["process_data"] = nlohmann::json::array();
             auto parsed = std::any_cast<std::vector<CPUMemInfo>>(data);
             spdlog::debug("CPUMemCollector: parsing data for FileWriter, data length={}", parsed.size());
-            std::ostringstream out;
             for (const auto& info : parsed) {
-                out << "CPUMemCollector"
-                    << " type=" << (info.pid == 0 ? "summary" : "process")
-                    << " pid=" << info.pid
-                    << " ppid=" << info.ppid
-                    << " name=" << info.name
-                    << " cpuPercent=" << info.cpuPercent
-                    << " utime=" << info.utime
-                    << " stime=" << info.stime
-                    << " starttime=" << info.starttime
-                    << " hz=" << info.hz
-                    << " mem_vm_kb=" << info.mem_vm_kb
-                    << " mem_rss_kb=" << info.mem_rss_kb
-                    << " mem_swap_kb=" << info.mem_swap_kb
-                    << " mem_peak_rss_kb=" << info.mem_peak_rss_kb
-                    << " memoryPercent=" << info.memoryPercent
-                    << " numThreads=" << info.numThreads
-                    << '\n';
+                nlohmann::json j;
+                j["pid"] = info.pid;
+                j["ppid"] = info.ppid;
+                j["name"] = info.name;
+                j["cpuPercent"] = info.cpuPercent;
+                j["utime"] = info.utime;
+                j["stime"] = info.stime;
+                j["starttime"] = info.starttime;
+                j["hz"] = info.hz;
+                j["mem_vm_kb"] = info.mem_vm_kb;
+                j["mem_rss_kb"] = info.mem_rss_kb;
+                j["mem_swap_kb"] = info.mem_swap_kb;
+                j["mem_peak_rss_kb"] = info.mem_peak_rss_kb;
+                j["memoryPercent"] = info.memoryPercent;
+                j["numThreads"] = info.numThreads;
+                if(info.pid == 0){
+                    ret["summary"] = j;
+                }else{
+                    ret["process_data"].push_back(j);
+                }
             }
-            return out.str();
+            return ret.dump() + "\n";
         };
     }
     if(writer_type.compare("PrometheusExporterWriter") == 0){
@@ -380,4 +385,53 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
         };
     }
     return func;
+}
+
+CollectDataParseFuncV2 CPUMemCollector::get_writer_parser_v2(const std::string& writer_type) {
+    // 只有 FileWriter 提供原生 V2 parser — 其他 writer 类型回退到 V1 默认适配器
+    if (writer_type == "FileWriter") {
+        return [this](const WriterParseContext& ctx, std::any data) -> std::any {
+            nlohmann::json ret;
+            if (!data.has_value()) {
+                spdlog::warn("CPUMemCollector: V2 FileWriter parser, empty data");
+                ret["error"] = "empty data";
+                return ret.dump() + "\n";
+            }
+            ret["process_data"] = nlohmann::json::array();
+            auto parsed = std::any_cast<std::vector<CPUMemInfo>>(data);
+            spdlog::debug("CPUMemCollector: V2 parsing data for FileWriter, data length={}", parsed.size());
+            for (const auto& info : parsed) {
+                nlohmann::json j;
+                j["pid"] = info.pid;
+                j["ppid"] = info.ppid;
+                j["name"] = info.name;
+                j["cpuPercent"] = info.cpuPercent;
+                j["utime"] = info.utime;
+                j["stime"] = info.stime;
+                j["starttime"] = info.starttime;
+                j["hz"] = info.hz;
+                j["mem_vm_kb"] = info.mem_vm_kb;
+                j["mem_rss_kb"] = info.mem_rss_kb;
+                j["mem_swap_kb"] = info.mem_swap_kb;
+                j["mem_peak_rss_kb"] = info.mem_peak_rss_kb;
+                j["memoryPercent"] = info.memoryPercent;
+                j["numThreads"] = info.numThreads;
+                if (info.pid == 0) {
+                    ret["summary"] = j;
+                } else {
+                    ret["process_data"].push_back(j);
+                }
+            }
+            // V2 上下文信息注入 — 作为概念验证，在输出中附加 writer/collector 上下文
+            ret["_writer_name"] = ctx.writer_name;
+            ret["_writer_config_name"] = ctx.writer_config_name;
+            ret["_collector_name"] = ctx.collector_name;
+            ret["_job_id"] = ctx.job.JobID;
+            ret["_timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                ctx.timestamp.time_since_epoch()).count();
+            return ret.dump() + "\n";
+        };
+    }
+    // ESWriter, PrometheusExporterWriter 等: 返回 nullptr，让 ICollector 默认适配器回退到 V1
+    return nullptr;
 }
