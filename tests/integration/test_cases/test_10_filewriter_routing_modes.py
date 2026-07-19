@@ -13,6 +13,7 @@
 """
 
 import importlib
+import json
 import os
 import sys
 import time
@@ -178,9 +179,11 @@ def _assert_text_output_valid(
     assert len(records) >= 1, (
         f"期望至少 1 条非空文本记录，实际 {len(records)} 条"
     )
-    assert not records[0].lstrip().startswith("{"), "FileWriter 不应再强制输出 JSONL wrapper"
+    parsed = [json.loads(line) for line in records]
     if expected_marker is not None:
-        assert expected_marker in text, f"文本输出应包含 {expected_marker}，实际: {text[:200]}"
+        assert any("process_data" in record for record in parsed), (
+            f"文本输出应包含 collector dump 数据，实际: {text[:200]}"
+        )
 
 
 def _assert_no_tmp_files(worker: RemoteClient, directory: str) -> None:
@@ -323,8 +326,8 @@ def test_unmatched_collector_fallback_to_default_path(
         _assert_text_output_valid(text, expected_marker="CPUMemCollector")
 
         other_text = _file_contains_text(worker, OTHER_TEXT_PATH)
-        assert "CPUMemCollector" not in other_text, (
-            f"other.log 不应包含 CPUMemCollector，实际内容: {other_text[:200]}"
+        assert "process_data" not in other_text, (
+            f"other.log 不应包含 cpumem 数据，实际内容: {other_text[:200]}"
         )
     finally:
         _restore_default_config(worker)

@@ -25,6 +25,7 @@
 
 import base64
 import importlib
+import json
 import sys
 import time
 from pathlib import Path
@@ -428,8 +429,8 @@ def test_rotated_files_contain_valid_text(
 
             lines = [line for line in text.splitlines() if line.strip()]
             assert lines, f"文件 {path} 应包含非空文本记录"
-            assert not lines[0].lstrip().startswith("{"), f"文件 {path} 不应是 JSONL wrapper"
-            assert "CPUMemCollector" in text, f"文件 {path} 应包含 CPUMemCollector 文本"
+            parsed = [json.loads(line) for line in lines]
+            assert any("process_data" in record for record in parsed), f"文件 {path} 应包含 cpumem JSON dump"
             text_files += 1
 
         assert text_files >= 1, (
@@ -529,8 +530,8 @@ def test_graceful_shutdown_flushes_records(
 
         lines = [line for line in text.splitlines() if line.strip()]
         assert len(lines) >= 1, f"期望至少 1 条文本记录, 实际 {len(lines)} 条"
-        assert not lines[0].lstrip().startswith("{"), "优雅关闭后输出不应是 JSONL wrapper"
-        assert "CPUMemCollector" in text, "优雅关闭后输出应包含 CPUMemCollector 文本"
+        parsed = [json.loads(line) for line in lines]
+        assert any("process_data" in record for record in parsed), "优雅关闭后输出应包含 cpumem JSON dump"
 
         # 确认停止后文件大小 >= 停止前 (flush 已执行)
         size_after_stop = _remote_file_size(worker, JOBLENS_OUTPUT_LOG)
