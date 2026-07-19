@@ -495,6 +495,88 @@ slurm_job_watcher:
 
 ---
 
+## 10. Writer Parser V2 Context API
+
+Each collector provides a parser function per writer type, converting raw collection data into a writer-specific format. The V2 parser API extends the original V1 `std::any(std::any)` signature with a read-only `WriterParseContext` argument, giving parsers access to runtime metadata without breaking existing code.
+
+### V1 Compatibility
+
+The legacy `get_writer_parser()` interface (V1) **remains fully supported**. No existing collector or writer needs modification. V1 parsers are automatically wrapped by the default adapter in `ICollector::get_writer_parser_v2()`.
+
+### V2 is Opt-in
+
+A collector opts into V2 by overriding the virtual method:
+
+```cpp
+// include/collector/icollector.h
+virtual CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type);
+```
+
+The default implementation wraps the V1 parser transparently, discarding `WriterParseContext` and delegating to the old signature. Collectors that do not override this method continue to work as before.
+
+### WriterParseContext
+
+The context struct is **read-only** and constructed at the call site per invocation. It contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `writer_name` | `std::string` | Writer instance name (e.g. `"file_writer"`) |
+| `writer_type` | `std::string` | Writer type identifier (e.g. `"FileWriter"`) |
+| `writer_config_name` | `std::string` | Writer config section name (e.g. `"file_writer_config"`) |
+| `collector_name` | `std::string` | Collector instance name that triggered the write |
+| `job` | `Job` | The `Job` object being collected (contains JobID, PIDs, sub_attr, etc.) |
+| `timestamp` | `std::chrono::system_clock::time_point` | Timestamp when the parser was invoked |
+
+Writers construct the context from their own metadata and the batch record before calling the parser:
+
+```cpp
+// src/writer/file_writer.cpp (simplified)
+WriterParseContext ctx{name_, type_, config_name_, collect_name, job, timestamp};
+auto parser = CollectorRegistry::instance().resolveBestParserV2(collect_name, type_);
+```
+
+### Parser Resolution (Fallback Order)
+
+The recommended entry point for writers is `CollectorRegistry::resolveBestParserV2()`, which resolves the best available parser in this order:
+
+1. **V2 parser** — `get_writer_parser_v2()` returns a native V2 parser (collector has overridden the method)
+2. **V1 adapter** — the default `ICollector::get_writer_parser_v2()` wraps the V1 parser with a `WriterParseContext`-discarding lambda
+3. **V1 fallback** — explicit `get_writer_parser()` call as a defensive fallback
+4. **Writer-specific fallback** — returns `nullptr`; the writer handles raw data (e.g. FileWriter accepts plain `std::string`)
+
+### First PoC: CPUMemCollector → FileWriter
+
+`CPUMemCollector` is the first collector to provide a native V2 parser, specifically for `FileWriter`. When `writer_type == "FileWriter"`, the V2 parser:
+
+- Serializes CPU/memory data as JSON with per-process details and optional summary
+- Injects context metadata (`_writer_name`, `_collector_name`, `_job_id`, `_timestamp`) into the output for traceability
+
+For all other writer types, `CPUMemCollector::get_writer_parser_v2()` falls through to the default V1 adapter.
+
+### Adding V2 Support to a New Collector
+
+```cpp
+// In your collector's header:
+CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type) override;
+
+// In your collector's implementation:
+CollectDataParseFuncV2 MyCollector::get_writer_parser_v2(const std::string& writer_type) {
+    if (writer_type == "FileWriter") {
+        return [this](const WriterParseContext& ctx, std::any data) -> std::any {
+            // Use ctx.writer_name, ctx.job.JobID, ctx.timestamp, etc.
+            // Return writer-specific formatted output
+            return formatted_output;
+        };
+    }
+    // Fall back to V1 adapter for other writer types
+    return ICollector::get_writer_parser_v2(writer_type);
+}
+```
+
+> **Note**: Only `CPUMemCollector` currently implements a native V2 parser. Other collectors continue to use the V1 parser interface and are automatically adapted. See `include/collector/icollector.h` and `include/core/collector_type.h` for the full API definition.
+
+---
+
 ## Complete Configuration File Example
 
 ```yaml

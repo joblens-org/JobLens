@@ -492,6 +492,88 @@ slurm_job_watcher:
 
 ---
 
+## 10. Writer Parser V2 Context API
+
+每个收集器为每种写入器类型提供 parser 函数，将原始采集数据转换为写入器特定格式。V2 parser API 在原有 V1 `std::any(std::any)` 签名基础上增加了只读的 `WriterParseContext` 参数，使 parser 可以访问运行时元数据，无需修改现有代码。
+
+### V1 兼容性
+
+旧版 `get_writer_parser()` 接口（V1）**仍然完全支持**。现有收集器和写入器无需任何修改。V1 parser 由 `ICollector::get_writer_parser_v2()` 中的默认适配器自动包装。
+
+### V2 是 Opt-in 的
+
+收集器通过覆写虚方法选择加入 V2：
+
+```cpp
+// include/collector/icollector.h
+virtual CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type);
+```
+
+默认实现透明地包装 V1 parser，丢弃 `WriterParseContext` 并委托给旧签名。未覆写此方法的收集器将按原有方式继续工作。
+
+### WriterParseContext
+
+上下文结构体是**只读**的，在每次调用时按调用点构造。包含以下字段：
+
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| `writer_name` | `std::string` | 写入器实例名称（如 `"file_writer"`） |
+| `writer_type` | `std::string` | 写入器类型标识（如 `"FileWriter"`） |
+| `writer_config_name` | `std::string` | 写入器配置节名称（如 `"file_writer_config"`） |
+| `collector_name` | `std::string` | 触发此写入的收集器实例名称 |
+| `job` | `Job` | 正在采集的 `Job` 对象（包含 JobID、PIDs、sub_attr 等） |
+| `timestamp` | `std::chrono::system_clock::time_point` | parser 被调用的时间戳 |
+
+写入器在调用 parser 之前，从自身元数据和批次记录构造上下文：
+
+```cpp
+// src/writer/file_writer.cpp（简化）
+WriterParseContext ctx{name_, type_, config_name_, collect_name, job, timestamp};
+auto parser = CollectorRegistry::instance().resolveBestParserV2(collect_name, type_);
+```
+
+### Parser 解析顺序（回退链）
+
+写入器推荐使用 `CollectorRegistry::resolveBestParserV2()` 入口，按以下顺序解析最佳 parser：
+
+1. **V2 parser** — `get_writer_parser_v2()` 返回原生 V2 parser（收集器已覆写此方法）
+2. **V1 适配器** — 默认的 `ICollector::get_writer_parser_v2()` 将 V1 parser 包装为丢弃 `WriterParseContext` 的 lambda
+3. **V1 回退** — 显式调用 `get_writer_parser()` 作为防御性回退
+4. **写入器特定回退** — 返回 `nullptr`；写入器自行处理原始数据（如 FileWriter 接受纯 `std::string`）
+
+### 首个 PoC 示例：CPUMemCollector → FileWriter
+
+`CPUMemCollector` 是首个提供原生 V2 parser 的收集器，专门针对 `FileWriter`。当 `writer_type == "FileWriter"` 时，V2 parser：
+
+- 将 CPU/内存数据序列化为 JSON，包含每个进程的详细信息和可选的汇总数据
+- 在输出中注入上下文元数据（`_writer_name`、`_collector_name`、`_job_id`、`_timestamp`），便于追踪
+
+对于其他 writer 类型，`CPUMemCollector::get_writer_parser_v2()` 回退到默认的 V1 适配器。
+
+### 为新收集器添加 V2 支持
+
+```cpp
+// 在收集器头文件中：
+CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type) override;
+
+// 在收集器实现中：
+CollectDataParseFuncV2 MyCollector::get_writer_parser_v2(const std::string& writer_type) {
+    if (writer_type == "FileWriter") {
+        return [this](const WriterParseContext& ctx, std::any data) -> std::any {
+            // 使用 ctx.writer_name、ctx.job.JobID、ctx.timestamp 等
+            // 返回写入器特定格式的输出
+            return formatted_output;
+        };
+    }
+    // 其他 writer 类型回退到 V1 适配器
+    return ICollector::get_writer_parser_v2(writer_type);
+}
+```
+
+> **注意**：目前仅有 `CPUMemCollector` 实现了原生 V2 parser。其他收集器继续使用 V1 parser 接口，由适配器自动转换。完整 API 定义见 `include/collector/icollector.h` 和 `include/core/collector_type.h`。
+
+---
+
 ## 完整配置文件示例
 
 ```yaml
