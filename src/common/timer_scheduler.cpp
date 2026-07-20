@@ -12,7 +12,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "common/timer_scheduler.hpp"
-#include <iostream>
 #include <spdlog/spdlog.h>
 
 TimerScheduler::TimerScheduler(size_t numWorkers)
@@ -66,6 +65,34 @@ bool TimerScheduler::cancelTimer(size_t id) {
     return taskMap.erase(id) > 0;
 }
 
+bool TimerScheduler::rescheduleTimer(size_t id, Duration delay) {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = taskMap.find(id);
+    if (it == taskMap.end()) {
+        return false;
+    }
+
+    auto oldTask = it->second;
+    auto now = Clock::now();
+    auto newTask = std::make_shared<TimerTask>(TimerTask{
+        now + delay,
+        oldTask->interval,
+        oldTask->task,
+        oldTask->repeat,
+        oldTask->id,
+        now
+    });
+
+    taskMap[id] = newTask;
+    tasks.push(newTask);
+    cv.notify_one();
+    return true;
+}
+
+bool TimerScheduler::triggerTimer(size_t id) {
+    return rescheduleTimer(id, Duration{0});
+}
+
 size_t TimerScheduler::addTask(Task task, Duration interval, bool repeat) {
     std::lock_guard<std::mutex> lock(mtx);
     auto id = nextId++;
@@ -106,9 +133,8 @@ void TimerScheduler::schedulerLoop() {
         if (!tasks.empty() && tasks.top()->nextRun <= now) {
             auto task = tasks.top();
             tasks.pop();
-            lock.unlock();
-            
-            if (taskMap.count(task->id) == 0) {
+            auto it = taskMap.find(task->id);
+            if (it == taskMap.end() || it->second != task) {
                 continue; 
             }
             
@@ -127,20 +153,20 @@ void TimerScheduler::schedulerLoop() {
             }
             
             task->scheduledTime = now; // 更新任务的调度时间
-            taskQueue.push(task->task);
-            schedulerCv.notify_one();
-
             if (task->repeat) {
                 task->nextRun = now + task->interval;
-                lock.lock();
-                if (taskMap.count(task->id)) {
-                    tasks.push(task);
-                }
-                lock.unlock();
+                tasks.push(task);
             } else {
-                lock.lock();
                 taskMap.erase(task->id);
             }
+            lock.unlock();
+
+            {
+                std::lock_guard<std::mutex> queueLock(queueMtx);
+                taskQueue.push(task->task);
+                queueSizeCounter++;
+            }
+            schedulerCv.notify_one();
         } else {
             cv.wait_until(lock, tasks.top()->nextRun);
         }
@@ -209,6 +235,7 @@ void TimerScheduler::workerLoop(size_t workerIndex) {
             bool success = true;
             auto task = std::move(taskQueue.front());
             taskQueue.pop();
+            queueSizeCounter--;
             lock.unlock();
 
             startTaskExecution(stat);
@@ -267,6 +294,8 @@ void TimerScheduler::updateAllThreadLoad() {
         
         // 1. 待调度任务数 = 定时任务队列中的任务数
         stats.schedulerStats.pendingTasks = tasks.size();
+        stats.currentTimerTasks = tasks.size();
+        stats.currentQueuedTasks = queueSizeCounter.load();
         
         // 2. 活跃的工作线程数（正在执行任务的线程）
         stats.schedulerStats.activeWorkers = 0;

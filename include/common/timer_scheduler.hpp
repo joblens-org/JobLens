@@ -19,7 +19,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
-#include <future>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -122,6 +121,12 @@ public:
 
     // 取消任务
     bool cancelTimer(size_t id);
+
+    // 重新调度任务到当前时间之后的指定延迟
+    bool rescheduleTimer(size_t id, Duration delay);
+
+    // 立即触发任务执行
+    bool triggerTimer(size_t id);
 
     // 获取性能统计
     nlohmann::json getPerformanceStats();
