@@ -13,19 +13,16 @@
  * limitations under the License. */
 #pragma once
 
-#include <iostream>
 #include <vector>
 #include <string>
 #include <unordered_map>
-#include <filesystem>
 #include <memory>
 #include <lua.hpp>
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 #include <sol/sol.hpp>
+#include "common/struct2ltable.hpp"
 
-
-namespace fs = std::filesystem;
 
 struct Rule {
     std::string name;           // 规则名称

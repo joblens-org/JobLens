@@ -13,8 +13,10 @@
  * limitations under the License. */
 #include "rule_engine/rules_manager.hpp"
 #include "common/local_rpc.hpp"
+#include <filesystem>
 #include <fstream>
 
+namespace fs = std::filesystem;
 
 RulesManager::RulesManager(const std::string& name, const std::string& rules_dir, const std::string& rules_prefix) : 
 name_(name), rule_engine_(), rules_dir_(rules_dir), rules_prefix_(rules_prefix), dir_watcher_(rules_dir) {

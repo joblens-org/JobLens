@@ -13,13 +13,12 @@
  * limitations under the License. */
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 #include <iostream>
-#include <thread>
 #include <spdlog/spdlog.h>
 #include <csignal>
 
 #include "common/main_utils.hpp"
 
-#include "common/config.hpp"
+#include "common/print_fmt.hpp"
 #include "core/collector_registry.hpp"
 #include "core/writer_manager.hpp"
 #include "core/collector_scheduler.hpp"
