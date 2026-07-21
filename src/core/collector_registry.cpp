@@ -14,11 +14,10 @@
 // collector_registry.cpp
 #include "core/collector_registry.hpp"
 #include "core/collector_type.h"
+#include "common/config.hpp"
 #include "common/local_rpc.hpp"
-#include <mutex>
-#include <iostream>
+#include "common/print_fmt.hpp"
 #include <spdlog/spdlog.h>
-#include <thread>
 
 
 CollectorRegistry& CollectorRegistry::instance() {
@@ -106,24 +105,44 @@ CollectorHandle CollectorRegistry::createCollector(const std::string& type, cons
     newInst->set_name(name);
     newInst->set_type(type);
     auto inst = newInst.get();
+    auto periodic_job = dynamic_cast<IPeriodicJobCollector*>(inst);
+    auto periodic_system = dynamic_cast<IPeriodicSystemCollector*>(inst);
+    auto event_job = dynamic_cast<IEventJobCollector*>(inst);
+    auto event_system = dynamic_cast<IEventSystemCollector*>(inst);
     collector_instances_[name] = std::move(newInst);
     
     CollectFunc c_func;
 
     if (enable_collector_perf) {
-        c_func = makePerfFunc(name, [inst](const Job& job) { return inst->collect(job); });
+        c_func = makePerfFunc(name, [periodic_job](const Job& job) {
+            if (!periodic_job) return CollectResult{};
+            return periodic_job->collect(job);
+        });
     }else {
-        c_func = [inst](const Job& job) { return inst->collect(job); };
+        c_func = [periodic_job](const Job& job) {
+            if (!periodic_job) return CollectResult{};
+            return periodic_job->collect(job);
+        };
     }
 
     if (it->second.scope == CollectorScope::Job) {
         return {
+            inst,
+            periodic_job,
+            periodic_system,
+            event_job,
+            event_system,
             [inst](const nlohmann::json& cfg) { return inst->init(cfg); },
             c_func,
             [inst](){ inst->deinit(); }
         };
     } else { // System scope
         return {
+            inst,
+            periodic_job,
+            periodic_system,
+            event_job,
+            event_system,
             [inst](const nlohmann::json& cfg) { return inst->init(cfg); },
             c_func, //保证接口一致，忽略job参数
             [inst](){ inst->deinit(); }
@@ -136,6 +155,13 @@ CollectorScope CollectorRegistry::getScope(const std::string& name) const {
     if (it == collectors_.end())
         return CollectorScope::Undefined;                     // 空句柄，调用方可判空
     return it->second.scope;
+}
+
+CollectorTrigger CollectorRegistry::getTrigger(const std::string& name) const {
+    auto it = collectors_.find(name);
+    if (it == collectors_.end())
+        return CollectorTrigger::Undefined;
+    return it->second.trigger;
 }
 
 const CollectorHelpInfo* CollectorRegistry::getHelp(const std::string& name) const {

@@ -17,12 +17,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <atomic>
-#include <limits>
-#include <thread>
-#include "common/print_fmt.hpp"
 #include "collector/icollector.h"
-#include "common/config.hpp"
 #include "common/perf_counter.hpp"
 
 
@@ -37,19 +32,26 @@ public:
         
         Factory factory;                    // 工厂函数
         CollectorScope scope;               // 作用域
+        CollectorTrigger trigger;           // 触发方式
         CollectorHelpInfo help_info;        // 帮助信息
         
         CollectorInfo() = default;
-        CollectorInfo(Factory f, CollectorScope s, CollectorHelpInfo help) 
-            : factory(std::move(f)), scope(s), help_info(std::move(help)) {}
+        CollectorInfo(Factory f, CollectorScope s, CollectorTrigger t, CollectorHelpInfo help) 
+            : factory(std::move(f)), scope(s), trigger(t), help_info(std::move(help)) {}
     };
 
     // 统一的注册函数
     template <typename T>
     void registerCollector(const std::string& name, CollectorScope scope, const CollectorHelpInfo& help_info) {
+        registerCollector<T>(name, scope, CollectorTrigger::Periodic, help_info);
+    }
+
+    template <typename T>
+    void registerCollector(const std::string& name, CollectorScope scope, CollectorTrigger trigger, const CollectorHelpInfo& help_info) {
         collectors_.emplace(name, CollectorInfo{
             []() -> std::unique_ptr<ICollector> { return std::make_unique<T>(); },
             scope,
+            trigger,
             help_info
         });
     }
@@ -57,28 +59,43 @@ public:
     // 重载版本：使用可变参数创建帮助信息
     template <typename T>
     void registerCollector(const std::string& name, CollectorScope scope, 
-                          const std::string& help_text, 
+                           const std::string& help_text, 
+                           std::initializer_list<ConfigParam> config_params = {}) {
+        registerCollector<T>(name, scope, CollectorTrigger::Periodic, help_text, config_params);
+    }
+
+    template <typename T>
+    void registerCollector(const std::string& name, CollectorScope scope, CollectorTrigger trigger,
+                          const std::string& help_text,
                           std::initializer_list<ConfigParam> config_params = {}) {
         CollectorHelpInfo help_info;
         help_info.help_text = help_text;
         help_info.config_params = config_params;
         
-        registerCollector<T>(name, scope, help_info);
+        registerCollector<T>(name, scope, trigger, help_info);
     }
 
     // 重载版本：接受ConfigParams（vector）
     template <typename T>
     void registerCollector(const std::string& name, CollectorScope scope, 
-                          const std::string& help_text, 
+                           const std::string& help_text, 
+                           const ConfigParams& config_params) {
+        registerCollector<T>(name, scope, CollectorTrigger::Periodic, help_text, config_params);
+    }
+
+    template <typename T>
+    void registerCollector(const std::string& name, CollectorScope scope, CollectorTrigger trigger,
+                          const std::string& help_text,
                           const ConfigParams& config_params) {
         CollectorHelpInfo help_info;
         help_info.help_text = help_text;
         help_info.config_params = config_params;
         
-        registerCollector<T>(name, scope, help_info);
+        registerCollector<T>(name, scope, trigger, help_info);
     }
 
     CollectorScope getScope(const std::string& name) const;
+    CollectorTrigger getTrigger(const std::string& name) const;
 
     // 获取帮助信息
     const CollectorHelpInfo* getHelp(const std::string& name) const;
@@ -154,3 +171,13 @@ namespace {                                                              \
     static AutoReg_##CollectorClass _auto_reg_##CollectorClass;          \
 }
 
+#define AUTO_REGISTER_JOB_EVENT_COLLECTOR(CollectorClass, ...)   \
+namespace {                                                              \
+    struct AutoReg_##CollectorClass {                                    \
+        AutoReg_##CollectorClass() {                                     \
+            CollectorRegistry::instance()                                \
+                .registerCollector<CollectorClass>(#CollectorClass, CollectorScope::Job, CollectorTrigger::EventBatch, __VA_ARGS__); \
+        }                                                                \
+    };                                                                   \
+    static AutoReg_##CollectorClass _auto_reg_##CollectorClass;          \
+}

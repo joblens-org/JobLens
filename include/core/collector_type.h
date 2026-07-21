@@ -15,15 +15,20 @@
 #include <string>
 #include <vector>
 #include <chrono>
-#include <unordered_map>
 #include <functional>
 #include <any>
 #include <nlohmann/json.hpp>
 #include <variant>
-#include "common/struct2ltable.hpp"
+#include <sol/sol.hpp>
 #include <spdlog/spdlog.h>
 
 #define COLLECTOR_TYPE_PROC "ProcCollector"
+
+class ICollector;
+class IPeriodicJobCollector;
+class IPeriodicSystemCollector;
+class IEventJobCollector;
+class IEventSystemCollector;
 
 enum class CollectorType {
     ProcCollector,      // 采集 /proc/<pid>/stat
@@ -78,6 +83,12 @@ enum class CollectorScope{
     Undefined = 0,
     Job,
     System
+};
+
+enum class CollectorTrigger{
+    Undefined = 0,
+    Periodic,
+    EventBatch
 };
 
 struct CondorJobAttr{
@@ -314,6 +325,10 @@ using CollectResult = std::any;
 using CollectFunc = std::function<CollectResult(const Job&)>;
 using CollectInitFunc = std::function<bool(const nlohmann::json& config)>;
 using CollectDeinitFunc = std::function<void()>;
+using CollectReadyNotifyFunc = std::function<void()>;
+using CollectSetReadyNotifyFunc = std::function<void(CollectReadyNotifyFunc)>;
+using CollectPendingCountFunc = std::function<size_t()>;
+using CollectDrainEventsFunc = std::function<CollectResult(size_t)>;
 
 using CollectDataParseFunc = std::function<std::any(std::any)>;
 
@@ -337,7 +352,12 @@ struct WriterParseContext {
 using CollectDataParseFuncV2 = std::function<std::any(const WriterParseContext&, std::any)>;
 
 struct CollectorHandle {
-    CollectInitFunc        init;   
+    ICollector* base{nullptr};
+    IPeriodicJobCollector* periodic_job{nullptr};
+    IPeriodicSystemCollector* periodic_system{nullptr};
+    IEventJobCollector* event_job{nullptr};
+    IEventSystemCollector* event_system{nullptr};
+    CollectInitFunc        init;
     CollectFunc            collect;
     CollectDeinitFunc      deinit;
 };

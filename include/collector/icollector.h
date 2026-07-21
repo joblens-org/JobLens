@@ -20,15 +20,7 @@
 class ICollector {
 public:
     virtual ~ICollector() = default;
-    const CollectorScope scope() const { return scope_; }
-    // 生命周期
     virtual bool init(const nlohmann::json& config)      = 0;   // 返回 false 表示失败
-    virtual CollectResult collect(const Job& job){       // 传入 Job 信息进行采集
-        return {};
-    }          
-    virtual CollectResult collect(){                     // 无参采集，适用于系统级采集器
-        return {};
-    }                        
     virtual void deinit() noexcept                       = 0;
     virtual CollectDataParseFunc get_writer_parser(const std::string& writer_type) = 0;
 
@@ -56,10 +48,34 @@ public:
     std::string get_type(){
         return type_;
     }
-protected:
-    CollectorScope scope_;
 private:
     std::string name_;
     std::string type_;
 };
 
+class IPeriodicJobCollector : public ICollector {
+public:
+    virtual CollectResult collect(const Job& job) = 0;
+};
+
+class IPeriodicSystemCollector : public ICollector {
+public:
+    virtual CollectResult collect() = 0;
+};
+
+class IEventJobCollector : public ICollector {
+public:
+    virtual void add_job(const Job& job) = 0;
+    virtual void update_job(const Job& job) = 0;
+    virtual void remove_job(uint64_t job_id) = 0;
+    virtual void set_ready_notify(CollectReadyNotifyFunc notify) = 0;
+    virtual size_t pending_events() const = 0;
+    virtual CollectResult drain_events(size_t max_events) = 0;
+};
+
+class IEventSystemCollector : public ICollector {
+public:
+    virtual void set_ready_notify(CollectReadyNotifyFunc notify) = 0;
+    virtual size_t pending_events() const = 0;
+    virtual CollectResult drain_events(size_t max_events) = 0;
+};

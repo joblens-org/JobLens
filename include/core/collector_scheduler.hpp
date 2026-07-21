@@ -14,26 +14,17 @@
 #pragma once
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
-#include <chrono>
-#include <functional>
 #include <mutex>
-#include <thread>
 #include <vector>
 #include <atomic>
-#include <future>
 #include <string>
+#include <chrono>
 #include <unordered_map>
-#include <optional>
-#include <fmt/core.h>
-#include <fmt/chrono.h>
-#include <date/date.h>
+#include <unordered_set>
 
-#include "collector/proc_collector_func.hpp"
 #include "core/collector_type.h"
 #include "common/config.hpp"
-#include "common/streamer_watcher.hpp"
 #include "common/timer_scheduler.hpp"
-#include "core/writer_manager.hpp"
 #include <nlohmann/json.hpp>
 
 #include "job_lifecycle_event.h"
@@ -42,11 +33,8 @@ class CollectorScheduler {
 public:
     ~CollectorScheduler();
 
-    // 非拷贝、可移动
     CollectorScheduler(const CollectorScheduler&)            = delete;
     CollectorScheduler& operator=(const CollectorScheduler&) = delete;
-    CollectorScheduler(CollectorScheduler&&)                 = default;
-    CollectorScheduler& operator=(CollectorScheduler&&)      = default;
 
 
     void start();
@@ -58,34 +46,74 @@ public:
 
 private:
     CollectorScheduler();
-    void addJobCollectFunc(std::string name, std::string config, CollectFunc collector_handle,CollectInitFunc init_handle,CollectDeinitFunc deinit_handle);
-    void addSystemCollectFunc(std::string name, std::string config, CollectFunc collector_handle,CollectInitFunc init_handle,CollectDeinitFunc deinit_handle);
+    void addPeriodicJobCollector(std::string name, std::string config, const CollectorHandle& collector_handle);
+    void addPeriodicSystemCollector(std::string name, std::string config, const CollectorHandle& collector_handle);
+    void addJobEventCollectFunc(std::string name, std::string config, const CollectorHandle& collector_handle);
+    void addSystemEventCollectFunc(std::string name, std::string config, const CollectorHandle& collector_handle);
     void addCallback(std::string name, OnFinish cb);
     void registerCollectFuncs();
     void registerFinishCallbacks();
     void onJobLifecycle(JobEvent ev, Job& job);
-    void addJobCollect(const Job& job);
-    void startCollector(std::string collector);
-    void addJob2Collector(size_t jobid, std::string collector);
-    void rmJobCollect(const Job& job);
-    void updateJobCollect(const Job& job);
+    void onJobAdded(const Job& job);
+    void onJobRemoved(const Job& job);
+    void onJobUpdated(const Job& job);
+    void startPeriodicJobCollector(std::string collector);
+    void addJob2PeriodicCollector(size_t jobid, std::string collector);
+    void removeJobFromPeriodicCollector(uint64_t jobid, std::string collector);
+    void addJob2EventCollector(const Job& job, std::string collector);
+    void removeJobFromEventCollector(uint64_t jobid, std::string collector);
+    void updateJobForEventCollector(const Job& job, std::string collector);
+    void flushEventJobCollector(std::string collector);
+    void flushEventSystemCollector(std::string collector);
     Config& global_config = Config::instance();
     TimerScheduler timerScheduler_;
 
-    struct collector_state{
+    struct PeriodicJobState{
         std::vector<size_t> jobid_list;
         std::mutex              m_;
         size_t task_id;
         std::atomic<bool>        running;
     };
 
+    struct PeriodicSystemState{
+        std::mutex              m_;
+        size_t task_id{0};
+        std::atomic<bool>        running{false};
+    };
+
+    struct EventJobState{
+        std::mutex              m_;
+        size_t flush_task_id{0};
+        std::atomic<bool>        running{false};
+        std::atomic<bool>        flushing{false};
+        size_t flush_threshold{100};
+        size_t max_batch_size{1000};
+        std::chrono::milliseconds max_wait{1000};
+        std::unordered_set<uint64_t> active_job_ids;
+    };
+
+    struct EventSystemState{
+        std::mutex              m_;
+        size_t flush_task_id{0};
+        std::atomic<bool>        running{false};
+        std::atomic<bool>        flushing{false};
+        size_t flush_threshold{100};
+        size_t max_batch_size{1000};
+        std::chrono::milliseconds max_wait{1000};
+    };
+
     struct collector_info
     {
         std::string name;
         CollectorScope scope;
+        CollectorTrigger trigger;
         std::string config_name;
         double freq;
-        CollectFunc collect_handle;
+        ICollector* base{nullptr};
+        IPeriodicJobCollector* periodic_job{nullptr};
+        IPeriodicSystemCollector* periodic_system{nullptr};
+        IEventJobCollector* event_job{nullptr};
+        IEventSystemCollector* event_system{nullptr};
         CollectInitFunc init_handle;
         CollectDeinitFunc deinit_handle;
         std::vector<OnFinish> finish_cbs;
@@ -94,7 +122,10 @@ private:
 
     std::mutex              m_;
     std::unordered_map<std::string, collector_info> collector_info_dict;
-    std::unordered_map<std::string, collector_state> collector_state_dict;
+    std::unordered_map<std::string, PeriodicJobState> periodic_job_state_dict;
+    std::unordered_map<std::string, PeriodicSystemState> periodic_system_state_dict;
+    std::unordered_map<std::string, EventJobState> event_job_state_dict;
+    std::unordered_map<std::string, EventSystemState> event_system_state_dict;
     std::unordered_map<std::string, OnFinish>   finishCallbacks_;
 
     double default_freq;
