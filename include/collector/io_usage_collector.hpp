@@ -17,8 +17,8 @@
 #include "core/collector_type.h"
 #include "icollector.h"
 #include <spdlog/spdlog.h>
-#include "common/ebpf_common.hpp"
 #include "common/spin_lock.hpp"
+#include <bpf/libbpf.h>
 // #include "ebpf/job_fd_basic.h"
 #include "ebpf/job_fd_rw_stat.h"
 #include <queue>
@@ -89,12 +89,12 @@ namespace std {
     };
 }
 
-class IOUsageCollector : public ICollector{
+class IOUsageCollector : public IPeriodicJobCollector{
 public:
     bool init(const nlohmann::json& cfg) override;
     CollectResult collect(const Job& job) override;
     void deinit() noexcept override;
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type);
+    CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
 private:
     double collect_period;
     struct pid_state{
@@ -150,4 +150,3 @@ private:
     bpf_object* bpf_obj_;
     ring_buffer* bpf_rb_;
 };
-

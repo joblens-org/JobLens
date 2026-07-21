@@ -14,14 +14,10 @@
 #pragma once
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
-#include <fstream>
-#include <sstream>
 #include <dirent.h>
 #include <unistd.h>
 #include <cstring>
 #include <string>
-#include <vector>
-#include <optional>
 #include <fmt/core.h>
 #include <memory>
 #include "core/collector_type.h"
@@ -55,12 +51,12 @@ struct proc_info {
     std::string status{"unknown"};
 };
 
-class ProcCollector : public ICollector {
+class ProcCollector : public IPeriodicJobCollector {
 public:
     bool init(const nlohmann::json& cfg) override;
     CollectResult collect(const Job& job) override;
     void deinit() noexcept override;
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type);
+    CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
 private:
     std::any impl_collect(const Job& job);
     std::unique_ptr<proc_info> snapshotOf(int pid);

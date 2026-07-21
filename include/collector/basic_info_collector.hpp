@@ -50,7 +50,7 @@ struct BasicInfo {
 };
 
 
-class BasicInfoCollector : public ICollector {
+class BasicInfoCollector : public IPeriodicJobCollector {
 public:
     bool init(const nlohmann::json& cfg) override;
     CollectResult collect(const Job& job) override;
@@ -96,4 +96,3 @@ private:
     };
     std::unordered_map<int, pid_state> pid_state_dict;
 };
-

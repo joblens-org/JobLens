@@ -67,12 +67,12 @@ struct NetInfo{
     std::vector<Connection>     connections;
 };
 
-class NetUsageCollector : public ICollector{
+class NetUsageCollector : public IPeriodicJobCollector{
 public:
     bool init(const nlohmann::json& cfg) override;
     CollectResult collect(const Job& job) override;
     void deinit() noexcept override;
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type);
+    CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
     
 private:
     void init_netlink();

@@ -37,12 +37,12 @@ struct CPUMemInfo{
     int         numThreads{};
 };
 
-class CPUMemCollector : public ICollector {
+class CPUMemCollector : public IPeriodicJobCollector {
 public:
     bool init(const nlohmann::json& cfg) override;
     CollectResult collect(const Job& job) override;
     void deinit() noexcept override;
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type);
+    CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
     CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type) override;
 
 private:

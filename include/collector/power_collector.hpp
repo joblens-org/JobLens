@@ -48,7 +48,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <fstream>
 
 /* ── 每个PID的能耗归因结果 (按Job分组前的中间层) ─────────────────────── */
 struct PowerPerPid {
@@ -109,7 +108,7 @@ struct CalibrationRef {
     std::string source_path;        // 校准数据来源 (summary.json路径)
 };
 
-class PowerCollector : public ICollector {
+class PowerCollector : public IPeriodicJobCollector {
 public:
     /* ── ICollector 生命周期 ──────────────────────────────────────── */
     bool init(const nlohmann::json& cfg) override;   // 加载eBPF、检测RAPL、配置参数

@@ -13,7 +13,7 @@ struct __YOUR_COLLECTOR_NAME__Data {
 };
 
 //-------------------- 采集器声明 --------------------
-class __YOUR_COLLECTOR_NAME__Collector : public ICollector {
+class __YOUR_COLLECTOR_NAME__Collector : public IPeriodicJobCollector {
 public:
     /*-------- 生命周期 --------*/
     bool init(const nlohmann::json& cfg) override;
