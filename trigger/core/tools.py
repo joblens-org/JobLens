@@ -151,8 +151,100 @@ def run(cmd, check=True):
         raise RuntimeError(f"命令失败: {cmd}\n{cp.stdout}")
     return cp.stdout.strip()
 
+# docker start 命令行中容器名的提取正则
+# 匹配形如: /usr/bin/docker start -a HTCJob187_0_slot1_PID2359653
+#          docker container start --attach <name>
+_DOCKER_START_RE = re.compile(
+    r'docker\s+(?:container\s+)?start\s+(?:(?:-a|--attach|-i|--interactive)\s+)*(\S+)'
+)
+
+
+def _find_docker_container_by_slot(slot: str, starter_pid: int) -> Optional[str]:
+    """在指定 condor_starter 的进程树内查找 docker start 命令行，提取容器名。
+
+    condor 的 docker universe 作业模式下，condor_starter 会拉起一个
+    `docker start -a <容器名>` 客户端进程；真正的业务进程由 containerd
+    托管、不在 starter 进程树下，因此需要先拿到容器名再用 docker top 定位。
+
+    :param slot: slot 名（如 "slot1"），用于二次校验容器名归属
+    :param starter_pid: 已定位到的 condor_starter 进程 PID
+    :return: 命中的容器名；未找到 docker start 命令行则返回 None（表示非 docker 作业）
+    """
+    # 列出 starter 进程树下所有 PID（含 starter 自身），逐个读命令行
+    tree = run(f"/usr/bin/pstree -pT {starter_pid}", check=False)
+    tree_pids = {int(x) for x in re.findall(r'\((\d+)\)', tree or '')}
+    tree_pids.add(starter_pid)
+
+    for pid in sorted(tree_pids):
+        # 读取该进程的完整命令行（/proc/<pid>/cmdline 用 \0 分隔参数）
+        cmdline = _read_proc_cmdline(pid)
+        if not cmdline or 'docker' not in cmdline:
+            continue
+        m = _DOCKER_START_RE.search(cmdline)
+        if not m:
+            continue
+        container = m.group(1)
+        logger.info("Docker container discovered in slot tree: slot=%s, starter_pid=%d, "
+                     "cmd_pid=%d, container=%s", slot, starter_pid, pid, container)
+        # 二次校验：容器名里通常含 slotN 片段（如 ..._slot1_...），做一次弱校验但不强制
+        num = slot[4:]
+        if num and f"slot{num}" not in container:
+            logger.warning("Docker container name %s 未包含期望的 slot%s 片段，仍继续处理",
+                           container, num)
+        return container
+
+    return None
+
+
+def _read_proc_cmdline(pid: int) -> str:
+    """读取 /proc/<pid>/cmdline 并以空格拼接为可读命令行；读取失败返回空串。"""
+    try:
+        with open(f"/proc/{pid}/cmdline", 'rb') as f:
+            raw = f.read()
+        # cmdline 各参数以 \0 分隔，末尾可能带 \0
+        return ' '.join(p for p in raw.decode('utf-8', errors='replace').split('\0') if p)
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return ''
+
+
+def _docker_top_pids(container: str) -> List[int]:
+    """通过 `docker top <container> -eo pid,comm` 获取容器内进程在 host 命名空间的 PID 列表。
+
+    docker top 返回的 PID 是 host（宿主机）命名空间的 PID，可直接用于 JobLens
+    的进程监控，无需再做 PID namespace 转换。
+
+    :param container: 容器名或容器 ID
+    :return: host 命名空间下的 PID 列表；容器不存在或无进程则抛 RuntimeError
+    """
+    out = run(f"/usr/bin/docker top {shlex.quote(container)} -eo pid,comm", check=False)
+    if not out:
+        raise RuntimeError(f"docker top 未返回任何内容，容器可能不存在或已退出: {container}")
+
+    pids: List[int] = []
+    lines = out.splitlines()
+    for line in lines:
+        parts = line.split()
+        if not parts:
+            continue
+        # 跳过表头行（首列不是数字，如 "PID  COMMAND"）
+        if not parts[0].isdigit():
+            continue
+        pids.append(int(parts[0]))
+
+    if not pids:
+        raise RuntimeError(f"docker top 未解析到有效 PID，容器: {container}，原始输出: {out!r}")
+
+    return sorted(set(pids))
+
+
 def find_pids_by_slot(slot: str):
-    """返回 slot 对应 condor_starter 下的真实子进程 PID 列表（排除 starter 自身）。"""
+    """返回 slot 对应作业的真实进程 PID 列表。
+
+    自动探测两种作业形态：
+    1. docker 作业：condor_starter 进程树里存在 `docker start -a <容器名>` 命令行，
+       则解析出容器名并用 docker top 获取容器内进程的 host PID。
+    2. 普通作业：回退到 pstree，返回 condor_starter 下的全部子进程 PID（排除 starter 自身）。
+    """
     if not slot.startswith('slot'):
         raise ValueError("slot 名必须以 'slot' 开头")
     num = slot[4:]
@@ -162,7 +254,15 @@ def find_pids_by_slot(slot: str):
         raise RuntimeError(f"未找到 {slot} 对应的 condor_starter")
     starter_pid = int(ps_out.split()[0])
 
-    # 获取进程树中所有 PID
+    # 优先探测 docker 作业：在 starter 进程树内查找 docker start 命令行
+    container = _find_docker_container_by_slot(slot, starter_pid)
+    if container:
+        pids = _docker_top_pids(container)
+        logger.info("Docker job pids via docker top: slot=%s, container=%s, pids_count=%d",
+                     slot, container, len(pids))
+        return pids
+
+    # 回退：普通 condor 作业，取 starter 进程树的子进程
     tree = run(f"/usr/bin/pstree -pT {starter_pid}")
     all_pids = {int(x) for x in re.findall(r'\((\d+)\)', tree)}
 
