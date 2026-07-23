@@ -285,6 +285,28 @@ verify_rpm() {
     local rpm_size
     rpm_size=$(ls -lh "$rpm_file" | awk '{print $5}')
 
+    local python_abi
+    python_abi=$(/usr/bin/python3 -c 'import sys; print("{}.{}".format(sys.version_info[0], sys.version_info[1]))')
+
+    local rpm_requires
+    rpm_requires=$(rpm -qp --requires "$rpm_file")
+
+    if ! printf '%s\n' "$rpm_requires" | grep -Fxq "python(abi) = $python_abi"; then
+        log_error "RPM 未声明精确 Python ABI 依赖: python(abi) = $python_abi"
+        log_error "当前 Requires:"
+        printf '%s\n' "$rpm_requires" | sort
+        exit 1
+    fi
+
+    if ! printf '%s\n' "$rpm_requires" | grep -Fxq "/usr/bin/python$python_abi"; then
+        log_error "RPM 未声明版本化 Python 解释器依赖: /usr/bin/python$python_abi"
+        log_error "当前 Requires:"
+        printf '%s\n' "$rpm_requires" | sort
+        exit 1
+    fi
+
+    log_info "Python ABI 依赖验证通过: python(abi) = $python_abi, /usr/bin/python$python_abi"
+
     echo ""
     echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║                    RPM 构建成功！                            ║${NC}"

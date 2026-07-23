@@ -19,6 +19,13 @@
 #   - rpm-macros-virtualenv (kushaldas/rpm-macros-virtualenv)
 
 %global debug_package %{nil}
+%{!?__python3: %global __python3 /usr/bin/python3}
+
+# Trigger venv 使用构建机的 Python 次版本安装依赖。RPM 运行时必须使用同一次
+# 版本的解释器，否则 venv 的 lib/pythonX.Y/site-packages 与运行解释器 ABI 不匹配，
+# 会在目标机上触发 ModuleNotFoundError（例如构建机 3.9，目标机 /usr/bin/python3 为
+# 3.13）。这里记录构建解释器 ABI，并在 Requires 与 venv symlink 中精确使用它。
+%global joblens_python_abi %(%{__python3} -c 'import sys; print("{}.{}".format(sys.version_info[0], sys.version_info[1]))')
 
 # ---- venv auto-dependency suppression ----
 # 抑制 RPM 自动依赖检测：Python venv 内的所有依赖均为捆绑（bundled），
@@ -117,8 +124,13 @@ BuildRequires:  python3-pip
 # Python 依赖全部打包在 venv 中（通过 auto-dep suppression 抑制）。
 #
 # systemd 用于服务管理；python3 提供 venv 运行时解释器。
+# Trigger venv 与构建解释器 ABI 精确绑定：RPM 必须安装到拥有同一次版本
+# /usr/bin/pythonX.Y 的目标机，否则安装阶段即失败，避免服务启动后才出现
+# ModuleNotFoundError。
 Requires:       systemd
 Requires:       python3 >= 3.8
+Requires:       python(abi) = %{joblens_python_abi}
+Requires:       /usr/bin/python%{joblens_python_abi}
 
 # ============================================================
 # 描述
@@ -171,11 +183,19 @@ cmake --build --preset %{?preset}%{!?preset:rpm-system-deps}
 # ===== Trigger 安装 =====
 
 # 8. 创建 Python 虚拟环境（新路径：/usr/lib/joblens/trigger-venv/）
-#    不使用 --copies：复制 Python 解释器会导致 ELF build-id 与系统 python3 包冲突
-#    （RPM find-debuginfo.sh 会为复制的 python 二进制生成 .build-id 条目）
-#    使用默认 symlink 模式：解释器符号链接到系统 /usr/bin/python3
-#    Requires: python3 >= 3.8 确保运行时解释器一定存在
+#    不使用 --copies：venv --copies 只复制解释器入口，不复制 libpython 与标准库，
+#    不是可移植运行时；默认 symlink 模式更符合 RPM 的系统依赖模型。
+#    创建后将 venv/bin/python3 精确指向 /usr/bin/pythonX.Y，避免目标机默认
+#    /usr/bin/python3 次版本变化时读取错误的 site-packages 目录。
+#    Requires: /usr/bin/pythonX.Y + python(abi) = X.Y 确保装错目标机时 RPM 直接失败。
 %{__python3} -m venv %{buildroot}/usr/lib/joblens/trigger-venv
+if [ ! -x /usr/bin/python%{joblens_python_abi} ]; then
+    echo "FATAL: /usr/bin/python%{joblens_python_abi} 不存在，无法构建 ABI 绑定的 Trigger venv"
+    exit 1
+fi
+ln -sfn /usr/bin/python%{joblens_python_abi} %{buildroot}/usr/lib/joblens/trigger-venv/bin/python3
+ln -sfn python3 %{buildroot}/usr/lib/joblens/trigger-venv/bin/python
+ln -sfn python3 %{buildroot}/usr/lib/joblens/trigger-venv/bin/python%{joblens_python_abi}
 
 # 9. 安装运行时 Python 依赖 + trigger 包本身
 #    --no-compile: 不生成 .pyc，避免嵌入 buildroot 路径被 check-buildroot 拦截

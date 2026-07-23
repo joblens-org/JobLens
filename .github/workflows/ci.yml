@@ -129,6 +129,16 @@ jobs:
           echo "$REQS" | grep -q 'systemd' && echo "✓ Requires: systemd" || echo "⚠ 未声明 systemd 依赖"
           echo "$REQS" | grep -q 'python3' && echo "✓ Requires: python3" || echo "⚠ 未声明 python3 依赖"
 
+          echo ""
+          echo "=== Trigger venv Python ABI 精确绑定检查 ==="
+          PY_ABI=$(/usr/bin/python3 -c 'import sys; print("{}.{}".format(sys.version_info[0], sys.version_info[1]))')
+          echo "$REQS" | grep -Fxq "python(abi) = ${PY_ABI}" && \
+            echo "✓ Requires: python(abi) = ${PY_ABI}" || \
+            { echo "✗ 缺少 python(abi) = ${PY_ABI}"; exit 1; }
+          echo "$REQS" | grep -Fxq "/usr/bin/python${PY_ABI}" && \
+            echo "✓ Requires: /usr/bin/python${PY_ABI}" || \
+            { echo "✗ 缺少 /usr/bin/python${PY_ABI}"; exit 1; }
+
       # ════════════════════════════════════════════════════════
       # 统一 RPM 维护脚本检查
       # ════════════════════════════════════════════════════════
@@ -193,6 +203,4 @@ jobs:
         with:
           name: joblens-core-tgz-${{ matrix.target.name }}
           path: build/joblens-*-Linux-x86_64.tar.gz
-
-
 
