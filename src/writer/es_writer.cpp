@@ -288,6 +288,10 @@ bool ESWriter::flush_impl(const std::vector<write_data>& batch)
         }
         json jobj;
         parse_ret = try_parse_data(collect_name, any_data, jobj);
+        if (!parse_ret) {
+            spdlog::debug("elasticsearch_writer: skip document (parse failed for collector '{}')", collect_name);
+            continue;
+        }
         src["data"] = jobj;
         spdlog::debug("elasticsearch_writer: document to index: {}", src.dump());
         body << action.dump() << '\n';

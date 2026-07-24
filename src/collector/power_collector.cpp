@@ -421,7 +421,10 @@ PowerSnapshot PowerCollector::compute_energy(
         uint64_t jid = 0;
         std::string native_jid;
 
-        auto it_j = pid2job.find(acc.pid);
+        auto it_j = pid2job.find(acc.pid);       // 先按 tid 查
+        if (it_j == pid2job.end()) {
+            it_j = pid2job.find(acc.tgid);       // 查不到用 tgid fallback
+        }
         if (it_j != pid2job.end()) {
             jid = it_j->second;
             auto it_nj = job_native_ids.find(jid);
@@ -946,6 +949,13 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
                 spdlog::warn("PowerCollector: bad any_cast in FileWriter parser — {}", e.what());
                 ret["error"] = std::string("bad any_cast: ") + e.what();
                 return ret;
+            }
+
+            /* 跳过空快照 (去重或未初始化返回的默认值) */
+            if (snap.interval_s <= 0.0 || snap.delta_rapl_j <= 0.0) {
+                spdlog::debug("PowerCollector: skip empty snapshot (interval_s={}, delta_rapl_j={})",
+                              snap.interval_s, snap.delta_rapl_j);
+                return std::any();
             }
 
             /* ── 整机字段 (sys_ 前缀，data 顶层) ── */
