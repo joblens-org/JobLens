@@ -46,7 +46,9 @@ void EventJobManager::registerCollector(const std::string& name, const std::stri
     info.trigger = CollectorTrigger::EventBatch;
     info.finish_cbs = resolveCollectorFinishCallbacks(name, config, finishCallbacks_, default_cbs_name_);
     configureState(name, config);
-    startCollector(name);
+    if (resolveAutoStart(config)) {
+        startCollector(name);
+    }
 }
 
 void EventJobManager::configureState(const std::string& name, const std::string& config) {
@@ -112,6 +114,9 @@ void EventJobManager::addJob(const Job& job, const std::string& collector) {
         std::lock_guard lg(state_it->second.m_);
         state_it->second.active_job_ids.insert(job.JobID);
     }
+    if (!state_it->second.running) {
+        startCollector(collector);
+    }
     info_it->second.event_job->add_job(job);
 }
 
@@ -135,6 +140,9 @@ void EventJobManager::updateJob(const Job& job, const std::string& collector) {
         if (!state_it->second.active_job_ids.count(job.JobID)) {
             state_it->second.active_job_ids.insert(job.JobID);
         }
+    }
+    if (!state_it->second.running) {
+        startCollector(collector);
     }
     info_it->second.event_job->update_job(job);
 }
@@ -235,7 +243,9 @@ void EventSystemManager::registerCollector(const std::string& name, const std::s
     info.trigger = CollectorTrigger::EventBatch;
     info.finish_cbs = resolveCollectorFinishCallbacks(name, config, finishCallbacks_, default_cbs_name_);
     configureState(name, config);
-    startCollector(name);
+    if (resolveAutoStart(config)) {
+        startCollector(name);
+    }
 }
 
 void EventSystemManager::configureState(const std::string& name, const std::string& config) {

@@ -75,3 +75,7 @@ EventBatchConfig resolveEventBatchConfig(const std::string& config_name) {
     }
     return config;
 }
+
+bool resolveAutoStart(const std::string& config_name) {
+    return Config::instance().getBool(config_name, "auto_start", false);
+}

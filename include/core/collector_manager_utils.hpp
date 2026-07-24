@@ -38,3 +38,7 @@ double resolveCollectorFreq(
     bool allow_period_key);
 
 EventBatchConfig resolveEventBatchConfig(const std::string& config_name);
+
+// 从采集器自己的 config 段读取 auto_start，控制是否在注册时自动启动。
+// 缺省（未配置）时返回 false，即默认不自动启动，改由 RPC 控制启停。
+bool resolveAutoStart(const std::string& config_name);

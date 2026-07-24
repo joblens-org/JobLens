@@ -230,14 +230,8 @@ void PeriodicSystemManager::registerCollector(const std::string& name, const std
     info.freq = resolveCollectorFreq(name, config, default_freq_, false);
     info.finish_cbs = resolveCollectorFinishCallbacks(name, config, finishCallbacks_, default_cbs_name_);
 
-    try{
-        auto auto_start = Config::instance().getBool(config, "auto_start");
-        if(auto_start){
-            startCollector(name);
-        }
-    }
-    catch(const std::exception& e){
-        spdlog::info("CollectorScheduler: can not get collect {} auto_start, do not start it", name);
+    if (resolveAutoStart(config)) {
+        startCollector(name);
     }
 }
 
