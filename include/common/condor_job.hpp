@@ -39,12 +39,12 @@ using Utils::get_pids_in_cgroup;
 
 inline bool update_job_pids(Job& job){
     auto& condor_attr = std::get<CondorJobAttr>(job.sub_attr);
-    if (job.JobPIDs.empty() && condor_attr.starter_pid == 0) {
-        spdlog::debug("CondorJob: cannot update pids by cgroup, JobPIDs and starter_pid are empty");
-        return false;
-    }
 
     if(condor_attr.starter_pid == 0){
+        if (job.JobPIDs.empty()) {
+            spdlog::debug("CondorJob: cannot initialize starter_pid, JobPIDs is empty");
+            return false;
+        }
         //初始化相关内容
         if(job.JobPIDs.size()>1){
             spdlog::warn("CondorJob: multi pids, use first");
@@ -58,7 +58,11 @@ inline bool update_job_pids(Job& job){
     }
 
     if (condor_attr.slots_cgroup_path.empty()) {
-        condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(condor_attr.starter_pid);
+        if (job.JobPIDs.empty()) {
+            spdlog::debug("CondorJob: cannot discover cgroup path, JobPIDs is empty");
+            return false;
+        }
+        condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(job.JobPIDs[0]);
     }
 
     if (condor_attr.slots_cgroup_path.empty()) {
@@ -218,29 +222,38 @@ inline std::string get_native_job_id(pid_t pid){
 
 inline void update_job_info(Job& job){
     auto& condor_attr = std::get<CondorJobAttr>(job.sub_attr);
+    const bool has_job_pid = !job.JobPIDs.empty();
 
     // 确保 starter_pid 已知 (其他字段依赖它)
     if (condor_attr.starter_pid == 0) {
-        condor_attr.starter_pid = get_ppid_of(job.JobPIDs[0]);
+        if (has_job_pid) {
+            condor_attr.starter_pid = get_ppid_of(job.JobPIDs[0]);
+        } else {
+            spdlog::debug("CondorJob: cannot initialize starter_pid in update_job_info, JobPIDs is empty");
+        }
     }
 
     // 逐字段检查，为空则从系统补全
-    if (condor_attr.scheduler_host.empty()) {
+    if (condor_attr.scheduler_host.empty() && condor_attr.starter_pid > 0) {
         condor_attr.scheduler_host = get_scheduler_host(condor_attr.starter_pid);
     }
-    if (condor_attr.scheduler_name.empty()) {
+    if (condor_attr.scheduler_name.empty() && condor_attr.starter_pid > 0) {
         condor_attr.scheduler_name = get_scheduler_name(condor_attr.starter_pid);
     }
     job.clusterTag = condor_attr.scheduler_name;
 
     if (condor_attr.slots_cgroup_path.empty()) {
-        condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(condor_attr.starter_pid);
+        if (has_job_pid) {
+            condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(job.JobPIDs[0]);
+        } else {
+            spdlog::debug("CondorJob: cannot discover cgroup path in update_job_info, JobPIDs is empty");
+        }
     }
     if (condor_attr.collector_host.empty()) {
         condor_attr.collector_host = Utils::get_condor_collector_host();
         job.cluster_name = condor_attr.collector_host;
     }
-    if (condor_attr.cluster_id == 0 || condor_attr.proc_id == 0) {
+    if ((condor_attr.cluster_id == 0 || condor_attr.proc_id == 0) && condor_attr.starter_pid > 0) {
         auto [cid, pid_] = get_cluster_and_proc_id(condor_attr.starter_pid);
         if (condor_attr.cluster_id == 0) condor_attr.cluster_id = cid;
         if (condor_attr.proc_id == 0) condor_attr.proc_id = pid_;
