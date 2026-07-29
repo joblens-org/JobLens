@@ -1,5 +1,28 @@
 # JobLens Changelog
 
+## v0.2.3 (2026-07)
+
+### Patch Release - FileWriter Parser V2 and Collector Attribution Fixes
+- Added FileWriter plain-text output support and migrated base/extended collectors onto the new FileWriter text parsing path:
+  - Introduced the FileWriter write contract for plain-text output (`449f1c6`)
+  - Migrated base and extended collector FileWriter parsing to the text parser flow (`0e8d60b`, `9da0ddb`)
+  - Updated deployment, power, and core configuration documentation to describe plain-text FileWriter output (`41a473d`, `1e05820`)
+- Added writer parser V2 context and routing support:
+  - Added the writer parser V2 context interface (`45c8c63`)
+  - Wired FileWriter and external writer parser V2 invocation paths (`7d4ca96`, `ea03f9f`)
+  - Documented the writer parser context migration strategy (`65759c1`)
+- Expanded FileWriter/parser regression coverage for output-file management, plain-text assertions, configuration conflict fallback, routing override mode, rotation close behavior, and FileWriter routing/close scenarios (`0043b67`, `004de52`, `71bf1b9`, `2e9722d`, `68bf981`, `a02ec7e`, `2b14406`)
+- Improved collector/runtime attribution robustness:
+  - Added Docker job support by extracting container names and resolving process PIDs (`11725ec`)
+  - Added `tgid` fallback for thread-level energy attribution and skipped empty snapshots (`73e166e`, `0c2ca89`)
+  - Added debugging context for disappeared processes during collector state handling (`0cad7b3`)
+  - Renamed PowerCollector Elasticsearch fields with `sys_`, nested job fields, and `rapl_` prefixes to distinguish system/IPMI/RAPL metrics (`ecf713c`, `3b6799b`)
+- Hardened release/RPM validation:
+  - Added Fedora static EPEL dependency support and updated RPM verification/release steps (`dd15a04`)
+  - Added Python ABI dependency validation so RPM artifacts match the build environment (`8d6646b`)
+
+---
+
 ## v0.2.2 (2026-07)
 
 ### Patch Release - Trigger Gunicorn Fork-Safety Fix
