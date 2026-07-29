@@ -503,7 +503,9 @@ inline bool is_process_running(pid_t pid) {
 inline void JobRegistry::update_job(Job& job){
     if(job.subtype == JobSubType::Condor){
         CondorJob::update_job_info(job);
-        CommonJob::update_job_child_process(job);   
+        if (!CondorJob::update_job_pids(job)) {
+            CommonJob::update_job_child_process(job);
+        }
     }
     if(job.subtype == JobSubType::Slurm){
         SlurmJob::update_job_info(job);

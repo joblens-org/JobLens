@@ -37,19 +37,50 @@ using Utils::get_env_field;
 using Utils::v2_cgroup_absolute_path;
 using Utils::get_pids_in_cgroup;
 
-inline void update_job_pids(Job& job){
+inline bool update_job_pids(Job& job){
     auto& condor_attr = std::get<CondorJobAttr>(job.sub_attr);
+    if (job.JobPIDs.empty() && condor_attr.starter_pid == 0) {
+        spdlog::debug("CondorJob: cannot update pids by cgroup, JobPIDs and starter_pid are empty");
+        return false;
+    }
+
     if(condor_attr.starter_pid == 0){
         //初始化相关内容
         if(job.JobPIDs.size()>1){
             spdlog::warn("CondorJob: multi pids, use first");
         }
         condor_attr.starter_pid = get_ppid_of(job.JobPIDs[0]);
-        condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(job.JobPIDs[0]);
-    }   
+    }
+
+    if (condor_attr.starter_pid <= 0) {
+        spdlog::debug("CondorJob: cannot update pids by cgroup, invalid starter_pid {}", condor_attr.starter_pid);
+        return false;
+    }
+
+    if (condor_attr.slots_cgroup_path.empty()) {
+        condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(condor_attr.starter_pid);
+    }
+
+    if (condor_attr.slots_cgroup_path.empty()) {
+        spdlog::debug("CondorJob: cannot update pids by cgroup, empty cgroup path for starter_pid {}", condor_attr.starter_pid);
+        return false;
+    }
+
     auto pid_slots_cgroup = get_pids_in_cgroup(condor_attr.slots_cgroup_path);
-    std::remove(pid_slots_cgroup.begin(), pid_slots_cgroup.end(), condor_attr.starter_pid);
+    pid_slots_cgroup.erase(
+        std::remove(pid_slots_cgroup.begin(), pid_slots_cgroup.end(), condor_attr.starter_pid),
+        pid_slots_cgroup.end());
+
+    if (pid_slots_cgroup.empty()) {
+        spdlog::debug("CondorJob: cgroup {} has no job pids after filtering starter_pid {}",
+                      condor_attr.slots_cgroup_path,
+                      condor_attr.starter_pid);
+        return false;
+    }
+
     job.JobPIDs = std::move(pid_slots_cgroup);
+    spdlog::debug("CondorJob: updated JobPIDs from cgroup {}", condor_attr.slots_cgroup_path);
+    return true;
 }
 
 /* 解析 GlobalJobId */
