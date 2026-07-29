@@ -16,11 +16,26 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <cerrno>
+#include <filesystem>
 #include <unistd.h>
 
 #include "core/collector_registry.hpp"
 #include "writer/prometheus_exporter_writer.hpp"
 #include "common/utils.hpp"
+
+namespace {
+
+bool IsVanishedProcPath(int err) {
+    return err == ENOENT || err == ENOTDIR;
+}
+
+bool IsProcessStatusGone(int pid) {
+    std::error_code ec;
+    return !std::filesystem::exists(fmt::format("/proc/{}/status", pid), ec);
+}
+
+}
 
 AUTO_REGISTER_JOB_COLLECTOR(
     CPUMemCollector,
@@ -174,9 +189,15 @@ bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info){
 
 bool CPUMemCollector::MemOf(int pid,CPUMemInfo& info){
     std::string path = "/proc/" + std::to_string(pid) + "/status";
+    errno = 0;
     std::ifstream sf(path);
     if (!sf){
-        spdlog::error("MemOf: cannot open {}", path);
+        int err = errno;
+        if (IsVanishedProcPath(err) || IsProcessStatusGone(pid)) {
+            spdlog::debug("MemOf: skip vanished process status {}", path);
+        } else {
+            spdlog::error("MemOf: cannot open {}", path);
+        }
         return false;
     }
 
@@ -211,7 +232,11 @@ bool CPUMemCollector::MemOf(int pid,CPUMemInfo& info){
     info.memoryPercent = info.mem_rss_kb > 0 && PhysMemKB > 0 ?
                          100.0 * double(info.mem_rss_kb) / double(PhysMemKB) : 0.0;
     if (!info.mem_rss_kb && !info.mem_vm_kb){
-        spdlog::error("MemOf: parse /proc/{}/status failed", pid);
+        if (IsProcessStatusGone(pid)) {
+            spdlog::debug("MemOf: skip vanished process status /proc/{}/status", pid);
+        } else {
+            spdlog::error("MemOf: parse /proc/{}/status failed", pid);
+        }
         return false;
     }
     return true;

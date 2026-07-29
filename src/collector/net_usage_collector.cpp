@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -67,6 +68,15 @@ AUTO_REGISTER_JOB_COLLECTOR(
 )
 
 namespace {
+
+static bool IsProcRaceErrno(int err) {
+    return err == ENOENT || err == ENOTDIR;
+}
+
+static bool IsProcRaceErrorCode(const std::error_code& ec) {
+    return ec == std::errc::no_such_file_or_directory ||
+           ec == std::errc::not_a_directory;
+}
 
 // 读取小文件到字符串
 static bool ReadFileToString(const std::string& path, std::string& out) {
@@ -187,7 +197,12 @@ static std::unordered_map<uint64_t, uint32_t> BuildInodeToFdMap(pid_t pid) {
     std::string dir = "/proc/" + std::to_string(pid) + "/fd";
     DIR* dp = opendir(dir.c_str());
     if (!dp) {
-        spdlog::error("NetUsageCollector: open {} failed: {}", dir, strerror(errno));
+        int err = errno;
+        if (IsProcRaceErrno(err)) {
+            spdlog::debug("NetUsageCollector: skip vanished process fd dir {}: {}", dir, strerror(err));
+        } else {
+            spdlog::error("NetUsageCollector: open {} failed: {}", dir, strerror(err));
+        }
         return m;
     }
     dirent* de;
@@ -266,7 +281,12 @@ std::vector<Connection> NetUsageCollector::ParseProcNetFile(pid_t pid, const std
     std::string path = "/proc/" + std::to_string(pid) + "/net/" + proto_file;
     std::ifstream ifs(path);
     if (!ifs.is_open()) {
-        spdlog::error("NetUsageCollector: open {} failed: {}", path, strerror(errno));
+        int err = errno;
+        if (IsProcRaceErrno(err)) {
+            spdlog::debug("NetUsageCollector: skip vanished process net file {}: {}", path, strerror(err));
+        } else {
+            spdlog::error("NetUsageCollector: open {} failed: {}", path, strerror(err));
+        }
         return conns;
     }
     std::string line;
@@ -502,12 +522,30 @@ CollectResult NetUsageCollector::collect(const Job& job) {
         pid_t pid = static_cast<pid_t>(pid_int);
         auto& ino = pid_inode_dict[pid];
         std::string fdDir = "/proc/" + std::to_string(pid) + "/fd";
-        for (const auto& entry : std::filesystem::directory_iterator(fdDir)) {
-            std::string lnk = std::filesystem::read_symlink(entry).string();
-            if (lnk.compare(0, 8, "socket:[") == 0) {
-                uint64_t i = std::stoull(lnk.substr(8, lnk.size() - 9));
-                ino.insert(i);
+        try {
+            for (const auto& entry : std::filesystem::directory_iterator(fdDir)) {
+                std::error_code ec;
+                std::string lnk = std::filesystem::read_symlink(entry.path(), ec).string();
+                if (ec) {
+                    if (IsProcRaceErrorCode(ec)) {
+                        spdlog::debug("NetUsageCollector: skip vanished fd entry {}: {}", entry.path().string(), ec.message());
+                    } else {
+                        spdlog::warn("NetUsageCollector: read symlink {} failed: {}", entry.path().string(), ec.message());
+                    }
+                    continue;
+                }
+                if (lnk.compare(0, 8, "socket:[") == 0) {
+                    uint64_t i = std::stoull(lnk.substr(8, lnk.size() - 9));
+                    ino.insert(i);
+                }
             }
+        } catch (const std::filesystem::filesystem_error& e) {
+            if (IsProcRaceErrorCode(e.code())) {
+                spdlog::debug("NetUsageCollector: skip vanished fd dir {}: {}", fdDir, e.what());
+                continue;
+            }
+            spdlog::error("NetUsageCollector: iterate {} failed: {}", fdDir, e.what());
+            continue;
         }
         
         // inode -> fd 映射
