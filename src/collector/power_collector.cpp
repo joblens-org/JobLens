@@ -421,7 +421,10 @@ PowerSnapshot PowerCollector::compute_energy(
         uint64_t jid = 0;
         std::string native_jid;
 
-        auto it_j = pid2job.find(acc.pid);
+        auto it_j = pid2job.find(acc.pid);       // 先按 tid 查
+        if (it_j == pid2job.end()) {
+            it_j = pid2job.find(acc.tgid);       // 查不到用 tgid fallback
+        }
         if (it_j != pid2job.end()) {
             jid = it_j->second;
             auto it_nj = job_native_ids.find(jid);
