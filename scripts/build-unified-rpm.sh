@@ -216,6 +216,7 @@ prepare_sources() {
 #   spec 中使用 %%{!?_version: %%define _version 0.0.0} 模式：
 #     - 传参时 → %%{_version} = 传入值
 #     - 未传参时 → 回退占位值 0.0.0（本地调试用）
+#   同时传入 build_id 和 build_time 用于版本元数据。
 #   失败时自动回退 --nodeps 重试。
 # ============================================================================
 build_rpm() {
@@ -232,7 +233,23 @@ build_rpm() {
         with_bundled_libs=1
     fi
 
-    log_info "开始 RPM 构建（rpmbuild -ba, preset=${preset}, _version=${VERSION}, with_bundled_libs=${with_bundled_libs}）..."
+    # 计算 BUILD_ID：优先使用 JOBLENS_BUILD_ID 环境变量，否则尝试 git short SHA
+    local build_id="${JOBLENS_BUILD_ID:-}"
+    if [[ -z "$build_id" ]]; then
+        if command -v git &>/dev/null && [[ -d "$PROJECT_ROOT/.git" ]]; then
+            build_id=$(cd "$PROJECT_ROOT" && git rev-parse --short=7 HEAD 2>/dev/null || echo "unknown")
+        else
+            build_id="unknown"
+        fi
+    fi
+
+    # 计算 BUILD_TIME：优先使用 JOBLENS_BUILD_TIME 环境变量，否则使用当前 UTC ISO 时间戳
+    local build_time="${JOBLENS_BUILD_TIME:-}"
+    if [[ -z "$build_time" ]]; then
+        build_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    fi
+
+    log_info "开始 RPM 构建（rpmbuild -ba, preset=${preset}, _version=${VERSION}, with_bundled_libs=${with_bundled_libs}, build_id=${build_id}, build_time=${build_time}）..."
     echo ""
 
     if rpmbuild -ba \
@@ -240,6 +257,8 @@ build_rpm() {
         --define "unified_version ${VERSION}" \
         --define "_version ${VERSION}" \
         --define "with_bundled_libs ${with_bundled_libs}" \
+        --define "build_id ${build_id}" \
+        --define "build_time ${build_time}" \
         "$spec_file"; then
         log_info "rpmbuild 构建成功"
         return 0
@@ -255,6 +274,8 @@ build_rpm() {
         --define "unified_version ${VERSION}" \
         --define "_version ${VERSION}" \
         --define "with_bundled_libs ${with_bundled_libs}" \
+        --define "build_id ${build_id}" \
+        --define "build_time ${build_time}" \
         "$spec_file"
 }
 

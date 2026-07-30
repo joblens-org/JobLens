@@ -170,7 +170,10 @@ cp %{SOURCE2} . 2>/dev/null || :
 %build
 # ===== C++ core 构建（全部配置来自 CMakePresets.json）=====
 # %{preset} 由 rpmbuild --define "preset <name>" 传入，默认 rpm-system-deps
-cmake --preset %{?preset}%{!?preset:rpm-system-deps}
+# %{build_id} 和 %{build_time} 由构建脚本传入，用于版本元数据
+cmake --preset %{?preset}%{!?preset:rpm-system-deps} \
+    -DBUILD_ID="%{?build_id}" \
+    -DBUILD_TIME="%{?build_time}"
 cmake --build --preset %{?preset}%{!?preset:rpm-system-deps}
 
 # ===== Python trigger：纯 Python 项目 =====

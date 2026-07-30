@@ -41,7 +41,12 @@ endif()
 if(NOT BUILD_ID)
   set(BUILD_ID "unknown")
 endif()
-string(TIMESTAMP BUILD_TIME UTC)
+
+# BUILD_TIME can be set externally (e.g. -DBUILD_TIME=2026-07-30T12:00:00Z from CI)
+# Only use string(TIMESTAMP) when BUILD_TIME is not provided
+if(NOT BUILD_TIME)
+  string(TIMESTAMP BUILD_TIME UTC)
+endif()
 
 # Generate version.h in the build directory to avoid polluting source tree
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/include/common)
