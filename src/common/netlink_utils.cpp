@@ -36,8 +36,10 @@ int create_nl_socket(int protocol, int rcvbufsz) {
     struct sockaddr_nl local;
 
     fd = socket(AF_NETLINK, SOCK_RAW, protocol);
-    if (fd < 0)
+    if (fd < 0) {
+        spdlog::error("NetlinkUtils: create netlink socket failed, protocol={} err={}", protocol, strerror(errno));
         return -1;
+    }
 
     if (rcvbufsz)
         if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
@@ -49,8 +51,10 @@ int create_nl_socket(int protocol, int rcvbufsz) {
     memset(&local, 0, sizeof(local));
     local.nl_family = AF_NETLINK;
 
-    if (bind(fd, (struct sockaddr *) &local, sizeof(local)) < 0)
+    if (bind(fd, (struct sockaddr *) &local, sizeof(local)) < 0) {
+        spdlog::error("NetlinkUtils: bind netlink socket failed, err={}", strerror(errno));
         goto error;
+    }
 
     return fd;
 error:
@@ -92,8 +96,10 @@ int send_cmd(int sd, uint16_t nlmsg_type, uint32_t nlmsg_pid,
         if (r > 0) {
             buf += r;
             buflen -= r;
-        } else if (errno != EAGAIN)
+        } else if (errno != EAGAIN) {
+            spdlog::error("NetlinkUtils: send_cmd sendto failed, genl_cmd={} err={}", genl_cmd, strerror(errno));
             return -1;
+        }
     }
     return 0;
 }
@@ -113,8 +119,10 @@ int send_gen_msg(int sd, struct nlmsghdr *nlh) {
         if (r > 0) {
             buf += r;
             buflen -= r;
-        } else if (errno != EAGAIN)
+        } else if (errno != EAGAIN) {
+            spdlog::error("NetlinkUtils: send_gen_msg sendto failed, err={}", strerror(errno));
             return -1;
+        }
     }
     return 0;
 }
@@ -125,8 +133,10 @@ int NetLinkUtils::create_nl_socket(int protocol, int rcvbufsz) {
     struct sockaddr_nl local;
 
     fd = socket(AF_NETLINK, SOCK_RAW, protocol);
-    if (fd < 0)
+    if (fd < 0) {
+        spdlog::error("NetLinkUtils: create netlink socket failed, protocol={} err={}", protocol, strerror(errno));
         return -1;
+    }
 
     if (rcvbufsz)
         if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
@@ -138,8 +148,10 @@ int NetLinkUtils::create_nl_socket(int protocol, int rcvbufsz) {
     memset(&local, 0, sizeof(local));
     local.nl_family = AF_NETLINK;
 
-    if (bind(fd, (struct sockaddr *) &local, sizeof(local)) < 0)
+    if (bind(fd, (struct sockaddr *) &local, sizeof(local)) < 0) {
+        spdlog::error("NetLinkUtils: bind netlink socket failed, err={}", strerror(errno));
         goto error;
+    }
 
     return fd;
 error:

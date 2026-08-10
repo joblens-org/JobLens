@@ -25,6 +25,7 @@ DirectoryWatcher::DirectoryWatcher(const std::string& rootPath)
     
     // 递归添加初始监控
     recursiveAddWatch(rootPath);
+    spdlog::info("DirectoryWatcher: 初始化完成 root={} watch_count={}", rootPath, watchMap.size());
 }
 
 DirectoryWatcher::~DirectoryWatcher() {
@@ -32,16 +33,21 @@ DirectoryWatcher::~DirectoryWatcher() {
     if (inotifyFd >= 0) {
         close(inotifyFd);
     }
+    spdlog::debug("DirectoryWatcher: 已销毁 root={}", rootPath);
 }
 
 void DirectoryWatcher::start() {
-    if (running) return;
+    if (running) {
+        spdlog::debug("DirectoryWatcher: start 被忽略, 监控线程已在运行 root={}", rootPath);
+        return;
+    }
     
     running = true;
     needUpdate = true;
     
     // 启动监控线程
     watchThread = std::thread(&DirectoryWatcher::watchThreadFunc, this);
+    spdlog::info("DirectoryWatcher: 监控线程已启动 root={}", rootPath);
 }
 
 void DirectoryWatcher::stop() {
@@ -53,6 +59,7 @@ void DirectoryWatcher::stop() {
     if (watchThread.joinable()) {
         watchThread.join();
     }
+    spdlog::info("DirectoryWatcher: 监控线程已停止 root={}", rootPath);
 }
 
 void DirectoryWatcher::setEventCallback(EventCallback callback) {
@@ -83,7 +90,7 @@ void DirectoryWatcher::recursiveAddWatch(const std::string& path) {
         // 添加根目录本身
         addWatchForPath(path);
     } catch (const std::exception& e) {
-        std::cerr << "Error traversing directory: " << e.what() << std::endl;
+        spdlog::error("DirectoryWatcher: 遍历目录失败 path={} err={}", path, e.what());
     }
 }
 
@@ -94,8 +101,7 @@ void DirectoryWatcher::addWatchForPath(const std::string& path) {
                                IN_MOVED_TO | IN_CLOSE_WRITE);
     
     if (wd < 0) {
-        std::cerr << "Failed to add watch for " << path << ": " 
-                  << strerror(errno) << std::endl;
+        spdlog::warn("DirectoryWatcher: 添加监控失败 path={} err={}", path, strerror(errno));
         return;
     }
     
@@ -121,7 +127,7 @@ void DirectoryWatcher::watchThreadFunc() {
         
         if (retval < 0) {
             if (errno == EINTR) continue; // 被信号中断
-            std::cerr << "select() error: " << strerror(errno) << std::endl;
+            spdlog::error("DirectoryWatcher: select() 出错, 监控线程退出 root={} err={}", rootPath, strerror(errno));
             break;
         } else if (retval == 0) {
             // 超时，继续循环
@@ -132,7 +138,7 @@ void DirectoryWatcher::watchThreadFunc() {
         int length = read(inotifyFd, buffer, BUF_LEN);
         if (length < 0) {
             if (errno != EAGAIN) {
-                std::cerr << "read() error: " << strerror(errno) << std::endl;
+                spdlog::error("DirectoryWatcher: read() 出错 root={} err={}", rootPath, strerror(errno));
             }
             continue;
         }
@@ -228,6 +234,6 @@ void DirectoryWatcher::collectAllFiles() {
             }
         }
     } catch (const std::exception& e) {
-        std::cerr << "Error collecting files: " << e.what() << std::endl;
+        spdlog::error("DirectoryWatcher: 收集文件列表失败 root={} err={}", rootPath, e.what());
     }
 }

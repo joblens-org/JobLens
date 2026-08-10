@@ -23,6 +23,7 @@ TimerScheduler::TimerScheduler(size_t numWorkers)
             workerLoop(i); });
     }
     schedulerThread = std::thread([this] { schedulerLoop(); });
+    spdlog::info("TimerScheduler: 已初始化, worker_count={}", numWorkers);
 }
 
 TimerScheduler::~TimerScheduler() {
@@ -37,9 +38,12 @@ TimerScheduler::~TimerScheduler() {
     if (schedulerThread.joinable()) {
         schedulerThread.join();
     }
+    spdlog::debug("TimerScheduler: 已销毁, total_processed={} total_failed={}",
+                  stats.totalTasksProcessed, stats.totalTasksFailed);
 }
 
 void TimerScheduler::shutdown() {
+    spdlog::info("TimerScheduler: 开始关闭, 等待 worker 线程退出 worker_count={}", workers.size());
     stop = true;
     cv.notify_all();
     schedulerCv.notify_all();
@@ -51,6 +55,8 @@ void TimerScheduler::shutdown() {
     if (schedulerThread.joinable()) {
         schedulerThread.join();
     }
+    spdlog::info("TimerScheduler: 已关闭, total_registered={} total_processed={} total_failed={}",
+                 stats.totalTasksRegistered, stats.totalTasksProcessed, stats.totalTasksFailed);
 }
 
 size_t TimerScheduler::registerTimer(Duration delay, Task task) {
@@ -63,7 +69,9 @@ size_t TimerScheduler::registerRepeatingTimer(Duration interval, Task task) {
 
 bool TimerScheduler::cancelTimer(size_t id) {
     std::lock_guard<std::mutex> lock(mtx);
-    return taskMap.erase(id) > 0;
+    bool erased = taskMap.erase(id) > 0;
+    spdlog::debug("TimerScheduler: cancelTimer id={} result={}", id, erased ? "removed" : "not_found");
+    return erased;
 }
 
 size_t TimerScheduler::addTask(Task task, Duration interval, bool repeat) {
