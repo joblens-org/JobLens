@@ -18,6 +18,23 @@ This file is loaded by gunicorn when starting the application.
 Since preload_app=True, the app is initialized in the master process.
 """
 
+import os
+import yaml
+
+
+def _resolve_loglevel() -> str:
+    """从 trigger 配置文件读取 logging.level，供 gunicorn 自身日志复用；读取失败回退 info"""
+    config_path = os.environ.get(
+        "JOBLENS_TRIGGER_CONFIG", "/etc/JobLens/trigger/config.yaml"
+    )
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return str(cfg.get("logging", {}).get("level", "info")).lower()
+    except Exception:
+        return "info"
+
+
 # Network binding
 bind = "0.0.0.0:7592"
 
@@ -34,7 +51,7 @@ preload_app = False
 # Logging
 accesslog = "-"
 errorlog = "-"
-loglevel = "info"
+loglevel = _resolve_loglevel()
 
 
 def post_fork(server, worker):

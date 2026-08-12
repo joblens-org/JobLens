@@ -6,6 +6,10 @@ service:
   host: 0.0.0.0
   port: 7592
 
+# Logging configuration
+logging:
+  level: INFO  # Log level: DEBUG / INFO / WARNING / ERROR / CRITICAL
+
 # Service registry configuration
 service_registry:
   enabled: true  # Whether to enable service registration

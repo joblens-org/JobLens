@@ -34,8 +34,8 @@ from trigger.api.routes import register_routes
 from trigger.utils.email_notifier import simple_send
 from trigger.core.tools import restart_joblens
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
+# 配置日志：导入期先用环境变量兜底，最终等级由 load_configuration() 读配置文件覆盖
+logging.basicConfig(level=os.environ.get('JOBLENS_LOG_LEVEL', 'INFO').upper())
 logger = logging.getLogger(__name__)
 
 
@@ -205,7 +205,27 @@ class AppContext:
             'config_manager.etcd_priority', True
         )
         
+        # 应用日志等级配置
+        self.config.setdefault('logging', {})
+        self.config['logging']['level'] = self._get_config_value('logging.level', 'INFO')
+        self._apply_log_level(self.config['logging']['level'])
+        
         logger.info("阶段1完成\n")
+    
+    def _apply_log_level(self, level_name: str) -> None:
+        """设置根日志等级，非法值回退 INFO；并将 trigger 各命名 logger 重置为 NOTSET，
+        确保它们无条件继承根等级（防御某模块私自 setLevel 导致配置失效）"""
+        level = logging.getLevelName(str(level_name).upper())
+        if not isinstance(level, int):
+            logger.warning(f"未知日志等级 '{level_name}'，回退到 INFO")
+            level = logging.INFO
+        logging.getLogger().setLevel(level)
+
+        for name, obj in logging.root.manager.loggerDict.items():
+            if isinstance(obj, logging.Logger) and name.startswith('trigger'):
+                obj.setLevel(logging.NOTSET)
+
+        logger.info(f"日志等级设置为: {logging.getLevelName(level)}")
     
     def _load_joblens_config(self) -> dict:
         """加载JobLens配置"""
