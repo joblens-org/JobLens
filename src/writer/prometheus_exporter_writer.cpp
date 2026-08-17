@@ -48,6 +48,7 @@ enum class PrmxsCollectorType{
     IO,
     Net,
     Power,
+    FSMetadata,
     UNKNOWN
 };
 
@@ -56,7 +57,8 @@ static inline PrmxsCollectorType type2enum(const std::string& type){
         {"CPUMemCollector", PrmxsCollectorType::CPUMem},
         {"NetUsageCollector", PrmxsCollectorType::Net},
         {"IOUsageCollector", PrmxsCollectorType::IO},
-        {"PowerCollector", PrmxsCollectorType::Power}
+        {"PowerCollector", PrmxsCollectorType::Power},
+        {"FSMetadataCollector", PrmxsCollectorType::FSMetadata}
     };
     auto it = map.find(type);
     return (it != map.end()) ? it->second : PrmxsCollectorType::UNKNOWN;
@@ -132,6 +134,11 @@ void PrometheusExporterWriter::update_job_metrics(const prometheus_job_state& da
                 update_ref->mem_rss_kb = s.mem_rss_kb;
                 update_ref->mem_vm_kb = s.mem_vm_kb;
                 update_ref->threads_cnt = s.threads_cnt;
+                break;
+            case PrmxsCollectorType::FSMetadata:
+                update_ref->fs_metadata_ops_total = s.fs_metadata_ops_total;
+                update_ref->fs_metadata_ops_per_sec = s.fs_metadata_ops_per_sec;
+                update_ref->fs_metadata_errors_total = s.fs_metadata_errors_total;
                 break;
             case PrmxsCollectorType::UNKNOWN:
                 spdlog::warn("PrometheusExporterWriter: type2enum get UNKNOW for {}", type);
@@ -227,7 +234,11 @@ json nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_process_state
         {"net_send_bytes_per_sec",     s.net_send_bytes_per_sec},
         {"net_recv_bytes_per_sec",     s.net_recv_bytes_per_sec},
         {"tcp_retrans_total",          s.tcp_retrans_total},
-        {"tcp_rtt_us",                 s.tcp_rtt_us}
+        {"tcp_rtt_us",                 s.tcp_rtt_us},
+
+        {"fs_metadata_ops_total",      s.fs_metadata_ops_total},
+        {"fs_metadata_ops_per_sec",    s.fs_metadata_ops_per_sec},
+        {"fs_metadata_errors_total",     s.fs_metadata_errors_total}
     };
 }
 

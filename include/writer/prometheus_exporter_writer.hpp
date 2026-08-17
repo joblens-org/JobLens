@@ -68,6 +68,13 @@ public:
         uint64_t tcp_retrans_total = 0;     // job_network_tcp_retrans_total (Counter)
         uint32_t tcp_rtt_us = 0;            // job_network_tcp_rtt_us        (Gauge)
 
+        /* ========== FS Metadata ========== */
+        // 累计值 → Counter
+        uint64_t fs_metadata_ops_total = 0;     // job_fs_metadata_ops_total   (Counter)
+        uint64_t fs_metadata_errors_total = 0;  // job_fs_metadata_errors_total (Counter)
+        // 瞬时速率 → Gauge
+        double  fs_metadata_ops_per_sec = 0.0;  // job_fs_metadata_ops_per_sec (Gauge)
+
     };
 
     struct prometheus_job_state

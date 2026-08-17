@@ -23,6 +23,7 @@
 #include <algorithm>
 #include "common/utils.hpp"
 #include "core/collector_registry.hpp"
+#include "writer/prometheus_exporter_writer.hpp"
 
 using json = nlohmann::json;
 using namespace std::chrono;
@@ -432,6 +433,41 @@ CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& w
             } catch (const std::bad_any_cast& e) {
                 spdlog::error("FSMetadataCollector: ESWriter parser bad_any_cast: {}", e.what());
                 ret["error"] = "bad cast";
+                return ret;
+            }
+        };
+    } else if (writer_type == "PrometheusExporterWriter") {
+        func = [this](std::any data) -> std::any {
+            PrometheusExporterWriter::prometheus_job_state ret;
+            if (!data.has_value()) {
+                spdlog::warn("FSMetadataCollector: PrometheusExporterWriter parser received empty data");
+                ret.JobID = 0;
+                return ret;
+            }
+
+            try {
+                auto parsed = std::any_cast<std::vector<FSMetadataProcessInfo>>(data);
+
+                for (const auto& info : parsed) {
+                    PrometheusExporterWriter::prometheus_process_state state;
+                    state.pid = info.pid;
+                    state.fs_metadata_ops_total = info.metadata_ops_total;
+                    state.fs_metadata_ops_per_sec = info.metadata_ops_rate;
+
+                    // 计算总错误数
+                    uint64_t total_errors = 0;
+                    for (const auto& op : info.ops) {
+                        total_errors += op.errors;
+                    }
+                    state.fs_metadata_errors_total = total_errors;
+
+                    ret.processes_state.push_back(std::move(state));
+                }
+
+                return ret;
+            } catch (const std::bad_any_cast& e) {
+                spdlog::error("FSMetadataCollector: PrometheusExporterWriter parser bad_any_cast: {}", e.what());
+                ret.JobID = 0;
                 return ret;
             }
         };
