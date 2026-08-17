@@ -171,6 +171,15 @@ net_sys_collector_config:
 | | `freq` | double | 在 `init()` 中额外读取：用于计算 GPU 缓存刷新间隔（`1.0 / (freq * 1.5)`）。这是调度器层 `freq` 之外的额外使用。 |
 | **ProcCollector** | *(无)* | — | 无 init 配置参数。从 `/proc/[pid]/stat`、`/proc/[pid]/status`、`/proc/[pid]/io` 等读取进程信息。**注意**：源码中已标记为将来弃用（`//TODO: 这个模块将会逐步弃用`）。 |
 | **TaskstatsCollector** | *(无)* | — | 无 init 配置参数。使用 Linux taskstats netlink 接口。**注意**：部分实现——`collect()` 方法仅记录 PID，不产生数据输出；`get_writer_parser()` 返回 `nullptr`。 |
+| **FSMetadataCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的文件系统元数据事件 |
+| | `use_ebpf` | string | **必需**：`"true"` 启用 eBPF 采集。非 eBPF 模式输出为空 |
+| | `freq` | double | 采样频率（Hz）。建议：元数据负载场景使用 1 Hz |
+
+**FSMetadataCollector 说明**：
+- 通用文件系统元数据压力采集器，捕获 open/close/stat/readdir/rename/unlink/xattr/fsync 等操作
+- 对于 Lustre 集群：通过输出字段 `fs_type=lustre` 分析 MDS/MDT 压力
+- 适用于 ext4/xfs/nfs 等任何可追踪系统调用的文件系统
+- **v1 限制**：`mount_point`/`fs_type` 标注对携带 fd 的调用最可靠；对于 *at() 系列调用的 dirfd 路径，fs_type 为尽力标注，非精确匹配
 
 ---
 

@@ -67,3 +67,28 @@ file_writer_config:
   # outputs:
   #   - collector_name: cpumem_collector
   #     file_path: /var/log/joblens/cpumem.log
+
+# ============================================================
+# Optional: Generic Filesystem Metadata Collector
+# ============================================================
+# 通用文件系统元数据压力采集器
+# 捕获 open/close/stat/readdir/rename/unlink/xattr/fsync 等元数据类操作
+# 对于 Lustre 集群，可通过 fs_type=lustre 的输出分析 MDS/MDT 压力
+# 对于 ext4/xfs/nfs 等文件系统同样适用
+#
+# 注意 (v1 限制)：
+#   - 基于 eBPF hash accumulator，需要 use_ebpf: "true"
+#   - mount_point/fs_type 标注对 fd-bearing 调用最可靠
+#   - 对于 *at() 系列调用的 dirfd 路径，fs_type 为尽力标注，非精确匹配
+#
+#   collectors:
+#     - name: fs_metadata_collector
+#       type: FSMetadataCollector
+#       config: fs_metadata_collector_config
+#
+# fs_metadata_collector_config:
+#   freq: 1                    # 采样频率（Hz），建议 1
+#   summary: false             # false=按进程输出, true=全Job汇总
+#   use_ebpf: true             # 启用 eBPF（必须；非 eBPF 模式输出为空）
+#   use_writers:
+#     - file_writer

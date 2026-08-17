@@ -172,6 +172,15 @@ The collector's `init(json_cfg)` method receives a JSON object converted from th
 | | `freq` | double | Additionally read in `init()`: used to calculate GPU cache refresh interval (`1.0 / (freq * 1.5)`). This is in addition to the scheduler-level `freq`. | `gpu_usage_collector.cpp:156-197` |
 | **ProcCollector** | *(none)* | — | No init config parameters. Reads process information from `/proc/[pid]/stat`, `/proc/[pid]/status`, `/proc/[pid]/io`, etc. **Note**: source code marks this collector for future deprecation (`//TODO: 这个模块将会逐步弃用`). | `proc_collector_func.cpp:276-285` |
 | **TaskstatsCollector** | *(none)* | — | No init config parameters. Uses Linux taskstats netlink interface. **Note**: partially implemented — `collect()` method logs PIDs but does not produce data output; `get_writer_parser()` returns `nullptr`. | `taskstats_collector.cpp:44-47` |
+| **FSMetadataCollector** | `summary` | string | When `"true"`, aggregates filesystem metadata events across all processes | `fs_metadata_collector.cpp:45` |
+| | `use_ebpf` | string | **Required**: `"true"` to enable eBPF-based collection. Non-eBPF mode produces empty output | `fs_metadata_collector.cpp:52` |
+| | `freq` | double | Sampling frequency (Hz). Recommended: 1 Hz for metadata workloads | `fs_metadata_collector.cpp:58` |
+
+**FSMetadataCollector Notes**:
+- Generic filesystem metadata pressure collector capturing open/close/stat/readdir/rename/unlink/xattr/fsync operations
+- For Lustre clusters: analyze MDS/MDT pressure via `fs_type=lustre` output field
+- Works with ext4/xfs/nfs/etc. — any filesystem with traceable syscalls
+- **v1 Limitation**: `mount_point`/`fs_type` labels are most reliable for fd-bearing calls; for *at() dirfd paths, fs_type is best-effort, not exact
 
 ---
 
