@@ -33,12 +33,20 @@ collectors_config:
     - name: cpumem_collector
       type: CPUMemCollector
       config: cpumem_collector_config
+    # - name: new_io_usage
+    #   type: NewIOUsageCollector
+    #   config: new_io_usage_config
 
 cpumem_collector_config:
   freq: 1                                    # Sample once per second
   summary: false                             # false = per-process, true = aggregate summary
   use_writers:
     - file_writer                            # Output to local file
+
+# NewIOUsageCollector: Job/文件为中心的 IO 采集（eBPF Job 级聚合 + 时延分布）
+# new_io_usage_config:
+#   freq: 0.2                                # Sampling frequency in Hz
+#   use_ebpf: "true"                         # Enable eBPF job-level IO + latency histogram
 
 # ============================================================
 # Writer Configuration — FileWriter only

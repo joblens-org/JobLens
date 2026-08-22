@@ -74,6 +74,11 @@ public:
     {
         int JobID{};
         std::vector<prometheus_process_state> processes_state;
+        // Job 级 I/O（NewIOUsageCollector：VFS syscall 层，弃用物理块字段）
+        int64_t io_rchar_total = 0;
+        int64_t io_wchar_total = 0;
+        double  io_rchar_per_sec = 0.0;
+        double  io_wchar_per_sec = 0.0;
     };
 
 protected:

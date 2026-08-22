@@ -26,6 +26,9 @@
 #include <linux/bpf.h>
 #include <spdlog/spdlog.h>
 #include <optional>
+#include <sys/stat.h>
+#include <cerrno>
+#include <cstdint>
 
 
 namespace EbpfCommon{
@@ -256,6 +259,69 @@ namespace EbpfCommon{
         std::vector<uint64_t> values;
         values.assign(pids.size(), jobid);
         return update_hashmap_batch<pid_t, uint64_t>(obj, map_name, pids, values);
+    }
+
+    // stat().st_ino 即 cgroup v2 目录的 kernfs inode，与内核侧
+    // bpf_get_current_cgroup_id() 返回同值，故可直接作为 cgroup2job 的 key。
+    inline std::optional<uint64_t> cgroup_path_to_id(const std::string& cgroup_path){
+        if (cgroup_path.empty()) return std::nullopt;
+        struct stat st{};
+        if (::stat(cgroup_path.c_str(), &st) != 0){
+            spdlog::warn("cgroup_path_to_id: stat({}) failed, errno={}", cgroup_path, errno);
+            return std::nullopt;
+        }
+        return static_cast<uint64_t>(st.st_ino);
+    }
+
+    inline bool update_cgroup_in_kernel(const bpf_object* obj, const std::string& map_name, uint64_t jobid, const std::vector<uint64_t>& cgroup_ids){
+        std::vector<uint64_t> values;
+        values.assign(cgroup_ids.size(), jobid);
+        return update_hashmap_batch<uint64_t, uint64_t>(obj, map_name, cgroup_ids, values);
+    }
+
+    // 批量遍历 HASH map：一次拉取 batch 条 key/value，避免逐条 get_next_key 的 syscall 开销。
+    // 返回拉取到的条目数；返回后 keys/values 大小一致。
+    template <typename Key, typename Value>
+    size_t lookup_hashmap_batch(const bpf_object* obj,
+                                const std::string& map_name,
+                                std::vector<Key>& keys,
+                                std::vector<Value>& values,
+                                size_t batch_size = 1024)
+    {
+        struct bpf_map* map = bpf_object__find_map_by_name(obj, map_name.c_str());
+        if (!map) {
+            spdlog::error("lookup_hashmap_batch: map '{}' not found", map_name);
+            return 0;
+        }
+
+        keys.clear();
+        values.clear();
+
+        std::vector<Key> batch_keys(batch_size);
+        std::vector<Value> batch_vals(batch_size);
+
+        bpf_map_batch_opts opts{};
+        opts.sz = sizeof(opts);
+
+        void *in_batch = nullptr;
+        while (true) {
+            void *out_batch = nullptr;
+            uint32_t count = static_cast<uint32_t>(batch_size);
+            int err = bpf_map_lookup_batch(bpf_map__fd(map), in_batch, &out_batch,
+                                           batch_keys.data(), batch_vals.data(),
+                                           &count, &opts);
+            if (err) {
+                if (err == -ENOENT) break;  // 遍历完成
+                spdlog::error("lookup_hashmap_batch: bpf_map_lookup_batch({}) failed err={} errno={}",
+                              map_name, err, errno);
+                break;
+            }
+            keys.insert(keys.end(), batch_keys.begin(), batch_keys.begin() + count);
+            values.insert(values.end(), batch_vals.begin(), batch_vals.begin() + count);
+            if (count < batch_size) break;  // 已到尾部
+            in_batch = out_batch;
+        }
+        return keys.size();
     }
 
 
