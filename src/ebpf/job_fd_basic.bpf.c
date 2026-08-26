@@ -15,6 +15,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include "ebpf/job_pid_track.h" // 共享 pid2job 规格
 #include "ebpf/job_fd_basic.h" //一定要放在最后面
 
 #define TP_ARGS(dst, idx, ctx) \
@@ -25,12 +26,13 @@ bpf_probe_read_kernel(dst, sizeof(*dst), __p);}
 {void *__p = (void*)ctx + sizeof(struct trace_entry) + sizeof(long int); \
 bpf_probe_read_kernel(dst, sizeof(*dst), __p);}
 
-/* 过滤表：pid → job_id */
+/* 过滤表：pid → job_id（共享 map, 由 job_pid_track.bpf.o 维护, pin 复用） */
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, u32);
     __type(value, u64);
-    __uint(max_entries, 8192);
+    __uint(max_entries, JOBLENS_PID2JOB_MAX_ENTRIES);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } pid2job SEC(".maps");
 
 struct {

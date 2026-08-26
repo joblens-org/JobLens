@@ -36,6 +36,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include "ebpf/job_pid_track.h"
 #include "ebpf/trace_sched_runtime.h"
 
 /* ── BPF Maps ───────────────────────────────────────────────────────────── */
@@ -67,16 +68,16 @@ struct {
 } task_cpu_time SEC(".maps");
 
 /*
- * PID → JobID 映射表
- * 由用户态 PowerCollector::update_pid2job_map() 在每个采集周期批量写入。
- * eBPF侧仅用于查询——但当前版本的归因计算在用户态完成，
- * 此map可在eBPF侧做预过滤以减小map遍历开销。
+ * PID → JobID 映射表（共享 map, 由 job_pid_track.bpf.o 维护, pin 复用）
+ * 由 job_pid_track 的 fork/exit hook 及用户态 JobRegistry 统一维护,
+ * 本对象只读。规格必须与 job_pid_track.h 权威定义逐字节一致。
  */
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, u32);       /* tid (线程ID) */
     __type(value, u64);     /* JobID */
-    __uint(max_entries, 65536);
+    __uint(max_entries, JOBLENS_PID2JOB_MAX_ENTRIES);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } pid2job SEC(".maps");
 
 /* ── sched_switch tracepoint (BTF-enabled) ──────────────────────────────── */

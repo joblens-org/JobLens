@@ -14,6 +14,7 @@
 #include "ebpf/vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include "ebpf/job_pid_track.h" // 共享 pid2job / cgroup2job 规格
 #include "ebpf/job_io_new.h" //一定要放在最后面
 
 #define TP_ARGS(dst, idx, ctx) \
@@ -26,20 +27,24 @@ bpf_probe_read_kernel(dst, sizeof(*dst), __p);}
 
 #define MAX_ENTRIES 65536
 
-/* pid → job_id。LRU_HASH：resolve_job 命中 cgroup 后回写短命/子进程 pid，需内核自动淘汰脏项 */
+/* pid → job_id。共享 map(由 job_pid_track.bpf.o 维护, pin 复用)。
+ * 本对象只读: fork 繁衍/exit 回收统一由 job_pid_track 负责, 避免双写竞争。 */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, u32);
     __type(value, u64);
-    __uint(max_entries, MAX_ENTRIES);
+    __uint(max_entries, JOBLENS_PID2JOB_MAX_ENTRIES);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } pid2job SEC(".maps");
 
-/* cgroup_id(kernfs ino) → job_id。用户态 stat().st_ino 写入，与 bpf_get_current_cgroup_id() 同值 */
+/* cgroup_id(kernfs ino) → job_id。共享 map, pin 复用。用户态 stat().st_ino 写入,
+ * 与 bpf_get_current_cgroup_id() 同值。 */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, u64);
     __type(value, u64);
-    __uint(max_entries, 4096);
+    __uint(max_entries, JOBLENS_CGROUP2JOB_MAX_ENTRIES);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } cgroup2job SEC(".maps");
 
 /* Job 级 I/O 累加器：key=job_id，含短命进程，summary 按 JobID O(1) 读 */
@@ -66,7 +71,8 @@ struct {
     __uint(max_entries, 4096 * 64);
 } latency_hist SEC(".maps");
 
-/* 逐级解析归属 JobID：先查 pid2job；miss 则查 cgroup2job 并把 pid 回写 pid2job 做缓存 */
+/* 逐级解析归属 JobID：先查 pid2job；miss 则查 cgroup2job。
+ * 注意: pid2job 的繁衍(回写)统一由 job_pid_track 的 fork hook 负责, 本处只读, 不回写。 */
 static __always_inline u64* resolve_job(u32 pid)
 {
     u64 *job_id = bpf_map_lookup_elem(&pid2job, &pid);
@@ -74,13 +80,7 @@ static __always_inline u64* resolve_job(u32 pid)
         return job_id;
 
     u64 cgid = bpf_get_current_cgroup_id();
-    job_id = bpf_map_lookup_elem(&cgroup2job, &cgid);
-    if (job_id) {
-        u64 jid = *job_id;
-        bpf_map_update_elem(&pid2job, &pid, &jid, BPF_ANY);
-        return bpf_map_lookup_elem(&pid2job, &pid);
-    }
-    return NULL;
+    return bpf_map_lookup_elem(&cgroup2job, &cgid);
 }
 
 /* 低端线性 + 高端 log2 混合分桶（微秒基准）：
