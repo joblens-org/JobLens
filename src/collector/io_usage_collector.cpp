@@ -20,13 +20,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <nlohmann/json.hpp>
-#include <filesystem>
 #include <iostream>
 #include "common/utils.hpp"
 #include "core/collector_registry.hpp"
 #include "writer/prometheus_exporter_writer.hpp"
 // #include "ebpf/job_fd_basic.h"
-#include "common/utils.hpp"
 
 AUTO_REGISTER_JOB_COLLECTOR(
     IOUsageCollector, 
@@ -372,11 +370,11 @@ CollectResult IOUsageCollector::collect(const Job &job)
         auto it = pid_state_dict.find(pid);
         if (it != pid_state_dict.end()) {
             const pid_state &st = it->second;
-            collect_period = std::chrono::duration_cast<std::chrono::seconds>(now - st.last_time).count();
-            info.read_speed  = (rb  >= st.last_read_bytes)  ? (rb  - st.last_read_bytes)  / collect_period : 0;
-            info.write_speed = (wb  >= st.last_write_bytes) ? (wb  - st.last_write_bytes) / collect_period : 0;
-            info.rchar_speed = (rch >= st.last_rchar)       ? (rch - st.last_rchar)       / collect_period : 0;
-            info.wchar_speed = (wch >= st.last_wchar)       ? (wch - st.last_wchar)       / collect_period : 0;
+            collect_period = std::chrono::duration<double>(now - st.last_time).count();
+            info.read_speed  = (collect_period > 0 && rb  >= st.last_read_bytes)  ? (rb  - st.last_read_bytes)  / collect_period : 0;
+            info.write_speed = (collect_period > 0 && wb  >= st.last_write_bytes) ? (wb  - st.last_write_bytes) / collect_period : 0;
+            info.rchar_speed = (collect_period > 0 && rch >= st.last_rchar)       ? (rch - st.last_rchar)       / collect_period : 0;
+            info.wchar_speed = (collect_period > 0 && wch >= st.last_wchar)       ? (wch - st.last_wchar)       / collect_period : 0;
             spdlog::debug("IOUsageCollector: pid={} read_speed={} write_speed={} rchar_speed={} wchar_speed={}",
                           pid, info.read_speed, info.write_speed, info.rchar_speed, info.wchar_speed);
         }else {
@@ -468,11 +466,11 @@ CollectResult IOUsageCollector::collect(const Job &job)
         } else{
             auto& state = job_summary_state_dict[job.JobID];
             auto now = steady_clock::now();
-            collect_period = std::chrono::duration_cast<std::chrono::seconds>(now - state.last_time).count();
-            info_summary.read_speed  = (info_summary.read_bytes  >= state.last_read_bytes)  ? (info_summary.read_bytes  - state.last_read_bytes)  / collect_period : 0;
-            info_summary.write_speed = (info_summary.write_bytes  >= state.last_write_bytes) ? (info_summary.write_bytes  - state.last_write_bytes) / collect_period : 0;
-            info_summary.rchar_speed = (info_summary.rchar >= state.last_rchar)       ? (info_summary.rchar - state.last_rchar)       / collect_period : 0;
-            info_summary.wchar_speed = (info_summary.wchar >= state.last_wchar)       ? (info_summary.wchar - state.last_wchar)       / collect_period : 0;
+            collect_period = std::chrono::duration<double>(now - state.last_time).count();
+            info_summary.read_speed  = (collect_period > 0 && info_summary.read_bytes  >= state.last_read_bytes)  ? (info_summary.read_bytes  - state.last_read_bytes)  / collect_period : 0;
+            info_summary.write_speed = (collect_period > 0 && info_summary.write_bytes  >= state.last_write_bytes) ? (info_summary.write_bytes  - state.last_write_bytes) / collect_period : 0;
+            info_summary.rchar_speed = (collect_period > 0 && info_summary.rchar >= state.last_rchar)       ? (info_summary.rchar - state.last_rchar)       / collect_period : 0;
+            info_summary.wchar_speed = (collect_period > 0 && info_summary.wchar >= state.last_wchar)       ? (info_summary.wchar - state.last_wchar)       / collect_period : 0;
             state.last_read_bytes   = info_summary.read_bytes;
             state.last_write_bytes  = info_summary.write_bytes;
             state.last_rchar        = info_summary.rchar;

@@ -198,7 +198,7 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
     auto now = std::chrono::steady_clock::now();
     auto it_time = last_job_time_.find(job.JobID);
     if (it_time != last_job_time_.end()){
-        double period = std::chrono::duration_cast<std::chrono::seconds>(now - it_time->second).count();
+        double period = std::chrono::duration<double>(now - it_time->second).count();
         result.collect_period = period;
         auto it_io = last_job_io_.find(job.JobID);
         if (it_io != last_job_io_.end() && period > 0){
@@ -317,20 +317,82 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
             auto s = std::any_cast<JobIOStat>(data);
             std::ostringstream out;
             out << "NewIOUsageCollector job_id=" << s.job_id
+                << " collect_period=" << s.collect_period
                 << " rchar=" << s.job_total.rchar
                 << " wchar=" << s.job_total.wchar
                 << " syscr=" << s.job_total.syscr
                 << " syscw=" << s.job_total.syscw
+                << " read_mean=" << s.job_total.read_mean
+                << " write_mean=" << s.job_total.write_mean
+                << " read_variance=" << s.job_total.read_variance
+                << " write_variance=" << s.job_total.write_variance
                 << " rchar_speed=" << s.job_total.rchar_speed
                 << " wchar_speed=" << s.job_total.wchar_speed
                 << '\n';
+            for (size_t i = 0; i < LATENCY_BUCKETS; ++i){
+                if (s.job_latency.read_hist[i] != 0 || s.job_latency.write_hist[i] != 0){
+                    out << "NewIOUsageCollector latency_bucket"
+                        << " job_id=" << s.job_id
+                        << " bucket=" << i
+                        << " read_count=" << s.job_latency.read_hist[i]
+                        << " write_count=" << s.job_latency.write_hist[i]
+                        << '\n';
+                }
+            }
+            for (const auto& [pid, p] : s.processes){
+                out << "NewIOUsageCollector process"
+                    << " job_id=" << s.job_id
+                    << " pid=" << pid
+                    << " source=" << p.source
+                    << " alive=" << p.alive
+                    << " rchar=" << p.io.rchar
+                    << " wchar=" << p.io.wchar
+                    << " syscr=" << p.io.syscr
+                    << " syscw=" << p.io.syscw
+                    << " read_mean=" << p.io.read_mean
+                    << " write_mean=" << p.io.write_mean
+                    << " read_variance=" << p.io.read_variance
+                    << " write_variance=" << p.io.write_variance
+                    << " rchar_speed=" << p.io.rchar_speed
+                    << " wchar_speed=" << p.io.wchar_speed
+                    << '\n';
+            }
             for (const auto& [path, f] : s.files){
-                out << "NewIOUsageCollector file path=" << path
+                out << "NewIOUsageCollector file"
+                    << " job_id=" << s.job_id
+                    << " path=" << path
+                    << " mount_point=" << f.mount_point
+                    << " fs_type=" << f.fs_type
+                    << " pos=" << f.pos
                     << " rchar=" << f.total.rchar
                     << " wchar=" << f.total.wchar
+                    << " syscr=" << f.total.syscr
+                    << " syscw=" << f.total.syscw
+                    << " read_mean=" << f.total.read_mean
+                    << " write_mean=" << f.total.write_mean
+                    << " read_variance=" << f.total.read_variance
+                    << " write_variance=" << f.total.write_variance
                     << " rchar_speed=" << f.total.rchar_speed
                     << " wchar_speed=" << f.total.wchar_speed
                     << '\n';
+                for (const auto& [pid, p] : f.processes){
+                    out << "NewIOUsageCollector file_process"
+                        << " job_id=" << s.job_id
+                        << " path=" << path
+                        << " pid=" << pid
+                        << " alive=" << p.alive
+                        << " rchar=" << p.io.rchar
+                        << " wchar=" << p.io.wchar
+                        << " syscr=" << p.io.syscr
+                        << " syscw=" << p.io.syscw
+                        << " read_mean=" << p.io.read_mean
+                        << " write_mean=" << p.io.write_mean
+                        << " read_variance=" << p.io.read_variance
+                        << " write_variance=" << p.io.write_variance
+                        << " rchar_speed=" << p.io.rchar_speed
+                        << " wchar_speed=" << p.io.wchar_speed
+                        << '\n';
+                }
             }
             return out.str();
         };
