@@ -51,9 +51,41 @@ namespace EbpfCommon{
         return (mount / path).lexically_normal().string();
     }
 
-    inline bpf_object* load_bpf_obj(const std::string& bpf_o_path, std::vector<struct bpf_link *>& links) {
-        // 打开ELF
-        bpf_object* obj_ = bpf_object__open_file(bpf_o_path.c_str(), nullptr);
+    // 确保 bpffs 已挂载且 pin 根目录存在。pin_root 形如 "/sys/fs/bpf/joblens"。
+    // 常规系统 /sys/fs/bpf 已由 systemd 挂载, 这里仅兜底创建子目录。
+    inline bool ensure_bpf_pin_dir(const std::string& pin_root) {
+        const std::string bpffs = "/sys/fs/bpf";
+        struct stat st{};
+        if (::stat(bpffs.c_str(), &st) != 0) {
+            spdlog::error("ensure_bpf_pin_dir: bpffs {} not available, errno={}", bpffs, errno);
+            return false;
+        }
+        std::error_code ec;
+        fs::create_directories(pin_root, ec);
+        if (ec) {
+            spdlog::error("ensure_bpf_pin_dir: create {} failed: {}", pin_root, ec.message());
+            return false;
+        }
+        return true;
+    }
+
+    // 内部实现: open(可选 pin_root) -> load -> attach。
+    inline bpf_object* load_bpf_obj_impl(const std::string& bpf_o_path,
+                                         std::vector<struct bpf_link *>& links,
+                                         const std::string& pin_root) {
+        bpf_object* obj_ = nullptr;
+        // 打开ELF。传入 pin_root_path 后, 标记了 LIBBPF_PIN_BY_NAME 的 map 会在
+        // load 时按 <pin_root>/<map_name> 做 create-or-reuse, 实现跨 .bpf.o 共享。
+        if (!pin_root.empty()) {
+            if (!ensure_bpf_pin_dir(pin_root)) return nullptr;
+            LIBBPF_OPTS(bpf_object_open_opts, opts);
+            opts.pin_root_path = pin_root.c_str();
+            obj_ = bpf_object__open_file(bpf_o_path.c_str(), &opts);
+            spdlog::debug("load_bpf_obj: opening {} with pin_root={} (shared maps create-or-reuse)",
+                          bpf_o_path, pin_root);
+        } else {
+            obj_ = bpf_object__open_file(bpf_o_path.c_str(), nullptr);
+        }
         if (libbpf_get_error(obj_)) {
             spdlog::error("bpf_object__open_file {}", bpf_o_path);
             return nullptr;
@@ -62,6 +94,7 @@ namespace EbpfCommon{
         int err = bpf_object__load(obj_);
         if (err) {
             spdlog::error("load_bpf_obj: bpf_object__load {}", err);
+            bpf_object__close(obj_);
             return nullptr;
         }
 
@@ -77,6 +110,18 @@ namespace EbpfCommon{
         }
         spdlog::debug("load_bpf_obj: link count: {}",links.size());
         return obj_;
+    }
+
+    inline bpf_object* load_bpf_obj(const std::string& bpf_o_path, std::vector<struct bpf_link *>& links) {
+        return load_bpf_obj_impl(bpf_o_path, links, "");
+    }
+
+    // 带 pin 根目录的加载: 标记 LIBBPF_PIN_BY_NAME 的 map 在 <pin_root>/<name>
+    // 处做 create-or-reuse。首个加载者创建并 pin, 后续加载者复用同一份 map fd。
+    inline bpf_object* load_bpf_obj_pinned(const std::string& bpf_o_path,
+                                           std::vector<struct bpf_link *>& links,
+                                           const std::string& pin_root) {
+        return load_bpf_obj_impl(bpf_o_path, links, pin_root);
     }
 
     inline ring_buffer* new_rb(const bpf_object* obj, std::string name, ring_buffer_sample_fn callback, void* ctx){
@@ -344,6 +389,56 @@ namespace EbpfCommon{
         return keys.size();
     }
 
+
+    // 从 bpffs pin path 直接取回一个已 pin 的 map fd(不经由 bpf_object)。
+    // 供 JobRegistry / JobPidTracker 访问由 job_pid_track.bpf.o 创建的共享 map。
+    // 返回 <0 表示失败。调用方负责 close。
+    inline int get_pinned_map_fd(const std::string& pin_path) {
+        int fd = bpf_obj_get(pin_path.c_str());
+        if (fd < 0) {
+            spdlog::error("get_pinned_map_fd: bpf_obj_get({}) failed, errno={}", pin_path, errno);
+        }
+        return fd;
+    }
+
+    // 按 pid 逐条写入某个已取得 fd 的 hash map(key=u32 pid, value=u64 job_id)。
+    inline bool update_map_by_fd(int fd, uint32_t key, uint64_t value, uint64_t flags = BPF_ANY) {
+        if (fd < 0) return false;
+        if (bpf_map_update_elem(fd, &key, &value, flags) != 0) {
+            spdlog::error("update_map_by_fd: bpf_map_update_elem(fd={}) failed, errno={}", fd, errno);
+            return false;
+        }
+        return true;
+    }
+
+    inline bool update_map_by_fd_u64(int fd, uint64_t key, uint64_t value, uint64_t flags = BPF_ANY) {
+        if (fd < 0) return false;
+        if (bpf_map_update_elem(fd, &key, &value, flags) != 0) {
+            spdlog::error("update_map_by_fd_u64: bpf_map_update_elem(fd={}) failed, errno={}", fd, errno);
+            return false;
+        }
+        return true;
+    }
+
+    inline bool delete_map_by_fd(int fd, uint32_t key) {
+        if (fd < 0) return false;
+        int err = bpf_map_delete_elem(fd, &key);
+        if (err != 0 && errno != ENOENT) {
+            spdlog::error("delete_map_by_fd: bpf_map_delete_elem(fd={}) failed, errno={}", fd, errno);
+            return false;
+        }
+        return true;
+    }
+
+    inline bool delete_map_by_fd_u64(int fd, uint64_t key) {
+        if (fd < 0) return false;
+        int err = bpf_map_delete_elem(fd, &key);
+        if (err != 0 && errno != ENOENT) {
+            spdlog::error("delete_map_by_fd_u64: bpf_map_delete_elem(fd={}) failed, errno={}", fd, errno);
+            return false;
+        }
+        return true;
+    }
 
     inline void free_rb(struct ring_buffer* rb){
         if(rb) ring_buffer__free(rb);
