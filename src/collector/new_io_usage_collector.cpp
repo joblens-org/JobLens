@@ -25,8 +25,7 @@ AUTO_REGISTER_JOB_COLLECTOR(
     NewIOUsageCollector,
     "Collect IO usage aggregated by Job and file (eBPF job-level + latency distribution)",
     ConfigParams{
-        {"freq", "Sampling frequency in Hz"},
-        {"use_ebpf", "Whether to use ebpf for job-level IO (true/false)"}
+        {"freq", "Sampling frequency in Hz"}
     }
 )
 
@@ -45,13 +44,11 @@ static std::string get_job_cgroup_path(const Job& job){
 }
 
 bool NewIOUsageCollector::init(const json& cfg){
-    if (cfg.contains("use_ebpf") && cfg["use_ebpf"].get<std::string>() == "true"){
-        use_ebpf = true;
-        if (!init_ebpf()){
-            spdlog::error("NewIOUsageCollector: init ebpf error");
-            deinit_ebpf();
-            use_ebpf = false;
-        }
+    (void)cfg;
+    if (!init_ebpf()){
+        spdlog::error("NewIOUsageCollector: init ebpf error");
+        deinit_ebpf();
+        return false;
     }
     return true;
 }
@@ -67,7 +64,7 @@ void NewIOUsageCollector::deinit_ebpf(){
 }
 
 void NewIOUsageCollector::deinit() noexcept{
-    if (use_ebpf) deinit_ebpf();
+    deinit_ebpf();
     spdlog::info("NewIOUsageCollector deinit");
 }
 
@@ -106,96 +103,96 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
     JobIOStat result;
     result.job_id = job.JobID;
 
-    if (use_ebpf){
-        // 1. 更新内核过滤表（pid + cgroup）
-        EbpfCommon::update_pid_in_kernel(bpf_obj_, pid2jobid_map_name, job.JobID, job.JobPIDs);
-        auto cg_path = get_job_cgroup_path(job);
+    // 1. 更新内核过滤表（pid + cgroup）
+    EbpfCommon::update_pid_in_kernel(bpf_obj_, pid2jobid_map_name, job.JobID, job.JobPIDs);
+    auto cg_path = get_job_cgroup_path(job);
+    if (!cg_path.empty()){
         if (auto cgid = EbpfCommon::cgroup_path_to_id(cg_path)){
             if (!EbpfCommon::update_cgroup_in_kernel(bpf_obj_, cgroup2jobid_map_name, job.JobID, {*cgid})){
                 spdlog::warn("NewIOUsageCollector: update cgroup in kernel error, job={} path={}", job.JobID, cg_path);
             }
         }
+    }
 
-        // 2. Job 级总量（权威，含短命进程）
-        if (auto js = EbpfCommon::lookup_hashmap_elem<uint64_t, rw_stat>(bpf_obj_, jobstat_map_name, job.JobID)){
-            result.job_total.rchar = js->read_bytes;
-            result.job_total.wchar = js->write_bytes;
-            result.job_total.syscr = js->read_count;
-            result.job_total.syscw = js->write_count;
-            result.job_total.read_mean = js->read_mean;
-            result.job_total.write_mean = js->write_mean;
-            result.job_total.read_variance = js->read_variance;
-            result.job_total.write_variance = js->write_variance;
-        }
+    // 2. Job 级总量（权威，含短命进程）
+    if (auto js = EbpfCommon::lookup_hashmap_elem<uint64_t, rw_stat>(bpf_obj_, jobstat_map_name, job.JobID)){
+        result.job_total.rchar = js->read_bytes;
+        result.job_total.wchar = js->write_bytes;
+        result.job_total.syscr = js->read_count;
+        result.job_total.syscw = js->write_count;
+        result.job_total.read_mean = js->read_mean;
+        result.job_total.write_mean = js->write_mean;
+        result.job_total.read_variance = js->read_variance;
+        result.job_total.write_variance = js->write_variance;
+    }
 
-        // 3. 时延直方图（64 桶 × 读/写 逐桶查询）
-        for (uint32_t b = 0; b < LATENCY_BUCKETS; ++b){
-            struct latency_key rk = {.job_id = job.JobID, .bucket = b, .is_write = 0};
-            if (auto v = EbpfCommon::lookup_hashmap_elem<latency_key, u64>(bpf_obj_, latency_map_name, rk))
-                result.job_latency.read_hist[b] = *v;
-            struct latency_key wk = {.job_id = job.JobID, .bucket = b, .is_write = 1};
-            if (auto v = EbpfCommon::lookup_hashmap_elem<latency_key, u64>(bpf_obj_, latency_map_name, wk))
-                result.job_latency.write_hist[b] = *v;
-        }
+    // 3. 时延直方图（64 桶 × 读/写 逐桶查询）
+    for (uint32_t b = 0; b < LATENCY_BUCKETS; ++b){
+        struct latency_key rk = {.job_id = job.JobID, .bucket = b, .is_write = 0};
+        if (auto v = EbpfCommon::lookup_hashmap_elem<latency_key, u64>(bpf_obj_, latency_map_name, rk))
+            result.job_latency.read_hist[b] = *v;
+        struct latency_key wk = {.job_id = job.JobID, .bucket = b, .is_write = 1};
+        if (auto v = EbpfCommon::lookup_hashmap_elem<latency_key, u64>(bpf_obj_, latency_map_name, wk))
+            result.job_latency.write_hist[b] = *v;
+    }
 
-        // 4. 刷新周期缓存 + 聚合进程/文件
-        refresh_dump_cache_if_needed();
-        for (size_t i = 0; i < dump_keys_.size(); ++i){
-            if (dump_keys_[i].job_id != job.JobID) continue;
-            pid_t pid = dump_keys_[i].pid;
-            u32 fd = dump_keys_[i].fd;
-            const rw_stat& s = dump_vals_[i];
+    // 4. 刷新周期缓存 + 聚合进程/文件
+    refresh_dump_cache_if_needed();
+    for (size_t i = 0; i < dump_keys_.size(); ++i){
+        if (dump_keys_[i].job_id != job.JobID) continue;
+        pid_t pid = dump_keys_[i].pid;
+        u32 fd = dump_keys_[i].fd;
+        const rw_stat& s = dump_vals_[i];
 
-            // 进程级聚合（含短命进程）
-            auto& proc = result.processes[pid];
-            proc.pid = pid;
-            proc.io.rchar += s.read_bytes;
-            proc.io.wchar += s.write_bytes;
-            proc.io.syscr += s.read_count;
-            proc.io.syscw += s.write_count;
-            proc.alive = Utils::is_process_running(pid);
-            proc.source = proc.alive ? "alive" : "ephemeral";
+        // 进程级聚合（含短命进程）
+        auto& proc = result.processes[pid];
+        proc.pid = pid;
+        proc.io.rchar += s.read_bytes;
+        proc.io.wchar += s.write_bytes;
+        proc.io.syscr += s.read_count;
+        proc.io.syscw += s.write_count;
+        proc.alive = Utils::is_process_running(pid);
+        proc.source = proc.alive ? "alive" : "ephemeral";
 
-            // 文件级聚合（仅存活进程能 fd→path；短命进程死后无法反查文件路径）
-            if (proc.alive){
-                std::string fdpath = "/proc/" + std::to_string(pid) + "/fd/" + std::to_string(fd);
-                char buf[512];
-                ssize_t n = ::readlink(fdpath.c_str(), buf, sizeof(buf) - 1);
-                if (n > 0){
-                    buf[n] = '\0';
-                    std::string path(buf);
-                    if (!path.empty() && path[0] == '/'){
-                        struct stat stb;
-                        if (::stat(path.c_str(), &stb) == 0 && (S_ISREG(stb.st_mode) || S_ISBLK(stb.st_mode))){
-                            auto& finfo = result.files[path];
-                            finfo.path = path;
-                            finfo.pos = static_cast<unsigned long long>(stb.st_size);
-                            finfo.total.rchar += s.read_bytes;
-                            finfo.total.wchar += s.write_bytes;
-                            finfo.total.syscr += s.read_count;
-                            finfo.total.syscw += s.write_count;
-                            auto& pfinfo = finfo.processes[pid];
-                            pfinfo.pid = pid;
-                            pfinfo.alive = true;
-                            pfinfo.io.rchar += s.read_bytes;
-                            pfinfo.io.wchar += s.write_bytes;
-                            pfinfo.io.syscr += s.read_count;
-                            pfinfo.io.syscw += s.write_count;
-                        }
+        // 文件级聚合（仅存活进程能 fd→path；短命进程死后无法反查文件路径）
+        if (proc.alive){
+            std::string fdpath = "/proc/" + std::to_string(pid) + "/fd/" + std::to_string(fd);
+            char buf[512];
+            ssize_t n = ::readlink(fdpath.c_str(), buf, sizeof(buf) - 1);
+            if (n > 0){
+                buf[n] = '\0';
+                std::string path(buf);
+                if (!path.empty() && path[0] == '/'){
+                    struct stat stb;
+                    if (::stat(path.c_str(), &stb) == 0 && (S_ISREG(stb.st_mode) || S_ISBLK(stb.st_mode))){
+                        auto& finfo = result.files[path];
+                        finfo.path = path;
+                        finfo.pos = static_cast<unsigned long long>(stb.st_size);
+                        finfo.total.rchar += s.read_bytes;
+                        finfo.total.wchar += s.write_bytes;
+                        finfo.total.syscr += s.read_count;
+                        finfo.total.syscw += s.write_count;
+                        auto& pfinfo = finfo.processes[pid];
+                        pfinfo.pid = pid;
+                        pfinfo.alive = true;
+                        pfinfo.io.rchar += s.read_bytes;
+                        pfinfo.io.wchar += s.write_bytes;
+                        pfinfo.io.syscr += s.read_count;
+                        pfinfo.io.syscw += s.write_count;
                     }
                 }
             }
         }
-
-        // 5. 更新短命进程状态 + 延迟清理
-        for (const auto& [pid, proc] : result.processes){
-            auto& st = known_pids_[pid];
-            st.job_id = job.JobID;
-            st.output_count++;
-            st.alive = proc.alive;
-        }
-        cleanup_dead_pids();
     }
+
+    // 5. 更新短命进程状态 + 延迟清理
+    for (const auto& [pid, proc] : result.processes){
+        auto& st = known_pids_[pid];
+        st.job_id = job.JobID;
+        st.output_count++;
+        st.alive = proc.alive;
+    }
+    cleanup_dead_pids();
 
     // 6. speed 差分（Job 级）
     auto now = std::chrono::steady_clock::now();
@@ -210,9 +207,50 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
             result.job_total.wchar_speed = (result.job_total.wchar >= it_io->second.wchar)
                 ? (result.job_total.wchar - it_io->second.wchar) / period : 0;
         }
+
+        if (period > 0){
+            for (auto& [pid, proc] : result.processes){
+                auto it_proc_io = last_proc_io_.find(pid);
+                if (it_proc_io != last_proc_io_.end()){
+                    proc.io.rchar_speed = (proc.io.rchar >= it_proc_io->second.rchar)
+                        ? (proc.io.rchar - it_proc_io->second.rchar) / period : 0;
+                    proc.io.wchar_speed = (proc.io.wchar >= it_proc_io->second.wchar)
+                        ? (proc.io.wchar - it_proc_io->second.wchar) / period : 0;
+                }
+            }
+
+            for (auto& [path, file] : result.files){
+                auto it_file_io = last_file_io_.find(path);
+                if (it_file_io != last_file_io_.end()){
+                    file.total.rchar_speed = (file.total.rchar >= it_file_io->second.rchar)
+                        ? (file.total.rchar - it_file_io->second.rchar) / period : 0;
+                    file.total.wchar_speed = (file.total.wchar >= it_file_io->second.wchar)
+                        ? (file.total.wchar - it_file_io->second.wchar) / period : 0;
+                }
+                for (auto& [pid, proc] : file.processes){
+                    auto key = path + "#" + std::to_string(pid);
+                    auto it_file_proc_io = last_file_io_.find(key);
+                    if (it_file_proc_io != last_file_io_.end()){
+                        proc.io.rchar_speed = (proc.io.rchar >= it_file_proc_io->second.rchar)
+                            ? (proc.io.rchar - it_file_proc_io->second.rchar) / period : 0;
+                        proc.io.wchar_speed = (proc.io.wchar >= it_file_proc_io->second.wchar)
+                            ? (proc.io.wchar - it_file_proc_io->second.wchar) / period : 0;
+                    }
+                }
+            }
+        }
     }
     last_job_time_[job.JobID] = now;
     last_job_io_[job.JobID] = result.job_total;
+    for (const auto& [pid, proc] : result.processes){
+        last_proc_io_[pid] = proc.io;
+    }
+    for (const auto& [path, file] : result.files){
+        last_file_io_[path] = file.total;
+        for (const auto& [pid, proc] : file.processes){
+            last_file_io_[path + "#" + std::to_string(pid)] = proc.io;
+        }
+    }
 
     return result;
 }
@@ -246,12 +284,14 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
                 fj["fs_type"] = f.fs_type;
                 fj["pos"] = f.pos;
                 fj["total"] = {{"rchar", f.total.rchar}, {"wchar", f.total.wchar},
-                               {"syscr", f.total.syscr}, {"syscw", f.total.syscw}};
+                               {"syscr", f.total.syscr}, {"syscw", f.total.syscw},
+                               {"rchar_speed", f.total.rchar_speed}, {"wchar_speed", f.total.wchar_speed}};
                 fj["processes"] = json::array();
                 for (const auto& [pid, p] : f.processes){
                     fj["processes"].push_back({
                         {"pid", pid}, {"alive", p.alive},
-                        {"rchar", p.io.rchar}, {"wchar", p.io.wchar}
+                        {"rchar", p.io.rchar}, {"wchar", p.io.wchar},
+                        {"rchar_speed", p.io.rchar_speed}, {"wchar_speed", p.io.wchar_speed}
                     });
                 }
                 j["files"].push_back(fj);
@@ -261,7 +301,8 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
                 j["processes"].push_back({
                     {"pid", pid}, {"source", p.source}, {"alive", p.alive},
                     {"rchar", p.io.rchar}, {"wchar", p.io.wchar},
-                    {"syscr", p.io.syscr}, {"syscw", p.io.syscw}
+                    {"syscr", p.io.syscr}, {"syscw", p.io.syscw},
+                    {"rchar_speed", p.io.rchar_speed}, {"wchar_speed", p.io.wchar_speed}
                 });
             }
             return j;
@@ -287,6 +328,8 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
                 out << "NewIOUsageCollector file path=" << path
                     << " rchar=" << f.total.rchar
                     << " wchar=" << f.total.wchar
+                    << " rchar_speed=" << f.total.rchar_speed
+                    << " wchar_speed=" << f.total.wchar_speed
                     << '\n';
             }
             return out.str();
