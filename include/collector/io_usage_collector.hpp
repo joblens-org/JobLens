@@ -142,7 +142,6 @@ private:
     // std::string bpf_o_path = "bpf_obj/job_fd_basic.bpf.o";
     std::string bpf_o_path = JOBLENS_INSTALL_LIBDIR "/joblens/bpf_obj/job_fd_rw_stat.bpf.o";
     std::string rb_name = "event_rb";
-    std::string pid2jobid_map_name = "pid2job";
     std::string pid2fdstat_map_name = "job_fd_stat";
     std::vector<bpf_link*> bpf_links_;
     // (pid,fd) -> user_rw_stat

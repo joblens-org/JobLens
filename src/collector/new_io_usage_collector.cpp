@@ -15,6 +15,7 @@
 #include "core/collector_registry.hpp"
 #include "common/utils.hpp"
 #include "common/ebpf_common.hpp"
+#include "ebpf/job_pid_track.h"
 #include "writer/prometheus_exporter_writer.hpp"
 #include <sys/stat.h>
 #include <unistd.h>
@@ -31,18 +32,6 @@ AUTO_REGISTER_JOB_COLLECTOR(
 
 using json = nlohmann::json;
 
-// Slurm 用 cgroup_path，Condor 用 slots_cgroup_path；Common job 无 cgroup 返回空串。
-static std::string get_job_cgroup_path(const Job& job){
-    try{
-        if (job.subtype == JobSubType::Slurm)
-            return std::get<SlurmJobAttr>(job.sub_attr).cgroup_path;
-        if (job.subtype == JobSubType::Condor)
-            return std::get<CondorJobAttr>(job.sub_attr).slots_cgroup_path;
-    }catch(const std::bad_variant_access&){
-    }
-    return {};
-}
-
 bool NewIOUsageCollector::init(const json& cfg){
     (void)cfg;
     if (!init_ebpf()){
@@ -55,7 +44,7 @@ bool NewIOUsageCollector::init(const json& cfg){
 
 bool NewIOUsageCollector::init_ebpf(){
     auto path = Utils::JobLensRootDir() + bpf_o_path;
-    bpf_obj_ = EbpfCommon::load_bpf_obj(path, bpf_links_);
+    bpf_obj_ = EbpfCommon::load_bpf_obj_pinned(path, bpf_links_, JOBLENS_BPF_PIN_ROOT);
     return bpf_obj_ != nullptr;
 }
 
@@ -87,14 +76,14 @@ void NewIOUsageCollector::cleanup_dead_pids(){
         }
     }
     for (pid_t pid : to_cleanup){
-        // 删除该 pid 在本 job 下所有 job_fd_stat 条目
+        // 删除该 pid 在本 job 下所有 job_fd_stat 条目（本采集器私有 map）。
+        // pid2job 为共享 map, 其删除由内核 exit hook 统一负责, 此处不再触碰。
         for (size_t i = 0; i < dump_keys_.size(); ++i){
             if (dump_keys_[i].pid == pid){
                 EbpfCommon::delete_hashmap_elem<job_pid_fd_key, rw_stat>(
                     bpf_obj_, jobfdstat_map_name, dump_keys_[i]);
             }
         }
-        EbpfCommon::delete_hashmap_elem<pid_t, uint64_t>(bpf_obj_, pid2jobid_map_name, pid);
         known_pids_.erase(pid);
     }
 }
@@ -103,16 +92,7 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
     JobIOStat result;
     result.job_id = job.JobID;
 
-    // 1. 更新内核过滤表（pid + cgroup）
-    EbpfCommon::update_pid_in_kernel(bpf_obj_, pid2jobid_map_name, job.JobID, job.JobPIDs);
-    auto cg_path = get_job_cgroup_path(job);
-    if (!cg_path.empty()){
-        if (auto cgid = EbpfCommon::cgroup_path_to_id(cg_path)){
-            if (!EbpfCommon::update_cgroup_in_kernel(bpf_obj_, cgroup2jobid_map_name, job.JobID, {*cgid})){
-                spdlog::warn("NewIOUsageCollector: update cgroup in kernel error, job={} path={}", job.JobID, cg_path);
-            }
-        }
-    }
+    // pid2job / cgroup2job 由 JobRegistry + 内核 fork/exit hook 统一维护, 本处只读。
 
     // 2. Job 级总量（权威，含短命进程）
     if (auto js = EbpfCommon::lookup_hashmap_elem<uint64_t, rw_stat>(bpf_obj_, jobstat_map_name, job.JobID)){

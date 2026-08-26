@@ -38,6 +38,7 @@
 #include "core/collector_registry.hpp"
 #include "core/job_registry.hpp"
 #include "common/ebpf_common.hpp"
+#include "ebpf/job_pid_track.h"
 #include "common/utils.hpp"
 
 #include <bpf/bpf.h>
@@ -200,7 +201,7 @@ bool PowerCollector::load_ebpf()
         bpf_path = "bpf_obj/trace_sched_runtime.bpf.o";
     }
 
-    bpf_obj_ = EbpfCommon::load_bpf_obj(bpf_path, bpf_links_);
+    bpf_obj_ = EbpfCommon::load_bpf_obj_pinned(bpf_path, bpf_links_, JOBLENS_BPF_PIN_ROOT);
     if (!bpf_obj_) {
         spdlog::error("PowerCollector: failed to load eBPF object from {}", bpf_path);
         return false;
@@ -218,27 +219,6 @@ void PowerCollector::unload_ebpf() noexcept
         bpf_obj_ = nullptr;
         spdlog::info("PowerCollector: eBPF unloaded");
     }
-}
-
-void PowerCollector::update_pid2job_map()
-{
-    if (!bpf_obj_) return;
-
-    /* Get all active jobs from JobRegistry and push their PIDs into the
-     * pid2job BPF map so the collector can group runtime by JobID. */
-    auto jobs = JobRegistry::instance().snapshot();
-
-    int total_pids = 0;
-    for (const auto& job : jobs) {
-        if (job.JobPIDs.empty()) continue;
-        EbpfCommon::update_pid_in_kernel(
-            bpf_obj_, "pid2job",
-            static_cast<uint64_t>(job.JobID),
-            job.JobPIDs);
-        total_pids += static_cast<int>(job.JobPIDs.size());
-    }
-    spdlog::debug("PowerCollector: updated pid2job map with {} PIDs from {} jobs",
-                  total_pids, jobs.size());
 }
 
 std::vector<task_cpu_runtime> PowerCollector::read_task_cpu_time()
@@ -801,8 +781,6 @@ void PowerCollector::deinit() noexcept
 /* ── 刷新全局缓存 (对标 IO/Net: 全量读一次, 后续 collect(Job) 切片取) ── */
 void PowerCollector::refresh_global_cache()
 {
-    update_pid2job_map();
-
     auto now = std::chrono::steady_clock::now();
     double interval_s = std::chrono::duration<double>(now - last_collect_ts_).count();
     last_collect_ts_ = now;

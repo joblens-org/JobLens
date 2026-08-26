@@ -125,7 +125,6 @@ private:
     /* ── eBPF管理 ──────────────────────────────────────────────────── */
     bool load_ebpf();              // 加载power_collect.bpf.o
     void unload_ebpf() noexcept;   // 卸载eBPF程序
-    void update_pid2job_map();     // 从JobRegistry同步PID→JobID到BPF map
     std::vector<task_cpu_runtime> read_task_cpu_time(); // batch读取+清空BPF map
     std::vector<task_cpu_runtime> read_task_cpu_time_single(int fd, struct bpf_map* map, size_t key_sz, size_t val_sz); // fallback
 

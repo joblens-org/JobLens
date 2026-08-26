@@ -10,10 +10,12 @@ User=root
 WorkingDirectory=/var/JobLens
 @JOBLENS_SERVICE_ENV@
 ExecStartPre=@CMAKE_INSTALL_FULL_BINDIR@/JobLens -v
+ExecStartPre=-/bin/sh -c 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'
 ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/JobLens \
           -m service \
           -c /etc/JobLens/config.yaml
 ExecStopPost=-/bin/rm -f /var/JobLens/JobLens.lock
+ExecStopPost=-/bin/rm -rf /sys/fs/bpf/joblens
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536

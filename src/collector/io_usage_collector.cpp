@@ -24,6 +24,7 @@
 #include "common/utils.hpp"
 #include "core/collector_registry.hpp"
 #include "writer/prometheus_exporter_writer.hpp"
+#include "ebpf/job_pid_track.h"
 // #include "ebpf/job_fd_basic.h"
 
 AUTO_REGISTER_JOB_COLLECTOR(
@@ -43,7 +44,7 @@ bool IOUsageCollector::init_ebpf(){
     auto path = Utils::JobLensRootDir() + bpf_o_path;
     // event_front_ = std::make_unique<std::queue<event>>();
     // event_back_ = std::make_unique<std::queue<event>>();
-    bpf_obj_ = EbpfCommon::load_bpf_obj(path, bpf_links_);
+    bpf_obj_ = EbpfCommon::load_bpf_obj_pinned(path, bpf_links_, JOBLENS_BPF_PIN_ROOT);
     ring_buffer_sample_fn fn  = [](void *ctx, void *data, size_t size){
         spdlog::debug("IOUsageCollector: ebpf got io event");
         // auto ptr = static_cast<IOUsageCollector*>(ctx);
@@ -80,7 +81,7 @@ bool IOUsageCollector::init_ebpf(){
 void IOUsageCollector::deinit_ebpf(){
     for(auto& kv: pidfd_stat_map){
         pid_fd_key key = {.pid=kv.first.pid, .fd=kv.first.fd};
-        EbpfCommon::delete_hashmap_elem<pid_t, uint64_t>(bpf_obj_, pid2jobid_map_name, kv.first.pid);
+        // pid2job 为共享 map, 删除由内核 exit hook 统一负责; 此处仅清理本采集器私有的 job_fd_stat。
         EbpfCommon::delete_hashmap_elem<pid_fd_key, rw_stat>(bpf_obj_, pid2fdstat_map_name, key);
     }
     pidfd_stat_map.clear();
@@ -336,11 +337,8 @@ CollectResult IOUsageCollector::collect(const Job &job)
 {
     std::vector<IOUsageInfo> result;
     if (use_ebpf){
-        if (!EbpfCommon::update_pid_in_kernel(bpf_obj_, pid2jobid_map_name, job.JobID, job.JobPIDs)){
-            spdlog::error("IOUsageCollector: update pid in kernel error");
-            ring_buffer__consume(bpf_rb_);
-            // 触发一次fetch，之后执行完其他内容的时候再分析fetch内容或者执行多cpu数据聚合（这里fetch是无堵塞的，所以需要这样）
-        }
+        // pid2job 由 JobRegistry + 内核 fork/exit hook 维护; 此处仅触发一次无阻塞 fetch。
+        ring_buffer__consume(bpf_rb_);
     }
     for (int pid : job.JobPIDs) {
         // 提高鲁棒性
