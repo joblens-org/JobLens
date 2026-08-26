@@ -21,6 +21,7 @@
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
 #include <thread>
+#include <atomic>
 
 
 #include "common/streamer_watcher.hpp"
@@ -28,6 +29,7 @@
 #include "job_lifecycle_event.h"
 #include "ebpf/trace_condor_starter.h"
 #include "common/ebpf_common.hpp"
+#include "core/job_pid_tracker.hpp"
 
 #include "job_watcher/condor_job_watcher.hpp"
 #include "job_watcher/slurm_job_watcher.hpp"
@@ -37,6 +39,7 @@ class JobRegistry {
 public:
     static JobRegistry& instance();          // 仍保留单例，方便迁移；也可由 main() 构造
     ~JobRegistry(){
+        stop_pid_tracker();
         if (db_running){
             deinit_job_db();
         }
@@ -102,4 +105,17 @@ private:
     // Slurm作业自动添加
     bool enable_auto_add_slurm_job{false};
     std::unique_ptr<SlurmJobWatcher> slurm_job_watcher_;
+
+    // 共享 pid2job / cgroup2job 维护: JobPidTracker 加载生命周期追踪 bpf,
+    // JobRegistry 通过它向内核登记 Job 归属并消费 fork/exit 事件。
+    void init_pid_tracker();
+    void stop_pid_tracker();
+    void sync_job_to_kernel(const Job& job);      // Added: 写 cgroup2job + 种子 pid2job
+    void remove_job_from_kernel(const Job& job);  // Removed: 删 cgroup2job + 清 pid2job 残留
+    void on_kernel_fork(uint32_t pid, uint64_t job_id);  // ringbuf FORK: 给 Job 加 pid
+    void on_kernel_exit(uint32_t pid, uint64_t job_id);  // ringbuf EXIT: 从 Job 删 pid
+    void reconcile_loop();                         // 低频对账, 防 ringbuf 丢事件导致漂移
+    std::unique_ptr<JobPidTracker> pid_tracker_;
+    std::atomic<bool> reconcile_running_{false};
+    std::unique_ptr<std::thread> reconcile_thread_;
 };

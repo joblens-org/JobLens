@@ -197,6 +197,8 @@ JobRegistry::JobRegistry(){
 
     init_job_watcher();
 
+    init_pid_tracker();
+
     regRPChandle();
 };
 
@@ -221,6 +223,136 @@ void JobRegistry::init_job_watcher() {
             }
         );
         spdlog::info("JobRegistry: enabled auto add slurm job");
+    }
+}
+
+// 从 Job 取 cgroup 路径: Slurm 用 cgroup_path, Condor 用 slots_cgroup_path。
+static std::string job_cgroup_path(const Job& job) {
+    try {
+        if (job.subtype == JobSubType::Slurm)
+            return std::get<SlurmJobAttr>(job.sub_attr).cgroup_path;
+        if (job.subtype == JobSubType::Condor)
+            return std::get<CondorJobAttr>(job.sub_attr).slots_cgroup_path;
+    } catch (const std::bad_variant_access&) {
+    }
+    return {};
+}
+
+void JobRegistry::init_pid_tracker() {
+    pid_tracker_ = std::make_unique<JobPidTracker>();
+    pid_tracker_->set_fork_cb([this](uint32_t pid, uint64_t job_id) { on_kernel_fork(pid, job_id); });
+    pid_tracker_->set_exit_cb([this](uint32_t pid, uint64_t job_id) { on_kernel_exit(pid, job_id); });
+    if (!pid_tracker_->start()) {
+        spdlog::warn("JobRegistry: pid tracker start failed, kernel pid2job maintenance disabled");
+        pid_tracker_.reset();
+        return;
+    }
+    reconcile_running_ = true;
+    reconcile_thread_ = std::make_unique<std::thread>([this]() { reconcile_loop(); });
+    spdlog::info("JobRegistry: pid tracker enabled");
+}
+
+void JobRegistry::stop_pid_tracker() {
+    if (reconcile_running_) {
+        reconcile_running_ = false;
+        if (reconcile_thread_ && reconcile_thread_->joinable()) reconcile_thread_->join();
+        reconcile_thread_.reset();
+    }
+    if (pid_tracker_) {
+        pid_tracker_->stop();
+        pid_tracker_.reset();
+    }
+}
+
+// JobEvent::Added 时调用: 向内核登记 cgroup 归属 + 写入根 pid 种子, 内核 fork hook 据此繁衍。
+void JobRegistry::sync_job_to_kernel(const Job& job) {
+    if (!pid_tracker_ || job.JobID == 0) return;
+    const auto cg = job_cgroup_path(job);
+    if (!cg.empty()) {
+        if (auto cgid = EbpfCommon::cgroup_path_to_id(cg)) {
+            if (pid_tracker_->set_cgroup_job(*cgid, job.JobID)) {
+                spdlog::debug("JobRegistry: kernel cgroup2job registered job_id={} cgroup_id={} path={}",
+                              job.JobID, *cgid, cg);
+            } else {
+                spdlog::warn("JobRegistry: kernel cgroup2job write failed job_id={} cgroup_id={} path={}",
+                             job.JobID, *cgid, cg);
+            }
+        } else {
+            spdlog::warn("JobRegistry: cgroup path->id resolve failed job_id={} path={}, "
+                         "kernel will rely on parent-pid inheritance only", job.JobID, cg);
+        }
+    }
+    for (pid_t pid : job.JobPIDs) {
+        if (!pid_tracker_->set_pid_job(static_cast<uint32_t>(pid), job.JobID)) {
+            spdlog::warn("JobRegistry: kernel pid2job seed write failed job_id={} pid={}", job.JobID, pid);
+        }
+    }
+    spdlog::debug("JobRegistry: synced job to kernel job_id={} seed_pids={} has_cgroup={}",
+                  job.JobID, job.JobPIDs.size(), !cg.empty());
+}
+
+// JobEvent::Removed 时调用: 删 cgroup2job + 清理该 Job 在 pid2job 的所有已知 pid。
+void JobRegistry::remove_job_from_kernel(const Job& job) {
+    if (!pid_tracker_ || job.JobID == 0) return;
+    const auto cg = job_cgroup_path(job);
+    if (!cg.empty()) {
+        if (auto cgid = EbpfCommon::cgroup_path_to_id(cg)) {
+            pid_tracker_->del_cgroup_job(*cgid);
+        }
+    }
+    for (pid_t pid : job.JobPIDs) {
+        pid_tracker_->del_pid_job(static_cast<uint32_t>(pid));
+    }
+    spdlog::debug("JobRegistry: removed job from kernel job_id={} cleared_pids={} has_cgroup={}",
+                  job.JobID, job.JobPIDs.size(), !cg.empty());
+}
+
+// ringbuf FORK: 内核已将 child 写入 pid2job, 这里同步更新用户态 Job.JobPIDs。
+void JobRegistry::on_kernel_fork(uint32_t pid, uint64_t job_id) {
+    std::unique_lock lg(mtx_);
+    auto it = jobs_.find(job_id);
+    if (it == jobs_.end()) {
+        spdlog::debug("JobRegistry: kernel FORK event for unknown job_id={} pid={}, ignored "
+                      "(job may have just been removed)", job_id, pid);
+        return;
+    }
+    auto& pids = it->second.JobPIDs;
+    if (std::find(pids.begin(), pids.end(), static_cast<pid_t>(pid)) == pids.end()) {
+        pids.push_back(static_cast<pid_t>(pid));
+        spdlog::debug("JobRegistry: kernel FORK added pid={} to job_id={} (now {} pids)",
+                      pid, job_id, pids.size());
+    }
+}
+
+// ringbuf EXIT: 内核已从 pid2job 删除, 这里同步移除用户态 Job.JobPIDs。
+void JobRegistry::on_kernel_exit(uint32_t pid, uint64_t job_id) {
+    std::unique_lock lg(mtx_);
+    auto it = jobs_.find(job_id);
+    if (it == jobs_.end()) {
+        spdlog::debug("JobRegistry: kernel EXIT event for unknown job_id={} pid={}, ignored", job_id, pid);
+        return;
+    }
+    auto& pids = it->second.JobPIDs;
+    auto before = pids.size();
+    pids.erase(std::remove(pids.begin(), pids.end(), static_cast<pid_t>(pid)), pids.end());
+    if (pids.size() != before) {
+        spdlog::debug("JobRegistry: kernel EXIT removed pid={} from job_id={} (now {} pids)",
+                      pid, job_id, pids.size());
+    }
+}
+
+// 低频对账: 周期性把当前所有 Job 的归属重新写回内核, 校正 ringbuf 丢事件导致的漂移。
+void JobRegistry::reconcile_loop() {
+    while (reconcile_running_) {
+        for (int i = 0; i < 300 && reconcile_running_; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!reconcile_running_) break;
+        auto jobs = snapshot();
+        for (const auto& job : jobs) {
+            sync_job_to_kernel(job);
+        }
+        spdlog::debug("JobRegistry: pid tracker reconcile pass done, resynced {} jobs to kernel", jobs.size());
     }
 }
 
@@ -370,6 +502,7 @@ bool JobRegistry::addJob(const Job& job, bool from_db) {
         }
 
         for (const auto& cb : cbs_) cb(JobEvent::Added, job_for_cb);
+        sync_job_to_kernel(job_for_cb);
         spdlog::info("JobRegistry: add job with JobID {}", job.JobID);
 
         // 回调链中定时器可能已立即触发并删除job，用find安全访问
@@ -398,6 +531,7 @@ void JobRegistry::delJob(uint64_t jobID) {
         jobs_.erase(it);
     }
     for (const auto& cb : cbs_) cb(JobEvent::Removed, removed);
+    remove_job_from_kernel(removed);
     spdlog::info("JobRegistry: remove job with JobID {}", removed.JobID);
     end_job_in_db(removed.JobID);
     return;
@@ -421,6 +555,7 @@ size_t JobRegistry::delJob(const SubAttrMatcher& matcher) {
     // 在锁外进行回调和数据库操作
     for (const auto& job : removed_jobs) {
         for (const auto& cb : cbs_) cb(JobEvent::Removed, job);
+        remove_job_from_kernel(job);
         spdlog::info("JobRegistry: remove job with JobID {} by sub_attr matcher", job.JobID);
         end_job_in_db(job.JobID);
     }
