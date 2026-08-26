@@ -27,7 +27,6 @@
 #include <signal.h>
 #include <execinfo.h>
 #include <spdlog/spdlog.h>
-#include <exception>
 #include <memory>
 #include <yaml-cpp/yaml.h>
 #include <nlohmann/json.hpp>
@@ -145,7 +144,11 @@ namespace Utils
                 std::string rel = line.substr(3);          // "/system.slice/xxx"
                 // 拼到挂载点即可。v2 统一层级挂载点 99% 是 /sys/fs/cgroup
                 fs::path mount = "/sys/fs/cgroup";
-                return (mount / fs::path(rel).lexically_normal()).string();
+                fs::path rel_path = fs::path(rel).lexically_normal();
+                if (rel_path.is_absolute()) {
+                    rel_path = rel_path.relative_path();
+                }
+                return (mount / rel_path).lexically_normal().string();
             }
         }
         return {};   // 不是 v2 或没找到

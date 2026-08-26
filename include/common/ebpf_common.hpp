@@ -29,9 +29,28 @@
 #include <sys/stat.h>
 #include <cerrno>
 #include <cstdint>
+#include <filesystem>
 
 
 namespace EbpfCommon{
+    namespace fs = std::filesystem;
+
+    inline std::string normalize_cgroup_fs_path(const std::string& cgroup_path){
+        const fs::path mount = "/sys/fs/cgroup";
+        fs::path path = fs::path(cgroup_path).lexically_normal();
+
+        const std::string mount_prefix = mount.string();
+        const std::string path_string = path.string();
+        if (path_string == mount_prefix || path_string.rfind(mount_prefix + "/", 0) == 0) {
+            return path_string;
+        }
+
+        if (path.is_absolute()) {
+            path = path.relative_path();
+        }
+        return (mount / path).lexically_normal().string();
+    }
+
     inline bpf_object* load_bpf_obj(const std::string& bpf_o_path, std::vector<struct bpf_link *>& links) {
         // 打开ELF
         bpf_object* obj_ = bpf_object__open_file(bpf_o_path.c_str(), nullptr);
@@ -265,9 +284,10 @@ namespace EbpfCommon{
     // bpf_get_current_cgroup_id() 返回同值，故可直接作为 cgroup2job 的 key。
     inline std::optional<uint64_t> cgroup_path_to_id(const std::string& cgroup_path){
         if (cgroup_path.empty()) return std::nullopt;
+        const std::string fs_path = normalize_cgroup_fs_path(cgroup_path);
         struct stat st{};
-        if (::stat(cgroup_path.c_str(), &st) != 0){
-            spdlog::warn("cgroup_path_to_id: stat({}) failed, errno={}", cgroup_path, errno);
+        if (::stat(fs_path.c_str(), &st) != 0){
+            spdlog::warn("cgroup_path_to_id: stat({}) failed, original={}, errno={}", fs_path, cgroup_path, errno);
             return std::nullopt;
         }
         return static_cast<uint64_t>(st.st_ino);
