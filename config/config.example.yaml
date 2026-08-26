@@ -43,11 +43,6 @@ cpumem_collector_config:
   use_writers:
     - file_writer                            # Output to local file
 
-# NewIOUsageCollector: Job/文件为中心的 IO 采集（eBPF Job 级聚合 + 时延分布）
-# new_io_usage_config:
-#   freq: 0.2                                # Sampling frequency in Hz
-#   use_ebpf: "true"                         # Enable eBPF job-level IO + latency histogram
-
 # ============================================================
 # Writer Configuration — FileWriter only
 # ============================================================
