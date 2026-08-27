@@ -26,7 +26,13 @@
 #include "ebpf/vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
 #include "ebpf/job_pid_track.h" // 一定要放在最后面
+
+/* kfunc: 按 pid 取 task 引用, 用于在 fork 上下文读 child 的 tgid。
+ * 需要内核 5.15+(本项目 CO-RE 目标内核均满足)。 */
+extern struct task_struct *bpf_task_from_pid(int pid) __ksym;
+extern void bpf_task_release(struct task_struct *p) __ksym;
 
 /* pid(tgid) -> job_id。LRU_HASH: pid 回卷或漏删时内核自动淘汰脏项。 */
 struct {
@@ -66,43 +72,57 @@ static __always_inline void push_event(u32 type, u32 pid, u64 job_id)
     bpf_ringbuf_submit(e, 0);
 }
 
-/* sched_process_fork: 上下文为 parent 进程, ctx 携带 parent/child pid。
- * fork 在 child pid 分配后触发, parent_pid 与 child_pid 均有效。
- * child 优先继承 parent 的 Job 归属(pid2job)。 */
+/* sched_process_fork: 上下文为 parent, ctx 携带 parent/child 的 pid(线程级 tid)。
+ * 本追踪统一为进程(tgid)语义: pid2job 只存 tgid。
+ *   - child 是新线程(child_tgid == parent 所属进程 tgid): 其 tgid 已作为进程种子
+ *     在 pid2job 中, 无需处理;
+ *   - child 是新进程(child_tgid == child_pid): 继承 parent 进程的 Job 归属,
+ *     以 child_tgid 为 key 写入 pid2job 并通知用户态。
+ * 用 bpf_task_from_pid 读 child 的 tgid 以区分二者。 */
 SEC("tp/sched/sched_process_fork")
 int on_sched_process_fork(struct trace_event_raw_sched_process_fork *ctx)
 {
-    u32 parent_pid = (u32)ctx->parent_pid;
     u32 child_pid = (u32)ctx->child_pid;
 
-    u64 *job_id = bpf_map_lookup_elem(&pid2job, &parent_pid);
+    struct task_struct *child = bpf_task_from_pid(child_pid);
+    if (!child)
+        return 0;
+    u32 child_tgid = (u32)BPF_CORE_READ(child, tgid);
+    bpf_task_release(child);
+
+    if (child_tgid != child_pid)
+        return 0; // child 是新线程, 其进程 tgid 已被追踪, 忽略
+
+    // child 是新进程: 用 parent 的 tgid 查归属(parent 上下文 tgid = current tgid)
+    u32 parent_tgid = bpf_get_current_pid_tgid() >> 32;
+    u64 *job_id = bpf_map_lookup_elem(&pid2job, &parent_tgid);
     if (!job_id)
-        return 0; // parent 不属于任何 Job, 忽略(种子根 pid 由用户态写)
+        return 0; // parent 进程不属于任何 Job
 
     u64 jid = *job_id;
-    bpf_map_update_elem(&pid2job, &child_pid, &jid, BPF_ANY);
-    push_event(JOB_PID_EVENT_FORK, child_pid, jid);
+    bpf_map_update_elem(&pid2job, &child_tgid, &jid, BPF_ANY);
+    push_event(JOB_PID_EVENT_FORK, child_tgid, jid);
     return 0;
 }
 
-/* sched_process_exit: 使用 sched_process_template 上下文(无 pid 字段),
- * 通过 bpf_get_current_pid_tgid() 取 pid/tid, 仅处理进程级退出。 */
+/* sched_process_exit: 按 tid 触发。pid2job 只存 tgid, 故仅在进程组代表
+ * (tid == tgid)退出时回收该 tgid 条目; 普通线程退出无需处理。 */
 SEC("tp/sched/sched_process_exit")
 int on_sched_process_exit(struct trace_event_raw_sched_process_template *ctx)
 {
     u64 id = bpf_get_current_pid_tgid();
-    u32 pid = id >> 32;   // tgid
+    u32 tgid = id >> 32;
     u32 tid = (u32)id;
-    if (pid != tid)
-        return 0; // 线程退出, 非进程退出, 忽略
+    if (tgid != tid)
+        return 0; // 普通线程退出, pid2job 只存 tgid, 无需处理
 
-    u64 *job_id = bpf_map_lookup_elem(&pid2job, &pid);
+    u64 *job_id = bpf_map_lookup_elem(&pid2job, &tgid);
     if (!job_id)
         return 0; // 不属于任何 Job
 
     u64 jid = *job_id;
-    push_event(JOB_PID_EVENT_EXIT, pid, jid);
-    bpf_map_delete_elem(&pid2job, &pid);
+    push_event(JOB_PID_EVENT_EXIT, tgid, jid);
+    bpf_map_delete_elem(&pid2job, &tgid);
     return 0;
 }
 
