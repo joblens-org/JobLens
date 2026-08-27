@@ -12,29 +12,28 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "collector/fs_metadata_collector.hpp"
+#include "core/collector_registry.hpp"
+#include "common/utils.hpp"
+#include "common/ebpf_common.hpp"
+#include "ebpf/job_pid_track.h"
+#include "writer/prometheus_exporter_writer.hpp"
 #include <nlohmann/json.hpp>
-#include <spdlog/spdlog.h>
-#include <chrono>
-#include <fstream>
 #include <sstream>
+#include <fstream>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <algorithm>
-#include "common/utils.hpp"
-#include "core/collector_registry.hpp"
-#include "writer/prometheus_exporter_writer.hpp"
 
 using json = nlohmann::json;
 using namespace std::chrono;
 
 AUTO_REGISTER_JOB_COLLECTOR(
     FSMetadataCollector,
-    "Collect filesystem metadata operation statistics via eBPF or /proc",
+    "Collect filesystem metadata operation statistics via eBPF (job-level + latency buckets)",
     ConfigParams{
         {"freq", "Sampling frequency in Hz, e.g., 0.2 for once every 5 seconds"},
-        {"summary", "Whether to summarize data across all processes (true/false), default false"},
-        {"use_ebpf", "Whether to use eBPF for collecting fs metadata statistics"}
+        {"summary", "Whether to summarize data across all processes (true/false), default false"}
     }
 )
 
@@ -139,22 +138,25 @@ static bool path_to_mount(const std::string& abs,
     return false;
 }
 
-bool FSMetadataCollector::init_ebpf() {
-    auto path = Utils::JobLensRootDir() + bpf_o_path;
-    bpf_obj_ = EbpfCommon::load_bpf_obj(path, bpf_links_);
-    if (!bpf_obj_) {
-        spdlog::error("FSMetadataCollector: failed to load eBPF object from {}", path);
-        return false;
+// 最佳努力：为存活进程反查挂载点 / 文件系统类型
+static void fill_proc_mount(pid_t pid, std::string& mnt, std::string& fst) {
+    std::string fd_dir = "/proc/" + std::to_string(pid) + "/fd/";
+    DIR* dir = ::opendir(fd_dir.c_str());
+    if (!dir) return;
+    struct dirent* ent;
+    while ((ent = ::readdir(dir))) {
+        if (ent->d_name[0] == '.') continue;
+        int fd = std::atoi(ent->d_name);
+        std::string path = fd_to_path(pid, fd);
+        if (path.empty() || path[0] != '/') continue;
+        std::string m, f;
+        if (path_to_mount(path, m, f)) {
+            mnt = m;
+            fst = f;
+            break;  // 找到第一个成功的就退出
+        }
     }
-    spdlog::info("FSMetadataCollector: eBPF loaded, {} links attached", bpf_links_.size());
-    return true;
-}
-
-void FSMetadataCollector::deinit_ebpf() {
-    EbpfCommon::unload_bpf_obj(bpf_obj_, bpf_links_);
-    bpf_obj_ = nullptr;
-    op_state_dict_.clear();
-    spdlog::info("FSMetadataCollector: deinit_ebpf completed");
+    ::closedir(dir);
 }
 
 bool FSMetadataCollector::init(const nlohmann::json& cfg) {
@@ -163,16 +165,6 @@ bool FSMetadataCollector::init(const nlohmann::json& cfg) {
         summary = true;
     } else {
         summary = false;
-    }
-
-    // 读取 use_ebpf 配置
-    if (cfg.contains("use_ebpf") && cfg["use_ebpf"].get<std::string>() == "true") {
-        use_ebpf = true;
-        if (!init_ebpf()) {
-            spdlog::error("FSMetadataCollector: init ebpf error, falling back to non-eBPF mode");
-            deinit_ebpf();
-            use_ebpf = false;
-        }
     }
 
     // 读取 freq 配置（采集周期）
@@ -185,285 +177,383 @@ bool FSMetadataCollector::init(const nlohmann::json& cfg) {
         }
     }
 
+    // 默认启用 eBPF（不再提供 use_ebpf 开关）
+    if (!init_ebpf()) {
+        spdlog::error("FSMetadataCollector: init ebpf error");
+        deinit_ebpf();
+        return false;
+    }
     return true;
 }
 
-void FSMetadataCollector::deinit() noexcept {
-    if (use_ebpf) {
-        deinit_ebpf();
+bool FSMetadataCollector::init_ebpf() {
+    auto path = Utils::JobLensRootDir() + bpf_o_path;
+    // 复用共享 pinned pid2job / cgroup2job（对标 new_io）
+    bpf_obj_ = EbpfCommon::load_bpf_obj_pinned(path, bpf_links_, JOBLENS_BPF_PIN_ROOT);
+    if (!bpf_obj_) {
+        spdlog::error("FSMetadataCollector: failed to load eBPF object from {}", path);
+        return false;
     }
-    op_state_dict_.clear();
+    spdlog::info("FSMetadataCollector: eBPF loaded, {} links attached", bpf_links_.size());
+    return true;
+}
+
+void FSMetadataCollector::deinit_ebpf() {
+    EbpfCommon::unload_bpf_obj(bpf_obj_, bpf_links_);
+    bpf_obj_ = nullptr;
+}
+
+void FSMetadataCollector::deinit() noexcept {
+    deinit_ebpf();
+    known_pids_.clear();
+    last_proc_op_calls_.clear();
+    last_job_op_calls_.clear();
+    last_job_time_.clear();
     spdlog::info("FSMetadataCollector deinit");
 }
 
+void FSMetadataCollector::refresh_dump_cache_if_needed() {
+    auto now = steady_clock::now();
+    auto elapsed = duration_cast<milliseconds>(now - last_dump_time_).count();
+    if (elapsed < DUMP_TTL_MS && !dump_keys_.empty()) return;
+
+    EbpfCommon::lookup_hashmap_batch<fs_meta_key, fs_meta_stat>(
+        bpf_obj_, fs_meta_map_name, dump_keys_, dump_vals_);
+    last_dump_time_ = now;
+}
+
+// 清理已死且已输出过的短命进程的 eBPF 明细条目（保证"至少输出一次"后延迟清理）。
+// pid2job 为共享 map，其删除由内核 exit hook 统一负责，此处不触碰。
+void FSMetadataCollector::cleanup_dead_pids() {
+    std::vector<pid_t> to_cleanup;
+    for (const auto& [pid, st] : known_pids_) {
+        if (!st.alive && st.output_count >= 1) {
+            to_cleanup.push_back(pid);
+        }
+    }
+    for (pid_t pid : to_cleanup) {
+        for (const auto& k : dump_keys_) {
+            if (k.pid == static_cast<u32>(pid)) {
+                EbpfCommon::delete_hashmap_elem<fs_meta_key, fs_meta_stat>(
+                    bpf_obj_, fs_meta_map_name, k);
+            }
+        }
+        known_pids_.erase(pid);
+    }
+}
+
 CollectResult FSMetadataCollector::collect(const Job& job) {
-    std::vector<FSMetadataProcessInfo> result;
+    JobFSMetaStat result;
+    result.job_id = job.JobID;
 
-    // 如果启用eBPF，更新pid2job映射
-    if (use_ebpf && bpf_obj_) {
-        if (!EbpfCommon::update_pid_in_kernel(bpf_obj_, pid2jobid_map_name, job.JobID, job.JobPIDs)) {
-            spdlog::error("FSMetadataCollector: update pid in kernel error");
+    // pid2job / cgroup2job 由 JobRegistry + 内核 fork/exit hook 统一维护, 本处只读。
+
+    // 1. Job 级按 op 聚合 + 时延直方图（按 job_id 直接切片）
+    for (uint32_t op = 0; op < FS_META_MAX; ++op) {
+        // Job 级 op 计数
+        fs_meta_job_key jkey{};
+        jkey.job_id = job.JobID;
+        jkey.op = op;
+        auto jval = EbpfCommon::lookup_hashmap_elem<fs_meta_job_key, fs_meta_stat>(
+            bpf_obj_, fs_meta_job_map_name, jkey);
+        if (jval.has_value() && jval->calls > 0) {
+            const auto& v = jval.value();
+            FSMetaOpCounters oc{};
+            oc.op_id = op;
+            oc.op_name = op_name_from_id(op);
+            oc.calls = v.calls;
+            oc.success = v.success;
+            oc.errors = v.errors;
+            oc.last_errno = v.last_errno;
+            oc.total_latency_ns = v.total_latency_ns;
+            oc.max_latency_ns = v.max_latency_ns;
+            result.job_ops[op] = oc;
+            result.job_metadata_ops_total += v.calls;
+        }
+
+        // Job 级各 op 的时延直方图（逐桶查询）
+        FSMetaLatencyHist hist{};
+        bool any = false;
+        for (uint32_t b = 0; b < FS_META_LATENCY_BUCKETS; ++b) {
+            fs_meta_latency_key lk{};
+            lk.job_id = job.JobID;
+            lk.op = op;
+            lk.bucket = b;
+            if (auto c = EbpfCommon::lookup_hashmap_elem<fs_meta_latency_key, u64>(
+                    bpf_obj_, fs_meta_latency_map_name, lk)) {
+                hist.hist[b] = *c;
+                any = true;
+            }
+        }
+        if (any) {
+            result.job_latency[op] = hist;
         }
     }
 
-    // 遍历作业的所有PID
-    for (int pid : job.JobPIDs) {
-        // 检查进程是否仍在运行
-        if (!Utils::is_process_running(pid)) {
-            continue;
-        }
+    // 2. 刷新周期缓存 + 按 Job 切片聚合进程（含短命进程）
+    refresh_dump_cache_if_needed();
+    for (size_t i = 0; i < dump_keys_.size(); ++i) {
+        if (dump_keys_[i].job_id != job.JobID) continue;
+        pid_t pid = static_cast<pid_t>(dump_keys_[i].pid);
+        uint32_t op = dump_keys_[i].op;
+        const fs_meta_stat& s = dump_vals_[i];
+        if (s.calls == 0) continue;
 
-        FSMetadataProcessInfo info{};
-        info.pid = pid;
+        auto& proc = result.processes[pid];
+        proc.pid = pid;
+        proc.alive = Utils::is_process_running(pid);
+        proc.source = proc.alive ? "alive" : "ephemeral";
 
-        // 如果启用eBPF，从eBPF map中读取统计信息
-        if (use_ebpf && bpf_obj_) {
-            for (uint32_t op = 0; op < FS_META_MAX; ++op) {
-                fs_meta_key key{static_cast<u32>(pid), op};
-                auto val_opt = EbpfCommon::lookup_hashmap_elem<fs_meta_key, fs_meta_stat>(
-                    bpf_obj_, fs_meta_map_name, key);
-
-                if (val_opt.has_value() && val_opt.value().calls > 0) {
-                    const auto& val = val_opt.value();
-                    FSMetadataOpInfo op_info{};
-                    op_info.op_id = op;
-                    op_info.op_name = op_name_from_id(op);
-                    op_info.calls = val.calls;
-                    op_info.success = val.success;
-                    op_info.errors = val.errors;
-                    op_info.last_errno = val.last_errno;
-                    op_info.total_latency_ns = val.total_latency_ns;
-                    op_info.max_latency_ns = val.max_latency_ns;
-
-                    // 计算调用速率
-                    uint64_t state_key = (static_cast<uint64_t>(pid) << 32) | op;
-                    auto& state = op_state_dict_[state_key];
-                    auto now = steady_clock::now();
-
-                    if (state.last_calls > 0) {
-                        double dt = duration_cast<duration<double>>(now - state.last_time).count();
-                        if (dt > 0) {
-                            op_info.calls_rate = static_cast<double>(op_info.calls - state.last_calls) / dt;
-                        }
-                    }
-                    state.last_time = now;
-                    state.last_calls = op_info.calls;
-
-                    // 计算错误速率
-                    // 注意：这里使用相同的dt，如果dt为0则error_rate为0
-                    if (state.last_calls > 0) {
-                        double dt = duration_cast<duration<double>>(now - state.last_time).count();
-                        if (dt > 0) {
-                            // 这里需要跟踪上次的错误数，简化处理：使用当前错误数计算
-                            // 实际上应该跟踪last_errors，但为了简化，暂时不计算error_rate
-                            op_info.error_rate = 0.0;
-                        }
-                    }
-
-                    info.ops.push_back(std::move(op_info));
-                    info.metadata_ops_total += op_info.calls;
-                }
-            }
-        }
-
-        // 计算总速率
-        double total_rate = 0.0;
-        for (const auto& op : info.ops) {
-            total_rate += op.calls_rate;
-        }
-        info.metadata_ops_rate = total_rate;
-
-        // 最佳努力：尝试获取挂载点和文件系统类型
-        if (!info.ops.empty()) {
-            std::string fd_dir = "/proc/" + std::to_string(pid) + "/fd/";
-            DIR* dir = ::opendir(fd_dir.c_str());
-            if (dir) {
-                struct dirent* ent;
-                while ((ent = ::readdir(dir))) {
-                    if (ent->d_name[0] == '.') continue;
-                    int fd = std::atoi(ent->d_name);
-                    std::string path = fd_to_path(pid, fd);
-                    if (path.empty() || path[0] != '/') continue;
-
-                    std::string mnt, fst;
-                    if (path_to_mount(path, mnt, fst)) {
-                        info.mount_point = mnt;
-                        info.fs_type = fst;
-                        break;  // 找到第一个成功的就退出
-                    }
-                }
-                ::closedir(dir);
-            }
-        }
-
-        result.push_back(std::move(info));
+        FSMetaOpCounters oc{};
+        oc.op_id = op;
+        oc.op_name = op_name_from_id(op);
+        oc.calls = s.calls;
+        oc.success = s.success;
+        oc.errors = s.errors;
+        oc.last_errno = s.last_errno;
+        oc.total_latency_ns = s.total_latency_ns;
+        oc.max_latency_ns = s.max_latency_ns;
+        proc.ops[op] = oc;
+        proc.metadata_ops_total += s.calls;
     }
 
-    // 如果需要汇总数据
-    if (summary && !result.empty()) {
-        FSMetadataProcessInfo summary_info{};
-        summary_info.pid = 0;  // 0表示汇总
+    // 3. 存活进程反查挂载点 / fs 类型（最佳努力）
+    for (auto& [pid, proc] : result.processes) {
+        if (proc.alive) {
+            fill_proc_mount(pid, proc.mount_point, proc.fs_type);
+        }
+    }
 
-        // 汇总所有进程的统计信息
-        std::unordered_map<uint32_t, FSMetadataOpInfo> op_summary;
-        for (const auto& proc_info : result) {
-            summary_info.metadata_ops_total += proc_info.metadata_ops_total;
-            summary_info.metadata_ops_rate += proc_info.metadata_ops_rate;
+    // 4. 更新短命进程状态 + 延迟清理
+    for (const auto& [pid, proc] : result.processes) {
+        auto& st = known_pids_[pid];
+        st.job_id = job.JobID;
+        st.output_count++;
+        st.alive = proc.alive;
+    }
+    cleanup_dead_pids();
 
-            for (const auto& op : proc_info.ops) {
-                if (op_summary.find(op.op_id) == op_summary.end()) {
-                    op_summary[op.op_id] = op;
-                } else {
-                    auto& sum_op = op_summary[op.op_id];
-                    sum_op.calls += op.calls;
-                    sum_op.success += op.success;
-                    sum_op.errors += op.errors;
-                    sum_op.total_latency_ns += op.total_latency_ns;
-                    if (op.max_latency_ns > sum_op.max_latency_ns) {
-                        sum_op.max_latency_ns = op.max_latency_ns;
-                    }
-                    sum_op.calls_rate += op.calls_rate;
+    // 5. 速率差分（Job 级 + 进程级各 op）
+    auto now = steady_clock::now();
+    auto it_time = last_job_time_.find(job.JobID);
+    double period = 0.0;
+    if (it_time != last_job_time_.end()) {
+        period = duration<double>(now - it_time->second).count();
+        result.collect_period = period;
+    }
+
+    if (period > 0) {
+        // Job 级 op 速率
+        for (auto& [op, oc] : result.job_ops) {
+            auto it = last_job_op_calls_.find(op);
+            if (it != last_job_op_calls_.end() && oc.calls >= it->second) {
+                oc.calls_rate = static_cast<double>(oc.calls - it->second) / period;
+            }
+            result.job_metadata_ops_rate += oc.calls_rate;
+        }
+        // 进程级 op 速率
+        for (auto& [pid, proc] : result.processes) {
+            for (auto& [op, oc] : proc.ops) {
+                uint64_t key = (static_cast<uint64_t>(pid) << 32) | op;
+                auto it = last_proc_op_calls_.find(key);
+                if (it != last_proc_op_calls_.end() && oc.calls >= it->second) {
+                    oc.calls_rate = static_cast<double>(oc.calls - it->second) / period;
                 }
+                proc.metadata_ops_rate += oc.calls_rate;
             }
         }
+    }
 
-        // 将汇总后的操作信息转换为向量
-        for (auto& [op_id, op_info] : op_summary) {
-            summary_info.ops.push_back(std::move(op_info));
+    // 6. 更新速率基线
+    last_job_time_[job.JobID] = now;
+    for (const auto& [op, oc] : result.job_ops) {
+        last_job_op_calls_[op] = oc.calls;
+    }
+    for (const auto& [pid, proc] : result.processes) {
+        for (const auto& [op, oc] : proc.ops) {
+            uint64_t key = (static_cast<uint64_t>(pid) << 32) | op;
+            last_proc_op_calls_[key] = oc.calls;
         }
-
-        result.push_back(std::move(summary_info));
     }
 
     return std::any(result);
 }
 
 CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& writer_type) {
-    CollectDataParseFunc func = nullptr;
+    if (writer_type == "ESWriter") {
+        return [](std::any data) -> std::any {
+            json j;
+            if (!data.has_value()) {
+                j["error"] = "empty data";
+                return j;
+            }
+            try {
+                auto s = std::any_cast<JobFSMetaStat>(data);
+                j["job_id"] = s.job_id;
+                j["collect_period"] = s.collect_period;
+                j["job_metadata_ops_total"] = s.job_metadata_ops_total;
+                j["job_metadata_ops_rate"] = s.job_metadata_ops_rate;
+
+                j["job_ops"] = json::array();
+                for (const auto& [op, oc] : s.job_ops) {
+                    json oj;
+                    oj["op_id"] = oc.op_id;
+                    oj["op_name"] = oc.op_name;
+                    oj["calls"] = oc.calls;
+                    oj["calls_rate"] = oc.calls_rate;
+                    oj["success"] = oc.success;
+                    oj["errors"] = oc.errors;
+                    oj["last_errno"] = oc.last_errno;
+                    oj["total_latency_ns"] = oc.total_latency_ns;
+                    oj["max_latency_ns"] = oc.max_latency_ns;
+                    auto it = s.job_latency.find(op);
+                    if (it != s.job_latency.end()) {
+                        oj["latency_hist"] = std::vector<u64>(
+                            std::begin(it->second.hist), std::end(it->second.hist));
+                    }
+                    j["job_ops"].push_back(oj);
+                }
+
+                j["processes"] = json::array();
+                for (const auto& [pid, p] : s.processes) {
+                    json pj;
+                    pj["pid"] = p.pid;
+                    pj["source"] = p.source;
+                    pj["alive"] = p.alive;
+                    pj["mount_point"] = p.mount_point;
+                    pj["fs_type"] = p.fs_type;
+                    pj["metadata_ops_total"] = p.metadata_ops_total;
+                    pj["metadata_ops_rate"] = p.metadata_ops_rate;
+                    pj["ops"] = json::array();
+                    for (const auto& [op, oc] : p.ops) {
+                        pj["ops"].push_back({
+                            {"op_id", oc.op_id}, {"op_name", oc.op_name},
+                            {"calls", oc.calls}, {"calls_rate", oc.calls_rate},
+                            {"success", oc.success}, {"errors", oc.errors},
+                            {"last_errno", oc.last_errno},
+                            {"total_latency_ns", oc.total_latency_ns},
+                            {"max_latency_ns", oc.max_latency_ns}
+                        });
+                    }
+                    j["processes"].push_back(pj);
+                }
+                return j;
+            } catch (const std::bad_any_cast& e) {
+                spdlog::error("FSMetadataCollector: ESWriter parser bad_any_cast: {}", e.what());
+                j["error"] = "bad cast";
+                return j;
+            }
+        };
+    }
 
     if (writer_type == "FileWriter") {
-        func = [this](std::any data) -> std::any {
+        return [](std::any data) -> std::any {
             if (!data.has_value()) {
-                spdlog::warn("FSMetadataCollector: FileWriter parser received empty data");
                 return std::string("FSMetadataCollector error=empty_data\n");
             }
-
             try {
-                auto parsed = std::any_cast<std::vector<FSMetadataProcessInfo>>(data);
+                auto s = std::any_cast<JobFSMetaStat>(data);
                 std::ostringstream out;
+                out << "FSMetadataCollector job_id=" << s.job_id
+                    << " collect_period=" << s.collect_period
+                    << " metadata_ops_total=" << s.job_metadata_ops_total
+                    << " metadata_ops_rate=" << s.job_metadata_ops_rate
+                    << '\n';
 
-                for (const auto& info : parsed) {
-                    // 输出进程级汇总行
-                    out << "FSMetadataCollector"
-                        << " type=" << (info.pid == 0 ? "summary" : "process")
-                        << " pid=" << info.pid
-                        << " metadata_ops_total=" << info.metadata_ops_total
-                        << " metadata_ops_rate=" << info.metadata_ops_rate
-                        << " mount_point=" << (info.mount_point.empty() ? "" : info.mount_point)
-                        << " fs_type=" << (info.fs_type.empty() ? "" : info.fs_type)
-                        << "\n";
+                // Job 级各 op
+                for (const auto& [op, oc] : s.job_ops) {
+                    out << "FSMetadataCollector job_op"
+                        << " job_id=" << s.job_id
+                        << " op=" << oc.op_name
+                        << " calls=" << oc.calls
+                        << " calls_rate=" << oc.calls_rate
+                        << " success=" << oc.success
+                        << " errors=" << oc.errors
+                        << " last_errno=" << oc.last_errno
+                        << " total_latency_ns=" << oc.total_latency_ns
+                        << " max_latency_ns=" << oc.max_latency_ns
+                        << '\n';
+                }
 
-                    // 输出每个操作的详细信息
-                    for (const auto& op : info.ops) {
-                        out << "FSMetadataCollector op"
-                            << " pid=" << info.pid
-                            << " op=" << op.op_name
-                            << " calls=" << op.calls
-                            << " calls_rate=" << op.calls_rate
-                            << " success=" << op.success
-                            << " errors=" << op.errors
-                            << " last_errno=" << op.last_errno
-                            << " total_latency_ns=" << op.total_latency_ns
-                            << " max_latency_ns=" << op.max_latency_ns
-                            << "\n";
+                // Job 级各 op 的时延桶（仅输出非零桶）
+                for (const auto& [op, hist] : s.job_latency) {
+                    for (size_t b = 0; b < FS_META_LATENCY_BUCKETS; ++b) {
+                        if (hist.hist[b] != 0) {
+                            out << "FSMetadataCollector latency_bucket"
+                                << " job_id=" << s.job_id
+                                << " op=" << op_name_from_id(op)
+                                << " bucket=" << b
+                                << " count=" << hist.hist[b]
+                                << '\n';
+                        }
                     }
                 }
 
+                // 进程级各 op
+                for (const auto& [pid, p] : s.processes) {
+                    for (const auto& [op, oc] : p.ops) {
+                        out << "FSMetadataCollector process_op"
+                            << " job_id=" << s.job_id
+                            << " pid=" << p.pid
+                            << " source=" << p.source
+                            << " alive=" << p.alive
+                            << " mount_point=" << p.mount_point
+                            << " fs_type=" << p.fs_type
+                            << " op=" << oc.op_name
+                            << " calls=" << oc.calls
+                            << " calls_rate=" << oc.calls_rate
+                            << " success=" << oc.success
+                            << " errors=" << oc.errors
+                            << " last_errno=" << oc.last_errno
+                            << " total_latency_ns=" << oc.total_latency_ns
+                            << " max_latency_ns=" << oc.max_latency_ns
+                            << '\n';
+                    }
+                }
                 return out.str();
             } catch (const std::bad_any_cast& e) {
                 spdlog::error("FSMetadataCollector: FileWriter parser bad_any_cast: {}", e.what());
                 return std::string("FSMetadataCollector error=bad_cast\n");
             }
         };
-    } else if (writer_type == "ESWriter") {
-        func = [this](std::any data) -> std::any {
-            json ret;
-            ret["process_data"] = json::array();
+    }
 
-            if (!data.has_value()) {
-                spdlog::warn("FSMetadataCollector: ESWriter parser received empty data");
-                ret["error"] = "empty data";
-                return ret;
-            }
-
-            try {
-                auto parsed = std::any_cast<std::vector<FSMetadataProcessInfo>>(data);
-
-                for (const auto& info : parsed) {
-                    json j;
-                    j["pid"] = info.pid;
-                    j["metadata_ops_total"] = info.metadata_ops_total;
-                    j["metadata_ops_rate"] = info.metadata_ops_rate;
-                    j["mount_point"] = info.mount_point;
-                    j["fs_type"] = info.fs_type;
-
-                    j["ops"] = json::array();
-                    for (const auto& op : info.ops) {
-                        json op_j;
-                        op_j["op_id"] = op.op_id;
-                        op_j["op_name"] = op.op_name;
-                        op_j["calls"] = op.calls;
-                        op_j["calls_rate"] = op.calls_rate;
-                        op_j["success"] = op.success;
-                        op_j["errors"] = op.errors;
-                        op_j["last_errno"] = op.last_errno;
-                        op_j["total_latency_ns"] = op.total_latency_ns;
-                        op_j["max_latency_ns"] = op.max_latency_ns;
-                        j["ops"].push_back(op_j);
-                    }
-
-                    if (info.pid == 0) {
-                        ret["summary"] = j;
-                    } else {
-                        ret["process_data"].push_back(j);
-                    }
-                }
-
-                return ret;
-            } catch (const std::bad_any_cast& e) {
-                spdlog::error("FSMetadataCollector: ESWriter parser bad_any_cast: {}", e.what());
-                ret["error"] = "bad cast";
-                return ret;
-            }
-        };
-    } else if (writer_type == "PrometheusExporterWriter") {
-        func = [this](std::any data) -> std::any {
+    if (writer_type == "PrometheusExporterWriter") {
+        return [](std::any data) -> std::any {
             PrometheusExporterWriter::prometheus_job_state ret;
             if (!data.has_value()) {
-                spdlog::warn("FSMetadataCollector: PrometheusExporterWriter parser received empty data");
                 ret.JobID = 0;
                 return ret;
             }
-
             try {
-                auto parsed = std::any_cast<std::vector<FSMetadataProcessInfo>>(data);
+                auto s = std::any_cast<JobFSMetaStat>(data);
+                ret.JobID = static_cast<int>(s.job_id);
 
-                for (const auto& info : parsed) {
-                    PrometheusExporterWriter::prometheus_process_state state;
-                    state.pid = info.pid;
-                    state.fs_metadata_ops_total = info.metadata_ops_total;
-                    state.fs_metadata_ops_per_sec = info.metadata_ops_rate;
-
-                    // 计算总错误数
-                    uint64_t total_errors = 0;
-                    for (const auto& op : info.ops) {
-                        total_errors += op.errors;
-                    }
-                    state.fs_metadata_errors_total = total_errors;
-
-                    ret.processes_state.push_back(std::move(state));
+                // Job 级汇总（pid=0）
+                uint64_t job_errors = 0;
+                for (const auto& [op, oc] : s.job_ops) {
+                    job_errors += oc.errors;
                 }
+                PrometheusExporterWriter::prometheus_process_state jobstate;
+                jobstate.pid = 0;
+                jobstate.fs_metadata_ops_total = s.job_metadata_ops_total;
+                jobstate.fs_metadata_ops_per_sec = s.job_metadata_ops_rate;
+                jobstate.fs_metadata_errors_total = job_errors;
+                ret.processes_state.push_back(std::move(jobstate));
 
+                // 进程级
+                for (const auto& [pid, p] : s.processes) {
+                    uint64_t total_errors = 0;
+                    for (const auto& [op, oc] : p.ops) {
+                        total_errors += oc.errors;
+                    }
+                    PrometheusExporterWriter::prometheus_process_state ps;
+                    ps.pid = p.pid;
+                    ps.fs_metadata_ops_total = p.metadata_ops_total;
+                    ps.fs_metadata_ops_per_sec = p.metadata_ops_rate;
+                    ps.fs_metadata_errors_total = total_errors;
+                    ret.processes_state.push_back(std::move(ps));
+                }
                 return ret;
             } catch (const std::bad_any_cast& e) {
                 spdlog::error("FSMetadataCollector: PrometheusExporterWriter parser bad_any_cast: {}", e.what());
@@ -473,5 +563,5 @@ CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& w
         };
     }
 
-    return func;
+    return nullptr;
 }

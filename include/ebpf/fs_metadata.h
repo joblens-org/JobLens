@@ -46,10 +46,21 @@ enum fs_meta_op {
     FS_META_MAX         = 21,  /* 操作类型最大值（用于边界检查） */
 };
 
-/* 累加器 map 键：进程ID + 操作类型 */
+/* 明细累加器 map 键：{job_id, pid, op}。
+ * 带 job_id 可按 Job O(1) 切片；带 pid 供用户态发现短命进程 + 按进程聚合。
+ * 对标 job_io_new 的 job_pid_fd_key 设计。 */
 struct fs_meta_key {
-    u32 pid;    /* 进程ID */
-    u32 op;     /* 操作类型，enum fs_meta_op 转换为 u32 */
+    u64 job_id;  /* 归属的 Job ID */
+    u32 pid;     /* 进程ID(tgid) */
+    u32 op;      /* 操作类型，enum fs_meta_op 转换为 u32 */
+};
+
+/* Job 级累加器 map 键：{job_id, op}。含短命进程，summary 按 JobID O(1) 读。
+ * 对标 job_io_new 的 job_stat(key=job_id) 设计，此处多 op 维度以区分操作类型。 */
+struct fs_meta_job_key {
+    u64 job_id;  /* 归属的 Job ID */
+    u32 op;      /* 操作类型 */
+    u32 _pad;    /* 8 字节对齐填充 */
 };
 
 /* 累加器 map 值：文件系统元数据统计信息 */
@@ -61,6 +72,18 @@ struct fs_meta_stat {
     u64 total_latency_ns;   /* 总延迟（纳秒） */
     u64 max_latency_ns;     /* 最大延迟（纳秒） */
     u64 last_timestamp_ns;  /* 最后一次操作时间戳（纳秒） */
+};
+
+/* 时延直方图桶数（对标 job_io_new：低端线性 + 高端 log2 混合分桶，48 桶实际使用，
+ * 预留至 64 便于 key 对齐与后续扩展）。 */
+#define FS_META_LATENCY_BUCKETS 64
+
+/* 时延直方图 key：{job_id, op, bucket}。value=count（累积计数）。
+ * 每种操作类型独立一套直方图，可区分 open/getattr/readdir 等各自的时延分布。 */
+struct fs_meta_latency_key {
+    u64 job_id;  /* 归属的 Job ID */
+    u32 op;      /* 操作类型 */
+    u32 bucket;  /* 时延桶编号，[0, FS_META_LATENCY_BUCKETS) */
 };
 
 #endif
