@@ -56,10 +56,6 @@ struct FSMetaLatencyHist {
  */
 struct FSMetaProcStat {
     pid_t pid{0};
-    std::string source;                       ///< "alive" | "ephemeral"
-    bool alive{false};
-    std::string mount_point;                  ///< 挂载点路径（未知则为空）
-    std::string fs_type;                      ///< 文件系统类型（未知则为空）
     std::unordered_map<uint32_t, FSMetaOpCounters> ops;  ///< 按 op_id 索引的操作统计
     u64 metadata_ops_total{0};                ///< 所有操作的总调用次数
     double metadata_ops_rate{0};              ///< 每秒元数据操作总数
@@ -103,8 +99,6 @@ private:
 
     // 周期缓存：DUMP_TTL 内共享一次全表遍历（对标 new_io 的 refresh_dump_cache_if_needed）
     void refresh_dump_cache_if_needed();
-    // 清理已死且已输出过的短命进程的 eBPF 明细条目（保证"至少输出一次"后延迟清理）
-    void cleanup_dead_pids();
 
     double collect_period{1.0};             ///< 采集周期（秒，来自 freq 配置）
     bool summary{false};                    ///< 是否输出聚合摘要
@@ -123,10 +117,6 @@ private:
     std::chrono::steady_clock::time_point last_dump_time_{};
     std::vector<fs_meta_key> dump_keys_;
     std::vector<fs_meta_stat> dump_vals_;
-
-    // 短命进程生命周期状态
-    struct EphemeralState { uint64_t job_id{0}; uint64_t output_count{0}; bool alive{false}; };
-    std::unordered_map<pid_t, EphemeralState> known_pids_;
 
     // 速率差分基线（(pid<<32|op) → 上次 calls；job 级 op → 上次 calls）
     std::unordered_map<uint64_t, u64> last_proc_op_calls_;

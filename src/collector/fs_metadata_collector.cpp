@@ -19,11 +19,7 @@
 #include "writer/prometheus_exporter_writer.hpp"
 #include <nlohmann/json.hpp>
 #include <sstream>
-#include <fstream>
-#include <dirent.h>
-#include <sys/stat.h>
 #include <unistd.h>
-#include <algorithm>
 
 using json = nlohmann::json;
 using namespace std::chrono;
@@ -63,100 +59,6 @@ static std::string op_name_from_id(uint32_t op_id) {
         case FS_META_FSYNC:       return "fsync";
         default:                  return "unknown";
     }
-}
-
-// 静态辅助函数：将fd转换为绝对路径
-static std::string fd_to_path(int pid, int fd) {
-    char buf[512];
-    std::string p = "/proc/" + std::to_string(pid) + "/fd/" + std::to_string(fd);
-    ssize_t n = readlink(p.c_str(), buf, sizeof(buf) - 1);
-    if (n < 0) return {};
-    buf[n] = '\0';
-    return std::string(buf);
-}
-
-// 静态辅助函数：根据绝对路径查找挂载点和文件系统类型
-static bool path_to_mount(const std::string& abs,
-                          std::string& mnt,
-                          std::string& fst) {
-    /* 缓存项 */
-    struct MountEntry {
-        std::string mntpoint;
-        std::string fstype;
-        bool operator<(const MountEntry& rhs) const {
-            return mntpoint.size() > rhs.mntpoint.size(); // 长的放前面
-        }
-    };
-    /* 静态缓存：解析后的挂载表 + 时间戳 */
-    static std::vector<MountEntry> s_cache;
-    static time_t s_cache_mtime = 0;
-
-    /* 1. 判断是否需要重新加载：缓存空 或 文件更新 */
-    struct stat st{};
-    if (stat("/proc/self/mountinfo", &st) != 0) return false;      // 文件都打不开
-    bool need_reload = s_cache.empty() || st.st_mtime > s_cache_mtime;
-
-    if (need_reload) {
-        s_cache.clear();
-        std::ifstream ifs("/proc/self/mountinfo");
-        if (!ifs) return false;
-
-        std::string line;
-        while (std::getline(ifs, line)) {
-            std::istringstream iss(line);
-            int d1, d2, d3;
-            std::string dev, root, mntpoint;
-            if (!(iss >> d1 >> d2 >> d3 >> dev >> root >> mntpoint))
-                continue;
-
-            // 简单取 fs-type：倒数第二段
-            std::string fstype;
-            auto pos = line.rfind(' ');
-            if (pos != std::string::npos) {
-                auto pos2 = line.rfind(' ', pos - 1);
-                if (pos2 != std::string::npos)
-                    fstype = line.substr(pos2 + 1, pos - pos2 - 1);
-            }
-            s_cache.push_back({std::move(mntpoint), std::move(fstype)});
-        }
-        /* 按挂载点长度降序，保证最长前缀先匹配 */
-        std::sort(s_cache.begin(), s_cache.end());
-        s_cache_mtime = st.st_mtime;
-    }
-
-    /* 2. 在缓存里找最长前缀 */
-    for (const auto& e : s_cache) {
-        if (abs.find(e.mntpoint) == 0) {
-            mnt = e.mntpoint;
-            fst = e.fstype;
-            return true;
-        }
-    }
-
-    /* 3. 缓存里找不到 -> 视为"失效"，下次重新读（可选） */
-    s_cache.clear();   // 强制下次重载
-    return false;
-}
-
-// 最佳努力：为存活进程反查挂载点 / 文件系统类型
-static void fill_proc_mount(pid_t pid, std::string& mnt, std::string& fst) {
-    std::string fd_dir = "/proc/" + std::to_string(pid) + "/fd/";
-    DIR* dir = ::opendir(fd_dir.c_str());
-    if (!dir) return;
-    struct dirent* ent;
-    while ((ent = ::readdir(dir))) {
-        if (ent->d_name[0] == '.') continue;
-        int fd = std::atoi(ent->d_name);
-        std::string path = fd_to_path(pid, fd);
-        if (path.empty() || path[0] != '/') continue;
-        std::string m, f;
-        if (path_to_mount(path, m, f)) {
-            mnt = m;
-            fst = f;
-            break;  // 找到第一个成功的就退出
-        }
-    }
-    ::closedir(dir);
 }
 
 bool FSMetadataCollector::init(const nlohmann::json& cfg) {
@@ -205,7 +107,6 @@ void FSMetadataCollector::deinit_ebpf() {
 
 void FSMetadataCollector::deinit() noexcept {
     deinit_ebpf();
-    known_pids_.clear();
     last_proc_op_calls_.clear();
     last_job_op_calls_.clear();
     last_job_time_.clear();
@@ -220,26 +121,6 @@ void FSMetadataCollector::refresh_dump_cache_if_needed() {
     EbpfCommon::lookup_hashmap_batch<fs_meta_key, fs_meta_stat>(
         bpf_obj_, fs_meta_map_name, dump_keys_, dump_vals_);
     last_dump_time_ = now;
-}
-
-// 清理已死且已输出过的短命进程的 eBPF 明细条目（保证"至少输出一次"后延迟清理）。
-// pid2job 为共享 map，其删除由内核 exit hook 统一负责，此处不触碰。
-void FSMetadataCollector::cleanup_dead_pids() {
-    std::vector<pid_t> to_cleanup;
-    for (const auto& [pid, st] : known_pids_) {
-        if (!st.alive && st.output_count >= 1) {
-            to_cleanup.push_back(pid);
-        }
-    }
-    for (pid_t pid : to_cleanup) {
-        for (const auto& k : dump_keys_) {
-            if (k.pid == static_cast<u32>(pid)) {
-                EbpfCommon::delete_hashmap_elem<fs_meta_key, fs_meta_stat>(
-                    bpf_obj_, fs_meta_map_name, k);
-            }
-        }
-        known_pids_.erase(pid);
-    }
 }
 
 CollectResult FSMetadataCollector::collect(const Job& job) {
@@ -301,8 +182,6 @@ CollectResult FSMetadataCollector::collect(const Job& job) {
 
         auto& proc = result.processes[pid];
         proc.pid = pid;
-        proc.alive = Utils::is_process_running(pid);
-        proc.source = proc.alive ? "alive" : "ephemeral";
 
         FSMetaOpCounters oc{};
         oc.op_id = op;
@@ -317,23 +196,7 @@ CollectResult FSMetadataCollector::collect(const Job& job) {
         proc.metadata_ops_total += s.calls;
     }
 
-    // 3. 存活进程反查挂载点 / fs 类型（最佳努力）
-    for (auto& [pid, proc] : result.processes) {
-        if (proc.alive) {
-            fill_proc_mount(pid, proc.mount_point, proc.fs_type);
-        }
-    }
-
-    // 4. 更新短命进程状态 + 延迟清理
-    for (const auto& [pid, proc] : result.processes) {
-        auto& st = known_pids_[pid];
-        st.job_id = job.JobID;
-        st.output_count++;
-        st.alive = proc.alive;
-    }
-    cleanup_dead_pids();
-
-    // 5. 速率差分（Job 级 + 进程级各 op）
+    // 3. 速率差分（Job 级 + 进程级各 op）
     auto now = steady_clock::now();
     auto it_time = last_job_time_.find(job.JobID);
     double period = 0.0;
@@ -364,7 +227,7 @@ CollectResult FSMetadataCollector::collect(const Job& job) {
         }
     }
 
-    // 6. 更新速率基线
+    // 4. 更新速率基线
     last_job_time_[job.JobID] = now;
     for (const auto& [op, oc] : result.job_ops) {
         last_job_op_calls_[op] = oc.calls;
@@ -418,10 +281,6 @@ CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& w
                 for (const auto& [pid, p] : s.processes) {
                     json pj;
                     pj["pid"] = p.pid;
-                    pj["source"] = p.source;
-                    pj["alive"] = p.alive;
-                    pj["mount_point"] = p.mount_point;
-                    pj["fs_type"] = p.fs_type;
                     pj["metadata_ops_total"] = p.metadata_ops_total;
                     pj["metadata_ops_rate"] = p.metadata_ops_rate;
                     pj["ops"] = json::array();
@@ -495,10 +354,6 @@ CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& w
                         out << "FSMetadataCollector process_op"
                             << " job_id=" << s.job_id
                             << " pid=" << p.pid
-                            << " source=" << p.source
-                            << " alive=" << p.alive
-                            << " mount_point=" << p.mount_point
-                            << " fs_type=" << p.fs_type
                             << " op=" << oc.op_name
                             << " calls=" << oc.calls
                             << " calls_rate=" << oc.calls_rate
