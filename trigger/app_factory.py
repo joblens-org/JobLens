@@ -165,9 +165,6 @@ class AppContext:
         self.config['service_registry']['max_retries'] = int(
             self._get_config_value('service_registry.max_retries', 3)
         )
-        self.config['service_registry']['heartbeat_interval'] = int(
-            self._get_config_value('service_registry.heartbeat_interval', 1800)
-        )
         
         # 加载JobLens配置用于获取其他配置项
         joblens_config = self._load_joblens_config()
@@ -305,8 +302,7 @@ class AppContext:
                 service_host=registrar_config['host'],
                 service_port=registrar_config['port'],
                 retry_interval=registrar_config['retry_interval'],
-                max_retries=registrar_config['max_retries'],
-                heartbeat_interval=registrar_config['heartbeat_interval']
+                max_retries=registrar_config['max_retries']
             )
             
             # 尝试注册服务

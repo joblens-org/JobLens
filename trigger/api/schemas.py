@@ -141,7 +141,6 @@ class RegistryStatusResponse(BaseModel):
     service_host: Optional[str] = Field(None, description="服务主机")
     service_port: Optional[int] = Field(None, description="服务端口")
     registry_url: Optional[str] = Field(None, description="注册中心URL")
-    heartbeat_interval: Optional[int] = Field(None, description="心跳间隔(秒)")
     version: Optional[str] = Field(None, description="版本信息")
     etcd_path: Optional[str] = Field(None, description="etcd路径")
     etcd_workdir: Optional[str] = Field(None, description="etcd工作目录")

@@ -21,6 +21,22 @@ Since preload_app=True, the app is initialized in the master process.
 import os
 import yaml
 
+# ---------------------------------------------------------------------------
+# gRPC fork 支持（必须在任何 `import grpc` / etcd3 之前设置环境变量才生效）
+#
+# etcd3 底层依赖 grpcio 的 C 扩展（cygrpc），gRPC core 使用多线程，
+# 官方明确声明不支持 fork()。在 gunicorn worker 被超时杀死后 master 重新
+# fork worker 时，残留的 gRPC 后台线程状态会在子进程中损坏，导致 abort/段错误
+# （core dump）。此处在 gunicorn 加载配置阶段（master 进程、任何 grpc import 之前）
+# 提前注入官方 fork 支持开关，使所有后续 fork 出的 worker 都继承。
+#
+# 参考：grpc/grpc doc/fork_support.md —— 两个变量必须同时设置，
+# 且 fork 支持仅在 'poll' / 'epoll1' 轮询策略下有效。
+# systemd unit 已通过 Environment= 设置；此处为手动/开发直启 gunicorn 时的兜底。
+# ---------------------------------------------------------------------------
+os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "true")
+os.environ.setdefault("GRPC_POLL_STRATEGY", "poll")
+
 
 def _resolve_loglevel() -> str:
     """从 trigger 配置文件读取 logging.level，供 gunicorn 自身日志复用；读取失败回退 info"""
@@ -63,6 +79,13 @@ def post_fork(server, worker):
         worker: The worker instance
     """
     server.log.info(f"Worker spawned (pid: {worker.pid})")
+    # 记录 gRPC fork 支持环境变量的实际生效值，便于线上排查 core dump 问题。
+    # etcd3(grpcio) 的 client 应在此 fork 之后、于 worker 进程内创建（use-after-fork）。
+    server.log.info(
+        "gRPC fork settings in worker: "
+        f"GRPC_ENABLE_FORK_SUPPORT={os.environ.get('GRPC_ENABLE_FORK_SUPPORT')}, "
+        f"GRPC_POLL_STRATEGY={os.environ.get('GRPC_POLL_STRATEGY')}"
+    )
 
 
 def worker_exit(server, worker):

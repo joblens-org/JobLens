@@ -10,6 +10,12 @@ User=root
 WorkingDirectory=/var/lib/joblens
 Environment=JOBLENS_CONFIG_PATH=/etc/JobLens/config.yaml
 Environment=PYTHONUNBUFFERED=1
+# gRPC 官方 fork 支持（实验性）：etcd3 底层依赖 grpcio C 扩展，
+# 在 gunicorn worker fork/超时重启场景下多线程 + fork() 会导致 C 扩展段错误（core dump）。
+# 开启官方 fork 支持并强制 poll 轮询策略，缓解 fork 后 gRPC 状态损坏问题。
+# 参考 grpc/grpc doc/fork_support.md：两个变量必须同时设置。
+Environment=GRPC_ENABLE_FORK_SUPPORT=true
+Environment=GRPC_POLL_STRATEGY=poll
 ExecStart=/usr/lib/joblens/trigger-venv/bin/gunicorn \
     --config /etc/JobLens/trigger/gunicorn.conf.py \
     --chdir /var/lib/joblens \

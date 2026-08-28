@@ -27,8 +27,7 @@ class ServiceRegistrar:
     """服务注册器，支持向注册中心注册服务，并提供心跳机制"""
     
     def __init__(self, registry_url: str, service_host: str, service_port: int,
-                 retry_interval: int = 10, max_retries: int = 3,
-                 heartbeat_interval: int = 1800):
+                 retry_interval: int = 10, max_retries: int = 3):
         """
         初始化服务注册器
         
@@ -38,7 +37,6 @@ class ServiceRegistrar:
             service_port: 服务端口
             retry_interval: 注册失败重试间隔（秒）
             max_retries: 最大重试次数
-            heartbeat_interval: 心跳间隔（秒），默认30分钟
             enabled: 是否启用注册功能
         """
         self.registry_url = registry_url.rstrip('/')
@@ -46,12 +44,9 @@ class ServiceRegistrar:
         self.service_port = service_port
         self.retry_interval = retry_interval
         self.max_retries = max_retries
-        self.heartbeat_interval = heartbeat_interval
         self.enabled = True
         
         self.service_id = None
-        self._heartbeat_thread = None
-        self._stop_event = threading.Event()
         self._lock = threading.Lock()  # 保护service_id的并发访问
         
         
@@ -172,9 +167,6 @@ class ServiceRegistrar:
                 self.etcd_addr, self.etcd_port = self._fetch_etcd_addr()
                 self.etcd_path = self._fetch_etcd_path()
                 
-                # 启动心跳线程
-                self._start_heartbeat()
-                
                 return True
                 
             except Exception as e:
@@ -185,40 +177,6 @@ class ServiceRegistrar:
         
         logger.error("服务注册最终失败，将继续运行但无法被注册中心发现")
         return False
-    
-    def _start_heartbeat(self):
-        """启动心跳线程，定期重新注册"""
-        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
-            logger.warning("心跳线程已在运行，忽略重复启动")
-            return
-        
-        def heartbeat_worker():
-            logger.info(f"心跳线程已启动，每{self.heartbeat_interval}秒重新注册一次")
-            
-            while not self._stop_event.is_set():
-                try:
-                    # 等待心跳间隔
-                    if self._stop_event.wait(self.heartbeat_interval):
-                        break  # 收到停止信号
-                    
-                    # 重新注册
-                    with self._lock:
-                        current_service_id = self.service_id
-                    
-                    if current_service_id:
-                        logger.info("心跳触发：重新注册服务...")
-                        
-                        # 再注册
-                        self.register()
-                    else:
-                        logger.warning("服务未注册，心跳跳过")
-                        
-                except Exception as e:
-                    logger.error(f"心跳线程异常: {e}", exc_info=True)
-                    # 继续运行，不退出线程
-        
-        self._heartbeat_thread = threading.Thread(target=heartbeat_worker, daemon=True)
-        self._heartbeat_thread.start()
     
     def unregister(self):
         """从注册中心注销服务"""
@@ -247,17 +205,8 @@ class ServiceRegistrar:
                 self.service_id = None
     
     def shutdown(self):
-        """优雅关闭，停止心跳线程并注销服务"""
+        """优雅关闭，注销服务"""
         logger.info("正在停止ServiceRegistrar...")
-        
-        # 发送停止信号
-        self._stop_event.set()
-        
-        # 等待心跳线程结束（最多5秒）
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=5)
-            if self._heartbeat_thread.is_alive():
-                logger.warning("心跳线程未在5秒内停止，强制继续")
         
         # 注销服务
         self.unregister()
@@ -274,7 +223,6 @@ class ServiceRegistrar:
                 "service_host": self.service_host,
                 "service_port": self.service_port,
                 "registry_url": self.registry_url,
-                "heartbeat_interval": self.heartbeat_interval,
                 "version": self.version,
                 "etcd_path": self.etcd_path,
                 "etcd_workdir": self.etcd_workdir,
