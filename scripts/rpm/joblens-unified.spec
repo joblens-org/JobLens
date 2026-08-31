@@ -410,8 +410,8 @@ if [ "$1" -eq 1 ] && [ -x /usr/bin/systemctl ]; then
     # 首次安装：preset 启用 core 服务（由 preset 文件决定是否 auto-start）
     /usr/bin/systemctl preset joblens.service >/dev/null 2>&1 || :
 elif [ "$1" -eq 2 ] && [ -x /usr/bin/systemctl ]; then
-    # 升级：尝试重启 core 服务
-    /usr/bin/systemctl try-restart joblens.service >/dev/null 2>&1 || :
+    # 升级：重启 core 服务（%preun 不再 stop，此处 restart 拉起新版本）
+    /usr/bin/systemctl restart joblens.service >/dev/null 2>&1 || :
 fi
 
 # trigger 服务的 systemd post 逻辑（首次安装 enable，升级不操作）
@@ -431,10 +431,9 @@ if [ -x /usr/bin/systemctl ]; then
         # 完全卸载：先 disable（下次开机不再启动），再停止当前实例
         /usr/bin/systemctl --no-reload disable joblens.service >/dev/null 2>&1 || :
         /usr/bin/systemctl stop joblens.service >/dev/null 2>&1 || :
-    elif [ "$1" -eq 1 ]; then
-        # 升级：停止旧版本，%%post 中 try-restart 将启动新版本
-        /usr/bin/systemctl stop joblens.service >/dev/null 2>&1 || :
     fi
+    # 升级($1=1)不 stop：rpm 升级时 %post(new) 先于 %preun(old) 执行,
+    # %post 已 restart 拉起新版本, 此处 stop 会误停新版本。
 fi
 
 # trigger 服务的 preun 逻辑
@@ -454,10 +453,10 @@ if [ "$1" -eq 0 ] && [ -x /usr/bin/systemctl ]; then
     /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || :
 fi
 
-# core 服务的 postun 逻辑：升级时 restart
-%systemd_postun_with_restart joblens.service
-
-# trigger 服务的 postun 逻辑
+# core 服务升级时的重启已在 %post 中完成, 此处不再 mark-restart,
+# 否则 systemd transfiletrigger 的 reload-or-restart --marked 会对
+# 标记单元再执行一次 restart, 与 %post 冲突导致服务被 stop。
+# trigger 服务的 postun 逻辑（%post 未 restart trigger, 此处仍需 mark-restart）
 %systemd_postun_with_restart joblens-trigger.service
 
 exit 0
