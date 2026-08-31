@@ -312,12 +312,16 @@ DEFINE_META_SIMPLE(getdents64, FS_META_READDIR)
 DEFINE_META_SIMPLE(mkdirat, FS_META_MKDIR)
 DEFINE_META_SIMPLE(mknodat, FS_META_MKNOD)
 
-/* ==================== unlinkat (unlink/rmdir) ==================== */
+/* ==================== unlinkat / unlink (unlink/rmdir) ==================== */
 /* unlinkat: dirfd, pathname, flags(arg2) → AT_REMOVEDIR 决定 rmdir/unlink */
 DEFINE_META_FLAG(unlinkat, 2, AT_REMOVEDIR, FS_META_RMDIR, FS_META_UNLINK, FS_META_UNLINK)
+/* unlink: 非 *at 变体, glibc unlink() 实际调用本 syscall → 纯 unlink */
+DEFINE_META_SIMPLE(unlink, FS_META_UNLINK)
 
-/* ==================== renameat2 / linkat / symlinkat / readlinkat ==================== */
+/* ==================== renameat2 / rename / linkat / symlinkat / readlinkat ==================== */
 DEFINE_META_SIMPLE(renameat2,  FS_META_RENAME)
+/* rename: 非 *at 变体, glibc rename() 实际调用本 syscall → rename */
+DEFINE_META_SIMPLE(rename,     FS_META_RENAME)
 DEFINE_META_SIMPLE(linkat,     FS_META_LINK)
 DEFINE_META_SIMPLE(symlinkat,  FS_META_SYMLINK)
 DEFINE_META_SIMPLE(readlinkat, FS_META_READLINK)
