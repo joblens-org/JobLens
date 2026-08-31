@@ -1,5 +1,36 @@
 # JobLens Changelog
 
+## v0.3.0 (2026-08)
+
+### Kernel-Side Job Attribution (eBPF Shared Pinned Maps)
+- Introduced shared pinned-map infrastructure: `job_pid_track.bpf.c` pins the `pid2job`/`cgroup2job`/`job_event_rb` maps to bpffs (`/sys/fs/bpf/joblens`) for cross-`.bpf.o` reuse (`1345a60`)
+- Added kernel-side `pid2job`/`cgroup2job` self-maintenance with fork/exit lifecycle tracking, so child-process attribution is propagated and cleaned up in-kernel (`9f85614`)
+- Made `JobRegistry` own kernel job attribution via a new `JobPidTracker` that consumes fork/exit ringbuf events and runs a low-frequency reconcile loop (`797c54e`)
+- Converted collectors to shared-map pure readers (PowerCollector no longer writes `pid2job` itself) with systemd bpffs mount/cleanup guarantees (`c7f657c`, `ee5ac1d`)
+
+### New Collectors
+- **FSMetadataCollector**: per-job filesystem metadata operation statistics (open/close/getattr/readdir/rename/unlink/xattr/fsync, etc.) with frequency, latency histograms, and error rates via eBPF, plus Prometheus metrics (`7af2168`, `bfa1b96`, `34f2809`, `1a7ea59`)
+- **NewIOUsageCollector**: job/file-centric IO aggregation with VFS syscall-layer semantics, latency histograms, and ephemeral-process handling (`399604c`); removed the `use_ebpf` flag and improved speed calculation with floating-point precision (`1fc9ef6`, `03cd5c8`, `cea40e4`)
+
+### Trigger and Runtime
+- Removed the service-registration heartbeat interval and added gRPC fork support (`GRPC_ENABLE_FORK_SUPPORT` + `GRPC_POLL_STRATEGY=poll`) to prevent gunicorn worker fork core dumps (`5e6f348`)
+- Added configurable log level resolved from the config file and the environment (`a3478f8`)
+- Added initialization/destruction logging to DirectoryWatcher, NetLinkUtils, and TimerScheduler (`cf8b8bb`)
+
+### Configuration and Build
+- Added `normalize_cgroup_fs_path` to canonicalize cgroup filesystem paths (`bb09f44`)
+- Added build metadata support (`BUILD_ID`/`BUILD_TIME`) propagated through CMake and the unified RPM build (`f319c31`)
+
+### Bug Fixes
+- Fixed FSMetadataCollector failing to load by correcting the `fstat` tracepoint name to `newfstat` (`fdd9295`)
+- Fixed `cgroup2job` map leakage after job completion by caching `cgroup_id` on `Job` at add time instead of re-resolving at removal (`b90f591`)
+- Fixed negative variance overflow in NewIO by switching to the correct Welford online algorithm (`a4123f7`)
+- Fixed `lookup_hashmap_batch` EFAULT during concurrent map deletion by restarting traversal from the head (`00caf55`)
+- Fixed the core service not auto-restarting after RPM upgrade by removing the `%preun` stop and the redundant `%postun` restart marker (`78fb246`)
+- Added missing `rename`/`unlink` tracepoint hooks (non-`*at` variants) to FSMetadataCollector so those operations are collected (`08e782e`)
+
+---
+
 ## v0.2.3 (2026-07)
 
 ### Patch Release - FileWriter Parser V2 and Collector Attribution Fixes
