@@ -98,43 +98,40 @@ static __always_inline u32 latency_bucket(u64 ns)
     return 47;
 }
 
-static __always_inline s8 sign_and_abs_s64(s64* x)
+/* BPF 后端不支持有符号除法, 拆符号后用无符号除法再恢复符号。 */
+static __always_inline s64 signed_div(s64 x, u64 d)
 {
-    if (*x >= 0) return 1;
-    *x = -*x;
-    return -1;
+    if (x >= 0) return (s64)((u64)x / d);
+    return -(s64)((u64)(-x) / d);
 }
 
-static __always_inline u64 div_u64(u64 x, u64 d)
-{
-    if (d == 0) return 0;
-    return x / d;
-}
-
-/* 对一个 rw_stat 累加器施加单次读/写：字节累计 + Welford 在线均值/方差 */
+/* 对一个 rw_stat 累加器施加单次读/写：字节累计 + Welford 在线均值/方差。
+ * variance 字段实际存储 M2(离均差平方和)。正确 Welford 递推:
+ *   delta = x - old_mean;  new_mean = old_mean + delta/count;
+ *   M2 += delta * (x - new_mean)
+ * delta 与 (x - new_mean) 同号, 乘积恒非负, M2 单调递增。
+ * 原实现将 diff2 误设为 -mean, 导致负向累积最终溢出为负。 */
 static __always_inline void apply_rw(struct rw_stat *stat, ssize_t ret, bool is_write)
 {
-    s64 diff = ret, diff2 = 0;
-    s8 sign_diff = 1;
-    if (is_write){
+    if (is_write) {
         __sync_fetch_and_add(&stat->write_bytes, ret);
-        __sync_fetch_and_add(&stat->write_count, 1);
-        __sync_fetch_and_sub(&diff, stat->write_mean);
-        sign_diff = sign_and_abs_s64(&diff);
-        u64 r = div_u64(diff, stat->write_count);
-        __sync_fetch_and_add(&stat->write_mean, sign_diff * r);
-        __sync_fetch_and_sub(&diff2, stat->write_mean);
-        __sync_fetch_and_add(&stat->write_variance, diff2 * diff * r);
+        u64 count = __sync_add_and_fetch(&stat->write_count, 1);
+        s64 x = ret;
+        s64 old_mean = (s64)stat->write_mean;
+        s64 delta = x - old_mean;
+        s64 new_mean = old_mean + signed_div(delta, count);
+        stat->write_mean = (u64)new_mean;
+        __sync_fetch_and_add(&stat->write_variance, delta * (x - new_mean));
         stat->write_ktimestamp = bpf_ktime_get_ns();
     } else {
         __sync_fetch_and_add(&stat->read_bytes, ret);
-        __sync_fetch_and_add(&stat->read_count, 1);
-        __sync_fetch_and_sub(&diff, stat->read_mean);
-        sign_diff = sign_and_abs_s64(&diff);
-        u64 r = div_u64(diff, stat->read_count);
-        __sync_fetch_and_add(&stat->read_mean, sign_diff * r);
-        __sync_fetch_and_sub(&diff2, stat->read_mean);
-        __sync_fetch_and_add(&stat->read_variance, diff2 * diff * r);
+        u64 count = __sync_add_and_fetch(&stat->read_count, 1);
+        s64 x = ret;
+        s64 old_mean = (s64)stat->read_mean;
+        s64 delta = x - old_mean;
+        s64 new_mean = old_mean + signed_div(delta, count);
+        stat->read_mean = (u64)new_mean;
+        __sync_fetch_and_add(&stat->read_variance, delta * (x - new_mean));
         stat->read_ktimestamp = bpf_ktime_get_ns();
     }
 }
