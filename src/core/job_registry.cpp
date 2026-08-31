@@ -238,6 +238,17 @@ static std::string job_cgroup_path(const Job& job) {
     return {};
 }
 
+// 解析 Job 的 cgroup 路径为 cgroup_id 并缓存到 job.cgroup_id(仅解析一次)。
+// 删除作业时直接复用缓存的 id, 不依赖 cgroup 目录仍存在(作业结束后调度器可能已删除该目录)。
+static void resolve_and_cache_cgroup_id(Job& job) {
+    if (job.cgroup_id != 0) return;  // 已缓存, 跳过重复 stat
+    const auto cg = job_cgroup_path(job);
+    if (cg.empty()) return;
+    if (auto cgid = EbpfCommon::cgroup_path_to_id(cg)) {
+        job.cgroup_id = *cgid;
+    }
+}
+
 void JobRegistry::init_pid_tracker() {
     pid_tracker_ = std::make_unique<JobPidTracker>();
     pid_tracker_->set_fork_cb([this](uint32_t pid, uint64_t job_id) { on_kernel_fork(pid, job_id); });
@@ -265,21 +276,17 @@ void JobRegistry::stop_pid_tracker() {
 }
 
 // JobEvent::Added 时调用: 向内核登记 cgroup 归属 + 写入根 pid 种子, 内核 fork hook 据此繁衍。
-void JobRegistry::sync_job_to_kernel(const Job& job) {
+void JobRegistry::sync_job_to_kernel(Job& job) {
     if (!pid_tracker_ || job.JobID == 0) return;
-    const auto cg = job_cgroup_path(job);
-    if (!cg.empty()) {
-        if (auto cgid = EbpfCommon::cgroup_path_to_id(cg)) {
-            if (pid_tracker_->set_cgroup_job(*cgid, job.JobID)) {
-                spdlog::debug("JobRegistry: kernel cgroup2job registered job_id={} cgroup_id={} path={}",
-                              job.JobID, *cgid, cg);
-            } else {
-                spdlog::warn("JobRegistry: kernel cgroup2job write failed job_id={} cgroup_id={} path={}",
-                             job.JobID, *cgid, cg);
-            }
+    // 确保 cgroup_id 已缓存(从 db 恢复的旧 job 可能未缓存, 此处兜底解析一次)。
+    resolve_and_cache_cgroup_id(job);
+    if (job.cgroup_id != 0) {
+        if (pid_tracker_->set_cgroup_job(job.cgroup_id, job.JobID)) {
+            spdlog::debug("JobRegistry: kernel cgroup2job registered job_id={} cgroup_id={}",
+                          job.JobID, job.cgroup_id);
         } else {
-            spdlog::warn("JobRegistry: cgroup path->id resolve failed job_id={} path={}, "
-                         "kernel will rely on parent-pid inheritance only", job.JobID, cg);
+            spdlog::warn("JobRegistry: kernel cgroup2job write failed job_id={} cgroup_id={}",
+                         job.JobID, job.cgroup_id);
         }
     }
     for (pid_t pid : job.JobPIDs) {
@@ -288,23 +295,22 @@ void JobRegistry::sync_job_to_kernel(const Job& job) {
         }
     }
     spdlog::debug("JobRegistry: synced job to kernel job_id={} seed_pids={} has_cgroup={}",
-                  job.JobID, job.JobPIDs.size(), !cg.empty());
+                  job.JobID, job.JobPIDs.size(), job.cgroup_id != 0);
 }
 
 // JobEvent::Removed 时调用: 删 cgroup2job + 清理该 Job 在 pid2job 的所有已知 pid。
 void JobRegistry::remove_job_from_kernel(const Job& job) {
     if (!pid_tracker_ || job.JobID == 0) return;
-    const auto cg = job_cgroup_path(job);
-    if (!cg.empty()) {
-        if (auto cgid = EbpfCommon::cgroup_path_to_id(cg)) {
-            pid_tracker_->del_cgroup_job(*cgid);
-        }
+    if (job.cgroup_id != 0) {
+        pid_tracker_->del_cgroup_job(job.cgroup_id);
+        spdlog::debug("JobRegistry: kernel cgroup2job removed job_id={} cgroup_id={}",
+                      job.JobID, job.cgroup_id);
     }
     for (pid_t pid : job.JobPIDs) {
         pid_tracker_->del_pid_job(static_cast<uint32_t>(pid));
     }
     spdlog::debug("JobRegistry: removed job from kernel job_id={} cleared_pids={} has_cgroup={}",
-                  job.JobID, job.JobPIDs.size(), !cg.empty());
+                  job.JobID, job.JobPIDs.size(), job.cgroup_id != 0);
 }
 
 // ringbuf FORK: 内核已将 child 写入 pid2job, 这里同步更新用户态 Job.JobPIDs。
@@ -349,7 +355,7 @@ void JobRegistry::reconcile_loop() {
         }
         if (!reconcile_running_) break;
         auto jobs = snapshot();
-        for (const auto& job : jobs) {
+        for (auto& job : jobs) {
             sync_job_to_kernel(job);
         }
         spdlog::debug("JobRegistry: pid tracker reconcile pass done, resynced {} jobs to kernel", jobs.size());
@@ -463,6 +469,9 @@ bool JobRegistry::addJob(const Job& job) {
 }
 
 bool JobRegistry::addJob(const Job& job, bool from_db) {
+    // 锁外解析 cgroup_id(stat 可能较慢), 缓存到待存储副本, 删除作业时直接复用。
+    Job job_with_cgroup = job;
+    resolve_and_cache_cgroup_id(job_with_cgroup);
     {
         std::lock_guard lg(mtx_);
         SubAttrMatcher matcher;
@@ -489,7 +498,7 @@ bool JobRegistry::addJob(const Job& job, bool from_db) {
             spdlog::warn("JobRegistry: duplicate jobID {}, ignored", job.JobID);
             return false;
         }
-        jobs_.emplace(job.JobID, job);
+        jobs_.emplace(job.JobID, job_with_cgroup);
     }
     if (!from_db) {
         // 在锁内取出job副本，避免释放锁后worker线程并发删除导致at()抛out_of_range

@@ -110,7 +110,7 @@ private:
     // JobRegistry 通过它向内核登记 Job 归属并消费 fork/exit 事件。
     void init_pid_tracker();
     void stop_pid_tracker();
-    void sync_job_to_kernel(const Job& job);      // Added: 写 cgroup2job + 种子 pid2job
+    void sync_job_to_kernel(Job& job);            // Added: 写 cgroup2job + 种子 pid2job
     void remove_job_from_kernel(const Job& job);  // Removed: 删 cgroup2job + 清 pid2job 残留
     void on_kernel_fork(uint32_t pid, uint64_t job_id);  // ringbuf FORK: 给 Job 加 pid
     void on_kernel_exit(uint32_t pid, uint64_t job_id);  // ringbuf EXIT: 从 Job 删 pid

@@ -247,6 +247,11 @@ struct Job {
 
     SubAttr                                 sub_attr;
 
+    // 运行时缓存: 添加作业时解析一次 cgroup 路径 → cgroup_id (stat().st_ino)。
+    // 删除作业时直接复用, 避免 cgroup 目录已被调度器删除导致 stat 失败、无法清理内核 cgroup2job。
+    // 仅内存缓存, 不参与序列化/持久化 (cgroup inode 重启后可能变化)。
+    uint64_t                                cgroup_id{0};
+
     static constexpr auto reflection() {
         return std::make_tuple(
             std::make_pair("JobID", &Job::JobID),
