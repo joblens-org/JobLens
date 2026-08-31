@@ -303,7 +303,7 @@ DEFINE_META_SIMPLE(close, FS_META_CLOSE)
 
 /* ==================== stat 系列 (getattr) ==================== */
 DEFINE_META_SIMPLE(newfstatat, FS_META_GETATTR)
-DEFINE_META_SIMPLE(fstat,      FS_META_GETATTR)
+DEFINE_META_SIMPLE(newfstat,   FS_META_GETATTR)
 
 /* ==================== getdents64 (readdir) ==================== */
 DEFINE_META_SIMPLE(getdents64, FS_META_READDIR)
