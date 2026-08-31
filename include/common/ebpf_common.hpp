@@ -369,6 +369,11 @@ namespace EbpfCommon{
         opts.sz = sizeof(opts);
 
         void *in_batch = nullptr;
+        // 遍历期间 map 可能被并发修改(如清理死进程条目), 导致 in_batch 指向的
+        // key 被删除, 内核访问该失效 key 时 bpf_map_lookup_batch 返回 EFAULT。
+        // 此时已收集的 keys/values 作废, 从头重启遍历; 限次避免死循环。
+        constexpr int kMaxRestarts = 3;
+        int restarts = 0;
         while (true) {
             void *out_batch = nullptr;
             uint32_t count = static_cast<uint32_t>(batch_size);
@@ -377,6 +382,16 @@ namespace EbpfCommon{
                                            &count, &opts);
             if (err) {
                 if (err == -ENOENT) break;  // 遍历完成
+                if (err == -EFAULT && in_batch != nullptr && restarts < kMaxRestarts) {
+                    // in_batch 指向的 key 在遍历期间被并发删除, 从头重启
+                    spdlog::warn("lookup_hashmap_batch: {} EFAULT (key removed during traversal), restarting from head",
+                                 map_name);
+                    keys.clear();
+                    values.clear();
+                    in_batch = nullptr;
+                    ++restarts;
+                    continue;
+                }
                 spdlog::error("lookup_hashmap_batch: bpf_map_lookup_batch({}) failed err={} errno={}",
                               map_name, err, errno);
                 break;
