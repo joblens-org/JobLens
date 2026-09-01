@@ -41,7 +41,8 @@ using json = nlohmann::json;
 using namespace std::chrono;
 
 bool IOUsageCollector::init_ebpf(){
-    auto path = Utils::JobLensRootDir() + bpf_o_path;
+    auto path = EbpfCommon::resolve_bpf_obj("job_fd_rw_stat.bpf.o");
+    if (path.empty()) return false;
     // event_front_ = std::make_unique<std::queue<event>>();
     // event_back_ = std::make_unique<std::queue<event>>();
     bpf_obj_ = EbpfCommon::load_bpf_obj_pinned(path, bpf_links_, JOBLENS_BPF_PIN_ROOT);

@@ -43,7 +43,8 @@ bool NewIOUsageCollector::init(const json& cfg){
 }
 
 bool NewIOUsageCollector::init_ebpf(){
-    auto path = Utils::JobLensRootDir() + bpf_o_path;
+    auto path = EbpfCommon::resolve_bpf_obj("job_io_new.bpf.o");
+    if (path.empty()) return false;
     bpf_obj_ = EbpfCommon::load_bpf_obj_pinned(path, bpf_links_, JOBLENS_BPF_PIN_ROOT);
     return bpf_obj_ != nullptr;
 }

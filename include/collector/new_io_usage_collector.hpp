@@ -88,7 +88,6 @@ private:
     // 短命进程生命周期状态
     struct EphemeralState { uint64_t job_id{0}; uint64_t output_count{0}; bool alive{false}; };
 
-    std::string bpf_o_path = JOBLENS_INSTALL_LIBDIR "/joblens/bpf_obj/job_io_new.bpf.o";
     std::string jobstat_map_name = "job_stat";
     std::string jobfdstat_map_name = "job_fd_stat";
     std::string latency_map_name = "latency_hist";
