@@ -128,7 +128,8 @@ private:
     }
 
     bool init_ebpf(){
-        auto path = Utils::JobLensRootDir() + bpf_o_path;
+        auto path = EbpfCommon::resolve_bpf_obj("trace_condor_starter.bpf.o");
+        if (path.empty()) return false;
         bpf_obj_ = EbpfCommon::load_bpf_obj(path, bpf_links_);
 
         ring_buffer_sample_fn fn  = [](void *ctx, void *data, size_t size){
@@ -212,7 +213,6 @@ private:
     bool polling_running;
     std::unique_ptr<std::thread> poll_thread;
     std::vector<std::string> use_collectors;
-    std::string bpf_o_path = JOBLENS_INSTALL_LIBDIR "/joblens/bpf_obj/trace_condor_starter.bpf.o";
     std::string rb_name = "exec_events";
     std::function<void(Job)> add_if_;
     std::vector<bpf_link*> bpf_links_;
