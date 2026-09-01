@@ -89,7 +89,8 @@ bool FSMetadataCollector::init(const nlohmann::json& cfg) {
 }
 
 bool FSMetadataCollector::init_ebpf() {
-    auto path = Utils::JobLensRootDir() + bpf_o_path;
+    auto path = EbpfCommon::resolve_bpf_obj("fs_metadata.bpf.o");
+    if (path.empty()) return false;
     // 复用共享 pinned pid2job / cgroup2job（对标 new_io）
     bpf_obj_ = EbpfCommon::load_bpf_obj_pinned(path, bpf_links_, JOBLENS_BPF_PIN_ROOT);
     if (!bpf_obj_) {

@@ -103,8 +103,7 @@ private:
     double collect_period{1.0};             ///< 采集周期（秒，来自 freq 配置）
     bool summary{false};                    ///< 是否输出聚合摘要
 
-    // eBPF 对象文件路径与 map 名（对标 new_io）
-    std::string bpf_o_path = JOBLENS_INSTALL_LIBDIR "/joblens/bpf_obj/fs_metadata.bpf.o";
+    // eBPF map 名（对标 new_io）
     std::string fs_meta_map_name{"fs_meta_stat"};             ///< {job_id,pid,op} 明细 map
     std::string fs_meta_job_map_name{"fs_meta_job_stat"};     ///< {job_id,op} Job 级 map
     std::string fs_meta_latency_map_name{"fs_meta_latency_hist"};  ///< {job_id,op,bucket} 时延桶

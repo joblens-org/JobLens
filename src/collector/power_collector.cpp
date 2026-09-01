@@ -189,17 +189,11 @@ std::vector<double> PowerCollector::read_cpu_freqs_mhz()
 
 bool PowerCollector::load_ebpf()
 {
-    /* Path to the compiled BPF object.
-     * CMake places .bpf.o files under ${CMAKE_BINARY_DIR}/bpf_obj/,
+    /* CMake places .bpf.o files under ${CMAKE_BINARY_DIR}/bpf_obj/,
      * and the installed RPM places them under /usr/<lib>/joblens/bpf_obj/.
      */
-    std::string bpf_path = std::string("/usr/") + JOBLENS_INSTALL_LIBDIR
-                         + "/joblens/bpf_obj/trace_sched_runtime.bpf.o";
-    /* If we're running from a build tree, try the build directory first */
-    if (access(bpf_path.c_str(), R_OK) != 0) {
-        /* Fallback: running from build directory (development) */
-        bpf_path = "bpf_obj/trace_sched_runtime.bpf.o";
-    }
+    std::string bpf_path = EbpfCommon::resolve_bpf_obj("trace_sched_runtime.bpf.o");
+    if (bpf_path.empty()) return false;
 
     bpf_obj_ = EbpfCommon::load_bpf_obj_pinned(bpf_path, bpf_links_, JOBLENS_BPF_PIN_ROOT);
     if (!bpf_obj_) {
