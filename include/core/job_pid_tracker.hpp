@@ -25,7 +25,6 @@
 #include <vector>
 
 #include "common/ebpf_common.hpp"
-#include "common/utils.hpp"
 #include "ebpf/job_pid_track.h"
 
 // JobPidTracker: 共享 pid2job/cgroup2job/job_event_rb 三张 map 的宿主。
@@ -50,7 +49,8 @@ public:
     // 加载 bpf 对象(create-or-reuse pinned map)、取回 map fd、起 ringbuf poll 线程。
     bool start() {
         if (running_) return true;
-        auto path = Utils::JobLensRootDir() + bpf_o_path_;
+        auto path = EbpfCommon::resolve_bpf_obj("job_pid_track.bpf.o");
+        if (path.empty()) return false;
         bpf_obj_ = EbpfCommon::load_bpf_obj_pinned(path, bpf_links_, JOBLENS_BPF_PIN_ROOT);
         if (!bpf_obj_) {
             spdlog::error("JobPidTracker: load bpf {} failed", path);
@@ -163,7 +163,6 @@ private:
         pid2job_fd_ = -1;
     }
 
-    std::string bpf_o_path_ = JOBLENS_INSTALL_LIBDIR "/joblens/bpf_obj/job_pid_track.bpf.o";
     bpf_object* bpf_obj_{nullptr};
     std::vector<bpf_link*> bpf_links_;
     ring_buffer* rb_{nullptr};
