@@ -29,11 +29,52 @@
 #include <sys/stat.h>
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
+#include "common/utils.hpp"
 
 
 namespace EbpfCommon{
     namespace fs = std::filesystem;
+
+    // 统一的 .bpf.o 定位解析器: 按优先级探测候选目录, 返回第一个存在的文件路径。
+    // 候选顺序(高 -> 低):
+    //   1. 环境变量 JOBLENS_BPF_OBJ_DIR   -- 运行时显式覆盖(自定义/容器部署、开发调试)
+    //   2. <可执行文件目录>/bpf_obj/      -- 手动编译(build/JobLens + build/bpf_obj)或便携部署
+    //   3. <JobLensRootDir()>/<libdir>/joblens/bpf_obj/ -- RPM/install 布局(向后兼容)
+    // 全部未命中返回空字符串, 并汇总日志列出所有尝试过的候选路径。
+    inline std::string resolve_bpf_obj(const std::string& name) {
+        std::vector<std::string> candidates;
+
+        if (const char* env = ::getenv("JOBLENS_BPF_OBJ_DIR"); env && *env) {
+            candidates.emplace_back((fs::path(env) / name).string());
+        }
+        try {
+            candidates.emplace_back((fs::path(Utils::executableDir()) / "bpf_obj" / name).string());
+            candidates.emplace_back(
+                (fs::path(Utils::JobLensRootDir()) / JOBLENS_INSTALL_LIBDIR / "joblens" / "bpf_obj" / name).string());
+        } catch (const std::exception& e) {
+            spdlog::warn("resolve_bpf_obj: resolving executable/install dir failed: {}", e.what());
+        }
+
+        for (const auto& cand : candidates) {
+            std::error_code ec;
+            if (fs::exists(cand, ec) && !ec) {
+                spdlog::debug("resolve_bpf_obj: {} -> {}", name, cand);
+                return cand;
+            }
+        }
+
+        std::string tried;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (i) tried += ", ";
+            tried += candidates[i];
+        }
+        spdlog::error("resolve_bpf_obj: {} not found, tried: [{}] "
+                      "(hint: set JOBLENS_BPF_OBJ_DIR to the directory containing the .bpf.o files)",
+                      name, tried);
+        return "";
+    }
 
     inline std::string normalize_cgroup_fs_path(const std::string& cgroup_path){
         const fs::path mount = "/sys/fs/cgroup";
@@ -87,7 +128,8 @@ namespace EbpfCommon{
             obj_ = bpf_object__open_file(bpf_o_path.c_str(), nullptr);
         }
         if (libbpf_get_error(obj_)) {
-            spdlog::error("bpf_object__open_file {}", bpf_o_path);
+            spdlog::error("bpf_object__open_file {} failed, errno={} ({})",
+                          bpf_o_path, errno, strerror(errno));
             return nullptr;
         }
         /* 4. 加载进内核 */
