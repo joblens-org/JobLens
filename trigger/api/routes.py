@@ -95,6 +95,12 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         rule_manager: 规则管理器（可选）
     """
 
+    def rpc_call(method: str, params=None):
+        """RPC 调用兜底：core 未连接时抛 RPCError，由各路由已有的 503 分支统一处理"""
+        if rpc_client is None:
+            raise RPCError("RPC client is not initialized (JobLens core may be down)")
+        return rpc_client.call(method, params)
+
     def current_joblens_version() -> str:
         try:
             from trigger.core.tools import get_joblens_version
@@ -108,7 +114,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     def prmxs_writer_metrics():
         """获取Prometheus格式的指标数据"""
         try:
-            metrics = rpc_client.call("prmxs_writer/metrics")
+            metrics = rpc_call("prmxs_writer/metrics")
             # 防御检查: C++ 返回 JSON 数组表示方法不存在/错误
             if not isinstance(metrics, dict):
                 return Response("", mimetype="text/plain")
@@ -192,7 +198,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         """
         try:
             start_time = time.time()
-            result = rpc_client.call("health")
+            result = rpc_call("health")
             result['rpc_latency_ms'] = round((time.time() - start_time) * 1000, 2)
             response = RPCHealthResponse.model_validate(result)
             return jsonify(response.model_dump())
@@ -362,7 +368,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     def get_job_count():
         """获取当前注册的作业总数"""
         try:
-            result = rpc_client.call("JobRegistry/get_job_count")
+            result = rpc_call("JobRegistry/get_job_count")
             response = JobCountResponse.model_validate(result)
             return jsonify(response.model_dump())
         except RPCError as e:
@@ -374,7 +380,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     def list_all_jobs():
         """列出所有作业（不包含彩蛋任务 JobID=0）"""
         try:
-            result = rpc_client.call("JobRegistry/list_jobs")
+            result = rpc_call("JobRegistry/list_jobs")
             # RPC 返回 {"status": "ok", "jobs": [...]}，需提取 jobs 数组
             jobs = result.get("jobs", []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
             response = JobsListResponse(status="ok", jobs=jobs)
@@ -388,7 +394,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     def get_job_by_id(job_id: int):
         """获取指定 JobID 的详细信息"""
         try:
-            result = rpc_client.call("JobRegistry/get_job", {"JobID": job_id})
+            result = rpc_call("JobRegistry/get_job", {"JobID": job_id})
             if "error" in result:
                 return abort(404, description=result["error"])
             response = JobDetailResponse.model_validate(result)
@@ -406,7 +412,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     def rpc_functions():
         """获取 RPC 服务端注册的所有可用方法列表"""
         try:
-            result = rpc_client.call("func_list")
+            result = rpc_call("func_list")
             response = RPCFunctionsResponse(
                 status="ok",
                 functions=result if isinstance(result, list) else [],
@@ -424,7 +430,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     def collectors_perf():
         """获取所有 Collector 的性能统计信息"""
         try:
-            result = rpc_client.call("CollectorRegistry/CollectorsPerfCount")
+            result = rpc_call("CollectorRegistry/CollectorsPerfCount")
             if result.get("status") == "error":
                 return abort(500, description=result.get("msg", "Unknown error"))
             response = CollectorsPerfResponse.model_validate(result)
@@ -441,7 +447,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         """获取指定 Writer 的基本信息"""
         try:
             method_name = f"{writer_name}/info"
-            result = rpc_client.call(method_name)
+            result = rpc_call(method_name)
             response = WriterInfoResponse.model_validate(result)
             return jsonify(response.model_dump())
         except RPCError as e:
@@ -455,7 +461,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     def writers_perf():
         """获取所有 Writer 的性能统计信息"""
         try:
-            result = rpc_client.call("WriterManager/WriterPerfCount")
+            result = rpc_call("WriterManager/WriterPerfCount")
             if result.get("status") == "error":
                 return abort(500, description=result.get("msg", "Unknown error"))
             response = WritersPerfResponse.model_validate(result)
