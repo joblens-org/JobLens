@@ -12,15 +12,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "collector/io_usage_collector.hpp"
+#include "common/mountinfo_utils.hpp"
 #include <chrono>
 #include <dirent.h>
-#include <fcntl.h>
 #include <fstream>
 #include <sstream>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <nlohmann/json.hpp>
-#include <iostream>
 #include "common/utils.hpp"
 #include "core/collector_registry.hpp"
 #include "writer/prometheus_exporter_writer.hpp"
@@ -240,99 +239,6 @@ static std::string fd_to_path(int pid, int fd)
     return std::string(buf);
 }
 
-// 根据绝对路径找挂载点和文件系统类型
-// static bool path_to_mount(const std::string &abs, std::string &mnt, std::string &fst)
-// {
-//     std::ifstream ifs("/proc/self/mountinfo");
-//     if (!ifs) return false;
-//     std::string line;
-//     std::string best_mnt;
-//     std::string best_fst;
-//     size_t best_len = 0;
-//     while (std::getline(ifs, line)) {
-//         std::istringstream iss(line);
-//         int dummy; std::string dev, root, mntpoint, opts;
-//         iss >> dummy >> dummy >> dummy >> dev >> root >> mntpoint;
-//         std::getline(iss, opts);          // 剩下的忽略
-//         if (abs.find(mntpoint) == 0 && mntpoint.size() > best_len) {
-//             best_len = mntpoint.size();
-//             best_mnt = mntpoint;
-//             // 简单解析：倒数第二段就是 fs-type
-//             auto pos = line.rfind(' ');
-//             if (pos != std::string::npos) {
-//                 auto pos2 = line.rfind(' ', pos-1);
-//                 if (pos2 != std::string::npos)
-//                     best_fst = line.substr(pos2+1, pos-pos2-1);
-//             }
-//         }
-//     }
-//     if (best_len) { mnt = best_mnt; fst = best_fst; return true; }
-//     return false;
-// }
-
-static bool path_to_mount(const std::string &abs,
-                          std::string &mnt,
-                          std::string &fst)
-{
-    /* 缓存项 */
-    struct MountEntry {
-        std::string mntpoint;
-        std::string fstype;
-        bool operator<(const MountEntry &rhs) const {
-            return mntpoint.size() > rhs.mntpoint.size(); // 长的放前面
-        }
-    };
-    /* 静态缓存：解析后的挂载表 + 时间戳 */
-    static std::vector<MountEntry>  s_cache;
-    static time_t                   s_cache_mtime = 0;
-
-    /* 1. 判断是否需要重新加载：缓存空 或 文件更新 */
-    struct stat st{};
-    if (stat("/proc/self/mountinfo", &st) != 0) return false;      // 文件都打不开
-    bool need_reload = s_cache.empty() || st.st_mtime > s_cache_mtime;
-
-    if (need_reload) {
-        s_cache.clear();
-        std::ifstream ifs("/proc/self/mountinfo");
-        if (!ifs) return false;
-
-        std::string line;
-        while (std::getline(ifs, line)) {
-            std::istringstream iss(line);
-            int d1, d2, d3;
-            std::string dev, root, mntpoint;
-            if (!(iss >> d1 >> d2 >> d3 >> dev >> root >> mntpoint))
-                continue;
-
-            // 简单取 fs-type：倒数第二段
-            std::string fstype;
-            auto pos = line.rfind(' ');
-            if (pos != std::string::npos) {
-                auto pos2 = line.rfind(' ', pos - 1);
-                if (pos2 != std::string::npos)
-                    fstype = line.substr(pos2 + 1, pos - pos2 - 1);
-            }
-            s_cache.push_back({std::move(mntpoint), std::move(fstype)});
-        }
-        /* 按挂载点长度降序，保证最长前缀先匹配 */
-        std::sort(s_cache.begin(), s_cache.end());
-        s_cache_mtime = st.st_mtime;
-    }
-
-    /* 2. 在缓存里找最长前缀 */
-    for (const auto &e : s_cache) {
-        if (abs.find(e.mntpoint) == 0) {
-            mnt = e.mntpoint;
-            fst = e.fstype;
-            return true;
-        }
-    }
-
-    /* 3. 缓存里找不到 -> 视为“失效”，下次重新读（可选） */
-    s_cache.clear();   // 强制下次重载
-    return false;
-}
-
 // --------------- CPUMemCollector ---------------
 CollectResult IOUsageCollector::collect(const Job &job)
 {
@@ -385,6 +291,7 @@ CollectResult IOUsageCollector::collect(const Job &job)
         pid_state_dict[pid] = pid_state{ now, rb, wb, rch, wch };
 
         /* 3. 扫描 /proc/pid/fd/ 收集打开的文件 */
+        auto mount_table = MountInfoUtils::read_for_pid(pid);
         std::string fd_dir = "/proc/" + std::to_string(pid) + "/fd/";
         DIR *dir = ::opendir(fd_dir.c_str());
         if (dir) {
@@ -401,7 +308,12 @@ CollectResult IOUsageCollector::collect(const Job &job)
                 FileIOInfo finfo;
                 finfo.path = path;
                 finfo.pos  = static_cast<unsigned long long>(stb.st_size);
-                path_to_mount(path, finfo.mount_point, finfo.fs_type);
+                if (mount_table) {
+                    if (auto mount_entry = MountInfoUtils::resolve(*mount_table, path)) {
+                        finfo.mount_point = mount_entry->mount_point;
+                        finfo.fs_type = mount_entry->fs_type;
+                    }
+                }
                 if (use_ebpf){
                     auto stat = get_fd_stat(pid, fd);
                     if (stat != std::nullopt) {
