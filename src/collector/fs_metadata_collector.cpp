@@ -29,7 +29,7 @@ AUTO_REGISTER_JOB_COLLECTOR(
     "Collect filesystem metadata operation statistics via eBPF (job-level + latency buckets)",
     ConfigParams{
         {"freq", "Sampling frequency in Hz, e.g., 0.2 for once every 5 seconds"},
-        {"summary", "Whether to summarize data across all processes (true/false), default false"}
+        {"include_process_details", "Whether to include per-process details (true/false), default true"}
     }
 )
 
@@ -62,22 +62,8 @@ static std::string op_name_from_id(uint32_t op_id) {
 }
 
 bool FSMetadataCollector::init(const nlohmann::json& cfg) {
-    // 读取 summary 配置
-    if (cfg.contains("summary") && cfg["summary"].get<std::string>() == "true") {
-        summary = true;
-    } else {
-        summary = false;
-    }
-
-    // 读取 freq 配置（采集周期）
-    if (cfg.contains("freq")) {
-        try {
-            collect_period = cfg["freq"].get<double>();
-        } catch (const std::exception& e) {
-            spdlog::warn("FSMetadataCollector: failed to parse freq, using default 1.0");
-            collect_period = 1.0;
-        }
-    }
+    include_process_details = !cfg.contains("include_process_details") ||
+        cfg["include_process_details"].get<std::string>() == "true";
 
     // 默认启用 eBPF（不再提供 use_ebpf 开关）
     if (!init_ebpf()) {
@@ -109,7 +95,9 @@ void FSMetadataCollector::deinit_ebpf() {
 void FSMetadataCollector::deinit() noexcept {
     deinit_ebpf();
     last_proc_op_calls_.clear();
+    last_proc_op_errors_.clear();
     last_job_op_calls_.clear();
+    last_job_op_errors_.clear();
     last_job_time_.clear();
     spdlog::info("FSMetadataCollector deinit");
 }
@@ -173,28 +161,30 @@ CollectResult FSMetadataCollector::collect(const Job& job) {
     }
 
     // 2. 刷新周期缓存 + 按 Job 切片聚合进程（含短命进程）
-    refresh_dump_cache_if_needed();
-    for (size_t i = 0; i < dump_keys_.size(); ++i) {
-        if (dump_keys_[i].job_id != job.JobID) continue;
-        pid_t pid = static_cast<pid_t>(dump_keys_[i].pid);
-        uint32_t op = dump_keys_[i].op;
-        const fs_meta_stat& s = dump_vals_[i];
-        if (s.calls == 0) continue;
+    if (include_process_details) {
+        refresh_dump_cache_if_needed();
+        for (size_t i = 0; i < dump_keys_.size(); ++i) {
+            if (dump_keys_[i].job_id != job.JobID) continue;
+            pid_t pid = static_cast<pid_t>(dump_keys_[i].pid);
+            uint32_t op = dump_keys_[i].op;
+            const fs_meta_stat& s = dump_vals_[i];
+            if (s.calls == 0) continue;
 
-        auto& proc = result.processes[pid];
-        proc.pid = pid;
+            auto& proc = result.processes[pid];
+            proc.pid = pid;
 
-        FSMetaOpCounters oc{};
-        oc.op_id = op;
-        oc.op_name = op_name_from_id(op);
-        oc.calls = s.calls;
-        oc.success = s.success;
-        oc.errors = s.errors;
-        oc.last_errno = s.last_errno;
-        oc.total_latency_ns = s.total_latency_ns;
-        oc.max_latency_ns = s.max_latency_ns;
-        proc.ops[op] = oc;
-        proc.metadata_ops_total += s.calls;
+            FSMetaOpCounters oc{};
+            oc.op_id = op;
+            oc.op_name = op_name_from_id(op);
+            oc.calls = s.calls;
+            oc.success = s.success;
+            oc.errors = s.errors;
+            oc.last_errno = s.last_errno;
+            oc.total_latency_ns = s.total_latency_ns;
+            oc.max_latency_ns = s.max_latency_ns;
+            proc.ops[op] = oc;
+            proc.metadata_ops_total += s.calls;
+        }
     }
 
     // 3. 速率差分（Job 级 + 进程级各 op）
@@ -206,37 +196,80 @@ CollectResult FSMetadataCollector::collect(const Job& job) {
         result.collect_period = period;
     }
 
-    if (period > 0) {
-        // Job 级 op 速率
-        for (auto& [op, oc] : result.job_ops) {
-            auto it = last_job_op_calls_.find(op);
-            if (it != last_job_op_calls_.end() && oc.calls >= it->second) {
-                oc.calls_rate = static_cast<double>(oc.calls - it->second) / period;
-            }
-            result.job_metadata_ops_rate += oc.calls_rate;
+    auto compute_rate = [period](u64 current, const auto* previous, auto key) -> double {
+        if (period <= 0 || previous == nullptr) return 0.0;
+        auto it = previous->find(key);
+        if (it == previous->end() || current < it->second) return 0.0;
+        return static_cast<double>(current - it->second) / period;
+    };
+
+    auto job_calls_it = last_job_op_calls_.find(job.JobID);
+    auto job_errors_it = last_job_op_errors_.find(job.JobID);
+    const auto* previous_job_calls = job_calls_it != last_job_op_calls_.end() ? &job_calls_it->second : nullptr;
+    const auto* previous_job_errors = job_errors_it != last_job_op_errors_.end() ? &job_errors_it->second : nullptr;
+
+    for (auto& [op, oc] : result.job_ops) {
+        oc.calls_rate = compute_rate(oc.calls, previous_job_calls, op);
+        oc.error_rate = compute_rate(oc.errors, previous_job_errors, op);
+        result.job_metadata_ops_rate += oc.calls_rate;
+    }
+
+    auto proc_calls_job_it = last_proc_op_calls_.find(job.JobID);
+    auto proc_errors_job_it = last_proc_op_errors_.find(job.JobID);
+    for (auto& [pid, proc] : result.processes) {
+        const std::unordered_map<uint32_t, u64>* previous_proc_calls = nullptr;
+        const std::unordered_map<uint32_t, u64>* previous_proc_errors = nullptr;
+        if (proc_calls_job_it != last_proc_op_calls_.end()) {
+            auto it = proc_calls_job_it->second.find(pid);
+            if (it != proc_calls_job_it->second.end()) previous_proc_calls = &it->second;
         }
-        // 进程级 op 速率
-        for (auto& [pid, proc] : result.processes) {
-            for (auto& [op, oc] : proc.ops) {
-                uint64_t key = (static_cast<uint64_t>(pid) << 32) | op;
-                auto it = last_proc_op_calls_.find(key);
-                if (it != last_proc_op_calls_.end() && oc.calls >= it->second) {
-                    oc.calls_rate = static_cast<double>(oc.calls - it->second) / period;
-                }
-                proc.metadata_ops_rate += oc.calls_rate;
-            }
+        if (proc_errors_job_it != last_proc_op_errors_.end()) {
+            auto it = proc_errors_job_it->second.find(pid);
+            if (it != proc_errors_job_it->second.end()) previous_proc_errors = &it->second;
+        }
+        for (auto& [op, oc] : proc.ops) {
+            oc.calls_rate = compute_rate(oc.calls, previous_proc_calls, op);
+            oc.error_rate = compute_rate(oc.errors, previous_proc_errors, op);
+            proc.metadata_ops_rate += oc.calls_rate;
         }
     }
 
     // 4. 更新速率基线
     last_job_time_[job.JobID] = now;
+    std::unordered_map<uint32_t, u64> current_job_calls;
+    std::unordered_map<uint32_t, u64> current_job_errors;
     for (const auto& [op, oc] : result.job_ops) {
-        last_job_op_calls_[op] = oc.calls;
+        current_job_calls[op] = oc.calls;
+        current_job_errors[op] = oc.errors;
     }
-    for (const auto& [pid, proc] : result.processes) {
-        for (const auto& [op, oc] : proc.ops) {
-            uint64_t key = (static_cast<uint64_t>(pid) << 32) | op;
-            last_proc_op_calls_[key] = oc.calls;
+    if (current_job_calls.empty()) {
+        last_job_op_calls_.erase(job.JobID);
+        last_job_op_errors_.erase(job.JobID);
+    } else {
+        last_job_op_calls_[job.JobID] = std::move(current_job_calls);
+        last_job_op_errors_[job.JobID] = std::move(current_job_errors);
+    }
+
+    if (!include_process_details) {
+        last_proc_op_calls_.erase(job.JobID);
+        last_proc_op_errors_.erase(job.JobID);
+    } else {
+        std::unordered_map<pid_t, std::unordered_map<uint32_t, u64>> current_proc_calls;
+        std::unordered_map<pid_t, std::unordered_map<uint32_t, u64>> current_proc_errors;
+        for (const auto& [pid, proc] : result.processes) {
+            auto& proc_calls = current_proc_calls[pid];
+            auto& proc_errors = current_proc_errors[pid];
+            for (const auto& [op, oc] : proc.ops) {
+                proc_calls[op] = oc.calls;
+                proc_errors[op] = oc.errors;
+            }
+        }
+        if (current_proc_calls.empty()) {
+            last_proc_op_calls_.erase(job.JobID);
+            last_proc_op_errors_.erase(job.JobID);
+        } else {
+            last_proc_op_calls_[job.JobID] = std::move(current_proc_calls);
+            last_proc_op_errors_[job.JobID] = std::move(current_proc_errors);
         }
     }
 
@@ -265,6 +298,7 @@ CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& w
                     oj["op_name"] = oc.op_name;
                     oj["calls"] = oc.calls;
                     oj["calls_rate"] = oc.calls_rate;
+                    oj["error_rate"] = oc.error_rate;
                     oj["success"] = oc.success;
                     oj["errors"] = oc.errors;
                     oj["last_errno"] = oc.last_errno;
@@ -289,6 +323,7 @@ CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& w
                         pj["ops"].push_back({
                             {"op_id", oc.op_id}, {"op_name", oc.op_name},
                             {"calls", oc.calls}, {"calls_rate", oc.calls_rate},
+                            {"error_rate", oc.error_rate},
                             {"success", oc.success}, {"errors", oc.errors},
                             {"last_errno", oc.last_errno},
                             {"total_latency_ns", oc.total_latency_ns},
@@ -327,6 +362,7 @@ CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& w
                         << " op=" << oc.op_name
                         << " calls=" << oc.calls
                         << " calls_rate=" << oc.calls_rate
+                        << " error_rate=" << oc.error_rate
                         << " success=" << oc.success
                         << " errors=" << oc.errors
                         << " last_errno=" << oc.last_errno
@@ -358,6 +394,7 @@ CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& w
                             << " op=" << oc.op_name
                             << " calls=" << oc.calls
                             << " calls_rate=" << oc.calls_rate
+                            << " error_rate=" << oc.error_rate
                             << " success=" << oc.success
                             << " errors=" << oc.errors
                             << " last_errno=" << oc.last_errno
@@ -387,27 +424,33 @@ CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& w
 
                 // Job 级汇总（pid=0）
                 uint64_t job_errors = 0;
+                double job_errors_per_sec = 0.0;
                 for (const auto& [op, oc] : s.job_ops) {
                     job_errors += oc.errors;
+                    job_errors_per_sec += oc.error_rate;
                 }
-                PrometheusExporterWriter::prometheus_process_state jobstate;
+                PrometheusExporterWriter::prometheus_process_state jobstate{};
                 jobstate.pid = 0;
                 jobstate.fs_metadata_ops_total = s.job_metadata_ops_total;
                 jobstate.fs_metadata_ops_per_sec = s.job_metadata_ops_rate;
                 jobstate.fs_metadata_errors_total = job_errors;
+                jobstate.fs_metadata_errors_per_sec = job_errors_per_sec;
                 ret.processes_state.push_back(std::move(jobstate));
 
                 // 进程级
                 for (const auto& [pid, p] : s.processes) {
                     uint64_t total_errors = 0;
+                    double errors_per_sec = 0.0;
                     for (const auto& [op, oc] : p.ops) {
                         total_errors += oc.errors;
+                        errors_per_sec += oc.error_rate;
                     }
-                    PrometheusExporterWriter::prometheus_process_state ps;
+                    PrometheusExporterWriter::prometheus_process_state ps{};
                     ps.pid = p.pid;
                     ps.fs_metadata_ops_total = p.metadata_ops_total;
                     ps.fs_metadata_ops_per_sec = p.metadata_ops_rate;
                     ps.fs_metadata_errors_total = total_errors;
+                    ps.fs_metadata_errors_per_sec = errors_per_sec;
                     ret.processes_state.push_back(std::move(ps));
                 }
                 return ret;

@@ -17,12 +17,15 @@
 #include "core/collector_type.h"
 #include "icollector.h"
 #include <spdlog/spdlog.h>
-#include "common/ebpf_common.hpp"
 #include "ebpf/fs_metadata.h"
 #include <chrono>
+#include <sys/types.h>
 #include <unordered_map>
 #include <string>
 #include <vector>
+
+struct bpf_link;
+struct bpf_object;
 
 /**
  * @brief 单操作类型的元数据统计（对标 new_io 的 IoCounters）
@@ -100,8 +103,7 @@ private:
     // 周期缓存：DUMP_TTL 内共享一次全表遍历（对标 new_io 的 refresh_dump_cache_if_needed）
     void refresh_dump_cache_if_needed();
 
-    double collect_period{1.0};             ///< 采集周期（秒，来自 freq 配置）
-    bool summary{false};                    ///< 是否输出聚合摘要
+    bool include_process_details{true};
 
     // eBPF map 名（对标 new_io）
     std::string fs_meta_map_name{"fs_meta_stat"};             ///< {job_id,pid,op} 明细 map
@@ -117,8 +119,10 @@ private:
     std::vector<fs_meta_key> dump_keys_;
     std::vector<fs_meta_stat> dump_vals_;
 
-    // 速率差分基线（(pid<<32|op) → 上次 calls；job 级 op → 上次 calls）
-    std::unordered_map<uint64_t, u64> last_proc_op_calls_;
-    std::unordered_map<uint32_t, u64> last_job_op_calls_;
+    // 速率差分基线按 JobID 隔离，避免不同 Job 或复用 PID 串用上次快照。
+    std::unordered_map<uint64_t, std::unordered_map<uint32_t, u64>> last_job_op_calls_;
+    std::unordered_map<uint64_t, std::unordered_map<uint32_t, u64>> last_job_op_errors_;
+    std::unordered_map<uint64_t, std::unordered_map<pid_t, std::unordered_map<uint32_t, u64>>> last_proc_op_calls_;
+    std::unordered_map<uint64_t, std::unordered_map<pid_t, std::unordered_map<uint32_t, u64>>> last_proc_op_errors_;
     std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> last_job_time_;
 };
