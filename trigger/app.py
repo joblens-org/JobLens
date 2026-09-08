@@ -30,6 +30,13 @@ JobLens触发器入口文件
 3. 关闭RPC客户端连接
 """
 import os
+import sys
+from pathlib import Path
+
+# 直跑 python app.py 时补齐仓库根到 sys.path，使绝对导入可用；需在 trigger.* 导入前执行
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import flask
 from flask import has_request_context, request
 from werkzeug.local import LocalProxy
@@ -103,7 +110,8 @@ from trigger.utils.email_notifier import simple_send
 # 创建应用实例
 # 使用工厂函数创建，所有初始化逻辑在工厂中完成
 try:
-    config_path = os.environ.get('JOBLENS_TRIGGER_CONFIG_PATH', '/etc/JobLens/trigger/config.yaml')
+    # 路径回退链（/etc -> 包内 example -> 内置默认）由 AppContext 负责，此处不硬编码
+    config_path = os.environ.get('JOBLENS_TRIGGER_CONFIG_PATH')
     app = create_application(config_path)
 except Exception as e:
     if __name__ != "__main__":

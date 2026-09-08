@@ -83,13 +83,21 @@ class AppContext:
         
         查找顺序:
         /etc/JobLens/trigger/config.yaml（生产配置）
+        -> 包内 config.example.yaml（源码/开发环境）
+        -> 内置空配置（仍可启动，走全默认值）
 
         """
         system_config = Path("/etc/JobLens/trigger/config.yaml")
         if system_config.exists():
             return str(system_config)
 
-        raise FileNotFoundError("Cannot find configuration file. Please provide a config.yaml in /etc/JobLens/trigger/ or use the example config.")
+        bundled_example = Path(__file__).resolve().parent / "config.example.yaml"
+        if bundled_example.exists():
+            logger.warning(f"未找到生产配置 {system_config}，回退使用包内示例配置: {bundled_example}")
+            return str(bundled_example)
+
+        logger.warning("未找到任何配置文件，使用内置默认配置启动")
+        return ""
     
     def _load_yaml_config(self) -> dict:
         """从YAML文件加载配置"""
@@ -225,10 +233,15 @@ class AppContext:
         logger.info(f"日志等级设置为: {logging.getLevelName(level)}")
     
     def _load_joblens_config(self) -> dict:
-        """加载JobLens配置"""
-        config_file = self._get_config_value('config_manager.config_file', 'config/config.yaml')
-        abs_path = str(Path(__file__).resolve().parent.parent.absolute() / Path(config_file))
-        
+        """加载JobLens核心配置（用于 rpc_socket_path 等）"""
+        # JOBLENS_CONFIG_PATH 优先（systemd unit/README 的既定约定），其次配置项，最后仓库默认路径
+        env_config = os.environ.get('JOBLENS_CONFIG_PATH')
+        if env_config:
+            abs_path = env_config
+        else:
+            config_file = self._get_config_value('config_manager.config_file', 'config/config.yaml')
+            abs_path = str(Path(__file__).resolve().parent.parent.absolute() / Path(config_file))
+
         try:
             with open(abs_path, 'r', encoding='utf-8') as f:
                 return yaml.safe_load(f) or {}

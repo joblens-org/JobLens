@@ -41,7 +41,7 @@ os.environ.setdefault("GRPC_POLL_STRATEGY", "poll")
 def _resolve_loglevel() -> str:
     """从 trigger 配置文件读取 logging.level，供 gunicorn 自身日志复用；读取失败回退 info"""
     config_path = os.environ.get(
-        "JOBLENS_TRIGGER_CONFIG", "/etc/JobLens/trigger/config.yaml"
+        "JOBLENS_TRIGGER_CONFIG_PATH", "/etc/JobLens/trigger/config.yaml"
     )
     try:
         with open(config_path, "r", encoding="utf-8") as f:
