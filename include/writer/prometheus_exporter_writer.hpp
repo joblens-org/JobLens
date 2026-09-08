@@ -17,7 +17,6 @@
 #include "common/local_rpc.hpp"
 #include <nlohmann/json.hpp>
 #include <thread>
-#include <sstream>
 #include <shared_mutex>
 #include <atomic>
 #include <unordered_map>
@@ -74,6 +73,7 @@ public:
         uint64_t fs_metadata_errors_total = 0;  // job_fs_metadata_errors_total (Counter)
         // 瞬时速率 → Gauge
         double  fs_metadata_ops_per_sec = 0.0;  // job_fs_metadata_ops_per_sec (Gauge)
+        double  fs_metadata_errors_per_sec = 0.0;  // job_fs_metadata_errors_per_sec (Gauge)
 
     };
 

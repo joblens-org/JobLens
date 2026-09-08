@@ -139,6 +139,7 @@ void PrometheusExporterWriter::update_job_metrics(const prometheus_job_state& da
                 update_ref->fs_metadata_ops_total = s.fs_metadata_ops_total;
                 update_ref->fs_metadata_ops_per_sec = s.fs_metadata_ops_per_sec;
                 update_ref->fs_metadata_errors_total = s.fs_metadata_errors_total;
+                update_ref->fs_metadata_errors_per_sec = s.fs_metadata_errors_per_sec;
                 break;
             case PrmxsCollectorType::UNKNOWN:
                 spdlog::warn("PrometheusExporterWriter: type2enum get UNKNOW for {}", type);
@@ -238,7 +239,8 @@ json nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_process_state
 
         {"fs_metadata_ops_total",      s.fs_metadata_ops_total},
         {"fs_metadata_ops_per_sec",    s.fs_metadata_ops_per_sec},
-        {"fs_metadata_errors_total",     s.fs_metadata_errors_total}
+        {"fs_metadata_errors_total",    s.fs_metadata_errors_total},
+        {"fs_metadata_errors_per_sec",  s.fs_metadata_errors_per_sec}
     };
 }
 
