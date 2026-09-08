@@ -12,6 +12,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "collector/new_io_usage_collector.hpp"
+#include "common/mountinfo_utils.hpp"
+#include "common/welford_utils.hpp"
 #include "core/collector_registry.hpp"
 #include "common/utils.hpp"
 #include "common/ebpf_common.hpp"
@@ -20,7 +22,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <nlohmann/json.hpp>
+#include <limits>
+#include <optional>
 #include <sstream>
+#include <unordered_map>
+#include <utility>
 
 AUTO_REGISTER_JOB_COLLECTOR(
     NewIOUsageCollector,
@@ -31,6 +37,79 @@ AUTO_REGISTER_JOB_COLLECTOR(
 )
 
 using json = nlohmann::json;
+
+namespace {
+
+std::string make_file_identity_key(const std::string& mount_point, const std::string& fs_type, const std::string& path)
+{
+    // NUL 分隔避免字符串拼接歧义；写出时只使用 FileIOStat::path。
+    std::string key;
+    key.reserve(mount_point.size() + fs_type.size() + path.size() + 2);
+    key.append(mount_point);
+    key.push_back('\0');
+    key.append(fs_type);
+    key.push_back('\0');
+    key.append(path);
+    return key;
+}
+
+bool add_saturating_u64(u64& target, u64 value)
+{
+    if (value > std::numeric_limits<u64>::max() - target) {
+        target = std::numeric_limits<u64>::max();
+        return true;
+    }
+    target += value;
+    return false;
+}
+
+struct IoAggregationStatus {
+    bool byte_saturated{false};
+    WelfordUtils::MergeStatus welford;
+
+    void absorb(const WelfordUtils::MergeStatus& status) noexcept
+    {
+        welford.absorb(status);
+    }
+
+    bool needs_warning() const noexcept
+    {
+        return byte_saturated || !welford.ok();
+    }
+};
+
+void merge_rw_stat_into_io(IoCounters& target, const rw_stat& source, IoAggregationStatus& status)
+{
+    status.byte_saturated = add_saturating_u64(target.rchar, source.read_bytes) || status.byte_saturated;
+    status.byte_saturated = add_saturating_u64(target.wchar, source.write_bytes) || status.byte_saturated;
+
+    WelfordUtils::Aggregate read_target{target.syscr, target.read_mean, target.read_variance};
+    const WelfordUtils::Aggregate read_source{source.read_count, source.read_mean, source.read_variance};
+    status.absorb(WelfordUtils::merge_into(read_target, read_source));
+    target.syscr = read_target.count;
+    target.read_mean = read_target.mean;
+    target.read_variance = read_target.m2;
+
+    WelfordUtils::Aggregate write_target{target.syscw, target.write_mean, target.write_variance};
+    const WelfordUtils::Aggregate write_source{source.write_count, source.write_mean, source.write_variance};
+    status.absorb(WelfordUtils::merge_into(write_target, write_source));
+    target.syscw = write_target.count;
+    target.write_mean = write_target.mean;
+    target.write_variance = write_target.m2;
+}
+
+json io_counters_to_json(const IoCounters& io)
+{
+    return {
+        {"rchar", io.rchar}, {"wchar", io.wchar},
+        {"syscr", io.syscr}, {"syscw", io.syscw},
+        {"read_mean", io.read_mean}, {"write_mean", io.write_mean},
+        {"read_variance", io.read_variance}, {"write_variance", io.write_variance},
+        {"rchar_speed", io.rchar_speed}, {"wchar_speed", io.wchar_speed}
+    };
+}
+
+}
 
 bool NewIOUsageCollector::init(const json& cfg){
     (void)cfg;
@@ -55,6 +134,15 @@ void NewIOUsageCollector::deinit_ebpf(){
 
 void NewIOUsageCollector::deinit() noexcept{
     deinit_ebpf();
+    dump_keys_.clear();
+    dump_vals_.clear();
+    known_pids_.clear();
+    last_job_time_.clear();
+    last_proc_io_.clear();
+    last_file_io_.clear();
+    last_file_proc_io_.clear();
+    last_job_io_.clear();
+    last_job_latency_.clear();
     spdlog::info("NewIOUsageCollector deinit");
 }
 
@@ -69,23 +157,36 @@ void NewIOUsageCollector::refresh_dump_cache_if_needed(){
 }
 
 // 清理已死且已输出过的短命进程的 eBPF 条目（保证"至少输出一次"后延迟清理）
-void NewIOUsageCollector::cleanup_dead_pids(){
+void NewIOUsageCollector::cleanup_dead_pids(uint64_t job_id){
+    auto known_it = known_pids_.find(job_id);
+    if (known_it == known_pids_.end()) return;
+
     std::vector<pid_t> to_cleanup;
-    for (const auto& [pid, st] : known_pids_){
+    for (const auto& [pid, st] : known_it->second){
         if (!st.alive && st.output_count >= 1){
             to_cleanup.push_back(pid);
         }
     }
+    bool cache_changed = false;
     for (pid_t pid : to_cleanup){
         // 删除该 pid 在本 job 下所有 job_fd_stat 条目（本采集器私有 map）。
         // pid2job 为共享 map, 其删除由内核 exit hook 统一负责, 此处不再触碰。
         for (size_t i = 0; i < dump_keys_.size(); ++i){
-            if (dump_keys_[i].pid == pid){
+            if (dump_keys_[i].job_id == job_id && dump_keys_[i].pid == static_cast<u32>(pid)){
                 EbpfCommon::delete_hashmap_elem<job_pid_fd_key, rw_stat>(
                     bpf_obj_, jobfdstat_map_name, dump_keys_[i]);
+                cache_changed = true;
             }
         }
-        known_pids_.erase(pid);
+        known_it->second.erase(pid);
+    }
+    if (known_it->second.empty()){
+        known_pids_.erase(known_it);
+    }
+    if (cache_changed){
+        dump_keys_.clear();
+        dump_vals_.clear();
+        last_dump_time_ = std::chrono::steady_clock::time_point{};
     }
 }
 
@@ -119,24 +220,27 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
 
     // 4. 刷新周期缓存 + 聚合进程/文件
     refresh_dump_cache_if_needed();
+    std::unordered_map<pid_t, std::optional<MountInfoUtils::MountTable>> mount_tables;
+    IoAggregationStatus io_status;
     for (size_t i = 0; i < dump_keys_.size(); ++i){
         if (dump_keys_[i].job_id != job.JobID) continue;
-        pid_t pid = dump_keys_[i].pid;
+        pid_t pid = static_cast<pid_t>(dump_keys_[i].pid);
         u32 fd = dump_keys_[i].fd;
         const rw_stat& s = dump_vals_[i];
 
         // 进程级聚合（含短命进程）
         auto& proc = result.processes[pid];
         proc.pid = pid;
-        proc.io.rchar += s.read_bytes;
-        proc.io.wchar += s.write_bytes;
-        proc.io.syscr += s.read_count;
-        proc.io.syscw += s.write_count;
+        merge_rw_stat_into_io(proc.io, s, io_status);
         proc.alive = Utils::is_process_running(pid);
         proc.source = proc.alive ? "alive" : "ephemeral";
 
         // 文件级聚合（仅存活进程能 fd→path；短命进程死后无法反查文件路径）
         if (proc.alive){
+            auto mount_table_it = mount_tables.find(pid);
+            if (mount_table_it == mount_tables.end()) {
+                mount_table_it = mount_tables.emplace(pid, MountInfoUtils::read_for_pid(pid)).first;
+            }
             std::string fdpath = "/proc/" + std::to_string(pid) + "/fd/" + std::to_string(fd);
             char buf[512];
             ssize_t n = ::readlink(fdpath.c_str(), buf, sizeof(buf) - 1);
@@ -146,34 +250,49 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
                 if (!path.empty() && path[0] == '/'){
                     struct stat stb;
                     if (::stat(path.c_str(), &stb) == 0 && (S_ISREG(stb.st_mode) || S_ISBLK(stb.st_mode))){
-                        auto& finfo = result.files[path];
+                        std::string mount_point;
+                        std::string fs_type;
+                        if (mount_table_it->second) {
+                            if (auto mount_entry = MountInfoUtils::resolve(*mount_table_it->second, path)) {
+                                mount_point = mount_entry->mount_point;
+                                fs_type = mount_entry->fs_type;
+                            }
+                        }
+                        const auto file_key = make_file_identity_key(mount_point, fs_type, path);
+                        auto& finfo = result.files[file_key];
                         finfo.path = path;
+                        finfo.mount_point = mount_point;
+                        finfo.fs_type = fs_type;
                         finfo.pos = static_cast<unsigned long long>(stb.st_size);
-                        finfo.total.rchar += s.read_bytes;
-                        finfo.total.wchar += s.write_bytes;
-                        finfo.total.syscr += s.read_count;
-                        finfo.total.syscw += s.write_count;
+                        merge_rw_stat_into_io(finfo.total, s, io_status);
                         auto& pfinfo = finfo.processes[pid];
                         pfinfo.pid = pid;
                         pfinfo.alive = true;
-                        pfinfo.io.rchar += s.read_bytes;
-                        pfinfo.io.wchar += s.write_bytes;
-                        pfinfo.io.syscr += s.read_count;
-                        pfinfo.io.syscw += s.write_count;
+                        merge_rw_stat_into_io(pfinfo.io, s, io_status);
                     }
                 }
             }
         }
     }
+    if (io_status.needs_warning()){
+        spdlog::warn(
+            "NewIOUsageCollector: invalid or saturated fd aggregate while collecting job_id={} invalid_m2={} count_saturated={} mean_saturated={} m2_saturated={} byte_saturated={}",
+            job.JobID,
+            io_status.welford.invalid_input,
+            io_status.welford.count_saturated,
+            io_status.welford.mean_saturated,
+            io_status.welford.m2_saturated,
+            io_status.byte_saturated);
+    }
 
     // 5. 更新短命进程状态 + 延迟清理
+    auto& job_known_pids = known_pids_[job.JobID];
     for (const auto& [pid, proc] : result.processes){
-        auto& st = known_pids_[pid];
-        st.job_id = job.JobID;
+        auto& st = job_known_pids[pid];
         st.output_count++;
         st.alive = proc.alive;
     }
-    cleanup_dead_pids();
+    cleanup_dead_pids(job.JobID);
 
     // 6. speed 差分（Job 级）
     auto now = std::chrono::steady_clock::now();
@@ -190,9 +309,13 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
         }
 
         if (period > 0){
+            auto proc_snapshot_it = last_proc_io_.find(job.JobID);
+            auto file_snapshot_it = last_file_io_.find(job.JobID);
+            auto file_proc_snapshot_it = last_file_proc_io_.find(job.JobID);
             for (auto& [pid, proc] : result.processes){
-                auto it_proc_io = last_proc_io_.find(pid);
-                if (it_proc_io != last_proc_io_.end()){
+                if (proc_snapshot_it != last_proc_io_.end()){
+                    auto it_proc_io = proc_snapshot_it->second.find(pid);
+                    if (it_proc_io == proc_snapshot_it->second.end()) continue;
                     proc.io.rchar_speed = (proc.io.rchar >= it_proc_io->second.rchar)
                         ? (proc.io.rchar - it_proc_io->second.rchar) / period : 0;
                     proc.io.wchar_speed = (proc.io.wchar >= it_proc_io->second.wchar)
@@ -200,18 +323,22 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
                 }
             }
 
-            for (auto& [path, file] : result.files){
-                auto it_file_io = last_file_io_.find(path);
-                if (it_file_io != last_file_io_.end()){
-                    file.total.rchar_speed = (file.total.rchar >= it_file_io->second.rchar)
-                        ? (file.total.rchar - it_file_io->second.rchar) / period : 0;
-                    file.total.wchar_speed = (file.total.wchar >= it_file_io->second.wchar)
-                        ? (file.total.wchar - it_file_io->second.wchar) / period : 0;
+            for (auto& [file_key, file] : result.files){
+                if (file_snapshot_it != last_file_io_.end()){
+                    auto it_file_io = file_snapshot_it->second.find(file_key);
+                    if (it_file_io != file_snapshot_it->second.end()){
+                        file.total.rchar_speed = (file.total.rchar >= it_file_io->second.rchar)
+                            ? (file.total.rchar - it_file_io->second.rchar) / period : 0;
+                        file.total.wchar_speed = (file.total.wchar >= it_file_io->second.wchar)
+                            ? (file.total.wchar - it_file_io->second.wchar) / period : 0;
+                    }
                 }
+                if (file_proc_snapshot_it == last_file_proc_io_.end()) continue;
+                auto file_proc_it = file_proc_snapshot_it->second.find(file_key);
+                if (file_proc_it == file_proc_snapshot_it->second.end()) continue;
                 for (auto& [pid, proc] : file.processes){
-                    auto key = path + "#" + std::to_string(pid);
-                    auto it_file_proc_io = last_file_io_.find(key);
-                    if (it_file_proc_io != last_file_io_.end()){
+                    auto it_file_proc_io = file_proc_it->second.find(pid);
+                    if (it_file_proc_io != file_proc_it->second.end()){
                         proc.io.rchar_speed = (proc.io.rchar >= it_file_proc_io->second.rchar)
                             ? (proc.io.rchar - it_file_proc_io->second.rchar) / period : 0;
                         proc.io.wchar_speed = (proc.io.wchar >= it_file_proc_io->second.wchar)
@@ -223,15 +350,24 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
     }
     last_job_time_[job.JobID] = now;
     last_job_io_[job.JobID] = result.job_total;
+
+    ProcessIoSnapshot process_snapshot;
     for (const auto& [pid, proc] : result.processes){
-        last_proc_io_[pid] = proc.io;
+        process_snapshot[pid] = proc.io;
     }
-    for (const auto& [path, file] : result.files){
-        last_file_io_[path] = file.total;
+    last_proc_io_[job.JobID] = std::move(process_snapshot);
+
+    FileIoSnapshot file_snapshot;
+    FileProcessIoSnapshot file_process_snapshot;
+    for (const auto& [file_key, file] : result.files){
+        file_snapshot[file_key] = file.total;
+        auto& process_snapshot_for_file = file_process_snapshot[file_key];
         for (const auto& [pid, proc] : file.processes){
-            last_file_io_[path + "#" + std::to_string(pid)] = proc.io;
+            process_snapshot_for_file[pid] = proc.io;
         }
     }
+    last_file_io_[job.JobID] = std::move(file_snapshot);
+    last_file_proc_io_[job.JobID] = std::move(file_process_snapshot);
 
     return result;
 }
@@ -248,43 +384,36 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
             json j;
             j["job_id"] = s.job_id;
             j["collect_period"] = s.collect_period;
-            j["job_total"] = {
-                {"rchar", s.job_total.rchar}, {"wchar", s.job_total.wchar},
-                {"syscr", s.job_total.syscr}, {"syscw", s.job_total.syscw},
-                {"rchar_speed", s.job_total.rchar_speed}, {"wchar_speed", s.job_total.wchar_speed}
-            };
+            j["job_total"] = io_counters_to_json(s.job_total);
             j["job_latency"] = {
                 {"read_hist", std::vector<u64>(std::begin(s.job_latency.read_hist), std::end(s.job_latency.read_hist))},
                 {"write_hist", std::vector<u64>(std::begin(s.job_latency.write_hist), std::end(s.job_latency.write_hist))}
             };
             j["files"] = json::array();
-            for (const auto& [path, f] : s.files){
+            for (const auto& file_entry : s.files){
+                const auto& f = file_entry.second;
                 json fj;
-                fj["path"] = path;
+                fj["path"] = f.path;
                 fj["mount_point"] = f.mount_point;
                 fj["fs_type"] = f.fs_type;
                 fj["pos"] = f.pos;
-                fj["total"] = {{"rchar", f.total.rchar}, {"wchar", f.total.wchar},
-                               {"syscr", f.total.syscr}, {"syscw", f.total.syscw},
-                               {"rchar_speed", f.total.rchar_speed}, {"wchar_speed", f.total.wchar_speed}};
+                fj["total"] = io_counters_to_json(f.total);
                 fj["processes"] = json::array();
                 for (const auto& [pid, p] : f.processes){
-                    fj["processes"].push_back({
-                        {"pid", pid}, {"alive", p.alive},
-                        {"rchar", p.io.rchar}, {"wchar", p.io.wchar},
-                        {"rchar_speed", p.io.rchar_speed}, {"wchar_speed", p.io.wchar_speed}
-                    });
+                    json pj = io_counters_to_json(p.io);
+                    pj["pid"] = pid;
+                    pj["alive"] = p.alive;
+                    fj["processes"].push_back(pj);
                 }
                 j["files"].push_back(fj);
             }
             j["processes"] = json::array();
             for (const auto& [pid, p] : s.processes){
-                j["processes"].push_back({
-                    {"pid", pid}, {"source", p.source}, {"alive", p.alive},
-                    {"rchar", p.io.rchar}, {"wchar", p.io.wchar},
-                    {"syscr", p.io.syscr}, {"syscw", p.io.syscw},
-                    {"rchar_speed", p.io.rchar_speed}, {"wchar_speed", p.io.wchar_speed}
-                });
+                json pj = io_counters_to_json(p.io);
+                pj["pid"] = pid;
+                pj["source"] = p.source;
+                pj["alive"] = p.alive;
+                j["processes"].push_back(pj);
             }
             return j;
         };
@@ -338,10 +467,11 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
                     << " wchar_speed=" << p.io.wchar_speed
                     << '\n';
             }
-            for (const auto& [path, f] : s.files){
+            for (const auto& file_entry : s.files){
+                const auto& f = file_entry.second;
                 out << "NewIOUsageCollector file"
                     << " job_id=" << s.job_id
-                    << " path=" << path
+                    << " path=" << f.path
                     << " mount_point=" << f.mount_point
                     << " fs_type=" << f.fs_type
                     << " pos=" << f.pos
@@ -359,7 +489,7 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
                 for (const auto& [pid, p] : f.processes){
                     out << "NewIOUsageCollector file_process"
                         << " job_id=" << s.job_id
-                        << " path=" << path
+                        << " path=" << f.path
                         << " pid=" << pid
                         << " alive=" << p.alive
                         << " rchar=" << p.io.rchar

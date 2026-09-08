@@ -19,8 +19,11 @@
 #include <spdlog/spdlog.h>
 #include <bpf/libbpf.h>
 #include "ebpf/job_io_new.h"
-#include <unordered_map>
 #include <chrono>
+#include <string>
+#include <sys/types.h>
+#include <unordered_map>
+#include <vector>
 
 // 统一 I/O 计量结构：VFS syscall 层语义（弃用物理块 read_bytes/write_bytes）
 struct IoCounters {
@@ -84,9 +87,12 @@ private:
     // 周期缓存：DUMP_TTL 内共享一次全表遍历
     void refresh_dump_cache_if_needed();
     // 清理已死且已输出过的短命进程的 eBPF 条目
-    void cleanup_dead_pids();
+    void cleanup_dead_pids(uint64_t job_id);
     // 短命进程生命周期状态
-    struct EphemeralState { uint64_t job_id{0}; uint64_t output_count{0}; bool alive{false}; };
+    struct EphemeralState { uint64_t output_count{0}; bool alive{false}; };
+    using ProcessIoSnapshot = std::unordered_map<pid_t, IoCounters>;
+    using FileIoSnapshot = std::unordered_map<std::string, IoCounters>;
+    using FileProcessIoSnapshot = std::unordered_map<std::string, std::unordered_map<pid_t, IoCounters>>;
 
     std::string jobstat_map_name = "job_stat";
     std::string jobfdstat_map_name = "job_fd_stat";
@@ -102,10 +108,11 @@ private:
     std::vector<rw_stat> dump_vals_;
 
     // 短命进程状态 + 上周期基线
-    std::unordered_map<pid_t, EphemeralState> known_pids_;
+    std::unordered_map<uint64_t, std::unordered_map<pid_t, EphemeralState>> known_pids_;
     std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> last_job_time_;
-    std::unordered_map<pid_t, IoCounters> last_proc_io_;
-    std::unordered_map<std::string, IoCounters> last_file_io_;
+    std::unordered_map<uint64_t, ProcessIoSnapshot> last_proc_io_;
+    std::unordered_map<uint64_t, FileIoSnapshot> last_file_io_;
+    std::unordered_map<uint64_t, FileProcessIoSnapshot> last_file_proc_io_;
     std::unordered_map<uint64_t, IoCounters> last_job_io_;
     std::unordered_map<uint64_t, LatencyHist> last_job_latency_;
 };
