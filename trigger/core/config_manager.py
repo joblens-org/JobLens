@@ -89,6 +89,13 @@ class ConfigManager:
                 self._notify_callbacks()
             
     def _sync_config_from_etcd2local(self):
+        # 核心语义：etcd 空 = 未配置（不是清空指令），禁止空配置落盘拖死 core 和 trigger
+        if not self._is_remote_config_usable():
+            logger.warning(
+                "etcd 配置为空或非字典（mode=%s），拒绝覆盖本地配置，保持当前配置运行",
+                getattr(self, 'mode', None)
+            )
+            return False
         is_diff = self._is_diff_local_config(self.remote_config)
         if is_diff:
             logger.info("Detected config change in etcd, updating local config")
@@ -97,9 +104,13 @@ class ConfigManager:
                 # 设置未同步标志
                 self.sync_status["etcd_synced"] = True
                 self.sync_status["last_sync_time"] = time.time()
-                
+
                 self.save_local_config(use_raw_content=True)
         return is_diff
+
+    def _is_remote_config_usable(self) -> bool:
+        """校验从 etcd 拉取的配置是否可作为有效配置落地（非空 dict 即通过，语义级校验由重启健康检查兜底）"""
+        return isinstance(self.remote_config, dict) and len(self.remote_config) > 0
 
     def _load_raw_local_config(self) -> bytes:
         if not os.path.exists(self.local_config_path):
@@ -113,7 +124,8 @@ class ConfigManager:
         if not raw_data:
             return {}
         try:
-            return yaml.safe_load(raw_data.decode("utf-8"))
+            # 空文件/纯注释 YAML 解析为 None，归一化为空 dict，防下游 .keys() 崩溃
+            return yaml.safe_load(raw_data.decode("utf-8")) or {}
         except yaml.YAMLError as e:
             logger.error(f"Failed to parse local config: {e}")
             return {}
@@ -167,7 +179,7 @@ class ConfigManager:
                 self._notify_callbacks()
     
     def _handle_etcd_config_update(self, event):
-        self.remote_config = yaml.safe_load(event.value.decode("utf-8"))
+        self.remote_config = yaml.safe_load(event.value.decode("utf-8")) or {}
         self.etcd_raw_content = event.value
         self._sync_config_from_etcd2local()
         self._notify_callbacks()
@@ -181,7 +193,7 @@ class ConfigManager:
                 with self.lock:
                     # 恢复为 etcd 配置
                     if self.etcd_raw_content:
-                        self.local_config = yaml.safe_load(self.etcd_raw_content.decode("utf-8"))
+                        self.local_config = yaml.safe_load(self.etcd_raw_content.decode("utf-8")) or {}
                         # 使用原始内容保存到本地
                         self.save_local_config(use_raw_content=True)
                     # 设置本地修改标志
@@ -284,21 +296,45 @@ class ConfigManager:
                 logger.error(f"回调函数执行失败: {e}")
     
     def save_local_config(self, use_raw_content: bool = False) -> bool:
-        """保存配置到本地 YAML 文件"""
+        """保存配置到本地 YAML 文件（先备份上一份，再原子替换，保证 core 不会读到半写文件）"""
+        backup_path = Path(str(self.local_config_path) + '.bak')
+        tmp_path = Path(str(self.local_config_path) + '.tmp')
         try:
             if use_raw_content and self.etcd_raw_content:
-                # 使用原始字节内容写入
-                with open(self.local_config_path, 'wb') as f:
-                    f.write(self.etcd_raw_content)
+                new_content = self.etcd_raw_content
             else:
-                # 使用字典序列化写入
-                with open(self.local_config_path, 'w', encoding='utf-8') as f:
-                    yaml.dump(self.local_config, f, default_flow_style=False, allow_unicode=True)
-            
-            logger.info(f"配置已保存到本地: {self.local_config_path}")
+                new_content = yaml.dump(
+                    self.local_config, default_flow_style=False, allow_unicode=True
+                ).encode('utf-8')
+
+            if self.local_config_path.exists():
+                shutil.copy2(self.local_config_path, backup_path)
+
+            with open(tmp_path, 'wb') as f:
+                f.write(new_content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.local_config_path)
+
+            logger.info(f"配置已保存到本地: {self.local_config_path}（备份: {backup_path}）")
             return True
         except Exception as e:
             logger.error(f"保存本地配置失败: {e}")
+            return False
+
+    def rollback_local_config(self) -> bool:
+        """从 .bak 备份恢复配置文件，用于坏配置导致 core 无法启动时自愈；无备份返回 False"""
+        backup_path = Path(str(self.local_config_path) + '.bak')
+        if not backup_path.exists():
+            logger.warning(f"无备份配置可回滚: {backup_path}")
+            return False
+        try:
+            shutil.copy2(backup_path, self.local_config_path)
+            self.local_config = self._load_local_config()
+            logger.warning(f"已回滚本地配置: {backup_path} -> {self.local_config_path}")
+            return True
+        except Exception as e:
+            logger.error(f"回滚本地配置失败: {e}")
             return False
 
     
