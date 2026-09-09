@@ -32,7 +32,8 @@ AUTO_REGISTER_JOB_COLLECTOR(
     NewIOUsageCollector,
     "Collect IO usage aggregated by Job and file (eBPF job-level + latency distribution)",
     ConfigParams{
-        {"freq", "Sampling frequency in Hz"}
+        {"freq", "Sampling frequency in Hz"},
+        {"include_process_details", "Whether to include per-process and per-file details (true/false), default true"}
     }
 )
 
@@ -112,7 +113,9 @@ json io_counters_to_json(const IoCounters& io)
 }
 
 bool NewIOUsageCollector::init(const json& cfg){
-    (void)cfg;
+    include_process_details = !cfg.contains("include_process_details") ||
+        cfg["include_process_details"].get<std::string>() == "true";
+
     if (!init_ebpf()){
         spdlog::error("NewIOUsageCollector: init ebpf error");
         deinit_ebpf();
@@ -235,8 +238,9 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
         proc.alive = Utils::is_process_running(pid);
         proc.source = proc.alive ? "alive" : "ephemeral";
 
-        // 文件级聚合（仅存活进程能 fd→path；短命进程死后无法反查文件路径）
-        if (proc.alive){
+        // 文件级聚合（仅存活进程能 fd→path；短命进程死后无法反查文件路径）。
+        // fd→path 反查（mountinfo/readlink/stat）是明细路径的主要开销，受开关控制。
+        if (include_process_details && proc.alive){
             auto mount_table_it = mount_tables.find(pid);
             if (mount_table_it == mount_tables.end()) {
                 mount_table_it = mount_tables.emplace(pid, MountInfoUtils::read_for_pid(pid)).first;
@@ -293,6 +297,13 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
         st.alive = proc.alive;
     }
     cleanup_dead_pids(job.JobID);
+
+    // 清空需在状态机/清理之后（它们依赖 processes 的存活信息）；
+    // 第 6 步的明细差分与基线更新随空 map 自然跳过
+    if (!include_process_details){
+        result.processes.clear();
+        result.files.clear();
+    }
 
     // 6. speed 差分（Job 级）
     auto now = std::chrono::steady_clock::now();

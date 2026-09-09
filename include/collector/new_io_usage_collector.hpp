@@ -88,6 +88,10 @@ private:
     void refresh_dump_cache_if_needed();
     // 清理已死且已输出过的短命进程的 eBPF 条目
     void cleanup_dead_pids(uint64_t job_id);
+
+    // false 时输出仅含 Job 级聚合（processes/files 明细为空）。
+    // 短命进程状态机与 job_fd_stat 条目清理仍持续运行，不受此开关影响。
+    bool include_process_details{true};
     // 短命进程生命周期状态
     struct EphemeralState { uint64_t output_count{0}; bool alive{false}; };
     using ProcessIoSnapshot = std::unordered_map<pid_t, IoCounters>;
