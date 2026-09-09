@@ -145,7 +145,7 @@ Condor 作业专用操作，目前仅支持 `"add"`。
 | `opt` | string | **是** | 操作类型，仅支持 `"add"` |
 | `JobID` | int | 否 | 作业 ID |
 | `slot` | string | **是** | 槽位名称，必须以 `"slot"` 开头 |
-| `Lens` | array[string] | 否 | 收集器列表（默认：`["proc_collector"]`） |
+| `Lens` | array[string] | 否 | 收集器列表（默认：`["cpumem_collector", "io_collector", "net_collector"]`） |
 | `sub_attr` | object | 否 | 子属性（如 `{"cluster_id": 123456, "proc_id": 0}`） |
 
 **示例请求：**
@@ -182,7 +182,7 @@ Slurm 作业专用操作，目前仅支持 `"add"`。
 |---|---|---|---|
 | `opt` | string | **是** | 操作类型，仅支持 `"add"` |
 | `JobID` | int | **是** | Slurm 作业 ID |
-| `Lens` | array[string] | 否 | 收集器列表（默认：`["proc_collector"]`） |
+| `Lens` | array[string] | 否 | 收集器列表（默认：`["cpumem_collector", "io_collector", "net_collector"]`） |
 | `sub_attr` | object | 否 | 子属性（如 `{"job_id": 12345, "step_id": 0}`） |
 
 **示例请求：**

@@ -115,7 +115,7 @@ Content-Type: application/json
   "type": "job.common",   # Job type: "job.common" or "job.condor"
   "JobID": 12345,         # Job ID
   "JobPIDs": [6789],      # Process PID list
-  "Lens": ["proc_collector", "cpumem_collector"]  # Collectors to use
+  "Lens": ["cpumem_collector", "io_collector", "net_collector"]  # Collectors to use
 }
 ```
 
@@ -128,7 +128,7 @@ Content-Type: application/json
   "opt": "add",           # Currently only "add" is supported
   "slot": "slot1",        # Condor job slot name
   "JobID": 12345,         # Job ID
-  "Lens": ["proc_collector"]  # Collectors to use
+  "Lens": ["cpumem_collector"]  # Collectors to use
 }
 ```
 

@@ -169,7 +169,6 @@ net_sys_collector_config:
 | **BasicInfoCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的 taskstats 数据（TGID 级摘要） |
 | **GPUUsageCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的 GPU 使用数据 |
 | | `freq` | double | 在 `init()` 中额外读取：用于计算 GPU 缓存刷新间隔（`1.0 / (freq * 1.5)`）。这是调度器层 `freq` 之外的额外使用。 |
-| **ProcCollector** | *(无)* | — | 无 init 配置参数。从 `/proc/[pid]/stat`、`/proc/[pid]/status`、`/proc/[pid]/io` 等读取进程信息。**注意**：源码中已标记为将来弃用（`//TODO: 这个模块将会逐步弃用`）。 |
 | **TaskstatsCollector** | *(无)* | — | 无 init 配置参数。使用 Linux taskstats netlink 接口。**注意**：部分实现——`collect()` 方法仅记录 PID，不产生数据输出；`get_writer_parser()` 返回 `nullptr`。 |
 | **FSMetadataCollector** | `include_process_details` | string | 为 `"true"`（默认）时，输出 Job 聚合数据和按进程明细；为 `"false"` 时，只输出 Job 聚合数据 |
 | | `freq` | double | 调度器层采样频率（Hz），由 `CollectorScheduler` 解析，不在 FSMetadataCollector 的 `init()` 中解析。建议元数据负载场景使用 1 Hz |
@@ -628,9 +627,6 @@ collectors_config:
     - name: gpu_collector
       type: GPUUsageCollector
       config: gpu_collector_config
-    - name: proc_collector
-      type: ProcCollector
-      config: proc_collector_config
     - name: taskstats_collector
       type: TaskstatsCollector
       config: taskstats_collector_config
@@ -663,9 +659,6 @@ basic_info_collector_config:
 gpu_collector_config:
   freq: 1
   summary: true
-
-proc_collector_config:
-  freq: 1
 
 taskstats_collector_config:
   freq: 1

@@ -23,15 +23,6 @@
 #include "common/struct2ltable.hpp"
 #include <spdlog/spdlog.h>
 
-#define COLLECTOR_TYPE_PROC "ProcCollector"
-
-enum class CollectorType {
-    ProcCollector,      // 采集 /proc/<pid>/stat
-    kStatus,    // 采集 /proc/<pid>/status
-    kCmdline,   // 采集 /proc/<pid>/cmdline
-    kFd         // 采集 /proc/<pid>/fd 信息
-};
-
 //TODO: 其实更好的方案是设计Job描述方法，但是设计和实现都很痛苦，先开摆
 
 enum class JobType{

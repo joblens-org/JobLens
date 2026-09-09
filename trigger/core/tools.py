@@ -303,7 +303,7 @@ def add_condorjob(data):
         "type": "job.condor",
         "JobID": jobid,
         "JobPIDs": pids,
-        "Lens": data.get('Lens', ['proc_collector']),
+        "Lens": data.get('Lens', ['cpumem_collector', 'io_collector', 'net_collector']),
         "sub_attr": sub_attr
     }
     logger.info("Condor job data constructed: JobID=%s, slot=%s, PIDs=%s, Lens=%s",
@@ -340,7 +340,7 @@ def add_slurmjob(data):
         "type": "job.slurm",
         "JobID": jobid,
         "JobPIDs": pids,
-        "Lens": data.get('Lens', ['proc_collector']),
+        "Lens": data.get('Lens', ['cpumem_collector', 'io_collector', 'net_collector']),
         "sub_attr": sub_attr
     }
     logger.info("Slurm job data constructed: JobID=%s, PIDs=%s, Lens=%s, sub_attr=%s",

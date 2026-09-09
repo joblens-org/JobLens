@@ -28,7 +28,6 @@
 #include <fmt/chrono.h>
 #include <date/date.h>
 
-#include "collector/proc_collector_func.hpp"
 #include "core/collector_type.h"
 #include "common/config.hpp"
 #include "common/streamer_watcher.hpp"

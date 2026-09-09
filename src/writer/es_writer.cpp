@@ -20,7 +20,6 @@
 #include <unordered_set>
 #include "common/config.hpp"
 #include "collector/collector_utils.hpp"
-#include "collector/proc_collector_func.hpp"
 #include "core/collector_registry.hpp"
 #include "core/writer_manager.hpp"
 #include "common/utils.hpp"

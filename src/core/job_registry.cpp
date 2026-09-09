@@ -370,7 +370,7 @@ void JobRegistry::regRPChandle() {
     //     "type": "job.condor",
     //     "JobID": 1,
     //     "JobPIDs": [1],
-    //     "Lens": ["proc_collector"],
+    //     "Lens": ["cpumem_collector"],
     //      "auto_update_child": true
     // }
     RPCServer::instance().register_method("JobRegistry/job_opt",

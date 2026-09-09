@@ -170,7 +170,6 @@ The collector's `init(json_cfg)` method receives a JSON object converted from th
 | **BasicInfoCollector** | `summary` | string | When `"true"`, aggregates taskstats data across all processes (TGID-level summary) | `basic_info_collector.cpp:45` |
 | **GPUUsageCollector** | `summary` | string | When `"true"`, aggregates GPU usage data across all processes | `gpu_usage_collector.cpp:162` |
 | | `freq` | double | Additionally read in `init()`: used to calculate GPU cache refresh interval (`1.0 / (freq * 1.5)`). This is in addition to the scheduler-level `freq`. | `gpu_usage_collector.cpp:156-197` |
-| **ProcCollector** | *(none)* | — | No init config parameters. Reads process information from `/proc/[pid]/stat`, `/proc/[pid]/status`, `/proc/[pid]/io`, etc. **Note**: source code marks this collector for future deprecation (`//TODO: 这个模块将会逐步弃用`). | `proc_collector_func.cpp:276-285` |
 | **TaskstatsCollector** | *(none)* | — | No init config parameters. Uses Linux taskstats netlink interface. **Note**: partially implemented — `collect()` method logs PIDs but does not produce data output; `get_writer_parser()` returns `nullptr`. | `taskstats_collector.cpp:44-47` |
 | **FSMetadataCollector** | `include_process_details` | string | When `"true"` (default), emits a Job aggregate plus per-process detail. When `"false"`, emits the Job aggregate only. | `fs_metadata_collector.cpp:64` |
 | | `freq` | double | Scheduler-level sampling frequency (Hz), parsed by `CollectorScheduler`, not by FSMetadataCollector `init()`. Recommended: 1 Hz for metadata workloads | `collector_scheduler.cpp` |
@@ -631,9 +630,6 @@ collectors_config:
     - name: gpu_collector
       type: GPUUsageCollector
       config: gpu_collector_config
-    - name: proc_collector
-      type: ProcCollector
-      config: proc_collector_config
     - name: taskstats_collector
       type: TaskstatsCollector
       config: taskstats_collector_config
@@ -666,9 +662,6 @@ basic_info_collector_config:
 gpu_collector_config:
   freq: 1
   summary: true
-
-proc_collector_config:
-  freq: 1
 
 taskstats_collector_config:
   freq: 1

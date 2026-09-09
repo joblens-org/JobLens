@@ -145,7 +145,7 @@ Condor job specific operation. Currently only supports `"add"`.
 | `opt` | string | **Yes** | Operation type, only `"add"` is supported |
 | `JobID` | int | No | Job ID |
 | `slot` | string | **Yes** | Slot name, must start with `"slot"` |
-| `Lens` | array[string] | No | Collector list (default: `["proc_collector"]`) |
+| `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "io_collector", "net_collector"]`) |
 | `sub_attr` | object | No | Sub-attributes (e.g., `{"cluster_id": 123456, "proc_id": 0}`) |
 
 **Example request:**
@@ -182,7 +182,7 @@ Slurm job specific operation. Currently only supports `"add"`.
 |---|---|---|---|
 | `opt` | string | **Yes** | Operation type, only `"add"` is supported |
 | `JobID` | int | **Yes** | Slurm job ID |
-| `Lens` | array[string] | No | Collector list (default: `["proc_collector"]`) |
+| `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "io_collector", "net_collector"]`) |
 | `sub_attr` | object | No | Sub-attributes (e.g., `{"job_id": 12345, "step_id": 0}`) |
 
 **Example request:**
