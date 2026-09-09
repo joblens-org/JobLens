@@ -172,15 +172,23 @@ The collector's `init(json_cfg)` method receives a JSON object converted from th
 | | `freq` | double | Additionally read in `init()`: used to calculate GPU cache refresh interval (`1.0 / (freq * 1.5)`). This is in addition to the scheduler-level `freq`. | `gpu_usage_collector.cpp:156-197` |
 | **ProcCollector** | *(none)* | — | No init config parameters. Reads process information from `/proc/[pid]/stat`, `/proc/[pid]/status`, `/proc/[pid]/io`, etc. **Note**: source code marks this collector for future deprecation (`//TODO: 这个模块将会逐步弃用`). | `proc_collector_func.cpp:276-285` |
 | **TaskstatsCollector** | *(none)* | — | No init config parameters. Uses Linux taskstats netlink interface. **Note**: partially implemented — `collect()` method logs PIDs but does not produce data output; `get_writer_parser()` returns `nullptr`. | `taskstats_collector.cpp:44-47` |
-| **FSMetadataCollector** | `summary` | string | When `"true"`, aggregates filesystem metadata events across all processes | `fs_metadata_collector.cpp:45` |
-| | `use_ebpf` | string | **Required**: `"true"` to enable eBPF-based collection. Non-eBPF mode produces empty output | `fs_metadata_collector.cpp:52` |
-| | `freq` | double | Sampling frequency (Hz). Recommended: 1 Hz for metadata workloads | `fs_metadata_collector.cpp:58` |
+| **FSMetadataCollector** | `include_process_details` | string | When `"true"` (default), emits a Job aggregate plus per-process detail. When `"false"`, emits the Job aggregate only. | `fs_metadata_collector.cpp:64` |
+| | `freq` | double | Scheduler-level sampling frequency (Hz), parsed by `CollectorScheduler`, not by FSMetadataCollector `init()`. Recommended: 1 Hz for metadata workloads | `collector_scheduler.cpp` |
+| **NewIOUsageCollector** | `include_process_details` | string | When `"true"` (default), emits Job aggregate plus per-process and per-file detail. When `"false"`, emits the Job aggregate only (empty `processes`/`files`), significantly reducing output volume for jobs with many open file handles. | `new_io_usage_collector.cpp:116` |
+| | `freq` | double | Scheduler-level sampling frequency (Hz), parsed by `CollectorScheduler`, not by NewIOUsageCollector `init()` | `collector_scheduler.cpp` |
 
 **FSMetadataCollector Notes**:
 - Generic filesystem metadata pressure collector capturing open/close/stat/readdir/rename/unlink/xattr/fsync operations
-- For Lustre clusters: analyze MDS/MDT pressure via `fs_type=lustre` output field
-- Works with ext4/xfs/nfs/etc. — any filesystem with traceable syscalls
-- **v1 Limitation**: `mount_point`/`fs_type` labels are most reliable for fd-bearing calls; for *at() dirfd paths, fs_type is best-effort, not exact
+- Always eBPF-backed: the collector initializes eBPF internally and has no `use_ebpf` switch
+- Current output dimensions are JobID, PID when `include_process_details=true`, metadata operation, and Job/operation latency buckets
+- `include_process_details=true` emits both Job aggregate metrics and per-process detail. `include_process_details=false` emits Job aggregate metrics only
+- Output does not include `mount_point` or `fs_type`; the collector does not provide filesystem-specific attribution
+
+**NewIOUsageCollector Notes**:
+- Generic I/O accounting collector at the VFS syscall layer (rchar/wchar semantics), always eBPF-backed with no `use_ebpf` switch
+- Output dimensions: Job-level totals (`job_total`), read/write latency histograms, per-process detail (including short-lived processes), and per-file detail with per-process breakdown — the latter two only when `include_process_details=true`
+- `include_process_details=false` also skips fd→path resolution (mountinfo/readlink/stat), the dominant user-space cost of the detail path
+- Short-lived process lifecycle tracking and `job_fd_stat` eBPF entry cleanup keep running regardless of this switch; disabling details does not cause eBPF map growth
 
 ---
 

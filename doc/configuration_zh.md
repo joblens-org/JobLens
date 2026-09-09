@@ -171,15 +171,23 @@ net_sys_collector_config:
 | | `freq` | double | 在 `init()` 中额外读取：用于计算 GPU 缓存刷新间隔（`1.0 / (freq * 1.5)`）。这是调度器层 `freq` 之外的额外使用。 |
 | **ProcCollector** | *(无)* | — | 无 init 配置参数。从 `/proc/[pid]/stat`、`/proc/[pid]/status`、`/proc/[pid]/io` 等读取进程信息。**注意**：源码中已标记为将来弃用（`//TODO: 这个模块将会逐步弃用`）。 |
 | **TaskstatsCollector** | *(无)* | — | 无 init 配置参数。使用 Linux taskstats netlink 接口。**注意**：部分实现——`collect()` 方法仅记录 PID，不产生数据输出；`get_writer_parser()` 返回 `nullptr`。 |
-| **FSMetadataCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的文件系统元数据事件 |
-| | `use_ebpf` | string | **必需**：`"true"` 启用 eBPF 采集。非 eBPF 模式输出为空 |
-| | `freq` | double | 采样频率（Hz）。建议：元数据负载场景使用 1 Hz |
+| **FSMetadataCollector** | `include_process_details` | string | 为 `"true"`（默认）时，输出 Job 聚合数据和按进程明细；为 `"false"` 时，只输出 Job 聚合数据 |
+| | `freq` | double | 调度器层采样频率（Hz），由 `CollectorScheduler` 解析，不在 FSMetadataCollector 的 `init()` 中解析。建议元数据负载场景使用 1 Hz |
+| **NewIOUsageCollector** | `include_process_details` | string | 为 `"true"`（默认）时，输出 Job 聚合数据和进程级/文件级明细；为 `"false"` 时，只输出 Job 聚合数据（`processes`/`files` 为空），可显著降低高文件句柄作业的输出量 |
+| | `freq` | double | 调度器层采样频率（Hz），由 `CollectorScheduler` 解析，不在 NewIOUsageCollector 的 `init()` 中解析 |
 
 **FSMetadataCollector 说明**：
 - 通用文件系统元数据压力采集器，捕获 open/close/stat/readdir/rename/unlink/xattr/fsync 等操作
-- 对于 Lustre 集群：通过输出字段 `fs_type=lustre` 分析 MDS/MDT 压力
-- 适用于 ext4/xfs/nfs 等任何可追踪系统调用的文件系统
-- **v1 限制**：`mount_point`/`fs_type` 标注对携带 fd 的调用最可靠；对于 *at() 系列调用的 dirfd 路径，fs_type 为尽力标注，非精确匹配
+- 始终基于 eBPF：收集器内部初始化 eBPF，没有 `use_ebpf` 开关
+- 当前输出维度为 JobID、`include_process_details=true` 时的 PID、元数据操作，以及 Job/操作延迟桶
+- `include_process_details=true` 输出 Job 聚合指标和按进程明细；`include_process_details=false` 只输出 Job 聚合指标
+- 输出不包含 `mount_point` 或 `fs_type`，此收集器不提供文件系统特定归因
+
+**NewIOUsageCollector 说明**：
+- 通用 I/O 计量采集器（VFS syscall 层语义，rchar/wchar），始终基于 eBPF，没有 `use_ebpf` 开关
+- 输出维度：Job 级总量（`job_total`）、读/写时延直方图、进程级明细（含短命进程）、文件级明细（含按进程细分）——后两者仅在 `include_process_details=true` 时输出
+- `include_process_details=false` 时同时跳过 fd→path 反查（mountinfo/readlink/stat），即明细路径用户态开销的大头
+- 短命进程状态机与 `job_fd_stat` eBPF 条目清理不受此开关影响，持续运行，关闭明细不会导致 eBPF map 无限增长
 
 ---
 
