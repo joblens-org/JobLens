@@ -1,5 +1,35 @@
 # JobLens Changelog
 
+## v0.3.1 (2026-09)
+
+### Collector List Rework and Output Detail Control
+- Reworked the collector list: removed the deprecated `ProcCollector` and added `cpumem_collector`, `io_collector`, and `net_collector` (`c02fd39`). **Breaking**: `ProcCollector` is no longer registered, so any configuration enabling it should be updated.
+- Added `include_process_details` configuration to control process/file-level detail output for FSMetadataCollector and NewIOUsageCollector, replacing the previous `summary` flag (`deaab78`, `67ae7b4`).
+- Removed the fs_metadata collector sample section from the minimal example config (`c31355a`).
+
+### Per-Job State Isolation and Aggregation Fixes
+- Isolated fs_metadata diff baselines by JobID and added per-job/per-process error-rate statistics, wired to the new Prometheus metric (`ba323d5`).
+- Isolated NewIOUsageCollector ephemeral-process state and diff baselines by JobID, keyed file aggregation by `(mount_point, fs_type, path)`, and merged read/write mean/variance via the new `welford_utils` (`3195a2d`).
+
+### Unified eBPF Object Resolution
+- Added `resolve_bpf_obj()` to locate `.bpf.o` objects via a priority probe (`JOBLENS_BPF_OBJ_DIR` → `<executable dir>/bpf_obj/` → install layout), so manually-built binaries can load eBPF objects (`e941d12`).
+- Migrated all collectors, Condor/Slurm watchers, and JobPidTracker to the unified resolver, removing hardcoded `bpf_o_path` members (`36a5bb4`, `71804e2`, `36c1068`, `56d6ea8`).
+
+### New Common Utilities
+- Added `mountinfo_utils` for unified `/proc/<pid>/mountinfo` parsing with octal-escape decoding and longest-prefix matching (`9974d1a`).
+- Added `welford_utils` for online mean/variance merging with saturation and invalid-input handling (`42635b7`).
+- Refactored `io_usage` onto `mountinfo_utils` (`e1a2b4c`).
+
+### Trigger Resilience
+- Added a `/etc/JobLens/trigger/config.yaml` → packaged example → built-in fallback chain plus `JOBLENS_CONFIG_PATH` override (`ca77433`).
+- Made empty etcd configs non-destructive to the local config, and made local config writes atomic (backup → tmp → fsync → replace) with rollback support (`0526df2`).
+- Unified `rpc_call()` to raise `RPCError` when the RPC client is unavailable, returning 503 instead of a 500 `AttributeError` (`3ae44a1`).
+
+### Prometheus
+- Exported `job_fs_metadata_errors_per_sec` error-rate gauges from the Prometheus writer (`26b93e7`).
+
+---
+
 ## v0.3.0 (2026-08)
 
 ### Kernel-Side Job Attribution (eBPF Shared Pinned Maps)
