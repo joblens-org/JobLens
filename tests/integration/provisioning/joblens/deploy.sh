@@ -43,7 +43,7 @@ JobLens 部署脚本 — 从外部配置文件部署到 worker VM
 
 示例:
   sudo bash deploy.sh \
-    --rpm-path=/vagrant/rpms/joblens-0.3.0.rpm \
+    --rpm-path=/vagrant/rpms/joblens-0.3.1.rpm \
     --core-config=/vagrant/.runtime/joblens_core.yaml \
     --trigger-config=/vagrant/.runtime/joblens_trigger.yaml
 
