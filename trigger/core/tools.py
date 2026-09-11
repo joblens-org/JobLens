@@ -26,7 +26,7 @@ import logging
 import subprocess
 import re
 import shlex
-from trigger.core.rpc_client import RPCClient
+from trigger.core.rpc_client import RPCClient, RPCError
 import yaml
 from datetime import datetime, timezone
 from typing import List, Tuple, Optional
@@ -113,7 +113,10 @@ def use_rpc_opt():
     if not socket_path:
         return False
     r = RPCClient(socket_path, timeout)
-    return 'JobRegistry/job_opt' in r.get_function_list()
+    try:
+        return 'JobRegistry/job_opt' in r.get_function_list()
+    except RPCError:
+        return False
 def job_opt(data):
     if 'USE_MOCK_TOOLS' in globals() and USE_MOCK_TOOLS:
         # 使用 mock 版本
@@ -247,12 +250,40 @@ def find_pids_by_slot(slot: str):
     """
     if not slot.startswith('slot'):
         raise ValueError("slot 名必须以 'slot' 开头")
-    num = slot[4:]
-    ps_out = run(f"/usr/bin/ps -ax -o pid,cmd --no-headers | "
-                 f"/usr/bin/grep -E 'condor_starter.*[s]lot{num}'")
-    if not ps_out:
+    if slot == 'slot':
+        raise ValueError("slot 名必须包含编号")
+
+    ps = subprocess.run(
+        ["/usr/bin/ps", "-ax", "-o", "pid=,comm=,args="],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if ps.returncode != 0:
+        raise RuntimeError(f"ps 查询 condor_starter 失败: {ps.stderr.strip()}")
+
+    slot_pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(slot)}(?![A-Za-z0-9_])")
+    starter_pids: List[int] = []
+    malformed_lines: List[str] = []
+    for line in ps.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) != 3:
+            continue
+        pid_text, comm, command = parts
+        if comm != 'condor_starter' or not slot_pattern.search(command):
+            continue
+        if not pid_text.isdigit():
+            malformed_lines.append(line)
+            continue
+        starter_pids.append(int(pid_text))
+
+    if malformed_lines:
+        raise RuntimeError(f"{slot} 对应的 condor_starter PID 非数字: {malformed_lines[0]}")
+    if not starter_pids:
         raise RuntimeError(f"未找到 {slot} 对应的 condor_starter")
-    starter_pid = int(ps_out.split()[0])
+    if len(starter_pids) > 1:
+        raise RuntimeError(f"{slot} 对应多个 condor_starter: {starter_pids}")
+    starter_pid = starter_pids[0]
 
     # 优先探测 docker 作业：在 starter 进程树内查找 docker start 命令行
     container = _find_docker_container_by_slot(slot, starter_pid)
@@ -644,4 +675,3 @@ def get_job_processes(job_id: str) -> List[Tuple[str, str, str]]:
                         pids.append((node, child_pid, cmd_name))
     
     return pids
-

@@ -435,6 +435,8 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
                 return abort(500, description=result.get("msg", "Unknown error"))
             response = CollectorsPerfResponse.model_validate(result)
             return jsonify(response.model_dump())
+        except HTTPException:
+            raise
         except RPCError as e:
             return abort(503, description=f"Failed to get collector perf: {str(e)}")
         except Exception as e:
@@ -466,6 +468,8 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
                 return abort(500, description=result.get("msg", "Unknown error"))
             response = WritersPerfResponse.model_validate(result)
             return jsonify(response.model_dump())
+        except HTTPException:
+            raise
         except RPCError as e:
             return abort(503, description=f"Failed to get writer perf: {str(e)}")
         except Exception as e:

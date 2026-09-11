@@ -16,7 +16,7 @@ import logging
 import socket
 import os
 import time
-from typing import Any, Optional, Union, List
+from typing import Any, Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,9 @@ class RPCClient:
                 raise RPCError("Empty response from server")
                 
             response = json.loads(response_data)
+            if (isinstance(response, list) and len(response) == 2
+                    and response[0] == "error" and isinstance(response[1], str)):
+                raise RPCError(response[1])
             if isinstance(response, dict):
                 logger.debug("RPC response: method=%s, status=%s, msg=%s",
                              method, response.get('status'), response.get('msg', ''))
