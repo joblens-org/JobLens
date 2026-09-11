@@ -30,6 +30,29 @@
 
 ## 前置条件
 
+### 独立 HASH map 批量读取回归
+
+在具备项目构建依赖、BTF 与 BPF 权限的 Linux 主机上运行：
+
+```bash
+sudo bash tests/integration/run_batch_lookup_test.sh
+```
+
+该测试不启动 JobLens、不访问现有 map、不修改配置。它创建未 pin 的独立 map，直接调用生产 `EbpfCommon::lookup_hashmap_batch()`，分别使用 NewIOUsage 与 FSMetadata 的真实 key/value 类型验证 0、1、1023、1024、1025、2051 条数据，检查数量、唯一性及全部字段，覆盖 ENOENT 有效尾批和跨批次游标。临时 map/文件随测试关闭清理。
+
+### NewIOUsage / FSMetadata 运行态回归
+
+在测试执行节点使用已安装的 JobLens、Trigger、jq 和 wzycc 用户。两个采集器必须注册且挂载 ESWriter，诊断日志级别需为 debug。测试通过 HTTP 手动注册真实 PID，不代表调度器自动发现或前端页面验收。
+
+```bash
+cc -O2 -Wall -Wextra -Werror tests/integration/io_metadata_workload.c -o /tmp/jl-io-meta-workload
+sudo bash tests/integration/verify_io_metadata.sh 99129999 /tmp/jl-io-meta-workload true
+```
+
+负载持续读写/fsync，并执行成功及 ENOENT 的 open。脚本验证两种采集器的汇总增长、速率、目标 PID 明细、文件明细、元数据成功/错误计数及 last_errno，并检查 ESWriter HTTP 200。它检查实际序列化文档日志，而非直接查询 ES；不会暴露 ES 凭据。将两个配置节的 `include_process_details` 设置为 false 并重启后，用新 JobID 和参数 `false` 可验证仅关闭明细、汇总仍增长。操作者必须在结束后恢复原配置。
+
+脚本自动移除本轮采集和负载文件，需使用未占用的 JobID；工作负载可执行文件由操作者删除。脚本不修改配置、不重启服务。
+
 ### 硬件
 - 支持 KVM 的 x86_64 主机 (Intel VT-x 或 AMD-V)
 - 内存 >= 8 GB (VM1: 2GB, VM2: 3GB, 剩余给宿主机)
