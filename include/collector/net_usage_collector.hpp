@@ -37,9 +37,9 @@ struct Endpoint {
 };
 
 struct Connection {
-    bool summary;
+    bool summary = false;
     //储存用hash
-    size_t hash;
+    size_t hash = 0;
     //内容
     L4Proto     proto = L4Proto::TCP;
     TcpState    state = TcpState::UNKNOWN;
@@ -47,11 +47,11 @@ struct Connection {
     Endpoint    peer;
     uint32_t    recv_q = 0;            //缓存大小，单位是字节
     uint32_t    send_q = 0;            //缓存大小，单位是字节
-    uint64_t    sent;                  // tcpi_bytes_sent
-    uint64_t    recv;                  // tcpi_bytes_received
+    uint64_t    sent = 0;              // tcpi_bytes_sent
+    uint64_t    recv = 0;              // tcpi_bytes_received
     double      send_rate = 0;
     double      recv_rate = 0;
-    uint64_t    delivery_rate;         // tcpi_delivery_rate (byte/s)
+    uint64_t    delivery_rate = 0;     // tcpi_delivery_rate (byte/s)
     uint32_t    uid    = static_cast<uint32_t>(-1);
     uint64_t    inode  = 0;            // socket inode
     uint32_t    fd      = 0;           // 对应 /proc/<pid>/fd/<fd>

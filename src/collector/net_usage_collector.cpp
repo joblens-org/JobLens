@@ -736,8 +736,10 @@ CollectDataParseFunc NetUsageCollector::get_writer_parser(const std::string& wri
                     state.tcp_retrans_total += c.retrans;
                     state.tcp_rtt_us += c.rtt;
                 }
-                state.tcp_rtt_us /= info.connections.size();
-                
+                if (!info.connections.empty()) {
+                    state.tcp_rtt_us /= info.connections.size();
+                }
+
                 ret.processes_state.push_back(state);
             }
             return ret;

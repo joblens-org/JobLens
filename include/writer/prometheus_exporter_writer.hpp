@@ -35,26 +35,26 @@ public:
 
     struct prometheus_process_state
     {
-        uint32_t job_id;          // job_id
-        pid_t    pid;             // pid
+        uint32_t job_id = 0;      // job_id
+        pid_t    pid = 0;         // pid
         std::string name;         // name   （进程名，低基数即可）
 
         /* ========== CPU ========== */
-        double cpu_usage_percent; // job_cpu_usage_percent  (Gauge)
+        double cpu_usage_percent = 0.0; // job_cpu_usage_percent  (Gauge)
 
         /* ========== 内存 ========== */
-        double mem_usage_percent; // job_memory_usage_percent (Gauge)
-        int64_t mem_rss_kb;       // job_memory_rss_kb        (Gauge)
-        int64_t mem_vm_kb;        // job_memory_vm_kb         (Gauge)
-        int32_t threads_cnt;      // job_threads_count        (Gauge)
+        double mem_usage_percent = 0.0; // job_memory_usage_percent (Gauge)
+        int64_t mem_rss_kb = 0;   // job_memory_rss_kb        (Gauge)
+        int64_t mem_vm_kb = 0;    // job_memory_vm_kb         (Gauge)
+        int32_t threads_cnt = 0;  // job_threads_count        (Gauge)
 
         /* ========== I/O ========== */
         // 累计值 → Counter
-        int64_t io_read_bytes_total;   // job_io_read_bytes_total   (Counter)
-        int64_t io_write_bytes_total;  // job_io_write_bytes_total  (Counter)
+        int64_t io_read_bytes_total = 0;   // job_io_read_bytes_total   (Counter)
+        int64_t io_write_bytes_total = 0;  // job_io_write_bytes_total  (Counter)
         // 瞬时速率 → Gauge（若不想用 rate() 可直用）
-        double  io_read_bytes_per_sec;  // job_io_read_bytes_per_sec  (Gauge)
-        double  io_write_bytes_per_sec; // job_io_write_bytes_per_sec (Gauge)
+        double  io_read_bytes_per_sec = 0.0;  // job_io_read_bytes_per_sec  (Gauge)
+        double  io_write_bytes_per_sec = 0.0; // job_io_write_bytes_per_sec (Gauge)
 
         // 累计字节（TCP  only）
         uint32_t tcp_conns             = 0; // tcp_connections                (Counter)
