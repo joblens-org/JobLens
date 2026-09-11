@@ -1,5 +1,29 @@
 # JobLens Changelog
 
+## v0.3.2 (2026-09-11)
+
+### IO and Filesystem Metadata Fixes
+- Fixed `lookup_hashmap_batch()` discarding valid final-batch entries when libbpf returns `-ENOENT`, restoring process/file details in NewIOUsageCollector and process details in FSMetadataCollector.
+- Fixed HASH map cursor storage and address passing between batches, preventing spurious `EFAULT` failures and incomplete results for maps larger than one batch.
+- Continue successful short batches until the explicit end-of-traversal result rather than assuming a short batch is the final batch.
+
+### Trigger Robustness
+- Recognize legacy RPC error arrays at the client boundary while preserving legitimate list responses. Unsupported writer info methods now reach HTTP 404 handling, and unavailable performance RPC methods reach HTTP 503 handling instead of response-parsing failures.
+- Preserve Flask HTTP exceptions in collector/writer performance routes and retain the existing FIFO fallback when RPC function discovery fails.
+- Harden Condor starter discovery with argument-vector `ps` execution, separate stdout/stderr, exact process-name and static/dynamic slot matching, PID validation, and explicit rejection of ambiguous starters. Preserve Docker container PID discovery.
+
+### Diagnostics and Regression Coverage
+- Added NewIOUsage configuration, eBPF load, cache, aggregation, cleanup, output, and ES serialization diagnostics, plus shared map batch return/count logging.
+- Added 15 Trigger regression cases covering RPC errors, HTTP status handling, slot matching, malformed output, stderr isolation, and Docker container discovery.
+- Added real-kernel HASH map regression tools for both collector key/value layouts, covering 0, 1, 1023, 1024, 1025, and 2051 entries with count, uniqueness, and field checks.
+- Added live IO/metadata workload and verification scripts. Both test execution nodes passed detail-enabled and detail-disabled checks, including growing aggregates/rates and filesystem error statistics.
+
+### Validation Scope
+- The fixes were validated on Condor and Slurm test execution nodes using a pre-release `0.3.1` build with build ID `71097aa-fix004`. Live checks used manually registered PIDs, serialized document logs, and successful ESWriter HTTP responses; they do not constitute scheduler auto-discovery or browser validation.
+- Real Condor Docker-universe end-to-end validation remains blocked by the test pool's `no match found` scheduling issue. The production source of the reported `I0911` parsing input remains unconfirmed.
+
+---
+
 ## v0.3.1 (2026-09)
 
 ### Collector List Rework and Output Detail Control
