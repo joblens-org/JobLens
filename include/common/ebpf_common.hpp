@@ -410,23 +410,26 @@ namespace EbpfCommon{
         bpf_map_batch_opts opts{};
         opts.sz = sizeof(opts);
 
+        // HASH map 的 opaque cursor 是至少四字节的存储，不是内核返回的指针。
+        uint32_t cursor = 0;
         void *in_batch = nullptr;
-        // 遍历期间 map 可能被并发修改(如清理死进程条目), 导致 in_batch 指向的
-        // key 被删除, 内核访问该失效 key 时 bpf_map_lookup_batch 返回 EFAULT。
-        // 此时已收集的 keys/values 作废, 从头重启遍历; 限次避免死循环。
+        // EFAULT 时 count 不可信，丢弃本次结果并限次重试。
         constexpr int kMaxRestarts = 3;
         int restarts = 0;
         while (true) {
-            void *out_batch = nullptr;
             uint32_t count = static_cast<uint32_t>(batch_size);
-            int err = bpf_map_lookup_batch(bpf_map__fd(map), in_batch, &out_batch,
+            int err = bpf_map_lookup_batch(bpf_map__fd(map), in_batch, &cursor,
                                            batch_keys.data(), batch_vals.data(),
                                            &count, &opts);
-            if (err) {
-                if (err == -ENOENT) break;  // 遍历完成
+            // 在原有分支处理前记录批次返回，定位结束标记携带有效数据的情形。
+            // 日志调用不得污染下方原有错误报告使用的 errno。
+            const int batch_errno = errno;
+            spdlog::debug("lookup_hashmap_batch: batch result map={} err={} errno={} returned_count={} accumulated={} first_batch={} restarts={}",
+                          map_name, err, batch_errno, count, keys.size(), in_batch == nullptr, restarts);
+            errno = batch_errno;
+            if (err && err != -ENOENT) {
                 if (err == -EFAULT && in_batch != nullptr && restarts < kMaxRestarts) {
-                    // in_batch 指向的 key 在遍历期间被并发删除, 从头重启
-                    spdlog::warn("lookup_hashmap_batch: {} EFAULT (key removed during traversal), restarting from head",
+                    spdlog::warn("lookup_hashmap_batch: {} EFAULT, discarding partial traversal and restarting from head",
                                  map_name);
                     keys.clear();
                     values.clear();
@@ -440,9 +443,12 @@ namespace EbpfCommon{
             }
             keys.insert(keys.end(), batch_keys.begin(), batch_keys.begin() + count);
             values.insert(values.end(), batch_vals.begin(), batch_vals.begin() + count);
-            if (count < batch_size) break;  // 已到尾部
-            in_batch = out_batch;
+            // ENOENT 标记遍历结束，但当前 count 条数据仍有效，必须先追加。
+            if (err == -ENOENT) break;
+            in_batch = &cursor;
         }
+        spdlog::debug("lookup_hashmap_batch: traversal completed map={} entries={} restarts={}",
+                      map_name, keys.size(), restarts);
         return keys.size();
     }
 
