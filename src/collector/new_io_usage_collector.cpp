@@ -115,6 +115,8 @@ json io_counters_to_json(const IoCounters& io)
 bool NewIOUsageCollector::init(const json& cfg){
     include_process_details = !cfg.contains("include_process_details") ||
         cfg["include_process_details"].get<std::string>() == "true";
+    spdlog::info("NewIOUsageCollector: configuration applied include_process_details={} details_configured={}",
+                 include_process_details, cfg.contains("include_process_details"));
 
     if (!init_ebpf()){
         spdlog::error("NewIOUsageCollector: init ebpf error");
@@ -128,6 +130,8 @@ bool NewIOUsageCollector::init_ebpf(){
     auto path = EbpfCommon::resolve_bpf_obj("job_io_new.bpf.o");
     if (path.empty()) return false;
     bpf_obj_ = EbpfCommon::load_bpf_obj_pinned(path, bpf_links_, JOBLENS_BPF_PIN_ROOT);
+    spdlog::info("NewIOUsageCollector: eBPF load completed loaded={} links={}",
+                 bpf_obj_ != nullptr, bpf_links_.size());
     return bpf_obj_ != nullptr;
 }
 
@@ -156,6 +160,8 @@ void NewIOUsageCollector::refresh_dump_cache_if_needed(){
 
     EbpfCommon::lookup_hashmap_batch<job_pid_fd_key, rw_stat>(
         bpf_obj_, jobfdstat_map_name, dump_keys_, dump_vals_);
+    spdlog::debug("NewIOUsageCollector: fd cache refreshed keys={} values={} cache_age_ms={}",
+                  dump_keys_.size(), dump_vals_.size(), elapsed);
     last_dump_time_ = now;
 }
 
@@ -187,6 +193,8 @@ void NewIOUsageCollector::cleanup_dead_pids(uint64_t job_id){
         known_pids_.erase(known_it);
     }
     if (cache_changed){
+        spdlog::debug("NewIOUsageCollector: dead process cleanup job_id={} dead_pids={} cached_keys={}",
+                      job_id, to_cleanup.size(), dump_keys_.size());
         dump_keys_.clear();
         dump_vals_.clear();
         last_dump_time_ = std::chrono::steady_clock::time_point{};
@@ -289,6 +297,10 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
             io_status.byte_saturated);
     }
 
+    spdlog::debug("NewIOUsageCollector: detail aggregation job_id={} include_process_details={} cached_keys={} processes={} files={} read_bytes={} write_bytes={}",
+                  job.JobID, include_process_details, dump_keys_.size(), result.processes.size(),
+                  result.files.size(), result.job_total.rchar, result.job_total.wchar);
+
     // 5. 更新短命进程状态 + 延迟清理
     auto& job_known_pids = known_pids_[job.JobID];
     for (const auto& [pid, proc] : result.processes){
@@ -301,6 +313,8 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
     // 清空需在状态机/清理之后（它们依赖 processes 的存活信息）；
     // 第 6 步的明细差分与基线更新随空 map 自然跳过
     if (!include_process_details){
+        spdlog::debug("NewIOUsageCollector: details disabled job_id={} discarded_processes={} discarded_files={}",
+                      job.JobID, result.processes.size(), result.files.size());
         result.processes.clear();
         result.files.clear();
     }
@@ -380,6 +394,9 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
     last_file_io_[job.JobID] = std::move(file_snapshot);
     last_file_proc_io_[job.JobID] = std::move(file_process_snapshot);
 
+    spdlog::debug("NewIOUsageCollector: collection completed job_id={} processes={} files={} read_bytes={} write_bytes={}",
+                  job.JobID, result.processes.size(), result.files.size(),
+                  result.job_total.rchar, result.job_total.wchar);
     return result;
 }
 
@@ -392,6 +409,8 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
                 return j;
             }
             auto s = std::any_cast<JobIOStat>(data);
+            spdlog::debug("NewIOUsageCollector: ES serialization job_id={} processes={} files={}",
+                          s.job_id, s.processes.size(), s.files.size());
             json j;
             j["job_id"] = s.job_id;
             j["collect_period"] = s.collect_period;
