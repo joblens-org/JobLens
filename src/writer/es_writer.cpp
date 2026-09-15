@@ -32,6 +32,10 @@ AUTO_REGISTER_WRITER(
         {"port", "Elasticsearch server port"},
         {"index_prefix", "Prefix for index names, e.g., 'collector_name' -> 'index_name'"},
         {"batch_size", "Number of records to batch before sending to ES"},
+        {"max_bulk_bytes", "Maximum bulk request body bytes including metadata and newlines (default: 1048576)"},
+        {"max_retries", "Additional retry rounds, 0 disables retries (default: 3, maximum: 10)"},
+        {"retry_initial_backoff_ms", "Initial retry backoff in milliseconds (default: 200)"},
+        {"retry_max_backoff_ms", "Maximum retry backoff in milliseconds (default: 5000)"},
         {"write_timeout", "Timeout in seconds for write operations"},
         {"indexs", "List of mappings from collector_name to index_name"}
     }
@@ -83,23 +87,29 @@ static std::string generate_doc_id(const Job& job,
 
 static size_t discard_cb(char*, size_t size, size_t n, void*) { return size * n; }
 
-static size_t string_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata)
-{
-    auto* str = static_cast<std::string*>(userdata);
-    str->append(ptr, size * nmemb);
-    return size * nmemb;
-}
-
 /* ---------- 构造/析构 ---------- */
 ESWriter::ESWriter(std::string name, std::string type, std::string config_name)
     : BaseWriter(name,type,config_name)
 {
     opt_.batch_size = Config::instance().getInt(config_name, "batch_size", 1);
+    const int max_bulk_bytes = Config::instance().getInt(config_name, "max_bulk_bytes", 1048576);
+    if (max_bulk_bytes <= 0) {
+        throw std::invalid_argument("ESWriter max_bulk_bytes must be positive");
+    }
+    opt_.max_bulk_bytes = static_cast<std::size_t>(max_bulk_bytes);
+    opt_.max_retries = Config::instance().getInt(config_name, "max_retries", 3);
+    opt_.retry_initial_backoff_ms = Config::instance().getInt(config_name, "retry_initial_backoff_ms", 200);
+    opt_.retry_max_backoff_ms = Config::instance().getInt(config_name, "retry_max_backoff_ms", 5000);
+    if (opt_.max_retries < 0 || opt_.max_retries > 10 || opt_.retry_initial_backoff_ms <= 0
+        || opt_.retry_max_backoff_ms < opt_.retry_initial_backoff_ms || opt_.retry_max_backoff_ms > 60000) {
+        throw std::invalid_argument("ESWriter invalid retry limits: retries 0..10, backoff 1..60000 ms, initial <= maximum");
+    }
     opt_.host = Config::instance().getString(config_name, "host");
     opt_.port = Config::instance().getInt(config_name, "port");
     opt_.user = Config::instance().getString(config_name, "user", "");
     opt_.passwd = Config::instance().getString(config_name, "passwd", "");
     write_timeout = Config::instance().getInt(config_name, "write_timeout", 5);
+    if (write_timeout <= 0) throw std::invalid_argument("ESWriter write_timeout must be positive");
     opt_.index_prefix = Config::instance().getString(config_name, "index_prefix", "collector");
     opt_.insecure = Config::instance().getBool(config_name, "insecure", false);
     
@@ -271,13 +281,22 @@ bool ESWriter::try_parse_data(const std::string& collector_name, const std::any&
 /* ---------- 真正写 ES ---------- */
 bool ESWriter::flush_impl(const std::vector<write_data>& batch)
 {
+    retry_documents_.clear();
     if (batch.empty()) return true;
 
-    std::ostringstream body;
-    bool parse_ret = true;
+    std::vector<BulkDocument> chunk;
+    std::size_t chunk_bytes = 0;
+    bool flush_ret = true;
+    auto send_chunk = [&]() {
+        if (chunk.empty()) return;
+        if (!send_documents(chunk)) flush_ret = false;
+        chunk.clear();
+        chunk_bytes = 0;
+    };
 
     for (const auto& [collect_name, job, any_data, ts] : batch)
     {
+        try {
         json action;
         auto index_name = try_get_index_name(collect_name);
         index_name += date::format("_%Y.%m.%d", date::floor<date::days>(ts));
@@ -296,78 +315,41 @@ bool ESWriter::flush_impl(const std::vector<write_data>& batch)
             spdlog::debug("elasticsearch_writer: rendered index name '{}'", action["index"]["_index"].get<std::string>());
         }
         json jobj;
-        parse_ret = try_parse_data(collect_name, any_data, job, ts, jobj);
+        if (!try_parse_data(collect_name, any_data, job, ts, jobj)) {
+            spdlog::error("elasticsearch_writer: parser failed, dropping collector={}, job_id={}", collect_name, job.JobID);
+            flush_ret = false;
+            continue;
+        }
         src["data"] = jobj;
-        spdlog::debug("elasticsearch_writer: document to index: {}", src.dump());
-        body << action.dump() << '\n';
-        body << src.dump() << '\n';
+        std::string document = action.dump();
+        document += '\n';
+        document += src.dump();
+        document += '\n';
+
+        // 单文档不可切断；拒绝超限记录，但不阻塞同批次的正常记录。
+        if (document.size() > opt_.max_bulk_bytes) {
+            spdlog::error("elasticsearch_writer: oversized document not sent, collector={}, job_id={}, document_bytes={}, max_bulk_bytes={}",
+                          collect_name, job.JobID, document.size(), opt_.max_bulk_bytes);
+            flush_ret = false;
+            continue;
+        }
+        // 按序列化后的实际字节计量，保留完整 action/source 对及末尾换行。
+        if (chunk_bytes > opt_.max_bulk_bytes - document.size()) {
+            send_chunk();
+        }
+        chunk_bytes += document.size();
+        chunk.push_back({std::move(document), action["index"]["_index"].get<std::string>(),
+                         action["index"]["_id"].get<std::string>(), collect_name});
+        } catch (const std::exception& error) {
+            spdlog::error("elasticsearch_writer: document processing failed, collector={}, job_id={}, reason={}",
+                          collect_name, job.JobID, error.what());
+            flush_ret = false;
+        } catch (...) {
+            spdlog::error("elasticsearch_writer: document processing failed, collector={}, job_id={}, unknown exception", collect_name, job.JobID);
+            flush_ret = false;
+        }
     }
 
-    if (!post_bulk(body.str())){
-        spdlog::warn("elasticsearch_writer: flush failed, batch={}", batch.size());
-        return false;
-    } else {
-        spdlog::debug("elasticsearch_writer: flushed {}", batch.size());
-    }
-
-    return parse_ret;
-}
-
-/* ---------- libcurl POST ---------- */
-
-
-bool ESWriter::post_bulk(const std::string& bulk)
-{
-    if (!curl_) return false;
-    curl_easy_reset(curl_);
-    
-    std::string url;
-    if (opt_.host.find("http") != std::string::npos){
-        url = fmt::format("{}:{}/_bulk", opt_.host, opt_.port);
-    }else {
-        url = fmt::format("http://{}:{}/_bulk", opt_.host, opt_.port);
-    }
-
-    if (opt_.user.compare("") != 0){
-        std::string userpwd = opt_.user+":"+opt_.passwd;
-        curl_easy_setopt(curl_, CURLOPT_USERPWD, userpwd.c_str());
-    }
-    
-    curl_easy_setopt(curl_, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, bulk.c_str());
-    curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, bulk.size());
-    curl_easy_setopt(curl_, CURLOPT_TIMEOUT, write_timeout); // 设置超时
-    if (opt_.insecure) {
-        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 0L);
-        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 0L);
-    }
-
-    struct curl_slist* hdrs = nullptr;
-    hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-    curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, hdrs);
-
-    std::string response;
-    curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, string_write_cb);
-    curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &response);
-
-    CURLcode rc = curl_easy_perform(curl_);
-    curl_slist_free_all(hdrs);
-
-    if (rc != CURLE_OK)
-    {
-        spdlog::error("elasticsearch_writer: curl_easy_perform() failed: {}, url: {}", curl_easy_strerror(rc), url);
-        return false;
-    }
-
-    long code = 0;
-    curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &code);
-    spdlog::debug("ESWriter: post ret code: {}", code);
-
-    if (code != 200 && code != 201)
-    {
-        spdlog::error("elasticsearch_writer: bulk post failed, url: {}, http_code: {}, response: {}", url, code, response);
-        return false;
-    }
-
-    return true;
+    send_chunk();
+    return flush_ret;
 }

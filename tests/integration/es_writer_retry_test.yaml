@@ -1,0 +1,13 @@
+writers_config:
+  buffer_capacity: 1024
+collectors_config:
+  enable_collector_perf: false
+es_test:
+  host: http://127.0.0.1
+  port: 19200
+  indexs: []
+  max_bulk_bytes: 1048576
+  max_retries: 2
+  retry_initial_backoff_ms: 20
+  retry_max_backoff_ms: 80
+  write_timeout: 1

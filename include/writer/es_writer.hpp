@@ -28,6 +28,10 @@ public:
         int         port         = 9200;
         std::string index_prefix = "joblens";
         std::size_t batch_size   = 500;   // 达到多少条就打包
+        std::size_t max_bulk_bytes = 1048576; // 单次请求体上限，包含元数据和换行
+        int max_retries = 3;
+        int retry_initial_backoff_ms = 200;
+        int retry_max_backoff_ms = 5000;
         std::string user         = "";
         std::string passwd       = "";
         bool        insecure     = false; // skip SSL verification
@@ -43,8 +47,24 @@ public:
     /* 真正写 ES：被 BaseWriter 后台线程调用 */
     bool flush_impl(const std::vector<write_data>& batch) override;
 
+protected:
+    void on_flush_error(const std::vector<write_data>& batch) override;
+
 private:
-    bool post_bulk(const std::string& bulk_body);
+    struct BulkDocument {
+        std::string ndjson;
+        std::string index;
+        std::string id;
+        std::string collector;
+    };
+    struct BulkResponse {
+        CURLcode transport;
+        long status;
+        std::string body;
+    };
+    BulkResponse post_bulk(const std::string& bulk_body);
+    bool send_documents(const std::vector<BulkDocument>& documents);
+    std::vector<BulkDocument> retry_documents_;
     bool test_server();
     std::string try_get_index_name(const std::string& collector_name);
     bool try_parse_data(const std::string& collector_name, const std::any& data, const Job& job,
