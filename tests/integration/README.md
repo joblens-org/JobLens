@@ -30,6 +30,16 @@
 
 ## 前置条件
 
+### ESWriter 退避重试与性能计数回归
+
+在已配置 Ninja 构建目录、具备项目 C++ 编译依赖的本机运行：
+
+```bash
+bash tests/integration/run_writer_retry_test.sh
+```
+
+可传入构建目录作为第一个参数。脚本复用 JobLens 的实际目标文件和链接参数，运行本地随机端口 HTTP 模拟服务与独立 Unix socket RPC，不连接生产 ES，不需要 eBPF 权限。覆盖 Bulk 部分失败、成功项不重发、永久错误、异常响应、超时、指数退避、次数耗尽、重试字节分包、非法配置、真实后台失败钩子，以及 writer/collector 的 call_cnt 单次计数。测试程序和 socket 在结束时清理。
+
 ### 独立 HASH map 批量读取回归
 
 在具备项目构建依赖、BTF 与 BPF 权限的 Linux 主机上运行：
