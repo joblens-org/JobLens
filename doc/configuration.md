@@ -237,7 +237,11 @@ ES_writer_config:
   user: ""                       # ES username (optional)
   passwd: ""                     # ES password (optional)
   index_prefix: collector        # Index name prefix
-  batch_size: 100                # Batch write size
+  batch_size: 100                # 兼容旧配置，当前不控制 HTTP 请求分包
+  max_bulk_bytes: 1048576        # 请求体字节上限，包含元数据和换行
+  max_retries: 3                # 首次发送失败后的额外重试轮数，0 表示禁用
+  retry_initial_backoff_ms: 200
+  retry_max_backoff_ms: 5000
   write_timeout: 30              # Write timeout (seconds)
   indexs:                        # Optional index name mapping list
     - collector_name: cpumem_collector
@@ -253,13 +257,27 @@ ES_writer_config:
 | `user` | string | No | `""` | Basic authentication username |
 | `passwd` | string | No | `""` | Basic authentication password |
 | `index_prefix` | string | No | `"collector"` | Index name prefix, final index name is `{prefix}_{collector_name}_{YYYY.MM.DD}` |
-| `batch_size` | int | Yes | - | Batch size |
-| `write_timeout` | int | Yes | - | Write timeout in seconds |
+| `batch_size` | int | No | `1` | Legacy buffer reservation setting; does not cap HTTP request size |
+| `max_bulk_bytes` | int | No | `1048576` | Positive maximum bulk request body size in bytes, including action metadata and both newline delimiters |
+| `max_retries` | int | No | `3` | Additional retry rounds, 0–10; each document is sent at most 1 + max_retries times |
+| `retry_initial_backoff_ms` | int | No | `200` | Initial backoff ceiling in milliseconds; positive and no greater than retry_max_backoff_ms |
+| `retry_max_backoff_ms` | int | No | `5000` | Backoff ceiling, at most 60000 ms |
+| `write_timeout` | int | No | `5` | Positive timeout in seconds per HTTP request, including retries |
 | `indexs` | array | No | - | Explicit mapping from collector to index name. Each element contains `collector_name` and `index_name` |
 
 **Index rendering supports variable templates**: Index names support `[[job_info.field]]` syntax, rendered at runtime using `Utils::render_bracket()` and `Utils::flatten_json()`.
 
 **Time suffix**: Automatically appends a date suffix of the form `_{YYYY.MM.DD}`.
+
+**Byte-based batching**: ESWriter measures the actual serialized UTF-8 NDJSON bytes and splits only between complete action/source pairs. A request exactly equal to `max_bulk_bytes` is allowed. Set this value no higher than the smallest request body limit across your proxies and Elasticsearch nodes. Zero and negative values are rejected when initializing the writer.
+
+If a single action/source pair exceeds the limit, it is not sent or truncated: the writer logs its collector, job ID, byte size and limit, continues sending other valid documents, and reports the flush as failed. Parser failures are logged and dropped rather than indexing an error placeholder. Increasing the proxy limit or changing the document model is still necessary for oversized individual documents.
+
+**Failure handling**: HTTP success is checked against the Bulk `errors` and individual `items`. The ESWriter `on_flush_error()` hook retries only transient failures and records with unknown delivery results. Retryable HTTP/item statuses are 408, 429, 500, 502, 503 and 504; temporary resolution, connection, timeout, send/receive and incomplete-response errors are also retried. Other statuses (including 400, 401, 403, 404, 409 and 413), TLS/configuration errors and oversized documents are logged and dropped without retry. Missing or malformed Bulk responses are treated as unknown delivery, not success. When the item count matches, valid successful items are excluded from retry even if another item is malformed.
+
+Retries reuse the original serialized action/source, index and ID, and obey the same byte limit. Each round waits a random delay between half and all of `min(initial_backoff * 2^(round-1), max_backoff)`. After the configured rounds, remaining failures are logged and discarded; nothing is persisted or replayed after restart. Unknown-delivery retries may repeat an already applied `index` operation: stable IDs prevent allocating new IDs, but do not provide exactly-once delivery or protect against concurrent updates to the same ID.
+
+Retries run synchronously on the flush path and can delay subsequent batches and shutdown. The retry count limits attempts, not total flush wall time across multiple HTTP chunks. Pending retry payloads are retained in memory for the current flush only. Writer `call_cnt` counts each nonempty logical flush once, not HTTP attempts; `err_cnt` counts initially failed flushes even when the hook later recovers, and timing includes backoff and retries. Collector timing retains its existing success-only sampling semantics; exceptions increment `err_cnt` without appending a sample.
 
 **Per‑document structure** (automatically wrapped by ESWriter):
 ```json
