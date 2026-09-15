@@ -105,6 +105,9 @@ public:
     
 protected:
     virtual bool flush_impl(const std::vector<write_data>& batch);
+    // 失败时在清空缓冲前、队列锁外调用；batch 可能含成功项，引用仅在回调期间有效。
+    // 子类自行保留所需数据；不得重入当前 writer 的 shutdown 或刷新流程。
+    virtual void on_flush_error(const std::vector<write_data>& batch);
     void write(const write_data& t);
     std::string name_;
     std::string type_;

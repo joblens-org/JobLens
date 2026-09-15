@@ -78,6 +78,11 @@ bool BaseWriter::flush_impl(const std::vector<write_data>&)
     // 默认空实现，留给派生类覆写
 }
 
+void BaseWriter::on_flush_error(const std::vector<write_data>& batch)
+{
+    spdlog::error("BaseWriter: flush failed for writer '{}', attempted_records={}", name_, batch.size());
+}
+
 void BaseWriter::write(const write_data& t)
 {
     
@@ -119,22 +124,26 @@ void BaseWriter::flush_buffer(const Buffer& buf)
     {
         spdlog::debug("BaseWriter: flushing {} items for writer '{}'", buf.vec.size(), name_);
         auto start = std::chrono::steady_clock::now();
-        if (use_perf){
-            bool ok = true;
-        }
         try{
             flush_ret = flush_impl(buf.vec);
         }catch(const std::exception& e){
             spdlog::error("BaseWriter: flush_impl failed for writer '{}': {}", name_, e.what());
-            if (use_perf){
-                perf_->err_cnt++;
+        }catch(...){
+            spdlog::error("BaseWriter: flush_impl failed for writer '{}': unknown exception", name_);
+        }
+        if (!flush_ret){
+            try{
+                on_flush_error(buf.vec);
+            }catch(const std::exception& e){
+                spdlog::error("BaseWriter: on_flush_error failed for writer '{}': {}", name_, e.what());
+            }catch(...){
+                spdlog::error("BaseWriter: on_flush_error failed for writer '{}': unknown exception", name_);
             }
         }
         if (use_perf){
             if (!flush_ret){
                 perf_->err_cnt++;
             }
-            // TODO: 这里需要实现报错调用计数，但是之前设计的逻辑并非这样，所以先空着
             auto us = std::chrono::duration<double, std::micro>(
                       std::chrono::steady_clock::now() - start).count();
             perf_->append(us);
