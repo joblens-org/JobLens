@@ -452,7 +452,7 @@ JobRegistry& JobRegistry::instance() {
 
 
 bool JobRegistry::addJob(const Job& job) {
-    spdlog::info("JobRegistry: addJob entry JobID={}, type={}, collectors={}, PIDs={}",
+    spdlog::info("JobRegistry: addJob entry JobID={}, native_id={}, collectors={}, PIDs={}",
                  job.JobID, job.NativeJobID, job.CollectorNames.size(), job.JobPIDs.size());
     // 错误检查
     if (job.CollectorNames.empty()) {
