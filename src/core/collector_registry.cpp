@@ -72,12 +72,9 @@ CollectFunc CollectorRegistry::makePerfFunc(std::string name, CollectFunc func) 
     return [func, &perf](const Job& job) -> std::any {
         auto start = std::chrono::steady_clock::now();
         std::any ret;
-        bool ok = true;
         try {
             ret = func(job); 
-            perf->call_cnt++;
         } catch (...) {
-            ok = false;
             perf->err_cnt++;
             throw;
         }

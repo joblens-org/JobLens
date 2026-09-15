@@ -131,7 +131,6 @@ void BaseWriter::flush_buffer(const Buffer& buf)
             }
         }
         if (use_perf){
-            perf_->call_cnt++;
             if (!flush_ret){
                 perf_->err_cnt++;
             }
