@@ -20,10 +20,16 @@
 
 #include <iostream>
 #include <tuple>
+#include "common/local_rpc.hpp"
 
 CollectorScheduler::CollectorScheduler()
     : timerScheduler_(Config::instance().getInt("lens_config", "max_collector_threads"))
 {
+    auto runtime = runtime_;
+    RPCServer::instance().register_method("CollectorScheduler/status",
+        [runtime](const nlohmann::json&) { return runtime->snapshot(); });
+    RPCServer::instance().register_method("CollectorScheduler/collector_status",
+        [runtime](const nlohmann::json& params) { return runtime->collector(params); });
     default_freq = Config::instance().getInt("collectors_config", "default_freq");
     default_cbs_name = Config::instance().getArray<std::string>("collectors_config", "default_use_writers");
     registerFinishCallbacks();
@@ -77,9 +83,11 @@ void CollectorScheduler::startCollector(std::string collector_name){
     }
     try
     {
+        CollectorRuntime::Operation initializing(runtime_, collector_name, "init");
         auto config_node = Config::instance().getRawNode(info.config_name);
         auto j_config = Utils::yamlToJson(config_node);
         if (!info.init_handle(j_config)) {
+            initializing.fail("Collector initialization returned false");
             spdlog::error("CollectorScheduler: collector {} init failed", collector_name);
             return;
         }
@@ -90,6 +98,7 @@ void CollectorScheduler::startCollector(std::string collector_name){
         collector_job.task_id = timerScheduler_.registerRepeatingTimer(
             std::chrono::milliseconds(static_cast<long long>(1000.0 / freq)),
             [this, collector_name](){
+                CollectorRuntime::Operation callback(runtime_, collector_name, "callback");
                 // 使用find代替operator[]，避免与持有m_的路径形成数据竞争
                 auto it_info = collector_info_dict.find(collector_name);
                 if (it_info == collector_info_dict.end()) return;
@@ -104,9 +113,11 @@ void CollectorScheduler::startCollector(std::string collector_name){
                     if(collector_job.jobid_list.empty() && collector_job.running){
                         //由JobRegistry完成任务清理工作
                         //没有任务，取消这个收集器，节省资源
+                        CollectorRuntime::Operation deinitializing(runtime_, collector_name, "deinit");
                         info.deinit_handle();
                         timerScheduler_.cancelTimer(collector_job.task_id);
                         collector_job.running = false;
+                        runtime_->timer(collector_name, false);
                         return;
                     }
                     jobids_snapshot = collector_job.jobid_list;
@@ -122,14 +133,19 @@ void CollectorScheduler::startCollector(std::string collector_name){
                         std::any ret;
                         try
                         {
-                            ret = info.collect_handle(job.value());
+                            {
+                                CollectorRuntime::Operation collecting(runtime_, collector_name, "collect");
+                                ret = info.collect_handle(job.value());
+                            }
                             auto now = std::chrono::system_clock::now();
+                            CollectorRuntime::Operation writing(runtime_, collector_name, "write");
                             for(const auto& cb:info.finish_cbs){
                                 cb(collector_name, job.value(), ret, now);
                             }
                         }
                         catch(const std::exception& e)
                         {
+                            callback.fail(e.what());
                             spdlog::error("CollectorScheduler: collector {} collect error: {}", collector_name, e.what());
                         }
                     }
@@ -140,8 +156,10 @@ void CollectorScheduler::startCollector(std::string collector_name){
             }
         );
         collector_job.running = true;
+        runtime_->timer(collector_name, true);
     }
     catch(const std::exception& e) {
+        runtime_->error(collector_name, e.what());
         spdlog::error("CollectorScheduler: start collector {} error: {}", collector_name, e.what());
     }
 
@@ -158,6 +176,7 @@ void CollectorScheduler::addJob2Collector(size_t jobid, std::string collector){
         return;
     }
     state.jobid_list.push_back(jobid);
+    runtime_->jobs(collector, state.jobid_list.size());
     if(!state.running){
         startCollector(collector);
     }
@@ -186,7 +205,8 @@ void CollectorScheduler::rmJobCollect(const Job& job){
         auto& state = it->second;
         std::lock_guard lg(state.m_);
         size_t id = job.JobID;
-        state.jobid_list.erase(std::remove_if(state.jobid_list.begin(),state.jobid_list.end(),[id](size_t x){return x==id;}));
+        state.jobid_list.erase(std::remove_if(state.jobid_list.begin(),state.jobid_list.end(),[id](size_t x){return x==id;}), state.jobid_list.end());
+        runtime_->jobs(collector_name, state.jobid_list.size());
     }
 }
 
@@ -210,11 +230,7 @@ void CollectorScheduler::updateJobCollect(const Job& job){
             spdlog::error("CollectorScheduler: {} name is error, continue..", collector_name);
             continue;
         }
-        auto& state = collector_state_dict[collector_name];
-        auto it = std::find(state.jobid_list.begin(), state.jobid_list.end(), job.JobID);
-        if (it == state.jobid_list.end()){
-            addJob2Collector(job.JobID, collector_name);
-        }
+        addJob2Collector(job.JobID, collector_name);
     }
     // 删除采集器
     for(auto& collector_name:to_remove){
@@ -224,7 +240,8 @@ void CollectorScheduler::updateJobCollect(const Job& job){
         auto& state = it->second;
         std::lock_guard lg(state.m_);
         size_t id = job.JobID;
-        state.jobid_list.erase(std::remove_if(state.jobid_list.begin(),state.jobid_list.end(),[id](size_t x){return x==id;}));
+        state.jobid_list.erase(std::remove_if(state.jobid_list.begin(),state.jobid_list.end(),[id](size_t x){return x==id;}), state.jobid_list.end());
+        runtime_->jobs(collector_name, state.jobid_list.size());
     }
 }
 
@@ -250,6 +267,8 @@ void CollectorScheduler::addJobCollectFunc(std::string name, std::string config,
     }
 
 
+    collector_state_dict.try_emplace(name);
+    runtime_->configure(name, config, "job", 1000.0 / collector_info_dict[name].freq);
     try{
         auto writers = Config::instance().getArray<std::string>(config, "use_writers");
         for (const auto& writer_name: writers){
@@ -292,6 +311,8 @@ void CollectorScheduler::addSystemCollectFunc(std::string name, std::string conf
         collector_info_dict[name].freq = default_freq;
     }
 
+    collector_state_dict.try_emplace(name);
+    runtime_->configure(name, config, "system", 1000.0 / collector_info_dict[name].freq);
     try{
         auto writers = Config::instance().getArray<std::string>(config, "use_writers");
         for (const auto& writer_name: writers){
@@ -319,6 +340,7 @@ void CollectorScheduler::addSystemCollectFunc(std::string name, std::string conf
         auto auto_start = Config::instance().getBool(config, "auto_start");
         if(auto_start){
             collector_state_dict[name].jobid_list.push_back(0); //job 0已经默认存在
+            runtime_->jobs(name, collector_state_dict[name].jobid_list.size());
             startCollector(name);
         }
     }
@@ -359,22 +381,23 @@ void CollectorScheduler::start() {
     std::lock_guard lg(m_);
     if (running_) return;
     running_ = true;
+    runtime_->lifecycle("running");
 }
 
 void CollectorScheduler::shutdown() {
+    std::lock_guard shutdown_lock(shutdown_mutex_);
+    runtime_->lifecycle("stopping");
     {
         std::lock_guard lg(m_);
-        if (!running_) return;
         running_ = false;
     }
     timerScheduler_.shutdown();
+    runtime_->lifecycle("stopped");
     spdlog::info("CollectorScheduler: CollectorScheduler shutdown complete");
 }
 
 nlohmann::json CollectorScheduler::snapshot() {
-    nlohmann::json result;
-    std::lock_guard lg(m_);
-    return result;
+    return runtime_->snapshot();
 }
 
 CollectorScheduler& CollectorScheduler::instance() {
@@ -400,15 +423,19 @@ void CollectorScheduler::registerCollectFuncs() {
             return c;
         });
     auto& collector_reg = CollectorRegistry::instance();
+    for (const auto& collector : collectors)
+        runtime_->configure(collector.name, collector.config, "undefined", 0);
     
     for (const auto& collector : collectors) {
         
         auto collector_handle = collector_reg.createCollector(collector.type, collector.name);
         if (!collector_handle.init) {
+            runtime_->error(collector.name, "Collector has no initialization handler");
             spdlog::error("CollectorScheduler: {} init error",collector.name);
         }
         auto scope = collector_reg.getScope(collector.type);
         if(scope == CollectorScope::Undefined){
+            runtime_->error(collector.name, "Collector scope is undefined");
             spdlog::error("CollectorScheduler: {} scope is undefined, skip it",collector.name);
             continue;
         }

@@ -36,6 +36,7 @@
 #include <nlohmann/json.hpp>
 
 #include "job_lifecycle_event.h"
+#include "core/collector_runtime.hpp"
 
 class CollectorScheduler {
 public:
@@ -56,6 +57,7 @@ public:
     static CollectorScheduler& instance();
 
 private:
+    friend struct CollectorSchedulerTestAccess;
     CollectorScheduler();
     void addJobCollectFunc(std::string name, std::string config, CollectFunc collector_handle,CollectInitFunc init_handle,CollectDeinitFunc deinit_handle);
     void addSystemCollectFunc(std::string name, std::string config, CollectFunc collector_handle,CollectInitFunc init_handle,CollectDeinitFunc deinit_handle);
@@ -69,13 +71,14 @@ private:
     void rmJobCollect(const Job& job);
     void updateJobCollect(const Job& job);
     Config& global_config = Config::instance();
+    std::shared_ptr<CollectorRuntime> runtime_ = std::make_shared<CollectorRuntime>();
     TimerScheduler timerScheduler_;
 
     struct collector_state{
         std::vector<size_t> jobid_list;
         std::mutex              m_;
-        size_t task_id;
-        std::atomic<bool>        running;
+        size_t task_id = 0;
+        std::atomic<bool>        running{false};
     };
 
     struct collector_info
@@ -92,6 +95,7 @@ private:
     
 
     std::mutex              m_;
+    std::mutex shutdown_mutex_;
     std::unordered_map<std::string, collector_info> collector_info_dict;
     std::unordered_map<std::string, collector_state> collector_state_dict;
     std::unordered_map<std::string, OnFinish>   finishCallbacks_;
