@@ -143,6 +143,7 @@ void NewIOUsageCollector::deinit() noexcept{
     deinit_ebpf();
     dump_keys_.clear();
     dump_vals_.clear();
+    dump_index_.clear();
     known_pids_.clear();
     last_job_time_.clear();
     last_proc_io_.clear();
@@ -160,6 +161,7 @@ void NewIOUsageCollector::refresh_dump_cache_if_needed(){
 
     EbpfCommon::lookup_hashmap_batch<job_pid_fd_key, rw_stat>(
         bpf_obj_, jobfdstat_map_name, dump_keys_, dump_vals_);
+    dump_index_.rebuild(dump_keys_);
     spdlog::debug("NewIOUsageCollector: fd cache refreshed keys={} values={} cache_age_ms={}",
                   dump_keys_.size(), dump_vals_.size(), elapsed);
     last_dump_time_ = now;
@@ -176,17 +178,20 @@ void NewIOUsageCollector::cleanup_dead_pids(uint64_t job_id){
             to_cleanup.push_back(pid);
         }
     }
+    if (to_cleanup.empty()){
+        if (known_it->second.empty()) known_pids_.erase(known_it);
+        return;
+    }
     bool cache_changed = false;
-    for (pid_t pid : to_cleanup){
-        // 删除该 pid 在本 job 下所有 job_fd_stat 条目（本采集器私有 map）。
-        // pid2job 为共享 map, 其删除由内核 exit hook 统一负责, 此处不再触碰。
-        for (size_t i = 0; i < dump_keys_.size(); ++i){
-            if (dump_keys_[i].job_id == job_id && dump_keys_[i].pid == static_cast<u32>(pid)){
-                EbpfCommon::delete_hashmap_elem<job_pid_fd_key, rw_stat>(
-                    bpf_obj_, jobfdstat_map_name, dump_keys_[i]);
-                cache_changed = true;
-            }
+    for (const auto i : dump_index_.entries(job_id)){
+        const auto state = known_it->second.find(static_cast<pid_t>(dump_keys_[i].pid));
+        if (state != known_it->second.end() && !state->second.alive && state->second.output_count >= 1){
+            EbpfCommon::delete_hashmap_elem<job_pid_fd_key, rw_stat>(
+                bpf_obj_, jobfdstat_map_name, dump_keys_[i]);
+            cache_changed = true;
         }
+    }
+    for (pid_t pid : to_cleanup){
         known_it->second.erase(pid);
     }
     if (known_it->second.empty()){
@@ -197,6 +202,7 @@ void NewIOUsageCollector::cleanup_dead_pids(uint64_t job_id){
                       job_id, to_cleanup.size(), dump_keys_.size());
         dump_keys_.clear();
         dump_vals_.clear();
+        dump_index_.clear();
         last_dump_time_ = std::chrono::steady_clock::time_point{};
     }
 }
@@ -233,8 +239,7 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
     refresh_dump_cache_if_needed();
     std::unordered_map<pid_t, std::optional<MountInfoUtils::MountTable>> mount_tables;
     IoAggregationStatus io_status;
-    for (size_t i = 0; i < dump_keys_.size(); ++i){
-        if (dump_keys_[i].job_id != job.JobID) continue;
+    for (const auto i : dump_index_.entries(job.JobID)){
         pid_t pid = static_cast<pid_t>(dump_keys_[i].pid);
         u32 fd = dump_keys_[i].fd;
         const rw_stat& s = dump_vals_[i];

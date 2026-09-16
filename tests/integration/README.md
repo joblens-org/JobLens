@@ -40,6 +40,18 @@ bash tests/integration/run_writer_retry_test.sh
 
 可传入构建目录作为第一个参数。脚本复用 JobLens 的实际目标文件和链接参数，运行本地随机端口 HTTP 模拟服务与独立 Unix socket RPC，不连接生产 ES，不需要 eBPF 权限。覆盖 Bulk 部分失败、成功项不重发、永久错误、异常响应、超时、指数退避、次数耗尽、重试字节分包、非法配置、真实后台失败钩子，以及 writer/collector 的 call_cnt 单次计数。测试程序和 socket 在结束时清理。
 
+### NewIOUsage 按作业缓存索引回归
+
+在有项目 Ninja 构建目录及 BPF 权限的 Linux 主机运行：
+
+```bash
+bash tests/integration/run_new_io_cache_test.sh
+```
+
+脚本先验证索引的作业隔离、刷新和失效，再链接实际采集器代码，以独立、未 pin、无探针的 BPF map 调用真实 `collect()`。覆盖明细开关、文件明细、速率基线、同 PID 跨 Job 隔离、短命进程清理及空缓存刷新。不启动 JobLens 服务，不访问现有内核 map。测试文件和 map 随进程结束清理。
+
+无 BPF 权限时可单独编译运行 `new_io_fd_index_test.cpp`；其中 146 作业规模用例核对条目访问数量，不是端到端性能基准。索引优化不改变现有 200 ms 缓存 TTL，缓存过期或短命进程清理后的刷新仍需要读取全表。
+
 ### 独立 HASH map 批量读取回归
 
 在具备项目构建依赖、BTF 与 BPF 权限的 Linux 主机上运行：

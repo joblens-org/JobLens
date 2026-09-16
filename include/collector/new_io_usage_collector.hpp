@@ -16,6 +16,7 @@
 
 #include "core/collector_type.h"
 #include "icollector.h"
+#include "collector/job_fd_index.hpp"
 #include <spdlog/spdlog.h>
 #include <bpf/libbpf.h>
 #include "ebpf/job_io_new.h"
@@ -82,6 +83,7 @@ public:
     void deinit() noexcept override;
     CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
 private:
+    friend struct NewIOUsageCollectorTestAccess;
     bool init_ebpf();
     void deinit_ebpf();
     // 周期缓存：DUMP_TTL 内共享一次全表遍历
@@ -110,6 +112,7 @@ private:
     std::chrono::steady_clock::time_point last_dump_time_{};
     std::vector<job_pid_fd_key> dump_keys_;
     std::vector<rw_stat> dump_vals_;
+    JobFdIndex dump_index_;
 
     // 短命进程状态 + 上周期基线
     std::unordered_map<uint64_t, std::unordered_map<pid_t, EphemeralState>> known_pids_;
