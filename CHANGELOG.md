@@ -1,5 +1,33 @@
 # JobLens Changelog
 
+## v0.3.3 (2026-09-16)
+
+### Elasticsearch Writer Delivery Hardening
+- Reworked ESWriter bulk delivery to build per-document NDJSON entries and chunk requests by a byte budget (`max_bulk_bytes`, default 1 MiB) in addition to `batch_size`, keeping payloads within cluster limits when document sizes vary (`1300267`).
+- Added bounded exponential backoff with jitter for retryable failures, configurable via `max_retries`, `retry_initial_backoff_ms`, and `retry_max_backoff_ms`; retryable HTTP statuses (408/429/5xx) and transport errors are retried, while permanent failures are dropped with a warning (`1300267`).
+- Validated every Bulk item against its submitted document (item shape, status range, `_id` match) so partially failed batches retry only the failed documents and confirmed successes are never resent; ambiguous or inconsistent responses are treated as retryable instead of silently dropped (`1300267`).
+- Added an overridable `BaseWriter::on_flush_error()` hook invoked outside the queue lock before the buffer is discarded, letting subclasses act on a failed flush without stalling the writer (`8eafeeb`).
+
+### Collector Runtime Observability
+- Added `CollectorRuntime` to track per-collector lifecycle phase, scope/config, job count, timer state, and per-operation (`init`/`deinit`/`callback`/`collect`/`write`) success/error counts and durations (`7bbd260`).
+- Exposed `CollectorScheduler/status` and `CollectorScheduler/collector_status` JSON-RPC methods returning whole-scheduler or single-collector snapshots; operations are recorded through an RAII guard, including exception paths (`7bbd260`).
+- Fixed `jobid_list` erase calls that omitted the container `end` iterator, and initialized `collector_state` fields to avoid undefined behavior (`7bbd260`).
+
+### Performance and Correctness Fixes
+- Eliminated duplicate collector/writer call counting by removing the extra perf counter increment in `CollectorRegistry` and `BaseWriter` (`b9e497d`).
+- Indexed the NewIOUsageCollector FD snapshot cache by `job_id` so `collect()` and dead-PID cleanup no longer scan the entire cache (`c72b44d`).
+- Initialized connection/process-state structs in NetUsageCollector and default member values in PrometheusExporterWriter to avoid undefined behavior (`ce298fc`).
+- Corrected the `addJob` log field name from `type` to `native_id` (`10dfd31`).
+
+### Regression Coverage and Documentation
+- Added ESWriter regression coverage for byte batching, partial failure, permanent errors, timeout, exponential backoff, retry chunking, and invalid configuration, with a runnable entry point (`1300267`, `6ee0ac7`).
+- Added collector/writer call-count regression coverage (`b9e497d`).
+- Added NewIOUsage per-job cache index regression covering detail toggles, file details, rate baselines, same-PID cross-job isolation, ephemeral-process cleanup, and empty-cache refresh (`c72b44d`).
+- Added CollectorRuntime status snapshot test coverage (`7bbd260`).
+- Documented the ESWriter byte budget, backoff retry, and failure-handling semantics in the configuration manual (`0edc7a9`).
+
+---
+
 ## v0.3.2 (2026-09-11)
 
 ### IO and Filesystem Metadata Fixes
