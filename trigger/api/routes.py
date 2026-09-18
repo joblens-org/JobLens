@@ -21,6 +21,7 @@ from flask import Flask, Response, request, jsonify, abort
 import logging
 import time
 import subprocess
+import os
 from typing import Optional
 from werkzeug.exceptions import HTTPException
 
@@ -658,6 +659,89 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             )
             return jsonify(response.model_dump())
     
+    # ==================== SSH Session Dashboard ====================
+
+    def _get_es_config():
+        """从 JobLens 核心配置读取 ES 连接信息"""
+        import yaml
+        from pathlib import Path
+        import os
+        config_path = os.environ.get('JOBLENS_CONFIG_PATH', '/etc/JobLens/config.yaml')
+        if not os.path.exists(config_path):
+            config_path = str(Path(__file__).resolve().parent.parent.parent / 'config' / 'config.example.yaml')
+        try:
+            with open(config_path, 'r') as f:
+                cfg = yaml.safe_load(f) or {}
+            es = cfg.get('ES_writer_config', {})
+            host = es.get('host', 'http://localhost')
+            port = es.get('port', 9200)
+            user = es.get('user', '')
+            passwd = es.get('passwd', '')
+            indexes = es.get('indexs', [])
+            base = host if host.startswith('http') else f'http://{host}'
+            return {
+                'url': f'{base}:{port}',
+                'user': user,
+                'passwd': passwd,
+                'indexes': indexes,
+            }
+        except Exception:
+            return {'url': 'http://localhost:9200', 'user': '', 'passwd': '', 'indexes': []}
+
+    def _get_ssh_index():
+        """从 ES 配置中找到 SSH session 的索引名前缀"""
+        cfg = _get_es_config()
+        for idx in cfg['indexes']:
+            if idx.get('collector_name') == 'ssh_session_collector':
+                return idx.get('index_name', 'ssh_session')
+        return 'ssh_session'
+
+    @app.route('/dashboard/ssh')
+    def ssh_dashboard():
+        """SSH 会话监控 Dashboard"""
+        template_path = os.path.join(os.path.dirname(__file__), '..', 'templates', 'ssh_dashboard.html')
+        if os.path.exists(template_path):
+            with open(template_path, 'r') as f:
+                html = f.read()
+            return html
+        # fallback: inline minimal page
+        return '<html><body><h1>SSH Dashboard template not found</h1></body></html>'
+
+    @app.route('/dashboard/ssh/api/es', methods=['GET', 'POST'])
+    def ssh_dashboard_es_proxy():
+        """代理 ES 查询，避免浏览器跨域问题"""
+        import requests as req
+        es_cfg = _get_es_config()
+
+        # 支持 GET 请求用 body 参数传查询，或 POST 请求用 JSON body
+        if request.method == 'POST':
+            query_body = request.get_json(silent=True) or {}
+        else:
+            import json as _json
+            query_body = _json.loads(request.args.get('body', '{}'))
+
+        # 构造 ES 搜索 URL：用通配符匹配日期索引
+        index_pattern = _get_ssh_index()
+        es_url = f"{es_cfg['url']}/{index_pattern}_*/_search"
+
+        auth = None
+        if es_cfg['user']:
+            auth = (es_cfg['user'], es_cfg['passwd'])
+
+        try:
+            r = req.post(es_url, json=query_body, auth=auth, timeout=15,
+                         verify=False)
+            # 校验 ES 响应
+            if r.status_code >= 400:
+                return jsonify({'error': f'ES returned {r.status_code}', 'detail': r.text[:500]}), 502
+            return jsonify(r.json())
+        except req.exceptions.Timeout:
+            return jsonify({'error': 'ES query timeout'}), 504
+        except req.exceptions.ConnectionError as e:
+            return jsonify({'error': f'Cannot connect to ES: {e}'}), 502
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
     # ==================== 一些奇妙的用户需求 ====================
     @app.route('/utils/hardware_info', methods=['GET'])
     def get_hardware_info():

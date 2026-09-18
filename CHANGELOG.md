@@ -1,5 +1,18 @@
 # JobLens Changelog
 
+## Unreleased
+
+### SSH Session Dashboard & Collector Fixes
+- Added SSH Session Dashboard — a real-time process monitoring frontend:
+  - HTML single-page app (`trigger/templates/ssh_dashboard.html`) with ECharts trend charts, user list, process tree, and process detail panel
+  - Flask dev server (`trigger/dev_dashboard.py`) serving the dashboard + proxying ES queries, independent of the full trigger app
+  - Production trigger routes (`trigger/api/routes.py`) now include `/dashboard/ssh` and `/dashboard/ssh/api/es` endpoints with the same functionality
+- Added `SSHSessionCollector` (`src/collector/ssh_session_collector.cpp`) — a system-level collector that scans `/proc` for per-user process CPU/memory/IO stats every 10 seconds (0.1 Hz)
+- Registered `ssh_session_collector` in `config/config.example.yaml` with ES writer output to `gaohan_ssh_session` index
+- Fixed kernel thread pollution in `ssh_session_collector`: the original filter checked `comm.empty()` but kernel threads have non-empty comm; changed to filter by empty `cmdline` (kernel threads have no command-line arguments)
+- Fixed process deduplication in dashboard frontend: the 30-second snapshot window captured 3-4 collector scan cycles, causing each PID to appear multiple times in the process tree; added PID-based dedup via `Set`
+- Replaced mock data in `dev_dashboard.py` with real ES query forwarding, reading ES credentials from `config/config.example.yaml`
+
 ## v0.3.3 (2026-09-16)
 
 ### Elasticsearch Writer Delivery Hardening

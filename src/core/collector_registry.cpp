@@ -108,9 +108,17 @@ CollectorHandle CollectorRegistry::createCollector(const std::string& type, cons
     CollectFunc c_func;
 
     if (enable_collector_perf) {
-        c_func = makePerfFunc(name, [inst](const Job& job) { return inst->collect(job); });
+        if (it->second.scope == CollectorScope::System) {
+            c_func = makePerfFunc(name, [inst](const Job& /*job*/) { return inst->collect(); });
+        } else {
+            c_func = makePerfFunc(name, [inst](const Job& job) { return inst->collect(job); });
+        }
     }else {
-        c_func = [inst](const Job& job) { return inst->collect(job); };
+        if (it->second.scope == CollectorScope::System) {
+            c_func = [inst](const Job& /*job*/) { return inst->collect(); };
+        } else {
+            c_func = [inst](const Job& job) { return inst->collect(job); };
+        }
     }
 
     if (it->second.scope == CollectorScope::Job) {

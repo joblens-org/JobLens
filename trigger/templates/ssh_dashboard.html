@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SSH Session Monitor — JobLens</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>
+:root {
+  --bg: #0f1923;
+  --card-bg: #1a2633;
+  --border: #2a3a4a;
+  --text: #c8d6e5;
+  --text-dim: #8395a7;
+  --accent: #0abde3;
+  --accent2: #10ac84;
+  --warn: #ff9f43;
+  --danger: #ee5a24;
+  --pid-color: #48dbfb;
+  --mem-color: #0be881;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.header{background:var(--card-bg);border-bottom:1px solid var(--border);padding:0 24px;height:56px;display:flex;align-items:center;justify-content:space-between}
+.header h1{font-size:18px;font-weight:600;display:flex;align-items:center;gap:8px}
+.header h1 .dot{width:8px;height:8px;border-radius:50%;background:var(--accent2);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+.header-right{display:flex;align-items:center;gap:12px;font-size:13px;color:var(--text-dim)}
+.header-right .refresh{cursor:pointer;padding:4px 10px;border:1px solid var(--border);border-radius:4px;background:transparent;color:var(--text);font-size:12px;transition:all .2s}
+.header-right .refresh:hover{border-color:var(--accent);color:var(--accent)}
+.main{padding:20px 24px;max-width:1600px;margin:0 auto}
+/* Overview cards */
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:20px}
+.card{background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:16px 20px;position:relative;overflow:hidden}
+.card .label{font-size:12px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
+.card .value{font-size:28px;font-weight:700}
+.card .value.accent{color:var(--accent)}
+.card .value.accent2{color:var(--accent2)}
+.card .value.warn{color:var(--warn)}
+.card .sub{font-size:12px;color:var(--text-dim);margin-top:4px}
+/* Time range & charts */
+.toolbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:12px}
+.time-btns{display:flex;gap:6px}
+.time-btn{padding:5px 14px;border:1px solid var(--border);border-radius:4px;background:transparent;color:var(--text-dim);font-size:12px;cursor:pointer;transition:all .2s}
+.time-btn:hover,.time-btn.active{border-color:var(--accent);color:var(--accent)}
+.chart-row{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:20px}
+.chart-panel{background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:16px}
+.chart-panel .chart-title{font-size:13px;color:var(--text-dim);margin-bottom:12px;font-weight:600}
+.chart-box{width:100%;height:280px}
+/* User list + process tree */
+.two-col{display:grid;grid-template-columns:300px 1fr;gap:16px}
+.user-panel{background:var(--card-bg);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.user-panel .panel-title{font-size:13px;font-weight:600;padding:14px 16px;border-bottom:1px solid var(--border);color:var(--text-dim)}
+.user-item{padding:10px 16px;cursor:pointer;border-bottom:1px solid rgba(42,58,74,0.5);transition:all .15s;display:flex;align-items:center;gap:8px}
+.user-item:hover{background:rgba(10,189,227,0.06)}
+.user-item.selected{background:rgba(10,189,227,0.12);border-left:3px solid var(--accent)}
+.user-item .user-name{font-size:14px;font-weight:500;flex:1}
+.user-item .user-count{font-size:12px;color:var(--text-dim);background:rgba(255,255,255,0.05);padding:2px 8px;border-radius:10px}
+.detail-panel{background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:16px}
+.detail-panel .panel-title{font-size:13px;font-weight:600;margin-bottom:14px;color:var(--text-dim)}
+.tree-node{margin-left:20px;position:relative}
+.tree-node::before{content:'';position:absolute;left:-12px;top:0;bottom:50%;width:1px;background:var(--border)}
+.tree-node::after{content:'';position:absolute;left:-12px;top:50%;width:10px;height:1px;background:var(--border)}
+.tree-item{padding:6px 8px;border-radius:4px;margin:2px 0;cursor:pointer;transition:all .15s;font-size:13px;display:flex;align-items:center;gap:8px;position:relative}
+.tree-item:hover{background:rgba(10,189,227,0.08)}
+.tree-item .proc-name{font-weight:500;flex:1}
+.tree-item .proc-pid{font-size:11px;color:var(--pid-color);font-family:'SF Mono','Cascadia Code',monospace}
+.tree-item .proc-cpu{font-size:11px;color:var(--text-dim)}
+.tree-item .proc-mem{font-size:11px;color:var(--mem-color)}
+.tree-item .proc-state{font-size:10px;padding:1px 5px;border-radius:3px;background:rgba(255,255,255,0.08)}
+.tree-toggle{cursor:pointer;font-size:10px;width:16px;text-align:center;user-select:none;color:var(--text-dim)}
+.tree-toggle:hover{color:var(--accent)}
+.proc-detail-panel{margin-top:16px;background:rgba(0,0,0,0.2);border:1px solid var(--border);border-radius:6px;padding:14px;display:none}
+.proc-detail-panel.show{display:block}
+.proc-detail-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px 20px;font-size:13px}
+.proc-detail-grid .dl{color:var(--text-dim)}
+.proc-detail-grid .dv{font-weight:500;word-break:break-all}
+.empty-state{text-align:center;padding:40px;color:var(--text-dim)}
+.empty-state .icon{font-size:40px;margin-bottom:12px}
+/* loading */
+.loading{text-align:center;padding:20px;color:var(--text-dim)}
+.spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+/* responsive */
+@media(max-width:1200px){.two-col{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,1fr)}.chart-row{grid-template-columns:1fr}}
+@media(max-width:768px){.cards{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>
+    <span class="dot"></span> SSH Session Monitor
+  </h1>
+  <div class="header-right">
+    <span id="last-refresh">—</span>
+    <button class="refresh" onclick="refreshAll()">⟳ Refresh</button>
+  </div>
+</div>
+
+<div class="main">
+  <!-- Overview Cards -->
+  <div class="cards">
+    <div class="card">
+      <div class="label">Online Users</div>
+      <div class="value accent" id="val-users">—</div>
+      <div class="sub">unique UIDs active in last scan</div>
+    </div>
+    <div class="card">
+      <div class="label">Total Processes</div>
+      <div class="value accent2" id="val-procs">—</div>
+      <div class="sub">across all users</div>
+    </div>
+    <div class="card">
+      <div class="label">Total CPU</div>
+      <div class="value warn" id="val-cpu">—</div>
+      <div class="sub">sum of all process CPU%</div>
+    </div>
+    <div class="card">
+      <div class="label">Total Memory (RSS)</div>
+      <div class="value" id="val-mem" style="color:var(--mem-color)">—</div>
+      <div class="sub">aggregated RSS across users</div>
+    </div>
+  </div>
+
+  <!-- Time Range Selector -->
+  <div class="toolbar">
+    <div class="time-btns">
+      <button class="time-btn active" data-range="5m" onclick="setTimeRange('5m',this)">Last 5 min</button>
+      <button class="time-btn" data-range="15m" onclick="setTimeRange('15m',this)">Last 15 min</button>
+      <button class="time-btn" data-range="1h" onclick="setTimeRange('1h',this)">Last 1 hour</button>
+      <button class="time-btn" data-range="6h" onclick="setTimeRange('6h',this)">Last 6 hours</button>
+      <button class="time-btn" data-range="24h" onclick="setTimeRange('24h',this)">Last 24 hours</button>
+    </div>
+    <span style="font-size:12px;color:var(--text-dim)">Auto refresh: 10s</span>
+  </div>
+
+  <!-- Trend Charts -->
+  <div class="chart-row">
+    <div class="chart-panel">
+      <div class="chart-title">CPU & Process Count Over Time</div>
+      <div class="chart-box" id="chart-cpu"></div>
+    </div>
+    <div class="chart-panel">
+      <div class="chart-title">Memory RSS Over Time</div>
+      <div class="chart-box" id="chart-mem"></div>
+    </div>
+  </div>
+
+  <!-- User List + Process Tree -->
+  <div class="two-col">
+    <div class="user-panel">
+      <div class="panel-title">👥 Users</div>
+      <div id="user-list">
+        <div class="loading"><span class="spinner"></span> Loading...</div>
+      </div>
+    </div>
+    <div class="detail-panel">
+      <div class="panel-title" id="tree-title">📋 Select a user to view process tree</div>
+      <div id="tree-container"><div class="empty-state"><div class="icon">👈</div><div>Select a user from the left panel</div></div></div>
+      <div class="proc-detail-panel" id="proc-detail">
+        <div class="panel-title" style="padding:0 0 10px 0;border:none">🔍 Process Detail</div>
+        <div class="proc-detail-grid" id="proc-detail-grid"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ========== State ==========
+let timeRange = '5m';
+let selectedUser = null;
+let selectedPid = null;
+let lastSnapshot = {};
+let chartCpu = null;
+let chartMem = null;
+let autoRefreshTimer = null;
+
+// ========== ES Proxy ==========
+async function esQuery(body) {
+  const resp = await fetch('/dashboard/ssh/api/es', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!resp.ok) throw new Error(`ES proxy error: ${resp.status}`);
+  return resp.json();
+}
+
+// ========== Time helpers ==========
+function getTimeRange() {
+  const now = new Date();
+  const ms = { '5m': 300000, '15m': 900000, '1h': 3600000, '6h': 21600000, '24h': 86400000 };
+  const dt = ms[timeRange] || 300000;
+  return { gte: new Date(now.getTime() - dt).toISOString(), lte: now.toISOString() };
+}
+
+// ========== Data queries ==========
+async function fetchSnapshot() {
+  const range = getTimeRange();
+  // Get the most recent batch of docs (last 30s)
+  const recent = { gte: new Date(Date.now() - 30000).toISOString(), lte: new Date().toISOString() };
+  const body = {
+    size: 10000,
+    query: { bool: { filter: [{ range: { '@timestamp': recent } }] } },
+    sort: [{ '@timestamp': 'desc' }]
+  };
+  const result = await esQuery(body);
+  let hits = (result.hits && result.hits.hits) ? result.hits.hits.map(h => h._source.data) : [];
+  // Dedup by pid: collector runs every 10s, 30s window captures 3-4 snapshots of each process
+  const seen = new Set();
+  hits = hits.filter(p => { const ok = !seen.has(p.pid); seen.add(p.pid); return ok; });
+  return hits;
+}
+
+async function fetchTrends() {
+  const range = getTimeRange();
+  const bucketMs = { '5m': '30s', '15m': '1m', '1h': '5m', '6h': '15m', '24h': '1h' };
+  const interval = bucketMs[timeRange] || '1m';
+  const body = {
+    size: 0,
+    query: { bool: { filter: [{ range: { '@timestamp': range } }] } },
+    aggs: {
+      timeline: {
+        date_histogram: { field: '@timestamp', fixed_interval: interval },
+        aggs: {
+          avg_cpu: { avg: { field: 'data.cpu_percent' } },
+          total_mem: { sum: { field: 'data.mem_rss_kb' } },
+          proc_count: { value_count: { field: 'data.pid' } }
+        }
+      }
+    }
+  };
+  const result = await esQuery(body);
+  const buckets = result.aggregations ? (result.aggregations.timeline.buckets || []) : [];
+  return buckets.map(b => ({
+    time: new Date(b.key).toLocaleTimeString(),
+    timestamp: b.key,
+    avg_cpu: b.avg_cpu ? b.avg_cpu.value : 0,
+    total_mem: b.total_mem ? (b.total_mem.value / 1024 / 1024) : 0,  // kB → GB
+    proc_count: b.proc_count ? b.proc_count.value : 0
+  }));
+}
+
+// ========== Render ==========
+function groupByUser(processes) {
+  const map = {};
+  processes.forEach(p => {
+    const u = p.user || 'unknown';
+    if (!map[u]) map[u] = { user: u, processes: [], totalCpu: 0, totalMem: 0 };
+    map[u].processes.push(p);
+    map[u].totalCpu += p.cpu_percent || 0;
+    map[u].totalMem += p.mem_rss_kb || 0;
+  });
+  return Object.values(map).sort((a, b) => b.processes.length - a.processes.length);
+}
+
+function buildTree(processes) {
+  const map = {};
+  processes.forEach(p => {
+    map[p.pid] = { ...p, children: [] };
+  });
+  const roots = [];
+  processes.forEach(p => {
+    if (map[p.ppid] && map[p.ppid] !== map[p.pid]) {
+      map[p.ppid].children.push(map[p.pid]);
+    } else {
+      roots.push(map[p.pid]);
+    }
+  });
+  // Sort children by pid
+  function sortTree(n) { n.children.sort((a, b) => a.pid - b.pid); n.children.forEach(sortTree); }
+  roots.forEach(sortTree);
+  return roots;
+}
+
+function renderOverview(snapshot) {
+  const users = new Set(snapshot.map(p => p.user));
+  document.getElementById('val-users').textContent = users.size || '—';
+  document.getElementById('val-procs').textContent = snapshot.length || '—';
+  const totalCpu = snapshot.reduce((s, p) => s + (p.cpu_percent || 0), 0);
+  document.getElementById('val-cpu').textContent = totalCpu.toFixed(1) + '%';
+  const totalMem = snapshot.reduce((s, p) => s + (p.mem_rss_kb || 0), 0);
+  const memStr = totalMem > 1048576 ? (totalMem / 1048576).toFixed(2) + ' GB'
+    : totalMem > 1024 ? (totalMem / 1024).toFixed(1) + ' MB'
+    : totalMem + ' kB';
+  document.getElementById('val-mem').textContent = memStr;
+}
+
+function renderUserList(groups) {
+  const container = document.getElementById('user-list');
+  if (groups.length === 0) {
+    container.innerHTML = '<div class="empty-state"><div class="icon">🔍</div><div>No processes found</div></div>';
+    return;
+  }
+  let html = '';
+  groups.forEach(g => {
+    const sel = selectedUser === g.user ? ' selected' : '';
+    html += `<div class="user-item${sel}" onclick="selectUser('${g.user.replace(/'/g,"\\'")}')">
+      <span class="user-name">${g.user}</span>
+      <span class="user-count">${g.processes.length} procs</span>
+    </div>`;
+  });
+  container.innerHTML = html;
+}
+
+function renderProcessTree(processes) {
+  const container = document.getElementById('tree-container');
+  const title = document.getElementById('tree-title');
+  if (!selectedUser) {
+    container.innerHTML = '<div class="empty-state"><div class="icon">👈</div><div>Select a user from the left panel</div></div>';
+    title.textContent = '📋 Select a user to view process tree';
+    return;
+  }
+  title.textContent = `🌳 Process Tree — ${selectedUser} (${processes.length} processes)`;
+
+  if (processes.length === 0) {
+    container.innerHTML = '<div class="empty-state"><div class="icon">📭</div><div>No processes found for this user</div></div>';
+    hideProcDetail();
+    return;
+  }
+
+  const tree = buildTree(processes);
+  container.innerHTML = tree.map(n => renderTreeNode(n, 0)).join('');
+
+  // Re-highlight selected pid
+  if (selectedPid) {
+    const el = document.querySelector(`.tree-item[data-pid="${selectedPid}"]`);
+    if (el) el.style.background = 'rgba(10,189,227,0.18)';
+  }
+}
+
+function renderTreeNode(node, depth) {
+  const hasChildren = node.children && node.children.length > 0;
+  const pidStr = `${node.pid}`;
+  const toggleId = `toggle-${node.pid}`;
+  const childrenId = `children-${node.pid}`;
+
+  let html = `<div class="tree-node" style="margin-left:${depth * 20}px">`;
+  html += `<div class="tree-item" data-pid="${node.pid}" onclick="showProcDetail(${node.pid})">`;
+  if (hasChildren) {
+    html += `<span class="tree-toggle" id="${toggleId}" onclick="event.stopPropagation();toggleChildren('${childrenId}','${toggleId}',${node.pid})">▼</span>`;
+  } else {
+    html += `<span style="width:16px;display:inline-block"></span>`;
+  }
+  const name = node.comm || (node.cmdline ? node.cmdline.split(' ')[0].split('/').pop() : '?');
+  const stateClass = node.state || '?';
+  html += `<span class="proc-name">${name}</span>`;
+  html += `<span class="proc-pid">PID ${node.pid}</span>`;
+  html += `<span class="proc-cpu">CPU ${(node.cpu_percent || 0).toFixed(1)}%</span>`;
+  html += `<span class="proc-mem">${fmtMem(node.mem_rss_kb)}</span>`;
+  html += `<span class="proc-state">${stateClass}</span>`;
+  html += `</div>`;
+  if (hasChildren) {
+    html += `<div id="${childrenId}">`;
+    node.children.forEach(c => { html += renderTreeNode(c, depth + 1); });
+    html += `</div>`;
+  }
+  html += `</div>`;
+  return html;
+}
+
+function toggleChildren(childrenId, toggleId, pid) {
+  const el = document.getElementById(childrenId);
+  const toggle = document.getElementById(toggleId);
+  if (el.style.display === 'none') {
+    el.style.display = 'block';
+    toggle.textContent = '▼';
+  } else {
+    el.style.display = 'none';
+    toggle.textContent = '▶';
+  }
+}
+
+function fmtMem(kb) {
+  if (!kb || kb === 0) return '0 kB';
+  if (kb > 1048576) return (kb / 1048576).toFixed(1) + ' GB';
+  if (kb > 1024) return (kb / 1024).toFixed(0) + ' MB';
+  return kb + ' kB';
+}
+
+function showProcDetail(pid) {
+  selectedPid = pid;
+  const proc = lastSnapshot[selectedUser] ? lastSnapshot[selectedUser].processes.find(p => p.pid === pid) : null;
+  if (!proc) return;
+
+  const grid = document.getElementById('proc-detail-grid');
+  grid.innerHTML = `
+    <div><span class="dl">PID</span><div class="dv">${proc.pid}</div></div>
+    <div><span class="dl">PPID</span><div class="dv">${proc.ppid}</div></div>
+    <div><span class="dl">User</span><div class="dv">${proc.user} (UID ${proc.uid})</div></div>
+    <div><span class="dl">Name</span><div class="dv">${proc.comm || '—'}</div></div>
+    <div><span class="dl">Command</span><div class="dv">${proc.cmdline || '—'}</div></div>
+    <div><span class="dl">State</span><div class="dv">${proc.state || '—'}</div></div>
+    <div><span class="dl">CPU %</span><div class="dv" style="color:var(--warn)">${(proc.cpu_percent || 0).toFixed(2)}%</div></div>
+    <div><span class="dl">Memory RSS</span><div class="dv" style="color:var(--mem-color)">${fmtMem(proc.mem_rss_kb)}</div></div>
+    <div><span class="dl">Memory VM</span><div class="dv">${fmtMem(proc.mem_vm_kb)}</div></div>
+    <div><span class="dl">Memory %</span><div class="dv">${(proc.mem_percent || 0).toFixed(2)}%</div></div>
+    <div><span class="dl">Threads</span><div class="dv">${proc.num_threads || 0}</div></div>
+    <div><span class="dl">I/O Read</span><div class="dv">${proc.io_read_bytes ? fmtBytes(proc.io_read_bytes) : '—'}</div></div>
+    <div><span class="dl">I/O Write</span><div class="dv">${proc.io_write_bytes ? fmtBytes(proc.io_write_bytes) : '—'}</div></div>
+    <div><span class="dl">Starttime</span><div class="dv">${proc.starttime || '—'}</div></div>
+  `;
+  document.getElementById('proc-detail').classList.add('show');
+
+  // Highlight in tree
+  document.querySelectorAll('.tree-item').forEach(el => {
+    el.style.background = el.dataset.pid == pid ? 'rgba(10,189,227,0.18)' : '';
+  });
+}
+
+function hideProcDetail() {
+  document.getElementById('proc-detail').classList.remove('show');
+}
+
+function fmtBytes(b) {
+  if (!b) return '0 B';
+  if (b > 1e12) return (b / 1e12).toFixed(1) + ' TB';
+  if (b > 1e9) return (b / 1e9).toFixed(1) + ' GB';
+  if (b > 1e6) return (b / 1e6).toFixed(1) + ' MB';
+  if (b > 1e3) return (b / 1e3).toFixed(1) + ' kB';
+  return b + ' B';
+}
+
+function selectUser(user) {
+  selectedUser = user;
+  selectedPid = null;
+  hideProcDetail();
+  const groups = groupByUser(Object.values(lastSnapshot).flatMap(g => g.processes));
+  renderUserList(groups);
+
+  // Re-render tree for the selected user
+  const found = groups.find(g => g.user === user);
+  if (found) {
+    renderProcessTree(found.processes);
+  }
+}
+
+// ========== Charts ==========
+function initCharts() {
+  chartCpu = echarts.init(document.getElementById('chart-cpu'));
+  chartMem = echarts.init(document.getElementById('chart-mem'));
+  window.addEventListener('resize', () => { chartCpu.resize(); chartMem.resize(); });
+}
+
+function renderTrends(data) {
+  const times = data.map(d => d.time);
+  const cpuData = data.map(d => +d.avg_cpu.toFixed(2));
+  const procData = data.map(d => d.proc_count);
+  const memData = data.map(d => +d.total_mem.toFixed(3));
+
+  chartCpu.setOption({
+    tooltip: { trigger: 'axis', backgroundColor: 'rgba(26,38,51,0.95)', borderColor: '#2a3a4a', textStyle: { color: '#c8d6e5', fontSize: 12 } },
+    legend: { data: ['Avg CPU %', 'Process Count'], textStyle: { color: '#8395a7', fontSize: 11 }, top: 0, right: 0 },
+    grid: { left: 50, right: 50, top: 35, bottom: 30 },
+    xAxis: { type: 'category', data: times, axisLine: { lineStyle: { color: '#2a3a4a' } }, axisLabel: { color: '#8395a7', fontSize: 10, rotate: 30 } },
+    yAxis: [
+      { type: 'value', name: 'CPU %', nameTextStyle: { color: '#8395a7' }, axisLabel: { color: '#8395a7' }, splitLine: { lineStyle: { color: '#1e2d3d' } } },
+      { type: 'value', name: 'Count', nameTextStyle: { color: '#8395a7' }, axisLabel: { color: '#8395a7' }, splitLine: { show: false } }
+    ],
+    series: [
+      { name: 'Avg CPU %', type: 'line', data: cpuData, smooth: true, symbol: 'none', lineStyle: { color: '#ff9f43', width: 1.5 }, itemStyle: { color: '#ff9f43' } },
+      { name: 'Process Count', type: 'line', yAxisIndex: 1, data: procData, smooth: true, symbol: 'none', lineStyle: { color: '#0abde3', width: 1.5 }, itemStyle: { color: '#0abde3' } }
+    ]
+  });
+
+  chartMem.setOption({
+    tooltip: { trigger: 'axis', backgroundColor: 'rgba(26,38,51,0.95)', borderColor: '#2a3a4a', textStyle: { color: '#c8d6e5', fontSize: 12 } },
+    legend: { data: ['Total Mem RSS'], textStyle: { color: '#8395a7', fontSize: 11 }, top: 0, right: 0 },
+    grid: { left: 60, right: 20, top: 35, bottom: 30 },
+    xAxis: { type: 'category', data: times, axisLine: { lineStyle: { color: '#2a3a4a' } }, axisLabel: { color: '#8395a7', fontSize: 10, rotate: 30 } },
+    yAxis: { type: 'value', name: 'GB', nameTextStyle: { color: '#8395a7' }, axisLabel: { color: '#8395a7' }, splitLine: { lineStyle: { color: '#1e2d3d' } } },
+    series: [
+      { name: 'Total Mem RSS', type: 'line', data: memData, smooth: true, areaStyle: { color: 'rgba(11,232,129,0.08)' }, symbol: 'none', lineStyle: { color: '#0be881', width: 1.5 }, itemStyle: { color: '#0be881' } }
+    ]
+  });
+}
+
+// ========== Main Refresh ==========
+async function refreshAll() {
+  try {
+    const [snapshot, trends] = await Promise.all([fetchSnapshot(), fetchTrends()]);
+
+    // Store snapshot
+    lastSnapshot = {};
+    snapshot.forEach(p => {
+      const u = p.user || 'unknown';
+      if (!lastSnapshot[u]) lastSnapshot[u] = { user: u, processes: [], totalCpu: 0, totalMem: 0 };
+      lastSnapshot[u].processes.push(p);
+      lastSnapshot[u].totalCpu += p.cpu_percent || 0;
+      lastSnapshot[u].totalMem += p.mem_rss_kb || 0;
+    });
+
+    const groups = Object.values(lastSnapshot).sort((a, b) => b.processes.length - a.processes.length);
+
+    renderOverview(snapshot);
+    renderUserList(groups);
+    renderTrends(trends);
+
+    // If a user is selected, re-render tree with latest data
+    if (selectedUser) {
+      const found = groups.find(g => g.user === selectedUser);
+      if (found) {
+        renderProcessTree(found.processes);
+      }
+    }
+
+    document.getElementById('last-refresh').textContent = 'Last: ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    console.error('Refresh error:', e);
+    document.getElementById('last-refresh').textContent = 'Error: ' + e.message;
+  }
+}
+
+function setTimeRange(range, btn) {
+  timeRange = range;
+  document.querySelectorAll('.time-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  refreshAll();
+}
+
+// ========== Bootstrap ==========
+document.addEventListener('DOMContentLoaded', () => {
+  initCharts();
+  refreshAll();
+  autoRefreshTimer = setInterval(refreshAll, 10000);
+});
+</script>
+</body>
+</html>

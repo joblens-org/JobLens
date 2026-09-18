@@ -17,6 +17,7 @@
 #include <fmt/format.h>
 #include <fmt/chrono.h>
 #include <date/date.h>
+#include <atomic>
 #include <unordered_set>
 #include "common/config.hpp"
 #include "collector/collector_utils.hpp"
@@ -253,25 +254,45 @@ std::string ESWriter::try_get_index_name(const std::string& collector_name)
 }
 
 bool ESWriter::try_parse_data(const std::string& collector_name, const std::any& data,
-                               const Job& job, std::chrono::system_clock::time_point ts, json& out)
+                               const Job& job, std::chrono::system_clock::time_point ts,
+                               std::vector<json>& out)
 {
     WriterParseContext ctx{name_, type_, config_name_, collector_name, job, ts};
 
     auto parser_func = CollectorRegistry::instance().resolveBestParserV2(collector_name, type_);
     if (!parser_func) {
         spdlog::debug("elasticsearch_writer: no parser for collector '{}', writer '{}'", collector_name, type_);
-        out["error"] = "no parser registered";
+        json err;
+        err["error"] = "no parser registered";
+        out.push_back(std::move(err));
         return false;
     }
 
     spdlog::debug("elasticsearch_writer: using parser for collector '{}', writer '{}'", collector_name, type_);
     try {
         auto parsed_data = parser_func(ctx, data);
-        out = std::move(std::any_cast<json>(parsed_data));
+
+        // 支持两种 parser 输出格式：
+        //   1) std::vector<json> — 一轮 collect 拆成多条 ES 文档（用于 SSH collector）
+        //   2) json                  — 传统单条文档
+        if (parsed_data.type() == typeid(std::vector<json>)) {
+            out = std::move(std::any_cast<std::vector<json>>(parsed_data));
+        } else {
+            out.push_back(std::any_cast<json>(parsed_data));
+        }
+    }
+    catch (const std::bad_any_cast& e) {
+        spdlog::error("elasticsearch_writer: bad_any_cast for collector '{}': {}", collector_name, e.what());
+        json err;
+        err["error"] = std::string(e.what());
+        out.push_back(std::move(err));
+        return false;
     }
     catch (const std::exception& e) {
-        spdlog::error("elasticsearch_writer: bad_any_cast for collector '{}': {}", collector_name, e.what());
-        out["error"] = std::string(e.what());
+        spdlog::error("elasticsearch_writer: parser error for collector '{}': {}", collector_name, e.what());
+        json err;
+        err["error"] = std::string(e.what());
+        out.push_back(std::move(err));
         return false;
     }
 
@@ -297,49 +318,63 @@ bool ESWriter::flush_impl(const std::vector<write_data>& batch)
     for (const auto& [collect_name, job, any_data, ts] : batch)
     {
         try {
-        json action;
-        auto index_name = try_get_index_name(collect_name);
-        index_name += date::format("_%Y.%m.%d", date::floor<date::days>(ts));
-        action["index"]["_index"] = index_name;
-        action["index"]["_id"] = generate_doc_id(job, ts);
-        spdlog::debug("elasticsearch_writer: indexing to '{}'", action["index"]["_index"].get<std::string>());
-        json src;
-        src["@timestamp"] = format_utc8(ts); //国产软件不能自己识别时区，要求东八区时间
-        src["hostname"] = collector_utils::get_hostname();
-        src["job_info"] = job_to_json(job);
-        if (Utils::has_template_vars(index_name)) {
-            json jobinfo;
-            jobinfo["job_info"] = src["job_info"];
-            auto flat_job = Utils::flatten_json(jobinfo);
-            action["index"]["_index"] = Utils::render_bracket(index_name, flat_job);
-            spdlog::debug("elasticsearch_writer: rendered index name '{}'", action["index"]["_index"].get<std::string>());
-        }
-        json jobj;
-        if (!try_parse_data(collect_name, any_data, job, ts, jobj)) {
-            spdlog::error("elasticsearch_writer: parser failed, dropping collector={}, job_id={}", collect_name, job.JobID);
-            flush_ret = false;
-            continue;
-        }
-        src["data"] = jobj;
-        std::string document = action.dump();
-        document += '\n';
-        document += src.dump();
-        document += '\n';
+            auto index_name = try_get_index_name(collect_name);
+            index_name += date::format("_%Y.%m.%d", date::floor<date::days>(ts));
 
-        // 单文档不可切断；拒绝超限记录，但不阻塞同批次的正常记录。
-        if (document.size() > opt_.max_bulk_bytes) {
-            spdlog::error("elasticsearch_writer: oversized document not sent, collector={}, job_id={}, document_bytes={}, max_bulk_bytes={}",
-                          collect_name, job.JobID, document.size(), opt_.max_bulk_bytes);
-            flush_ret = false;
-            continue;
-        }
-        // 按序列化后的实际字节计量，保留完整 action/source 对及末尾换行。
-        if (chunk_bytes > opt_.max_bulk_bytes - document.size()) {
-            send_chunk();
-        }
-        chunk_bytes += document.size();
-        chunk.push_back({std::move(document), action["index"]["_index"].get<std::string>(),
-                         action["index"]["_id"].get<std::string>(), collect_name});
+            std::vector<json> parsed_docs;
+            if (!try_parse_data(collect_name, any_data, job, ts, parsed_docs)) {
+                spdlog::error("elasticsearch_writer: parser failed, dropping collector={}, job_id={}", collect_name, job.JobID);
+                flush_ret = false;
+                continue;
+            }
+
+            for (auto& doc_json : parsed_docs) {
+                json action;
+                action["index"]["_index"] = index_name;
+                action["index"]["_id"] = generate_doc_id(job, ts);
+                spdlog::debug("elasticsearch_writer: indexing to '{}'", action["index"]["_index"].get<std::string>());
+
+                json src;
+                src["@timestamp"] = format_utc8(ts); //国产软件不能自己识别时区，要求东八区时间
+                src["hostname"] = collector_utils::get_hostname();
+                src["job_info"] = job_to_json(job);
+
+                if (Utils::has_template_vars(index_name)) {
+                    json jobinfo;
+                    jobinfo["job_info"] = src["job_info"];
+                    auto flat_job = Utils::flatten_json(jobinfo);
+                    action["index"]["_index"] = Utils::render_bracket(index_name, flat_job);
+                    spdlog::debug("elasticsearch_writer: rendered index name '{}'", action["index"]["_index"].get<std::string>());
+                }
+
+                // 多条文档时追加序号避免 _id 冲突
+                if (parsed_docs.size() > 1) {
+                    static std::atomic<size_t> multi_seq{0};
+                    action["index"]["_id"] = fmt::format("{}_{}", action["index"]["_id"].get<std::string>(), multi_seq.fetch_add(1));
+                }
+
+                src["data"] = std::move(doc_json);
+                spdlog::debug("elasticsearch_writer: document to index: {}", src.dump());
+                std::string document = action.dump();
+                document += '\n';
+                document += src.dump();
+                document += '\n';
+
+                // 单文档不可切断；拒绝超限记录，但不阻塞同批次的正常记录。
+                if (document.size() > opt_.max_bulk_bytes) {
+                    spdlog::error("elasticsearch_writer: oversized document not sent, collector={}, job_id={}, document_bytes={}, max_bulk_bytes={}",
+                                  collect_name, job.JobID, document.size(), opt_.max_bulk_bytes);
+                    flush_ret = false;
+                    continue;
+                }
+                // 按序列化后的实际字节计量，保留完整 action/source 对及末尾换行。
+                if (chunk_bytes > opt_.max_bulk_bytes - document.size()) {
+                    send_chunk();
+                }
+                chunk_bytes += document.size();
+                chunk.push_back({std::move(document), action["index"]["_index"].get<std::string>(),
+                                 action["index"]["_id"].get<std::string>(), collect_name});
+            }
         } catch (const std::exception& error) {
             spdlog::error("elasticsearch_writer: document processing failed, collector={}, job_id={}, reason={}",
                           collect_name, job.JobID, error.what());
