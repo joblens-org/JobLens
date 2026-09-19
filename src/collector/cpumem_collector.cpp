@@ -144,7 +144,7 @@ bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info){
     info.stime = stime;
     info.starttime = starttime;
     info.ppid = ppid;
-    spdlog::debug("CPUOf: pid={} utime={} stime={} starttime={}", pid, info.utime, info.stime, info.starttime);
+    spdlog::trace("CPUOf: pid={} utime={} stime={} starttime={}", pid, info.utime, info.stime, info.starttime);
 
     /* ---- 计算 CPU 百分比 ---- */
     info.hz = sysconf(_SC_CLK_TCK);      // 每秒 jiffies
@@ -165,12 +165,12 @@ bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info){
         unsigned long long currTotal = cpuStat();
         unsigned long long currProc  = info.utime + info.stime;
         auto& cu = pid_state_dict[pid];
-        spdlog::debug("use pid:{}",pid);
+        spdlog::trace("use pid:{}",pid);
         unsigned long long deltaTotal = currTotal - cu.lastTotal;
         unsigned long long deltaProc  = currProc  - cu.lastProc;
-        spdlog::debug("deltaTotal={}   deltaProc={}",deltaTotal,deltaProc);
-        spdlog::debug("currTotal={}   currProc={}",currTotal,currProc);
-        spdlog::debug("lastTotal={}   lastProc={}",cu.lastTotal,cu.lastProc);
+        spdlog::trace("deltaTotal={}   deltaProc={}",deltaTotal,deltaProc);
+        spdlog::trace("currTotal={}   currProc={}",currTotal,currProc);
+        spdlog::trace("lastTotal={}   lastProc={}",cu.lastTotal,cu.lastProc);
         if (deltaTotal > 0) {
             info.cpuPercent = 100.0 * double(deltaProc) / double(deltaTotal) * numCores;
         } else {
@@ -180,7 +180,7 @@ bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info){
         /* 更新静态缓存（用于下一次采样） */
         cu.lastTotal = currTotal;
         cu.lastProc  = currProc;
-        spdlog::debug("update lastTotal={}   lastProc={}",cu.lastTotal,cu.lastProc);
+        spdlog::trace("update lastTotal={}   lastProc={}",cu.lastTotal,cu.lastProc);
     } else {
         info.cpuPercent = 0.0;
     }
@@ -305,7 +305,7 @@ CollectResult CPUMemCollector::collect(const Job& job) {
 
 CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& writer_type){
     CollectDataParseFunc func = nullptr;
-    spdlog::debug("CPUMemCollector: get_writer_parser for writer_type: {}", writer_type);
+    spdlog::trace("CPUMemCollector: get_writer_parser for writer_type: {}", writer_type);
     if(writer_type.compare("ESWriter") == 0){
         func = [this](std::any data)->std::any{
             nlohmann::json ret;
@@ -316,7 +316,7 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
             }
             ret["process_data"] = nlohmann::json::array();
             auto parsed = std::any_cast<std::vector<CPUMemInfo>>(data);
-            spdlog::debug("CPUMemCollector: parsing data for ESWriter, data length={}", parsed.size());
+            spdlog::trace("CPUMemCollector: parsing data for ESWriter, data length={}", parsed.size());
             for (const auto& info : parsed) {
                 
                 nlohmann::json j;
@@ -334,7 +334,7 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
                 j["mem_peak_rss_kb"] = info.mem_peak_rss_kb;
                 j["memoryPercent"] = info.memoryPercent;
                 j["numThreads"] = info.numThreads;
-                spdlog::debug("CPUMemCollector: parsed data: {}", j.dump());
+                spdlog::trace("CPUMemCollector: parsed data: {}", j.dump());
 
                 if(info.pid == 0){
                     if (summary) ret["summary"] = j;
@@ -356,7 +356,7 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
             }
             ret["process_data"] = nlohmann::json::array();
             auto parsed = std::any_cast<std::vector<CPUMemInfo>>(data);
-            spdlog::debug("CPUMemCollector: parsing data for FileWriter, data length={}", parsed.size());
+            spdlog::trace("CPUMemCollector: parsing data for FileWriter, data length={}", parsed.size());
             for (const auto& info : parsed) {
                 nlohmann::json j;
                 j["pid"] = info.pid;
@@ -391,12 +391,12 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
                 return ret;
             }
             if (summary){
-                spdlog::debug("PrometheusExporterWriter Parser in summary mode");
+                spdlog::trace("PrometheusExporterWriter Parser in summary mode");
             }
             auto parsed = std::any_cast<std::vector<CPUMemInfo>>(data);
             for (const auto& info : parsed) {
                 PrometheusExporterWriter::prometheus_process_state state;
-                spdlog::debug("CollectDataParseFunc CPUMemCollector parse pid: {}", info.pid);
+                spdlog::trace("CollectDataParseFunc CPUMemCollector parse pid: {}", info.pid);
                 state.pid = info.pid;
                 state.cpu_usage_percent = info.cpuPercent;
                 state.threads_cnt = info.numThreads;
@@ -424,7 +424,7 @@ CollectDataParseFuncV2 CPUMemCollector::get_writer_parser_v2(const std::string& 
             }
             ret["process_data"] = nlohmann::json::array();
             auto parsed = std::any_cast<std::vector<CPUMemInfo>>(data);
-            spdlog::debug("CPUMemCollector: V2 parsing data for FileWriter, data length={}", parsed.size());
+            spdlog::trace("CPUMemCollector: V2 parsing data for FileWriter, data length={}", parsed.size());
             for (const auto& info : parsed) {
                 nlohmann::json j;
                 j["pid"] = info.pid;

@@ -313,7 +313,7 @@ bool FileWriter::flush_impl(const std::vector<write_data>& batch)
                 continue;
             }
         } else {
-            spdlog::debug("file_writer: using parser for collector '{}'", collect_name);
+            spdlog::trace("file_writer: using parser for collector '{}'", collect_name);
             try {
                 auto parsed = parser_func(ctx, any_data);
                 payload = std::any_cast<std::string>(parsed);

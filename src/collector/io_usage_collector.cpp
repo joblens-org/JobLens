@@ -46,7 +46,7 @@ bool IOUsageCollector::init_ebpf(){
     // event_back_ = std::make_unique<std::queue<event>>();
     bpf_obj_ = EbpfCommon::load_bpf_obj_pinned(path, bpf_links_, JOBLENS_BPF_PIN_ROOT);
     ring_buffer_sample_fn fn  = [](void *ctx, void *data, size_t size){
-        spdlog::debug("IOUsageCollector: ebpf got io event");
+        spdlog::trace("IOUsageCollector: ebpf got io event");
         // auto ptr = static_cast<IOUsageCollector*>(ctx);
         // auto event_ptr = static_cast<struct event*>(data);
         // auto event_copy = *event_ptr;
@@ -129,7 +129,7 @@ std::optional<IOUsageCollector::user_rw_stat> IOUsageCollector::get_fd_stat(pid_
     struct pid_fd_key key = { .pid = static_cast<u32>(pid), .fd = fd };
 
     /* 1. 从 eBPF map 里取当前内核统计值 */
-    spdlog::debug("IOUsageCollector: get_fd_stat called for pid:{} fd:{}", pid, fd);
+    spdlog::trace("IOUsageCollector: get_fd_stat called for pid:{} fd:{}", pid, fd);
     auto ret = EbpfCommon::lookup_hashmap_elem<pid_fd_key, rw_stat>(
         bpf_obj_, pid2fdstat_map_name, key);
     if (ret == std::nullopt) {
@@ -267,7 +267,7 @@ CollectResult IOUsageCollector::collect(const Job &job)
         info.wchar       = wch;
         info.syscr       = scr;
         info.syscw       = scw;
-        spdlog::debug("IOUsageCollector: pid={} read_bytes={} write_bytes={} rchar={} wchar={} syscr={} syscw={}",
+        spdlog::trace("IOUsageCollector: pid={} read_bytes={} write_bytes={} rchar={} wchar={} syscr={} syscw={}",
                       pid, rb, wb, rch, wch, scr, scw);
         auto now = steady_clock::now();
 
@@ -280,7 +280,7 @@ CollectResult IOUsageCollector::collect(const Job &job)
             info.write_speed = (collect_period > 0 && wb  >= st.last_write_bytes) ? (wb  - st.last_write_bytes) / collect_period : 0;
             info.rchar_speed = (collect_period > 0 && rch >= st.last_rchar)       ? (rch - st.last_rchar)       / collect_period : 0;
             info.wchar_speed = (collect_period > 0 && wch >= st.last_wchar)       ? (wch - st.last_wchar)       / collect_period : 0;
-            spdlog::debug("IOUsageCollector: pid={} read_speed={} write_speed={} rchar_speed={} wchar_speed={}",
+            spdlog::trace("IOUsageCollector: pid={} read_speed={} write_speed={} rchar_speed={} wchar_speed={}",
                           pid, info.read_speed, info.write_speed, info.rchar_speed, info.wchar_speed);
         }else {
             info.read_speed  = 0;

@@ -189,7 +189,7 @@ json KafkaWriter::serialize(const write_data& w) {
         throw std::runtime_error("no parser available");
     }
 
-    spdlog::debug("KafkaWriter: using parser for collector '{}', writer '{}'", collector_name, type_);
+    spdlog::trace("KafkaWriter: using parser for collector '{}', writer '{}'", collector_name, type_);
 
     // 构造 WriterParseContext，传递 writer 上下文供 V2 parser 使用
     WriterParseContext ctx{name_, type_, config_name_, collector_name, job, tp};

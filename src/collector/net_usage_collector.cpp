@@ -389,7 +389,7 @@ int NetUsageCollector::query_single_tcp(Connection& conn){
     auto dst_ip = dst.addr.c_str();
     auto src_port = src.port;
     auto dst_port = dst.port;
-    spdlog::debug("NetUsageCollector: netlink query tcp {}:{} -> {}:{}", src.addr, src.port, dst.addr, dst.port);
+    spdlog::trace("NetUsageCollector: netlink query tcp {}:{} -> {}:{}", src.addr, src.port, dst.addr, dst.port);
     struct {
         struct nlmsghdr         nlh;
         struct inet_diag_req_v2 req;
@@ -618,7 +618,7 @@ void NetUsageCollector::deinit() noexcept {
 // 若 writer 未定义标准接口，这里返回一个空的默认解析器（按需在你的框架中实现）
 CollectDataParseFunc NetUsageCollector::get_writer_parser(const std::string& writer_type) {
     CollectDataParseFunc func = nullptr;
-    spdlog::debug("NetUsageCollector: get_writer_parser for writer_type: {}", writer_type);
+    spdlog::trace("NetUsageCollector: get_writer_parser for writer_type: {}", writer_type);
     if(writer_type.compare("ESWriter") == 0){
         func = [this](std::any data)->std::any{
             nlohmann::json ret;
@@ -629,7 +629,7 @@ CollectDataParseFunc NetUsageCollector::get_writer_parser(const std::string& wri
             }
             ret["process_data"] = nlohmann::json::array();
             auto parsed = std::any_cast<std::vector<NetInfo>>(data);
-            spdlog::debug("NetUsageCollector: writer parser get {} NetInfo entries", parsed.size());
+            spdlog::trace("NetUsageCollector: writer parser get {} NetInfo entries", parsed.size());
             for (const auto& info : parsed) {
                 nlohmann::json j;
                 j["pid"] = info.pid;

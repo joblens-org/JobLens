@@ -64,7 +64,7 @@ CollectResult TaskstatsCollector::collect(const Job& job) {
     // 采集逻辑实现
     spdlog::info("TaskstatsCollector: Collecting task stats for job id {}", job.JobID);
     for (const auto& pid : job.JobPIDs) {
-        spdlog::debug("TaskstatsCollector: Collecting stats for PID {}", pid);
+        spdlog::trace("TaskstatsCollector: Collecting stats for PID {}", pid);
         
     }
     return result;

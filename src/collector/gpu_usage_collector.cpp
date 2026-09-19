@@ -468,7 +468,7 @@ CollectResult GPUUsageCollector::collect(const Job& job) {
 
 CollectDataParseFunc GPUUsageCollector::get_writer_parser(const std::string& writer_type) {
     CollectDataParseFunc func = nullptr;
-    spdlog::debug("GPUUsageCollector: get_writer_parser for writer_type: {}", writer_type);
+    spdlog::trace("GPUUsageCollector: get_writer_parser for writer_type: {}", writer_type);
 
     if (writer_type.compare("ESWriter") == 0) {
         func = [this](std::any data) -> std::any {

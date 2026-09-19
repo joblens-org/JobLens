@@ -202,7 +202,7 @@ CollectDataParseFuncV2 CollectorRegistry::resolveBestParserV2(const std::string&
     // 步骤 1: 优先 V2（内部已通过 ICollector 默认适配器支持 V2→V1 回退）
     auto v2_parser = getCollectorParserV2(collector_name, writer_type);
     if (v2_parser) {
-        spdlog::debug("resolveBestParserV2: V2 parser found for collector '{}', writer '{}'", collector_name, writer_type);
+        spdlog::trace("resolveBestParserV2: V2 parser found for collector '{}', writer '{}'", collector_name, writer_type);
         return v2_parser;
     }
 

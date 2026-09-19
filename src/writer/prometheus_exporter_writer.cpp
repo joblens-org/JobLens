@@ -71,7 +71,7 @@ void PrometheusExporterWriter::update_job_metrics(const prometheus_job_state& da
     prometheus_process_state new_state = {};
     
     metric.JobID = data.JobID;
-    spdlog::debug("PrometheusExporterWriter: update job id: {}", metric.JobID);
+    spdlog::trace("PrometheusExporterWriter: update job id: {}", metric.JobID);
     
     // 这里采用细粒度锁的模式可以获得更高的性能，但要注意并发写的问题
     // 开始写操作，加锁
@@ -92,8 +92,8 @@ void PrometheusExporterWriter::update_job_metrics(const prometheus_job_state& da
             update_ref->pid = s.pid;
             push = true;
         }
-        spdlog::debug("PrometheusExporterWriter: use type {}", static_cast<int>(type2enum(type)));
-        spdlog::debug("PrometheusExporterWriter: update job pid: {}", pid);
+        spdlog::trace("PrometheusExporterWriter: use type {}", static_cast<int>(type2enum(type)));
+        spdlog::trace("PrometheusExporterWriter: update job pid: {}", pid);
         switch (type2enum(type))
         {
             case PrmxsCollectorType::CPUMem:
@@ -159,13 +159,13 @@ void PrometheusExporterWriter::update_job_metrics(const prometheus_job_state& da
 bool PrometheusExporterWriter::flush_impl(const std::vector<write_data>& batch){
     for (const auto& [collect_name, job, any_data, ts] : batch)
     {
-        spdlog::debug("PrometheusExporterWriter: get in flush");
+        spdlog::trace("PrometheusExporterWriter: get in flush");
         WriterParseContext ctx{name_, type_, config_name_, collect_name, job, ts};
         auto parser_func = CollectorRegistry::instance().resolveBestParserV2(collect_name, type_);
-        spdlog::debug("PrometheusExporterWriter: using parser for collector '{}', writer '{}'", collect_name, type_);
+        spdlog::trace("PrometheusExporterWriter: using parser for collector '{}', writer '{}'", collect_name, type_);
         auto collector_type = CollectorRegistry::instance().getCollectorType(collect_name);
         auto parsed = std::any_cast<PrometheusExporterWriter::prometheus_job_state>(parser_func(ctx, any_data));
-        spdlog::debug("PrometheusExporterWriter: size of parsed: {}", parsed.processes_state.size());
+        spdlog::trace("PrometheusExporterWriter: size of parsed: {}", parsed.processes_state.size());
         parsed.JobID = job.JobID;
         update_job_metrics(parsed, collector_type);
     }

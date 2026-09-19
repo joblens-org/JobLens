@@ -895,7 +895,7 @@ CollectResult PowerCollector::collect(const Job& job)
 
 CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer_type)
 {
-    spdlog::debug("PowerCollector: get_writer_parser for writer_type: {}", writer_type);
+    spdlog::trace("PowerCollector: get_writer_parser for writer_type: {}", writer_type);
 
     if (writer_type == "ESWriter") {
         return [this](std::any data) -> std::any {
@@ -988,7 +988,7 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
                         << '\n';
                 }
 
-                spdlog::debug("PowerCollector: FileWriter parsed job#{} E={:.4f}J P={:.2f}W pids={}",
+                spdlog::trace("PowerCollector: FileWriter parsed job#{} E={:.4f}J P={:.2f}W pids={}",
                               job.job_id, job.energy_j, job.power_watt, job.pids.size());
             }
 

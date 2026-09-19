@@ -55,8 +55,8 @@ void BaseWriter::on_finish(std::string collect_name,
                             const std::any data,
                             std::chrono::system_clock::time_point ts)
 {
-    spdlog::debug("BaseWriter: on_finish called for writer '{}', collector '{}'", name_, collect_name);
-    spdlog::debug("BaseWriter: job info: ID={}", job.JobID);
+    spdlog::trace("BaseWriter: on_finish called for writer '{}', collector '{}'", name_, collect_name);
+    spdlog::trace("BaseWriter: job info: ID={}", job.JobID);
     auto t = std::make_tuple(collect_name, job, data, ts);
     write(std::move(t));
     trigger_async_flush();
@@ -86,7 +86,7 @@ void BaseWriter::on_flush_error(const std::vector<write_data>& batch)
 void BaseWriter::write(const write_data& t)
 {
     
-    spdlog::debug("BaseWriter: write called for writer '{}', collector '{}'", name_, std::get<0>(t));
+    spdlog::trace("BaseWriter: write called for writer '{}', collector '{}'", name_, std::get<0>(t));
     {
         std::lock_guard<std::mutex> lg(mtx_);
         front_->push_back(t);

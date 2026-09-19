@@ -325,7 +325,7 @@ void JobRegistry::on_kernel_fork(uint32_t pid, uint64_t job_id) {
     auto& pids = it->second.JobPIDs;
     if (std::find(pids.begin(), pids.end(), static_cast<pid_t>(pid)) == pids.end()) {
         pids.push_back(static_cast<pid_t>(pid));
-        spdlog::debug("JobRegistry: kernel FORK added pid={} to job_id={} (now {} pids)",
+        spdlog::trace("JobRegistry: kernel FORK added pid={} to job_id={} (now {} pids)",
                       pid, job_id, pids.size());
     }
 }
@@ -342,7 +342,7 @@ void JobRegistry::on_kernel_exit(uint32_t pid, uint64_t job_id) {
     auto before = pids.size();
     pids.erase(std::remove(pids.begin(), pids.end(), static_cast<pid_t>(pid)), pids.end());
     if (pids.size() != before) {
-        spdlog::debug("JobRegistry: kernel EXIT removed pid={} from job_id={} (now {} pids)",
+        spdlog::trace("JobRegistry: kernel EXIT removed pid={} from job_id={} (now {} pids)",
                       pid, job_id, pids.size());
     }
 }

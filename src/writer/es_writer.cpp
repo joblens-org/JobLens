@@ -264,7 +264,7 @@ bool ESWriter::try_parse_data(const std::string& collector_name, const std::any&
         return false;
     }
 
-    spdlog::debug("elasticsearch_writer: using parser for collector '{}', writer '{}'", collector_name, type_);
+    spdlog::trace("elasticsearch_writer: using parser for collector '{}', writer '{}'", collector_name, type_);
     try {
         auto parsed_data = parser_func(ctx, data);
         out = std::move(std::any_cast<json>(parsed_data));
@@ -302,7 +302,7 @@ bool ESWriter::flush_impl(const std::vector<write_data>& batch)
         index_name += date::format("_%Y.%m.%d", date::floor<date::days>(ts));
         action["index"]["_index"] = index_name;
         action["index"]["_id"] = generate_doc_id(job, ts);
-        spdlog::debug("elasticsearch_writer: indexing to '{}'", action["index"]["_index"].get<std::string>());
+        spdlog::trace("elasticsearch_writer: indexing to '{}'", action["index"]["_index"].get<std::string>());
         json src;
         src["@timestamp"] = format_utc8(ts); //国产软件不能自己识别时区，要求东八区时间
         src["hostname"] = collector_utils::get_hostname();
@@ -312,7 +312,7 @@ bool ESWriter::flush_impl(const std::vector<write_data>& batch)
             jobinfo["job_info"] = src["job_info"];
             auto flat_job = Utils::flatten_json(jobinfo);
             action["index"]["_index"] = Utils::render_bracket(index_name, flat_job);
-            spdlog::debug("elasticsearch_writer: rendered index name '{}'", action["index"]["_index"].get<std::string>());
+            spdlog::trace("elasticsearch_writer: rendered index name '{}'", action["index"]["_index"].get<std::string>());
         }
         json jobj;
         if (!try_parse_data(collect_name, any_data, job, ts, jobj)) {

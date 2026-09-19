@@ -140,7 +140,7 @@ bool BasicInfoCollector::get_taskstats_for_tgid(int tgid, struct taskstats* out_
         spdlog::error("BasicInfoCollector: Failed to allocate netlink message");
         return false;
     }
-    spdlog::debug("family_id: {}", family_id);
+    spdlog::trace("family_id: {}", family_id);
 
     genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 
                 0, TASKSTATS_CMD_GET, TASKSTATS_GENL_VERSION);
@@ -182,7 +182,7 @@ bool BasicInfoCollector::get_taskstats_for_tgid(int tgid, struct taskstats* out_
     if (h->nlmsg_type == NLMSG_ERROR) {
         auto data = (struct nlmsgerr *)NLMSG_DATA(h);
         if (data->error == 0) {
-            spdlog::debug("BasicInfoCollector: Netlink ACK received for TGID {}", tgid);
+            spdlog::trace("BasicInfoCollector: Netlink ACK received for TGID {}", tgid);
         } else if (data->error == -EPERM) {
             spdlog::error("BasicInfoCollector: Permission denied for TGID {}", tgid);
             nlmsg_free(msg);
@@ -219,7 +219,7 @@ bool BasicInfoCollector::get_taskstats_for_tgid(int tgid, struct taskstats* out_
     }
     
     if (attrs[TASKSTATS_TYPE_AGGR_PID]) {
-        spdlog::debug("BasicInfoCollector: Parsing taskstats for TGID {}", tgid);
+        spdlog::trace("BasicInfoCollector: Parsing taskstats for TGID {}", tgid);
         struct nlattr* task_attrs[TASKSTATS_TYPE_MAX + 1];
         
         if (nla_parse_nested(task_attrs, TASKSTATS_TYPE_MAX, 
@@ -232,15 +232,15 @@ bool BasicInfoCollector::get_taskstats_for_tgid(int tgid, struct taskstats* out_
         
         if (task_attrs[TASKSTATS_TYPE_STATS]) {
             memcpy(out_stats, nla_data(task_attrs[TASKSTATS_TYPE_STATS]), sizeof(struct taskstats));
-            spdlog::debug("BasicInfoCollector: Retrieved taskstats for TGID {}, version {}", tgid, out_stats->version);
-            spdlog::debug("BasicInfoCollector: TGID {} {} stats - CPU time (user: {}, system: {}), Memory (RSS: {} KB, VM: {} KB), IO (read bytes: {}, write bytes: {})",
+            spdlog::trace("BasicInfoCollector: Retrieved taskstats for TGID {}, version {}", tgid, out_stats->version);
+            spdlog::trace("BasicInfoCollector: TGID {} {} stats - CPU time (user: {}, system: {}), Memory (RSS: {} KB, VM: {} KB), IO (read bytes: {}, write bytes: {})",
                           tgid, std::string(out_stats->ac_comm),
                           out_stats->ac_utime, out_stats->ac_stime,
                           out_stats->coremem, out_stats->virtmem,
                           out_stats->read_bytes, out_stats->write_bytes);
             nlmsg_free(reply_msg);
             nl_cb_put(cb);
-            spdlog::debug("BasicInfoCollector: Successfully retrieved taskstats for TGID {}", tgid);
+            spdlog::trace("BasicInfoCollector: Successfully retrieved taskstats for TGID {}", tgid);
             return true;
         }
     }
@@ -377,7 +377,7 @@ CollectResult BasicInfoCollector::collect(const Job& job) {
         info.voluntaryCtxSw = stats.nvcsw;
         info.nonvoluntaryCtxSw = stats.nivcsw;
 
-        spdlog::debug("BasicInfoCollector: Collected for name {} PID {}: CPU% {:.2f}, MEM% {:.2f}, ReadSpeed {:.2f} B/s, WriteSpeed {:.2f} B/s",
+        spdlog::trace("BasicInfoCollector: Collected for name {} PID {}: CPU% {:.2f}, MEM% {:.2f}, ReadSpeed {:.2f} B/s, WriteSpeed {:.2f} B/s",
                       stats.ac_comm, pid, info.cpuPercent, info.memoryPercent, info.readSpeed, info.writeSpeed);
         
         infos.push_back(info);
@@ -392,7 +392,7 @@ CollectResult BasicInfoCollector::collect(const Job& job) {
 
 CollectDataParseFunc BasicInfoCollector::get_writer_parser(const std::string& writer_type) {
     CollectDataParseFunc func = nullptr;
-    spdlog::debug("BasicInfoCollector: get_writer_parser for writer_type: {}", writer_type);
+    spdlog::trace("BasicInfoCollector: get_writer_parser for writer_type: {}", writer_type);
     
     if (writer_type.compare("ESWriter") == 0) {
         func = [this](std::any data) -> std::any {
@@ -406,7 +406,7 @@ CollectDataParseFunc BasicInfoCollector::get_writer_parser(const std::string& wr
             ret["process_data"] = nlohmann::json::array();
             auto parsed = std::any_cast<std::vector<BasicInfo>>(data);
             
-            spdlog::debug("BasicInfoCollector: parsing {} entries for ESWriter", parsed.size());
+            spdlog::trace("BasicInfoCollector: parsing {} entries for ESWriter", parsed.size());
             
             for (const auto& info : parsed) {
                 nlohmann::json j;

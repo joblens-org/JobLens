@@ -83,7 +83,7 @@ inline bool update_job_pids(Job& job){
     }
 
     job.JobPIDs = std::move(pid_slots_cgroup);
-    spdlog::debug("CondorJob: updated JobPIDs from cgroup {}", condor_attr.slots_cgroup_path);
+    spdlog::trace("CondorJob: updated JobPIDs from cgroup {}", condor_attr.slots_cgroup_path);
     return true;
 }
 
