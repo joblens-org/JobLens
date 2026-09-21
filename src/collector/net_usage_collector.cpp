@@ -15,19 +15,21 @@
 
 #include <algorithm>
 #include <any>
+#include <array>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -73,28 +75,18 @@ static bool IsProcRaceErrno(int err) {
     return err == ENOENT || err == ENOTDIR;
 }
 
-static bool IsProcRaceErrorCode(const std::error_code& ec) {
-    return ec == std::errc::no_such_file_or_directory ||
-           ec == std::errc::not_a_directory;
-}
-
-// 读取小文件到字符串
-static bool ReadFileToString(const std::string& path, std::string& out) {
-    std::ifstream ifs(path);
-    if (!ifs.is_open()) return false;
-    std::ostringstream ss;
-    ss << ifs.rdbuf();
-    out = ss.str();
+// Only the first ten /proc columns are used. Views avoid allocating strings
+// for every column of every (usually unrelated) socket in the namespace.
+static bool SplitProcColumns(std::string_view line, std::array<std::string_view, 10>& columns) {
+    size_t pos = 0;
+    for (auto& column : columns) {
+        while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos]))) ++pos;
+        const auto start = pos;
+        while (pos < line.size() && !std::isspace(static_cast<unsigned char>(line[pos]))) ++pos;
+        if (start == pos) return false;
+        column = line.substr(start, pos - start);
+    }
     return true;
-}
-
-// 拆分空白分隔的字符串
-static std::vector<std::string> SplitWS(const std::string& s) {
-    std::vector<std::string> out;
-    std::istringstream iss(s);
-    std::string tok;
-    while (iss >> tok) out.push_back(std::move(tok));
-    return out;
 }
 
 // 判断字符串是否都是数字
@@ -106,20 +98,20 @@ static bool IsDigits(const std::string& s) {
     return true;
 }
 
-// 解析十六进制到整数（无符号）
 template <typename T>
-static bool ParseHex(const std::string& s, T& out) {
+static bool ParseUnsigned(std::string_view s, T& out, int base = 10) {
     if (s.empty()) return false;
-    char* end = nullptr;
-    errno = 0;
-    unsigned long long v = std::strtoull(s.c_str(), &end, 16);
-    if (errno != 0 || end == s.c_str()) return false;
-    out = static_cast<T>(v);
-    return true;
+    const auto parsed = std::from_chars(s.data(), s.data() + s.size(), out, base);
+    return parsed.ec == std::errc{} && parsed.ptr == s.data() + s.size();
+}
+
+template <typename T>
+static bool ParseHex(std::string_view s, T& out) {
+    return ParseUnsigned(s, out, 16);
 }
 
 // 将 /proc/net/tcp 的 IPv4 地址（8位十六进制，小端序）转为点分十进制
-static std::string IPv4HexToStr(const std::string& hex8) {
+static std::string IPv4HexToStr(std::string_view hex8) {
     if (hex8.size() != 8) return "";
     uint32_t v = 0;
     if (!ParseHex<uint32_t>(hex8, v)) return "";
@@ -135,13 +127,12 @@ static std::string IPv4HexToStr(const std::string& hex8) {
 }
 
 // 将 /proc/net/tcp6 的 IPv6 地址（32位十六进制，按字节顺序）转为文本
-static std::string IPv6HexToStr(const std::string& hex32) {
+static std::string IPv6HexToStr(std::string_view hex32) {
     if (hex32.size() != 32) return "";
     unsigned char b[16];
     for (int i = 0; i < 16; ++i) {
-        std::string byte_hex = hex32.substr(i * 2, 2);
         unsigned int val = 0;
-        if (sscanf(byte_hex.c_str(), "%02x", &val) != 1) return "";
+        if (!ParseHex(hex32.substr(i * 2, 2), val)) return "";
         b[i] = static_cast<unsigned char>(val);
     }
     char buf[INET6_ADDRSTRLEN] = {0};
@@ -150,14 +141,14 @@ static std::string IPv6HexToStr(const std::string& hex32) {
 }
 
 // 解析本地地址:端口，返回 Endpoint
-static Endpoint ParseEndpoint(bool v6, const std::string& addr_port_hex) {
+static Endpoint ParseEndpoint(bool v6, std::string_view addr_port_hex) {
     // 格式: <ADDR_HEX>:<PORT_HEX>
     Endpoint ep;
     ep.ver = v6 ? IPVer::V6 : IPVer::V4;
     auto pos = addr_port_hex.find(':');
     if (pos == std::string::npos) return ep;
-    std::string ahex = addr_port_hex.substr(0, pos);
-    std::string phex = addr_port_hex.substr(pos + 1);
+    const auto ahex = addr_port_hex.substr(0, pos);
+    const auto phex = addr_port_hex.substr(pos + 1);
 
     uint32_t port = 0;
     ParseHex<uint32_t>(phex, port);
@@ -172,7 +163,7 @@ static Endpoint ParseEndpoint(bool v6, const std::string& addr_port_hex) {
     return ep;
 }
 
-static TcpState MapTcpStateFromHex(const std::string& st_hex) {
+static TcpState MapTcpStateFromHex(std::string_view st_hex) {
     uint32_t st = 0;
     if (!ParseHex<uint32_t>(st_hex, st)) return TcpState::UNKNOWN;
     switch (st) {
@@ -192,10 +183,13 @@ static TcpState MapTcpStateFromHex(const std::string& st_hex) {
 }
 
 // 建立 inode -> fd 的映射：读取 /proc/<pid>/fd/* 的链接目标 socket:[inode]
-static std::unordered_map<uint64_t, uint32_t> BuildInodeToFdMap(pid_t pid) {
-    std::unordered_map<uint64_t, uint32_t> m;
+using InodeToFd = std::unordered_map<uint64_t, uint32_t>;
+
+static std::optional<InodeToFd> BuildInodeToFdMap(pid_t pid) {
+    InodeToFd m;
     std::string dir = "/proc/" + std::to_string(pid) + "/fd";
-    DIR* dp = opendir(dir.c_str());
+    const auto close_directory = [](DIR* directory) { closedir(directory); };
+    std::unique_ptr<DIR, decltype(close_directory)> dp(opendir(dir.c_str()), close_directory);
     if (!dp) {
         int err = errno;
         if (IsProcRaceErrno(err)) {
@@ -203,44 +197,33 @@ static std::unordered_map<uint64_t, uint32_t> BuildInodeToFdMap(pid_t pid) {
         } else {
             spdlog::error("NetUsageCollector: open {} failed: {}", dir, strerror(err));
         }
-        return m;
+        return std::nullopt;
     }
     dirent* de;
     char buf[PATH_MAX + 1];
-    while ((de = readdir(dp)) != nullptr) {
+    while ((de = readdir(dp.get())) != nullptr) {
         if (!IsDigits(de->d_name)) continue;
         std::string fdpath = dir + "/" + de->d_name;
         ssize_t n = readlink(fdpath.c_str(), buf, PATH_MAX);
         if (n <= 0) continue;
         buf[n] = '\0';
-        std::string target(buf);
+        const std::string_view target(buf, static_cast<size_t>(n));
         // socket:[inode]
-        static const std::string prefix = "socket:[";
+        static constexpr std::string_view prefix = "socket:[";
         auto pos = target.find(prefix);
         if (pos != 0) continue;
         auto rpos = target.find(']', prefix.size());
         if (rpos == std::string::npos) continue;
-        std::string inode_str = target.substr(prefix.size(), rpos - prefix.size());
+        const auto inode_str = target.substr(prefix.size(), rpos - prefix.size());
         uint64_t inode = 0;
-        // inode 是十进制
-        char* end = nullptr;
-        errno = 0;
-        inode = std::strtoull(inode_str.c_str(), &end, 10);
-        if (errno != 0 || end == inode_str.c_str()) continue;
-
         uint32_t fd_num = 0;
-        try {
-            fd_num = static_cast<uint32_t>(std::stoul(de->d_name));
-        } catch (...) {
-            continue;
-        }
+        if (!ParseUnsigned(inode_str, inode) || !ParseUnsigned(std::string_view(de->d_name), fd_num)) continue;
         // 选择最小 fd
         auto it = m.find(inode);
         if (it == m.end() || fd_num < it->second) {
             m[inode] = fd_num;
         }
     }
-    closedir(dp);
     return m;
 }
 
@@ -274,9 +257,11 @@ static std::string fd_to_path(int pid, int fd)
     return std::string(buf);
 }
 
-// 解析 /proc/<pid>/net/{tcp,tcp6,udp,udp6}
-// 返回 connections（不填充 fd，稍后通过 inode->fd 映射补全）
-std::vector<Connection> NetUsageCollector::ParseProcNetFile(pid_t pid, const std::string& proto_file, L4Proto proto, bool v6) {
+// Parse a namespace table once for all sockets owned by this Job's processes.
+// An unsuccessful read is not cached: another live process can supply the table.
+static bool ReadProcNetFile(pid_t pid, const char* proto_file, L4Proto proto, bool v6,
+                            const std::unordered_set<uint64_t>& wanted,
+                            std::vector<Connection>& result) {
     std::vector<Connection> conns;
     std::string path = "/proc/" + std::to_string(pid) + "/net/" + proto_file;
     std::ifstream ifs(path);
@@ -287,26 +272,17 @@ std::vector<Connection> NetUsageCollector::ParseProcNetFile(pid_t pid, const std
         } else {
             spdlog::error("NetUsageCollector: open {} failed: {}", path, strerror(err));
         }
-        return conns;
+        return false;
     }
     std::string line;
     // 跳过表头
-    if (!std::getline(ifs, line)) return conns;
+    if (!std::getline(ifs, line)) return false;
 
     while (std::getline(ifs, line)) {
         Connection c;
-        if (line.empty()) continue;
-        auto cols = SplitWS(line);
-        c.inode = std::strtoull(cols[9].c_str(), nullptr, 10);
-        if (c.inode == 0){
-            continue;   // inode为0无效，跳过
-        }
-        if (pid_inode_dict[pid].count(c.inode) == 0){
-            continue;   // 不属于该pid的连接，跳过
-        }
-        // 至少需要前10列（直到 inode）
-        // 格式参考：/proc/net/tcp 文档
-        if (cols.size() < 10) continue;
+        std::array<std::string_view, 10> cols;
+        if (!SplitProcColumns(line, cols) || !ParseUnsigned(cols[9], c.inode) ||
+            c.inode == 0 || wanted.count(c.inode) == 0) continue;
 
         // cols[1] local_address, cols[2] rem_address
         // cols[3] st, cols[4] tx_queue:rx_queue, cols[5] tr:tm->when, cols[6] retrnsmt
@@ -323,15 +299,15 @@ std::vector<Connection> NetUsageCollector::ParseProcNetFile(pid_t pid, const std
         c.peer  = std::move(peer);
         // 利用local和peer计算hash
         c.hash = hashConnection(c);
-        c.uid   = static_cast<uint32_t>(std::strtoul(cols[7].c_str(), nullptr, 10));
+        if (!ParseUnsigned(cols[7], c.uid)) continue;
         
         
         // // 解析队列 tx_queue:rx_queue（十六进制）
         // 默认使用netlink解析
         auto pos = cols[4].find(':');
         if (pos != std::string::npos) {
-            std::string txh = cols[4].substr(0, pos);
-            std::string rxh = cols[4].substr(pos + 1);
+            const auto txh = cols[4].substr(0, pos);
+            const auto rxh = cols[4].substr(pos + 1);
             uint32_t tx = 0, rx = 0;
             ParseHex<uint32_t>(txh, tx);
             ParseHex<uint32_t>(rxh, rx);
@@ -360,8 +336,34 @@ std::vector<Connection> NetUsageCollector::ParseProcNetFile(pid_t pid, const std
         
         conns.emplace_back(std::move(c));
     }
-    return conns;
+    if (ifs.bad()) return false;
+    result.insert(result.end(), std::make_move_iterator(conns.begin()), std::make_move_iterator(conns.end()));
+    return true;
 }
+
+static std::string NetworkNamespaceKey(pid_t pid) {
+    const auto path = "/proc/" + std::to_string(pid) + "/ns/net";
+    struct stat info{};
+    if (::stat(path.c_str(), &info) == 0) {
+        return std::to_string(info.st_dev) + ":" + std::to_string(info.st_ino);
+    }
+    // Without a verified namespace identity, never share another PID's table.
+    return "pid:" + std::to_string(pid);
+}
+
+struct ProcessSockets {
+    pid_t pid;
+    InodeToFd inode_to_fd;
+    size_t namespace_index = 0;
+};
+
+struct NamespaceSockets {
+    std::string key;
+    std::vector<pid_t> readers;
+    std::unordered_set<uint64_t> inodes;
+    std::vector<Connection> connections;
+    std::unordered_map<uint64_t, std::vector<size_t>> inode_to_connections;
+};
 
 void print_hex(const void* p, std::size_t len, bool upper_case = false)
 {
@@ -513,76 +515,79 @@ CollectResult NetUsageCollector::collect(const Job& job) {
     Connection summary_conn;
     summary_conn.summary = true;
     all.reserve(job.JobPIDs.size());
+    // These snapshots deliberately live for just this collect(Job) call. They
+    // cannot leak stale PID/FD ownership or samples into a later Job or cycle.
+    std::vector<ProcessSockets> processes;
+    processes.reserve(job.JobPIDs.size());
+    std::vector<NamespaceSockets> namespaces;
+    std::unordered_map<std::string, size_t> namespace_indices;
+    for (pid_t pid : job.JobPIDs) {
+        if (!Utils::is_process_running(pid)) continue;
+        auto inode_to_fd = BuildInodeToFdMap(pid);
+        if (!inode_to_fd) continue;
+        processes.push_back({pid, std::move(*inode_to_fd), 0});
+        auto& process = processes.back();
+        if (process.inode_to_fd.empty()) continue;
 
-    for (int pid_int : job.JobPIDs) {
-        if (! Utils::is_process_running(pid_int)){
-            continue;
+        const auto key = NetworkNamespaceKey(pid);
+        const auto entry = namespace_indices.emplace(key, namespaces.size());
+        if (entry.second) {
+            namespaces.emplace_back();
+            namespaces.back().key = key;
         }
+        process.namespace_index = entry.first->second;
+        auto& snapshot = namespaces[process.namespace_index];
+        snapshot.readers.push_back(pid);
+        for (const auto& [inode, fd] : process.inode_to_fd) snapshot.inodes.insert(inode);
+    }
 
-        pid_t pid = static_cast<pid_t>(pid_int);
-        auto& ino = pid_inode_dict[pid];
-        std::string fdDir = "/proc/" + std::to_string(pid) + "/fd";
-        try {
-            for (const auto& entry : std::filesystem::directory_iterator(fdDir)) {
-                std::error_code ec;
-                std::string lnk = std::filesystem::read_symlink(entry.path(), ec).string();
-                if (ec) {
-                    if (IsProcRaceErrorCode(ec)) {
-                        spdlog::debug("NetUsageCollector: skip vanished fd entry {}: {}", entry.path().string(), ec.message());
-                    } else {
-                        spdlog::warn("NetUsageCollector: read symlink {} failed: {}", entry.path().string(), ec.message());
-                    }
-                    continue;
-                }
-                if (lnk.compare(0, 8, "socket:[") == 0) {
-                    uint64_t i = std::stoull(lnk.substr(8, lnk.size() - 9));
-                    ino.insert(i);
-                }
+    struct Table { const char* name; L4Proto proto; bool v6; };
+    static constexpr std::array<Table, 4> tables{{
+        {"tcp", L4Proto::TCP, false}, {"tcp6", L4Proto::TCP, true},
+        {"udp", L4Proto::UDP, false}, {"udp6", L4Proto::UDP, true}
+    }};
+    for (auto& snapshot : namespaces) {
+        const bool verify_namespace = snapshot.key.compare(0, 4, "pid:") != 0;
+        for (const auto& table : tables) {
+            for (pid_t pid : snapshot.readers) {
+                const auto begin = snapshot.connections.size();
+                if (!ReadProcNetFile(pid, table.name, table.proto, table.v6,
+                                     snapshot.inodes, snapshot.connections)) continue;
+                if (!verify_namespace || NetworkNamespaceKey(pid) == snapshot.key) break;
+                // A reader can move namespaces after grouping. Discard that
+                // table and let a stable reader supply the original namespace.
+                snapshot.connections.resize(begin);
             }
-        } catch (const std::filesystem::filesystem_error& e) {
-            if (IsProcRaceErrorCode(e.code())) {
-                spdlog::debug("NetUsageCollector: skip vanished fd dir {}: {}", fdDir, e.what());
-                continue;
-            }
-            spdlog::error("NetUsageCollector: iterate {} failed: {}", fdDir, e.what());
-            continue;
         }
-        
-        // inode -> fd 映射
-        auto inode2fd = BuildInodeToFdMap(pid);
+        for (size_t i = 0; i < snapshot.connections.size(); ++i) {
+            auto& c = snapshot.connections[i];
+            if (c.proto == L4Proto::TCP && netlink_inited) query_single_tcp(c);
+            snapshot.inode_to_connections[c.inode].push_back(i);
+        }
+    }
 
-        // 解析 tcp/tcp6/udp/udp6
-        std::vector<Connection> conns;
-
-        {
-            auto v = ParseProcNetFile(pid, "tcp",  L4Proto::TCP, false);
-            conns.insert(conns.end(), std::make_move_iterator(v.begin()), std::make_move_iterator(v.end()));
-        }
-        {
-            auto v = ParseProcNetFile(pid, "tcp6", L4Proto::TCP, true);
-            conns.insert(conns.end(), std::make_move_iterator(v.begin()), std::make_move_iterator(v.end()));
-        }
-        {
-            auto v = ParseProcNetFile(pid, "udp",  L4Proto::UDP, false);
-            conns.insert(conns.end(), std::make_move_iterator(v.begin()), std::make_move_iterator(v.end()));
-        }
-        {
-            auto v = ParseProcNetFile(pid, "udp6", L4Proto::UDP, true);
-            conns.insert(conns.end(), std::make_move_iterator(v.begin()), std::make_move_iterator(v.end()));
-        }
-    
-        // 用 inode 映射 fd
-        for (auto& c : conns) {
-            auto it = inode2fd.find(c.inode);
-            if (it != inode2fd.end()) {
-                c.fd = it->second;
-            } else {
-                c.fd = 0;
+    for (const auto& process : processes) {
+        NetInfo info{process.pid, {}};
+        if (!process.inode_to_fd.empty()) {
+            const auto& snapshot = namespaces[process.namespace_index];
+            std::vector<size_t> entries;
+            for (const auto& [inode, fd] : process.inode_to_fd) {
+                const auto found = snapshot.inode_to_connections.find(inode);
+                if (found != snapshot.inode_to_connections.end())
+                    entries.insert(entries.end(), found->second.begin(), found->second.end());
             }
-            // 无法从 /proc 直接得到吞吐字节计数，先置 0
-            if (c.proto == L4Proto::TCP) {
-                query_single_tcp(c);
+            // Keep the existing tcp/tcp6/udp/udp6 and table-row ordering.
+            std::sort(entries.begin(), entries.end());
+            info.connections.reserve(entries.size());
+            for (const auto index : entries) {
+                auto c = snapshot.connections[index];
+                c.fd = process.inode_to_fd.at(c.inode);
+                info.connections.push_back(std::move(c));
             }
+        }
+        for (const auto& c : info.connections) {
+            // Preserve the existing sum of process views, including shared
+            // sockets. Changing Job accounting is separate from this refactor.
             if (summary) {
                 summary_conn.delivery_rate += c.delivery_rate;
                 summary_conn.recv_rate += c.recv_rate;
@@ -593,9 +598,6 @@ CollectResult NetUsageCollector::collect(const Job& job) {
             }
         }
 
-        NetInfo info;
-        info.pid = pid;
-        info.connections = std::move(conns);
         all.emplace_back(std::move(info));
     }
     if (summary) {
@@ -610,7 +612,9 @@ CollectResult NetUsageCollector::collect(const Job& job) {
 
 void NetUsageCollector::deinit() noexcept {
     connection_state_dict.clear();
-    pid_inode_dict.clear();
+    if (netlink_fd >= 0) close(netlink_fd);
+    netlink_fd = -1;
+    netlink_inited = false;
     spdlog::info("NetUsageCollector {} deinitialized");
 }
 

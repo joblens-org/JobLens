@@ -20,7 +20,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <unordered_set>
+#include <unordered_map>
 
 enum class IPVer : uint8_t { V4 = 4, V6 = 6 };
 enum class L4Proto : uint8_t { TCP = 6, UDP = 17 };
@@ -80,10 +80,8 @@ private:
     void parse_tcp_info(const struct inet_diag_msg *m,
                                        unsigned nlmsg_len,
                                        Connection& conn);
-    int netlink_fd;
+    int netlink_fd = -1;
     bool netlink_inited = false;
-
-    std::vector<Connection> ParseProcNetFile(pid_t pid, const std::string& proto_file, L4Proto proto, bool v6);
 
     struct connection_state{
         std::chrono::steady_clock::time_point last_time{};
@@ -92,6 +90,5 @@ private:
         uint64_t  delivery_rate{};  // tcpi_delivery_rate (byte/s)
     };
     std::unordered_map<int, connection_state> connection_state_dict;
-    std::unordered_map<pid_t, std::unordered_set<uint64_t>> pid_inode_dict;
     bool summary = false;
 };

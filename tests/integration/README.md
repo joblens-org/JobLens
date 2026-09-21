@@ -30,6 +30,33 @@
 
 ## 前置条件
 
+### NetUsage repeated-work and writer compatibility regression
+
+```bash
+bash tests/integration/run_net_usage_test.sh build
+```
+
+Requires the configured Ninja build, `strace`, Python 3, permission to trace a
+child process, and local loopback TCP/UDP plus socket-diagnostic netlink access.
+The test links the production collector and creates two live processes sharing
+local sockets. It checks connection ownership, smallest-FD selection, shared
+TCP sampling/rates, closed sockets, netlink disable/cleanup, and literal
+ES/FileWriter/Prometheus output contracts (with and without summary).
+Actual syscall counts verify one FD scan per PID, four table reads per known
+network namespace and one request per shared TCP socket. A narrowly injected
+namespace-stat permission failure verifies that unknown namespaces do not
+share snapshots. No production endpoints or BPF maps are accessed.
+When `unshare` and user/network namespaces are available, a separate regression
+moves the first reader into a new namespace during collection and verifies
+that connections belonging to a stable process are still collected. Otherwise,
+the script prints an explicit skip for this case.
+
+Snapshot reuse is limited to one `collect(Job)` invocation; it does not cache
+across Jobs/cycles or change the scheduler. Existing per-process output and
+process-sum summary semantics are retained, including shared-socket totals.
+Run same-load measurements on a deployment node to assess end-to-end gains;
+the syscall regression is not a timing benchmark.
+
 ### ESWriter 退避重试与性能计数回归
 
 在已配置 Ninja 构建目录、具备项目 C++ 编译依赖的本机运行：
