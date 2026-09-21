@@ -71,6 +71,8 @@ static std::string persist_job_to_json(const Job& job) {
     j["pids"]          = job.JobPIDs;
     j["collectors"]    = job.CollectorNames;
     j["native_job_id"] = job.NativeJobID;
+    j["cluster_name"]  = job.cluster_name;
+    j["clusterTag"]    = job.clusterTag;
     std::visit([&j](const auto& obj) {
         j["sub_attr"] = nlohmann::json(obj);
     }, job.sub_attr);
@@ -85,6 +87,8 @@ static Job persist_json_to_job(const std::string& json_str) {
     job.JobPIDs       = j.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>();
     job.CollectorNames = j.value("collectors", nlohmann::json::array()).get<std::vector<std::string>>();
     job.NativeJobID   = j.value("native_job_id", "");
+    job.cluster_name  = j.value("cluster_name", "");
+    job.clusterTag    = j.value("clusterTag", "");
 
     if (job.subtype == JobSubType::Condor) {
         if (j.contains("sub_attr")) {

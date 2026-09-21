@@ -251,6 +251,8 @@ inline void update_job_info(Job& job){
     }
     if (condor_attr.collector_host.empty()) {
         condor_attr.collector_host = Utils::get_condor_collector_host();
+    }
+    if (job.cluster_name.empty()) {
         job.cluster_name = condor_attr.collector_host;
     }
     if ((condor_attr.cluster_id == 0 || condor_attr.proc_id == 0) && condor_attr.starter_pid > 0) {

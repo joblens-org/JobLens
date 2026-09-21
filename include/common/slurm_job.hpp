@@ -190,7 +190,11 @@ inline void update_job_info(Job& job){
     }
     if (slurm_attr.cluster_name.empty()) {
         slurm_attr.cluster_name = get_cluster_name(representative_pid);
+    }
+    if (job.cluster_name.empty()) {
         job.cluster_name = slurm_attr.cluster_name;
+    }
+    if (job.clusterTag.empty()) {
         job.clusterTag = slurm_attr.cluster_name;
     }
     // stepd_pid 取 JobPIDs 中最小的 PID (slurmstepd 通常为父进程, PID 最小)
