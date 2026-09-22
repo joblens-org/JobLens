@@ -122,6 +122,7 @@ public:
     CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
 
 private:
+    friend struct PowerCollectorTestAccess;
     /* ── eBPF管理 ──────────────────────────────────────────────────── */
     bool load_ebpf();              // 加载power_collect.bpf.o
     void unload_ebpf() noexcept;   // 卸载eBPF程序
@@ -192,6 +193,8 @@ private:
     double   cached_interval_s_    = 0.0;
     std::vector<double> cached_freqs_;
     std::chrono::steady_clock::time_point cache_ts_;
+    // A consumed sample must be accounted before TTL refresh may replace it.
+    bool cached_sample_accounted_ = true;
     std::unordered_set<uint64_t> processed_in_cycle_;
     double cache_ttl_s_ = 2.0;  // = 1/freq, init时根据配置计算
 };

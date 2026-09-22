@@ -12,12 +12,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "collector/basic_info_collector.hpp"
+#include <memory>
+#include <cstdlib>
+#include <cerrno>
+#include <algorithm>
 #include "core/collector_registry.hpp"
 #include "writer/prometheus_exporter_writer.hpp"
 #include <fstream>
 #include <sstream>
 #include <fmt/format.h>
 #include <unistd.h>
+#include <poll.h>
 #include <linux/genetlink.h>
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
@@ -74,32 +79,23 @@ void BasicInfoCollector::deinit() noexcept {
 
 
 bool BasicInfoCollector::connect_to_taskstats() {
-    // 创建netlink socket
-    nl_sock = nl_socket_alloc();
-    if (!nl_sock) {
-        spdlog::error("Failed to allocate netlink socket");
-        return false;
-    }
-    
-    // 连接到GENERIC NETLINK
-    if (genl_connect(nl_sock) < 0) {
+    std::unique_ptr<struct nl_sock, decltype(&nl_socket_free)> socket(nl_socket_alloc(), nl_socket_free);
+    if (!socket || genl_connect(socket.get()) < 0) {
         spdlog::error("Failed to connect to generic netlink");
-        nl_socket_free(nl_sock);
-        nl_sock = nullptr;
         return false;
     }
-    
-    // 获取family ID
-    family_id = genl_ctrl_resolve(nl_sock, TASKSTATS_GENL_NAME);
-    if (family_id < 0) {
-        spdlog::error("Failed to resolve family ID for taskstats");
-        disconnect_from_taskstats();
+    // Family resolution is done during init. Reconnecting after a timeout can
+    // reuse the known ID without a second blocking controller exchange.
+    const int resolved_family = family_id >= 0 ? family_id : genl_ctrl_resolve(socket.get(), TASKSTATS_GENL_NAME);
+    if (resolved_family < 0 || nl_socket_set_nonblocking(socket.get()) < 0) {
+        spdlog::error("Failed to configure nonblocking taskstats connection");
         return false;
     }
-    
+    nl_socket_disable_auto_ack(socket.get());
+    family_id = resolved_family;
+    nl_sock = socket.release();
     return true;
 }
-
 
 void BasicInfoCollector::disconnect_from_taskstats() {
     if (nl_sock) {
@@ -129,128 +125,77 @@ uint64_t BasicInfoCollector::get_total_memory_bytes() {
 }
 
 
-bool BasicInfoCollector::get_taskstats_for_tgid(int tgid, struct taskstats* out_stats) {
-    // 类似于get_taskstats_for_pid，但使用TGID
-    int ret = 0;
+namespace {
+// The taskstats socket is non-blocking, so netlink calls retry after readiness.
+void wait_netlink_fd(int fd, short events) {
+    pollfd descriptor{fd, events, 0};
+    while (::poll(&descriptor, 1, -1) < 0 && errno == EINTR) {}
+}
+}
 
-    if (!nl_sock || family_id < 0) return false;
-    
-    struct nl_msg* msg = nlmsg_alloc();
-    if (!msg){
+bool BasicInfoCollector::get_taskstats_for_tgid(int tgid, struct taskstats* out_stats) {
+    if (!nl_sock && !connect_to_taskstats()) return false;
+    if (family_id < 0) return false;
+
+    std::unique_ptr<nl_msg, decltype(&nlmsg_free)> msg(nlmsg_alloc(), nlmsg_free);
+    if (!msg || !genlmsg_put(msg.get(), NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0,
+                            0, TASKSTATS_CMD_GET, TASKSTATS_GENL_VERSION) ||
+        nla_put_s32(msg.get(), TASKSTATS_CMD_ATTR_PID, tgid) < 0) {
         spdlog::error("BasicInfoCollector: Failed to allocate netlink message");
         return false;
     }
-    spdlog::trace("family_id: {}", family_id);
-
-    genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 
-                0, TASKSTATS_CMD_GET, TASKSTATS_GENL_VERSION);
-    
-    nla_put_s32(msg, TASKSTATS_CMD_ATTR_PID, tgid);
-
-    struct nl_cb* cb = nl_cb_alloc(NL_CB_DEFAULT);
-    if (!cb) {
-        nlmsg_free(msg);
-        spdlog::error("BasicInfoCollector: Failed to allocate netlink callback");
-        return false;
-    }
-    
-    int err = nl_send_auto(nl_sock, msg);
-    if (err < 0) {
-        nlmsg_free(msg);
-        nl_cb_put(cb);
+    const int fd = nl_socket_get_fd(nl_sock);
+    for (;;) {
+        const int sent = nl_send_auto(nl_sock, msg.get());
+        if (sent >= 0) break;
+        if (sent == -NLE_INTR) continue;
+        if (sent == -NLE_AGAIN) {
+            wait_netlink_fd(fd, POLLOUT);
+            continue;
+        }
         spdlog::error("BasicInfoCollector: Failed to send netlink message");
         return false;
     }
-    
-    unsigned char* reply = nullptr;
-    sockaddr_nl addr;
-    addr.nl_family = AF_NETLINK;
-    addr.nl_pad = 0;
-    addr.nl_pid = 0;
-    addr.nl_groups = 0;
 
-    ret = nl_recv(nl_sock, &addr, &reply, NULL);
-    if (ret < 0 || !reply) {
-        nlmsg_free(msg);
-        nl_cb_put(cb);
-        spdlog::error("BasicInfoCollector: Failed to receive netlink reply for TGID {}, error code {}", tgid, ret);
-        return false;
-    }
-
-    struct nlmsghdr *h = (struct nlmsghdr *)(reply);
-    auto reply_msg = nlmsg_convert(h);
-    if (h->nlmsg_type == NLMSG_ERROR) {
-        auto data = (struct nlmsgerr *)NLMSG_DATA(h);
-        if (data->error == 0) {
-            spdlog::trace("BasicInfoCollector: Netlink ACK received for TGID {}", tgid);
-        } else if (data->error == -EPERM) {
-            spdlog::error("BasicInfoCollector: Permission denied for TGID {}", tgid);
-            nlmsg_free(msg);
-            nlmsg_free(reply_msg);
-            nl_cb_put(cb);
-            return false;
-
-        } else {
-            spdlog::error("BasicInfoCollector: Netlink error {} for TGID {}", data->error, tgid);
-            nlmsg_free(msg);
-            nl_cb_put(cb);
+    for (;;) {
+        unsigned char* reply = nullptr;
+        sockaddr_nl address{};
+        const int received = nl_recv(nl_sock, &address, &reply, nullptr);
+        std::unique_ptr<unsigned char, decltype(&std::free)> owned_reply(reply, std::free);
+        if (received == -NLE_INTR) continue;
+        if (received == -NLE_AGAIN) {
+            wait_netlink_fd(fd, POLLIN);
+            continue;
+        }
+        if (received <= 0 || !reply) {
+            spdlog::error("BasicInfoCollector: Failed to receive netlink reply for TGID {}, error code {}", tgid, received);
             return false;
         }
-    }
-
-    struct nlattr* attrs[TASKSTATS_TYPE_MAX + 1];
-    struct genlmsghdr* gnlh = (struct genlmsghdr*)nlmsg_data(nlmsg_hdr(reply_msg));
-
-    ret = genlmsg_parse(nlmsg_hdr(reply_msg), sizeof(gnlh), attrs, TASKSTATS_TYPE_MAX, NULL);
-    if(ret < 0) {
-        nlmsg_free(msg);
-        nlmsg_free(reply_msg);
-        nl_cb_put(cb);
-        spdlog::error("BasicInfoCollector: Invalid generic netlink message for TGID {}, error code {}", tgid, ret);
-        return false;
-    }
-
-    if (nla_parse(attrs, TASKSTATS_TYPE_MAX, genlmsg_attrdata(gnlh, 0),
-                  genlmsg_attrlen(gnlh, 0), NULL) < 0) {
-        nlmsg_free(reply_msg);
-        nl_cb_put(cb);
-        spdlog::error("BasicInfoCollector: Failed to parse netlink attributes");
-        return false;
-    }
-    
-    if (attrs[TASKSTATS_TYPE_AGGR_PID]) {
-        spdlog::trace("BasicInfoCollector: Parsing taskstats for TGID {}", tgid);
-        struct nlattr* task_attrs[TASKSTATS_TYPE_MAX + 1];
-        
-        if (nla_parse_nested(task_attrs, TASKSTATS_TYPE_MAX, 
-                            attrs[TASKSTATS_TYPE_AGGR_PID], NULL) < 0) {
-            nlmsg_free(reply_msg);
-            nl_cb_put(cb);
-            spdlog::error("BasicInfoCollector: Failed to parse nested taskstats attributes");
-            return false;
-        }
-        
-        if (task_attrs[TASKSTATS_TYPE_STATS]) {
-            memcpy(out_stats, nla_data(task_attrs[TASKSTATS_TYPE_STATS]), sizeof(struct taskstats));
-            spdlog::trace("BasicInfoCollector: Retrieved taskstats for TGID {}, version {}", tgid, out_stats->version);
-            spdlog::trace("BasicInfoCollector: TGID {} {} stats - CPU time (user: {}, system: {}), Memory (RSS: {} KB, VM: {} KB), IO (read bytes: {}, write bytes: {})",
-                          tgid, std::string(out_stats->ac_comm),
-                          out_stats->ac_utime, out_stats->ac_stime,
-                          out_stats->coremem, out_stats->virtmem,
-                          out_stats->read_bytes, out_stats->write_bytes);
-            nlmsg_free(reply_msg);
-            nl_cb_put(cb);
-            spdlog::trace("BasicInfoCollector: Successfully retrieved taskstats for TGID {}", tgid);
+        int remaining = received;
+        for (auto* h = reinterpret_cast<nlmsghdr*>(reply); NLMSG_OK(h, remaining);
+             h = NLMSG_NEXT(h, remaining)) {
+            if (h->nlmsg_seq != nlmsg_hdr(msg.get())->nlmsg_seq) continue;
+            if (h->nlmsg_type == NLMSG_ERROR) {
+                if (h->nlmsg_len < NLMSG_LENGTH(sizeof(nlmsgerr))) return false;
+                const auto* error = static_cast<const nlmsgerr*>(NLMSG_DATA(h));
+                if (!error->error) continue;
+                spdlog::error("BasicInfoCollector: Netlink error {} for TGID {}", error->error, tgid);
+                return false;
+            }
+            nlattr* attrs[TASKSTATS_TYPE_MAX + 1]{};
+            if (genlmsg_parse(h, 0, attrs, TASKSTATS_TYPE_MAX, nullptr) < 0 ||
+                !attrs[TASKSTATS_TYPE_AGGR_PID]) return false;
+            nlattr* task_attrs[TASKSTATS_TYPE_MAX + 1]{};
+            if (nla_parse_nested(task_attrs, TASKSTATS_TYPE_MAX,
+                                 attrs[TASKSTATS_TYPE_AGGR_PID], nullptr) < 0 ||
+                !task_attrs[TASKSTATS_TYPE_STATS]) return false;
+            std::memset(out_stats, 0, sizeof(*out_stats));
+            std::memcpy(out_stats, nla_data(task_attrs[TASKSTATS_TYPE_STATS]),
+                        std::min<size_t>(sizeof(*out_stats), nla_len(task_attrs[TASKSTATS_TYPE_STATS])));
             return true;
         }
     }
-    
-    nlmsg_free(reply_msg);
-    nl_cb_put(cb);
-    spdlog::error("BasicInfoCollector: No taskstats for TGID {}", tgid);
-    return false;
 }
-
 
 void BasicInfoCollector::calculate_cpu_percent(BasicInfo& info, const struct taskstats& stats,
                                               const std::chrono::steady_clock::time_point& now) {
@@ -321,7 +266,7 @@ void BasicInfoCollector::calculate_io_speed(BasicInfo& info, const struct taskst
 
 
 CollectResult BasicInfoCollector::collect(const Job& job) {
-    if (!inited || !nl_sock) {
+    if (!inited) {
         spdlog::error("BasicInfoCollector not initialized");
         return {};
     }
@@ -404,7 +349,7 @@ CollectDataParseFunc BasicInfoCollector::get_writer_parser(const std::string& wr
             }
             
             ret["process_data"] = nlohmann::json::array();
-            auto parsed = std::any_cast<std::vector<BasicInfo>>(data);
+            const auto& parsed = std::any_cast<const std::vector<BasicInfo>&>(data);
             
             spdlog::trace("BasicInfoCollector: parsing {} entries for ESWriter", parsed.size());
             
@@ -439,9 +384,9 @@ CollectDataParseFunc BasicInfoCollector::get_writer_parser(const std::string& wr
                 j["ctx_sw_nonvoluntary"] = info.nonvoluntaryCtxSw;
                 
                 if (info.pid == 0) {
-                    ret["summary"] = j;
+                    ret["summary"] = std::move(j);
                 } else {
-                    ret["process_data"].push_back(j);
+                    ret["process_data"].push_back(std::move(j));
                 }
             }
             
@@ -455,7 +400,7 @@ CollectDataParseFunc BasicInfoCollector::get_writer_parser(const std::string& wr
                 spdlog::warn("BasicInfoCollector: error FileWriter parser, empty data");
                 return std::string("BasicInfoCollector error=empty_data\n");
             }
-            auto parsed = std::any_cast<std::vector<BasicInfo>>(data);
+            const auto& parsed = std::any_cast<const std::vector<BasicInfo>&>(data);
             std::ostringstream out;
             for (const auto& info : parsed) {
                 out << "BasicInfoCollector"
@@ -493,7 +438,7 @@ CollectDataParseFunc BasicInfoCollector::get_writer_parser(const std::string& wr
                 return ret;
             }
             
-            auto parsed = std::any_cast<std::vector<BasicInfo>>(data);
+            const auto& parsed = std::any_cast<const std::vector<BasicInfo>&>(data);
             
             for (const auto& info : parsed) {
                 PrometheusExporterWriter::prometheus_process_state state;

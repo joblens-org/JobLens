@@ -107,9 +107,14 @@ void FSMetadataCollector::refresh_dump_cache_if_needed() {
     auto elapsed = duration_cast<milliseconds>(now - last_dump_time_).count();
     if (elapsed < DUMP_TTL_MS && !dump_keys_.empty()) return;
 
+    std::vector<fs_meta_key> keys;
+    std::vector<fs_meta_stat> values;
+    bool complete = false;
     EbpfCommon::lookup_hashmap_batch<fs_meta_key, fs_meta_stat>(
-        bpf_obj_, fs_meta_map_name, dump_keys_, dump_vals_);
-    last_dump_time_ = now;
+        bpf_obj_, fs_meta_map_name, keys, values, 1024, &complete);
+    dump_keys_ = std::move(keys);
+    dump_vals_ = std::move(values);
+    last_dump_time_ = complete ? now : steady_clock::time_point{};
 }
 
 CollectResult FSMetadataCollector::collect(const Job& job) {
@@ -234,14 +239,22 @@ CollectResult FSMetadataCollector::collect(const Job& job) {
         }
     }
 
-    // 4. 更新速率基线
-    last_job_time_[job.JobID] = now;
-    std::unordered_map<uint32_t, u64> current_job_calls;
-    std::unordered_map<uint32_t, u64> current_job_errors;
+    // Build all rate baselines before replacing any previous sample.
+    std::unordered_map<uint32_t, u64> current_job_calls, current_job_errors;
+    std::unordered_map<pid_t, std::unordered_map<uint32_t, u64>> current_proc_calls, current_proc_errors;
     for (const auto& [op, oc] : result.job_ops) {
         current_job_calls[op] = oc.calls;
         current_job_errors[op] = oc.errors;
     }
+    for (const auto& [pid, proc] : result.processes) {
+        auto& proc_calls = current_proc_calls[pid];
+        auto& proc_errors = current_proc_errors[pid];
+        for (const auto& [op, oc] : proc.ops) {
+            proc_calls[op] = oc.calls;
+            proc_errors[op] = oc.errors;
+        }
+    }
+    last_job_time_[job.JobID] = now;
     if (current_job_calls.empty()) {
         last_job_op_calls_.erase(job.JobID);
         last_job_op_errors_.erase(job.JobID);
@@ -249,28 +262,12 @@ CollectResult FSMetadataCollector::collect(const Job& job) {
         last_job_op_calls_[job.JobID] = std::move(current_job_calls);
         last_job_op_errors_[job.JobID] = std::move(current_job_errors);
     }
-
-    if (!include_process_details) {
+    if (current_proc_calls.empty()) {
         last_proc_op_calls_.erase(job.JobID);
         last_proc_op_errors_.erase(job.JobID);
     } else {
-        std::unordered_map<pid_t, std::unordered_map<uint32_t, u64>> current_proc_calls;
-        std::unordered_map<pid_t, std::unordered_map<uint32_t, u64>> current_proc_errors;
-        for (const auto& [pid, proc] : result.processes) {
-            auto& proc_calls = current_proc_calls[pid];
-            auto& proc_errors = current_proc_errors[pid];
-            for (const auto& [op, oc] : proc.ops) {
-                proc_calls[op] = oc.calls;
-                proc_errors[op] = oc.errors;
-            }
-        }
-        if (current_proc_calls.empty()) {
-            last_proc_op_calls_.erase(job.JobID);
-            last_proc_op_errors_.erase(job.JobID);
-        } else {
-            last_proc_op_calls_[job.JobID] = std::move(current_proc_calls);
-            last_proc_op_errors_[job.JobID] = std::move(current_proc_errors);
-        }
+        last_proc_op_calls_[job.JobID] = std::move(current_proc_calls);
+        last_proc_op_errors_[job.JobID] = std::move(current_proc_errors);
     }
 
     return std::any(result);
@@ -285,7 +282,7 @@ CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& w
                 return j;
             }
             try {
-                auto s = std::any_cast<JobFSMetaStat>(data);
+                const auto& s = std::any_cast<const JobFSMetaStat&>(data);
                 j["job_id"] = s.job_id;
                 j["collect_period"] = s.collect_period;
                 j["job_metadata_ops_total"] = s.job_metadata_ops_total;
@@ -309,7 +306,7 @@ CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& w
                         oj["latency_hist"] = std::vector<u64>(
                             std::begin(it->second.hist), std::end(it->second.hist));
                     }
-                    j["job_ops"].push_back(oj);
+                    j["job_ops"].push_back(std::move(oj));
                 }
 
                 j["processes"] = json::array();
@@ -330,7 +327,7 @@ CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& w
                             {"max_latency_ns", oc.max_latency_ns}
                         });
                     }
-                    j["processes"].push_back(pj);
+                    j["processes"].push_back(std::move(pj));
                 }
                 return j;
             } catch (const std::bad_any_cast& e) {
@@ -347,7 +344,7 @@ CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& w
                 return std::string("FSMetadataCollector error=empty_data\n");
             }
             try {
-                auto s = std::any_cast<JobFSMetaStat>(data);
+                const auto& s = std::any_cast<const JobFSMetaStat&>(data);
                 std::ostringstream out;
                 out << "FSMetadataCollector job_id=" << s.job_id
                     << " collect_period=" << s.collect_period
@@ -419,7 +416,7 @@ CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& w
                 return ret;
             }
             try {
-                auto s = std::any_cast<JobFSMetaStat>(data);
+                const auto& s = std::any_cast<const JobFSMetaStat&>(data);
                 ret.JobID = static_cast<int>(s.job_id);
 
                 // Job 级汇总（pid=0）
