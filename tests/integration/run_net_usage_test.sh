@@ -15,7 +15,7 @@ c++ -std=c++17 -O0 -g -DSPDLOG_COMPILED_LIB -DYAML_CPP_STATIC_DEFINE -DHAS_STRIN
     -I"$build/include" -I"$root/include" -I/usr/include/libnl3 \
     -c "$root/tests/integration/net_usage_collector_test.cpp" -o "$work/test.o"
 command=${link/CMakeFiles\/JobLens.dir\/src\/main.cpp.o/\"$work\/test.o\"}
-command=${command/ -o JobLens / -Wl,--wrap=stat -o \"$work\/test\" }
+command=${command/ -o JobLens / -Wl,--wrap=stat -Wl,--wrap=send -Wl,--wrap=recv -o \"$work\/test\" }
 (cd "$build"; bash -c "$command")
 timeout 30 strace -f -s 256 -e trace=openat,sendto,write -o "$work/trace" "$work/test"
 python3 - "$work/trace" <<'PY'

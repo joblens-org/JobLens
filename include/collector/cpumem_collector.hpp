@@ -46,9 +46,13 @@ public:
     CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type) override;
 
 private:
-    bool CPUOf(int pid, CPUMemInfo& info);
+    struct CpuSample {
+        long hz;
+        long numCores;
+        unsigned long long total;
+    };
+    bool CPUOf(int pid, CPUMemInfo& info, const CpuSample& sample);
     bool MemOf(int pid, CPUMemInfo& info);
-    bool BaseInfo(int pid, CPUMemInfo& info);
     bool inited = false;
     bool summary = false;
 

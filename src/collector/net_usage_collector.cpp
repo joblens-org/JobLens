@@ -27,6 +27,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <poll.h>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -384,9 +385,18 @@ void print_hex(const void* p, std::size_t len, bool upper_case = false)
     std::cout.flags(old_flags);                  // 恢复原来的格式
 }
 
-int NetUsageCollector::query_single_tcp(Connection& conn){    
-    auto src = conn.local;
-    auto dst = conn.peer;
+namespace {
+// The diagnostic socket is non-blocking, so send/recv retry after the socket
+// becomes ready again.
+void wait_netlink_fd(int fd, short events) {
+    pollfd descriptor{fd, events, 0};
+    while (::poll(&descriptor, 1, -1) < 0 && errno == EINTR) {}
+}
+}
+
+int NetUsageCollector::query_single_tcp(Connection& conn) {
+    const auto& src = conn.local;
+    const auto& dst = conn.peer;
     auto src_ip = src.addr.c_str();
     auto dst_ip = dst.addr.c_str();
     auto src_port = src.port;
@@ -400,7 +410,7 @@ int NetUsageCollector::query_single_tcp(Connection& conn){
     q.nlh.nlmsg_len = sizeof(q);
     q.nlh.nlmsg_type = SOCK_DIAG_BY_FAMILY;
     q.nlh.nlmsg_flags = NLM_F_REQUEST;   /* 关键：没有 DUMP */
-    q.nlh.nlmsg_seq = 1;
+    q.nlh.nlmsg_seq = ++query_sequence;
     q.nlh.nlmsg_pid = getpid();
 
     if(src.ver == IPVer::V4){
@@ -428,25 +438,43 @@ int NetUsageCollector::query_single_tcp(Connection& conn){
     q.req.id.idiag_cookie[0] = -1;
     q.req.id.idiag_cookie[1] = -1;
 
-    if (send(netlink_fd, &q, sizeof(q), 0) != sizeof(q)) {
+    for (;;) {
+        const auto sent = send(netlink_fd, &q, sizeof(q), MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (sent == sizeof(q)) break;
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            wait_netlink_fd(netlink_fd, POLLOUT);
+            continue;
+        }
         spdlog::error("NetUsageCollector: netlink req sent msg error");
         return -1;
     }
     spdlog::debug("NetUsageCollector: netlink req sent msg");
 
-    /* 接收一条即可 */
+    // Match requests even after a previous non-timeout error left a reply queued.
     char buf[1024];
-    ssize_t n = recv(netlink_fd, buf, sizeof(buf), 0);
-    if (n < 0) { spdlog::error("NetUsageCollector: netlink recv msg error"); return -1; }
-    spdlog::debug("NetUsageCollector: netlink req recv msg");
-
-    /* 解析同 DUMP，但只有一条 inet_diag_msg */
-    const nlmsghdr* h = reinterpret_cast<const nlmsghdr*>(buf);
+    const nlmsghdr* h = nullptr;
+    while (!h) {
+        const ssize_t n = recv(netlink_fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            wait_netlink_fd(netlink_fd, POLLIN);
+            continue;
+        }
+        if (n <= 0) { spdlog::error("NetUsageCollector: netlink recv msg error"); return -1; }
+        int remaining = static_cast<int>(n);
+        for (auto* candidate = reinterpret_cast<const nlmsghdr*>(buf);
+             NLMSG_OK(candidate, remaining); candidate = NLMSG_NEXT(candidate, remaining)) {
+            if (candidate->nlmsg_seq == q.nlh.nlmsg_seq) { h = candidate; break; }
+        }
+    }
     if (h->nlmsg_type == NLMSG_ERROR) {
+        if (h->nlmsg_len < NLMSG_LENGTH(sizeof(nlmsgerr))) return -1;
         const nlmsgerr* e = (const nlmsgerr*)(NLMSG_DATA(h));
         spdlog::error("NetUsageCollector: netlink query kernel error: {}", e->error);
         return -1;
     }
+    if (h->nlmsg_len < NLMSG_LENGTH(sizeof(inet_diag_msg))) return -1;
 
     const inet_diag_msg* m = (const inet_diag_msg*)(NLMSG_DATA(h));
 
@@ -454,7 +482,9 @@ int NetUsageCollector::query_single_tcp(Connection& conn){
     int rtlen = h->nlmsg_len - NLMSG_LENGTH(sizeof(*m));
     for (rta = (struct rtattr*)((char*)m + sizeof(*m)); RTA_OK(rta, rtlen); rta = RTA_NEXT(rta, rtlen)) {
         if (rta->rta_type == INET_DIAG_INFO) {
-            const struct tcp_info* info = reinterpret_cast<const tcp_info*>(RTA_DATA(rta));
+            struct tcp_info sample{};
+            std::memcpy(&sample, RTA_DATA(rta), std::min<size_t>(sizeof(sample), RTA_PAYLOAD(rta)));
+            const struct tcp_info* info = &sample;
             // print_hex(info, rta->rta_len, true);
             conn.sent = info->tcpi_bytes_sent;
             conn.recv = info->tcpi_bytes_received;
@@ -462,22 +492,20 @@ int NetUsageCollector::query_single_tcp(Connection& conn){
             conn.rto = info->tcpi_rto;
             conn.rtt = info->tcpi_rtt;
             conn.rtt_var = info->tcpi_rttvar;
-                src.addr, src.port, dst.addr, dst.port,
-                conn.sent, conn.recv, conn.delivery_rate,
-                conn.rto, conn.rtt, conn.rtt_var;
-            
+
             // 简单差分计算速度
-            auto last_sent = connection_state_dict[conn.hash].sent;
-            auto last_recv = connection_state_dict[conn.hash].recv;
+            auto& state = connection_state_dict[conn.hash];
+            auto last_sent = state.sent;
+            auto last_recv = state.recv;
             auto now = std::chrono::steady_clock::now();
-            auto duration = now - connection_state_dict[conn.hash].last_time;
+            auto duration = now - state.last_time;
             double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(duration).count();
 
             conn.send_rate = seconds > 0.0 ? (conn.sent - last_sent) / seconds : 0.0;
             conn.recv_rate= seconds > 0.0 ? (conn.recv - last_recv) / seconds : 0.0;
-            connection_state_dict[conn.hash].last_time = now;
-            connection_state_dict[conn.hash].sent = conn.sent;
-            connection_state_dict[conn.hash].recv = conn.recv;
+            state.last_time = now;
+            state.sent = conn.sent;
+            state.recv = conn.recv;
         }
     }
     return 0;
@@ -485,7 +513,7 @@ int NetUsageCollector::query_single_tcp(Connection& conn){
 
 
 void NetUsageCollector::init_netlink(){
-    netlink_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG);
+    netlink_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
     if(netlink_fd < 0){
         spdlog::error("NetUsageCollector: netlink init error");
         return;
@@ -501,7 +529,8 @@ bool NetUsageCollector::init(const nlohmann::json& cfg) {
     }else{
         summary = false;
     }
-    if(cfg["use_netlink"].get<std::string>() == "true"){
+    netlink_requested = cfg["use_netlink"].get<std::string>() == "true";
+    if(netlink_requested){
         init_netlink();
         spdlog::info("NetUsageCollector: use netlink to query tcp info");
     }
@@ -511,6 +540,7 @@ bool NetUsageCollector::init(const nlohmann::json& cfg) {
 
 
 CollectResult NetUsageCollector::collect(const Job& job) {
+    if (netlink_requested && !netlink_inited) init_netlink();
     std::vector<NetInfo> all;
     Connection summary_conn;
     summary_conn.summary = true;
@@ -538,7 +568,9 @@ CollectResult NetUsageCollector::collect(const Job& job) {
         process.namespace_index = entry.first->second;
         auto& snapshot = namespaces[process.namespace_index];
         snapshot.readers.push_back(pid);
-        for (const auto& [inode, fd] : process.inode_to_fd) snapshot.inodes.insert(inode);
+        for (const auto& [inode, fd] : process.inode_to_fd) {
+            snapshot.inodes.insert(inode);
+        }
     }
 
     struct Table { const char* name; L4Proto proto; bool v6; };
@@ -615,6 +647,7 @@ void NetUsageCollector::deinit() noexcept {
     if (netlink_fd >= 0) close(netlink_fd);
     netlink_fd = -1;
     netlink_inited = false;
+    netlink_requested = false;
     spdlog::info("NetUsageCollector {} deinitialized");
 }
 
@@ -632,7 +665,7 @@ CollectDataParseFunc NetUsageCollector::get_writer_parser(const std::string& wri
                 return ret;
             }
             ret["process_data"] = nlohmann::json::array();
-            auto parsed = std::any_cast<std::vector<NetInfo>>(data);
+            const auto& parsed = std::any_cast<const std::vector<NetInfo>&>(data);
             spdlog::trace("NetUsageCollector: writer parser get {} NetInfo entries", parsed.size());
             for (const auto& info : parsed) {
                 nlohmann::json j;
@@ -665,9 +698,9 @@ CollectDataParseFunc NetUsageCollector::get_writer_parser(const std::string& wri
                     j["connections"].push_back(std::move(cj));
                 }
                 if (info.pid == 0){
-                    if (summary) ret["summary"] = j;
+                    if (summary) ret["summary"] = std::move(j);
                 }else{
-                    ret["process_data"].push_back(j);
+                    ret["process_data"].push_back(std::move(j));
                 }
             }
             return ret;
@@ -680,7 +713,7 @@ CollectDataParseFunc NetUsageCollector::get_writer_parser(const std::string& wri
                 spdlog::warn("NetUsageCollector: error FileWriter parser, empty data");
                 return std::string("NetUsageCollector error=empty_data\n");
             }
-            auto parsed = std::any_cast<std::vector<NetInfo>>(data);
+            const auto& parsed = std::any_cast<const std::vector<NetInfo>&>(data);
             std::ostringstream out;
             for (const auto& info : parsed) {
                 out << "NetUsageCollector"
@@ -727,7 +760,7 @@ CollectDataParseFunc NetUsageCollector::get_writer_parser(const std::string& wri
                 ret.JobID = 0;
                 return ret;
             }
-            auto parsed = std::any_cast<std::vector<NetInfo>>(data);
+            const auto& parsed = std::any_cast<const std::vector<NetInfo>&>(data);
             
             for (const auto& info : parsed) {
                 PrometheusExporterWriter::prometheus_process_state state;

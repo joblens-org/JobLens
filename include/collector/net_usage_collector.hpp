@@ -82,6 +82,8 @@ private:
                                        Connection& conn);
     int netlink_fd = -1;
     bool netlink_inited = false;
+    bool netlink_requested = false;
+    uint32_t query_sequence = 0;
 
     struct connection_state{
         std::chrono::steady_clock::time_point last_time{};
