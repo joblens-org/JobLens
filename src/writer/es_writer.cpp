@@ -13,6 +13,7 @@
  * limitations under the License. */
 // elasticsearch_writer.cpp
 #include "writer/es_writer.hpp"
+#include "writer/batch_parser_cache.hpp"
 #include <spdlog/spdlog.h>
 #include <fmt/format.h>
 #include <fmt/chrono.h>
@@ -132,6 +133,7 @@ ESWriter::ESWriter(std::string name, std::string type, std::string config_name)
 
 ESWriter::~ESWriter()
 {
+    shutdown();
     if (curl_) curl_easy_cleanup(curl_);
     curl_global_cleanup();
 }
@@ -253,11 +255,9 @@ std::string ESWriter::try_get_index_name(const std::string& collector_name)
 }
 
 bool ESWriter::try_parse_data(const std::string& collector_name, const std::any& data,
-                               const Job& job, std::chrono::system_clock::time_point ts, json& out)
+                               const Job& job, std::chrono::system_clock::time_point ts, json& out,
+                               const CollectDataParseFuncV2& parser_func)
 {
-    WriterParseContext ctx{name_, type_, config_name_, collector_name, job, ts};
-
-    auto parser_func = CollectorRegistry::instance().resolveBestParserV2(collector_name, type_);
     if (!parser_func) {
         spdlog::debug("elasticsearch_writer: no parser for collector '{}', writer '{}'", collector_name, type_);
         out["error"] = "no parser registered";
@@ -266,8 +266,9 @@ bool ESWriter::try_parse_data(const std::string& collector_name, const std::any&
 
     spdlog::trace("elasticsearch_writer: using parser for collector '{}', writer '{}'", collector_name, type_);
     try {
+        WriterParseContext ctx{name_, type_, config_name_, collector_name, job, ts};
         auto parsed_data = parser_func(ctx, data);
-        out = std::move(std::any_cast<json>(parsed_data));
+        out = std::any_cast<json>(std::move(parsed_data));
     }
     catch (const std::exception& e) {
         spdlog::error("elasticsearch_writer: bad_any_cast for collector '{}': {}", collector_name, e.what());
@@ -287,6 +288,7 @@ bool ESWriter::flush_impl(const std::vector<write_data>& batch)
     std::vector<BulkDocument> chunk;
     std::size_t chunk_bytes = 0;
     bool flush_ret = true;
+    BatchParserCache parsers(type_);
     auto send_chunk = [&]() {
         if (chunk.empty()) return;
         if (!send_documents(chunk)) flush_ret = false;
@@ -315,12 +317,12 @@ bool ESWriter::flush_impl(const std::vector<write_data>& batch)
             spdlog::trace("elasticsearch_writer: rendered index name '{}'", action["index"]["_index"].get<std::string>());
         }
         json jobj;
-        if (!try_parse_data(collect_name, any_data, job, ts, jobj)) {
+        if (!try_parse_data(collect_name, any_data, job, ts, jobj, parsers.get(collect_name))) {
             spdlog::error("elasticsearch_writer: parser failed, dropping collector={}, job_id={}", collect_name, job.JobID);
             flush_ret = false;
             continue;
         }
-        src["data"] = jobj;
+        src["data"] = std::move(jobj);
         std::string document = action.dump();
         document += '\n';
         document += src.dump();

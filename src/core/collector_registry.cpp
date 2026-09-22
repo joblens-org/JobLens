@@ -212,7 +212,7 @@ CollectDataParseFuncV2 CollectorRegistry::resolveBestParserV2(const std::string&
         spdlog::debug("resolveBestParserV2: V1 fallback for collector '{}', writer '{}'", collector_name, writer_type);
         // 将 V1 parser 包装为 V2 签名（丢弃 WriterParseContext）
         return [v1_parser](const WriterParseContext& /*ctx*/, std::any raw_data) -> std::any {
-            return v1_parser(raw_data);
+            return v1_parser(std::move(raw_data));
         };
     }
 

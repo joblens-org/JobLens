@@ -53,29 +53,14 @@ class BaseWriter
 {
 public:
     explicit BaseWriter(std::string name, std::string type, std::string config_name);
+    // Derived destructors must call shutdown() before their sink state is destroyed.
     virtual ~BaseWriter();
     virtual void do_shutdown(){}; // 子类可重载
-    void shutdown() {
-        {
-            std::lock_guard lg(mtx_);
-            stop_ = true;
-            need_flush_ = false;
-        }
-        
-        cv_.notify_one();
-        spdlog::info("BaseWriter: shutting down...");
-        if (flush_thread_.joinable()){
-            spdlog::info("BaseWriter: waiting for flush worker to finish...");
-            flush_thread_.join();
-        }
-        flush_buffer(*front_);
-        do_shutdown();
-        spdlog::info("BaseWriter: shutdown complete for writer '{}'", name_);
-    }
+    void shutdown();
 
     void on_finish(std::string collect_name,
-                   const Job job,
-                   const std::any data,
+                   Job job,
+                   std::any data,
                    std::chrono::system_clock::time_point ts);
 
     OnFinish get_onFinishCallback();
@@ -119,7 +104,8 @@ private:
     
     void flush_worker();
     void flush_buffer(const Buffer& buf);
-    void trigger_async_flush();
+    void enqueue(std::string collect_name, Job job, std::any data,
+                 std::chrono::system_clock::time_point ts);
     
     const std::size_t buf_capacity_;
     std::unique_ptr<Buffer> front_;
@@ -127,12 +113,15 @@ private:
 
     std::mutex mtx_;
     std::condition_variable cv_;
-    std::thread flush_thread_;
+    std::mutex shutdown_mtx_;
     bool stop_ = false;
     bool need_flush_ = false;
 
     //perf
     std::unique_ptr<PerfCounter> perf_;
-    bool use_perf;
+    bool use_perf = false;
+
+    // Start only after every field used by the worker has been initialized.
+    std::thread flush_thread_;
 
 };

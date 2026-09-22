@@ -14,6 +14,7 @@
 // icollector.h
 #pragma once
 #include <string>
+#include <utility>
 #include "core/collector_type.h"
 #include <nlohmann/json.hpp>
 
@@ -40,7 +41,7 @@ public:
             return nullptr;
         }
         return [legacy](const WriterParseContext& /*ctx*/, std::any data) {
-            return legacy(data);
+            return legacy(std::move(data));
         };
     }
 
