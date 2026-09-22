@@ -87,15 +87,21 @@ private:
     bool init_ebpf();
     void deinit_ebpf();
     // 周期缓存：DUMP_TTL 内共享一次全表遍历
-    void refresh_dump_cache_if_needed();
+    bool refresh_dump_cache_if_needed(bool force = false);
     // 清理已死且已输出过的短命进程的 eBPF 条目
-    void cleanup_dead_pids(uint64_t job_id);
+    bool cleanup_dead_pids(uint64_t job_id, std::unordered_map<pid_t, bool>& pid_liveness,
+                          bool fresh_dump);
 
     // false 时输出仅含 Job 级聚合（processes/files 明细为空）。
     // 短命进程状态机与 job_fd_stat 条目清理仍持续运行，不受此开关影响。
     bool include_process_details{true};
     // 短命进程生命周期状态
-    struct EphemeralState { uint64_t output_count{0}; bool alive{false}; };
+    struct EphemeralState {
+        uint64_t output_count{0};
+        bool alive{false};
+        bool complete_sample{false}; // A partial dump may omit still-unseen FDs.
+        std::unordered_map<uint32_t, rw_stat> emitted_fds; // Only populated for dead PIDs.
+    };
     using ProcessIoSnapshot = std::unordered_map<pid_t, IoCounters>;
     using FileIoSnapshot = std::unordered_map<std::string, IoCounters>;
     using FileProcessIoSnapshot = std::unordered_map<std::string, std::unordered_map<pid_t, IoCounters>>;
@@ -110,6 +116,7 @@ private:
     // 周期遍历缓存
     static constexpr int DUMP_TTL_MS = 200;
     std::chrono::steady_clock::time_point last_dump_time_{};
+    bool dump_cache_valid_{false};
     std::vector<job_pid_fd_key> dump_keys_;
     std::vector<rw_stat> dump_vals_;
     JobFdIndex dump_index_;

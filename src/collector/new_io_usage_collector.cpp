@@ -26,6 +26,8 @@
 #include <optional>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
+#include <cstring>
 #include <utility>
 
 AUTO_REGISTER_JOB_COLLECTOR(
@@ -144,6 +146,7 @@ void NewIOUsageCollector::deinit() noexcept{
     dump_keys_.clear();
     dump_vals_.clear();
     dump_index_.clear();
+    dump_cache_valid_ = false;
     known_pids_.clear();
     last_job_time_.clear();
     last_proc_io_.clear();
@@ -154,38 +157,68 @@ void NewIOUsageCollector::deinit() noexcept{
     spdlog::info("NewIOUsageCollector deinit");
 }
 
-void NewIOUsageCollector::refresh_dump_cache_if_needed(){
+bool NewIOUsageCollector::refresh_dump_cache_if_needed(bool force){
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_dump_time_).count();
-    if (elapsed < DUMP_TTL_MS && !dump_keys_.empty()) return;
+    if (!force && elapsed < DUMP_TTL_MS && dump_cache_valid_) return false;
 
+    std::vector<job_pid_fd_key> keys;
+    std::vector<rw_stat> values;
+    bool complete = false;
     EbpfCommon::lookup_hashmap_batch<job_pid_fd_key, rw_stat>(
-        bpf_obj_, jobfdstat_map_name, dump_keys_, dump_vals_);
-    dump_index_.rebuild(dump_keys_);
+        bpf_obj_, jobfdstat_map_name, keys, values, 1024, &complete);
+    JobFdIndex index;
+    index.rebuild(keys);
+    dump_keys_ = std::move(keys);
+    dump_vals_ = std::move(values);
+    dump_index_ = std::move(index);
+    dump_cache_valid_ = complete;
     spdlog::debug("NewIOUsageCollector: fd cache refreshed keys={} values={} cache_age_ms={}",
                   dump_keys_.size(), dump_vals_.size(), elapsed);
     last_dump_time_ = now;
+    return true;
 }
 
 // 清理已死且已输出过的短命进程的 eBPF 条目（保证"至少输出一次"后延迟清理）
-void NewIOUsageCollector::cleanup_dead_pids(uint64_t job_id){
+bool NewIOUsageCollector::cleanup_dead_pids(uint64_t job_id, std::unordered_map<pid_t, bool>& pid_liveness,
+                                            bool fresh_dump){
     auto known_it = known_pids_.find(job_id);
-    if (known_it == known_pids_.end()) return;
+    if (known_it == known_pids_.end()) return false;
 
-    std::vector<pid_t> to_cleanup;
+    std::unordered_set<pid_t> to_cleanup;
     for (const auto& [pid, st] : known_it->second){
-        if (!st.alive && st.output_count >= 1){
-            to_cleanup.push_back(pid);
+        if (!st.alive && st.output_count >= 1 && st.complete_sample){
+            // A numeric PID may have been reused since the completed sample.
+            // Reuse this query during aggregation so each PID is checked once.
+            const bool alive = Utils::is_process_running(pid);
+            pid_liveness.emplace(pid, alive);
+            if (!alive) to_cleanup.insert(pid);
         }
     }
     if (to_cleanup.empty()){
         if (known_it->second.empty()) known_pids_.erase(known_it);
-        return;
+        return false;
     }
+    // A replacement may also have exited between rounds. Refresh a reused
+    // cache and compare the actual returned records before authorizing cleanup.
+    if (!fresh_dump) refresh_dump_cache_if_needed(true);
+    if (!dump_cache_valid_) return false;
+    for (const auto i : dump_index_.entries(job_id)) {
+        const pid_t pid = static_cast<pid_t>(dump_keys_[i].pid);
+        if (!to_cleanup.count(pid)) continue;
+        const auto& emitted = known_it->second.at(pid).emitted_fds;
+        const auto previous = emitted.find(dump_keys_[i].fd);
+        if (previous == emitted.end() ||
+            std::memcmp(&previous->second, &dump_vals_[i], sizeof(rw_stat)) != 0) {
+            // Keep the whole PID snapshot so rates and process totals include
+            // both previously observed and newly arrived FD records.
+            to_cleanup.erase(pid);
+        }
+    }
+    if (to_cleanup.empty()) return false;
     bool cache_changed = false;
     for (const auto i : dump_index_.entries(job_id)){
-        const auto state = known_it->second.find(static_cast<pid_t>(dump_keys_[i].pid));
-        if (state != known_it->second.end() && !state->second.alive && state->second.output_count >= 1){
+        if (to_cleanup.count(static_cast<pid_t>(dump_keys_[i].pid))){
             EbpfCommon::delete_hashmap_elem<job_pid_fd_key, rw_stat>(
                 bpf_obj_, jobfdstat_map_name, dump_keys_[i]);
             cache_changed = true;
@@ -193,6 +226,7 @@ void NewIOUsageCollector::cleanup_dead_pids(uint64_t job_id){
     }
     for (pid_t pid : to_cleanup){
         known_it->second.erase(pid);
+        pid_liveness.erase(pid);
     }
     if (known_it->second.empty()){
         known_pids_.erase(known_it);
@@ -203,8 +237,10 @@ void NewIOUsageCollector::cleanup_dead_pids(uint64_t job_id){
         dump_keys_.clear();
         dump_vals_.clear();
         dump_index_.clear();
+        dump_cache_valid_ = false;
         last_dump_time_ = std::chrono::steady_clock::time_point{};
     }
+    return cache_changed;
 }
 
 CollectResult NewIOUsageCollector::collect(const Job& job){
@@ -236,24 +272,33 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
     }
 
     // 4. 刷新周期缓存 + 聚合进程/文件
-    refresh_dump_cache_if_needed();
+    const bool fresh_dump = refresh_dump_cache_if_needed();
+    std::unordered_map<pid_t, bool> pid_liveness;
+    // Only completed samples authorize deletion. Rebuild the cache before
+    // aggregation if cleanup removed data returned by an earlier sample.
+    if (cleanup_dead_pids(job.JobID, pid_liveness, fresh_dump)) refresh_dump_cache_if_needed();
     std::unordered_map<pid_t, std::optional<MountInfoUtils::MountTable>> mount_tables;
+    std::unordered_map<pid_t, std::unordered_map<uint32_t, rw_stat>> dead_snapshots;
     IoAggregationStatus io_status;
     for (const auto i : dump_index_.entries(job.JobID)){
         pid_t pid = static_cast<pid_t>(dump_keys_[i].pid);
-        u32 fd = dump_keys_[i].fd;
-        const rw_stat& s = dump_vals_[i];
+        auto [alive_it, inserted] = pid_liveness.try_emplace(pid, false);
+        if (inserted) alive_it->second = Utils::is_process_running(pid);
+        if (!alive_it->second) dead_snapshots[pid][dump_keys_[i].fd] = dump_vals_[i];
+        if (!include_process_details) continue;
 
         // 进程级聚合（含短命进程）
+        u32 fd = dump_keys_[i].fd;
+        const rw_stat& s = dump_vals_[i];
         auto& proc = result.processes[pid];
         proc.pid = pid;
         merge_rw_stat_into_io(proc.io, s, io_status);
-        proc.alive = Utils::is_process_running(pid);
+        proc.alive = alive_it->second;
         proc.source = proc.alive ? "alive" : "ephemeral";
 
         // 文件级聚合（仅存活进程能 fd→path；短命进程死后无法反查文件路径）。
         // fd→path 反查（mountinfo/readlink/stat）是明细路径的主要开销，受开关控制。
-        if (include_process_details && proc.alive){
+        if (proc.alive){
             auto mount_table_it = mount_tables.find(pid);
             if (mount_table_it == mount_tables.end()) {
                 mount_table_it = mount_tables.emplace(pid, MountInfoUtils::read_for_pid(pid)).first;
@@ -306,25 +351,7 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
                   job.JobID, include_process_details, dump_keys_.size(), result.processes.size(),
                   result.files.size(), result.job_total.rchar, result.job_total.wchar);
 
-    // 5. 更新短命进程状态 + 延迟清理
-    auto& job_known_pids = known_pids_[job.JobID];
-    for (const auto& [pid, proc] : result.processes){
-        auto& st = job_known_pids[pid];
-        st.output_count++;
-        st.alive = proc.alive;
-    }
-    cleanup_dead_pids(job.JobID);
-
-    // 清空需在状态机/清理之后（它们依赖 processes 的存活信息）；
-    // 第 6 步的明细差分与基线更新随空 map 自然跳过
-    if (!include_process_details){
-        spdlog::debug("NewIOUsageCollector: details disabled job_id={} discarded_processes={} discarded_files={}",
-                      job.JobID, result.processes.size(), result.files.size());
-        result.processes.clear();
-        result.files.clear();
-    }
-
-    // 6. speed 差分（Job 级）
+    // 5. speed 差分（Job 级）
     auto now = std::chrono::steady_clock::now();
     auto it_time = last_job_time_.find(job.JobID);
     if (it_time != last_job_time_.end()){
@@ -378,15 +405,10 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
             }
         }
     }
-    last_job_time_[job.JobID] = now;
-    last_job_io_[job.JobID] = result.job_total;
-
     ProcessIoSnapshot process_snapshot;
     for (const auto& [pid, proc] : result.processes){
         process_snapshot[pid] = proc.io;
     }
-    last_proc_io_[job.JobID] = std::move(process_snapshot);
-
     FileIoSnapshot file_snapshot;
     FileProcessIoSnapshot file_process_snapshot;
     for (const auto& [file_key, file] : result.files){
@@ -396,8 +418,23 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
             process_snapshot_for_file[pid] = proc.io;
         }
     }
+    // Commit related baselines together only after all cancellable work.
+    last_job_time_[job.JobID] = now;
+    last_job_io_[job.JobID] = result.job_total;
+    last_proc_io_[job.JobID] = std::move(process_snapshot);
     last_file_io_[job.JobID] = std::move(file_snapshot);
     last_file_proc_io_[job.JobID] = std::move(file_process_snapshot);
+    if (!pid_liveness.empty()) {
+        auto& job_known_pids = known_pids_[job.JobID];
+        for (const auto& [pid, alive] : pid_liveness) {
+            auto& state = job_known_pids[pid];
+            ++state.output_count;
+            state.alive = alive;
+            state.complete_sample = dump_cache_valid_;
+            if (alive) state.emitted_fds.clear();
+            else state.emitted_fds = std::move(dead_snapshots[pid]);
+        }
+    }
 
     spdlog::debug("NewIOUsageCollector: collection completed job_id={} processes={} files={} read_bytes={} write_bytes={}",
                   job.JobID, result.processes.size(), result.files.size(),
@@ -413,7 +450,7 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
                 j["error"] = "empty data";
                 return j;
             }
-            auto s = std::any_cast<JobIOStat>(data);
+            const auto& s = std::any_cast<const JobIOStat&>(data);
             spdlog::debug("NewIOUsageCollector: ES serialization job_id={} processes={} files={}",
                           s.job_id, s.processes.size(), s.files.size());
             json j;
@@ -438,9 +475,9 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
                     json pj = io_counters_to_json(p.io);
                     pj["pid"] = pid;
                     pj["alive"] = p.alive;
-                    fj["processes"].push_back(pj);
+                    fj["processes"].push_back(std::move(pj));
                 }
-                j["files"].push_back(fj);
+                j["files"].push_back(std::move(fj));
             }
             j["processes"] = json::array();
             for (const auto& [pid, p] : s.processes){
@@ -448,7 +485,7 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
                 pj["pid"] = pid;
                 pj["source"] = p.source;
                 pj["alive"] = p.alive;
-                j["processes"].push_back(pj);
+                j["processes"].push_back(std::move(pj));
             }
             return j;
         };
@@ -459,7 +496,7 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
             if (!data.has_value()){
                 return std::string("NewIOUsageCollector error=empty_data\n");
             }
-            auto s = std::any_cast<JobIOStat>(data);
+            const auto& s = std::any_cast<const JobIOStat&>(data);
             std::ostringstream out;
             out << "NewIOUsageCollector job_id=" << s.job_id
                 << " collect_period=" << s.collect_period
@@ -551,7 +588,7 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
                 ret.JobID = 0;
                 return ret;
             }
-            auto s = std::any_cast<JobIOStat>(data);
+            const auto& s = std::any_cast<const JobIOStat&>(data);
             ret.JobID = static_cast<int>(s.job_id);
             ret.io_rchar_total = static_cast<int64_t>(s.job_total.rchar);
             ret.io_wchar_total = static_cast<int64_t>(s.job_total.wchar);
