@@ -15,6 +15,7 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "writer/prometheus_exporter_writer.hpp"
+#include "writer/batch_parser_cache.hpp"
 #include <spdlog/spdlog.h>
 #include "core/collector_registry.hpp"
 #include "core/writer_manager.hpp"
@@ -40,7 +41,7 @@ PrometheusExporterWriter::PrometheusExporterWriter(const std::string& name,
 }
 
 PrometheusExporterWriter::~PrometheusExporterWriter(){
-
+    shutdown();
 }
 
 enum class PrmxsCollectorType{
@@ -66,35 +67,31 @@ static inline PrmxsCollectorType type2enum(const std::string& type){
 
 void PrometheusExporterWriter::update_job_metrics(const prometheus_job_state& data,const std::string& type){
     if (!data.JobID) return;
+    const auto collector_type = type2enum(type);
+    std::unique_lock lk(mtx_);
     auto& metric = job_metrics_[data.JobID];
-    prometheus_process_state* update_ref;
-    prometheus_process_state new_state = {};
     
     metric.JobID = data.JobID;
     spdlog::trace("PrometheusExporterWriter: update job id: {}", metric.JobID);
     
-    // 这里采用细粒度锁的模式可以获得更高的性能，但要注意并发写的问题
-    // 开始写操作，加锁
-    std::unique_lock lk(mtx_);
-    
-    for(auto& s: data.processes_state){
-        bool push = false;
-        auto pid = s.pid;
-        auto it = std::find_if(metric.processes_state.begin(), metric.processes_state.end(),
-            [pid](prometheus_process_state data_s){
-                return (pid == data_s.pid) ? true : false;
-            });
-        if (it != metric.processes_state.end()){
-            update_ref = &(*it);
-        }else{
-            update_ref = &new_state;
-            update_ref->job_id = data.JobID;
-            update_ref->pid = s.pid;
-            push = true;
+    // Indices survive vector growth and preserve first-seen PID ordering.
+    std::unordered_map<pid_t, std::size_t> process_indices;
+    process_indices.reserve(metric.processes_state.size() + data.processes_state.size());
+    for (std::size_t i = 0; i < metric.processes_state.size(); ++i) {
+        process_indices.emplace(metric.processes_state[i].pid, i);
+    }
+
+    for(const auto& s: data.processes_state){
+        const auto [it, inserted] = process_indices.emplace(s.pid, metric.processes_state.size());
+        if (inserted) {
+            metric.processes_state.emplace_back();
+            metric.processes_state.back().job_id = data.JobID;
+            metric.processes_state.back().pid = s.pid;
         }
-        spdlog::trace("PrometheusExporterWriter: use type {}", static_cast<int>(type2enum(type)));
-        spdlog::trace("PrometheusExporterWriter: update job pid: {}", pid);
-        switch (type2enum(type))
+        auto* update_ref = &metric.processes_state[it->second];
+        spdlog::trace("PrometheusExporterWriter: use type {}", static_cast<int>(collector_type));
+        spdlog::trace("PrometheusExporterWriter: update job pid: {}", s.pid);
+        switch (collector_type)
         {
             case PrmxsCollectorType::CPUMem:
                 update_ref->name = s.name;
@@ -147,21 +144,18 @@ void PrometheusExporterWriter::update_job_metrics(const prometheus_job_state& da
             default:
                 break;
         }
-
-        if(push){
-            metric.processes_state.push_back(*update_ref);
-        }
     }
 
     return;
 }
 
 bool PrometheusExporterWriter::flush_impl(const std::vector<write_data>& batch){
+    BatchParserCache parsers(type_);
     for (const auto& [collect_name, job, any_data, ts] : batch)
     {
         spdlog::trace("PrometheusExporterWriter: get in flush");
         WriterParseContext ctx{name_, type_, config_name_, collect_name, job, ts};
-        auto parser_func = CollectorRegistry::instance().resolveBestParserV2(collect_name, type_);
+        const auto& parser_func = parsers.get(collect_name);
         spdlog::trace("PrometheusExporterWriter: using parser for collector '{}', writer '{}'", collect_name, type_);
         auto collector_type = CollectorRegistry::instance().getCollectorType(collect_name);
         auto parsed = std::any_cast<PrometheusExporterWriter::prometheus_job_state>(parser_func(ctx, any_data));
@@ -188,6 +182,7 @@ void PrometheusExporterWriter::register_rpc_methods() {
     
     // 注册info方法，返回基本信息
     rpc_server_.register_method(name_ + "/info", [this](const json& params) -> json {
+        std::shared_lock lk(mtx_);
         json response = {
             {"name", name_},
             {"type", type_},
@@ -251,8 +246,7 @@ json nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_job_state>::t
     for (const auto& p : j.processes_state)
         proc_array.push_back(nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_process_state>::to_json(p));
 
-    return json{
-        {"JobID",         j.JobID},
-        {"process_state", proc_array}
-    };
+    json result{{"JobID", j.JobID}};
+    result["process_state"] = std::move(proc_array);
+    return result;
 }

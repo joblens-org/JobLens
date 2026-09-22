@@ -2,6 +2,7 @@
 #include "writer/prometheus_exporter_writer.hpp"
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -17,6 +18,43 @@
 
 static void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+static bool stall_diag_reply = false;
+static int transient_diag_sends = 0, transient_diag_receives = 0;
+static int last_diag_fd = -1;
+static bool nonblocking_diag_io = true;
+static bool is_diag_socket(int fd) {
+    int domain = 0;
+    socklen_t size = sizeof(domain);
+    return getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &size) == 0 && domain == AF_NETLINK;
+}
+extern "C" ssize_t __real_send(int, const void*, size_t, int);
+extern "C" ssize_t __wrap_send(int fd, const void* data, size_t length, int flags) {
+    if (is_diag_socket(fd)) {
+        last_diag_fd = fd;
+        nonblocking_diag_io = nonblocking_diag_io && (flags & MSG_DONTWAIT);
+        if (transient_diag_sends > 0) {
+            errno = transient_diag_sends-- == 2 ? EINTR : EAGAIN;
+            return -1;
+        }
+    }
+    return __real_send(fd, data, length, flags);
+}
+extern "C" ssize_t __real_recv(int, void*, size_t, int);
+extern "C" ssize_t __wrap_recv(int fd, void* data, size_t length, int flags) {
+    if (is_diag_socket(fd)) {
+        nonblocking_diag_io = nonblocking_diag_io && (flags & MSG_DONTWAIT);
+        if (transient_diag_receives > 0) {
+            --transient_diag_receives;
+            errno = EINTR;
+            return -1;
+        }
+        // Leave a genuine kernel response queued on the timed-out socket.
+        // Recovery must never consume it as the following request's response.
+        if (stall_diag_reply) { errno = EAGAIN; return -1; }
+    }
+    return __real_recv(fd, data, length, flags);
 }
 
 // A narrow syscall fault injection exercises the safe per-PID fallback when
@@ -250,6 +288,13 @@ static void run(bool namespace_race) {
     require(a.sent == b.sent && a.send_rate == b.send_rate, "shared socket was sampled more than once");
     require(second[2].connections[0].sent == second[0].connections[0].sent + second[0].connections[1].sent +
         second[1].connections[0].sent + second[1].connections[1].sent, "legacy process-sum summary changed");
+
+    transient_diag_sends = 2;
+    transient_diag_receives = 1;
+    const auto recovered = std::any_cast<std::vector<NetInfo>>(collector.collect(job));
+    require(recovered.size() == 3 && findConnection(recovered[0], client_inode).sent >= a.sent &&
+            transient_diag_sends == 0 && transient_diag_receives == 0 && nonblocking_diag_io,
+            "netlink did not recover after timeout and EINTR/EAGAIN retries");
 
     deny_namespace_stat = true;
     mark("NET_BEGIN unknown_namespace");

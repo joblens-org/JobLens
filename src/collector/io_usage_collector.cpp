@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "collector/io_usage_collector.hpp"
+#include <memory>
 #include "common/mountinfo_utils.hpp"
 #include <chrono>
 #include <dirent.h>
@@ -293,10 +294,11 @@ CollectResult IOUsageCollector::collect(const Job &job)
         /* 3. 扫描 /proc/pid/fd/ 收集打开的文件 */
         auto mount_table = MountInfoUtils::read_for_pid(pid);
         std::string fd_dir = "/proc/" + std::to_string(pid) + "/fd/";
-        DIR *dir = ::opendir(fd_dir.c_str());
+        const auto close_directory = [](DIR* directory) { ::closedir(directory); };
+        std::unique_ptr<DIR, decltype(close_directory)> dir(::opendir(fd_dir.c_str()), close_directory);
         if (dir) {
             struct dirent *ent;
-            while ((ent = ::readdir(dir))) {
+            while ((ent = ::readdir(dir.get()))) {
                 if (ent->d_name[0] == '.') continue;
                 int fd = std::atoi(ent->d_name);
                 std::string path = fd_to_path(pid, fd);
@@ -344,7 +346,6 @@ CollectResult IOUsageCollector::collect(const Job &job)
                 info.file_info[fd] = std::move(finfo);
                 
             }
-            ::closedir(dir);
         }
 
         result.push_back(info);
@@ -406,7 +407,7 @@ CollectDataParseFunc IOUsageCollector::get_writer_parser(const std::string& writ
                 return ret;
             }
             ret["process_data"] = nlohmann::json::array();
-            auto parsed = std::any_cast<std::vector<IOUsageInfo>>(data);
+            const auto& parsed = std::any_cast<const std::vector<IOUsageInfo>&>(data);
             for (const auto& info : parsed) {
                 nlohmann::json j;
                 j["pid"] = info.pid;
@@ -440,13 +441,13 @@ CollectDataParseFunc IOUsageCollector::get_writer_parser(const std::string& writ
                         fj["write_count"] = finfo.write_count;
                         fj["read_count"] = finfo.read_count;
                     }
-                    files.push_back(fj);
+                    files.push_back(std::move(fj));
                 }
-                j["files"] = files;
+                j["files"] = std::move(files);
                 if (info.pid == 0){
-                    if (summary) ret["summary"] = j;
+                    if (summary) ret["summary"] = std::move(j);
                 }else{
-                    ret["process_data"].push_back(j);
+                    ret["process_data"].push_back(std::move(j));
                 }
             }
             return ret;
@@ -459,7 +460,7 @@ CollectDataParseFunc IOUsageCollector::get_writer_parser(const std::string& writ
                 spdlog::warn("IOUsageInfo: error FileWriter parser, empty data");
                 return std::string("IOUsageCollector error=empty_data\n");
             }
-            auto parsed = std::any_cast<std::vector<IOUsageInfo>>(data);
+            const auto& parsed = std::any_cast<const std::vector<IOUsageInfo>&>(data);
             std::ostringstream out;
             for (const auto& info : parsed) {
                 out << "IOUsageCollector"
@@ -511,7 +512,7 @@ CollectDataParseFunc IOUsageCollector::get_writer_parser(const std::string& writ
                 ret.JobID = 0;
                 return ret;
             }
-            auto parsed = std::any_cast<std::vector<IOUsageInfo>>(data);
+            const auto& parsed = std::any_cast<const std::vector<IOUsageInfo>&>(data);
             
             for (const auto& info : parsed) {
                 PrometheusExporterWriter::prometheus_process_state state;

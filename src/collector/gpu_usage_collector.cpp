@@ -405,8 +405,8 @@ CollectResult GPUUsageCollector::collect(const Job& job) {
     // ---- 阶段0: 按需刷新全局 GPU 缓存 ----
     auto now = std::chrono::steady_clock::now();
     if (gpu_global_cache_.empty() || (now - last_refresh_) > refresh_interval_) {
-        gpu_global_cache_.clear();
-        gpu_global_cache_.reserve(gpu_handles_.size());
+        std::vector<GPUCachedInfo> refreshed_cache;
+        refreshed_cache.reserve(gpu_handles_.size());
         for (size_t gi = 0; gi < gpu_handles_.size(); ++gi) {
             nvmlDevice_t device = gpu_handles_[gi].device;
             GPUCachedInfo cache;
@@ -428,8 +428,9 @@ CollectResult GPUUsageCollector::collect(const Job& job) {
                 cache.gpu_mem_total_bytes = meminfo.total;
             }
 
-            gpu_global_cache_.push_back(cache);
+            refreshed_cache.push_back(cache);
         }
+        gpu_global_cache_ = std::move(refreshed_cache);
         last_refresh_ = now;
     }
 
@@ -479,7 +480,7 @@ CollectDataParseFunc GPUUsageCollector::get_writer_parser(const std::string& wri
                 return ret;
             }
             ret["process_data"] = nlohmann::json::array();
-            auto parsed = std::any_cast<std::vector<GPUProcessUsage>>(data);
+            const auto& parsed = std::any_cast<const std::vector<GPUProcessUsage>&>(data);
 
             for (const auto& pu : parsed) {
                 nlohmann::json j;
@@ -508,14 +509,14 @@ CollectDataParseFunc GPUUsageCollector::get_writer_parser(const std::string& wri
                     dj["gpu_mem_bw_util"] = d.gpu_mem_bw_util;
                     dj["gpu_mem_total_bytes"] = d.gpu_mem_total_bytes;
                     dj["process_type"] = d.process_type;
-                    j["devices"].push_back(dj);
+                    j["devices"].push_back(std::move(dj));
                 }
 
                 // Job 汇总与进程数据分离存放
                 if (pu.pid == 0 && summary) {
-                    ret["summary"] = j;
+                    ret["summary"] = std::move(j);
                 } else {
-                    ret["process_data"].push_back(j);
+                    ret["process_data"].push_back(std::move(j));
                 }
             }
             return ret;
@@ -528,7 +529,7 @@ CollectDataParseFunc GPUUsageCollector::get_writer_parser(const std::string& wri
                 spdlog::warn("GPUUsageCollector: error FileWriter parser, empty data");
                 return std::string("GPUUsageCollector error=empty_data\n");
             }
-            auto parsed = std::any_cast<std::vector<GPUProcessUsage>>(data);
+            const auto& parsed = std::any_cast<const std::vector<GPUProcessUsage>&>(data);
             std::ostringstream out;
             for (const auto& pu : parsed) {
                 out << "GPUUsageCollector"
@@ -571,7 +572,7 @@ CollectDataParseFunc GPUUsageCollector::get_writer_parser(const std::string& wri
                 ret.JobID = 0;
                 return ret;
             }
-            auto parsed = std::any_cast<std::vector<GPUProcessUsage>>(data);
+            const auto& parsed = std::any_cast<const std::vector<GPUProcessUsage>&>(data);
             for (const auto& pu : parsed) {
                 for (const auto& d : pu.devices) {
                     PrometheusExporterWriter::prometheus_process_state state;

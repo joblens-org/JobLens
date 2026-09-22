@@ -43,6 +43,7 @@ public:
     };
 
     explicit KafkaWriter(std::string name, std::string type, std::string config_name);
+    ~KafkaWriter() override;
 protected:
     // 覆写基类
     bool flush_impl(const std::vector<write_data>&) override;
@@ -51,10 +52,10 @@ protected:
 private:
 
     // 工具：把 write_data 序列化成 json string
-    json serialize(const write_data& w);
+    json serialize(const write_data& w, const CollectDataParseFuncV2& parser_func);
 
     Options                              opt_;
-    RdKafka::Producer*                   producer_;
+    RdKafka::Producer*                   producer_ = nullptr;
     std::thread                          worker_;
     std::mutex                           mq_mtx_;
     std::condition_variable              mq_cv_;

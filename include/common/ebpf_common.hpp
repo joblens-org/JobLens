@@ -388,21 +388,23 @@ namespace EbpfCommon{
 
     // 批量遍历 HASH map：一次拉取 batch 条 key/value，避免逐条 get_next_key 的 syscall 开销。
     // 返回拉取到的条目数；返回后 keys/values 大小一致。
+    // complete distinguishes a successful empty snapshot from a failed/partial dump.
     template <typename Key, typename Value>
     size_t lookup_hashmap_batch(const bpf_object* obj,
                                 const std::string& map_name,
                                 std::vector<Key>& keys,
                                 std::vector<Value>& values,
-                                size_t batch_size = 1024)
+                                size_t batch_size = 1024,
+                                bool* complete = nullptr)
     {
+        if (complete) *complete = false;
+        keys.clear();
+        values.clear();
         struct bpf_map* map = bpf_object__find_map_by_name(obj, map_name.c_str());
         if (!map) {
             spdlog::error("lookup_hashmap_batch: map '{}' not found", map_name);
             return 0;
         }
-
-        keys.clear();
-        values.clear();
 
         std::vector<Key> batch_keys(batch_size);
         std::vector<Value> batch_vals(batch_size);
@@ -444,7 +446,10 @@ namespace EbpfCommon{
             keys.insert(keys.end(), batch_keys.begin(), batch_keys.begin() + count);
             values.insert(values.end(), batch_vals.begin(), batch_vals.begin() + count);
             // ENOENT 标记遍历结束，但当前 count 条数据仍有效，必须先追加。
-            if (err == -ENOENT) break;
+            if (err == -ENOENT) {
+                if (complete) *complete = true;
+                break;
+            }
             in_batch = &cursor;
         }
         spdlog::debug("lookup_hashmap_batch: traversal completed map={} entries={} restarts={}",

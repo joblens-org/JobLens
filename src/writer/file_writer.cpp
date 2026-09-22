@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "writer/file_writer.hpp"
+#include "writer/batch_parser_cache.hpp"
 #include "core/writer_manager.hpp"
 #include <spdlog/spdlog.h>
 #include <map>
@@ -168,6 +169,11 @@ FileWriter::FileWriter(std::string name, std::string type, std::string config_na
     spdlog::info("file_writer: opened '{}' in {} mode", options_.path, options_.write_mode);
 }
 
+FileWriter::~FileWriter()
+{
+    shutdown();
+}
+
 std::string FileWriter::resolveDestinationPath(const std::string& collector_name)
 {
     auto it = collector_to_path_.find(collector_name);
@@ -290,17 +296,15 @@ bool FileWriter::flush_impl(const std::vector<write_data>& batch)
     // 第一遍：将每条记录解析为 FileWriter 纯文本块并按目标路径分组
     // 使用有序 map 以保证确定性输出顺序（文件路径为 key）
     std::map<std::string, std::vector<std::string>> path_to_payloads;
+    BatchParserCache parsers(type_);
 
     for (const auto& w : batch)
     {
         const auto& collect_name = std::get<0>(w);
         const auto& any_data     = std::get<2>(w);
 
-        // 构造 V2 parser 上下文，传递 writer 元信息、collector 名称、Job 和时间戳
-        WriterParseContext ctx{name_, type_, config_name_, collect_name, std::get<1>(w), std::get<3>(w)};
-
         std::string payload;
-        auto parser_func = CollectorRegistry::instance().resolveBestParserV2(collect_name, type_);
+        const auto& parser_func = parsers.get(collect_name);
         if (!parser_func) {
             // 如果 collector 没有为当前 writer 注册 parser，仅支持原始 std::string 数据回退。
             spdlog::debug("file_writer: no parser for collector '{}', using raw string fallback", collect_name);
@@ -315,8 +319,9 @@ bool FileWriter::flush_impl(const std::vector<write_data>& batch)
         } else {
             spdlog::trace("file_writer: using parser for collector '{}'", collect_name);
             try {
+                WriterParseContext ctx{name_, type_, config_name_, collect_name, std::get<1>(w), std::get<3>(w)};
                 auto parsed = parser_func(ctx, any_data);
-                payload = std::any_cast<std::string>(parsed);
+                payload = std::any_cast<std::string>(std::move(parsed));
             } catch (const std::exception& e) {
                 spdlog::error("file_writer: failed to parse data for collector '{}': {}", collect_name, e.what());
                 all_success = false;
@@ -522,7 +527,7 @@ bool FileWriter::flush_impl(const std::vector<write_data>& batch)
 void FileWriter::do_shutdown()
 {
     // do_shutdown() 在 BaseWriter::shutdown() 的最后阶段被调用，
-    // 此时 flush worker 已停止，最终缓冲区已通过 flush_buffer(*front_) 刷入 flush_impl。
+    // 此时 flush worker 已排空缓冲区并停止，全部记录已通过 flush_impl 写出。
     // 因此此处的职责仅为：关闭 FileWriter 管理的所有持久化 ofstream 句柄。
     //
     // flush_on_shutdown 语义：

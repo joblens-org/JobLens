@@ -34,6 +34,7 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "collector/power_collector.hpp"
+#include <memory>
 
 #include "core/collector_registry.hpp"
 #include "core/job_registry.hpp"
@@ -84,12 +85,13 @@ using json = nlohmann::json;
 std::string PowerCollector::detect_rapl_base()
 {
     /* Probe for Intel or AMD RAPL. ARM / unknown → empty. */
-    DIR* dp = opendir("/sys/class/powercap");
+    const auto close_directory = [](DIR* directory) { closedir(directory); };
+    std::unique_ptr<DIR, decltype(close_directory)> dp(opendir("/sys/class/powercap"), close_directory);
     if (!dp) return "";
 
     std::string found;
     struct dirent* entry;
-    while ((entry = readdir(dp)) != nullptr) {
+    while ((entry = readdir(dp.get())) != nullptr) {
         std::string name(entry->d_name);
         if (name.rfind("intel-rapl", 0) == 0) {
             found = "/sys/class/powercap/intel-rapl"; break;
@@ -98,7 +100,6 @@ std::string PowerCollector::detect_rapl_base()
             found = "/sys/class/powercap/amd_energy"; break;
         }
     }
-    closedir(dp);
     return found;
 }
 
@@ -113,11 +114,12 @@ uint64_t PowerCollector::read_rapl_uj()
     std::regex pkg_re(R"(intel-rapl:(\d+)$)");
     std::regex amd_re(R"(amd_energy:(\d+)$)");
 
-    DIR* dp = opendir("/sys/class/powercap");
+    const auto close_directory = [](DIR* directory) { closedir(directory); };
+    std::unique_ptr<DIR, decltype(close_directory)> dp(opendir("/sys/class/powercap"), close_directory);
     if (!dp) return 0;
 
     struct dirent* entry;
-    while ((entry = readdir(dp)) != nullptr) {
+    while ((entry = readdir(dp.get())) != nullptr) {
         std::string name(entry->d_name);
         bool is_pkg = std::regex_match(name, pkg_re) ||
                       std::regex_match(name, amd_re);
@@ -131,7 +133,6 @@ uint64_t PowerCollector::read_rapl_uj()
         f >> val;
         total += val;
     }
-    closedir(dp);
     return total;
 }
 
@@ -261,7 +262,7 @@ std::vector<task_cpu_runtime> PowerCollector::read_task_cpu_time()
         result.push_back(tcr);
     }
 
-    /* 批量清空 */
+    /* 批量清空: no throwing checkpoints after consumption until cache commit. */
     if (count > 0) {
         bpf_map_delete_batch(fd, keys_buf.data(), &count, nullptr);
     }
@@ -291,8 +292,6 @@ std::vector<task_cpu_runtime> PowerCollector::read_task_cpu_time_single(
         cur_key = next_key;
     }
 
-    for (const auto& k : keys) bpf_map_delete_elem(fd, k.data());
-
     for (size_t i = 0; i < keys.size(); ++i) {
         struct task_cpu_key tck;
         std::memcpy(&tck, keys[i].data(), sizeof(tck));
@@ -302,6 +301,9 @@ std::vector<task_cpu_runtime> PowerCollector::read_task_cpu_time_single(
         tcr.runtime_ns = values[i];
         result.push_back(tcr);
     }
+    // No cancellation between deleting these counters and returning their
+    // complete sample. The round runner still isolates a slow kernel call.
+    for (const auto& k : keys) bpf_map_delete_elem(fd, k.data());
     return result;
 }
 
@@ -328,6 +330,8 @@ PowerSnapshot PowerCollector::compute_energy(
     snap.delta_rapl_j      = snap.delta_rapl_uj / 1e6;
     snap.core_count        = core_count_;
     snap.core_freqs_mhz    = freqs;
+    snap.cumulative_kwh_total = cumulative_kwh_total_;
+    if (!cached_sample_accounted_) snap.cumulative_kwh_by_job = cumulative_kwh_by_job_;
 
     /* ── total_weighted = interval_s × Σ_cpu freq_mhz ── */
     double sum_freq = 0.0;
@@ -459,13 +463,13 @@ PowerSnapshot PowerCollector::compute_energy(
 
     /* ── Gap 2: Cumulative kWh accumulator (对标 GLASGOW power_plus.py) ── */
     /* ΔE_pkg (J) → kWh */
-    double delta_kwh = snap.delta_rapl_j / 3.6e6;
-    cumulative_kwh_total_ += delta_kwh;
-    snap.cumulative_kwh_total = cumulative_kwh_total_;
-    for (auto& job : snap.jobs) {
-        double job_kwh = job.energy_j / 3.6e6;
-        cumulative_kwh_by_job_[job.job_id] += job_kwh;
-        snap.cumulative_kwh_by_job[job.job_id] = cumulative_kwh_by_job_[job.job_id];
+    // A cache sample is shared by Jobs and retried after cancellation. Charge
+    // its energy once; both returned and internal totals then remain stable.
+    if (!cached_sample_accounted_) {
+        snap.cumulative_kwh_total += snap.delta_rapl_j / 3.6e6;
+        for (const auto& job : snap.jobs) {
+            snap.cumulative_kwh_by_job[job.job_id] += job.energy_j / 3.6e6;
+        }
     }
 
     /* ── Gap 3: IPMI cross-validation log ─────────────────────────────── */
@@ -678,13 +682,17 @@ double PowerCollector::read_ipmi_watts()
 
     double w = 0.0;
     std::string cmd = ipmi_cmd_ + " 2>/dev/null";
-    FILE* fp = popen(cmd.c_str(), "r");
+    std::unique_ptr<FILE, decltype(&pclose)> fp(popen(cmd.c_str(), "r"), pclose);
     if (!fp) return 0.0;
 
     char buf[256];
     std::string output;
-    while (fgets(buf, sizeof(buf), fp)) output += buf;
-    pclose(fp);
+    // popen/fgets/pclose can still wait inside libc; their lifetime is owned
+    // here and the round runner isolates that wait without leaking a child.
+    while (fgets(buf, sizeof(buf), fp.get())) {
+        output += buf;
+    }
+    fp.reset();
 
     /* Parse: "Current Power : 285 Watts" or "Instantaneous power reading: 285 Watts" */
     if (ipmi_cmd_.find("ipmi-dcmi") != std::string::npos) {
@@ -775,23 +783,23 @@ void PowerCollector::deinit() noexcept
 /* ── 刷新全局缓存 (对标 IO/Net: 全量读一次, 后续 collect(Job) 切片取) ── */
 void PowerCollector::refresh_global_cache()
 {
-    auto now = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
     double interval_s = std::chrono::duration<double>(now - last_collect_ts_).count();
-    last_collect_ts_ = now;
     if (interval_s > 60.0 || interval_s <= 0.0) interval_s = 1.0;
-
+    const uint64_t rapl_now = rapl_valid_ ? read_rapl_uj() : 0;
+    auto freqs = read_cpu_freqs_mhz();
+    // This last operation consumes BPF counters. Publish the coherent sample
+    // immediately afterwards, even when deletion itself crossed the deadline.
+    auto tasks = read_task_cpu_time();
     cached_rapl_start_uj_ = last_rapl_uj_;
-    uint64_t rapl_now = rapl_valid_ ? read_rapl_uj() : 0;
     cached_rapl_end_uj_ = rapl_now;
-    if (!(rapl_valid_ && rapl_now >= last_rapl_uj_)) {
-        spdlog::debug("PowerCollector: RAPL wraparound");
-    }
     last_rapl_uj_ = rapl_now;
-
+    last_collect_ts_ = now;
     cached_interval_s_ = interval_s;
-    cached_freqs_ = read_cpu_freqs_mhz();
-    cached_tasks_ = read_task_cpu_time();
+    cached_freqs_ = std::move(freqs);
+    cached_tasks_ = std::move(tasks);
     cache_ts_ = now;
+    cached_sample_accounted_ = false;
     processed_in_cycle_.clear();
 }
 
@@ -801,6 +809,14 @@ PowerSnapshot PowerCollector::extract_job_energy(
     double interval_s, const std::vector<double>& freqs, uint64_t target_job_id)
 {
     PowerSnapshot full = compute_energy(tasks, delta_uj, interval_s, freqs);
+    if (!cached_sample_accounted_) {
+        // All accounting is staged by compute_energy. Commit before any
+        // further cancellable work (especially IPMI), independently of which
+        // Job requested the sample. No checkpoint may split this commit.
+        cumulative_kwh_by_job_.swap(full.cumulative_kwh_by_job);
+        cumulative_kwh_total_ = full.cumulative_kwh_total;
+        cached_sample_accounted_ = true;
+    }
 
     PowerSnapshot snap;
     snap.ts                = full.ts;
@@ -842,7 +858,7 @@ CollectResult PowerCollector::collect(const Job& job)
     double age = std::chrono::duration<double>(now - cache_ts_).count();
 
     /* 缓存过期 → 刷新全局数据 */
-    if (age >= cache_ttl_s_ || cached_tasks_.empty()) {
+    if (cached_sample_accounted_ && (age >= cache_ttl_s_ || cached_tasks_.empty())) {
         refresh_global_cache();
     }
 
@@ -851,7 +867,6 @@ CollectResult PowerCollector::collect(const Job& job)
         spdlog::debug("PowerCollector: collect(job#{}) dedup — jobid already processed this cycle", job.JobID);
         return PowerSnapshot{};
     }
-    processed_in_cycle_.insert(job.JobID);
 
     /* 从缓存提取本 Job 的能耗 */
     uint64_t delta_uj = 0;
@@ -888,6 +903,7 @@ CollectResult PowerCollector::collect(const Job& job)
                   snap.jobs.empty() ? 0.0 : snap.jobs[0].energy_j,
                   snap.delta_rapl_j, snap.interval_s,
                   cached_tasks_.size());
+    processed_in_cycle_.insert(job.JobID);
     return snap;
 }
 
@@ -906,14 +922,15 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
                 return ret;
             }
 
-            PowerSnapshot snap;
+            const PowerSnapshot* snapshot;
             try {
-                snap = std::any_cast<PowerSnapshot>(data);
+                snapshot = &std::any_cast<const PowerSnapshot&>(data);
             } catch (const std::bad_any_cast& e) {
                 spdlog::warn("PowerCollector: bad any_cast in ESWriter parser — {}", e.what());
                 ret["error"] = std::string("bad any_cast: ") + e.what();
                 return ret;
             }
+            const auto& snap = *snapshot;
 
             ret["interval_s"]        = snap.interval_s;
             ret["delta_rapl_j"]      = snap.delta_rapl_j;
@@ -950,13 +967,14 @@ CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer
                 return std::string("PowerCollector error=empty_data\n");
             }
 
-            PowerSnapshot snap;
+            const PowerSnapshot* snapshot;
             try {
-                snap = std::any_cast<PowerSnapshot>(data);
+                snapshot = &std::any_cast<const PowerSnapshot&>(data);
             } catch (const std::bad_any_cast& e) {
                 spdlog::warn("PowerCollector: bad any_cast in FileWriter parser — {}", e.what());
                 return std::string("PowerCollector error=bad_any_cast detail=") + e.what() + "\n";
             }
+            const auto& snap = *snapshot;
 
             std::ostringstream out;
             out << "PowerCollector"

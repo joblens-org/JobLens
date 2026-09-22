@@ -18,7 +18,6 @@
 struct BaseWriter::Buffer
 {
     explicit Buffer(std::size_t reserve) { vec.reserve(reserve); }
-    void push_back(const write_data j) { vec.push_back(j); }
     void clear() { vec.clear(); }
     std::size_t size() const { return vec.size(); }
     std::vector<write_data> vec;
@@ -38,37 +37,43 @@ BaseWriter::BaseWriter(std::string name, std::string type, std::string config_na
 
 BaseWriter::~BaseWriter()
 {
+    shutdown();
+}
+
+void BaseWriter::shutdown()
+{
+    // Serialize shutdown callers so cleanup cannot run before another caller's join.
+    std::lock_guard shutdown_lock(shutdown_mtx_);
     {
         std::lock_guard lg(mtx_);
+        if (stop_) return;
         stop_ = true;
     }
     cv_.notify_one();
     if (flush_thread_.joinable())
         flush_thread_.join();
-
-    flush_buffer(*front_);
+    do_shutdown();
+    spdlog::info("BaseWriter: shutdown complete for writer '{}'", name_);
 }
 
 // -------------------- 公有接口 --------------------
 void BaseWriter::on_finish(std::string collect_name,
-                            const Job job,
-                            const std::any data,
+                            Job job,
+                            std::any data,
                             std::chrono::system_clock::time_point ts)
 {
     spdlog::trace("BaseWriter: on_finish called for writer '{}', collector '{}'", name_, collect_name);
     spdlog::trace("BaseWriter: job info: ID={}", job.JobID);
-    auto t = std::make_tuple(collect_name, job, data, ts);
-    write(std::move(t));
-    trigger_async_flush();
+    enqueue(std::move(collect_name), std::move(job), std::move(data), ts);
 }
 
 OnFinish BaseWriter::get_onFinishCallback()
 {
-    return [this](const std::string& collect_name,
+    return [this](std::string collect_name,
                   const Job& job,
-                  const std::any data,
+                  std::any data,
                   std::chrono::system_clock::time_point ts)
-    { on_finish(collect_name, job, data, ts); };
+    { enqueue(std::move(collect_name), job, std::move(data), ts); };
 }
 
 // -------------------- 保护 / 私有实现 --------------------
@@ -85,23 +90,32 @@ void BaseWriter::on_flush_error(const std::vector<write_data>& batch)
 
 void BaseWriter::write(const write_data& t)
 {
-    
-    spdlog::trace("BaseWriter: write called for writer '{}', collector '{}'", name_, std::get<0>(t));
+    enqueue(std::get<0>(t), std::get<1>(t), std::get<2>(t), std::get<3>(t));
+}
+
+void BaseWriter::enqueue(std::string collect_name, Job job, std::any data,
+                         std::chrono::system_clock::time_point ts)
+{
+    bool notify = false;
     {
         std::lock_guard<std::mutex> lg(mtx_);
-        front_->push_back(t);
+        if (stop_) return;
+        // Construct the const tuple elements in place from owned values. Moving a
+        // completed write_data tuple would copy its const Job/std::any elements.
+        front_->vec.emplace_back(std::move(collect_name), std::move(job), std::move(data), ts);
+        notify = !need_flush_;
+        need_flush_ = true;
     }
-    if (front_->size() >= buf_capacity_)
-        trigger_async_flush();
+    if (notify) cv_.notify_one();
 }
 
 void BaseWriter::flush_worker()
 {
     std::unique_lock<std::mutex> lk(mtx_);
-    while (stop_ == false)
+    for (;;)
     {
         cv_.wait(lk, [this] { return stop_ || need_flush_; });
-        if (stop_){
+        if (stop_ && front_->size() == 0){
             spdlog::info("BaseWriter: flush worker stopping...");
             break;
         }
@@ -150,13 +164,4 @@ void BaseWriter::flush_buffer(const Buffer& buf)
         }
     }
         
-}
-
-void BaseWriter::trigger_async_flush()
-{
-    {
-        std::lock_guard lg(mtx_);
-        need_flush_ = true;
-    }
-    cv_.notify_one();
 }

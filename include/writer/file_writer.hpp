@@ -40,6 +40,7 @@ struct FileWriterOptions {
 class FileWriter : public BaseWriter {
 public:
     explicit FileWriter(std::string name, std::string type, std::string config_name);
+    ~FileWriter() override;
 
 protected:
     bool flush_impl(const std::vector<write_data>& batch) override;

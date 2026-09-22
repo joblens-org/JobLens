@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "writer/kafka_writer.hpp"
+#include "writer/batch_parser_cache.hpp"
 #include "core/collector_registry.hpp"
 #include <chrono>
 #include <sstream>
@@ -114,6 +115,11 @@ KafkaWriter::KafkaWriter(std::string name, std::string type, std::string config_
 }
 
 
+KafkaWriter::~KafkaWriter() {
+    shutdown();
+    delete producer_;
+}
+
 void KafkaWriter::do_shutdown() {
      producer_->flush(10000);
     if (producer_->outq_len() > 0) {
@@ -124,10 +130,11 @@ void KafkaWriter::do_shutdown() {
 
 // -------------------------- flush_impl --------------------------
 bool KafkaWriter::flush_impl(const std::vector<write_data>& batch) {
+    BatchParserCache parsers(type_);
     for (const auto& w : batch) {
         json payload;
         try {
-            payload = serialize(w);
+            payload = serialize(w, parsers.get(std::get<0>(w)));
         } catch (const std::exception& ex) {
             if (opt_.enable_dlq) {
                 std::string dlq = json{
@@ -178,12 +185,9 @@ retry:
 }
 
 // -------------------------- serialize --------------------------
-json KafkaWriter::serialize(const write_data& w) {
+json KafkaWriter::serialize(const write_data& w, const CollectDataParseFuncV2& parser_func) {
     const auto& [collector_name, job, data_any, tp] = w;
 
-    // 使用 V2 parser：resolveBestParserV2() 按 V2 → V1 → nullptr 回退，返回类型安全的 CollectDataParseFuncV2
-    CollectDataParseFuncV2 parser_func = CollectorRegistry::instance()
-        .resolveBestParserV2(collector_name, type_);
     if (!parser_func) {
         spdlog::debug("KafkaWriter: no parser for collector '{}', writer '{}'", collector_name, type_);
         throw std::runtime_error("no parser available");
@@ -196,7 +200,7 @@ json KafkaWriter::serialize(const write_data& w) {
 
     try {
         std::any parsed = parser_func(ctx, data_any);
-        auto parsed_data = std::any_cast<json>(parsed);
+        auto parsed_data = std::any_cast<json>(std::move(parsed));
 
         // 包装 Kafka message envelope（元数据 + 业务数据）
         json wrap = {
@@ -204,9 +208,9 @@ json KafkaWriter::serialize(const write_data& w) {
             {"hostname",      collector_utils::get_hostname()},
             {"@timestamp",  std::chrono::duration_cast<std::chrono::milliseconds>(
                             tp.time_since_epoch()).count()},
-            {"job_info",  job_to_json(job)},
-            {"data",      parsed_data}
+            {"job_info",  job_to_json(job)}
         };
+        wrap["data"] = std::move(parsed_data);
         return wrap.dump();
     } catch (const std::exception& ex) {
         spdlog::error("KafkaWriter: error parsing data for collector '{}', writer '{}': {}",

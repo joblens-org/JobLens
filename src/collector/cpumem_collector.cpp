@@ -74,46 +74,24 @@ void CPUMemCollector::deinit() noexcept {
 }
 
 // 静态函数：读 /proc/stat 获取系统总 jiffies
-static bool read_system_cpu(uint64_t& total)
+static unsigned long long read_system_cpu()
 {
     std::ifstream stat("/proc/stat");
-    if (!stat) return false;
     std::string line;
-    if (!std::getline(stat, line)) return false;
+    std::getline(stat, line);
     std::istringstream iss(line);
     std::string cpu;
-    iss >> cpu;                 // "cpu"
-    uint64_t user, nice, sys, idle, iowait, irq, softirq, steal;
-    iss >> user >> nice >> sys >> idle >> iowait >> irq >> softirq >> steal;
-    total = user + nice + sys + idle + iowait + irq + softirq + steal;
-    return true;
+    iss >> cpu;
+    unsigned long long value, total = 0;
+    while (iss >> value) total += value;
+    return total;
 }
 
-// 静态函数：读 /proc/[pid]/stat 获取进程 jiffies
-static bool read_process_cpu(int pid, uint64_t& utime, uint64_t& stime)
-{
-    std::string path = "/proc/" + std::to_string(pid) + "/stat";
-    std::ifstream sf(path);
-    if (!sf) return false;
-    std::string line;
-    if (!std::getline(sf, line)) return false;
-    // 找第 14、15 字段（utime, stime）
-    // 先跳过第一个括号里的 comm 字段（可能含空格）
-    size_t rpar = line.rfind(')');
-    if (rpar == std::string::npos) return false;
-    std::istringstream iss(line.substr(rpar + 1));
-    uint64_t skip;
-    iss >> skip; // state
-    for (int i = 0; i < 11; ++i) iss >> skip; // 跳过 11 个字段
-    iss >> utime >> stime;
-    return true;
-}
-
-bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info){
+bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info, const CpuSample& sample){
     std::ifstream f(fmt::format("/proc/{}/stat", pid));
     if (!f) return false;
 
-    std::string line, head, tail;
+    std::string line, tail;
     if (!std::getline(f, line)) return false;
 
     auto p1 = line.find('(');
@@ -121,8 +99,6 @@ bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info){
     if (p1 == std::string::npos || p2 == std::string::npos || p2 <= p1)
         return false;
 
-    head = line.substr(0, p1);                 // pid 及之前
-    info.name = line.substr(p1 + 1, p2 - p1 - 1);
     tail = line.substr(p2 + 2);                // 跳过 ") "
 
     std::istringstream iss(tail);
@@ -135,11 +111,12 @@ bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info){
     unsigned long long starttime;
 
     // 顺序把前 20 个字段读掉，我们只用其中 3 个
-    iss >> state >> ppid >> pgrp >> session >> tty_nr >> tpgid
+    if (!(iss >> state >> ppid >> pgrp >> session >> tty_nr >> tpgid
         >> flags >> minflt >> cminflt >> majflt >> cmajflt
         >> utime >> stime >> cutime >> cstime
-        >> priority >> nice >> num_threads >> itrealvalue >> starttime;
+        >> priority >> nice >> num_threads >> itrealvalue >> starttime)) return false;
 
+    info.name = line.substr(p1 + 1, p2 - p1 - 1);
     info.utime = utime;
     info.stime = stime;
     info.starttime = starttime;
@@ -147,22 +124,9 @@ bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info){
     spdlog::trace("CPUOf: pid={} utime={} stime={} starttime={}", pid, info.utime, info.stime, info.starttime);
 
     /* ---- 计算 CPU 百分比 ---- */
-    info.hz = sysconf(_SC_CLK_TCK);      // 每秒 jiffies
-    auto numCores = sysconf(_SC_NPROCESSORS_ONLN);
-    if (info.hz > 0 && numCores > 0) {
-        auto cpuStat = []() -> unsigned long long {   // 取系统总 CPU 时间
-            std::ifstream f("/proc/stat");
-            std::string line;
-            std::getline(f, line);
-            std::istringstream iss(line);
-            std::string _;
-            unsigned long long v, sum = 0;
-            iss >> _;                          
-            while (iss >> v) sum += v;
-            return sum;
-        };
-
-        unsigned long long currTotal = cpuStat();
+    info.hz = sample.hz;
+    if (info.hz > 0 && sample.numCores > 0) {
+        unsigned long long currTotal = sample.total;
         unsigned long long currProc  = info.utime + info.stime;
         auto& cu = pid_state_dict[pid];
         spdlog::trace("use pid:{}",pid);
@@ -172,7 +136,7 @@ bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info){
         spdlog::trace("currTotal={}   currProc={}",currTotal,currProc);
         spdlog::trace("lastTotal={}   lastProc={}",cu.lastTotal,cu.lastProc);
         if (deltaTotal > 0) {
-            info.cpuPercent = 100.0 * double(deltaProc) / double(deltaTotal) * numCores;
+            info.cpuPercent = 100.0 * double(deltaProc) / double(deltaTotal) * sample.numCores;
         } else {
             info.cpuPercent = 0.0;
         }
@@ -259,22 +223,21 @@ std::string get_process_name(int pid)
     return name;                   // 返回空串表示内核线程或异常
 }
 
-bool CPUMemCollector::BaseInfo(int pid, CPUMemInfo& info) {
-    info.pid = pid;
-    info.name = get_process_name(pid);
-    return true;
-}
-
 CollectResult CPUMemCollector::collect(const Job& job) {
     std::vector<CPUMemInfo> infos;
+    // CLK_TCK is invariant; online cores and CPU counters can change between Jobs.
+    static const long clock_ticks = sysconf(_SC_CLK_TCK);
+    CpuSample sample{clock_ticks, sysconf(_SC_NPROCESSORS_ONLN), 0};
+    if (sample.hz > 0 && sample.numCores > 0) sample.total = read_system_cpu();
+    infos.reserve(job.JobPIDs.size() + (summary ? 1 : 0));
     for (int pid : job.JobPIDs) {
         if (! Utils::is_process_running(pid)){
             continue;
         }
         CPUMemInfo info;
         if (pid <= 0) continue;
-        BaseInfo(pid, info);
-        CPUOf(pid, info);
+        info.pid = pid;
+        if (!CPUOf(pid, info, sample)) info.name = get_process_name(pid);
         MemOf(pid, info);
         if (!info.pid) continue;
         // job.JobInfo[fmt::format("proc_info_{}", pid)] = info.get();
@@ -315,7 +278,7 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
                 return ret;
             }
             ret["process_data"] = nlohmann::json::array();
-            auto parsed = std::any_cast<std::vector<CPUMemInfo>>(data);
+            const auto& parsed = std::any_cast<const std::vector<CPUMemInfo>&>(data);
             spdlog::trace("CPUMemCollector: parsing data for ESWriter, data length={}", parsed.size());
             for (const auto& info : parsed) {
                 
@@ -334,12 +297,14 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
                 j["mem_peak_rss_kb"] = info.mem_peak_rss_kb;
                 j["memoryPercent"] = info.memoryPercent;
                 j["numThreads"] = info.numThreads;
-                spdlog::trace("CPUMemCollector: parsed data: {}", j.dump());
+                if (spdlog::should_log(spdlog::level::trace)) {
+                    spdlog::trace("CPUMemCollector: parsed data: {}", j.dump());
+                }
 
                 if(info.pid == 0){
-                    if (summary) ret["summary"] = j;
+                    if (summary) ret["summary"] = std::move(j);
                 }else{
-                    ret["process_data"].push_back(j);
+                    ret["process_data"].push_back(std::move(j));
                 }
                 
             }
@@ -355,7 +320,7 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
                 return ret.dump() + "\n";
             }
             ret["process_data"] = nlohmann::json::array();
-            auto parsed = std::any_cast<std::vector<CPUMemInfo>>(data);
+            const auto& parsed = std::any_cast<const std::vector<CPUMemInfo>&>(data);
             spdlog::trace("CPUMemCollector: parsing data for FileWriter, data length={}", parsed.size());
             for (const auto& info : parsed) {
                 nlohmann::json j;
@@ -374,9 +339,9 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
                 j["memoryPercent"] = info.memoryPercent;
                 j["numThreads"] = info.numThreads;
                 if(info.pid == 0){
-                    ret["summary"] = j;
+                    ret["summary"] = std::move(j);
                 }else{
-                    ret["process_data"].push_back(j);
+                    ret["process_data"].push_back(std::move(j));
                 }
             }
             return ret.dump() + "\n";
@@ -393,7 +358,7 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
             if (summary){
                 spdlog::trace("PrometheusExporterWriter Parser in summary mode");
             }
-            auto parsed = std::any_cast<std::vector<CPUMemInfo>>(data);
+            const auto& parsed = std::any_cast<const std::vector<CPUMemInfo>&>(data);
             for (const auto& info : parsed) {
                 PrometheusExporterWriter::prometheus_process_state state;
                 spdlog::trace("CollectDataParseFunc CPUMemCollector parse pid: {}", info.pid);
@@ -423,7 +388,7 @@ CollectDataParseFuncV2 CPUMemCollector::get_writer_parser_v2(const std::string& 
                 return ret.dump() + "\n";
             }
             ret["process_data"] = nlohmann::json::array();
-            auto parsed = std::any_cast<std::vector<CPUMemInfo>>(data);
+            const auto& parsed = std::any_cast<const std::vector<CPUMemInfo>&>(data);
             spdlog::trace("CPUMemCollector: V2 parsing data for FileWriter, data length={}", parsed.size());
             for (const auto& info : parsed) {
                 nlohmann::json j;
@@ -442,9 +407,9 @@ CollectDataParseFuncV2 CPUMemCollector::get_writer_parser_v2(const std::string& 
                 j["memoryPercent"] = info.memoryPercent;
                 j["numThreads"] = info.numThreads;
                 if (info.pid == 0) {
-                    ret["summary"] = j;
+                    ret["summary"] = std::move(j);
                 } else {
-                    ret["process_data"].push_back(j);
+                    ret["process_data"].push_back(std::move(j));
                 }
             }
             // V2 上下文信息注入 — 作为概念验证，在输出中附加 writer/collector 上下文
