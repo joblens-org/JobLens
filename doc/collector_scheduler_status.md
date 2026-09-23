@@ -1,6 +1,12 @@
 # Collector scheduler status (core RPC)
 
-Read-only core Unix-socket methods; no Trigger/HTTP endpoint is added.
+Read-only core Unix-socket methods. Trigger exposes the bounded HTTP bridge
+`GET /joblens/collectors/status`, which forwards only
+`CollectorScheduler/status` with empty parameters and returns its successful
+payload unchanged. It does not proxy arbitrary core methods or configuration.
+If the core does not implement this method, the bridge returns HTTP 501 with
+`{"status":"error","code":"unsupported","supported":false}`. An unavailable
+RPC connection returns HTTP 503; a core error response returns HTTP 502.
 Send one JSON object per connection. The server returns the result directly,
 without a JSON-RPC `result` envelope, then closes the connection.
 

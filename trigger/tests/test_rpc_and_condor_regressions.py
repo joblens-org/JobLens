@@ -13,6 +13,81 @@ from trigger.core import tools
 from trigger.core.rpc_client import RPCClient, RPCError
 
 
+class CollectorStatusRPCClient:
+    def __init__(self, response: object | None = None, error: Exception | None = None) -> None:
+        self.response = response
+        self.error = error
+        self.calls: list[tuple[str, object | None]] = []
+
+    def call(self, method: str, params: object | None = None) -> object:
+        self.calls.append((method, params))
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def _collector_status_app(rpc_client: CollectorStatusRPCClient) -> Flask:
+    app = Flask(__name__)
+    register_routes(app, rpc_client, None, None, None)
+    return app
+
+
+def test_collectors_status_forwards_core_status_payload_unchanged() -> None:
+    core_status = {
+        "status": "ok",
+        "lifecycle": "running",
+        "observed_at_unix_ms": 123456789,
+        "collector_count": 1,
+        "collectors_with_error": 0,
+        "active_callback_count": 0,
+        "collectors": [{"name": "proc", "operations": {"collect": {"success_count": 4}}}],
+    }
+    rpc_client = CollectorStatusRPCClient(response=core_status)
+
+    response = _collector_status_app(rpc_client).test_client().get("/joblens/collectors/status")
+
+    assert response.status_code == 200
+    assert response.get_json() == core_status
+    assert rpc_client.calls == [("CollectorScheduler/status", {})]
+
+
+def test_collectors_status_returns_structured_unsupported_result_when_method_is_missing() -> None:
+    rpc_client = CollectorStatusRPCClient(error=RPCError("method not found: CollectorScheduler/status"))
+
+    response = _collector_status_app(rpc_client).test_client().get("/joblens/collectors/status")
+
+    assert response.status_code == 501
+    assert response.get_json() == {
+        "status": "error",
+        "code": "unsupported",
+        "supported": False,
+        "message": "CollectorScheduler/status is not supported by this JobLens core",
+    }
+
+
+def test_collectors_status_returns_503_when_rpc_is_unreachable() -> None:
+    rpc_client = CollectorStatusRPCClient(error=RPCError("Socket file not found: /var/JobLens/rpc.sock"))
+
+    response = _collector_status_app(rpc_client).test_client().get("/joblens/collectors/status")
+
+    assert response.status_code == 503
+    assert response.get_json()["status"] == "error"
+    assert response.get_json()["code"] == "rpc_unavailable"
+
+
+def test_collectors_status_returns_502_for_core_error_response() -> None:
+    rpc_client = CollectorStatusRPCClient(response={"status": "error", "code": "scheduler_failed", "msg": "snapshot failed"})
+
+    response = _collector_status_app(rpc_client).test_client().get("/joblens/collectors/status")
+
+    assert response.status_code == 502
+    assert response.get_json() == {
+        "status": "error",
+        "code": "core_error",
+        "message": "snapshot failed",
+    }
+
+
 def _serve_once(socket_path: str, response: object) -> threading.Thread:
     def server() -> None:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:

@@ -425,7 +425,40 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             return abort(500, description=f"Unexpected error: {str(e)}")
     
     # ==================== Collector接口 ====================
-    
+
+    @app.route('/joblens/collectors/status', methods=['GET'])
+    def collectors_status():
+        """返回核心 CollectorScheduler 的只读状态快照。"""
+        try:
+            result = rpc_call("CollectorScheduler/status", {})
+        except RPCError as e:
+            if "method not found" in str(e).lower():
+                return jsonify({
+                    "status": "error",
+                    "code": "unsupported",
+                    "supported": False,
+                    "message": "CollectorScheduler/status is not supported by this JobLens core",
+                }), 501
+            return jsonify({
+                "status": "error",
+                "code": "rpc_unavailable",
+                "message": "CollectorScheduler/status is unavailable",
+            }), 503
+
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            message = (
+                result.get("msg", "CollectorScheduler/status returned an invalid response")
+                if isinstance(result, dict)
+                else "CollectorScheduler/status returned an invalid response"
+            )
+            return jsonify({
+                "status": "error",
+                "code": "core_error",
+                "message": message,
+            }), 502
+
+        return jsonify(result)
+
     @app.route('/joblens/collectors/perf', methods=['GET'])
     def collectors_perf():
         """获取所有 Collector 的性能统计信息"""
