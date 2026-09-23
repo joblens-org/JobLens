@@ -1,5 +1,34 @@
 # JobLens Changelog
 
+## v0.3.4 (2026-09-23)
+
+### Collector Correctness and CPU Accounting
+- Fixed `CPUMemCollector` reporting astronomical `cpuPercent` values (up to ~1e15) when a PID was recycled: track per-PID `starttime`, reset the baseline on PID reuse, skip the delta when `utime+stime` regresses, and compute the `/proc/stat` delta once per cycle instead of per PID, preventing unsigned 64-bit underflow across jobs sharing the singleton collector (`9c3775e`).
+- Fixed `NewIOUsageCollector` deleting still-unseen FDs when a dump was partial or a PID was reused: track dump completeness and compare emitted FDs before removing entries (`3a97014`).
+- Commit rate baselines only after all cancellable work, use RAII for netlink and directory handles, and charge a consumed power sample once per cycle across jobs (`5da4536`).
+- Added `cluster_name` and `clusterTag` to persisted job information for both Condor and Slurm (`e1695a6`).
+
+### Collector Performance and Robustness
+- Read the system CPU counters once per Job and cache `CLK_TCK`; use non-blocking netlink with `EINTR`/`EAGAIN` retries in the socket-backed collectors (`1a393fe`).
+- Refactored `NetUsageCollector` to track connection state in an `unordered_map`, parse `/proc/net` with `string_view`, and add socket namespace management and error handling (`f8d2160`).
+- Downgraded high-frequency per-sample `debug` logs to `trace` across collectors and writers (`7e690b0`).
+
+### Writer Performance
+- Removed redundant `std::any`/JSON/tuple copies, resolve each collector's parser once per flush through a shared batch parser cache, index Prometheus PIDs while preserving output order, and drain accepted records on explicit shutdown or destruction (`d3279a0`).
+
+### Regression Coverage
+- Added a `CPUMemCollector` regression that fabricates `/proc/<pid>/stat` to cover PID reuse, counter regression, and normal growth.
+- Added `NetUsageCollector` integration coverage for connection ownership, socket sharing, netlink/namespace races, and writer compatibility, plus a runnable entry point (`f8d2160`, `1a393fe`).
+- Extended `NewIOUsage` cache regression for dump completeness, PID reuse, and same-PID cross-job isolation (`3a97014`).
+- Added `PowerCollector` cache regression covering per-cycle energy accounting across jobs (`5da4536`).
+- Added writer hot-path regressions for byte batching, buffering, and parser forwarding (`d3279a0`).
+
+### Validation Scope
+- Local verification: `cmake` + Ninja `RelWithDebInfo` build and `cpack -G TGZ` succeeded. The `CPUMemCollector` PID-reuse regression was confirmed to fail against the pre-fix code and pass after the fix.
+- Unified RPM/TGZ packaging and cross-distro checks are performed by the `Release` workflow on the `ver-0.3.4` tag; they are not part of this local validation.
+
+---
+
 ## v0.3.3 (2026-09-16)
 
 ### Elasticsearch Writer Delivery Hardening
