@@ -50,11 +50,14 @@ private:
         long hz;
         long numCores;
         unsigned long long total;
+        unsigned long long deltaTotal;
     };
     bool CPUOf(int pid, CPUMemInfo& info, const CpuSample& sample);
     bool MemOf(int pid, CPUMemInfo& info);
     bool inited = false;
     bool summary = false;
+    // 上一次采集周期读到的系统总 jiffies；/proc/stat 为全机共享，不按 PID 缓存
+    unsigned long long lastSystemTotal = 0;
 
     long getTotalPhysMemKB()
     {
@@ -69,8 +72,8 @@ private:
     long PhysMemKB = getTotalPhysMemKB();
 
     struct pid_state{
-        unsigned long long lastTotal{};
         unsigned long long lastProc{};
+        unsigned long long lastStarttime{};
     };
     std::unordered_map<int, pid_state> pid_state_dict;
 
