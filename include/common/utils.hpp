@@ -65,8 +65,8 @@ namespace Utils
 
         std::istringstream iss(line.substr(last_rparen + 1));
         pid_t ppid;
-        std::string dummy;
-        iss >> dummy >> dummy >> ppid;   // skip state, then ppid
+        std::string state;
+        iss >> state >> ppid;   // 字段序: state ppid pgrp ...; 多读一个会取到 pgrp
         return ppid;
     }
 
