@@ -178,6 +178,86 @@ def get_storage_static():
     
     return devices
 
+# 显示控制器 PCI class code：0300 VGA / 0301 XGA / 0302 3D / 0380 Other display
+DISPLAY_PCI_CLASS_CODES = {"0300", "0301", "0302", "0380"}
+
+# BMC 显卡厂商 ID（服务器管理芯片自带的显示输出，并非计算 GPU）
+BMC_GPU_VENDOR_IDS = {
+    "102b",  # Matrox Electronics Systems Ltd.
+    "1a03",  # ASPEED Technology, Inc.
+    "19e5",  # Huawei Technologies（Hi171x 系列 iBMC）
+}
+
+# 部分 BMC 显卡厂商 ID 不稳定，辅以名称关键字过滤
+BMC_GPU_NAME_KEYWORDS = ("matrox", "aspeed", "serverengines", "ibmc", "hi171")
+
+
+def _get_gpus_from_lspci():
+    """兜底方案：通过 lspci 按 PCI class code 精确匹配显示控制器。
+
+    仅保留 VGA/3D/Display 类的设备，避免旧实现用文本 grep ``(vga|3d|display)``
+    误伤 NVMe 名称中的 "3DNAND"、PCI bridge 的 "Root Port 3d"；
+    同时排除 Matrox/ASPEED/Huawei iBMC 等 BMC 显卡（同为 VGA 控制器但非计算 GPU）。
+    """
+    # -nn 会同时输出 class code（如 [0300]）与 vendor:device ID（如 [10de:2204]）
+    lspci = run_cmd(
+        "lspci -nn -d '::0300' -d '::0301' -d '::0302' -d '::0380' 2>/dev/null",
+        ""
+    )
+    # 旧版 lspci 可能不支持多次 -d，回退到全量输出后自行按 class 过滤
+    if not lspci:
+        lspci = run_cmd("lspci -nn 2>/dev/null", "")
+
+    gpus = []
+    for line in lspci.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+
+        # 1. 校验 class code，只保留显示控制器
+        class_match = re.search(r'\[([0-9a-fA-F]{4})\]:', line)
+        if not class_match or class_match.group(1) not in DISPLAY_PCI_CLASS_CODES:
+            continue
+
+        # 2. 提取 vendor:device ID（class bracket 不含冒号，不会被误取）
+        ids = re.findall(r'\[([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\]', line)
+        vendor_id = ids[-1][0].lower() if ids else ""
+
+        # 3. 排除 BMC 显卡
+        lower = line.lower()
+        if vendor_id in BMC_GPU_VENDOR_IDS or any(
+            kw in lower for kw in BMC_GPU_NAME_KEYWORDS
+        ):
+            continue
+
+        # 4. 解析型号：class bracket 之后、vendor:device bracket 之前的文本
+        #    lspci 结尾可能是 "[10de:2204] (rev a1)" 的任意顺序组合，循环剥离
+        model = line[class_match.end():].lstrip(': ').strip()
+        for _ in range(3):
+            model = re.sub(r'\s*\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]\s*$', '', model)
+            model = re.sub(r'\s*\(rev\s+[0-9a-fA-F]+\)\s*$', '', model)
+        model = model.strip()
+
+        # 5. 判定 vendor（使用词边界，避免 "ati" 匹配到子串）
+        if vendor_id == "10de" or re.search(r'\bnvidia\b', lower):
+            vendor = "NVIDIA"
+        elif vendor_id in ("1002", "1022") or re.search(r'\b(amd|ati)\b', lower):
+            vendor = "AMD"
+        elif vendor_id == "8086" or re.search(r'\bintel\b', lower):
+            vendor = "Intel"
+        else:
+            vendor = "Unknown"
+
+        gpus.append({
+            "vendor": vendor,
+            "model": model,
+            "bus_id": line.split()[0],
+            "raw_pci_info": line,
+        })
+
+    return gpus
+
+
 def get_gpu_static():
     """获取GPU型号信息"""
     gpus = []
@@ -210,29 +290,10 @@ def get_gpu_static():
                 if match:
                     gpus.append({"vendor": "AMD", "model": match.group(1).strip()})
     
-    # 3. 通用方法：lspci 查找 VGA/3D/Display 控制器
+    # 3. 通用兜底：lspci 按 PCI class code 精确匹配显示控制器
     if not gpus:
-        lspci = run_cmd("lspci | grep -iE '(vga|3d|display)'", "")
-        for line in lspci.split('\n'):
-            if line:
-                # 格式示例：01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3090] (rev a1)
-                match = re.search(r':\s*(.+?)(?:\s*\(|$)', line)
-                if match:
-                    model = match.group(1).strip()
-                    vendor = "Unknown"
-                    if "nvidia" in line.lower():
-                        vendor = "NVIDIA"
-                    elif "amd" in line.lower() or "ati" in line.lower():
-                        vendor = "AMD"
-                    elif "intel" in line.lower():
-                        vendor = "Intel"
-                    
-                    gpus.append({
-                        "vendor": vendor,
-                        "model": model,
-                        "raw_pci_info": line
-                    })
-    
+        gpus = _get_gpus_from_lspci()
+
     return gpus
 
 def get_network_static():
