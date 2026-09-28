@@ -102,6 +102,14 @@ class RPCFunctionsResponse(BaseModel):
     count: int = Field(..., description="函数数量")
 
 
+class PidTrackerStatsResponse(BaseModel):
+    """pid 归属追踪状态与 job_event ringbuf 统计响应"""
+    status: str = Field(..., description="响应状态")
+    running: bool = Field(..., description="归属追踪线程是否运行")
+    pushed_events: int = Field(..., description="ringbuf 累计成功入队事件数")
+    dropped_events: int = Field(..., description="ringbuf 累计溢出丢弃事件数")
+
+
 class CollectorsPerfResponse(BaseModel):
     """Collector性能统计响应 - 动态字段"""
     model_config = {"extra": "allow"}

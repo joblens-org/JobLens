@@ -39,7 +39,7 @@ try:
         ConfigUpdateResponse, ConfigStatusResponse,
         RegistryStatusResponse, RegistryRegisterResponse,
         RulesListResponse, RulesSyncResponse, RuleStatusResponse,
-        VersionResponse, UpgradeResponse, HardwareInfoResponse
+        VersionResponse, UpgradeResponse, HardwareInfoResponse, PidTrackerStatsResponse
     )
 except ImportError:
     from trigger.api.schemas import (
@@ -50,7 +50,7 @@ except ImportError:
         ConfigUpdateResponse, ConfigStatusResponse,
         RegistryStatusResponse, RegistryRegisterResponse,
         RulesListResponse, RulesSyncResponse, RuleStatusResponse,
-        VersionResponse, UpgradeResponse, HardwareInfoResponse
+        VersionResponse, UpgradeResponse, HardwareInfoResponse, PidTrackerStatsResponse
     )
 
 # 升级接口的访问 token，建议从环境变量读取，默认为空表示不校验
@@ -424,6 +424,20 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         except Exception as e:
             return abort(500, description=f"Unexpected error: {str(e)}")
     
+    # ==================== pid 归属追踪接口 ====================
+
+    @app.route('/joblens/pid_tracker/stats', methods=['GET'])
+    def pid_tracker_stats():
+        """获取 pid 归属追踪状态与 job_event ringbuf 入队/丢弃计数"""
+        try:
+            result = rpc_call("JobRegistry/pid_tracker_stats")
+            response = PidTrackerStatsResponse.model_validate(result)
+            return jsonify(response.model_dump())
+        except RPCError as e:
+            return abort(503, description=f"Failed to get pid tracker stats: {str(e)}")
+        except Exception as e:
+            return abort(500, description=f"Unexpected error: {str(e)}")
+
     # ==================== Collector接口 ====================
     
     @app.route('/joblens/collectors/perf', methods=['GET'])
