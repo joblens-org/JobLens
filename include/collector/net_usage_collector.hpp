@@ -73,7 +73,9 @@ public:
     CollectResult collect(const Job& job) override;
     void deinit() noexcept override;
     CollectDataParseFunc get_writer_parser(const std::string& writer_type);
-    
+
+    static size_t ConnectionHash(const Connection& c);
+
 private:
     void init_netlink();
     int query_single_tcp(Connection& conn); //使用netlink机制查询
@@ -85,12 +87,18 @@ private:
     bool netlink_requested = false;
     uint32_t query_sequence = 0;
 
+    friend struct NetUsageCollectorTestAccess;
+
+    static double SafeRate(uint64_t current, uint64_t previous, double seconds);
+    void prune_stale_connection_states(const std::chrono::steady_clock::time_point& now);
+
     struct connection_state{
         std::chrono::steady_clock::time_point last_time{};
         uint64_t  sent{};      // tcpi_bytes_sent
         uint64_t  recv{};      // tcpi_bytes_received
         uint64_t  delivery_rate{};  // tcpi_delivery_rate (byte/s)
     };
-    std::unordered_map<int, connection_state> connection_state_dict;
+    std::unordered_map<size_t, connection_state> connection_state_dict;
+    std::chrono::steady_clock::time_point last_prune_{};
     bool summary = false;
 };

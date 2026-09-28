@@ -228,7 +228,9 @@ static std::optional<InodeToFd> BuildInodeToFdMap(pid_t pid) {
     return m;
 }
 
-static int hashConnection(const Connection& c){
+} // namespace
+
+size_t NetUsageCollector::ConnectionHash(const Connection& c){
     static auto hash_combine = [](std::size_t& seed, std::size_t val){
         seed ^= val + 0x9e3779b9 + (seed << 6) + (seed >> 2);
     };
@@ -239,12 +241,10 @@ static int hashConnection(const Connection& c){
     hash_combine(seed, static_cast<std::size_t>(c.peer.ver));
     hash_combine(seed, std::hash<std::string>{}(c.peer.addr));
     hash_combine(seed, static_cast<std::size_t>(c.peer.port));
+    // 同一四元组会被新 socket 复用；inode 区分 socket 实例，避免沿用旧连接的基线
+    hash_combine(seed, static_cast<std::size_t>(c.inode));
     return seed;
 }
-
-
-
-} // namespace
 
 
 // 取 fd 对应的绝对路径
@@ -299,7 +299,7 @@ static bool ReadProcNetFile(pid_t pid, const char* proto_file, L4Proto proto, bo
         c.local = std::move(local);
         c.peer  = std::move(peer);
         // 利用local和peer计算hash
-        c.hash = hashConnection(c);
+        c.hash = NetUsageCollector::ConnectionHash(c);
         if (!ParseUnsigned(cols[7], c.uid)) continue;
         
         
@@ -392,6 +392,25 @@ void wait_netlink_fd(int fd, short events) {
     pollfd descriptor{fd, events, 0};
     while (::poll(&descriptor, 1, -1) < 0 && errno == EINTR) {}
 }
+}
+
+double NetUsageCollector::SafeRate(uint64_t current, uint64_t previous, double seconds) {
+    if (seconds <= 0.0 || current < previous) return 0.0;
+    return static_cast<double>(current - previous) / seconds;
+}
+
+void NetUsageCollector::prune_stale_connection_states(const std::chrono::steady_clock::time_point& now) {
+    constexpr double kStateTtlSeconds = 300.0;
+    constexpr double kPruneIntervalSeconds = 60.0;
+    if (last_prune_.time_since_epoch().count() != 0 &&
+        std::chrono::duration<double>(now - last_prune_).count() < kPruneIntervalSeconds) return;
+    last_prune_ = now;
+    for (auto it = connection_state_dict.begin(); it != connection_state_dict.end();) {
+        if (std::chrono::duration<double>(now - it->second.last_time).count() > kStateTtlSeconds)
+            it = connection_state_dict.erase(it);
+        else
+            ++it;
+    }
 }
 
 int NetUsageCollector::query_single_tcp(Connection& conn) {
@@ -495,14 +514,10 @@ int NetUsageCollector::query_single_tcp(Connection& conn) {
 
             // 简单差分计算速度
             auto& state = connection_state_dict[conn.hash];
-            auto last_sent = state.sent;
-            auto last_recv = state.recv;
             auto now = std::chrono::steady_clock::now();
-            auto duration = now - state.last_time;
-            double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(duration).count();
-
-            conn.send_rate = seconds > 0.0 ? (conn.sent - last_sent) / seconds : 0.0;
-            conn.recv_rate= seconds > 0.0 ? (conn.recv - last_recv) / seconds : 0.0;
+            double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(now - state.last_time).count();
+            conn.send_rate = SafeRate(conn.sent, state.sent, seconds);
+            conn.recv_rate = SafeRate(conn.recv, state.recv, seconds);
             state.last_time = now;
             state.sent = conn.sent;
             state.recv = conn.recv;
@@ -638,6 +653,7 @@ CollectResult NetUsageCollector::collect(const Job& job) {
         summary_info.connections.push_back(std::move(summary_conn));
         all.push_back(std::move(summary_info));
     }
+    prune_stale_connection_states(std::chrono::steady_clock::now());
     return CollectResult{std::move(all)};
 }
 

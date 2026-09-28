@@ -16,6 +16,15 @@
 #include <limits>
 #include <stdexcept>
 
+struct NetUsageCollectorTestAccess {
+    static double SafeRate(uint64_t current, uint64_t previous, double seconds) {
+        return NetUsageCollector::SafeRate(current, previous, seconds);
+    }
+    static size_t ConnectionHash(const Connection& connection) {
+        return NetUsageCollector::ConnectionHash(connection);
+    }
+};
+
 static void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -326,10 +335,33 @@ static void run(bool namespace_race) {
     require(openFdCount() == initial_fds, "collector lifecycle leaked FDs");
 }
 
+static void checkCounterRegressionGuards() {
+    require(NetUsageCollectorTestAccess::SafeRate(2, 18, 1.0) == 0.0,
+            "TCP counter regression underflow was not neutralized");
+    require(NetUsageCollectorTestAccess::SafeRate(18, 2, 2.0) == 8.0,
+            "normal TCP rate regressed after the guard");
+    require(NetUsageCollectorTestAccess::SafeRate(5, 5, 0.0) == 0.0,
+            "zero interval produced a rate");
+
+    Connection first;
+    first.local = {IPVer::V4, "127.0.0.1", 40000};
+    first.peer = {IPVer::V4, "127.0.0.2", 443};
+    first.inode = 100;
+    Connection reused = first;
+    reused.inode = 200;
+    require(NetUsageCollectorTestAccess::ConnectionHash(first) !=
+            NetUsageCollectorTestAccess::ConnectionHash(reused),
+            "reused 4-tuple with a new socket shares a baseline");
+    require(NetUsageCollectorTestAccess::ConnectionHash(first) ==
+            NetUsageCollectorTestAccess::ConnectionHash(first),
+            "connection hash is not stable");
+}
+
 int main(int argc, char** argv) {
     spdlog::set_level(spdlog::level::off);
     const bool namespace_race = argc == 2 && std::string(argv[1]) == "--namespace-race";
     try {
+        checkCounterRegressionGuards();
         run(namespace_race);
         std::cout << (namespace_race ? "Network namespace reader fallback passed\n" :
                                       "NetUsage collector and writer compatibility passed\n");
