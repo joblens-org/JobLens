@@ -60,15 +60,36 @@ struct {
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } job_event_rb SEC(".maps");
 
-/* 向用户态推送一条进程生命周期事件。 */
+/* ringbuf 统计: [DROPPED]=满而丢弃, [PUSHED]=成功入队。
+ * 每 CPU 一份, 用户态求和后暴露给 RPC/日志, 使"归属信息是否因溢出而失真"
+ * 以及实际入队速率都可直接观测, 而不是只能靠推算。 */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, JOBLENS_JOB_EVENT_STAT_SLOTS);
+} job_event_stats SEC(".maps");
+
+/* 累加一个统计槽位。per-CPU 数据无需原子操作, 且查找失败不构成错误。 */
+static __always_inline void bump_stat(u32 idx)
+{
+    u64 *v = bpf_map_lookup_elem(&job_event_stats, &idx);
+    if (v)
+        (*v)++;
+}
+
+/* 向用户态推送一条进程生命周期事件。ringbuf 满时计一次丢弃并放弃本条。 */
 static __always_inline void push_event(u32 type, u32 pid, u64 job_id)
 {
     struct job_pid_event *e = bpf_ringbuf_reserve(&job_event_rb, sizeof(*e), 0);
-    if (!e)
+    if (!e) {
+        bump_stat(JOBLENS_JOB_EVENT_STAT_DROPPED);
         return;
+    }
     e->type = type;
     e->pid = pid;
     e->job_id = job_id;
+    bump_stat(JOBLENS_JOB_EVENT_STAT_PUSHED);
     bpf_ringbuf_submit(e, 0);
 }
 

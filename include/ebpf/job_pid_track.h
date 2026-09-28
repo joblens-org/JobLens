@@ -50,6 +50,15 @@
 #define JOBLENS_CGROUP2JOB_MAP_NAME  "cgroup2job"
 #define JOBLENS_JOB_EVENT_RB_NAME    "job_event_rb"
 
+// job_event ringbuf 统计 map 名。每 CPU 一份 u64, 用户态按 CPU 求和后暴露,
+// 使溢出丢弃与应用侧真实入队速率都可直接观测(而不是只能靠推算)。
+// 与上述三张共享 map 不同, 该 map 不 pin: 它是本程序私有的运行时诊断数据,
+// 随进程重启清零, 不参与跨 .bpf.o 的 create-or-reuse 校验。
+#define JOBLENS_JOB_EVENT_STATS_MAP_NAME "job_event_stats"
+#define JOBLENS_JOB_EVENT_STAT_DROPPED   0  // ringbuf 满, reserve 失败而丢弃
+#define JOBLENS_JOB_EVENT_STAT_PUSHED    1  // 成功入队
+#define JOBLENS_JOB_EVENT_STAT_SLOTS     2
+
 // ringbuf 事件类型。
 enum job_pid_event_type {
     JOB_PID_EVENT_FORK = 0,  // 子进程继承了某 Job 归属, pid 已加入 pid2job

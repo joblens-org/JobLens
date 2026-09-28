@@ -79,6 +79,14 @@ public:
             return false;
         }
 
+        // 统计 map 是非致命可选项: 配到旧版 .bpf.o 时仅告警,
+        // 归属追踪本身仍可用, 只是入队/丢弃不再可观测。
+        stats_fd_ = bpf_object__find_map_fd_by_name(bpf_obj_, JOBLENS_JOB_EVENT_STATS_MAP_NAME);
+        if (stats_fd_ < 0) {
+            spdlog::warn("JobPidTracker: stats map {} not found, ringbuf push/drop will not be observable",
+                         JOBLENS_JOB_EVENT_STATS_MAP_NAME);
+        }
+
         running_ = true;
         poll_thread_ = std::make_unique<std::thread>([this]() {
             spdlog::debug("JobPidTracker: ringbuf poll thread started");
@@ -92,8 +100,8 @@ public:
             }
             spdlog::debug("JobPidTracker: ringbuf poll thread exited");
         });
-        spdlog::info("JobPidTracker: started (pid2job_fd={}, cgroup2job_fd={}, pin_root={})",
-                     pid2job_fd_, cgroup2job_fd_, JOBLENS_BPF_PIN_ROOT);
+        spdlog::info("JobPidTracker: started (pid2job_fd={}, cgroup2job_fd={}, stats_fd={}, pin_root={})",
+                     pid2job_fd_, cgroup2job_fd_, stats_fd_, JOBLENS_BPF_PIN_ROOT);
         return true;
     }
 
@@ -125,7 +133,32 @@ public:
 
     bool running() const { return running_; }
 
+    // 累计的 ringbuf 丢弃事件数(所有 CPU 求和)。大于 0 表示归属信息可能失真:
+    // FORK 丢失会让 Job.JobPIDs 少进程, EXIT 丢失会残留已退出 PID。
+    uint64_t dropped_events() const { return ringbuf_stat(JOBLENS_JOB_EVENT_STAT_DROPPED); }
+
+    // 累计成功入队的事件数(所有 CPU 求和), 即真实消费侧吞吐的下界。
+    uint64_t pushed_events() const { return ringbuf_stat(JOBLENS_JOB_EVENT_STAT_PUSHED); }
+
 private:
+    // 读取某个 per-CPU 统计槽位并求和。计数不可用时返回 0(不影响归属追踪)。
+    uint64_t ringbuf_stat(uint32_t idx) const {
+        if (stats_fd_ < 0) return 0;
+        const int ncpus = libbpf_num_possible_cpus();
+        if (ncpus <= 0) {
+            spdlog::warn("JobPidTracker: libbpf_num_possible_cpus failed: {}", ncpus);
+            return 0;
+        }
+        std::vector<uint64_t> per_cpu(static_cast<size_t>(ncpus), 0);
+        if (bpf_map_lookup_elem(stats_fd_, &idx, per_cpu.data()) != 0) {
+            spdlog::debug("JobPidTracker: read stats slot {} failed, errno={}", idx, errno);
+            return 0;
+        }
+        uint64_t total = 0;
+        for (const uint64_t v : per_cpu) total += v;
+        return total;
+    }
+
     static int handle_event(void* ctx, void* data, size_t size) {
         auto* self = static_cast<JobPidTracker*>(ctx);
         if (size < sizeof(job_pid_event)) {
@@ -161,6 +194,7 @@ private:
         }
         cgroup2job_fd_ = -1;
         pid2job_fd_ = -1;
+        stats_fd_ = -1;
     }
 
     bpf_object* bpf_obj_{nullptr};
@@ -168,6 +202,7 @@ private:
     ring_buffer* rb_{nullptr};
     int cgroup2job_fd_{-1};
     int pid2job_fd_{-1};
+    int stats_fd_{-1};
 
     std::atomic<bool> running_{false};
     std::unique_ptr<std::thread> poll_thread_;
