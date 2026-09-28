@@ -363,6 +363,18 @@ void JobRegistry::reconcile_loop() {
             sync_job_to_kernel(job);
         }
         spdlog::debug("JobRegistry: pid tracker reconcile pass done, resynced {} jobs to kernel", jobs.size());
+
+        // ringbuf 溢出是静默的: 一旦发生, JobPIDs 会悄悄失真。按对账周期上报增量,
+        // 让"归属信息是否可信"有据可查(可用 JobRegistry/pid_tracker_stats 查累计值)。
+        if (pid_tracker_) {
+            const uint64_t dropped = pid_tracker_->dropped_events();
+            if (dropped > last_dropped_events_) {
+                spdlog::warn("JobRegistry: job_event ringbuf overflow, {} new pid attribution events dropped "
+                             "(cumulative {}); JobPIDs may be incomplete until the next cgroup resync",
+                             dropped - last_dropped_events_, dropped);
+                last_dropped_events_ = dropped;
+            }
+        }
     }
 }
 
@@ -444,6 +456,19 @@ void JobRegistry::regRPChandle() {
                 return j;
             }
             j = dump_job(job.value());
+            return j;
+        }
+    );
+
+    // pid 归属追踪的运行状态与 ringbuf 入队/丢弃统计。
+    // dropped_events 持续增长说明 job_event ringbuf 溢出、JobPIDs 可能失真。
+    RPCServer::instance().register_method("JobRegistry/pid_tracker_stats",
+        [this](const nlohmann::json& req) -> nlohmann::json {
+            nlohmann::json j;
+            j["status"] = "ok";
+            j["running"] = static_cast<bool>(pid_tracker_);
+            j["pushed_events"] = pid_tracker_ ? pid_tracker_->pushed_events() : 0;
+            j["dropped_events"] = pid_tracker_ ? pid_tracker_->dropped_events() : 0;
             return j;
         }
     );

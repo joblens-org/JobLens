@@ -118,4 +118,6 @@ private:
     std::unique_ptr<JobPidTracker> pid_tracker_;
     std::atomic<bool> reconcile_running_{false};
     std::unique_ptr<std::thread> reconcile_thread_;
+    // 上一次对账时的 ringbuf 丢弃计数, 用于只上报增量而非每次重复告警。
+    uint64_t last_dropped_events_{0};
 };
