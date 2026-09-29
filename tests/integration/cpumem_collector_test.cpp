@@ -79,6 +79,21 @@ extern "C" long __wrap_sysconf(int name) {
     return __real_sysconf(name);
 }
 
+// 访问私有基线表，用于验证陈旧 PID 基线的清理行为。
+struct CPUMemCollectorTestAccess {
+    static void insert_stale(CPUMemCollector& collector, int pid,
+                             const std::chrono::steady_clock::time_point& seen) {
+        collector.pid_state_dict[pid].last_seen = seen;
+    }
+    static bool has(const CPUMemCollector& collector, int pid) {
+        return collector.pid_state_dict.count(pid) != 0;
+    }
+    static size_t size(const CPUMemCollector& collector) {
+        return collector.pid_state_dict.size();
+    }
+    static void reset_prune_clock(CPUMemCollector& collector) { collector.last_prune_ = {}; }
+};
+
 static void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -241,8 +256,43 @@ int main() {
             fake_file_fds.clear();
         }
 
-        std::cout << "PASS CPUMem real proc samples, shared CPU inputs, comm fallback, PID reuse guard "
-                     "and per-PID system baseline across jobs\n";
+        // 陈旧 PID 基线清理：pid_state_dict 按 PID 累积，作业结束或进程退出后不会再被
+        // 采样；不清理会随 PID churn 无界增长。回归点：超过 TTL 未再出现的 PID 基线应
+        // 被清除，仍在采样的 PID 基线必须保留。
+        {
+            Child worker;
+            write_fake_stat(stat_path(worker.pid), make_stat_line(worker.pid, "workerP", 10, 0, 701));
+            CPUMemCollector pruner;
+            require(pruner.init({}), "prune collector init failed");
+            Job prune_job;
+            prune_job.JobID = 21;
+            prune_job.JobPIDs = {worker.pid};
+            (void)pruner.collect(prune_job);
+            require(CPUMemCollectorTestAccess::has(pruner, worker.pid), "active pid baseline missing");
+
+            constexpr int kGhostPid = 999999;
+            CPUMemCollectorTestAccess::insert_stale(
+                pruner, kGhostPid, std::chrono::steady_clock::now() - std::chrono::seconds(600));
+            const size_t before = CPUMemCollectorTestAccess::size(pruner);
+
+            CPUMemCollectorTestAccess::reset_prune_clock(pruner);
+            mark("CPUMEM_BEGIN prune");
+            (void)pruner.collect(prune_job);
+            mark("CPUMEM_END prune");
+
+            require(CPUMemCollectorTestAccess::size(pruner) < before,
+                    "stale pid baseline was not pruned");
+            require(!CPUMemCollectorTestAccess::has(pruner, kGhostPid), "stale pid baseline retained");
+            require(CPUMemCollectorTestAccess::has(pruner, worker.pid), "live pid baseline was pruned");
+            pruner.deinit();
+            require(CPUMemCollectorTestAccess::size(pruner) == 0,
+                    "deinit did not release pid baselines");
+            fake_files.clear();
+            fake_file_fds.clear();
+        }
+
+        std::cout << "PASS CPUMem real proc samples, shared CPU inputs, comm fallback, PID reuse guard, "
+                     "per-PID system baseline across jobs and stale baseline pruning\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

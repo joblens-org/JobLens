@@ -70,7 +70,31 @@ void CPUMemCollector::deinit() noexcept {
         return;
     }
     inited = false;
+    pid_state_dict.clear();
+    last_prune_ = {};
     spdlog::info("CPUMemCollector deinit");
+}
+
+// pid_state_dict 按 PID 累积基线，作业结束或进程退出后不会再被采样；不清理会随
+// PID churn 无界增长。按 TTL 清理陈旧项，最多每 kPruneIntervalSeconds 扫描一次。
+void CPUMemCollector::prune_stale_pid_states(const std::chrono::steady_clock::time_point& now) {
+    constexpr double kStateTtlSeconds = 300.0;
+    constexpr double kPruneIntervalSeconds = 60.0;
+    if (last_prune_.time_since_epoch().count() != 0 &&
+        std::chrono::duration<double>(now - last_prune_).count() < kPruneIntervalSeconds) return;
+    last_prune_ = now;
+    size_t removed = 0;
+    for (auto it = pid_state_dict.begin(); it != pid_state_dict.end();) {
+        if (std::chrono::duration<double>(now - it->second.last_seen).count() > kStateTtlSeconds) {
+            it = pid_state_dict.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
+    }
+    if (removed > 0) {
+        spdlog::debug("CPUMemCollector: pruned {} stale pid baselines", removed);
+    }
 }
 
 // 静态函数：读 /proc/stat 获取系统总 jiffies
@@ -87,7 +111,8 @@ static unsigned long long read_system_cpu()
     return total;
 }
 
-bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info, const CpuSample& sample){
+bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info, const CpuSample& sample,
+                            const std::chrono::steady_clock::time_point& now){
     std::ifstream f(fmt::format("/proc/{}/stat", pid));
     if (!f) return false;
 
@@ -160,6 +185,7 @@ bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info, const CpuSample& sample){
         cu.lastProc      = currProc;
         cu.lastStarttime = info.starttime;
         cu.lastTotal     = sample.total;
+        cu.last_seen     = now;
         spdlog::trace("update lastProc={} lastTotal={} lastStarttime={}",
                       cu.lastProc, cu.lastTotal, cu.lastStarttime);
     } else {
@@ -242,6 +268,8 @@ std::string get_process_name(int pid)
 
 CollectResult CPUMemCollector::collect(const Job& job) {
     std::vector<CPUMemInfo> infos;
+    const auto now = std::chrono::steady_clock::now();
+    prune_stale_pid_states(now);
     // CLK_TCK is invariant; online cores and CPU counters can change between Jobs.
     static const long clock_ticks = sysconf(_SC_CLK_TCK);
     CpuSample sample{clock_ticks, sysconf(_SC_NPROCESSORS_ONLN), 0};
@@ -257,7 +285,7 @@ CollectResult CPUMemCollector::collect(const Job& job) {
         CPUMemInfo info;
         if (pid <= 0) continue;
         info.pid = pid;
-        if (!CPUOf(pid, info, sample)) info.name = get_process_name(pid);
+        if (!CPUOf(pid, info, sample, now)) info.name = get_process_name(pid);
         MemOf(pid, info);
         if (!info.pid) continue;
         // job.JobInfo[fmt::format("proc_info_{}", pid)] = info.get();
