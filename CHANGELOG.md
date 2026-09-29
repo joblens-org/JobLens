@@ -1,5 +1,14 @@
 # JobLens Changelog
 
+## v0.3.6 (2026-09-30)
+
+### CPU Percent Sampling Correctness
+- Fixed `CPUMemCollector` inflating `cpuPercent` by orders of magnitude when several jobs are sampled within the same tick: `9c3775e` had moved the system-wide `/proc/stat` jiffies baseline to collector-instance scope, but the collector is shared across jobs, so the second job's `Δproc` covered a whole tick while its `Δtotal` only covered the time between the two `collect()` calls. The system baseline is now cached per PID, so `Δproc` and `Δtotal` always span the same sampling interval regardless of how many jobs — or in which order — are sampled in one tick (`8db5461`).
+- A PID's first sample, and a regression of the system-wide jiffies counter (e.g. CPU hotplug), now report a rate of `0` for that cycle instead of a bogus value (`8db5461`).
+- The CPUMem integration test now fakes `/proc/stat` in addition to `/proc/<pid>/stat` and covers two jobs sharing one collector instance within a tick (`8db5461`).
+
+---
+
 ## v0.3.5 (2026-09-29)
 
 ### Job Discovery Correctness
