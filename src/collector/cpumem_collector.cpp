@@ -130,30 +130,38 @@ bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info, const CpuSample& sample){
         auto& cu = pid_state_dict[pid];
         const bool pidReused = cu.lastStarttime != 0 && cu.lastStarttime != info.starttime;
         unsigned long long deltaProc = 0;
+        unsigned long long deltaTotal = 0;
 
-        spdlog::trace("use pid:{} deltaTotal={} currProc={} lastProc={}", pid,
-                      sample.deltaTotal, currProc, cu.lastProc);
-        if (sample.deltaTotal > 0) {
-            if (pidReused) {
-                // PID 被回收：同 PID 已是新进程（starttime 不同），丢弃旧基线避免无符号下溢
-                spdlog::debug("CPUOf: pid {} reused (starttime {} -> {}), reset baseline",
-                              pid, cu.lastStarttime, info.starttime);
-            } else if (currProc >= cu.lastProc) {
+        if (pidReused) {
+            // PID 被回收：同 PID 已是新进程（starttime 不同），丢弃旧基线避免无符号下溢
+            spdlog::debug("CPUOf: pid {} reused (starttime {} -> {}), reset baseline",
+                          pid, cu.lastStarttime, info.starttime);
+        } else if (cu.lastTotal == 0 || sample.total < cu.lastTotal) {
+            // 首次采样，或系统总 jiffies 回退（CPU 热插拔等）：本周期不产出速率
+            spdlog::trace("CPUOf: pid {} baseline reset (lastTotal={} total={})",
+                          pid, cu.lastTotal, sample.total);
+        } else {
+            deltaTotal = sample.total - cu.lastTotal;
+            if (currProc >= cu.lastProc) {
                 deltaProc = currProc - cu.lastProc;
             } else {
                 // 计数器回退（进程重启等未识别情况），本周期按 0 处理，避免无符号下溢
                 spdlog::debug("CPUOf: pid {} cpu counter regressed ({} -> {}), skip delta",
                               pid, cu.lastProc, currProc);
             }
-            info.cpuPercent = 100.0 * double(deltaProc) / double(sample.deltaTotal) * sample.numCores;
-        } else {
-            info.cpuPercent = 0.0;
         }
+
+        // Δproc 与 Δtotal 取自该 PID 的同一采样区间，与 tick 内作业数量/顺序无关
+        info.cpuPercent = deltaTotal > 0
+                              ? 100.0 * double(deltaProc) / double(deltaTotal) * sample.numCores
+                              : 0.0;
 
         /* 更新基线（用于下一次采样） */
         cu.lastProc      = currProc;
         cu.lastStarttime = info.starttime;
-        spdlog::trace("update lastProc={} lastStarttime={}", cu.lastProc, cu.lastStarttime);
+        cu.lastTotal     = sample.total;
+        spdlog::trace("update lastProc={} lastTotal={} lastStarttime={}",
+                      cu.lastProc, cu.lastTotal, cu.lastStarttime);
     } else {
         info.cpuPercent = 0.0;
     }
@@ -236,14 +244,10 @@ CollectResult CPUMemCollector::collect(const Job& job) {
     std::vector<CPUMemInfo> infos;
     // CLK_TCK is invariant; online cores and CPU counters can change between Jobs.
     static const long clock_ticks = sysconf(_SC_CLK_TCK);
-    CpuSample sample{clock_ticks, sysconf(_SC_NPROCESSORS_ONLN), 0, 0};
+    CpuSample sample{clock_ticks, sysconf(_SC_NPROCESSORS_ONLN), 0};
     if (sample.hz > 0 && sample.numCores > 0) {
+        // /proc/stat 每 Job 读一次；增量基线按 PID 缓存，保证与 Δproc 覆盖同一采样区间
         sample.total = read_system_cpu();
-        // /proc/stat 为全机共享：每周期只算一次增量，避免个别 PID 长时间未采样时被拉大间隔
-        if (lastSystemTotal > 0 && sample.total > lastSystemTotal) {
-            sample.deltaTotal = sample.total - lastSystemTotal;
-        }
-        lastSystemTotal = sample.total;
     }
     infos.reserve(job.JobPIDs.size() + (summary ? 1 : 0));
     for (int pid : job.JobPIDs) {
