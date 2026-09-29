@@ -1,5 +1,26 @@
 # JobLens Changelog
 
+## v0.3.5 (2026-09-29)
+
+### Job Discovery Correctness
+- Fixed `get_ppid_of()` reading the `pgrp` field instead of `ppid` while parsing `/proc/<pid>/stat`: HTCondor makes each job process its own process-group leader (`pgrp == pid`), so `starter_pid` was recorded as the job's own PID, then filtered out of the cgroup PID list, leaving `JobPIDs` empty and triggering the `job has no running process, delete it` path about 200 ms after discovery. The Slurm `stepd_pid` resolution and the parent-process check in `get_slurm_job_pids()` were affected the same way (`2429a94`).
+
+### Job Event Drop Observability
+- Added a per-CPU `job_event_stats` map to the `job_pid_track` BPF program (slot 0 = overflow drops, slot 1 = successful enqueues) incremented in `push_event`, so events silently discarded when `job_event_rb` is full are now countable instead of corrupting `Job.JobPIDs` without any log; `JobPidTracker` sums the slots across CPUs and exposes `pushed_events()`/`dropped_events()` (`a2db35e`).
+- Added the `JobRegistry/pid_tracker_stats` RPC returning `running`/`pushed_events`/`dropped_events`, and the reconcile cycle now logs a warning when new drops appear, making ringbuf overflow directly observable rather than something to be inferred after the fact (`b2af9bf`).
+- Added `GET /joblens/pid_tracker/stats` to the Trigger as the HTTP bridge for the RPC above (`6ee1413`).
+
+### Network Usage Collector Correctness
+- Extracted `SafeRate` so TCP counter regressions (reset or wrapped statistics) and zero-length intervals report a rate of `0` instead of an abnormal value (`e6cb77a`).
+- Mixed the socket inode into the connection hash: the previous four-tuple-only key made a recycled four-tuple inherit the stale baseline of the previous connection (`e6cb77a`).
+- Bounded `connection_state_dict` with a 300 s TTL, swept at most once per 60 s, replacing unbounded growth over long-lived collectors (`e6cb77a`).
+
+### Hardware Inventory Correctness
+- Reworked Trigger GPU discovery to match PCI class codes (`lspci -nn -d '::0300'/'::0301'/'::0302'/'::0380'`, with a fallback that filters the full output on `[03xx]:` for older `lspci`), replacing the textual `grep '(vga|3d|display)'` scan that misread `3DNAND` in NVMe names and `Root Port 3d` PCI bridges as GPUs (`124a7f6`).
+- Excluded BMC graphics adapters (vendor IDs `102b`/`1a03`/`19e5` and known name keywords) such as Matrox/ASPEED/Huawei iBMC from the compute-GPU list, switched vendor detection to a word-boundary regex so substrings like `ati` no longer match unrelated names, and strip trailing `[vendor:device]`/`(rev xx)` suffixes from the model name (`124a7f6`).
+
+---
+
 ## v0.3.4 (2026-09-23)
 
 ### Collector Correctness and CPU Accounting
