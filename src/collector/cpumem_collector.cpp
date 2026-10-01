@@ -15,6 +15,7 @@
 
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <cerrno>
 #include <filesystem>
@@ -33,6 +34,46 @@ bool IsVanishedProcPath(int err) {
 bool IsProcessStatusGone(int pid) {
     std::error_code ec;
     return !std::filesystem::exists(fmt::format("/proc/{}/status", pid), ec);
+}
+
+enum class ProcessStatRead { Ok, Missing, Unavailable };
+
+ProcessStatRead ReadProcessStat(int pid, CPUMemInfo& info) {
+    errno = 0;
+    std::ifstream f(fmt::format("/proc/{}/stat", pid));
+    if (!f) {
+        return IsVanishedProcPath(errno) ? ProcessStatRead::Missing : ProcessStatRead::Unavailable;
+    }
+
+    std::string line;
+    if (!std::getline(f, line)) return ProcessStatRead::Unavailable;
+
+    auto p1 = line.find('(');
+    auto p2 = line.rfind(')');
+    if (p1 == std::string::npos || p2 == std::string::npos || p2 <= p1 || p2 + 2 >= line.size())
+        return ProcessStatRead::Unavailable;
+
+    std::istringstream iss(line.substr(p2 + 2));
+    char state;
+    int ppid, pgrp, session, tty_nr, tpgid;
+    unsigned flags;
+    unsigned long minflt, cminflt, majflt, cmajflt;
+    unsigned long utime, stime, cutime, cstime;
+    long priority, nice, num_threads, itrealvalue;
+    unsigned long long starttime;
+
+    if (!(iss >> state >> ppid >> pgrp >> session >> tty_nr >> tpgid
+        >> flags >> minflt >> cminflt >> majflt >> cmajflt
+        >> utime >> stime >> cutime >> cstime
+        >> priority >> nice >> num_threads >> itrealvalue >> starttime))
+        return ProcessStatRead::Unavailable;
+
+    info.name = line.substr(p1 + 1, p2 - p1 - 1);
+    info.utime = utime;
+    info.stime = stime;
+    info.starttime = starttime;
+    info.ppid = ppid;
+    return ProcessStatRead::Ok;
 }
 
 }
@@ -75,8 +116,8 @@ void CPUMemCollector::deinit() noexcept {
     spdlog::info("CPUMemCollector deinit");
 }
 
-// pid_state_dict 按 PID 累积基线，作业结束或进程退出后不会再被采样；不清理会随
-// PID churn 无界增长。按 TTL 清理陈旧项，最多每 kPruneIntervalSeconds 扫描一次。
+// TTL 只筛选待检查项，不能直接删除低频采样的存活进程基线。最多每分钟检查一次，
+// 仅清理已消失或 starttime 已改变的进程；权限/解析失败时保留，等待下次确认。
 void CPUMemCollector::prune_stale_pid_states(const std::chrono::steady_clock::time_point& now) {
     constexpr double kStateTtlSeconds = 300.0;
     constexpr double kPruneIntervalSeconds = 60.0;
@@ -85,7 +126,14 @@ void CPUMemCollector::prune_stale_pid_states(const std::chrono::steady_clock::ti
     last_prune_ = now;
     size_t removed = 0;
     for (auto it = pid_state_dict.begin(); it != pid_state_dict.end();) {
+        bool stale = false;
         if (std::chrono::duration<double>(now - it->second.last_seen).count() > kStateTtlSeconds) {
+            CPUMemInfo info;
+            const auto result = ReadProcessStat(it->first, info);
+            stale = result == ProcessStatRead::Missing ||
+                    (result == ProcessStatRead::Ok && info.starttime != it->second.lastStarttime);
+        }
+        if (stale) {
             it = pid_state_dict.erase(it);
             ++removed;
         } else {
@@ -113,39 +161,7 @@ static unsigned long long read_system_cpu()
 
 bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info, const CpuSample& sample,
                             const std::chrono::steady_clock::time_point& now){
-    std::ifstream f(fmt::format("/proc/{}/stat", pid));
-    if (!f) return false;
-
-    std::string line, tail;
-    if (!std::getline(f, line)) return false;
-
-    auto p1 = line.find('(');
-    auto p2 = line.rfind(')');
-    if (p1 == std::string::npos || p2 == std::string::npos || p2 <= p1)
-        return false;
-
-    tail = line.substr(p2 + 2);                // 跳过 ") "
-
-    std::istringstream iss(tail);
-    char state;
-    int ppid, pgrp, session, tty_nr, tpgid;
-    unsigned flags;
-    unsigned long minflt, cminflt, majflt, cmajflt;
-    unsigned long utime, stime, cutime, cstime;
-    long priority, nice, num_threads, itrealvalue;
-    unsigned long long starttime;
-
-    // 顺序把前 20 个字段读掉，我们只用其中 3 个
-    if (!(iss >> state >> ppid >> pgrp >> session >> tty_nr >> tpgid
-        >> flags >> minflt >> cminflt >> majflt >> cmajflt
-        >> utime >> stime >> cutime >> cstime
-        >> priority >> nice >> num_threads >> itrealvalue >> starttime)) return false;
-
-    info.name = line.substr(p1 + 1, p2 - p1 - 1);
-    info.utime = utime;
-    info.stime = stime;
-    info.starttime = starttime;
-    info.ppid = ppid;
+    if (ReadProcessStat(pid, info) != ProcessStatRead::Ok) return false;
     spdlog::trace("CPUOf: pid={} utime={} stime={} starttime={}", pid, info.utime, info.stime, info.starttime);
 
     /* ---- 计算 CPU 百分比 ---- */

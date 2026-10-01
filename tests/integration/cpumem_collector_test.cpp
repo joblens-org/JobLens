@@ -1,4 +1,5 @@
 #include "collector/cpumem_collector.hpp"
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -6,6 +7,7 @@
 #include <dlfcn.h>
 #include <iostream>
 #include <map>
+#include <signal.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -13,6 +15,7 @@
 #include <unistd.h>
 
 static std::string denied_stat;
+static int denied_stat_errno = EACCES;
 static std::map<std::string, std::string> fake_files;   // 目标 /proc 路径 -> 伪造文件路径
 static std::map<std::string, int> fake_file_fds;
 static unsigned clock_queries = 0, core_queries = 0;
@@ -61,13 +64,13 @@ static std::string make_proc_stat_line(unsigned long long total) {
 extern "C" FILE* fopen64(const char* path, const char* mode) {
     using Open = FILE* (*)(const char*, const char*);
     static const auto real_open = reinterpret_cast<Open>(dlsym(RTLD_NEXT, "fopen64"));
+    if (!denied_stat.empty() && denied_stat == path) {
+        errno = denied_stat_errno;
+        return nullptr;
+    }
     const auto it = fake_files.find(path ? std::string(path) : std::string());
     if (it != fake_files.end()) {
         return real_open(it->second.c_str(), mode);
-    }
-    if (!denied_stat.empty() && denied_stat == path) {
-        errno = EACCES;
-        return nullptr;
     }
     return real_open(path, mode);
 }
@@ -92,6 +95,9 @@ struct CPUMemCollectorTestAccess {
         return collector.pid_state_dict.size();
     }
     static void reset_prune_clock(CPUMemCollector& collector) { collector.last_prune_ = {}; }
+    static void prune_now(CPUMemCollector& collector) {
+        collector.prune_stale_pid_states(std::chrono::steady_clock::now());
+    }
 };
 
 static void require(bool condition, const char* message) {
@@ -256,12 +262,13 @@ int main() {
             fake_file_fds.clear();
         }
 
-        // 陈旧 PID 基线清理：pid_state_dict 按 PID 累积，作业结束或进程退出后不会再被
-        // 采样；不清理会随 PID churn 无界增长。回归点：超过 TTL 未再出现的 PID 基线应
-        // 被清除，仍在采样的 PID 基线必须保留。
+        // 超过 TTL 后先确认进程身份：清理已退出/复用的 PID，保留低频采样的存活进程。
         {
             Child worker;
             write_fake_stat(stat_path(worker.pid), make_stat_line(worker.pid, "workerP", 10, 0, 701));
+            const unsigned long long t0 = 1000000000ULL;
+            const unsigned long long interval = 100ULL * static_cast<unsigned long long>(cores);
+            write_fake_stat("/proc/stat", make_proc_stat_line(t0));
             CPUMemCollector pruner;
             require(pruner.init({}), "prune collector init failed");
             Job prune_job;
@@ -273,17 +280,64 @@ int main() {
             constexpr int kGhostPid = 999999;
             CPUMemCollectorTestAccess::insert_stale(
                 pruner, kGhostPid, std::chrono::steady_clock::now() - std::chrono::seconds(600));
+            CPUMemCollectorTestAccess::insert_stale(
+                pruner, worker.pid, std::chrono::steady_clock::now() - std::chrono::seconds(600));
             const size_t before = CPUMemCollectorTestAccess::size(pruner);
 
+            write_fake_stat(stat_path(worker.pid), make_stat_line(worker.pid, "worker (P)", 20, 0, 701));
+            write_fake_stat("/proc/stat", make_proc_stat_line(t0 + interval));
+            denied_stat = stat_path(kGhostPid);
+            denied_stat_errno = ENOENT;
             CPUMemCollectorTestAccess::reset_prune_clock(pruner);
             mark("CPUMEM_BEGIN prune");
-            (void)pruner.collect(prune_job);
+            const auto slow_sample = std::any_cast<std::vector<CPUMemInfo>>(pruner.collect(prune_job));
             mark("CPUMEM_END prune");
+            denied_stat.clear();
+            denied_stat_errno = EACCES;
 
             require(CPUMemCollectorTestAccess::size(pruner) < before,
                     "stale pid baseline was not pruned");
             require(!CPUMemCollectorTestAccess::has(pruner, kGhostPid), "stale pid baseline retained");
             require(CPUMemCollectorTestAccess::has(pruner, worker.pid), "live pid baseline was pruned");
+            require(slow_sample.size() == 1 && std::abs(slow_sample.front().cpuPercent - 10.0) < 0.01,
+                    "slow sampling lost the live process CPU baseline");
+
+            CPUMemCollectorTestAccess::insert_stale(
+                pruner, worker.pid, std::chrono::steady_clock::now() - std::chrono::seconds(600));
+            write_fake_stat(stat_path(worker.pid), make_stat_line(worker.pid, "worker (P)", 30, 0, 701));
+            write_fake_stat("/proc/stat", make_proc_stat_line(t0 + 2 * interval));
+            CPUMemCollectorTestAccess::reset_prune_clock(pruner);
+            const auto next_slow_sample = std::any_cast<std::vector<CPUMemInfo>>(pruner.collect(prune_job));
+            require(next_slow_sample.size() == 1 && std::abs(next_slow_sample.front().cpuPercent - 10.0) < 0.01,
+                    "repeated slow sampling lost the live process CPU baseline");
+
+            // 无权限或 stat 解析失败不能确认退出，保留基线供下次检查。
+            CPUMemCollectorTestAccess::insert_stale(
+                pruner, worker.pid, std::chrono::steady_clock::now() - std::chrono::seconds(600));
+            denied_stat = stat_path(worker.pid);
+            CPUMemCollectorTestAccess::reset_prune_clock(pruner);
+            CPUMemCollectorTestAccess::prune_now(pruner);
+            denied_stat.clear();
+            require(CPUMemCollectorTestAccess::has(pruner, worker.pid),
+                    "permission error was treated as process exit");
+
+            for (const auto* malformed : {"invalid stat\n", "42 (worker)\n", "42 (worker) S 1\n", ""}) {
+                write_fake_stat(stat_path(worker.pid), malformed);
+                CPUMemCollectorTestAccess::reset_prune_clock(pruner);
+                CPUMemCollectorTestAccess::prune_now(pruner);
+                require(CPUMemCollectorTestAccess::has(pruner, worker.pid),
+                        "malformed stat was treated as process exit");
+            }
+
+            // PID 仍存在但 starttime 改变，清理旧进程基线，新进程首采样为 0。
+            write_fake_stat(stat_path(worker.pid), make_stat_line(worker.pid, "newWorker", 1, 0, 702));
+            CPUMemCollectorTestAccess::reset_prune_clock(pruner);
+            CPUMemCollectorTestAccess::prune_now(pruner);
+            require(!CPUMemCollectorTestAccess::has(pruner, worker.pid),
+                    "expired baseline survived PID reuse");
+            const auto reused_sample = std::any_cast<std::vector<CPUMemInfo>>(pruner.collect(prune_job));
+            require(reused_sample.size() == 1 && reused_sample.front().cpuPercent == 0.0,
+                    "reused PID inherited the old process CPU baseline");
             pruner.deinit();
             require(CPUMemCollectorTestAccess::size(pruner) == 0,
                     "deinit did not release pid baselines");
@@ -292,7 +346,7 @@ int main() {
         }
 
         std::cout << "PASS CPUMem real proc samples, shared CPU inputs, comm fallback, PID reuse guard, "
-                     "per-PID system baseline across jobs and stale baseline pruning\n";
+                     "per-PID system baseline across jobs and identity-aware stale baseline pruning\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

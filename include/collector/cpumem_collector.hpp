@@ -78,7 +78,7 @@ private:
         // 该 PID 上次采样时的系统总 jiffies。按 PID 缓存，保证 Δproc 与 Δtotal
         // 覆盖同一个采样区间——采样器实例在所有作业间共享，不能用实例级系统基线。
         unsigned long long lastTotal{};
-        // 该 PID 最近一次被采样的时刻，用于清理已不再出现的 PID 基线
+        // 该 PID 最近一次被采样的时刻，用于筛选需要检查进程身份的陈旧基线
         std::chrono::steady_clock::time_point last_seen{};
     };
     std::unordered_map<int, pid_state> pid_state_dict;
