@@ -183,6 +183,15 @@ The collector's `init(json_cfg)` method receives a JSON object converted from th
 - `include_process_details=true` emits both Job aggregate metrics and per-process detail. `include_process_details=false` emits Job aggregate metrics only
 - Output does not include `mount_point` or `fs_type`; the collector does not provide filesystem-specific attribution
 
+**IO file metadata**: `IOUsageCollector` and `NewIOUsageCollector` resolve file
+paths through `/proc/<pid>/fd` and mount information through `/proc/<pid>/mountinfo`.
+They do not call `stat()` on target files, avoiding remote filesystem authentication
+waits (for example, AFS). The legacy `pos` field previously reported file size,
+not the current file offset; it is now `null` in JSON and `unknown` in text output.
+File details are no longer restricted to regular files and block devices: any
+absolute fd target may appear, including directories or deleted open files.
+Existing IO counters remain available without target metadata access.
+
 **NewIOUsageCollector Notes**:
 - Generic I/O accounting collector at the VFS syscall layer (rchar/wchar semantics), always eBPF-backed with no `use_ebpf` switch
 - Output dimensions: Job-level totals (`job_total`), read/write latency histograms, per-process detail (including short-lived processes), and per-file detail with per-process breakdown — the latter two only when `include_process_details=true`
