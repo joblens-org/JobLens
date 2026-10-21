@@ -25,6 +25,7 @@
 CollectorScheduler::CollectorScheduler()
     : timerScheduler_(Config::instance().getInt("lens_config", "max_collector_threads"))
 {
+    runtime_->schedulerStatusReader(timerScheduler_.statusReader());
     auto runtime = runtime_;
     RPCServer::instance().register_method("CollectorScheduler/status",
         [runtime](const nlohmann::json&) { return runtime->snapshot(); });
@@ -109,7 +110,11 @@ void CollectorScheduler::startCollector(std::string collector_name){
                 auto& collector_job = it_state->second;                
                 std::vector<size_t> jobids_snapshot;
                 {
-                    std::lock_guard lg(collector_job.m_);
+                    std::unique_lock<std::mutex> lg(collector_job.m_, std::defer_lock);
+                    {
+                        CollectorRuntime::Operation waiting(runtime_, collector_name, "wait_collector_lock");
+                        lg.lock();
+                    }
                     if(collector_job.jobid_list.empty() && collector_job.running){
                         //由JobRegistry完成任务清理工作
                         //没有任务，取消这个收集器，节省资源
@@ -124,9 +129,16 @@ void CollectorScheduler::startCollector(std::string collector_name){
                 }
 
                 for(auto jobid: jobids_snapshot){
-                    //TODO:当压力过高时，这里应该改为非阻塞执行
-                    auto job = JobRegistry::instance().findJob(jobid);
-                    std::lock_guard lg(collector_job.m_);
+                    std::optional<Job> job;
+                    {
+                        CollectorRuntime::Operation looking_up(runtime_, collector_name, "lookup_job", jobid);
+                        job = JobRegistry::instance().findJob(jobid);
+                    }
+                    std::unique_lock<std::mutex> lg(collector_job.m_, std::defer_lock);
+                    {
+                        CollectorRuntime::Operation waiting(runtime_, collector_name, "wait_collector_lock", jobid);
+                        lg.lock();
+                    }
                     if(!collector_job.running) return; //采集器已经deinit
                     if(!job.has_value())continue;
                     {
@@ -134,11 +146,11 @@ void CollectorScheduler::startCollector(std::string collector_name){
                         try
                         {
                             {
-                                CollectorRuntime::Operation collecting(runtime_, collector_name, "collect");
+                                CollectorRuntime::Operation collecting(runtime_, collector_name, "collect", jobid);
                                 ret = info.collect_handle(job.value());
                             }
                             auto now = std::chrono::system_clock::now();
-                            CollectorRuntime::Operation writing(runtime_, collector_name, "write");
+                            CollectorRuntime::Operation writing(runtime_, collector_name, "write", jobid);
                             for(const auto& cb:info.finish_cbs){
                                 cb(collector_name, job.value(), ret, now);
                             }
@@ -146,14 +158,14 @@ void CollectorScheduler::startCollector(std::string collector_name){
                         catch(const std::exception& e)
                         {
                             callback.fail(e.what());
-                            spdlog::error("CollectorScheduler: collector {} collect error: {}", collector_name, e.what());
+                            spdlog::error("CollectorScheduler: collector {} job {} collect/write error: {}", collector_name, jobid, e.what());
                         }
                     }
                     
                 }
                 return;
                 
-            }
+            }, collector_name
         );
         collector_job.running = true;
         runtime_->timer(collector_name, true);
