@@ -47,7 +47,6 @@ struct FileIOStat {
     std::string path;
     std::string mount_point;
     std::string fs_type;
-    unsigned long long pos{0};
     IoCounters total;
     std::unordered_map<pid_t, ProcFileIO> processes;
 };

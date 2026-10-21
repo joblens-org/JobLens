@@ -19,7 +19,6 @@
 #include "common/ebpf_common.hpp"
 #include "ebpf/job_pid_track.h"
 #include "writer/prometheus_exporter_writer.hpp"
-#include <sys/stat.h>
 #include <unistd.h>
 #include <nlohmann/json.hpp>
 #include <limits>
@@ -297,7 +296,7 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
         proc.source = proc.alive ? "alive" : "ephemeral";
 
         // 文件级聚合（仅存活进程能 fd→path；短命进程死后无法反查文件路径）。
-        // fd→path 反查（mountinfo/readlink/stat）是明细路径的主要开销，受开关控制。
+        // fd→path 反查（mountinfo/readlink）是明细路径的主要开销，受开关控制。
         if (proc.alive){
             auto mount_table_it = mount_tables.find(pid);
             if (mount_table_it == mount_tables.end()) {
@@ -310,28 +309,25 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
                 buf[n] = '\0';
                 std::string path(buf);
                 if (!path.empty() && path[0] == '/'){
-                    struct stat stb;
-                    if (::stat(path.c_str(), &stb) == 0 && (S_ISREG(stb.st_mode) || S_ISBLK(stb.st_mode))){
-                        std::string mount_point;
-                        std::string fs_type;
-                        if (mount_table_it->second) {
-                            if (auto mount_entry = MountInfoUtils::resolve(*mount_table_it->second, path)) {
-                                mount_point = mount_entry->mount_point;
-                                fs_type = mount_entry->fs_type;
-                            }
+                    // Never query target metadata: AFS authentication may block collection.
+                    std::string mount_point;
+                    std::string fs_type;
+                    if (mount_table_it->second) {
+                        if (auto mount_entry = MountInfoUtils::resolve(*mount_table_it->second, path)) {
+                            mount_point = mount_entry->mount_point;
+                            fs_type = mount_entry->fs_type;
                         }
-                        const auto file_key = make_file_identity_key(mount_point, fs_type, path);
-                        auto& finfo = result.files[file_key];
-                        finfo.path = path;
-                        finfo.mount_point = mount_point;
-                        finfo.fs_type = fs_type;
-                        finfo.pos = static_cast<unsigned long long>(stb.st_size);
-                        merge_rw_stat_into_io(finfo.total, s, io_status);
-                        auto& pfinfo = finfo.processes[pid];
-                        pfinfo.pid = pid;
-                        pfinfo.alive = true;
-                        merge_rw_stat_into_io(pfinfo.io, s, io_status);
                     }
+                    const auto file_key = make_file_identity_key(mount_point, fs_type, path);
+                    auto& finfo = result.files[file_key];
+                    finfo.path = path;
+                    finfo.mount_point = mount_point;
+                    finfo.fs_type = fs_type;
+                    merge_rw_stat_into_io(finfo.total, s, io_status);
+                    auto& pfinfo = finfo.processes[pid];
+                    pfinfo.pid = pid;
+                    pfinfo.alive = true;
+                    merge_rw_stat_into_io(pfinfo.io, s, io_status);
                 }
             }
         }
@@ -468,7 +464,7 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
                 fj["path"] = f.path;
                 fj["mount_point"] = f.mount_point;
                 fj["fs_type"] = f.fs_type;
-                fj["pos"] = f.pos;
+                fj["pos"] = nullptr; // File size is intentionally not queried.
                 fj["total"] = io_counters_to_json(f.total);
                 fj["processes"] = json::array();
                 for (const auto& [pid, p] : f.processes){
@@ -546,7 +542,7 @@ CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& w
                     << " path=" << f.path
                     << " mount_point=" << f.mount_point
                     << " fs_type=" << f.fs_type
-                    << " pos=" << f.pos
+                    << " pos=unknown"
                     << " rchar=" << f.total.rchar
                     << " wchar=" << f.total.wchar
                     << " syscr=" << f.total.syscr

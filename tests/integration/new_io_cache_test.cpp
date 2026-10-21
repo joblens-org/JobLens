@@ -1,4 +1,6 @@
 #include "collector/new_io_usage_collector.hpp"
+#include <sys/stat.h>
+#include <cerrno>
 #include <bpf/bpf.h>
 #include <cstdio>
 #include <iostream>
@@ -7,6 +9,15 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "bpf_map_fixture.hpp"
+
+// A remote metadata lookup may block before returning EACCES. Reject it here
+// without waiting, and assert that collection never attempts the lookup.
+unsigned metadata_calls = 0;
+extern "C" int __wrap_stat(const char*, struct stat*) {
+    ++metadata_calls;
+    errno = EACCES;
+    return -1;
+}
 
 static int observed_map_fd = -1;
 static unsigned batch_calls = 0;
@@ -97,6 +108,7 @@ static void run(const char* path, bool details) {
     observed_map_fd = fd;
     TestFile file;
     require(file.fd >= 0, "创建临时文件失败");
+    require(unlink(file.path) == 0, "unlink test file failed");
     const auto pid = static_cast<uint32_t>(getpid());
     const auto file_fd = static_cast<uint32_t>(file.fd);
     job_pid_fd_key a{7, pid, file_fd}, b{9, pid, file_fd};
@@ -116,7 +128,9 @@ static void run(const char* path, bool details) {
     NewIOUsageCollectorTestAccess::setup(collector, object.get(), details);
     Job job; job.JobID = 7; job.JobPIDs = {getpid()};
     liveness_calls.clear();
+    metadata_calls = 0;
     const auto first = std::any_cast<JobIOStat>(collector.collect(job));
+    require(metadata_calls == 0, "IO collection attempted a blocking metadata lookup");
     require(first.job_total.rchar == 100, "Job 总量改变");
     require(liveness_calls[pid] == 1, "liveness queried once per FD instead of once per PID");
     require(NewIOUsageCollectorTestAccess::output_count(collector, 7, pid) == 1,
@@ -124,6 +138,8 @@ static void run(const char* path, bool details) {
     if (details) {
         require(first.processes.at(getpid()).io.rchar == 150, "明细串作业");
         require(first.files.size() == 1 && first.files.begin()->second.total.rchar == 150, "文件明细不正确");
+        const auto output = std::any_cast<nlohmann::json>(collector.get_writer_parser("ESWriter")(first));
+        require(output.at("files").at(0).at("pos").is_null(), "unknown file size must be null");
     } else {
         require(first.processes.empty() && first.files.empty(), "关闭明细时仍输出明细");
         require(NewIOUsageCollectorTestAccess::empty_detail_baselines(collector, 7),
@@ -198,7 +214,9 @@ static void run_cleanup_recovery(const char* path, bool reuse, bool exited_again
     NewIOUsageCollectorTestAccess::setup(collector, object.get(), true);
     Job job; job.JobID = 7;
     if (!reuse) batches_before_error = 1;
+    metadata_calls = 0;
     const auto first = std::any_cast<JobIOStat>(collector.collect(job));
+    require(metadata_calls == 0, "IO collection attempted a blocking metadata lookup");
     require(first.processes.at(child).source == "ephemeral", "dead recovery PID missing");
     if (!reuse) require(first.processes.at(child).io.rchar < entries, "partial dump fixture did not truncate");
     if (reuse && !exited_again) revived_pid = child;
@@ -270,12 +288,15 @@ static void run_failure_retry(const char* path) {
     std::cout << "PASS empty and partial BPF dump failures retry inside the TTL\n";
 }
 
+void run_legacy_without_metadata();
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[2], "--map-fixture") == 0) BpfMapFixture::enabled = true;
     else if (argc != 2) { std::cerr << "Usage: new_io_cache_test maps.bpf.o [--map-fixture]\n"; return 2; }
     spdlog::set_level(spdlog::level::warn);
     if (BpfMapFixture::enabled) std::cout << "BPF map backend: in-memory fixture (no kernel BPF validation)\n";
     try {
+        run_legacy_without_metadata();
         run(argv[1], true); run(argv[1], false);
         run_cleanup_recovery(argv[1], true); run_cleanup_recovery(argv[1], false);
         run_cleanup_recovery(argv[1], true, true);

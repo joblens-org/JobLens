@@ -18,7 +18,6 @@
 #include <dirent.h>
 #include <fstream>
 #include <sstream>
-#include <sys/stat.h>
 #include <unistd.h>
 #include <nlohmann/json.hpp>
 #include "common/utils.hpp"
@@ -303,13 +302,10 @@ CollectResult IOUsageCollector::collect(const Job &job)
                 int fd = std::atoi(ent->d_name);
                 std::string path = fd_to_path(pid, fd);
                 if (path.empty() || path[0] != '/') continue; // 只保留真实文件系统路径
-                struct stat stb;
-                if (::stat(path.c_str(), &stb) < 0) continue;
-                if (!S_ISREG(stb.st_mode) && !S_ISBLK(stb.st_mode)) continue;
+                // Do not query the target: remote filesystems can block on authentication.
 
-                FileIOInfo finfo;
+                FileIOInfo finfo{};
                 finfo.path = path;
-                finfo.pos  = static_cast<unsigned long long>(stb.st_size);
                 if (mount_table) {
                     if (auto mount_entry = MountInfoUtils::resolve(*mount_table, path)) {
                         finfo.mount_point = mount_entry->mount_point;
@@ -428,7 +424,7 @@ CollectDataParseFunc IOUsageCollector::get_writer_parser(const std::string& writ
                     fj["path"] = finfo.path;
                     fj["mount_point"] = finfo.mount_point;
                     fj["fs_type"] = finfo.fs_type;
-                    fj["pos"] = finfo.pos;
+                    fj["pos"] = nullptr; // File size is intentionally not queried.
                     if (use_ebpf) {
                         fj["read_bytes"] = finfo.read_bytes;
                         fj["read_speed"] = finfo.read_speed;
@@ -484,7 +480,7 @@ CollectDataParseFunc IOUsageCollector::get_writer_parser(const std::string& writ
                         << " path=" << finfo.path
                         << " mount_point=" << finfo.mount_point
                         << " fs_type=" << finfo.fs_type
-                        << " pos=" << finfo.pos;
+                        << " pos=unknown";
                     if (use_ebpf) {
                         out << " read_bytes=" << finfo.read_bytes
                             << " read_speed=" << finfo.read_speed

@@ -28,7 +28,6 @@ struct FileIOInfo{
     std::string path;
     std::string mount_point;
     std::string fs_type;
-    unsigned long long pos;
     u64 read_bytes;
     double read_speed;
     u64 write_bytes;
