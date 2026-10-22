@@ -182,6 +182,8 @@ net_sys_collector_config:
 - `include_process_details=true` 输出 Job 聚合指标和按进程明细；`include_process_details=false` 只输出 Job 聚合指标
 - 输出不包含 `mount_point` 或 `fs_type`，此收集器不提供文件系统特定归因
 
+**IO 文件元数据**：`IOUsageCollector` 与 `NewIOUsageCollector` 通过 `/proc/<pid>/fd` 解析文件路径，通过 `/proc/<pid>/mountinfo` 解析挂载信息，二者不会对目标文件调用 `stat()`，避免远端文件系统认证等待（例如 AFS）阻塞整个采集周期。旧 `pos` 字段此前上报的其实是文件大小而非当前文件偏移，现改为 JSON 输出 `null`、文本输出 `unknown`。文件级明细不再限定常规文件与块设备：任何绝对路径的 fd 目标都可能出现，包括目录或已删除但仍打开的文件。在不访问目标文件元数据的情况下，既有 IO 计数器仍照常可用。
+
 **NewIOUsageCollector 说明**：
 - 通用 I/O 计量采集器（VFS syscall 层语义，rchar/wchar），始终基于 eBPF，没有 `use_ebpf` 开关
 - 输出维度：Job 级总量（`job_total`）、读/写时延直方图、进程级明细（含短命进程）、文件级明细（含按进程细分）——后两者仅在 `include_process_details=true` 时输出

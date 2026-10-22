@@ -1,5 +1,22 @@
 # JobLens Changelog
 
+## v0.3.7 (2026-10-22)
+
+### Scheduler Correctness and Observability
+- Fixed unbounded timer-queue growth when collectors ran slower than their period: `TimerScheduler` previously pushed a callback copy every tick, so a collector blocked for 60 s at 20 Hz queued 1200 duplicate callbacks, each re-contending the same collector lock and able to saturate the entire worker pool. Each timer now keeps at most one queued-or-running callback: a tick arriving while the timer is busy increments `skipped_runs` instead of enqueueing, the ready queue stores timer handles with an upper bound of the number of registered timers, and an overloaded scheduler (deadlines persistently overdue) releases its scheduling lock once per tick so workers, status queries and `cancelTimer` are not starved (`48996ab`).
+- Added scheduler/collector/job status visibility through new read-only core RPC methods `CollectorScheduler/status` and `CollectorScheduler/collector_status`, bridged as the bounded HTTP endpoint `GET /joblens/collectors/status`: a per-timer view (idle/queued/running, queued/running durations, `skipped_runs`/`completed_runs`/error counts, worker index), per-collector operations (`init`/`callback`/`lookup_job`/`wait_collector_lock`/`collect`/`write` with success/error counts, last duration, in-progress entries and job attribution including `current_job` with stage), and scheduler-level worker/queue statistics. Snapshots copy observational data under short-held locks and render JSON outside them, so the status RPC stays sub-millisecond while callbacks block and remains readable after scheduler destruction (`48996ab`).
+
+### CPUMemCollector Fixes
+- Fixed alive-PID baselines being dropped under low-frequency sampling: baselines exceeding the 300 s TTL are now verified against `/proc/<pid>/stat` and removed only after confirming the process is gone or its `starttime` changed; baselines are retained on permission or parse failures. Added regression tests covering long-period sampling, PID reuse, and stat read failures (`81afb08`).
+
+### IO Detail Collection
+- Fixed IO detail collection blocking on remote filesystems: `IOUsageCollector` and `NewIOUsageCollector` no longer call `stat()` on `/proc/<pid>/fd` targets, which could hang the entire collect cycle in remote filesystem authentication (for example AFS); file paths are resolved with `readlink` only and mount information via `/proc/<pid>/mountinfo`. Two downstream-visible behavior changes: file details are no longer restricted to regular and block devices (directories and deleted-but-open files now appear), and the legacy `pos` field — which reported file size rather than the current file offset — is now JSON `null` and text `unknown`. `FileIOInfo` is value-initialized to drop the stale `st_size` dependency (`28f811f`).
+
+### Documentation
+- Rewrote `doc/collector_scheduler_status.md` for the new status API and added an IO file metadata section to `doc/configuration.md` (`e078b32`).
+
+---
+
 ## v0.3.6 (2026-09-30)
 
 ### CPUMemCollector Fixes
