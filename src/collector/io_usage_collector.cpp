@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "collector/io_usage_collector.hpp"
+#include "core/output_context.hpp"
 #include <memory>
 #include "common/mountinfo_utils.hpp"
 #include <chrono>
@@ -247,7 +248,7 @@ static std::string fd_to_path(int pid, int fd)
 }
 
 // --------------- CPUMemCollector ---------------
-CollectResult IOUsageCollector::collect(const Job &job)
+std::vector<IOUsageInfo> IOUsageCollector::sample_job(const Job &job)
 {
     std::vector<IOUsageInfo> result;
     if (use_ebpf){
@@ -398,142 +399,127 @@ CollectResult IOUsageCollector::collect(const Job &job)
 }
 
 
-CollectDataParseFunc IOUsageCollector::get_writer_parser(const std::string& writer_type) {
-    CollectDataParseFunc func = nullptr;
-    
-    if(writer_type.compare("ESWriter") == 0){
-        func = [this](std::any data)->std::any{
-            nlohmann::json ret;
-            if(data.has_value() == false) {
-                spdlog::warn("IOUsageInfo: error writer parser, empty data");
-                ret["error"] = "empty data";
-                return ret;
-            }
-            ret["process_data"] = nlohmann::json::array();
-            const auto& parsed = std::any_cast<const std::vector<IOUsageInfo>&>(data);
-            for (const auto& info : parsed) {
-                nlohmann::json j;
-                j["pid"] = info.pid;
-                j["read_bytes"] = info.read_bytes;
-                j["writer_bytes"] = info.write_bytes;
-                j["read_speed"] = info.read_speed;
-                j["write_speed"] = info.write_speed;
-                j["rchar"] = info.rchar;
-                j["wchar"] = info.wchar;
-                j["rchar_speed"] = info.rchar_speed;
-                j["wchar_speed"] = info.wchar_speed;
-                j["syscr"] = info.syscr;
-                j["syscw"] = info.syscw;
-                nlohmann::json files = nlohmann::json::array();
-                for (const auto& [fd, finfo] : info.file_info) {
-                    nlohmann::json fj;
-                    fj["fd"] = fd;
-                    if (include_file_paths) {
-                        fj["path"] = finfo.path;
-                        fj["mount_point"] = finfo.mount_point;
-                    }
-                    fj["fs_type"] = finfo.fs_type;
-                    fj["pos"] = nullptr; // File size is intentionally not queried.
-                    if (use_ebpf) {
-                        fj["read_bytes"] = finfo.read_bytes;
-                        fj["read_speed"] = finfo.read_speed;
-                        fj["write_bytes"] = finfo.write_bytes;
-                        fj["write_speed"] = finfo.write_speed;
-                        fj["read_mean"] = finfo.read_mean;
-                        fj["write_mean"] = finfo.write_mean;
-                        fj["read_variance"] = finfo.read_variance;
-                        fj["write_variance"] = finfo.write_variance;
-                        fj["write_count"] = finfo.write_count;
-                        fj["read_count"] = finfo.read_count;
-                    }
-                    files.push_back(std::move(fj));
-                }
-                j["files"] = std::move(files);
-                if (info.pid == 0){
-                    if (summary) ret["summary"] = std::move(j);
-                }else{
-                    ret["process_data"].push_back(std::move(j));
-                }
-            }
-            return ret;
-        };
-    }
+std::vector<OutputChannel> IOUsageCollector::output_channels() const {
+    return {
+        {"document", OutputKind::Document},
+        {"text", OutputKind::Text},
+        {"metrics", OutputKind::Metrics}
+    };
+}
 
-    if(writer_type.compare("FileWriter") == 0){
-        func = [this](std::any data)->std::any{
-            if(data.has_value() == false) {
-                spdlog::warn("IOUsageInfo: error FileWriter parser, empty data");
-                return std::string("IOUsageCollector error=empty_data\n");
+nlohmann::json IOUsageCollector::to_document(const std::vector<IOUsageInfo>& infos) const {
+    nlohmann::json ret;
+    ret["process_data"] = nlohmann::json::array();
+    for (const auto& info : infos) {
+        nlohmann::json j;
+        j["pid"] = info.pid;
+        j["read_bytes"] = info.read_bytes;
+        j["writer_bytes"] = info.write_bytes;
+        j["read_speed"] = info.read_speed;
+        j["write_speed"] = info.write_speed;
+        j["rchar"] = info.rchar;
+        j["wchar"] = info.wchar;
+        j["rchar_speed"] = info.rchar_speed;
+        j["wchar_speed"] = info.wchar_speed;
+        j["syscr"] = info.syscr;
+        j["syscw"] = info.syscw;
+        nlohmann::json files = nlohmann::json::array();
+        for (const auto& [fd, finfo] : info.file_info) {
+            nlohmann::json fj;
+            fj["fd"] = fd;
+            if (include_file_paths) {
+                fj["path"] = finfo.path;
+                fj["mount_point"] = finfo.mount_point;
             }
-            const auto& parsed = std::any_cast<const std::vector<IOUsageInfo>&>(data);
-            std::ostringstream out;
-            for (const auto& info : parsed) {
-                out << "IOUsageCollector"
-                    << " type=" << (info.pid == 0 ? "summary" : "process")
-                    << " pid=" << info.pid
-                    << " read_bytes=" << info.read_bytes
-                    << " write_bytes=" << info.write_bytes
-                    << " read_speed=" << info.read_speed
-                    << " write_speed=" << info.write_speed
-                    << " rchar=" << info.rchar
-                    << " wchar=" << info.wchar
-                    << " rchar_speed=" << info.rchar_speed
-                    << " wchar_speed=" << info.wchar_speed
-                    << " syscr=" << info.syscr
-                    << " syscw=" << info.syscw
-                    << '\n';
-                for (const auto& [fd, finfo] : info.file_info) {
-                    out << "IOUsageCollector file"
-                        << " pid=" << info.pid
-                        << " fd=" << fd;
-                    if (include_file_paths) {
-                        out << " path=" << finfo.path
-                            << " mount_point=" << finfo.mount_point;
-                    }
-                    out << " fs_type=" << finfo.fs_type
-                        << " pos=unknown";
-                    if (use_ebpf) {
-                        out << " read_bytes=" << finfo.read_bytes
-                            << " read_speed=" << finfo.read_speed
-                            << " write_bytes=" << finfo.write_bytes
-                            << " write_speed=" << finfo.write_speed
-                            << " read_mean=" << finfo.read_mean
-                            << " write_mean=" << finfo.write_mean
-                            << " read_variance=" << finfo.read_variance
-                            << " write_variance=" << finfo.write_variance
-                            << " write_count=" << finfo.write_count
-                            << " read_count=" << finfo.read_count;
-                    }
-                    out << '\n';
-                }
+            fj["fs_type"] = finfo.fs_type;
+            fj["pos"] = nullptr;
+            if (use_ebpf) {
+                fj["read_bytes"] = finfo.read_bytes;
+                fj["read_speed"] = finfo.read_speed;
+                fj["write_bytes"] = finfo.write_bytes;
+                fj["write_speed"] = finfo.write_speed;
+                fj["read_mean"] = finfo.read_mean;
+                fj["write_mean"] = finfo.write_mean;
+                fj["read_variance"] = finfo.read_variance;
+                fj["write_variance"] = finfo.write_variance;
+                fj["write_count"] = finfo.write_count;
+                fj["read_count"] = finfo.read_count;
             }
-            return out.str();
-        };
+            files.push_back(std::move(fj));
+        }
+        j["files"] = std::move(files);
+        if (info.pid == 0) {
+            if (summary) ret["summary"] = std::move(j);
+        } else {
+            ret["process_data"].push_back(std::move(j));
+        }
     }
+    return ret;
+}
 
-    if(writer_type.compare("PrometheusExporterWriter") == 0){
-        func = [this](std::any data)->std::any{
-            PrometheusExporterWriter::prometheus_job_state ret;
-            if(data.has_value() == false) {
-                spdlog::warn("IOUsageCollector: error writer parser, empty data");
-                ret.JobID = 0;
-                return ret;
+std::string IOUsageCollector::to_text(const std::vector<IOUsageInfo>& infos) const {
+    std::ostringstream out;
+    for (const auto& info : infos) {
+        out << "IOUsageCollector"
+            << " type=" << (info.pid == 0 ? "summary" : "process")
+            << " pid=" << info.pid
+            << " read_bytes=" << info.read_bytes
+            << " write_bytes=" << info.write_bytes
+            << " read_speed=" << info.read_speed
+            << " write_speed=" << info.write_speed
+            << " rchar=" << info.rchar
+            << " wchar=" << info.wchar
+            << " rchar_speed=" << info.rchar_speed
+            << " wchar_speed=" << info.wchar_speed
+            << " syscr=" << info.syscr
+            << " syscw=" << info.syscw
+            << '\n';
+        for (const auto& [fd, finfo] : info.file_info) {
+            out << "IOUsageCollector file"
+                << " pid=" << info.pid
+                << " fd=" << fd;
+            if (include_file_paths) {
+                out << " path=" << finfo.path << " mount_point=" << finfo.mount_point;
             }
-            const auto& parsed = std::any_cast<const std::vector<IOUsageInfo>&>(data);
-            
-            for (const auto& info : parsed) {
-                PrometheusExporterWriter::prometheus_process_state state;
-                state.pid = info.pid;
-                state.io_read_bytes_per_sec = info.read_speed;
-                state.io_read_bytes_total = info.read_bytes;
-                state.io_write_bytes_per_sec = info.write_speed;
-                state.io_write_bytes_total = info.write_bytes;
-                
-                ret.processes_state.push_back(state);
+            out << " fs_type=" << finfo.fs_type
+                << " pos=unknown";
+            if (use_ebpf) {
+                out << " read_bytes=" << finfo.read_bytes
+                    << " read_speed=" << finfo.read_speed
+                    << " write_bytes=" << finfo.write_bytes
+                    << " write_speed=" << finfo.write_speed
+                    << " read_mean=" << finfo.read_mean
+                    << " write_mean=" << finfo.write_mean
+                    << " read_variance=" << finfo.read_variance
+                    << " write_variance=" << finfo.write_variance
+                    << " write_count=" << finfo.write_count
+                    << " read_count=" << finfo.read_count;
             }
-            return ret;
-        };
+            out << '\n';
+        }
     }
-    
-    return func;
+    return out.str();
+}
+
+MetricSnapshot IOUsageCollector::to_metrics(const std::vector<IOUsageInfo>& infos) const {
+    MetricSnapshot ret;
+    for (const auto& info : infos) {
+        ProcessMetricSnapshot state;
+        state.pid = info.pid;
+        state.io_read_bytes_per_sec = info.read_speed;
+        state.io_read_bytes_total = info.read_bytes;
+        state.io_write_bytes_per_sec = info.write_speed;
+        state.io_write_bytes_total = info.write_bytes;
+        ret.processes_state.push_back(state);
+    }
+    return ret;
+}
+
+CollectOutcome IOUsageCollector::collect(const Job& job, OutputContext& output) {
+    if (!output.enabled("document") && !output.enabled("text") && !output.enabled("metrics")) return {};
+    const auto infos = sample_job(job);
+    if (output.enabled("document")) output.emit("document", Document{to_document(infos)});
+    if (output.enabled("text")) output.emit("text", Text{to_text(infos)});
+    if (output.enabled("metrics")) output.emit("metrics", to_metrics(infos));
+    return {};
 }

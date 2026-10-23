@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "collector/basic_info_collector.hpp"
+#include "core/output_context.hpp"
 #include <memory>
 #include <cstdlib>
 #include <cerrno>
@@ -265,7 +266,7 @@ void BasicInfoCollector::calculate_io_speed(BasicInfo& info, const struct taskst
 }
 
 
-CollectResult BasicInfoCollector::collect(const Job& job) {
+std::vector<BasicInfo> BasicInfoCollector::sample_job(const Job& job) {
     if (!inited) {
         spdlog::error("BasicInfoCollector not initialized");
         return {};
@@ -334,132 +335,73 @@ CollectResult BasicInfoCollector::collect(const Job& job) {
     return infos;
 }
 
+std::vector<OutputChannel> BasicInfoCollector::output_channels() const {
+    return {{"document", OutputKind::Document}, {"text", OutputKind::Text}};
+}
 
-CollectDataParseFunc BasicInfoCollector::get_writer_parser(const std::string& writer_type) {
-    CollectDataParseFunc func = nullptr;
-    spdlog::trace("BasicInfoCollector: get_writer_parser for writer_type: {}", writer_type);
-    
-    if (writer_type.compare("ESWriter") == 0) {
-        func = [this](std::any data) -> std::any {
-            nlohmann::json ret;
-            if (!data.has_value()) {
-                spdlog::warn("BasicInfoCollector: empty data");
-                ret["error"] = "empty data";
-                return ret;
-            }
-            
-            ret["process_data"] = nlohmann::json::array();
-            const auto& parsed = std::any_cast<const std::vector<BasicInfo>&>(data);
-            
-            spdlog::trace("BasicInfoCollector: parsing {} entries for ESWriter", parsed.size());
-            
-            for (const auto& info : parsed) {
-                nlohmann::json j;
-                j["pid"] = info.pid;
-                j["name"] = info.name;
-                j["timestamp"] = std::chrono::system_clock::now().time_since_epoch().count();
-                
-                // CPU信息
-                j["cpu_percent"] = info.cpuPercent;
-                j["cpu_user_ns"] = info.cpuUserNs;
-                j["cpu_system_ns"] = info.cpuSystemNs;
-                j["cpu_total_ns"] = info.cpuTotalNs;
-                
-                // 内存信息
-                j["mem_rss_bytes"] = info.memRssBytes;
-                j["mem_vm_bytes"] = info.memVmBytes;
-                j["mem_percent"] = info.memoryPercent;
-                
-                // IO信息
-                j["io_read_speed_bps"] = info.readSpeed;
-                j["io_write_speed_bps"] = info.writeSpeed;
-                j["io_read_bytes_total"] = info.readBytes;
-                j["io_write_bytes_total"] = info.writeBytes;
-                j["io_read_ops_total"] = info.readOps;
-                j["io_write_ops_total"] = info.writeOps;
-                
-                // 其他
-                j["num_threads"] = info.numThreads;
-                j["ctx_sw_voluntary"] = info.voluntaryCtxSw;
-                j["ctx_sw_nonvoluntary"] = info.nonvoluntaryCtxSw;
-                
-                if (info.pid == 0) {
-                    ret["summary"] = std::move(j);
-                } else {
-                    ret["process_data"].push_back(std::move(j));
-                }
-            }
-            
-            return ret;
-        };
+nlohmann::json BasicInfoCollector::to_document(const std::vector<BasicInfo>& infos) const {
+    nlohmann::json ret;
+    ret["process_data"] = nlohmann::json::array();
+    for (const auto& info : infos) {
+        nlohmann::json j;
+        j["pid"] = info.pid;
+        j["name"] = info.name;
+        j["timestamp"] = std::chrono::system_clock::now().time_since_epoch().count();
+        j["cpu_percent"] = info.cpuPercent;
+        j["cpu_user_ns"] = info.cpuUserNs;
+        j["cpu_system_ns"] = info.cpuSystemNs;
+        j["cpu_total_ns"] = info.cpuTotalNs;
+        j["mem_rss_bytes"] = info.memRssBytes;
+        j["mem_vm_bytes"] = info.memVmBytes;
+        j["mem_percent"] = info.memoryPercent;
+        j["io_read_speed_bps"] = info.readSpeed;
+        j["io_write_speed_bps"] = info.writeSpeed;
+        j["io_read_bytes_total"] = info.readBytes;
+        j["io_write_bytes_total"] = info.writeBytes;
+        j["io_read_ops_total"] = info.readOps;
+        j["io_write_ops_total"] = info.writeOps;
+        j["num_threads"] = info.numThreads;
+        j["ctx_sw_voluntary"] = info.voluntaryCtxSw;
+        j["ctx_sw_nonvoluntary"] = info.nonvoluntaryCtxSw;
+        if (info.pid == 0) ret["summary"] = std::move(j);
+        else ret["process_data"].push_back(std::move(j));
     }
-    
-    if (writer_type.compare("FileWriter") == 0) {
-        func = [this](std::any data) -> std::any {
-            if (!data.has_value()) {
-                spdlog::warn("BasicInfoCollector: error FileWriter parser, empty data");
-                return std::string("BasicInfoCollector error=empty_data\n");
-            }
-            const auto& parsed = std::any_cast<const std::vector<BasicInfo>&>(data);
-            std::ostringstream out;
-            for (const auto& info : parsed) {
-                out << "BasicInfoCollector"
-                    << " type=" << (info.pid == 0 ? "summary" : "process")
-                    << " pid=" << info.pid
-                    << " name=" << info.name
-                    << " cpu_percent=" << info.cpuPercent
-                    << " cpu_user_ns=" << info.cpuUserNs
-                    << " cpu_system_ns=" << info.cpuSystemNs
-                    << " cpu_total_ns=" << info.cpuTotalNs
-                    << " mem_rss_bytes=" << info.memRssBytes
-                    << " mem_vm_bytes=" << info.memVmBytes
-                    << " mem_percent=" << info.memoryPercent
-                    << " io_read_speed_bps=" << info.readSpeed
-                    << " io_write_speed_bps=" << info.writeSpeed
-                    << " io_read_bytes_total=" << info.readBytes
-                    << " io_write_bytes_total=" << info.writeBytes
-                    << " io_read_ops_total=" << info.readOps
-                    << " io_write_ops_total=" << info.writeOps
-                    << " num_threads=" << info.numThreads
-                    << " ctx_sw_voluntary=" << info.voluntaryCtxSw
-                    << " ctx_sw_nonvoluntary=" << info.nonvoluntaryCtxSw
-                    << '\n';
-            }
-            return out.str();
-        };
+    return ret;
+}
+
+std::string BasicInfoCollector::to_text(const std::vector<BasicInfo>& infos) const {
+    std::ostringstream out;
+    for (const auto& info : infos) {
+        out << "BasicInfoCollector"
+            << " type=" << (info.pid == 0 ? "summary" : "process")
+            << " pid=" << info.pid
+            << " name=" << info.name
+            << " cpu_percent=" << info.cpuPercent
+            << " cpu_user_ns=" << info.cpuUserNs
+            << " cpu_system_ns=" << info.cpuSystemNs
+            << " cpu_total_ns=" << info.cpuTotalNs
+            << " mem_rss_bytes=" << info.memRssBytes
+            << " mem_vm_bytes=" << info.memVmBytes
+            << " mem_percent=" << info.memoryPercent
+            << " io_read_speed_bps=" << info.readSpeed
+            << " io_write_speed_bps=" << info.writeSpeed
+            << " io_read_bytes_total=" << info.readBytes
+            << " io_write_bytes_total=" << info.writeBytes
+            << " io_read_ops_total=" << info.readOps
+            << " io_write_ops_total=" << info.writeOps
+            << " num_threads=" << info.numThreads
+            << " ctx_sw_voluntary=" << info.voluntaryCtxSw
+            << " ctx_sw_nonvoluntary=" << info.nonvoluntaryCtxSw
+            << '\n';
     }
-    
-    if (writer_type.compare("PrometheusExporterWriter") == 0) {
-        func = [this](std::any data) -> std::any {
-            PrometheusExporterWriter::prometheus_job_state ret;
-            if (!data.has_value()) {
-                spdlog::warn("BasicInfoCollector: empty data");
-                ret.JobID = 0;
-                return ret;
-            }
-            
-            const auto& parsed = std::any_cast<const std::vector<BasicInfo>&>(data);
-            
-            for (const auto& info : parsed) {
-                PrometheusExporterWriter::prometheus_process_state state;
-                state.pid = info.pid;
-                state.cpu_usage_percent = info.cpuPercent;
-                state.threads_cnt = info.numThreads;
-                state.mem_rss_kb = info.memRssBytes / 1024; // 转换为KB
-                state.mem_usage_percent = info.memoryPercent;
-                state.mem_vm_kb = info.memVmBytes / 1024;
-                
-                // 扩展Prometheus结构以支持IO指标
-                // 需要在prometheus_exporter_writer.hpp中定义这些字段
-                ret.processes_state.push_back(state);
-                
-                // 如果需要，可以添加额外的metric
-                // 例如: ret.io_read_speed_bps = info.readSpeed;
-            }
-            
-            return ret;
-        };
-    }
-    
-    return func;
+    return out.str();
+}
+
+CollectOutcome BasicInfoCollector::collect(const Job& job, OutputContext& output) {
+    if (!inited) return {CollectState::Failed, "BasicInfoCollector not initialized"};
+    if (!output.enabled("document") && !output.enabled("text")) return {};
+    const auto infos = sample_job(job);
+    if (output.enabled("document")) output.emit("document", Document{to_document(infos)});
+    if (output.enabled("text")) output.emit("text", Text{to_text(infos)});
+    return {};
 }

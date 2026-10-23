@@ -1,6 +1,7 @@
 #pragma once
 #include "icollector.h"
 #include "core/collector_type.h"
+#include "core/output_record.h"
 #include "nlohmann/json.hpp"
 #include <unordered_map>
 #include <vector>
@@ -27,14 +28,17 @@ public:
     void on_job_updated(const Job& job) override;
     void on_job_removed(const Job& job) override;
 
-    /*-------- 采集接口 --------*/
-    CollectResult collect() override;                    // 系统级采集
-    CollectResult collect(const Job& job) override;      // 进程级采集
-
-    /*-------- 输出适配 --------*/
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
+    /*-------- 原生采集接口 --------
+     * 采集器负责采样并构造 0..N 条输出记录，经 OutputContext 提交。
+     * 采样只做一次；只有被路由启用的表示才需要构造。 */
+    CollectOutcome collect(const Job& job, OutputContext& output) override;
+    std::vector<OutputChannel> output_channels() const override;
 
 private:
+    std::vector<__YOUR_COLLECTOR_NAME__Data> sample_job(const Job& job);
+    nlohmann::json to_document(const std::vector<__YOUR_COLLECTOR_NAME__Data>& data) const;
+    std::string to_text(const std::vector<__YOUR_COLLECTOR_NAME__Data>& data) const;
+
     /*-------- 业务状态 --------*/
     double freq_{0.2};               // 例子：采样周期
     std::unordered_map<pid_t, double> last_value_;  // 例子：上次采样值

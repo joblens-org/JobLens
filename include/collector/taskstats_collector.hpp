@@ -21,9 +21,9 @@
 class TaskstatsCollector : public ICollector{
 public:
     bool init(const nlohmann::json& cfg) override;
-    CollectResult collect(const Job& job) override;
+    CollectOutcome collect(const Job& job, OutputContext& output) override;
     void deinit() noexcept override;
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type);
+    std::vector<OutputChannel> output_channels() const override { return {}; }
 private:
     bool init_taskstats();
     int netlink_fd;

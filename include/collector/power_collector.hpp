@@ -115,11 +115,14 @@ public:
     bool init(const nlohmann::json& cfg) override;   // 加载eBPF、检测RAPL、配置参数
     void deinit() noexcept override;                  // 卸载eBPF、清理资源
 
-    /* Job-scoped: 全局缓存后按Job逐个归因 (对标IO/Net Collector) */
-    CollectResult collect(const Job& job) override;   // 读缓存→归因单个Job
+    /* Job-scoped: 全局缓存后按Job逐个归因 (对标IO/Net Collector) */   // 读缓存→归因单个Job
 
     /* Writer适配器: 将PowerSnapshot转成各Writer可消费的格式 */
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
+    CollectOutcome collect(const Job& job, OutputContext& output) override;
+    std::vector<OutputChannel> output_channels() const override;
+    PowerSnapshot sample_job(const Job& job);
+    nlohmann::json to_document(const PowerSnapshot& snap) const;
+    std::string to_text(const PowerSnapshot& snap) const;
 
 private:
     friend struct PowerCollectorTestAccess;

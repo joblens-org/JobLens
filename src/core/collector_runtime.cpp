@@ -74,6 +74,10 @@ void CollectorRuntime::error(const std::string& name, const std::string& message
     for (auto& ch : entry.last_error)
         if (static_cast<unsigned char>(ch) >= 128) ch = '?';
 }
+void CollectorRuntime::clear_error(const std::string& name) {
+    std::lock_guard lock(mutex_);
+    entries_.at(name).failed = false;
+}
 void CollectorRuntime::lifecycle(const std::string& value) {
     std::lock_guard lock(mutex_);
     lifecycle_ = value;
@@ -121,6 +125,7 @@ nlohmann::json CollectorRuntime::snapshot() const {
         errors += entry.failed;
     }
     return {{"status", "ok"}, {"lifecycle", lifecycle},
+        {"operation_semantics_version", 2},
         {"observed_at_unix_ms", wallNow()}, {"collector_count", entries.size()},
         {"collectors_with_error", errors}, {"active_callback_count", active},
         {"collectors", collectors}, {"scheduler", scheduler}};
@@ -174,8 +179,8 @@ CollectorRuntime::Operation::~Operation() {
     } else {
         ++metric.success;
         metric.last_success_unix_ms = wallNow();
-        // 空扫描不能掩盖初始化或采集错误；历史错误文本和计数保留。
-        if (kind_ == "init" || kind_ == "write") entry.failed = false;
+        // 空扫描不能掩盖初始化错误；采集错误只在完整成功的调用后由调度器显式清除。
+        if (kind_ == "init") entry.failed = false;
     }
     if (kind_ == "init" || kind_ == "deinit") entry.phase = "idle";
 }

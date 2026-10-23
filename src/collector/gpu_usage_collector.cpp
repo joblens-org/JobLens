@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "collector/gpu_usage_collector.hpp"
+#include "core/output_context.hpp"
 #include "core/collector_registry.hpp"
 #include "writer/prometheus_exporter_writer.hpp"
 #include "common/utils.hpp"
@@ -396,7 +397,7 @@ GPUProcessUsage GPUUsageCollector::aggregate_job(const std::vector<GPUProcessUsa
     return job;
 }
 
-CollectResult GPUUsageCollector::collect(const Job& job) {
+std::vector<GPUProcessUsage> GPUUsageCollector::sample_job(const Job& job) {
     if (!inited || gpu_handles_.empty()) {
         spdlog::debug("GPUUsageCollector not initialized or no GPUs available");
         return std::vector<GPUProcessUsage>{};
@@ -467,131 +468,83 @@ CollectResult GPUUsageCollector::collect(const Job& job) {
     return results;
 }
 
-CollectDataParseFunc GPUUsageCollector::get_writer_parser(const std::string& writer_type) {
-    CollectDataParseFunc func = nullptr;
-    spdlog::trace("GPUUsageCollector: get_writer_parser for writer_type: {}", writer_type);
+std::vector<OutputChannel> GPUUsageCollector::output_channels() const {
+    return {{"document", OutputKind::Document}, {"text", OutputKind::Text}};
+}
 
-    if (writer_type.compare("ESWriter") == 0) {
-        func = [this](std::any data) -> std::any {
-            nlohmann::json ret;
-            if (!data.has_value()) {
-                spdlog::warn("GPUUsageCollector: error writer parser, empty data");
-                ret["error"] = "empty data";
-                return ret;
-            }
-            ret["process_data"] = nlohmann::json::array();
-            const auto& parsed = std::any_cast<const std::vector<GPUProcessUsage>&>(data);
-
-            for (const auto& pu : parsed) {
-                nlohmann::json j;
-
-                j["pid"] = pu.pid;
-                j["gpu_count"] = pu.gpu_count;
-                j["total_mem_used_bytes"] = pu.total_mem_used_bytes;
-                j["total_mem_used_mb"] = pu.total_mem_used_bytes / (1024.0 * 1024.0);
-                j["avg_sm_util"] = pu.avg_sm_util;
-                j["avg_mem_bw_util"] = pu.avg_mem_bw_util;
-                j["avg_gpu_util"] = pu.avg_gpu_util;
-                j["avg_gpu_mem_bw_util"] = pu.avg_gpu_mem_bw_util;
-                j["total_gpu_mem_bytes"] = pu.total_gpu_mem_bytes;
-
-                // 设备详情列表
-                j["devices"] = nlohmann::json::array();
-                for (const auto& d : pu.devices) {
-                    nlohmann::json dj;
-                    dj["gpu_index"] = d.gpu_index;
-                    dj["gpu_name"] = d.gpu_name;
-                    dj["mem_used_bytes"] = d.mem_used_bytes;
-                    dj["mem_used_mb"] = d.mem_used_bytes / (1024.0 * 1024.0);
-                    dj["sm_util"] = d.sm_util;
-                    dj["mem_bw_util"] = d.mem_bw_util;
-                    dj["gpu_util"] = d.gpu_util;
-                    dj["gpu_mem_bw_util"] = d.gpu_mem_bw_util;
-                    dj["gpu_mem_total_bytes"] = d.gpu_mem_total_bytes;
-                    dj["process_type"] = d.process_type;
-                    j["devices"].push_back(std::move(dj));
-                }
-
-                // Job 汇总与进程数据分离存放
-                if (pu.pid == 0 && summary) {
-                    ret["summary"] = std::move(j);
-                } else {
-                    ret["process_data"].push_back(std::move(j));
-                }
-            }
-            return ret;
-        };
+nlohmann::json GPUUsageCollector::to_document(const std::vector<GPUProcessUsage>& infos) const {
+    nlohmann::json ret;
+    ret["process_data"] = nlohmann::json::array();
+    for (const auto& pu : infos) {
+        nlohmann::json j;
+        j["pid"] = pu.pid;
+        j["gpu_count"] = pu.gpu_count;
+        j["total_mem_used_bytes"] = pu.total_mem_used_bytes;
+        j["total_mem_used_mb"] = pu.total_mem_used_bytes / (1024.0 * 1024.0);
+        j["avg_sm_util"] = pu.avg_sm_util;
+        j["avg_mem_bw_util"] = pu.avg_mem_bw_util;
+        j["avg_gpu_util"] = pu.avg_gpu_util;
+        j["avg_gpu_mem_bw_util"] = pu.avg_gpu_mem_bw_util;
+        j["total_gpu_mem_bytes"] = pu.total_gpu_mem_bytes;
+        j["devices"] = nlohmann::json::array();
+        for (const auto& d : pu.devices) {
+            nlohmann::json dj;
+            dj["gpu_index"] = d.gpu_index;
+            dj["gpu_name"] = d.gpu_name;
+            dj["mem_used_bytes"] = d.mem_used_bytes;
+            dj["mem_used_mb"] = d.mem_used_bytes / (1024.0 * 1024.0);
+            dj["sm_util"] = d.sm_util;
+            dj["mem_bw_util"] = d.mem_bw_util;
+            dj["gpu_util"] = d.gpu_util;
+            dj["gpu_mem_bw_util"] = d.gpu_mem_bw_util;
+            dj["gpu_mem_total_bytes"] = d.gpu_mem_total_bytes;
+            dj["process_type"] = d.process_type;
+            j["devices"].push_back(std::move(dj));
+        }
+        if (pu.pid == 0 && summary) ret["summary"] = std::move(j);
+        else ret["process_data"].push_back(std::move(j));
     }
+    return ret;
+}
 
-    if (writer_type.compare("FileWriter") == 0) {
-        func = [this](std::any data) -> std::any {
-            if (!data.has_value()) {
-                spdlog::warn("GPUUsageCollector: error FileWriter parser, empty data");
-                return std::string("GPUUsageCollector error=empty_data\n");
-            }
-            const auto& parsed = std::any_cast<const std::vector<GPUProcessUsage>&>(data);
-            std::ostringstream out;
-            for (const auto& pu : parsed) {
-                out << "GPUUsageCollector"
-                    << " type=" << (pu.pid == 0 ? "summary" : "process")
-                    << " pid=" << pu.pid
-                    << " gpu_count=" << pu.gpu_count
-                    << " total_mem_used_bytes=" << pu.total_mem_used_bytes
-                    << " total_mem_used_mb=" << pu.total_mem_used_bytes / (1024.0 * 1024.0)
-                    << " avg_sm_util=" << pu.avg_sm_util
-                    << " avg_mem_bw_util=" << pu.avg_mem_bw_util
-                    << " avg_gpu_util=" << pu.avg_gpu_util
-                    << " avg_gpu_mem_bw_util=" << pu.avg_gpu_mem_bw_util
-                    << " total_gpu_mem_bytes=" << pu.total_gpu_mem_bytes
-                    << '\n';
-                for (const auto& d : pu.devices) {
-                    out << "GPUUsageCollector device"
-                        << " pid=" << pu.pid
-                        << " gpu_index=" << d.gpu_index
-                        << " gpu_name=" << d.gpu_name
-                        << " mem_used_bytes=" << d.mem_used_bytes
-                        << " mem_used_mb=" << d.mem_used_bytes / (1024.0 * 1024.0)
-                        << " sm_util=" << d.sm_util
-                        << " mem_bw_util=" << d.mem_bw_util
-                        << " gpu_util=" << d.gpu_util
-                        << " gpu_mem_bw_util=" << d.gpu_mem_bw_util
-                        << " gpu_mem_total_bytes=" << d.gpu_mem_total_bytes
-                        << " process_type=" << d.process_type
-                        << '\n';
-                }
-            }
-            return out.str();
-        };
+std::string GPUUsageCollector::to_text(const std::vector<GPUProcessUsage>& infos) const {
+    std::ostringstream out;
+    for (const auto& pu : infos) {
+        out << "GPUUsageCollector"
+            << " type=" << (pu.pid == 0 ? "summary" : "process")
+            << " pid=" << pu.pid
+            << " gpu_count=" << pu.gpu_count
+            << " total_mem_used_bytes=" << pu.total_mem_used_bytes
+            << " total_mem_used_mb=" << pu.total_mem_used_bytes / (1024.0 * 1024.0)
+            << " avg_sm_util=" << pu.avg_sm_util
+            << " avg_mem_bw_util=" << pu.avg_mem_bw_util
+            << " avg_gpu_util=" << pu.avg_gpu_util
+            << " avg_gpu_mem_bw_util=" << pu.avg_gpu_mem_bw_util
+            << " total_gpu_mem_bytes=" << pu.total_gpu_mem_bytes
+            << '\n';
+        for (const auto& d : pu.devices) {
+            out << "GPUUsageCollector device"
+                << " pid=" << pu.pid
+                << " gpu_index=" << d.gpu_index
+                << " gpu_name=" << d.gpu_name
+                << " mem_used_bytes=" << d.mem_used_bytes
+                << " mem_used_mb=" << d.mem_used_bytes / (1024.0 * 1024.0)
+                << " sm_util=" << d.sm_util
+                << " mem_bw_util=" << d.mem_bw_util
+                << " gpu_util=" << d.gpu_util
+                << " gpu_mem_bw_util=" << d.gpu_mem_bw_util
+                << " gpu_mem_total_bytes=" << d.gpu_mem_total_bytes
+                << " process_type=" << d.process_type
+                << '\n';
+        }
     }
+    return out.str();
+}
 
-    if (writer_type.compare("PrometheusExporterWriter") == 0) {
-        func = [this](std::any data) -> std::any {
-            PrometheusExporterWriter::prometheus_job_state ret;
-            if (!data.has_value()) {
-                spdlog::warn("GPUUsageCollector: error writer parser, empty data");
-                ret.JobID = 0;
-                return ret;
-            }
-            const auto& parsed = std::any_cast<const std::vector<GPUProcessUsage>&>(data);
-            for (const auto& pu : parsed) {
-                for (const auto& d : pu.devices) {
-                    PrometheusExporterWriter::prometheus_process_state state;
-                    state.pid = pu.pid;
-                    state.name = d.gpu_name;
-                    state.mem_rss_kb = static_cast<int64_t>(d.mem_used_bytes / 1024);
-                    state.mem_usage_percent = 0.0;
-                    if (d.gpu_mem_total_bytes > 0) {
-                        state.mem_usage_percent = 100.0 * static_cast<double>(d.mem_used_bytes)
-                                                  / static_cast<double>(d.gpu_mem_total_bytes);
-                    }
-                    state.cpu_usage_percent = static_cast<double>(d.sm_util);
-                    state.threads_cnt = static_cast<int32_t>(d.gpu_util);
-                    ret.processes_state.push_back(state);
-                }
-            }
-            return ret;
-        };
-    }
-
-    return func;
+CollectOutcome GPUUsageCollector::collect(const Job& job, OutputContext& output) {
+    if (!output.enabled("document") && !output.enabled("text")) return {};
+    const auto infos = sample_job(job);
+    if (output.enabled("document")) output.emit("document", Document{to_document(infos)});
+    if (output.enabled("text")) output.emit("text", Text{to_text(infos)});
+    return {};
 }

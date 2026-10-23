@@ -96,11 +96,14 @@ struct GPUProcessUsage {
 class GPUUsageCollector : public ICollector {
 public:
     bool init(const nlohmann::json& cfg) override;
-    CollectResult collect(const Job& job) override;
+    CollectOutcome collect(const Job& job, OutputContext& output) override;
     void deinit() noexcept override;
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type);
+    std::vector<OutputChannel> output_channels() const override;
 
 private:
+    std::vector<GPUProcessUsage> sample_job(const Job& job);
+    nlohmann::json to_document(const std::vector<GPUProcessUsage>& infos) const;
+    std::string to_text(const std::vector<GPUProcessUsage>& infos) const;
     bool inited = false;
     bool summary = false;
     bool nvml_initialized = false;

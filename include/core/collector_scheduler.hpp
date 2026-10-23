@@ -70,23 +70,28 @@ private:
     struct collector_info
     {
         std::string name;
+        std::string type;
         CollectorScope scope;
         std::string config_name;
         double freq;
-        CollectFunc collect_handle;
         CollectInitFunc init_handle;
         CollectDeinitFunc deinit_handle;
         JobLifecycleFunc on_job_added;
         JobLifecycleFunc on_job_updated;
         JobLifecycleFunc on_job_removed;
-        std::vector<OnFinish> finish_cbs;
+        // 原生输出路径
+        NativeCollectFunc collect_native;
+        std::vector<OutputChannel> channels;
+        std::shared_ptr<const OutputRouter> router;
+        std::string route_error;   // 非空表示路由绑定失败，采集器不得启动
+        bool route_ok() const { return route_error.empty(); }
     };
 
-    void addJobCollectFunc(std::string name, std::string config, CollectorHandle handle);
-    void addSystemCollectFunc(std::string name, std::string config, CollectorHandle handle);
-    void addCallback(std::string name, OnFinish cb);
+    void addJobCollectFunc(std::string name, std::string type, std::string config, CollectorHandle handle);
+    void addSystemCollectFunc(std::string name, std::string type, std::string config, CollectorHandle handle);
+    /// 为原生采集器编译路由；失败时写入 route_error。
+    void buildOutputRoute(collector_info& info);
     void registerCollectFuncs();
-    void registerFinishCallbacks();
     void addJobCollect(const Job& job);
     void rmJobCollect(const Job& job);
     void updateJobCollect(const Job& job);
@@ -110,9 +115,6 @@ private:
     std::mutex shutdown_mutex_;
     std::unordered_map<std::string, collector_info> collector_info_dict;
     std::unordered_map<std::string, collector_state> collector_state_dict;
-    std::unordered_map<std::string, OnFinish>   finishCallbacks_;
-
     double default_freq;
-    std::vector<std::string> default_cbs_name;
     bool                    running_ = false;
 };

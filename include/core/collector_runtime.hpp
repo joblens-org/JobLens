@@ -51,6 +51,8 @@ public:
     void jobs(const std::string& name, size_t count);
     void timer(const std::string& name, bool active);
     void error(const std::string& name, const std::string& message);
+    /// 仅在一次完整、无输出拒绝的调用结束后清除当前错误位；保留历史错误文本与计数。
+    void clear_error(const std::string& name);
     void lifecycle(const std::string& value);
     void schedulerStatusReader(std::function<nlohmann::json()> reader);
     nlohmann::json snapshot() const;

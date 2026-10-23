@@ -15,6 +15,7 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "core/collector_type.h"
+#include "core/metric_data.h"
 #include "icollector.h"
 #include <spdlog/spdlog.h>
 #include "ebpf/fs_metadata.h"
@@ -92,11 +93,15 @@ struct JobFSMetaStat {
 class FSMetadataCollector : public ICollector {
 public:
     bool init(const nlohmann::json& cfg) override;
-    CollectResult collect(const Job& job) override;
+    CollectOutcome collect(const Job& job, OutputContext& output) override;
     void deinit() noexcept override;
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
+    std::vector<OutputChannel> output_channels() const override;
 
 private:
+    JobFSMetaStat sample_job(const Job& job);
+    nlohmann::json to_document(const JobFSMetaStat& s) const;
+    std::string to_text(const JobFSMetaStat& s) const;
+    MetricSnapshot to_metrics(const JobFSMetaStat& s) const;
     bool init_ebpf();
     void deinit_ebpf();
 

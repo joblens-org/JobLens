@@ -15,6 +15,7 @@
 #pragma once
 #include <string>
 #include <utility>
+#include <vector>
 #include "core/collector_type.h"
 #include <nlohmann/json.hpp>
 
@@ -24,14 +25,25 @@ public:
     const CollectorScope scope() const { return scope_; }
     // 生命周期
     virtual bool init(const nlohmann::json& config)      = 0;   // 返回 false 表示失败
-    virtual CollectResult collect(const Job& job){       // 传入 Job 信息进行采集
-        return {};
-    }          
-    virtual CollectResult collect(){                     // 无参采集，适用于系统级采集器
-        return {};
-    }                        
     virtual void deinit() noexcept                       = 0;
-    virtual CollectDataParseFunc get_writer_parser(const std::string& writer_type) = 0;
+
+    // ------------------------------------------------------------------
+    // 原生输出接口（Collector-Controlled Output）
+    //
+    // Job 作用域绑定 collect(job, output)；System 作用域绑定 collect(output)，
+    // 上下文内携带合成 Job 0。默认实现返回 Skipped（没有可用样本）。
+    // ------------------------------------------------------------------
+    virtual CollectOutcome collect(const Job& job, OutputContext& output) {
+        (void)job; (void)output;
+        return {CollectState::Skipped, {}};
+    }
+    virtual CollectOutcome collect(OutputContext& output) {
+        (void)output;
+        return {CollectState::Skipped, {}};
+    }
+
+    /// 采集器声明的输出通道。只有声明且被配置的通道会收到记录。
+    virtual std::vector<OutputChannel> output_channels() const = 0;
 
     // ------------------------------------------------------------------
     // Job 生命周期钩子（同步调用，默认空实现，由采集器实例自行按需覆写）
@@ -46,9 +58,6 @@ public:
     //   - System 作用域采集器：对全机所有 Job 的生命周期事件广播（采集器已 init 且在运行）。
     //   - 系统占位 Job(JobID == 0) 不触发任何钩子。
     //
-    // 注意：调度侧的 Update 分发已就绪，但 JobRegistry 目前只发布 Added / Removed，
-    // 尚未产生 JobEvent::Updated，因此 on_job_updated 暂时不会在运行时触发。
-    //
     // 调用约束（实现必须遵守，否则会阻塞采集或自锁）：
     //   - 在调度线程 / Job 管理线程中同步执行，且调度器持有该采集器的状态锁，
     //     必须快速返回，禁止阻塞等待、禁止长时间 IO；
@@ -61,28 +70,16 @@ public:
     virtual void on_job_updated(const Job& /*job*/) {}
     virtual void on_job_removed(const Job& /*job*/) {}
 
-    /// V2 解析器适配器 — 提供默认实现，将旧 V1 parser 包装为 V2 兼容格式
-    /// 子类可覆写以提供原生 V2 实现；默认实现忽略 WriterParseContext，仅委托给 V1 parser
-    virtual CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type) {
-        auto legacy = get_writer_parser(writer_type);
-        if (!legacy) {
-            return nullptr;
-        }
-        return [legacy](const WriterParseContext& /*ctx*/, std::any data) {
-            return legacy(std::move(data));
-        };
-    }
-
     void set_type(std::string type){
-        type_ = type;
+        type_ = std::move(type);
     }
     void set_name(std::string name){
-        name_ = name;
+        name_ = std::move(name);
     }
-    std::string get_name(){
+    std::string get_name() const {
         return name_;
     }
-    std::string get_type(){
+    std::string get_type() const {
         return type_;
     }
 protected:
@@ -91,4 +88,3 @@ private:
     std::string name_;
     std::string type_;
 };
-

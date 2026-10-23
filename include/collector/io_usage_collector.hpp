@@ -15,6 +15,7 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "core/collector_type.h"
+#include "core/metric_data.h"
 #include "icollector.h"
 #include <spdlog/spdlog.h>
 #include "common/ebpf_common.hpp"
@@ -91,9 +92,13 @@ namespace std {
 class IOUsageCollector : public ICollector{
 public:
     bool init(const nlohmann::json& cfg) override;
-    CollectResult collect(const Job& job) override;
+    CollectOutcome collect(const Job& job, OutputContext& output) override;
     void deinit() noexcept override;
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type);
+    std::vector<OutputChannel> output_channels() const override;
+    std::vector<IOUsageInfo> sample_job(const Job& job);
+    nlohmann::json to_document(const std::vector<IOUsageInfo>& infos) const;
+    std::string to_text(const std::vector<IOUsageInfo>& infos) const;
+    MetricSnapshot to_metrics(const std::vector<IOUsageInfo>& infos) const;
 private:
     double collect_period;
     struct pid_state{

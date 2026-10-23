@@ -408,48 +408,61 @@ inline nlohmann::json job_to_json(const Job& job) {
     return j;
 }
 
-using OnFinish = std::function<void(const std::string, const Job&, const std::any, std::chrono::system_clock::time_point)>;
+// ============================================================================
+// 原生输出契约（Collector-Controlled Output）
+//
+// 采集器在 collect() 内通过 OutputContext 提交 0..N 条带类型记录。
+// Success 允许零输出；Skipped 表示没有可用样本且不得输出。
+// ============================================================================
 
-using CollectResult = std::any;
+enum class CollectState { Success, Skipped, Failed };
 
-// 统一的可调用签名
-using CollectFunc = std::function<CollectResult(const Job&)>;
-using CollectInitFunc = std::function<bool(const nlohmann::json& config)>;
-using CollectDeinitFunc = std::function<void()>;
+struct CollectOutcome {
+    CollectState state = CollectState::Success;
+    std::string error;
+};
+
+// 输出通道与 payload 类型标签。定义在此以便 CollectorHandle 声明通道，
+// 具体 payload 容器（Document/Text/MetricSnapshot）位于 core/output_record.h。
+enum class OutputKind { Document, Text, Metrics };
+
+inline const char* to_string(OutputKind kind)
+{
+    switch (kind) {
+        case OutputKind::Document: return "document";
+        case OutputKind::Text:     return "text";
+        case OutputKind::Metrics:  return "metrics";
+    }
+    return "unknown";
+}
+
+struct OutputChannel {
+    std::string name;
+    OutputKind kind = OutputKind::Document;
+};
+
+class OutputContext;
+class OutputRouter;
+
+using NativeCollectFunc = std::function<CollectOutcome(const Job&, OutputContext&)>;
 
 /// Job 生命周期钩子签名 — 由 CollectorScheduler 同步调用，传入调用瞬间的 Job 快照
 using JobLifecycleFunc = std::function<void(const Job&)>;
 
-using CollectDataParseFunc = std::function<std::any(std::any)>;
-
-// ============================================================================
-// V2 Parser Context API — 为 writer parser 提供更丰富的上下文信息
-// 替代旧版 std::any 单参数签名，writer parser 可以通过 context 获取
-// writer 名称、类型、配置名、collector 名称、Job 信息和时间戳
-// ============================================================================
-
-/// Writer 解析上下文 — 传递给 V2 parser 函数的上下文参数
-struct WriterParseContext {
-    std::string writer_name;          // writer 实例名称（如 "file_writer"）
-    std::string writer_type;          // writer 类型标识（如 "file"）
-    std::string writer_config_name;   // writer 配置节名称（如 "output"）
-    std::string collector_name;       // 触发此 writer 的 collector 名称
-    Job job;                          // 当前解析的 Job 对象
-    std::chrono::system_clock::time_point timestamp;  // 解析触发时间戳
-};
-
-/// V2 解析函数签名 — 接收 WriterParseContext + 解析数据，返回 std::any 结果
-using CollectDataParseFuncV2 = std::function<std::any(const WriterParseContext&, std::any)>;
+using CollectInitFunc = std::function<bool(const nlohmann::json& config)>;
+using CollectDeinitFunc = std::function<void()>;
 
 struct CollectorHandle {
     CollectInitFunc        init;   
-    CollectFunc            collect;
     CollectDeinitFunc      deinit;
     // Job 生命周期钩子（两种作用域都会绑定，作用域语义见 ICollector::on_job_added 注释）
     // 未提供时为空 std::function，调度器会跳过调用
     JobLifecycleFunc       on_job_added;
     JobLifecycleFunc       on_job_updated;
     JobLifecycleFunc       on_job_removed;
+    // 原生输出入口：System 作用域同样绑定 Job 重载（上下文内是合成 Job 0）
+    NativeCollectFunc      collect_native;
+    std::vector<OutputChannel> channels;
 };
 
 using ConfigParam = std::pair<std::string, std::string>; // <param_name, description>

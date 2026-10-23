@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "collector/taskstats_collector.hpp"
+#include "core/output_context.hpp"
 #include "core/collector_registry.hpp"
 #include "common/netlink_utils.hpp"
 
@@ -55,22 +56,10 @@ void TaskstatsCollector::deinit() noexcept {
 }
 
 
-CollectResult TaskstatsCollector::collect(const Job& job) {
-    CollectResult result;
-    if (!netlink_inited) {
-        spdlog::warn("TaskstatsCollector: Netlink not initialized");
-        return result;
-    }
-    // 采集逻辑实现
-    spdlog::info("TaskstatsCollector: Collecting task stats for job id {}", job.JobID);
-    for (const auto& pid : job.JobPIDs) {
-        spdlog::trace("TaskstatsCollector: Collecting stats for PID {}", pid);
-        
-    }
-    return result;
-}
 
-CollectDataParseFunc TaskstatsCollector::get_writer_parser(const std::string& writer_type) {
-    // 根据 writer_type 返回相应的解析函数
-    return nullptr; // 占位符
+CollectOutcome TaskstatsCollector::collect(const Job& job, OutputContext& output) {
+    (void)job;
+    (void)output;
+    // 采样尚未实现：明确返回 Skipped 且不输出任何记录。
+    return {CollectState::Skipped, {}};
 }

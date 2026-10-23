@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "collector/cpumem_collector.hpp"
+#include "core/output_context.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -461,7 +462,7 @@ std::string get_process_name(int pid)
     return name;                   // 返回空串表示内核线程或异常
 }
 
-CollectResult CPUMemCollector::collect(const Job& job) {
+std::vector<CPUMemInfo> CPUMemCollector::sample_job(const Job& job) {
     std::vector<CPUMemInfo> infos;
     const auto now = std::chrono::steady_clock::now();
     prune_stale_pid_states(now);
@@ -551,121 +552,83 @@ void CPUMemCollector::update_job_peak(const Job& job, CPUMemInfo& summary_info,
     summary_info.sample_count = peak.samples;
 }
 
-CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& writer_type){
-    CollectDataParseFunc func = nullptr;
-    spdlog::trace("CPUMemCollector: get_writer_parser for writer_type: {}", writer_type);
-    if(writer_type.compare("ESWriter") == 0){
-        func = [this](std::any data)->std::any{
-            nlohmann::json ret;
-            if(data.has_value() == false) {
-                spdlog::warn("CPUMemCollector: error writer parser, empty data");
-                ret["error"] = "empty data";
-                return ret;
-            }
-            ret["process_data"] = nlohmann::json::array();
-            const auto& parsed = std::any_cast<const std::vector<CPUMemInfo>&>(data);
-            spdlog::trace("CPUMemCollector: parsing data for ESWriter, data length={}", parsed.size());
-            for (const auto& info : parsed) {
-                
-                nlohmann::json j = ToJson(info);
-                if (spdlog::should_log(spdlog::level::trace)) {
-                    spdlog::trace("CPUMemCollector: parsed data: {}", j.dump());
-                }
-
-                if(info.pid == 0){
-                    if (summary) ret["summary"] = std::move(j);
-                }else{
-                    ret["process_data"].push_back(std::move(j));
-                }
-                
-            }
-            return ret;
-        };
-    }
-    if(writer_type.compare("FileWriter") == 0){
-        func = [this](std::any data)->std::any{
-            nlohmann::json ret;
-            if(data.has_value() == false) {
-                spdlog::warn("CPUMemCollector: error FileWriter parser, empty data");
-                ret["error"] = "empty data";
-                return ret.dump() + "\n";
-            }
-            ret["process_data"] = nlohmann::json::array();
-            const auto& parsed = std::any_cast<const std::vector<CPUMemInfo>&>(data);
-            spdlog::trace("CPUMemCollector: parsing data for FileWriter, data length={}", parsed.size());
-            for (const auto& info : parsed) {
-                nlohmann::json j = ToJson(info);
-                if(info.pid == 0){
-                    ret["summary"] = std::move(j);
-                }else{
-                    ret["process_data"].push_back(std::move(j));
-                }
-            }
-            return ret.dump() + "\n";
-        };
-    }
-    if(writer_type.compare("PrometheusExporterWriter") == 0){
-        func = [this](std::any data)->std::any{
-            PrometheusExporterWriter::prometheus_job_state ret;
-            if(data.has_value() == false) {
-                spdlog::warn("CPUMemCollector: error writer parser, empty data");
-                ret.JobID = 0;
-                return ret;
-            }
-            if (summary){
-                spdlog::trace("PrometheusExporterWriter Parser in summary mode");
-            }
-            const auto& parsed = std::any_cast<const std::vector<CPUMemInfo>&>(data);
-            for (const auto& info : parsed) {
-                PrometheusExporterWriter::prometheus_process_state state;
-                spdlog::trace("CollectDataParseFunc CPUMemCollector parse pid: {}", info.pid);
-                state.pid = info.pid;
-                state.cpu_usage_percent = info.cpuPercent;
-                state.threads_cnt = info.numThreads;
-                state.mem_rss_kb = info.mem_rss_kb;
-                state.mem_usage_percent = info.memoryPercent;
-                state.mem_vm_kb = info.mem_vm_kb;
-                state.mem_pss_kb = info.mem_pss_kb;
-                state.name = info.name;
-                ret.processes_state.push_back(state);
-            }
-            return ret;
-        };
-    }
-    return func;
+std::vector<OutputChannel> CPUMemCollector::output_channels() const {
+    return {
+        {"document", OutputKind::Document},
+        {"text", OutputKind::Text},
+        {"metrics", OutputKind::Metrics}
+    };
 }
 
-CollectDataParseFuncV2 CPUMemCollector::get_writer_parser_v2(const std::string& writer_type) {
-    // 只有 FileWriter 提供原生 V2 parser — 其他 writer 类型回退到 V1 默认适配器
-    if (writer_type == "FileWriter") {
-        return [this](const WriterParseContext& ctx, std::any data) -> std::any {
-            nlohmann::json ret;
-            if (!data.has_value()) {
-                spdlog::warn("CPUMemCollector: V2 FileWriter parser, empty data");
-                ret["error"] = "empty data";
-                return ret.dump() + "\n";
-            }
-            ret["process_data"] = nlohmann::json::array();
-            const auto& parsed = std::any_cast<const std::vector<CPUMemInfo>&>(data);
-            spdlog::trace("CPUMemCollector: V2 parsing data for FileWriter, data length={}", parsed.size());
-            for (const auto& info : parsed) {
-                nlohmann::json j = ToJson(info);
-                if (info.pid == 0) {
-                    ret["summary"] = std::move(j);
-                } else {
-                    ret["process_data"].push_back(std::move(j));
-                }
-            }
-            // V2 上下文信息注入 — 作为概念验证，在输出中附加 writer/collector 上下文
-            ret["_writer_name"] = ctx.writer_name;
-            ret["_writer_config_name"] = ctx.writer_config_name;
-            ret["_collector_name"] = ctx.collector_name;
-            ret["_job_id"] = ctx.job.JobID;
-            ret["_timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
-                ctx.timestamp.time_since_epoch()).count();
-            return ret.dump() + "\n";
-        };
+nlohmann::json CPUMemCollector::to_document(const std::vector<CPUMemInfo>& infos) const {
+    nlohmann::json ret;
+    ret["process_data"] = nlohmann::json::array();
+    for (const auto& info : infos) {
+        nlohmann::json j = ToJson(info);
+        if (info.pid == 0) {
+            if (summary) ret["summary"] = std::move(j);
+        } else {
+            ret["process_data"].push_back(std::move(j));
+        }
     }
-    // ESWriter, PrometheusExporterWriter 等: 返回 nullptr，让 ICollector 默认适配器回退到 V1
-    return nullptr;
+    return ret;
+}
+
+std::string CPUMemCollector::to_text(const std::vector<CPUMemInfo>& infos,
+                                     const std::string& writer_name,
+                                     const std::string& writer_config_name,
+                                     uint64_t job_id,
+                                     std::chrono::system_clock::time_point sampled_at) const {
+    nlohmann::json ret = to_document(infos);
+    ret["_writer_name"] = writer_name;
+    ret["_writer_config_name"] = writer_config_name;
+    ret["_collector_name"] = get_name();
+    ret["_job_id"] = job_id;
+    ret["_timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+        sampled_at.time_since_epoch()).count();
+    return ret.dump() + "\n";
+}
+
+MetricSnapshot CPUMemCollector::to_metrics(const std::vector<CPUMemInfo>& infos) const {
+    MetricSnapshot ret;
+    for (const auto& info : infos) {
+        ProcessMetricSnapshot state;
+        state.pid = info.pid;
+        state.cpu_usage_percent = info.cpuPercent;
+        state.threads_cnt = info.numThreads;
+        state.mem_rss_kb = info.mem_rss_kb;
+        state.mem_usage_percent = info.memoryPercent;
+        state.mem_vm_kb = info.mem_vm_kb;
+        state.mem_pss_kb = info.mem_pss_kb;
+        state.name = info.name;
+        ret.processes_state.push_back(std::move(state));
+    }
+    return ret;
+}
+
+CollectOutcome CPUMemCollector::collect(const Job& job, OutputContext& output) {
+    if (!inited) {
+        return {CollectState::Failed, "CPUMemCollector not initialized"};
+    }
+    // 无论目标数量多少，只采样一次。
+    const auto infos = sample_job(job);
+    const auto& sample = output.sample();
+
+    if (output.enabled("document")) {
+        output.emit("document", Document{to_document(infos)});
+    }
+    if (output.enabled("text")) {
+        const auto& targets = output.targets("text");
+        for (const auto& target : targets) {
+            auto text = to_text(infos, target.writer_name, target.writer_config_name,
+                                sample.job.JobID, sample.sampled_at);
+            // 每个 writer 实例的渲染结果不同，必须逐目标提交。
+            output.emit_to("text", target.writer_name, Text{std::move(text)});
+        }
+    }
+    if (output.enabled("metrics")) {
+        output.emit("metrics", to_metrics(infos));
+    }
+    (void)sample;
+    return {};
 }

@@ -92,29 +92,16 @@ public:
     // 列举已注册采集器（调试用）
     std::vector<std::string> list() const;
 
-    CollectDataParseFunc getCollectorParser(const std::string& collector_name, const std::string& writer_type);
-
-    CollectDataParseFuncV2 getCollectorParserV2(const std::string& collector_name, const std::string& writer_type);
-
-    // 便捷方法：按 V2 → V1 → nullptr 回退顺序解析最佳 parser
-    // writer 调用点应使用此方法，避免因 FileWriter raw string fallback 绕过 V2-only parser
-    CollectDataParseFuncV2 resolveBestParserV2(const std::string& collector_name, const std::string& writer_type);
-
-    std::string getCollectorType(const std::string& collector_name);
-
     void shutdown() {
-        // 清理所有实例
-        collector_instances_.clear();
         collectors_.clear();
     }
 
 private:
     CollectorRegistry() = default;
     std::unordered_map<std::string, CollectorInfo> collectors_;  // 统一的数据结构
-    std::unordered_map<std::string, std::unique_ptr<ICollector>> collector_instances_;  
     // collector perf
     void initCollectorPerf();
-    CollectFunc makePerfFunc(std::string name, CollectFunc func);
+    NativeCollectFunc makeNativePerfFunc(std::string name, NativeCollectFunc func);
     std::mutex perf_mtx_;
     bool enable_collector_perf;
     bool perf_inited;

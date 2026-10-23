@@ -1,8 +1,10 @@
 #include "collector/__YOUR_COLLECTOR_NAME___collector.h"
 #include "core/collector_registry.hpp"
+#include "core/output_context.hpp"
 #include <spdlog/spdlog.h>
 #include <chrono>
 #include <fstream>
+#include <sstream>
 
 /*================ 注册到工厂 ================*/
 AUTO_REGISTER_JOB_COLLECTOR(
@@ -29,14 +31,8 @@ void __YOUR_COLLECTOR_NAME__Collector::deinit() noexcept {
 }
 
 /*================ 采集接口 ================*/
-CollectResult __YOUR_COLLECTOR_NAME__Collector::collect() {
-    // 系统级采集：/proc、/sys、命令行等
-    std::vector<__YOUR_COLLECTOR_NAME__Data> ret;
-    // TODO: 填入业务逻辑
-    return ret;
-}
-
-CollectResult __YOUR_COLLECTOR_NAME__Collector::collect(const Job& job) {
+std::vector<__YOUR_COLLECTOR_NAME__Data>
+__YOUR_COLLECTOR_NAME__Collector::sample_job(const Job& job) {
     std::vector<__YOUR_COLLECTOR_NAME__Data> ret;
     for (int pid : job.JobPIDs) {
         __YOUR_COLLECTOR_NAME__Data d;
@@ -44,31 +40,42 @@ CollectResult __YOUR_COLLECTOR_NAME__Collector::collect(const Job& job) {
         // TODO: 填入业务逻辑，读 /proc/pid/xxx 等
         ret.emplace_back(d);
     }
-
     if (summary_) { /* 可选：汇总逻辑 */ }
     return ret;
 }
 
-/*================ 输出适配 ================*/
-CollectDataParseFunc __YOUR_COLLECTOR_NAME__Collector::get_writer_parser(
-    const std::string& writer_type) {
-    using nlohmann::json;
+std::vector<OutputChannel> __YOUR_COLLECTOR_NAME__Collector::output_channels() const {
+    // 只声明实际能产出的通道；未声明/未配置的通道不会产生任何输出。
+    return {{"document", OutputKind::Document}, {"text", OutputKind::Text}};
+}
 
-    if (writer_type == "ESWriter") {
-        return [](std::any data)->std::any {
-            json root;
-            root["process_data"] = json::array();
-            if (!data.has_value()) return root;
-
-            auto vec = std::any_cast<std::vector<__YOUR_COLLECTOR_NAME__Data>>(data);
-            for (const auto& v : vec) {
-                json j;
-                j["pid"]   = v.pid;
-                j["value"] = v.value;
-                root["process_data"].push_back(j);
-            }
-            return root;
-        };
+nlohmann::json __YOUR_COLLECTOR_NAME__Collector::to_document(
+    const std::vector<__YOUR_COLLECTOR_NAME__Data>& data) const {
+    nlohmann::json root;
+    root["process_data"] = nlohmann::json::array();
+    for (const auto& v : data) {
+        root["process_data"].push_back({{"pid", v.pid}, {"value", v.value}});
     }
-    return nullptr;   // 不支持的 writer
+    return root;
+}
+
+std::string __YOUR_COLLECTOR_NAME__Collector::to_text(
+    const std::vector<__YOUR_COLLECTOR_NAME__Data>& data) const {
+    std::ostringstream out;
+    for (const auto& v : data) {
+        out << "__YOUR_COLLECTOR_NAME__Collector process pid=" << v.pid
+            << " value=" << v.value << '\n';
+    }
+    return out.str();
+}
+
+CollectOutcome __YOUR_COLLECTOR_NAME__Collector::collect(const Job& job, OutputContext& output) {
+    // 提前判断需要构造哪些表示；采样只执行一次。
+    const bool want_document = output.enabled("document");
+    const bool want_text = output.enabled("text");
+    if (!want_document && !want_text) return {};
+    const auto data = sample_job(job);
+    if (want_document) output.emit("document", Document{to_document(data)});
+    if (want_text) output.emit("text", Text{to_text(data)});
+    return {};
 }
