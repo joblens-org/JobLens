@@ -47,15 +47,25 @@ cpumem_collector_config:
   pss: true                                  # Collect PSS (Proportional Set Size); false disables /proc/<pid>/smaps_rollup reads
   pss_fallback_smaps: true                   # Kernels without smaps_rollup fall back to per-VMA smaps parsing
   pss_max_processes: 64                      # Skip PSS for jobs with more live pids (0 = unlimited)
-  use_writers:
-    - file_writer                            # Output to local file
+  # Explicit output routing: channel -> writer instances.
+  # Channels declared by CPUMemCollector: document, text, metrics.
+  # Omitted channels are disabled; an empty list disables that channel.
+  outputs:
+    text:
+      - file_writer                          # Output prepared plain text to local file
+  # Legacy form (mutually exclusive with 'outputs'); still accepted during migration:
+  # use_writers:
+  #   - file_writer
 
 # ============================================================
 # Writer Configuration — FileWriter only
 # ============================================================
 writers_config:
   enable_writer_perf: false                  # Disable writer performance counters
-  buffer_capacity: 1024                      # Internal ring buffer capacity
+  buffer_capacity: 1024                      # Reserve capacity per flush buffer (not a hard queue limit)
+  max_pending_records: 4096                  # Hard bound: records pending in front/back buffers
+  max_pending_bytes: 67108864                # Hard bound: accounted payload+metadata bytes (64 MiB)
+  max_record_bytes: 8388608                  # Reject a single record larger than this (8 MiB)
   writers:
     - name: file_writer
       type: FileWriter
