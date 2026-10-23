@@ -22,6 +22,11 @@
 #include <vector>
 #include <nlohmann/json.hpp>
 
+#include "common/task_executor.hpp"
+
+// TimerScheduler owns deadlines and one timer-wait thread. It never creates
+// collection workers: every callback or work request is executed by the
+// injected TaskExecutor.
 class TimerScheduler {
 public:
     using Task = std::function<void()>;
@@ -30,28 +35,44 @@ public:
     using Duration = std::chrono::milliseconds;
     using StatusReader = std::function<nlohmann::json()>;
 
-    explicit TimerScheduler(size_t numWorkers = 8);
+    explicit TimerScheduler(TaskExecutor& executor);
     ~TimerScheduler();
     void shutdown();
 
+    // Callback timers own one executor registration per timer. Repeating
+    // timers use SkipIfBusy, so a slow callback suppresses missed ticks instead
+    // of accumulating callbacks.
     size_t registerTimer(Duration delay, Task task, std::string name = {});
-    // At most one queued or running callback per timer. Missed ticks are skipped.
     size_t registerRepeatingTimer(Duration interval, Task task, std::string name = {});
-    // Removes queued work; an already running callback completes normally.
+
+    // Work timers request an existing executor registration. They do not own a
+    // worker or a callback closure per tick.
+    size_t registerWorkTimer(Duration delay, WorkHandle work,
+                             RequestPolicy policy, std::string name = {});
+    size_t registerRepeatingWorkTimer(Duration interval, WorkHandle work,
+                                      RequestPolicy policy, std::string name = {});
+
+    // Replaces the outstanding deadline instead of adding a stale heap entry.
+    bool triggerTimer(size_t id);
+    bool rescheduleTimer(size_t id, Duration delay);
+
+    // Removes the timing source. An unstarted timer request is withdrawn;
+    // caller/event work on the same lane is not. A running callback completes.
     bool cancelTimer(size_t id);
 
     nlohmann::json getPerformanceStats();
-    // The reader owns the status state, and is safe after scheduler destruction.
+    // The reader owns the observational state and is safe while the executor
+    // outlives the scheduler.
     StatusReader statusReader() const;
 
 private:
     struct State;
     std::shared_ptr<State> state_;
     std::mutex shutdown_mutex_;
-    std::vector<std::thread> workers_;
-    std::thread scheduler_thread_;
+    std::thread service_thread_;
 
-    size_t addTask(Task task, Duration interval, bool repeat, std::string name);
-    void schedulerLoop();
-    void workerLoop(size_t index);
+    void serviceLoop();
+    size_t addTimer(Duration delay, bool repeat, Task task,
+                    WorkHandle work, RequestPolicy policy,
+                    std::string name, bool callback_timer);
 };

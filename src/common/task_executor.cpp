@@ -51,7 +51,10 @@ struct TaskExecutor::Slot {
     Callback callback;
     SlotPhase phase = SlotPhase::Empty;
     bool invalid = false;
-    bool remembered = false;
+    bool queued_caller = false;
+    bool queued_timer = false;
+    bool remembered_caller = false;
+    bool remembered_timer = false;
     Clock::time_point queued_at{};
     Clock::time_point running_since{};
     uint64_t completed = 0;
@@ -150,7 +153,10 @@ std::optional<WorkHandle> TaskExecutor::registerTask(std::string name, Callback 
     target->callback = std::move(callback);
     target->phase = SlotPhase::Idle;
     target->invalid = false;
-    target->remembered = false;
+    target->queued_caller = false;
+    target->queued_timer = false;
+    target->remembered_caller = false;
+    target->remembered_timer = false;
     target->queued_at = {};
     target->running_since = {};
     target->completed = 0;
@@ -179,7 +185,10 @@ TaskExecutor::Callback TaskExecutor::retireLocked(Slot& slot)
     slot.callback = nullptr;
     slot.phase = SlotPhase::Retired;
     slot.invalid = false;
-    slot.remembered = false;
+    slot.queued_caller = false;
+    slot.queued_timer = false;
+    slot.remembered_caller = false;
+    slot.remembered_timer = false;
     slot.queued_at = {};
     slot.running_since = {};
     return retired;
@@ -211,7 +220,7 @@ bool TaskExecutor::invalidate(WorkHandle handle)
     return true;
 }
 
-bool TaskExecutor::request(WorkHandle handle, RequestPolicy policy)
+bool TaskExecutor::request(WorkHandle handle, RequestPolicy policy, RequestOrigin origin)
 {
     std::lock_guard lock(mutex_);
     if (stopped_) {
@@ -228,6 +237,7 @@ bool TaskExecutor::request(WorkHandle handle, RequestPolicy policy)
     switch (slot->phase) {
         case SlotPhase::Idle: {
             slot->phase = SlotPhase::Queued;
+            (origin == RequestOrigin::Timer ? slot->queued_timer : slot->queued_caller) = true;
             slot->queued_at = Clock::now();
             ready_.push_back(slot->id);
             ++requests_total_;
@@ -235,10 +245,20 @@ bool TaskExecutor::request(WorkHandle handle, RequestPolicy policy)
             ready_cv_.notify_one();
             return true;
         }
-        case SlotPhase::Queued:
+        case SlotPhase::Queued: {
+            if (policy == RequestPolicy::Remember) {
+                (origin == RequestOrigin::Timer ? slot->queued_timer : slot->queued_caller) = true;
+                ++slot->remembered_requests;
+                ++remembered_total_;
+                return true;
+            }
+            ++slot->skipped;
+            ++skipped_total_;
+            return false;
+        }
         case SlotPhase::Running: {
             if (policy == RequestPolicy::Remember) {
-                slot->remembered = true;
+                (origin == RequestOrigin::Timer ? slot->remembered_timer : slot->remembered_caller) = true;
                 ++slot->remembered_requests;
                 ++remembered_total_;
                 return true;
@@ -252,6 +272,36 @@ bool TaskExecutor::request(WorkHandle handle, RequestPolicy policy)
             break;
     }
     ++stale_total_;
+    return false;
+}
+
+bool TaskExecutor::cancelPending(WorkHandle handle, RequestOrigin origin)
+{
+    std::lock_guard lock(mutex_);
+    Slot* slot = findValidLocked(handle);
+    if (!slot) return false;
+
+    if (slot->phase == SlotPhase::Queued) {
+        bool& queued = origin == RequestOrigin::Timer ? slot->queued_timer : slot->queued_caller;
+        if (!queued) return false;
+        queued = false;
+        ++canceled_total_;
+        if (!slot->queued_caller && !slot->queued_timer) {
+            auto it = std::find(ready_.begin(), ready_.end(), slot->id);
+            if (it != ready_.end()) ready_.erase(it);
+            slot->phase = SlotPhase::Idle;
+            slot->queued_at = {};
+        }
+        return true;
+    }
+    if (slot->phase == SlotPhase::Running) {
+        bool& remembered = origin == RequestOrigin::Timer
+            ? slot->remembered_timer : slot->remembered_caller;
+        if (!remembered) return false;
+        remembered = false;
+        ++canceled_total_;
+        return true;
+    }
     return false;
 }
 
@@ -278,6 +328,8 @@ void TaskExecutor::workerLoop(size_t index)
             candidate.phase = SlotPhase::Running;
             candidate.running_since = Clock::now();
             candidate.queued_at = {};
+            candidate.queued_caller = false;
+            candidate.queued_timer = false;
             slot = &candidate;
 
             Worker& worker = workers_[index];
@@ -343,12 +395,14 @@ void TaskExecutor::workerLoop(size_t index)
                 retired = retireLocked(*slot);
             } else if (stopped_) {
                 slot->phase = SlotPhase::Idle;
-                slot->remembered = false;
+                slot->remembered_caller = false;
+                slot->remembered_timer = false;
                 slot->queued_at = {};
             } else {
-                const bool again = slot->remembered ||
+                const bool again = slot->remembered_caller || slot->remembered_timer ||
                                    (!failure && result == WorkResult::Yield);
-                slot->remembered = false;
+                slot->remembered_caller = false;
+                slot->remembered_timer = false;
                 if (again) {
                     slot->phase = SlotPhase::Queued;
                     slot->queued_at = now;
@@ -385,7 +439,10 @@ bool TaskExecutor::stopLocked()
         Slot& slot = *slots_[index];
         if (slot.phase != SlotPhase::Queued) continue;
         slot.phase = SlotPhase::Idle;
-        slot.remembered = false;
+        slot.queued_caller = false;
+        slot.queued_timer = false;
+        slot.remembered_caller = false;
+        slot.remembered_timer = false;
         slot.queued_at = {};
     }
     ready_.clear();
@@ -436,7 +493,10 @@ void TaskExecutor::clearCallbacksAfterJoin()
             slot->callback = nullptr;
             slot->phase = SlotPhase::Retired;
             slot->invalid = false;
-            slot->remembered = false;
+            slot->queued_caller = false;
+            slot->queued_timer = false;
+            slot->remembered_caller = false;
+            slot->remembered_timer = false;
             slot->queued_at = {};
             slot->running_since = {};
         }
@@ -519,6 +579,7 @@ nlohmann::json TaskExecutor::snapshot() const
         {"totalSkippedRequests", skipped_total_},
         {"totalStaleRequests", stale_total_},
         {"totalStoppedRequests", stopped_requests_},
+        {"totalCanceledRequests", canceled_total_},
         {"totalCompleted", completed_total_},
         {"totalFailed", failed_total_},
         {"totalYielded", yielded_total_},

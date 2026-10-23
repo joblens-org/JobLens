@@ -26,7 +26,11 @@
 #include "common/local_rpc.hpp"
 
 CollectorScheduler::CollectorScheduler()
-    : timerScheduler_(Config::instance().getInt("lens_config", "max_collector_threads"))
+    : taskExecutor_({
+          static_cast<size_t>(Config::instance().getInt("lens_config", "max_collector_threads")),
+          static_cast<size_t>(Config::instance().getInt(
+              "collector_execution_config", "max_registered_tasks", 1024))}),
+      timerScheduler_(taskExecutor_)
 {
     runtime_->schedulerStatusReader(timerScheduler_.statusReader());
     auto runtime = runtime_;
@@ -484,6 +488,7 @@ void CollectorScheduler::shutdown() {
         running_ = false;
     }
     timerScheduler_.shutdown();
+    taskExecutor_.shutdown();
     runtime_->lifecycle("stopped");
     spdlog::info("CollectorScheduler: CollectorScheduler shutdown complete");
 }

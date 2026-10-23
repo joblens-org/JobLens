@@ -31,6 +31,7 @@
 #include "core/collector_type.h"
 #include "common/config.hpp"
 #include "common/streamer_watcher.hpp"
+#include "common/task_executor.hpp"
 #include "common/timer_scheduler.hpp"
 #include "core/writer_manager.hpp"
 #include <nlohmann/json.hpp>
@@ -109,6 +110,9 @@ private:
 
     Config& global_config = Config::instance();
     std::shared_ptr<CollectorRuntime> runtime_ = std::make_shared<CollectorRuntime>();
+    // One bounded pool executes every timer, event and lifecycle callback.
+    // TimerScheduler only owns deadlines and its wait thread.
+    TaskExecutor taskExecutor_;
     TimerScheduler timerScheduler_;
 
     std::mutex              m_;

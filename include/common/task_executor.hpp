@@ -49,6 +49,14 @@ enum class WorkResult {
     Yield,
 };
 
+enum class RequestOrigin {
+    // Source readiness, lifecycle or other collector/coordinator work.
+    Caller,
+    // A timer deadline. Cancelling the timer can withdraw its pending request
+    // without dropping independently requested caller work on the same lane.
+    Timer,
+};
+
 struct WorkHandle {
     uint64_t id = 0;
     uint64_t generation = 0;
@@ -90,7 +98,12 @@ public:
 
     // Requests one turn for a handle. Returns true when the work is queued,
     // already running, or merged into an existing request.
-    bool request(WorkHandle handle, RequestPolicy policy);
+    bool request(WorkHandle handle, RequestPolicy policy,
+                 RequestOrigin origin = RequestOrigin::Caller);
+
+    // Withdraws the pending contribution of one request origin. A running turn
+    // is not interrupted. Caller work on the same lane remains runnable.
+    bool cancelPending(WorkHandle handle, RequestOrigin origin = RequestOrigin::Timer);
 
     // Stops accepting work, drops queued requests (counted), waits for running
     // callbacks to finish, then joins the workers. Must be called from a
@@ -133,6 +146,7 @@ private:
     uint64_t completed_total_ = 0;
     uint64_t failed_total_ = 0;
     uint64_t yielded_total_ = 0;
+    uint64_t canceled_total_ = 0;
     uint64_t discarded_on_stop_ = 0;
     size_t max_queue_ = 0;
 };

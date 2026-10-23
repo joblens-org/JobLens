@@ -12,285 +12,483 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "common/timer_scheduler.hpp"
+
 #include <algorithm>
-#include <condition_variable>
-#include <deque>
+#include <chrono>
+#include <exception>
 #include <map>
-#include <optional>
 #include <stdexcept>
+#include <utility>
+
 #include <spdlog/spdlog.h>
 
 namespace {
-double milliseconds(TimerScheduler::Clock::duration duration) {
+using Clock = std::chrono::steady_clock;
+
+double milliseconds(Clock::duration duration)
+{
     return std::chrono::duration<double, std::milli>(duration).count();
 }
-}
+} // namespace
 
-// One short-held mutex protects deadlines, the ready queue and all counters.
-// Callbacks execute without it, so observing a blocked callback never waits for it.
 struct TimerScheduler::State {
-    struct TimerStatus {
-        size_t id = 0;
-        std::string name, phase = "idle";
-        Duration interval{0};
-        TimePoint queued_at{}, started_at{};
-        size_t skipped = 0, completed = 0, errors = 0;
-        double last_wait_ms = 0, last_duration_ms = 0;
-        bool cancelled = false;
-        std::optional<size_t> worker_index;
-    };
     struct Timer {
-        TimerStatus status;
-        Task callback;
-        TimePoint next;
-        bool repeat;
-    };
-    struct Worker {
-        std::optional<size_t> task_id;
+        size_t id = 0;
         std::string name;
+        bool callback_timer = true;
+        bool repeat = false;
+        bool canceled = false;
+        Duration interval{0};
+        TimePoint next{};
+        Task task;
+        WorkHandle work{};
+        RequestPolicy policy = RequestPolicy::SkipIfBusy;
+        std::string phase = "idle";
+        TimePoint queued_at{};
         TimePoint started_at{};
-        size_t completed = 0, errors = 0;
-        double total_ms = 0, max_ms = 0, min_ms = 0;
+        size_t skipped = 0;
+        size_t completed = 0;
+        size_t errors = 0;
+        double last_wait_ms = 0;
+        double last_duration_ms = 0;
     };
+
     std::mutex mutex;
-    std::condition_variable timers_changed, work_ready;
+    std::condition_variable changed;
+    std::condition_variable drained;
+    TaskExecutor* executor = nullptr;
     bool stopped = false;
-    size_t next_id = 0, registered = 0, completed = 0, errors = 0;
-    size_t skipped = 0, max_queue = 0, dispatched = 0, wakeups = 0, started = 0;
-    double total_wait_ms = 0, max_wait_ms = 0, min_wait_ms = 0;
-    TimePoint created = Clock::now(), stopped_at{};
+    size_t next_id = 0;
+    size_t registered = 0;
+    size_t completed = 0;
+    size_t errors = 0;
+    size_t skipped = 0;
+    size_t wakeups = 0;
+    size_t dispatched = 0;
+    size_t canceled = 0;
+    size_t inflight = 0;
+    double total_duration_ms = 0;
+    TimePoint created = Clock::now();
+    TimePoint stopped_at{};
     std::map<size_t, std::shared_ptr<Timer>> timers;
     std::map<std::pair<TimePoint, size_t>, std::shared_ptr<Timer>> deadlines;
-    std::deque<std::shared_ptr<Timer>> ready;
-    std::vector<Worker> workers;
 
-    nlohmann::json snapshot() {
-        // Copy small observational values only. Never copy callbacks or Job data.
-        std::vector<TimerStatus> task_status;
-        std::vector<Worker> worker_status;
-        TimePoint now;
-        size_t pending, queued, registered_copy, completed_copy, errors_copy;
-        size_t skipped_copy, max_queue_copy, dispatched_copy, wakeups_copy;
-        double runtime_ms, average_wait, max_wait, min_wait;
-        bool stopped_copy;
-        {
-            std::lock_guard lock(mutex);
-            now = Clock::now();
-            for (const auto& [id, timer] : timers) task_status.push_back(timer->status);
-            worker_status = workers;
-            pending = deadlines.size(); queued = ready.size();
-            registered_copy = registered; completed_copy = completed; errors_copy = errors;
-            skipped_copy = skipped; max_queue_copy = max_queue; dispatched_copy = dispatched;
-            wakeups_copy = wakeups; stopped_copy = stopped;
-            runtime_ms = milliseconds((stopped_at == TimePoint{} ? now : stopped_at) - created);
-            average_wait = started ? total_wait_ms / started : 0;
-            max_wait = max_wait_ms; min_wait = min_wait_ms;
-        }
-        auto tasks = nlohmann::json::array();
-        size_t active = 0;
-        for (const auto& task : task_status) {
-            active += task.phase == "running";
-            tasks.push_back({{"task_id", task.id}, {"name", task.name}, {"state", task.phase},
-                {"cancelled", task.cancelled},
-                {"worker_index", task.worker_index ? nlohmann::json(*task.worker_index) : nlohmann::json(nullptr)}, {"period_ms", task.interval.count()},
-                {"queued_elapsed_ms", task.phase == "queued" ? milliseconds(now - task.queued_at) : 0},
-                {"running_elapsed_ms", task.phase == "running" ? milliseconds(now - task.started_at) : 0},
-                {"skipped_runs", task.skipped}, {"completed_runs", task.completed},
-                {"error_count", task.errors}, {"last_queue_wait_ms", task.last_wait_ms},
-                {"last_duration_ms", task.last_duration_ms}});
-        }
-        auto worker_json = nlohmann::json::array();
-        double total_load = 0, max_load = 0, min_load = 100, total_duration = 0;
-        for (size_t i = 0; i < worker_status.size(); ++i) {
-            const auto& worker = worker_status[i];
-            const double running_ms = worker.task_id ? milliseconds(now - worker.started_at) : 0;
-            const double load = runtime_ms > 0 ? (worker.total_ms + running_ms) * 100 / runtime_ms : 0;
-            total_load += load; max_load = std::max(max_load, load); min_load = std::min(min_load, load);
-            total_duration += worker.total_ms;
-            worker_json.push_back({{"workerIndex", i}, {"tasksProcessed", worker.completed},
-                {"tasksFailed", worker.errors}, {"maxExecutionTimeMs", worker.max_ms},
-                {"averageExecutionTimeMs", worker.completed ? worker.total_ms / worker.completed : 0},
-                {"isBusy", worker.task_id.has_value()}, {"name", worker.name},
-                {"task_id", worker.task_id ? nlohmann::json(*worker.task_id) : nlohmann::json(nullptr)},
-                {"running_elapsed_ms", running_ms},
-                {"minExecutionTimeMs", worker.min_ms}, {"loadPercentage", load}});
-        }
-        return {{"stopped", stopped_copy}, {"worker_count", worker_status.size()},
-            {"totalTasksRegistered", registered_copy}, {"totalTasksProcessed", completed_copy},
-            {"totalTasksFailed", errors_copy}, {"currentTimerTasks", pending},
-            {"currentQueuedTasks", queued}, {"maxQueueSize", max_queue_copy},
-            {"totalQueueOperations", dispatched_copy}, {"skippedRuns", skipped_copy},
-            {"schedulerRuntime", runtime_ms}, {"schedulerWakeups", wakeups_copy},
-            {"schedulerStats", {{"pendingTasks", pending}, {"activeWorkers", active},
-                {"averageWaitMs", average_wait}, {"maxWaitMs", max_wait}, {"minWaitMs", min_wait}}},
-            {"averageThreadLoad", total_load / worker_status.size()},
-            {"maxThreadLoad", max_load}, {"minThreadLoad", min_load},
-            {"averageTaskCompletionTimeMs", completed_copy ? total_duration / completed_copy : 0},
-            {"workerStats", worker_json}, {"tasks", tasks}};
-    }
+    nlohmann::json snapshot();
 };
 
-TimerScheduler::TimerScheduler(size_t numWorkers) : state_(std::make_shared<State>()) {
-    if (numWorkers == 0) throw std::invalid_argument("TimerScheduler requires at least one worker");
-    state_->workers.resize(numWorkers);
-    try {
-        for (size_t i = 0; i < numWorkers; ++i)
-            workers_.emplace_back([this, i] { workerLoop(i); });
-        scheduler_thread_ = std::thread([this] { schedulerLoop(); });
-    } catch (...) {
-        shutdown();
-        throw;
-    }
-}
-TimerScheduler::~TimerScheduler() { shutdown(); }
+nlohmann::json TimerScheduler::State::snapshot()
+{
+    struct TimerView {
+        size_t id = 0;
+        std::string name;
+        std::string phase;
+        bool canceled = false;
+        bool repeat = false;
+        Duration interval{0};
+        TimePoint queued_at{};
+        TimePoint started_at{};
+        size_t skipped = 0;
+        size_t completed = 0;
+        size_t errors = 0;
+        double last_wait_ms = 0;
+        double last_duration_ms = 0;
+    };
 
-void TimerScheduler::shutdown() {
-    std::lock_guard shutdown_lock(shutdown_mutex_);
+    std::vector<TimerView> views;
+    size_t pending = 0, registered_copy = 0, completed_copy = 0, errors_copy = 0;
+    size_t skipped_copy = 0, wakeups_copy = 0, dispatched_copy = 0, canceled_copy = 0;
+    double total_duration = 0;
+    TimePoint now{};
+    bool stopped_copy = false;
+    double runtime_ms = 0;
     {
-        std::lock_guard lock(state_->mutex);
-        state_->stopped = true;
-        state_->deadlines.clear();
-        state_->ready.clear();
-        for (auto it = state_->timers.begin(); it != state_->timers.end();) {
-            if (it->second->status.phase == "running") {
-                it->second->status.cancelled = true;
-                ++it;
-            } else it = state_->timers.erase(it);
+        std::lock_guard lock(mutex);
+        now = Clock::now();
+        for (const auto& [id, timer] : timers) {
+            (void)id;
+            views.push_back({timer->id, timer->name, timer->phase, timer->canceled,
+                             timer->repeat, timer->interval, timer->queued_at,
+                             timer->started_at, timer->skipped, timer->completed,
+                             timer->errors, timer->last_wait_ms, timer->last_duration_ms});
+        }
+        pending = deadlines.size();
+        registered_copy = registered;
+        completed_copy = completed;
+        errors_copy = errors;
+        skipped_copy = skipped;
+        wakeups_copy = wakeups;
+        dispatched_copy = dispatched;
+        canceled_copy = canceled;
+        total_duration = total_duration_ms;
+        stopped_copy = stopped;
+        runtime_ms = milliseconds((stopped ? stopped_at : now) - created);
+    }
+
+    const nlohmann::json executor_status = executor
+        ? executor->snapshot() : nlohmann::json::object();
+
+    auto tasks = nlohmann::json::array();
+    double wait_total = 0, wait_max = 0, wait_min = 0;
+    size_t wait_count = 0;
+    for (const auto& view : views) {
+        const double wait = view.last_wait_ms;
+        if (wait > 0) {
+            wait_total += wait;
+            wait_max = std::max(wait_max, wait);
+            wait_min = wait_count ? std::min(wait_min, wait) : wait;
+            ++wait_count;
+        }
+        tasks.push_back({
+            {"task_id", view.id},
+            {"name", view.name},
+            {"state", view.phase},
+            {"cancelled", view.canceled},
+            {"period_ms", view.interval.count()},
+            {"queued_elapsed_ms", view.phase == "queued"
+                ? milliseconds(now - view.queued_at) : 0.0},
+            {"running_elapsed_ms", view.phase == "running"
+                ? milliseconds(now - view.started_at) : 0.0},
+            {"skipped_runs", view.skipped},
+            {"completed_runs", view.completed},
+            {"error_count", view.errors},
+            {"last_queue_wait_ms", wait},
+            {"last_duration_ms", view.last_duration_ms},
+        });
+    }
+
+    auto worker_stats = nlohmann::json::array();
+    double total_load = 0, max_load = 0, min_load = 100;
+    double total_worker_duration = 0;
+    size_t worker_count = 0;
+    if (executor_status.is_object() && executor_status.contains("workers")) {
+        for (const auto& worker : executor_status.at("workers")) {
+            const auto completed_turns = worker.value("completed_turns", 0ull);
+            const double worker_total = worker.value("total_duration_ms", 0.0);
+            const double running = worker.value("running_elapsed_ms", 0.0);
+            const double load = runtime_ms > 0 ? (worker_total + running) * 100 / runtime_ms : 0;
+            total_load += load;
+            max_load = std::max(max_load, load);
+            min_load = std::min(min_load, load);
+            total_worker_duration += worker_total;
+            ++worker_count;
+            worker_stats.push_back({
+                {"workerIndex", worker.value("worker_index", 0ull)},
+                {"tasksProcessed", completed_turns},
+                {"tasksFailed", worker.value("failed_turns", 0ull)},
+                {"maxExecutionTimeMs", worker.value("max_duration_ms", 0.0)},
+                {"averageExecutionTimeMs", completed_turns
+                    ? worker_total / static_cast<double>(completed_turns) : 0.0},
+                {"isBusy", worker.value("busy", false)},
+                {"name", worker.value("name", std::string{})},
+                {"task_id", worker.contains("task_id") ? worker.at("task_id") : nlohmann::json(nullptr)},
+                {"running_elapsed_ms", running},
+                {"minExecutionTimeMs", 0.0},
+                {"loadPercentage", load},
+            });
         }
     }
-    state_->timers_changed.notify_all();
-    state_->work_ready.notify_all();
-    if (scheduler_thread_.joinable()) scheduler_thread_.join();
-    for (auto& worker : workers_) if (worker.joinable()) worker.join();
-    std::lock_guard lock(state_->mutex);
-    if (state_->stopped_at == TimePoint{}) state_->stopped_at = Clock::now();
+
+    const size_t active_workers = executor_status.value("active_workers", 0ull);
+    const size_t current_queued = executor_status.value("currentQueuedTasks", 0ull);
+    const size_t max_queue = executor_status.value("maxQueueSize", 0ull);
+    const size_t worker_count_value = executor_status.value("worker_count", 0ull);
+
+    return {
+        {"stopped", stopped_copy},
+        {"worker_count", worker_count_value},
+        {"totalTasksRegistered", registered_copy},
+        {"totalTasksProcessed", completed_copy},
+        {"totalTasksFailed", errors_copy},
+        {"currentTimerTasks", pending},
+        {"currentQueuedTasks", current_queued},
+        {"maxQueueSize", max_queue},
+        {"totalQueueOperations", dispatched_copy},
+        {"skippedRuns", skipped_copy},
+        {"canceledTimers", canceled_copy},
+        {"schedulerRuntime", runtime_ms},
+        {"schedulerWakeups", wakeups_copy},
+        {"scheduling_semantics_version", 2},
+        {"schedulerStats", {
+            {"pendingTasks", pending},
+            {"activeWorkers", active_workers},
+            {"averageWaitMs", wait_count ? wait_total / wait_count : 0.0},
+            {"maxWaitMs", wait_max},
+            {"minWaitMs", wait_count ? wait_min : 0.0},
+        }},
+        {"averageThreadLoad", worker_count ? total_load / worker_count : 0.0},
+        {"maxThreadLoad", max_load},
+        {"minThreadLoad", worker_count ? min_load : 0.0},
+        {"averageTaskCompletionTimeMs", completed_copy
+            ? total_duration / static_cast<double>(completed_copy) : 0.0},
+        {"workerStats", std::move(worker_stats)},
+        {"tasks", std::move(tasks)},
+        {"executor", executor_status},
+    };
 }
 
-size_t TimerScheduler::registerTimer(Duration delay, Task task, std::string name) {
-    return addTask(std::move(task), delay, false, std::move(name));
+TimerScheduler::TimerScheduler(TaskExecutor& executor)
+    : state_(std::make_shared<State>())
+{
+    state_->executor = &executor;
+    service_thread_ = std::thread([this] { serviceLoop(); });
 }
-size_t TimerScheduler::registerRepeatingTimer(Duration interval, Task task, std::string name) {
-    return addTask(std::move(task), interval, true, std::move(name));
+
+TimerScheduler::~TimerScheduler()
+{
+    shutdown();
 }
-size_t TimerScheduler::addTask(Task callback, Duration interval, bool repeat, std::string name) {
-    if (!callback || interval.count() < 0 || (repeat && interval.count() == 0))
-        throw std::invalid_argument("TimerScheduler requires a callback and a positive repeat interval");
+
+size_t TimerScheduler::addTimer(Duration delay, bool repeat, Task task,
+                                WorkHandle work, RequestPolicy policy,
+                                std::string name, bool callback_timer)
+{
+    if (repeat && delay.count() <= 0)
+        throw std::invalid_argument("TimerScheduler requires a positive repeat interval");
+    if (!repeat && delay.count() < 0)
+        throw std::invalid_argument("TimerScheduler requires a non-negative delay");
+    if (callback_timer && !task)
+        throw std::invalid_argument("TimerScheduler requires a callback");
+
+    auto timer = std::make_shared<State::Timer>();
+    timer->name = std::move(name);
+    timer->callback_timer = callback_timer;
+    timer->repeat = repeat;
+    timer->interval = delay;
+    timer->task = std::move(task);
+    timer->policy = policy;
+    timer->next = Clock::now() + (repeat ? Duration(0) : delay);
+
     std::lock_guard lock(state_->mutex);
     if (state_->stopped) throw std::logic_error("TimerScheduler is stopped");
-    auto task = std::make_shared<State::Timer>();
-    task->status.id = state_->next_id++;
-    task->status.name = std::move(name);
-    task->status.interval = interval;
-    task->callback = std::move(callback);
-    task->next = Clock::now() + (repeat ? Duration(0) : interval);
-    task->repeat = repeat;
-    state_->timers.emplace(task->status.id, task);
-    state_->deadlines.emplace(std::make_pair(task->next, task->status.id), task);
+
+    timer->id = state_->next_id++;
+    if (callback_timer) {
+        auto weak = std::weak_ptr<State::Timer>(timer);
+        auto state = state_;
+        auto handle = state->executor->registerTask(timer->name, [state, weak] {
+            auto timer = weak.lock();
+            if (!timer) return WorkResult::Complete;
+
+            bool canceled = false;
+            {
+                std::lock_guard lock(state->mutex);
+                if (timer->canceled) {
+                    canceled = true;
+                } else {
+                    timer->phase = "running";
+                    timer->started_at = Clock::now();
+                    timer->last_wait_ms = timer->queued_at == TimePoint{}
+                        ? 0.0 : milliseconds(timer->started_at - timer->queued_at);
+                    timer->queued_at = {};
+                    ++state->inflight;
+                }
+            }
+            if (canceled) return WorkResult::Complete;
+
+            std::exception_ptr failure;
+            try {
+                timer->task();
+            } catch (...) {
+                failure = std::current_exception();
+            }
+
+            bool retire = false;
+            {
+                std::lock_guard lock(state->mutex);
+                const auto now = Clock::now();
+                timer->phase = "idle";
+                timer->last_duration_ms = milliseconds(now - timer->started_at);
+                ++timer->completed;
+                ++state->completed;
+                state->total_duration_ms += timer->last_duration_ms;
+                if (failure) {
+                    ++timer->errors;
+                    ++state->errors;
+                }
+                if (!timer->repeat || timer->canceled) {
+                    retire = true;
+                    state->timers.erase(timer->id);
+                    state->deadlines.erase({timer->next, timer->id});
+                    timer->phase = "cancelled";
+                }
+                --state->inflight;
+                state->drained.notify_all();
+            }
+
+            if (retire) state->executor->invalidate(timer->work);
+            if (failure) std::rethrow_exception(failure);
+            return WorkResult::Complete;
+        });
+        if (!handle)
+            throw std::runtime_error("TimerScheduler: shared executor has no free task slot");
+        timer->work = *handle;
+    } else {
+        timer->work = work;
+    }
+
+    state_->timers.emplace(timer->id, timer);
+    state_->deadlines.emplace(std::make_pair(timer->next, timer->id), timer);
     ++state_->registered;
-    state_->timers_changed.notify_one();
-    return task->status.id;
+    state_->changed.notify_all();
+    return timer->id;
 }
 
-bool TimerScheduler::cancelTimer(size_t id) {
+size_t TimerScheduler::registerTimer(Duration delay, Task task, std::string name)
+{
+    return addTimer(delay, false, std::move(task), {}, RequestPolicy::Remember,
+                    std::move(name), true);
+}
+
+size_t TimerScheduler::registerRepeatingTimer(Duration interval, Task task, std::string name)
+{
+    return addTimer(interval, true, std::move(task), {}, RequestPolicy::SkipIfBusy,
+                    std::move(name), true);
+}
+
+size_t TimerScheduler::registerWorkTimer(Duration delay, WorkHandle work,
+                                         RequestPolicy policy, std::string name)
+{
+    return addTimer(delay, false, {}, work, policy, std::move(name), false);
+}
+
+size_t TimerScheduler::registerRepeatingWorkTimer(Duration interval,
+                                                  WorkHandle work,
+                                                  RequestPolicy policy, std::string name)
+{
+    return addTimer(interval, true, {}, work, policy, std::move(name), false);
+}
+
+bool TimerScheduler::triggerTimer(size_t id)
+{
+    return rescheduleTimer(id, Duration(0));
+}
+
+bool TimerScheduler::rescheduleTimer(size_t id, Duration delay)
+{
+    if (delay.count() < 0) return false;
     std::lock_guard lock(state_->mutex);
     const auto it = state_->timers.find(id);
-    if (it == state_->timers.end() || it->second->status.cancelled) return false;
-    auto task = it->second;
-    task->status.cancelled = true;
-    state_->deadlines.erase({task->next, id});
-    state_->ready.erase(std::remove(state_->ready.begin(), state_->ready.end(), task), state_->ready.end());
-    if (task->status.phase != "running") state_->timers.erase(it);
-    state_->timers_changed.notify_one();
+    if (it == state_->timers.end() || it->second->canceled) return false;
+    auto& timer = it->second;
+    state_->deadlines.erase({timer->next, id});
+    timer->next = Clock::now() + delay;
+    state_->deadlines.emplace(std::make_pair(timer->next, id), timer);
+    state_->changed.notify_all();
     return true;
 }
 
-void TimerScheduler::schedulerLoop() {
+bool TimerScheduler::cancelTimer(size_t id)
+{
+    std::shared_ptr<State::Timer> timer;
+    bool has_slot = false;
+    bool running = false;
+    {
+        std::lock_guard lock(state_->mutex);
+        const auto it = state_->timers.find(id);
+        if (it == state_->timers.end() || it->second->canceled) return false;
+        timer = it->second;
+        timer->canceled = true;
+        state_->deadlines.erase({timer->next, id});
+        ++state_->canceled;
+        running = timer->phase == "running";
+        has_slot = timer->callback_timer;
+        if (!running) state_->timers.erase(it);
+        state_->changed.notify_all();
+    }
+
+    if (has_slot) {
+        state_->executor->invalidate(timer->work);
+    } else {
+        state_->executor->cancelPending(timer->work, RequestOrigin::Timer);
+    }
+    return true;
+}
+
+void TimerScheduler::serviceLoop()
+{
     std::unique_lock lock(state_->mutex);
     while (!state_->stopped) {
         if (state_->deadlines.empty()) {
-            state_->timers_changed.wait(lock, [this] { return state_->stopped || !state_->deadlines.empty(); });
+            state_->changed.wait(lock);
             continue;
         }
         const auto next = state_->deadlines.begin()->first.first;
         const auto now = Clock::now();
         if (next > now) {
-            state_->timers_changed.wait_until(lock, next);
+            state_->changed.wait_until(lock, next);
             continue;
         }
-        auto task = state_->deadlines.begin()->second;
+
+        auto timer = state_->deadlines.begin()->second;
         state_->deadlines.erase(state_->deadlines.begin());
         ++state_->wakeups;
-        if (task->status.phase == "idle") {
-            task->status.phase = "queued";
-            task->status.queued_at = now;
-            state_->ready.push_back(task);
+        if (timer->canceled) continue;
+
+        const bool accepted = state_->executor->request(
+            timer->work, timer->policy, RequestOrigin::Timer);
+        if (accepted) {
+            timer->phase = "queued";
+            timer->queued_at = now;
             ++state_->dispatched;
-            state_->max_queue = std::max(state_->max_queue, state_->ready.size());
-            state_->work_ready.notify_one();
         } else {
-            ++task->status.skipped;
+            ++timer->skipped;
             ++state_->skipped;
         }
-        if (task->repeat) {
-            task->next = now + task->status.interval;
-            state_->deadlines.emplace(std::make_pair(task->next, task->status.id), task);
+
+        if (timer->repeat) {
+            timer->next = now + timer->interval;
+            state_->deadlines.emplace(std::make_pair(timer->next, timer->id), timer);
+        } else if (!accepted) {
+            state_->timers.erase(timer->id);
         }
-        // Under overload every deadline can remain overdue. Give workers and
-        // status/cancellation callers a chance to acquire the mutex each tick.
+
+        // Under overload every deadline can remain due. Release the timing
+        // lock once per dispatch so registration, cancellation and status
+        // queries are not starved.
         lock.unlock();
         std::this_thread::yield();
         lock.lock();
     }
 }
 
-void TimerScheduler::workerLoop(size_t index) {
-    std::unique_lock lock(state_->mutex);
-    auto& worker = state_->workers[index];
-    for (;;) {
-        state_->work_ready.wait(lock, [this] { return state_->stopped || !state_->ready.empty(); });
-        if (state_->stopped) return;
-        auto task = state_->ready.front();
-        state_->ready.pop_front();
-        task->status.phase = "running";
-        task->status.started_at = Clock::now();
-        task->status.last_wait_ms = milliseconds(task->status.started_at - task->status.queued_at);
-        const auto wait = task->status.last_wait_ms;
-        state_->total_wait_ms += wait;
-        state_->max_wait_ms = std::max(state_->max_wait_ms, wait);
-        state_->min_wait_ms = state_->started ? std::min(state_->min_wait_ms, wait) : wait;
-        ++state_->started;
-        worker.task_id = task->status.id;
-        worker.name = task->status.name;
-        worker.started_at = task->status.started_at;
-        task->status.worker_index = index;
-        lock.unlock();
-        bool failed = false;
-        try { task->callback(); }
-        catch (const std::exception& error) {
-            failed = true;
-            spdlog::error("TimerScheduler: task {} ({}) failed: {}", task->status.id, task->status.name, error.what());
-        } catch (...) {
-            failed = true;
-            spdlog::error("TimerScheduler: task {} ({}) failed with unknown exception", task->status.id, task->status.name);
+void TimerScheduler::shutdown()
+{
+    std::lock_guard shutdown_lock(shutdown_mutex_);
+    std::vector<WorkHandle> slots;
+    std::vector<WorkHandle> work_timers;
+    {
+        std::lock_guard lock(state_->mutex);
+        if (!state_->stopped) {
+            state_->stopped = true;
+            state_->deadlines.clear();
+            for (auto& [id, timer] : state_->timers) {
+                (void)id;
+                timer->canceled = true;
+                if (timer->callback_timer) slots.push_back(timer->work);
+                else work_timers.push_back(timer->work);
+            }
         }
-        lock.lock();
-        const auto duration = milliseconds(Clock::now() - task->status.started_at);
-        task->status.last_duration_ms = duration;
-        task->status.phase = "idle";
-        ++task->status.completed; task->status.errors += failed;
-        worker.total_ms += duration;
-        worker.max_ms = std::max(worker.max_ms, duration);
-        worker.min_ms = worker.completed ? std::min(worker.min_ms, duration) : duration;
-        ++worker.completed; worker.errors += failed;
-        ++state_->completed; state_->errors += failed;
-        worker.task_id.reset();
-        worker.name.clear();
-        task->status.worker_index.reset();
-        if (!task->repeat || task->status.cancelled) state_->timers.erase(task->status.id);
     }
+    state_->changed.notify_all();
+
+    if (service_thread_.joinable()) service_thread_.join();
+    for (const auto& handle : slots) state_->executor->invalidate(handle);
+    for (const auto& handle : work_timers)
+        state_->executor->cancelPending(handle, RequestOrigin::Timer);
+
+    std::unique_lock lock(state_->mutex);
+    state_->drained.wait(lock, [this] { return state_->inflight == 0; });
+    state_->timers.clear();
+    state_->deadlines.clear();
+    if (state_->stopped_at == TimePoint{}) state_->stopped_at = Clock::now();
 }
 
-TimerScheduler::StatusReader TimerScheduler::statusReader() const {
+nlohmann::json TimerScheduler::getPerformanceStats()
+{
+    return state_->snapshot();
+}
+
+TimerScheduler::StatusReader TimerScheduler::statusReader() const
+{
     return [state = state_] { return state->snapshot(); };
 }
-nlohmann::json TimerScheduler::getPerformanceStats() { return state_->snapshot(); }
