@@ -1,5 +1,7 @@
 #include "common/local_rpc.hpp"
 #include "core/collector_registry.hpp"
+#include "core/output_context.hpp"
+#include "core/output_router.hpp"
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -8,11 +10,11 @@
 struct CountingCollector : ICollector {
     bool init(const nlohmann::json&) override { return true; }
     void deinit() noexcept override {}
-    CollectDataParseFunc get_writer_parser(const std::string&) override { return nullptr; }
-    CollectResult collect(const Job& job) override {
+    CollectOutcome collect(const Job& job, OutputContext&) override {
         if (job.JobID == 0) throw std::runtime_error("模拟采集失败");
-        return 1;
+        return {};
     }
+    std::vector<OutputChannel> output_channels() const override { return {}; }
 };
 
 int main(int argc, char** argv) {
@@ -25,12 +27,15 @@ int main(int argc, char** argv) {
     auto& registry = CollectorRegistry::instance();
     registry.registerCollector<CountingCollector>("CountingCollector", CollectorScope::Job, "计数验证");
     const auto handle = registry.createCollector("CountingCollector", "count_test");
+    auto router = std::make_shared<OutputRouter>();
+    auto sample = std::make_shared<SampleMetadata>();
+    OutputContext context(router, sample);
     Job job{};
     job.JobID = 1;
-    handle.collect(job);
-    handle.collect(job);
+    handle.collect_native(job, context);
+    handle.collect_native(job, context);
     job.JobID = 0;
-    try { handle.collect(job); } catch (const std::runtime_error&) {}
+    try { handle.collect_native(job, context); } catch (const std::runtime_error&) {}
     rpc.start();
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     sockaddr_un address{};

@@ -14,7 +14,7 @@ if [[ -z "$link" ]]; then
     printf '%s\n' 'Could not find the Ninja JobLens link command' >&2
     exit 1
 fi
-for test in writer_buffer_test writer_parser_forwarding_test writer_batch_test; do
+for test in writer_buffer_test writer_batch_test; do
     c++ -std=c++17 -O0 -g -DSPDLOG_COMPILED_LIB -DYAML_CPP_STATIC_DEFINE -DHAS_STRING_VIEW=1 \
         -I"$build/include" -I"$root/include" -I/usr/include/libnl3 \
         -c "$root/tests/integration/$test.cpp" -o "$work/$test.o"

@@ -225,7 +225,7 @@ int main() {
         for (const auto* phase : {"first", "second"}) {
             const auto before_cores = core_queries;
             mark(std::string("CPUMEM_BEGIN ") + phase);
-            const auto infos = std::any_cast<std::vector<CPUMemInfo>>(collector.collect(job));
+            const auto infos = collector.sample_job(job);
             mark(std::string("CPUMEM_END ") + phase);
             require(infos.size() == 2, "live processes missing");
             for (const auto& info : infos) {
@@ -246,7 +246,7 @@ int main() {
         require(clock_queries == 1, "CLK_TCK was not cached across samples");
         denied_stat = "/proc/" + std::to_string(child.pid) + "/stat";
         mark("CPUMEM_BEGIN fallback");
-        const auto fallback = std::any_cast<std::vector<CPUMemInfo>>(collector.collect(job));
+        const auto fallback = collector.sample_job(job);
         mark("CPUMEM_END fallback");
         require(fallback.size() == 2, "stat failure discarded a live process");
         for (const auto& info : fallback) {
@@ -261,8 +261,7 @@ int main() {
         CPUMemInfo raw_name;
         raw_name.pid = getpid();
         raw_name.name = std::string(1, static_cast<char>(0xff));
-        const auto json = std::any_cast<nlohmann::json>(
-            collector.get_writer_parser("ESWriter")(std::vector<CPUMemInfo>{raw_name}));
+        const auto json = collector.to_document(std::vector<CPUMemInfo>{raw_name});
         require(json.at("process_data").at(0).at("name").get<std::string>() == raw_name.name,
                 "disabled trace changed the raw process name");
         collector.deinit();
@@ -276,7 +275,7 @@ int main() {
 
         write_fake_stat(stat_path(reused_child.pid), make_stat_line(reused_child.pid, "ps", 3, 15, 111));
         mark("CPUMEM_BEGIN reuse_old");
-        const auto old_infos = std::any_cast<std::vector<CPUMemInfo>>(reuse_collector.collect(reuse_job));
+        const auto old_infos = reuse_collector.sample_job(reuse_job);
         mark("CPUMEM_END reuse_old");
         require(old_infos.size() == 1 && std::isfinite(old_infos.front().cpuPercent) &&
                 old_infos.front().cpuPercent < 10000.0, "old process sample invalid");
@@ -284,7 +283,7 @@ int main() {
         usleep(50000);
         write_fake_stat(stat_path(reused_child.pid), make_stat_line(reused_child.pid, "appinit", 1, 1, 222));
         mark("CPUMEM_BEGIN reuse_new");
-        const auto new_infos = std::any_cast<std::vector<CPUMemInfo>>(reuse_collector.collect(reuse_job));
+        const auto new_infos = reuse_collector.sample_job(reuse_job);
         mark("CPUMEM_END reuse_new");
         require(new_infos.size() == 1, "reused process sample missing");
         require(new_infos.front().cpuPercent == 0.0, "PID reuse underflow was not neutralized");
@@ -292,7 +291,7 @@ int main() {
         usleep(50000);
         write_fake_stat(stat_path(reused_child.pid), make_stat_line(reused_child.pid, "appinit", 0, 0, 222));
         mark("CPUMEM_BEGIN reuse_regress");
-        const auto regressed = std::any_cast<std::vector<CPUMemInfo>>(reuse_collector.collect(reuse_job));
+        const auto regressed = reuse_collector.sample_job(reuse_job);
         mark("CPUMEM_END reuse_regress");
         require(regressed.size() == 1 && regressed.front().cpuPercent == 0.0,
                 "CPU counter regression underflow was not neutralized");
@@ -300,7 +299,7 @@ int main() {
         usleep(50000);
         write_fake_stat(stat_path(reused_child.pid), make_stat_line(reused_child.pid, "appinit", 10, 5, 222));
         mark("CPUMEM_BEGIN reuse_grow");
-        const auto grown = std::any_cast<std::vector<CPUMemInfo>>(reuse_collector.collect(reuse_job));
+        const auto grown = reuse_collector.sample_job(reuse_job);
         mark("CPUMEM_END reuse_grow");
         require(grown.size() == 1 && grown.front().cpuPercent > 0.0 &&
                 std::isfinite(grown.front().cpuPercent) && grown.front().cpuPercent < 100000.0,
@@ -332,15 +331,15 @@ int main() {
             // tick1：为两个作业各自建立基线，首采样输出 0
             write_fake_stat("/proc/stat", make_proc_stat_line(t0));
             mark("CPUMEM_BEGIN multi_tick1");
-            (void)multi.collect(jobA);
-            (void)multi.collect(jobB);
+            (void)multi.sample_job(jobA);
+            (void)multi.sample_job(jobB);
             mark("CPUMEM_END multi_tick1");
 
             // tick2：jobA 采样前系统前进整个 tick，Δproc=50 jiffies → 期望 10%
             write_fake_stat(stat_path(workerA.pid), make_stat_line(workerA.pid, "workerA", 150, 0, 601));
             write_fake_stat("/proc/stat", make_proc_stat_line(t0 + tick));
             mark("CPUMEM_BEGIN multi_tick2_a");
-            const auto a2 = std::any_cast<std::vector<CPUMemInfo>>(multi.collect(jobA));
+            const auto a2 = multi.sample_job(jobA);
             mark("CPUMEM_END multi_tick2_a");
             require(a2.size() == 1 && std::abs(a2.front().cpuPercent - 10.0) < 0.5,
                     "jobA cpuPercent does not match its sampling interval");
@@ -349,7 +348,7 @@ int main() {
             write_fake_stat(stat_path(workerB.pid), make_stat_line(workerB.pid, "workerB", 150, 0, 602));
             write_fake_stat("/proc/stat", make_proc_stat_line(t0 + tick + 1));
             mark("CPUMEM_BEGIN multi_tick2_b");
-            const auto b2 = std::any_cast<std::vector<CPUMemInfo>>(multi.collect(jobB));
+            const auto b2 = multi.sample_job(jobB);
             mark("CPUMEM_END multi_tick2_b");
             require(b2.size() == 1, "jobB sample missing");
             require(std::abs(b2.front().cpuPercent - 10.0) < 0.5,
@@ -372,7 +371,7 @@ int main() {
             Job prune_job;
             prune_job.JobID = 21;
             prune_job.JobPIDs = {worker.pid};
-            (void)pruner.collect(prune_job);
+            (void)pruner.sample_job(prune_job);
             require(CPUMemCollectorTestAccess::has(pruner, worker.pid), "active pid baseline missing");
 
             constexpr int kGhostPid = 999999;
@@ -388,7 +387,7 @@ int main() {
             denied_stat_errno = ENOENT;
             CPUMemCollectorTestAccess::reset_prune_clock(pruner);
             mark("CPUMEM_BEGIN prune");
-            const auto slow_sample = std::any_cast<std::vector<CPUMemInfo>>(pruner.collect(prune_job));
+            const auto slow_sample = pruner.sample_job(prune_job);
             mark("CPUMEM_END prune");
             denied_stat.clear();
             denied_stat_errno = EACCES;
@@ -405,7 +404,7 @@ int main() {
             write_fake_stat(stat_path(worker.pid), make_stat_line(worker.pid, "worker (P)", 30, 0, 701));
             write_fake_stat("/proc/stat", make_proc_stat_line(t0 + 2 * interval));
             CPUMemCollectorTestAccess::reset_prune_clock(pruner);
-            const auto next_slow_sample = std::any_cast<std::vector<CPUMemInfo>>(pruner.collect(prune_job));
+            const auto next_slow_sample = pruner.sample_job(prune_job);
             require(next_slow_sample.size() == 1 && std::abs(next_slow_sample.front().cpuPercent - 10.0) < 0.01,
                     "repeated slow sampling lost the live process CPU baseline");
 
@@ -433,7 +432,7 @@ int main() {
             CPUMemCollectorTestAccess::prune_now(pruner);
             require(!CPUMemCollectorTestAccess::has(pruner, worker.pid),
                     "expired baseline survived PID reuse");
-            const auto reused_sample = std::any_cast<std::vector<CPUMemInfo>>(pruner.collect(prune_job));
+            const auto reused_sample = pruner.sample_job(prune_job);
             require(reused_sample.size() == 1 && reused_sample.front().cpuPercent == 0.0,
                     "reused PID inherited the old process CPU baseline");
             pruner.deinit();

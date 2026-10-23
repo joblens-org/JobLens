@@ -1,19 +1,11 @@
 #include "writer/es_writer.hpp"
-#include "core/collector_registry.hpp"
+#include "core/output_record.h"
 #include "thirdparty/httplib.h"
 #include <iostream>
 #include <mutex>
 #include <thread>
 
 using json = nlohmann::json;
-
-struct TestCollector : ICollector {
-    bool init(const json&) override { return true; }
-    void deinit() noexcept override {}
-    CollectDataParseFunc get_writer_parser(const std::string&) override {
-        return [](std::any data) -> std::any { return std::any_cast<json>(data); };
-    }
-};
 
 struct TestWriter : ESWriter {
     using ESWriter::ESWriter;
@@ -84,9 +76,6 @@ int main(int argc, char** argv) {
     check(port > 0, "无法绑定本地端口");
     config.getRawNode("es_test")["port"] = port;
     std::thread serving([&] { server.listen_after_bind(); });
-    auto& registry = CollectorRegistry::instance();
-    registry.registerCollector<TestCollector>("RetryTestCollector", CollectorScope::Job, "重试验证");
-    registry.createCollector("RetryTestCollector", "retry_test");
     Job job{};
     job.JobID = 123;
     job.NativeJobID = "123";
@@ -94,9 +83,24 @@ int main(int argc, char** argv) {
     job.clusterTag = "test";
     job.jobtype = JobType::Job;
     job.subtype = JobSubType::Common;
-    std::vector<write_data> batch;
-    for (int i = 0; i < 3; ++i) batch.emplace_back("retry_test", job, json{{"value", i}, {"text", "中文\n\""}},
-        std::chrono::system_clock::time_point(std::chrono::seconds(1700000000 + i)));
+    auto make_record = [](const Job& job, int i, json value) {
+        auto sample = std::make_shared<SampleMetadata>();
+        sample->sample_id = "run";
+        sample->collector_name = "retry_test";
+        sample->collector_type = "RetryTestCollector";
+        sample->job = job;
+        sample->sampled_at = std::chrono::system_clock::time_point(std::chrono::seconds(1700000000 + i));
+        auto record = std::make_shared<OutputRecord>();
+        record->sample = sample;
+        record->channel = "document";
+        record->sequence = static_cast<uint64_t>(i);
+        record->record_id = "run:" + std::to_string(i);
+        record->payload = Document{std::move(value)};
+        record->accounted_bytes = estimate_output_bytes(record->payload);
+        return record;
+    };
+    std::vector<OutputRecordPtr> batch;
+    for (int i = 0; i < 3; ++i) batch.push_back(make_record(job, i, json{{"value", i}, {"text", "中文\n\""}}));
     int result = 0;
     try {
         auto run = [&](const std::string& mode, int retries) {
@@ -144,8 +148,7 @@ int main(int argc, char** argv) {
         requests.clear();
         TestWriter oversized("oversized", "ESWriter", "es_test");
         oversized.set_perf(false, 0);
-        auto huge = write_data{"retry_test", job, json{{"value", 9}, {"text", std::string(2000, 'x')}},
-            std::chrono::system_clock::now()};
+        auto huge = make_record(job, 9, json{{"value", 9}, {"text", std::string(2000, 'x')}});
         check(!oversized.flush_impl({huge}), "超限文档误判成功");
         oversized.on_flush_error({huge});
         oversized.shutdown();
@@ -168,7 +171,7 @@ int main(int argc, char** argv) {
         config.getRawNode("es_test")["max_retries"] = 2;
         TestWriter worker("worker", "ESWriter", "es_test");
         worker.set_perf(true, 32);
-        worker.on_finish("retry_test", job, json{{"value", 1}}, std::chrono::system_clock::now());
+        worker.try_enqueue(make_record(job, 1, json{{"value", 1}}));
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (worker.get_perf_snapshot()->call_cnt == 0 && std::chrono::steady_clock::now() < deadline)
             std::this_thread::sleep_for(std::chrono::milliseconds(5));

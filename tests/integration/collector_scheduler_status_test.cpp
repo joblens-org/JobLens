@@ -1,4 +1,6 @@
 #include "core/collector_scheduler.hpp"
+#include "core/output_context.hpp"
+#include "core/output_record.h"
 #include "common/local_rpc.hpp"
 #include "core/job_registry.hpp"
 #include <sys/socket.h>
@@ -10,13 +12,18 @@
 
 using namespace std::chrono_literals;
 struct CollectorSchedulerTestAccess {
-    static CollectorHandle makeHandle(CollectFunc collect, CollectInitFunc init,
+    static CollectorHandle makeHandle(std::function<void(const Job&)> collect, CollectInitFunc init,
                                       JobLifecycleFunc on_added = {},
                                       JobLifecycleFunc on_updated = {},
                                       JobLifecycleFunc on_removed = {}) {
         CollectorHandle handle;
         handle.init = std::move(init);
-        handle.collect = std::move(collect);
+        handle.collect_native = [collect](const Job& job, OutputContext& output) {
+            collect(job);
+            output.emit("text", Text{"probe"});
+            return CollectOutcome{};
+        };
+        handle.channels = {{"text", OutputKind::Text}};
         handle.deinit = [] {};
         handle.on_job_added = std::move(on_added);
         handle.on_job_updated = std::move(on_updated);
@@ -24,23 +31,20 @@ struct CollectorSchedulerTestAccess {
         return handle;
     }
     static void add(CollectorScheduler& scheduler, const std::string& name,
-                    CollectFunc collect, CollectInitFunc init,
+                    std::function<void(const Job&)> collect, CollectInitFunc init,
                     JobLifecycleFunc on_added = {}, JobLifecycleFunc on_updated = {},
                     JobLifecycleFunc on_removed = {}) {
-        scheduler.addJobCollectFunc(name, "test",
+        scheduler.addJobCollectFunc(name, "TestCollector", "test",
             makeHandle(std::move(collect), std::move(init),
                        std::move(on_added), std::move(on_updated), std::move(on_removed)));
     }
     static void addSystem(CollectorScheduler& scheduler, const std::string& name, const std::string& config,
-                          CollectFunc collect, CollectInitFunc init,
+                          std::function<void(const Job&)> collect, CollectInitFunc init,
                           JobLifecycleFunc on_added = {}, JobLifecycleFunc on_updated = {},
                           JobLifecycleFunc on_removed = {}) {
-        scheduler.addSystemCollectFunc(name, config,
+        scheduler.addSystemCollectFunc(name, "SystemTestCollector", config,
             makeHandle(std::move(collect), std::move(init),
                        std::move(on_added), std::move(on_updated), std::move(on_removed)));
-    }
-    static void writer(CollectorScheduler& scheduler, const std::string& name, OnFinish callback) {
-        scheduler.collector_info_dict.at(name).finish_cbs.push_back(std::move(callback));
     }
     static Job makeJob(size_t jobid, std::vector<std::string> names) {
         Job job;
@@ -105,7 +109,7 @@ void run(const std::string& base) {
     check(JobRegistry::instance().addJob(live), "register live test process");
     std::mutex mutex;
     std::condition_variable cv;
-    bool entered = false, writer_entered = false, released = false;
+    bool entered = false, released = false;
     struct Release {
         CollectorScheduler& scheduler;
         std::mutex& mutex;
@@ -118,30 +122,21 @@ void run(const std::string& base) {
         }
     };
     std::atomic<int> attempts{0};
-    CollectorSchedulerTestAccess::add(scheduler, "blocked", [&](const Job&) -> std::any {
+    CollectorSchedulerTestAccess::add(scheduler, "blocked", [&](const Job&) {
         std::unique_lock lock(mutex);
         entered = true;
         cv.notify_all();
         cv.wait(lock, [&] { return released; });
-        return 1;
+        return;
     }, [](const nlohmann::json&) { return true; });
-    CollectorSchedulerTestAccess::add(scheduler, "failed", [](const Job&) -> std::any { return 1; },
+    CollectorSchedulerTestAccess::add(scheduler, "failed", [](const Job&) { return; },
         [](const nlohmann::json&) { return false; });
-    CollectorSchedulerTestAccess::add(scheduler, "idle", [](const Job&) -> std::any { return 1; },
+    CollectorSchedulerTestAccess::add(scheduler, "idle", [](const Job&) { return; },
         [](const nlohmann::json&) { return true; });
-    CollectorSchedulerTestAccess::add(scheduler, "recovery", [&](const Job&) -> std::any {
+    CollectorSchedulerTestAccess::add(scheduler, "recovery", [&](const Job&) {
         if (++attempts == 1) throw std::runtime_error("controlled collect failure");
-        return 1;
+        return;
     }, [](const nlohmann::json&) { return true; });
-    CollectorSchedulerTestAccess::add(scheduler, "writer_blocked", [](const Job&) -> std::any { return 1; },
-        [](const nlohmann::json&) { return true; });
-    CollectorSchedulerTestAccess::writer(scheduler, "writer_blocked",
-        [&](const std::string&, const Job&, const std::any&, std::chrono::system_clock::time_point) {
-            std::unique_lock lock(mutex);
-            writer_entered = true;
-            cv.notify_all();
-            cv.wait(lock, [&] { return released; });
-        });
     Release release{scheduler, mutex, cv, released};
     server.start();
     auto status = [&](const std::string& name) {
@@ -169,15 +164,6 @@ void run(const std::string& base) {
     check(blocked.at("current_job").at("job_id") == 123 &&
           blocked.at("current_job").at("stage") == "collect", "blocked Job and collect stage missing");
     check(blocked.at("scheduling").at("state") == "running", "running timer missing");
-    CollectorSchedulerTestAccess::attach(scheduler, "writer_blocked");
-    {
-        std::unique_lock lock(mutex);
-        check(cv.wait_for(lock, 2s, [&] { return writer_entered; }), "writer callback entered");
-    }
-    auto writing = status("writer_blocked");
-    check(writing.at("current_job").at("job_id") == 123 &&
-          writing.at("current_job").at("stage") == "write", "blocked writer stage missing");
-    std::cout << "BLOCKED_RPC_LATENCY_MS=" << latency << "\nSAMPLE=" << blocked.dump() << '\n';
     CollectorSchedulerTestAccess::attach(scheduler, "recovery");
     for (int i = 0; i < 100 && status("blocked").at("scheduling").at("skipped_runs") < 3; ++i)
         std::this_thread::sleep_for(10ms);
@@ -215,13 +201,13 @@ void run(const std::string& base) {
     std::atomic<int> extra_added{0}, extra_removed{0};
     std::atomic<int> sys_added{0}, sys_updated{0}, sys_removed{0};
     CollectorSchedulerTestAccess::add(scheduler, "lifecycle",
-        [](const Job&) -> std::any { return 1; }, [](const nlohmann::json&) { return true; },
+        [](const Job&) { return; }, [](const nlohmann::json&) { return true; },
         bump(life_added), bump(life_updated), bump(life_removed));
     CollectorSchedulerTestAccess::add(scheduler, "extra",
-        [](const Job&) -> std::any { return 1; }, [](const nlohmann::json&) { return true; },
+        [](const Job&) { return; }, [](const nlohmann::json&) { return true; },
         bump(extra_added), {}, bump(extra_removed));
     CollectorSchedulerTestAccess::addSystem(scheduler, "sys_watch", "sys_test",
-        [](const Job&) -> std::any { return 1; }, [](const nlohmann::json&) { return true; },
+        [](const Job&) { return; }, [](const nlohmann::json&) { return true; },
         bump(sys_added), bump(sys_updated), bump(sys_removed));
 
     Job life_job = CollectorSchedulerTestAccess::makeJob(456, {"lifecycle"});

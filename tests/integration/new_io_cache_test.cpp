@@ -129,7 +129,7 @@ static void run(const char* path, bool details) {
     Job job; job.JobID = 7; job.JobPIDs = {getpid()};
     liveness_calls.clear();
     metadata_calls = 0;
-    const auto first = std::any_cast<JobIOStat>(collector.collect(job));
+    const auto first = collector.sample_job(job);
     require(metadata_calls == 0, "IO collection attempted a blocking metadata lookup");
     require(first.job_total.rchar == 100, "Job 总量改变");
     require(liveness_calls[pid] == 1, "liveness queried once per FD instead of once per PID");
@@ -138,7 +138,7 @@ static void run(const char* path, bool details) {
     if (details) {
         require(first.processes.at(getpid()).io.rchar == 150, "明细串作业");
         require(first.files.size() == 1 && first.files.begin()->second.total.rchar == 150, "文件明细不正确");
-        const auto output = std::any_cast<nlohmann::json>(collector.get_writer_parser("ESWriter")(first));
+        const auto output = collector.to_document(first);
         require(output.at("files").at(0).at("pos").is_null(), "unknown file size must be null");
     } else {
         require(first.processes.empty() && first.files.empty(), "关闭明细时仍输出明细");
@@ -150,7 +150,7 @@ static void run(const char* path, bool details) {
     require(!bpf_map_update_elem(fd, &a, &av, BPF_ANY) &&
             !bpf_map_update_elem(totals, &job_id, &av, BPF_ANY), "更新计数失败");
     NewIOUsageCollectorTestAccess::expire(collector);
-    const auto second = std::any_cast<JobIOStat>(collector.collect(job));
+    const auto second = collector.sample_job(job);
     require(NewIOUsageCollectorTestAccess::output_count(collector, 7, pid) == 2,
             "known PID output count did not advance on the next sample");
     require(second.collect_period > 0 && second.job_total.rchar_speed > 0, "差分基线失效");
@@ -167,28 +167,28 @@ static void run(const char* path, bool details) {
             !bpf_map_update_elem(fd, &dead_b, &bv, BPF_ANY), "初始化短命进程失败");
     NewIOUsageCollectorTestAccess::expire(collector);
     rw_stat value{};
-    const auto ephemeral = std::any_cast<JobIOStat>(collector.collect(job));
+    const auto ephemeral = collector.sample_job(job);
     if (details) require(ephemeral.processes.at(child).source == "ephemeral", "短命进程未输出");
     require(!bpf_map_lookup_elem(fd, &dead_a, &value),
             "first completed dead-PID sample must remain until the next collection cleans it");
-    const auto cleaned = std::any_cast<JobIOStat>(collector.collect(job));
+    const auto cleaned = collector.sample_job(job);
     require(!cleaned.processes.count(child), "already-output dead PID was returned again after cleanup");
     require(bpf_map_lookup_elem(fd, &dead_a, &value) != 0 && errno == ENOENT, "当前作业死 PID 未清理");
     require(!bpf_map_lookup_elem(fd, &dead_b, &value) && value.read_bytes == 900, "清理误删其他作业");
     require(NewIOUsageCollectorTestAccess::consistent_cache(collector), "清理未同步刷新索引");
     job.JobID = 9;
-    const auto other = std::any_cast<JobIOStat>(collector.collect(job));
+    const auto other = collector.sample_job(job);
     if (details) require(other.processes.at(getpid()).io.rchar == 900, "清理后刷新丢失其他作业");
     require(!bpf_map_delete_elem(fd, &a) && !bpf_map_delete_elem(fd, &b) &&
             !bpf_map_delete_elem(fd, &same_pid), "清理存活条目失败");
     close(duplicate_fd);
     NewIOUsageCollectorTestAccess::expire(collector);
-    const auto empty = std::any_cast<JobIOStat>(collector.collect(job));
+    const auto empty = collector.sample_job(job);
     require(empty.processes.empty() && empty.files.empty(), "空快照复用旧数据");
     const auto after_empty = batch_calls;
     NewIOUsageCollectorTestAccess::make_recent(collector);
     job.JobID = 99;
-    collector.collect(job);
+    collector.sample_job(job);
     require(batch_calls == after_empty, "successful empty snapshot was not cached within the TTL");
     require(!NewIOUsageCollectorTestAccess::has_pid_state(collector, 99), "空作业不应保留 PID 状态");
     std::cout << "PASS real collect details=" << details
@@ -215,7 +215,7 @@ static void run_cleanup_recovery(const char* path, bool reuse, bool exited_again
     Job job; job.JobID = 7;
     if (!reuse) batches_before_error = 1;
     metadata_calls = 0;
-    const auto first = std::any_cast<JobIOStat>(collector.collect(job));
+    const auto first = collector.sample_job(job);
     require(metadata_calls == 0, "IO collection attempted a blocking metadata lookup");
     require(first.processes.at(child).source == "ephemeral", "dead recovery PID missing");
     if (!reuse) require(first.processes.at(child).io.rchar < entries, "partial dump fixture did not truncate");
@@ -235,7 +235,7 @@ static void run_cleanup_recovery(const char* path, bool reuse, bool exited_again
         NewIOUsageCollectorTestAccess::expire(collector);
     }
     liveness_calls.clear();
-    const auto recovered = std::any_cast<JobIOStat>(collector.collect(job));
+    const auto recovered = collector.sample_job(job);
     revived_pid = -1;
     require(recovered.processes.count(child) && recovered.processes.at(child).io.rchar == (exited_again ? 8 : entries),
             exited_again ? "cleanup deleted changed/new FD records from an exited replacement PID"
@@ -244,7 +244,7 @@ static void run_cleanup_recovery(const char* path, bool reuse, bool exited_again
     require(liveness_calls[child] == 1, "cleanup repeated the current PID liveness query");
     if (reuse && !exited_again) require(recovered.processes.at(child).alive, "reused PID was still reported as dead");
     if (exited_again) {
-        const auto cleaned = std::any_cast<JobIOStat>(collector.collect(job));
+        const auto cleaned = collector.sample_job(job);
         require(!cleaned.processes.count(child), "returned replacement records were never cleaned");
     }
     std::cout << "PASS dead-PID cleanup recovery "
@@ -263,11 +263,11 @@ static void run_failure_retry(const char* path) {
     NewIOUsageCollectorTestAccess::setup(collector, object.get(), true);
 
     batches_before_error = 0;
-    const auto failed = std::any_cast<JobIOStat>(collector.collect(job));
+    const auto failed = collector.sample_job(job);
     require(failed.processes.empty(), "failed empty dump invented data");
     const auto after_failure = batch_calls;
     NewIOUsageCollectorTestAccess::make_recent(collector);
-    collector.collect(job);
+    collector.sample_job(job);
     require(batch_calls > after_failure, "failed empty dump was cached as a success");
 
     for (uint32_t i = 0; i < 2051; ++i) {
@@ -277,12 +277,12 @@ static void run_failure_retry(const char* path) {
     }
     NewIOUsageCollectorTestAccess::expire(collector);
     batches_before_error = 1;
-    const auto partial = std::any_cast<JobIOStat>(collector.collect(job));
+    const auto partial = collector.sample_job(job);
     require(partial.processes.at(pid).io.rchar > 0 && partial.processes.at(pid).io.rchar < 2051,
             "partial failure fixture did not preserve a successful first batch");
     const auto after_partial = batch_calls;
     NewIOUsageCollectorTestAccess::make_recent(collector);
-    const auto recovered = std::any_cast<JobIOStat>(collector.collect(job));
+    const auto recovered = collector.sample_job(job);
     require(batch_calls > after_partial && recovered.processes.at(pid).io.rchar == 2051,
             "partial failed traversal was cached instead of retried");
     std::cout << "PASS empty and partial BPF dump failures retry inside the TTL\n";

@@ -187,11 +187,7 @@ static void checkWriters(NetUsageCollector& collector, bool summary) {
        "recv_q":0,"send_q":0,"sent":100,"recv":200,"send_rate":1.25,"recv_rate":2.5,
        "delivery_rate":50,"uid":4294967295,"inode":0,"fd":0,"retrans":3,"rto":0,"rtt":0,"rtt_var":0,"fd_path":""}
     ]})");
-    const auto es = collector.get_writer_parser("ESWriter");
-    require(std::any_cast<nlohmann::json>(es(data)) == expected, "ES schema or field value changed");
-    WriterParseContext context{};
-    require(std::any_cast<nlohmann::json>(collector.get_writer_parser_v2("ESWriter")(context, data)) == expected,
-            "V2 writer adapter changed output");
+    require(collector.to_document(data) == expected, "document schema or field value changed");
 
     const auto pid = std::to_string(getpid());
     std::string expected_file = "NetUsageCollector type=process pid=" + pid + " connections=2\n";
@@ -201,10 +197,9 @@ static void checkWriters(NetUsageCollector& collector, bool summary) {
         " proto=UDP state=0 local_addr=[::1] local_port=5678 peer_addr=[::2] peer_port=53 recv_q=0 send_q=0 sent=0 recv=0 send_rate=0 recv_rate=0 delivery_rate=0 uid=1000 inode=43 fd=4294967295 retrans=0 rto=0 rtt=0 rtt_var=0 fd_path=\n";
     if (summary) expected_file += "NetUsageCollector type=summary pid=0 connections=1\n"
         "NetUsageCollector connection pid=0 proto=TCP state=0 local_addr= local_port=0 peer_addr= peer_port=0 recv_q=0 send_q=0 sent=100 recv=200 send_rate=1.25 recv_rate=2.5 delivery_rate=50 uid=4294967295 inode=0 fd=0 retrans=3 rto=0 rtt=0 rtt_var=0 fd_path=\n";
-    require(std::any_cast<std::string>(collector.get_writer_parser("FileWriter")(data)) == expected_file,
-            "FileWriter format or field value changed");
-    const auto prom = std::any_cast<PrometheusExporterWriter::prometheus_job_state>(
-        collector.get_writer_parser("PrometheusExporterWriter")(data));
+    require(collector.to_text(data) == expected_file,
+            "text format or field value changed");
+    const auto prom = collector.to_metrics(data);
     require(prom.processes_state.size() == (summary ? 2 : 1), "Prometheus process layout changed");
     const auto& p = prom.processes_state[0];
     require(p.pid == getpid() && p.net_sent_bytes_total == 100 && p.net_recv_bytes_total == 200 &&
@@ -255,7 +250,7 @@ static void run(bool namespace_race) {
     if (namespace_race) {
         collector.init({{"summary", "false"}, {"use_netlink", "false"}});
         Job job; job.JobPIDs = {getpid()};
-        const auto before = std::any_cast<std::vector<NetInfo>>(collector.collect(job));
+        const auto before = collector.sample_job(job);
         require(before.size() == 1 && before[0].connections.size() == 4,
                 "namespace race fixture is missing connections");
         // Move the first reader after its grouping stat but before table reads.
@@ -263,7 +258,7 @@ static void run(bool namespace_race) {
         switch_namespace_path = "/proc/" + std::to_string(child) + "/ns/net";
         switch_command_fd = commands[1]; switch_ack_fd = acknowledgements[0];
         job.JobPIDs = {child, getpid()};
-        const auto after = std::any_cast<std::vector<NetInfo>>(collector.collect(job));
+        const auto after = collector.sample_job(job);
         require(switch_namespace_path.empty(), "namespace switch hook did not run");
         require(after.size() == 2 && after[1].pid == getpid() && after[1].connections.size() == 4,
                 "namespace change in first reader lost stable process connections");
@@ -276,7 +271,7 @@ static void run(bool namespace_race) {
     checkWriters(collector, true);
     Job job; job.JobID = 17; job.JobPIDs = {getpid(), child};
     mark("NET_BEGIN shared");
-    auto first = std::any_cast<std::vector<NetInfo>>(collector.collect(job));
+    auto first = collector.sample_job(job);
     mark("NET_END shared");
     require(first.size() == 3 && first[0].pid == getpid() && first[1].pid == child && first[2].pid == 0,
             "process order or summary entry changed");
@@ -289,7 +284,7 @@ static void run(bool namespace_race) {
     char buffer[6];
     require(recv(server, buffer, sizeof(buffer), MSG_WAITALL) == 6, "receive test payload failed");
     mark("NET_BEGIN updated");
-    const auto second = std::any_cast<std::vector<NetInfo>>(collector.collect(job));
+    const auto second = collector.sample_job(job);
     mark("NET_END updated");
     const auto& a = findConnection(second[0], client_inode);
     const auto& b = findConnection(second[1], client_inode);
@@ -300,14 +295,14 @@ static void run(bool namespace_race) {
 
     transient_diag_sends = 2;
     transient_diag_receives = 1;
-    const auto recovered = std::any_cast<std::vector<NetInfo>>(collector.collect(job));
+    const auto recovered = collector.sample_job(job);
     require(recovered.size() == 3 && findConnection(recovered[0], client_inode).sent >= a.sent &&
             transient_diag_sends == 0 && transient_diag_receives == 0 && nonblocking_diag_io,
             "netlink did not recover after timeout and EINTR/EAGAIN retries");
 
     deny_namespace_stat = true;
     mark("NET_BEGIN unknown_namespace");
-    const auto isolated = std::any_cast<std::vector<NetInfo>>(collector.collect(job));
+    const auto isolated = collector.sample_job(job);
     mark("NET_END unknown_namespace");
     deny_namespace_stat = false;
     require(isolated.size() == 3 && isolated[0].connections.size() == 4 && isolated[1].connections.size() == 4,
@@ -316,7 +311,7 @@ static void run(bool namespace_race) {
     require(write(commands[1], "c", 1) == 1 && read(acknowledgements[0], buffer, 1) == 1, "child close failed");
     job.JobPIDs = {child};
     mark("NET_BEGIN empty");
-    const auto empty = std::any_cast<std::vector<NetInfo>>(collector.collect(job));
+    const auto empty = collector.sample_job(job);
     mark("NET_END empty");
     require(empty.size() == 2 && empty[0].connections.empty(), "closed socket ownership was reused");
     checkWriters(collector, true);
@@ -326,7 +321,7 @@ static void run(bool namespace_race) {
     checkWriters(collector, false);
     job.JobPIDs = {getpid()};
     mark("NET_BEGIN without_netlink");
-    const auto without_netlink = std::any_cast<std::vector<NetInfo>>(collector.collect(job));
+    const auto without_netlink = collector.sample_job(job);
     mark("NET_END without_netlink");
     require(without_netlink.size() == 1 && without_netlink[0].connections.size() == 4,
             "proc-only mode changed connection structure");
