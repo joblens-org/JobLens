@@ -63,8 +63,12 @@ bool ESWriter::send_documents(const std::vector<BulkDocument>& documents)
         success = false;
         spdlog::error("elasticsearch_writer: write failed, collector={}, index={}, id={}, status={}, retryable={}, reason={}",
                       document.collector, document.index, document.id, status, retry, reason.substr(0, 512));
-        if (retry) retry_documents_.push_back(document);
-        else spdlog::warn("elasticsearch_writer: dropping permanent failure, index={}, id={}", document.index, document.id);
+        if (retry) {
+            if (reserve_retry_budget(document)) retry_documents_.push_back(document);
+        } else {
+            spdlog::warn("elasticsearch_writer: dropping permanent failure, index={}, id={}",
+                         document.index, document.id);
+        }
     };
     if (response.transport != CURLE_OK || (response.status != 200 && response.status != 201)) {
         const bool retry = response.transport != CURLE_OK ? retryable_transport(response.transport) : retryable_status(response.status);
@@ -115,9 +119,26 @@ bool ESWriter::send_documents(const std::vector<BulkDocument>& documents)
     return success;
 }
 
-void ESWriter::on_flush_error(const std::vector<write_data>& batch)
+bool ESWriter::reserve_retry_budget(const BulkDocument& document)
 {
-    BaseWriter::on_flush_error(batch);
+    if (!reserve_additional_bytes(document.ndjson.size())) {
+        spdlog::error("elasticsearch_writer: retry budget exhausted, terminating retry for index={}, id={}",
+                      document.index, document.id);
+        return false;
+    }
+    retry_reserved_bytes_ += document.ndjson.size();
+    return true;
+}
+
+void ESWriter::release_retry_budget()
+{
+    if (retry_reserved_bytes_ == 0) return;
+    release_additional_bytes(retry_reserved_bytes_);
+    retry_reserved_bytes_ = 0;
+}
+
+void ESWriter::run_retry_rounds()
+{
     auto delay = opt_.retry_initial_backoff_ms;
     thread_local std::mt19937 random(std::random_device{}());
     for (int attempt = 1; attempt <= opt_.max_retries && !retry_documents_.empty(); ++attempt) {
@@ -146,4 +167,11 @@ void ESWriter::on_flush_error(const std::vector<write_data>& batch)
                       document.index, document.id, opt_.max_retries);
     }
     retry_documents_.clear();
+    release_retry_budget();
+}
+
+void ESWriter::on_flush_error(const std::vector<OutputRecordPtr>& batch)
+{
+    BaseWriter::on_flush_error(batch);
+    run_retry_rounds();
 }

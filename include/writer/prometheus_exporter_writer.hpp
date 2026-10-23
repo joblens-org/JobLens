@@ -14,6 +14,7 @@
 // ========================= prometheus_exporter_writer.hpp =========================
 #pragma once
 #include "writer/base_writer.hpp"
+#include "core/metric_data.h"
 #include "common/local_rpc.hpp"
 #include <nlohmann/json.hpp>
 #include <thread>
@@ -33,73 +34,18 @@ public:
 
     ~PrometheusExporterWriter() override;
 
-    struct prometheus_process_state
-    {
-        uint32_t job_id = 0;      // job_id
-        pid_t    pid = 0;         // pid
-        std::string name;         // name   （进程名，低基数即可）
+    // 迁移期别名：旧 parser 代码/测试仍可通过原名称引用同一 schema。
+    using prometheus_process_state = ProcessMetricSnapshot;
+    using prometheus_job_state = MetricSnapshot;
 
-        /* ========== CPU ========== */
-        double cpu_usage_percent = 0.0; // job_cpu_usage_percent  (Gauge)
-
-        /* ========== 内存 ========== */
-        double mem_usage_percent = 0.0; // job_memory_usage_percent (Gauge)
-        int64_t mem_rss_kb = 0;   // job_memory_rss_kb        (Gauge)
-        int64_t mem_vm_kb = 0;    // job_memory_vm_kb         (Gauge)
-        // job_memory_pss_kb (Gauge)；-1 表示本次未采到 PSS（未开启或内核不支持）
-        int64_t mem_pss_kb = -1;
-        int32_t threads_cnt = 0;  // job_threads_count        (Gauge)
-
-        /* ========== I/O ========== */
-        // 累计值 → Counter
-        int64_t io_read_bytes_total = 0;   // job_io_read_bytes_total   (Counter)
-        int64_t io_write_bytes_total = 0;  // job_io_write_bytes_total  (Counter)
-        // 瞬时速率 → Gauge（若不想用 rate() 可直用）
-        double  io_read_bytes_per_sec = 0.0;  // job_io_read_bytes_per_sec  (Gauge)
-        double  io_write_bytes_per_sec = 0.0; // job_io_write_bytes_per_sec (Gauge)
-
-        // 累计字节（TCP  only）
-        uint32_t tcp_conns             = 0; // tcp_connections                (Counter)
-        int64_t net_sent_bytes_total   = 0; // job_network_sent_bytes_total   (Counter)
-        int64_t net_recv_bytes_total   = 0; // job_network_recv_bytes_total   (Counter)
-        // 瞬时速率
-        double  net_send_bytes_per_sec = 0; // job_network_send_bytes_per_sec (Gauge)
-        double  net_recv_bytes_per_sec = 0; // job_network_recv_bytes_per_sec (Gauge)
-        // 重传 & RTT（TCP only）
-        uint64_t tcp_retrans_total = 0;     // job_network_tcp_retrans_total (Counter)
-        uint32_t tcp_rtt_us = 0;            // job_network_tcp_rtt_us        (Gauge)
-
-        /* ========== FS Metadata ========== */
-        // 累计值 → Counter
-        uint64_t fs_metadata_ops_total = 0;     // job_fs_metadata_ops_total   (Counter)
-        uint64_t fs_metadata_errors_total = 0;  // job_fs_metadata_errors_total (Counter)
-        // 瞬时速率 → Gauge
-        double  fs_metadata_ops_per_sec = 0.0;  // job_fs_metadata_ops_per_sec (Gauge)
-        double  fs_metadata_errors_per_sec = 0.0;  // job_fs_metadata_errors_per_sec (Gauge)
-
-    };
-
-    struct prometheus_job_state
-    {
-        int JobID{};
-        // 组归属 label：getGroups(job).acct_group 的原始计费组原值
-        //（Condor 为完整三段含队列等级，Slurm 为扁平 account）。
-        // 超 128 字节截断（计 GroupProbeStats::truncated），缺失为空串。
-        std::string group;
-        std::vector<prometheus_process_state> processes_state;
-        // Job 级 I/O（NewIOUsageCollector：VFS syscall 层，弃用物理块字段）
-        int64_t io_rchar_total = 0;
-        int64_t io_wchar_total = 0;
-        double  io_rchar_per_sec = 0.0;
-        double  io_wchar_per_sec = 0.0;
-    };
+    bool accepts(OutputKind kind) const override { return kind == OutputKind::Metrics; }
 
 protected:
-    bool flush_impl(const std::vector<write_data>& batch) override;
+    bool flush_impl(const std::vector<OutputRecordPtr>& batch) override;
 
 private:
     void register_rpc_methods();
-    void update_job_metrics(const prometheus_job_state& data,const std::string& type);
+    void update_job_metrics(const MetricSnapshot& data, const std::string& type);
     json json_metrics();
 
     std::string fifo_path_;
@@ -107,18 +53,5 @@ private:
     std::atomic<bool> stop_{false};
 
     mutable std::shared_mutex mtx_;
-    std::unordered_map<int, prometheus_job_state> job_metrics_;
-};
-
-/*-------------------- nlohmann JSON 序列化 --------------------*/
-template <>
-struct nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_process_state>
-{
-    static json to_json(const PrometheusExporterWriter::prometheus_process_state& s);
-};
-
-template <>
-struct nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_job_state>
-{
-    static json to_json(const PrometheusExporterWriter::prometheus_job_state& j);
+    std::unordered_map<int, MetricSnapshot> job_metrics_;
 };

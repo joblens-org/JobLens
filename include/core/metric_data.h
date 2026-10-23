@@ -38,6 +38,7 @@ struct ProcessMetricSnapshot
     double mem_usage_percent = 0.0; // job_memory_usage_percent (Gauge)
     int64_t mem_rss_kb = 0;   // job_memory_rss_kb        (Gauge)
     int64_t mem_vm_kb = 0;    // job_memory_vm_kb         (Gauge)
+    int64_t mem_pss_kb = -1;
     int32_t threads_cnt = 0;  // job_threads_count        (Gauge)
 
     /* ========== I/O ========== */
@@ -67,6 +68,7 @@ struct ProcessMetricSnapshot
 struct MetricSnapshot
 {
     int JobID{};
+    std::string group;
     std::vector<ProcessMetricSnapshot> processes_state;
     // Job 级 I/O（NewIOUsageCollector：VFS syscall 层，弃用物理块字段）
     int64_t io_rchar_total = 0;
@@ -85,6 +87,7 @@ inline bool operator==(const ProcessMetricSnapshot& a, const ProcessMetricSnapsh
         && a.cpu_usage_percent == b.cpu_usage_percent
         && a.mem_usage_percent == b.mem_usage_percent
         && a.mem_rss_kb == b.mem_rss_kb && a.mem_vm_kb == b.mem_vm_kb
+        && a.mem_pss_kb == b.mem_pss_kb
         && a.threads_cnt == b.threads_cnt
         && a.io_read_bytes_total == b.io_read_bytes_total
         && a.io_write_bytes_total == b.io_write_bytes_total
@@ -105,7 +108,7 @@ inline bool operator==(const ProcessMetricSnapshot& a, const ProcessMetricSnapsh
 
 inline bool operator==(const MetricSnapshot& a, const MetricSnapshot& b)
 {
-    return a.JobID == b.JobID && a.processes_state == b.processes_state
+    return a.JobID == b.JobID && a.group == b.group && a.processes_state == b.processes_state
         && a.io_rchar_total == b.io_rchar_total && a.io_wchar_total == b.io_wchar_total
         && a.io_rchar_per_sec == b.io_rchar_per_sec && a.io_wchar_per_sec == b.io_wchar_per_sec;
 }

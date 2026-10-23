@@ -18,6 +18,8 @@
 #include "writer/base_writer.hpp"
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
+#include <unordered_map>
+#include <unordered_set>
 
 class ESWriter : public BaseWriter
 {
@@ -41,14 +43,13 @@ public:
 
     ~ESWriter() override;
 
-    /* 重写父类 write，用于“本地缓冲 -> 父类缓冲” */
-    void write(const write_data& w);
+    bool accepts(OutputKind kind) const override { return kind == OutputKind::Document; }
 
     /* 真正写 ES：被 BaseWriter 后台线程调用 */
-    bool flush_impl(const std::vector<write_data>& batch) override;
+    bool flush_impl(const std::vector<OutputRecordPtr>& batch) override;
 
 protected:
-    void on_flush_error(const std::vector<write_data>& batch) override;
+    void on_flush_error(const std::vector<OutputRecordPtr>& batch) override;
 
 private:
     struct BulkDocument {
@@ -57,6 +58,7 @@ private:
         std::string id;
         std::string collector;
     };
+    bool flush_documents(const std::vector<BulkDocument>& documents);
     struct BulkResponse {
         CURLcode transport;
         long status;
@@ -64,15 +66,21 @@ private:
     };
     BulkResponse post_bulk(const std::string& bulk_body);
     bool send_documents(const std::vector<BulkDocument>& documents);
+    void run_retry_rounds();
+    bool reserve_retry_budget(const BulkDocument& document);
+    void release_retry_budget();
+    bool build_document(const std::string& collector_name, const Job& job,
+                        std::chrono::system_clock::time_point ts, const std::string& record_id,
+                        nlohmann::json data, BulkDocument& out);
     std::vector<BulkDocument> retry_documents_;
+    std::size_t retry_reserved_bytes_ = 0;
     bool test_server();
     std::string try_get_index_name(const std::string& collector_name);
-    bool try_parse_data(const std::string& collector_name, const std::any& data, const Job& job,
-                        std::chrono::system_clock::time_point ts, nlohmann::json& out,
-                        const CollectDataParseFuncV2& parser_func);
     int write_timeout;
     options opt_;
-    std::vector<write_data> local_buf_;   // 子类私有缓冲
-    std::mutex local_mtx_;                // 保护 local_buf_
     CURL* curl_ = nullptr;
+    // 每个实例独立的 collector→index 映射，不能使用函数级 static 缓存。
+    std::unordered_map<std::string, std::string> index_map_;
+    std::unordered_map<std::string, std::string> default_index_cache_;
+    std::unordered_set<std::string> warned_index_;
 };

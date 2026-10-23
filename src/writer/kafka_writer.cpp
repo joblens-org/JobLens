@@ -12,8 +12,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "writer/kafka_writer.hpp"
-#include "writer/batch_parser_cache.hpp"
-#include "core/collector_registry.hpp"
 #include <chrono>
 #include <sstream>
 #include <common/config.hpp>
@@ -129,18 +127,28 @@ void KafkaWriter::do_shutdown() {
 
 
 // -------------------------- flush_impl --------------------------
-bool KafkaWriter::flush_impl(const std::vector<write_data>& batch) {
-    BatchParserCache parsers(type_);
-    for (const auto& w : batch) {
-        json payload;
+bool KafkaWriter::flush_impl(const std::vector<OutputRecordPtr>& batch) {
+    for (const auto& record : batch) {
+        if (!record || !record->sample) {
+            spdlog::error("KafkaWriter: native record without sample metadata");
+            continue;
+        }
+        const auto* payload = std::get_if<Document>(&record->payload);
+        if (!payload || !payload->value.is_object()) {
+            spdlog::error("KafkaWriter: native payload is not a JSON object, collector={}, record={}",
+                          record->sample->collector_name, record->record_id);
+            continue;
+        }
+        json message;
         try {
-            payload = serialize(w, parsers.get(std::get<0>(w)));
+            message = serialize_payload(record->sample->collector_name, record->sample->job,
+                                        record->sample->sampled_at, payload->value);
         } catch (const std::exception& ex) {
             if (opt_.enable_dlq) {
                 std::string dlq = json{
                     {"exception", ex.what()},
-                    {"collector_name",       std::get<0>(w) /*collector_name*/},
-                    {"job_info",  job_to_json(std::get<1>(w))},
+                    {"collector_name", record->sample->collector_name},
+                    {"job_info", job_to_json(record->sample->job)},
                 }.dump();
                 producer_->produce(
                     opt_.topic_dlq,
@@ -153,68 +161,50 @@ bool KafkaWriter::flush_impl(const std::vector<write_data>& batch) {
                     nullptr
                 );
             }
+            continue;
         }
-        auto payload_str = payload.dump();
-retry:
-        RdKafka::ErrorCode err = producer_->produce(
-            opt_.topic_prefix + std::get<0>(w),
-            RdKafka::Topic::PARTITION_UA,
-            RdKafka::Producer::RK_MSG_COPY,
-            const_cast<char*>(payload_str.c_str()),
-            payload_str.size(),
-            nullptr,0,
-            0,
-            nullptr
-        );
-        if (err != RdKafka::ERR_NO_ERROR) {
-            spdlog::error("KafkaWriter: failed to produce message: {}", RdKafka::err2str(err));
-
-            if (err == RdKafka::ERR__QUEUE_FULL) {
-                producer_->poll(1000);
-                goto retry;
-            }
-
-            } else {
-                spdlog::error("KafkaWriter: produced message to collector '{}', size {} bytes",
-                            std::get<0>(w), payload_str.size());
-            }
-        producer_->poll(0);
+        produce_message(message, record->sample->collector_name);
     }
-
     return true;
 }
 
+void KafkaWriter::produce_message(const json& payload, const std::string& collector_name) {
+    auto payload_str = payload.dump();
+retry:
+    RdKafka::ErrorCode err = producer_->produce(
+        opt_.topic_prefix + collector_name,
+        RdKafka::Topic::PARTITION_UA,
+        RdKafka::Producer::RK_MSG_COPY,
+        const_cast<char*>(payload_str.c_str()),
+        payload_str.size(),
+        nullptr,0,
+        0,
+        nullptr
+    );
+    if (err != RdKafka::ERR_NO_ERROR) {
+        spdlog::error("KafkaWriter: failed to produce message: {}", RdKafka::err2str(err));
+        if (err == RdKafka::ERR__QUEUE_FULL) {
+            producer_->poll(1000);
+            goto retry;
+        }
+    } else {
+        spdlog::debug("KafkaWriter: produced message to collector '{}', size {} bytes",
+                      collector_name, payload_str.size());
+    }
+    producer_->poll(0);
+}
+
 // -------------------------- serialize --------------------------
-json KafkaWriter::serialize(const write_data& w, const CollectDataParseFuncV2& parser_func) {
-    const auto& [collector_name, job, data_any, tp] = w;
-
-    if (!parser_func) {
-        spdlog::debug("KafkaWriter: no parser for collector '{}', writer '{}'", collector_name, type_);
-        throw std::runtime_error("no parser available");
-    }
-
-    spdlog::trace("KafkaWriter: using parser for collector '{}', writer '{}'", collector_name, type_);
-
-    // 构造 WriterParseContext，传递 writer 上下文供 V2 parser 使用
-    WriterParseContext ctx{name_, type_, config_name_, collector_name, job, tp};
-
-    try {
-        std::any parsed = parser_func(ctx, data_any);
-        auto parsed_data = std::any_cast<json>(std::move(parsed));
-
-        // 包装 Kafka message envelope（元数据 + 业务数据）
-        json wrap = {
-            {"collector_name", collector_name},
-            {"hostname",      collector_utils::get_hostname()},
-            {"@timestamp",  std::chrono::duration_cast<std::chrono::milliseconds>(
-                            tp.time_since_epoch()).count()},
-            {"job_info",  job_to_json(job)}
-        };
-        wrap["data"] = std::move(parsed_data);
-        return wrap.dump();
-    } catch (const std::exception& ex) {
-        spdlog::error("KafkaWriter: error parsing data for collector '{}', writer '{}': {}",
-                      collector_name, type_, ex.what());
-        throw;
-    }
+json KafkaWriter::serialize_payload(const std::string& collector_name, const Job& job,
+                                    std::chrono::system_clock::time_point ts, json data) {
+    json wrap = {
+        {"collector_name", collector_name},
+        {"hostname",      collector_utils::get_hostname()},
+        {"@timestamp",  std::chrono::duration_cast<std::chrono::milliseconds>(
+                        ts.time_since_epoch()).count()},
+        {"job_info",  job_to_json(job)}
+    };
+    wrap["data"] = std::move(data);
+    // 返回值是“JSON 字符串”节点：保持既有 double-encoded 线格式不变。
+    return json(wrap.dump());
 }

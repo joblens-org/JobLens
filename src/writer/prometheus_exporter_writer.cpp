@@ -15,11 +15,9 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "writer/prometheus_exporter_writer.hpp"
-#include "writer/batch_parser_cache.hpp"
 #include "core/collector_type.h"
 #include "core/group_probe_stats.hpp"
 #include <spdlog/spdlog.h>
-#include "core/collector_registry.hpp"
 #include "core/writer_manager.hpp"
 #include <ctime>
 
@@ -67,7 +65,7 @@ static inline PrmxsCollectorType type2enum(const std::string& type){
     return (it != map.end()) ? it->second : PrmxsCollectorType::UNKNOWN;
 }
 
-void PrometheusExporterWriter::update_job_metrics(const prometheus_job_state& data,const std::string& type){
+void PrometheusExporterWriter::update_job_metrics(const MetricSnapshot& data,const std::string& type){
     if (!data.JobID) return;
     const auto collector_type = type2enum(type);
     std::unique_lock lk(mtx_);
@@ -154,29 +152,29 @@ void PrometheusExporterWriter::update_job_metrics(const prometheus_job_state& da
     return;
 }
 
-bool PrometheusExporterWriter::flush_impl(const std::vector<write_data>& batch){
-    BatchParserCache parsers(type_);
-    for (const auto& [collect_name, job, any_data, ts] : batch)
+bool PrometheusExporterWriter::flush_impl(const std::vector<OutputRecordPtr>& batch){
+    for (const auto& record : batch)
     {
-        spdlog::trace("PrometheusExporterWriter: get in flush");
-        WriterParseContext ctx{name_, type_, config_name_, collect_name, job, ts};
-        const auto& parser_func = parsers.get(collect_name);
-        spdlog::trace("PrometheusExporterWriter: using parser for collector '{}', writer '{}'", collect_name, type_);
-        auto collector_type = CollectorRegistry::instance().getCollectorType(collect_name);
-        auto parsed = std::any_cast<PrometheusExporterWriter::prometheus_job_state>(parser_func(ctx, any_data));
-        spdlog::trace("PrometheusExporterWriter: size of parsed: {}", parsed.processes_state.size());
-        parsed.JobID = job.JobID;
-        // 组 label 取原始计费组原值（getGroups 视图）；>128 字节截断并计数。
-        {
-            auto g = getGroups(job);
-            if (g.acct_group.size() > 128) {
-                parsed.group = g.acct_group.substr(0, 125) + "...";
-                GroupProbeStats::instance().record_truncated();
-            } else {
-                parsed.group = g.acct_group;
-            }
+        if (!record || !record->sample) {
+            spdlog::error("PrometheusExporterWriter: native record without sample metadata");
+            continue;
         }
-        update_job_metrics(parsed, collector_type);
+        const auto* metrics = std::get_if<MetricSnapshot>(&record->payload);
+        if (!metrics) {
+            spdlog::error("PrometheusExporterWriter: native payload is not metrics, collector={}, record={}",
+                          record->sample->collector_name, record->record_id);
+            continue;
+        }
+        MetricSnapshot parsed = *metrics;
+        parsed.JobID = static_cast<int>(record->sample->job.JobID);
+        const auto groups = getGroups(record->sample->job);
+        if (groups.acct_group.size() > 128) {
+            parsed.group = groups.acct_group.substr(0, 125) + "...";
+            GroupProbeStats::instance().record_truncated();
+        } else {
+            parsed.group = groups.acct_group;
+        }
+        update_job_metrics(parsed, record->sample->collector_type);
     }
     return true;
 }
@@ -216,53 +214,6 @@ json PrometheusExporterWriter::json_metrics(){
     std::shared_lock lk(mtx_);
     json wrapper = json::object();
     for (const auto& [key, value] : job_metrics_)
-        wrapper[std::to_string(key)] = nlohmann::adl_serializer<prometheus_job_state>::to_json(value);
+        wrapper[std::to_string(key)] = metric_snapshot_to_json(value);
     return wrapper;
-}
-
-/*-------------------- process_state 序列化 --------------------*/
-json nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_process_state>::to_json(
-    const PrometheusExporterWriter::prometheus_process_state& s){
-    return json{
-        {"job_id",                     s.job_id},
-        {"pid",                        s.pid},
-        {"name",                       s.name},
-
-        {"cpu_usage_percent",          s.cpu_usage_percent},
-
-        {"mem_usage_percent",          s.mem_usage_percent},
-        {"mem_rss_kb",                 s.mem_rss_kb},
-        {"mem_vm_kb",                  s.mem_vm_kb},
-        {"mem_pss_kb",                 s.mem_pss_kb},
-        {"threads_cnt",                s.threads_cnt},
-
-        {"io_read_bytes_total",        s.io_read_bytes_total},
-        {"io_write_bytes_total",       s.io_write_bytes_total},
-        {"io_read_bytes_per_sec",      s.io_read_bytes_per_sec},
-        {"io_write_bytes_per_sec",     s.io_write_bytes_per_sec},
-
-        {"net_sent_bytes_total",       s.net_sent_bytes_total},
-        {"net_recv_bytes_total",       s.net_recv_bytes_total},
-        {"net_send_bytes_per_sec",     s.net_send_bytes_per_sec},
-        {"net_recv_bytes_per_sec",     s.net_recv_bytes_per_sec},
-        {"tcp_retrans_total",          s.tcp_retrans_total},
-        {"tcp_rtt_us",                 s.tcp_rtt_us},
-
-        {"fs_metadata_ops_total",      s.fs_metadata_ops_total},
-        {"fs_metadata_ops_per_sec",    s.fs_metadata_ops_per_sec},
-        {"fs_metadata_errors_total",    s.fs_metadata_errors_total},
-        {"fs_metadata_errors_per_sec",  s.fs_metadata_errors_per_sec}
-    };
-}
-
-/*-------------------- job_state 序列化 --------------------*/
-json nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_job_state>::to_json(
-    const PrometheusExporterWriter::prometheus_job_state& j){
-    json proc_array = json::array();
-    for (const auto& p : j.processes_state)
-        proc_array.push_back(nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_process_state>::to_json(p));
-
-    json result{{"JobID", j.JobID}, {"group", j.group}};
-    result["process_state"] = std::move(proc_array);
-    return result;
 }

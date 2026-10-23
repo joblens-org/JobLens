@@ -27,6 +27,7 @@ json process_metric_to_json(const ProcessMetricSnapshot& s)
         {"mem_usage_percent",          s.mem_usage_percent},
         {"mem_rss_kb",                 s.mem_rss_kb},
         {"mem_vm_kb",                  s.mem_vm_kb},
+        {"mem_pss_kb",                 s.mem_pss_kb},
         {"threads_cnt",                s.threads_cnt},
 
         {"io_read_bytes_total",        s.io_read_bytes_total},
@@ -54,7 +55,7 @@ json metric_snapshot_to_json(const MetricSnapshot& j)
     for (const auto& p : j.processes_state)
         proc_array.push_back(process_metric_to_json(p));
 
-    json result{{"JobID", j.JobID}};
+    json result{{"JobID", j.JobID}, {"group", j.group}};
     result["process_state"] = std::move(proc_array);
     return result;
 }

@@ -44,21 +44,20 @@ public:
 
     explicit KafkaWriter(std::string name, std::string type, std::string config_name);
     ~KafkaWriter() override;
+
+    bool accepts(OutputKind kind) const override { return kind == OutputKind::Document; }
 protected:
     // 覆写基类
-    bool flush_impl(const std::vector<write_data>&) override;
+    bool flush_impl(const std::vector<OutputRecordPtr>&) override;
     void do_shutdown() override;
 
 private:
 
-    // 工具：把 write_data 序列化成 json string
-    json serialize(const write_data& w, const CollectDataParseFuncV2& parser_func);
+    // 工具：把已准备好的 data 包装成 Kafka 信封（保持既有 double-encoded 线格式）
+    json serialize_payload(const std::string& collector_name, const Job& job,
+                           std::chrono::system_clock::time_point ts, json data);
+    void produce_message(const json& payload, const std::string& collector_name);
 
     Options                              opt_;
     RdKafka::Producer*                   producer_ = nullptr;
-    std::thread                          worker_;
-    std::mutex                           mq_mtx_;
-    std::condition_variable              mq_cv_;
-    std::queue<std::vector<write_data>>  mq_;   // 待写队列
-    bool                                 running_ = true;
 };
