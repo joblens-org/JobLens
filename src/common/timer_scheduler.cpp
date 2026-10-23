@@ -258,10 +258,6 @@ size_t TimerScheduler::addTimer(Duration delay, bool repeat, Task task,
     timer->policy = policy;
     timer->next = Clock::now() + (repeat ? Duration(0) : delay);
 
-    std::lock_guard lock(state_->mutex);
-    if (state_->stopped) throw std::logic_error("TimerScheduler is stopped");
-
-    timer->id = state_->next_id++;
     if (callback_timer) {
         auto weak = std::weak_ptr<State::Timer>(timer);
         auto state = state_;
@@ -326,11 +322,19 @@ size_t TimerScheduler::addTimer(Duration delay, bool repeat, Task task,
         timer->work = work;
     }
 
-    state_->timers.emplace(timer->id, timer);
-    state_->deadlines.emplace(std::make_pair(timer->next, timer->id), timer);
-    ++state_->registered;
-    state_->changed.notify_all();
-    return timer->id;
+    {
+        std::lock_guard lock(state_->mutex);
+        if (!state_->stopped) {
+            timer->id = state_->next_id++;
+            state_->timers.emplace(timer->id, timer);
+            state_->deadlines.emplace(std::make_pair(timer->next, timer->id), timer);
+            ++state_->registered;
+            state_->changed.notify_all();
+            return timer->id;
+        }
+    }
+    if (callback_timer) state_->executor->invalidate(timer->work);
+    throw std::logic_error("TimerScheduler is stopped");
 }
 
 size_t TimerScheduler::registerTimer(Duration delay, Task task, std::string name)
@@ -424,22 +428,33 @@ void TimerScheduler::serviceLoop()
         ++state_->wakeups;
         if (timer->canceled) continue;
 
-        const bool accepted = state_->executor->request(
-            timer->work, timer->policy, RequestOrigin::Timer);
+        const auto id = timer->id;
+        const auto work = timer->work;
+        const auto policy = timer->policy;
+        const bool repeat = timer->repeat;
+        const auto interval = timer->interval;
+        lock.unlock();
+
+        const bool accepted = state_->executor->request(work, policy, RequestOrigin::Timer);
+
+        lock.lock();
+        if (state_->stopped) break;
+        auto it = state_->timers.find(id);
+        if (it == state_->timers.end() || it->second->canceled) continue;
+        auto& current = *it->second;
         if (accepted) {
-            timer->phase = "queued";
-            timer->queued_at = now;
+            current.phase = "queued";
+            current.queued_at = Clock::now();
             ++state_->dispatched;
         } else {
-            ++timer->skipped;
+            ++current.skipped;
             ++state_->skipped;
         }
-
-        if (timer->repeat) {
-            timer->next = now + timer->interval;
-            state_->deadlines.emplace(std::make_pair(timer->next, timer->id), timer);
+        if (repeat) {
+            current.next = Clock::now() + interval;
+            state_->deadlines.emplace(std::make_pair(current.next, id), it->second);
         } else if (!accepted) {
-            state_->timers.erase(timer->id);
+            state_->timers.erase(it);
         }
 
         // Under overload every deadline can remain due. Release the timing
