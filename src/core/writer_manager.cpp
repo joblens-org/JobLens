@@ -69,6 +69,13 @@ void WriterManager::initWriterPerf() {
 }
 
 WriterManager::WriterManager() {
+    // WriterManager is constructed by the AUTO_REGISTER_WRITER static initializers
+    // before main(). Touch the spdlog registry here so it is constructed no later
+    // than WriterManager; static destruction order is then guaranteed to destroy
+    // WriterManager (and its writers, which log during shutdown) first, rather
+    // than logging into an already-destroyed spdlog registry at process exit.
+    (void)spdlog::default_logger_raw();
+
     // 128-bit 进程运行标识：由操作系统随机源生成，配合单调采样计数器构成 sample_id。
     std::random_device device;
     std::ostringstream os;
