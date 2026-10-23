@@ -473,6 +473,11 @@ inline bool operator==(const SourceHandle& lhs, const SourceHandle& rhs)
     return lhs.id == rhs.id && lhs.generation == rhs.generation;
 }
 
+inline bool operator!=(const SourceHandle& lhs, const SourceHandle& rhs)
+{
+    return !(lhs == rhs);
+}
+
 enum class Interest { Readable };
 
 struct ReadySource {

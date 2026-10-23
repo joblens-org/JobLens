@@ -31,8 +31,11 @@ CollectorScheduler::CollectorScheduler()
           static_cast<size_t>(Config::instance().getInt("lens_config", "max_collector_threads")),
           static_cast<size_t>(Config::instance().getInt(
               "collector_execution_config", "max_registered_tasks", 1024))}),
-      timerScheduler_(taskExecutor_)
+      timerScheduler_(taskExecutor_),
+      eventPoller_(static_cast<size_t>(Config::instance().getInt(
+          "collector_execution_config", "max_event_sources", 1024)))
 {
+    eventPoller_.start();
     runtime_->schedulerStatusReader(timerScheduler_.statusReader());
     auto runtime = runtime_;
     RPCServer::instance().register_method("CollectorScheduler/status",
@@ -619,6 +622,7 @@ void CollectorScheduler::shutdown() {
         std::lock_guard lg(m_);
         running_ = false;
     }
+    eventPoller_.shutdown();
     timerScheduler_.shutdown();
     taskExecutor_.shutdown();
     runtime_->lifecycle("stopped");

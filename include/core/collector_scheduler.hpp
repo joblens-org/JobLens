@@ -31,6 +31,7 @@
 #include "core/collector_type.h"
 #include "common/config.hpp"
 #include "common/streamer_watcher.hpp"
+#include "common/event_poller.hpp"
 #include "common/task_executor.hpp"
 #include "common/timer_scheduler.hpp"
 #include "core/writer_manager.hpp"
@@ -127,6 +128,7 @@ private:
     // TimerScheduler only owns deadlines and its wait thread.
     TaskExecutor taskExecutor_;
     TimerScheduler timerScheduler_;
+    EventPoller eventPoller_;
 
     std::mutex              m_;
     std::mutex shutdown_mutex_;

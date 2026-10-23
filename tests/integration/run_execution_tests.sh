@@ -55,6 +55,15 @@ run_executor() {
     timeout 120 "$work/task_executor_test"
 }
 
+run_poller() {
+    c++ -std=c++17 -O0 -g -Wall -Wextra -Werror -I"$root/include" -pthread \
+        "$root/tests/integration/event_poller_test.cpp" \
+        "$root/src/common/event_poller.cpp" \
+        "$root/src/common/task_executor.cpp" \
+        -lspdlog -lfmt -o "$work/event_poller_test"
+    timeout 120 "$work/event_poller_test"
+}
+
 run_matrix() {
     link=""
     while IFS= read -r command; do
@@ -77,9 +86,13 @@ case "$suite" in
     matrix)
         run_matrix
         ;;
+    poller)
+        run_poller
+        ;;
     all)
         run_executor
         run_matrix
+        run_poller
         ;;
     *)
         printf 'Unknown execution suite: %s\n' "$suite" >&2
