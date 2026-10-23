@@ -71,6 +71,14 @@ enum class CollectorScope{
     System
 };
 
+inline const char* to_string(CollectorScope scope) {
+    switch (scope) {
+        case CollectorScope::Job:    return "job";
+        case CollectorScope::System: return "system";
+        default:                     return "undefined";
+    }
+}
+
 struct CondorJobAttr{
     bool auto_update_child{};
     pid_t starter_pid{};
@@ -422,6 +430,79 @@ struct CollectOutcome {
     std::string error;
 };
 
+// ---------------------------------------------------------------------------
+// Execution contracts: scope, trigger and output policy are independent.
+// ---------------------------------------------------------------------------
+enum class CollectorTrigger {
+    Periodic,
+    Event,
+};
+
+enum class OutputPolicy {
+    Stream,
+    Final,
+    Both,
+};
+
+inline const char* to_string(CollectorTrigger trigger)
+{
+    switch (trigger) {
+        case CollectorTrigger::Periodic: return "periodic";
+        case CollectorTrigger::Event:    return "event";
+    }
+    return "unknown";
+}
+
+inline const char* to_string(OutputPolicy policy)
+{
+    switch (policy) {
+        case OutputPolicy::Stream: return "stream";
+        case OutputPolicy::Final:  return "final";
+        case OutputPolicy::Both:   return "both";
+    }
+    return "unknown";
+}
+
+struct SourceHandle {
+    uint64_t id = 0;
+    uint64_t generation = 0;
+};
+
+inline bool operator==(const SourceHandle& lhs, const SourceHandle& rhs)
+{
+    return lhs.id == rhs.id && lhs.generation == rhs.generation;
+}
+
+enum class Interest { Readable };
+
+struct ReadySource {
+    SourceHandle source;
+    uint32_t readiness = 0;
+};
+
+using ReadySources = std::vector<ReadySource>;
+
+struct WorkBudget {
+    size_t max_events = 0;
+    size_t max_bytes = 0;
+    size_t max_jobs = 0;
+    std::chrono::steady_clock::time_point deadline{};
+};
+
+struct DrainOutcome {
+    CollectOutcome outcome;
+    size_t consumed = 0;
+    bool more = false;
+};
+
+struct JobKey {
+    uint64_t job_id = 0;
+    uint64_t monitoring_generation = 1;
+};
+
+class JobEventContext;
+class SystemEventContext;
+
 // 输出通道与 payload 类型标签。定义在此以便 CollectorHandle 声明通道，
 // 具体 payload 容器（Document/Text/MetricSnapshot）位于 core/output_record.h。
 enum class OutputKind { Document, Text, Metrics };
@@ -443,26 +524,58 @@ struct OutputChannel {
 
 class OutputContext;
 class OutputRouter;
+class CollectorInitContext;
 
 using NativeCollectFunc = std::function<CollectOutcome(const Job&, OutputContext&)>;
+using SystemCollectFunc = std::function<CollectOutcome(OutputContext&)>;
+using EventJobFunc = std::function<DrainOutcome(const ReadySources&, const WorkBudget&,
+                                               JobEventContext&)>;
+using EventSystemFunc = std::function<DrainOutcome(const ReadySources&, const WorkBudget&,
+                                                  SystemEventContext&)>;
 
 /// Job 生命周期钩子签名 — 由 CollectorScheduler 同步调用，传入调用瞬间的 Job 快照
 using JobLifecycleFunc = std::function<void(const Job&)>;
 
-using CollectInitFunc = std::function<bool(const nlohmann::json& config)>;
+using CollectInitFunc = std::function<bool(const nlohmann::json& config,
+                                           CollectorInitContext& context)>;
 using CollectDeinitFunc = std::function<void()>;
 
+struct PeriodicJobBinding {
+    NativeCollectFunc collect;
+};
+
+struct PeriodicSystemBinding {
+    SystemCollectFunc collect;
+};
+
+struct EventJobBinding {
+    EventJobFunc on_ready;
+};
+
+struct EventSystemBinding {
+    EventSystemFunc on_ready;
+};
+
+using CollectorBinding = std::variant<PeriodicJobBinding, PeriodicSystemBinding,
+                                      EventJobBinding, EventSystemBinding>;
+
 struct CollectorHandle {
-    CollectInitFunc        init;   
+    CollectInitFunc        init;
     CollectDeinitFunc      deinit;
     // Job 生命周期钩子（两种作用域都会绑定，作用域语义见 ICollector::on_job_added 注释）
     // 未提供时为空 std::function，调度器会跳过调用
     JobLifecycleFunc       on_job_added;
     JobLifecycleFunc       on_job_updated;
     JobLifecycleFunc       on_job_removed;
-    // 原生输出入口：System 作用域同样绑定 Job 重载（上下文内是合成 Job 0）
-    NativeCollectFunc      collect_native;
+    // Exactly one binding is populated according to scope + trigger.
+    CollectorBinding       binding = PeriodicJobBinding{};
+    CollectorScope         scope = CollectorScope::Undefined;
+    CollectorTrigger       trigger = CollectorTrigger::Periodic;
+    bool                   supports_final = false;
     std::vector<OutputChannel> channels;
+    std::string            error;
+
+    bool valid() const { return error.empty() && init; }
 };
 
 using ConfigParam = std::pair<std::string, std::string>; // <param_name, description>

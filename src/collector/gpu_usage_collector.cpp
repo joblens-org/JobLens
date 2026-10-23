@@ -155,7 +155,7 @@ bool GPUUsageCollector::enum_gpus() {
     return true;
 }
 
-bool GPUUsageCollector::init(const nlohmann::json& cfg) {
+bool GPUUsageCollector::init(const nlohmann::json& cfg, CollectorInitContext& /*context*/) {
     if (inited) {
         spdlog::warn("GPUUsageCollector init twice with config: {}", cfg.dump());
         return false;

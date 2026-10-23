@@ -153,7 +153,7 @@ AUTO_REGISTER_JOB_COLLECTOR(
     }
 )
 
-bool CPUMemCollector::init(const nlohmann::json& cfg) {
+bool CPUMemCollector::init(const nlohmann::json& cfg, CollectorInitContext& /*context*/) {
     
     if (inited){
         spdlog::warn("CPUMemCollector init twice with config: {}", cfg.dump());

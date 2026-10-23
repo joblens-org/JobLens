@@ -25,7 +25,8 @@ public:
         std::optional<uint64_t> last_job_id;
     };
     struct Entry {
-        std::string name, scope = "undefined", config, phase = "idle", last_error;
+        std::string name, scope = "undefined", trigger = "periodic";
+        std::string output_policy = "stream", config, phase = "idle", last_error;
         double period_ms = 0;
         size_t job_count = 0;
         bool timer_active = false, failed = false;
@@ -47,7 +48,9 @@ public:
         bool failed_ = false;
     };
     void configure(const std::string& name, const std::string& config,
-                   const std::string& scope, double period_ms);
+                   const std::string& scope, double period_ms,
+                   const std::string& trigger = "periodic",
+                   const std::string& output_policy = "stream");
     void jobs(const std::string& name, size_t count);
     void timer(const std::string& name, bool active);
     void error(const std::string& name, const std::string& message);

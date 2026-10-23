@@ -57,6 +57,10 @@ public:
 
     static CollectorScheduler& instance();
 
+    // Shared validation used by registration and the policy regression test.
+    static bool parse_output_policy(const std::string& raw, bool supports_final,
+                                    OutputPolicy& policy, std::string& error);
+
 private:
     friend struct CollectorSchedulerTestAccess;
     CollectorScheduler();
@@ -72,16 +76,19 @@ private:
     {
         std::string name;
         std::string type;
-        CollectorScope scope;
+        CollectorScope scope = CollectorScope::Undefined;
+        CollectorTrigger trigger = CollectorTrigger::Periodic;
+        OutputPolicy output_policy = OutputPolicy::Stream;
+        bool supports_final = false;
         std::string config_name;
-        double freq;
+        double freq = 0;
         CollectInitFunc init_handle;
         CollectDeinitFunc deinit_handle;
         JobLifecycleFunc on_job_added;
         JobLifecycleFunc on_job_updated;
         JobLifecycleFunc on_job_removed;
-        // 原生输出路径
-        NativeCollectFunc collect_native;
+        // Exactly one binding selected by scope + trigger.
+        CollectorBinding binding = PeriodicJobBinding{};
         std::vector<OutputChannel> channels;
         std::shared_ptr<const OutputRouter> router;
         std::string route_error;   // 非空表示路由绑定失败，采集器不得启动
@@ -90,6 +97,12 @@ private:
 
     void addJobCollectFunc(std::string name, std::string type, std::string config, CollectorHandle handle);
     void addSystemCollectFunc(std::string name, std::string type, std::string config, CollectorHandle handle);
+    void addJobEventCollectFunc(std::string name, std::string type, std::string config, CollectorHandle handle);
+    void addSystemEventCollectFunc(std::string name, std::string type, std::string config, CollectorHandle handle);
+    void commonCollectorSetup(const std::string& name, const std::string& type,
+                              const std::string& config, CollectorHandle& handle,
+                              collector_info& info);
+    void applyOutputPolicy(collector_info& info);
     /// 为原生采集器编译路由；失败时写入 route_error。
     void buildOutputRoute(collector_info& info);
     void registerCollectFuncs();

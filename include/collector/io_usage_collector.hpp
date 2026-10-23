@@ -89,9 +89,9 @@ namespace std {
     };
 }
 
-class IOUsageCollector : public ICollector{
+class IOUsageCollector : public IPeriodicJobCollector{
 public:
-    bool init(const nlohmann::json& cfg) override;
+    bool init(const nlohmann::json& cfg, CollectorInitContext& context) override;
     CollectOutcome collect(const Job& job, OutputContext& output) override;
     void deinit() noexcept override;
     std::vector<OutputChannel> output_channels() const override;

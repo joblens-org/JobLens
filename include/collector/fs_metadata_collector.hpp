@@ -90,9 +90,9 @@ struct JobFSMetaStat {
  *   - 用户态: batch dump 明细 map（周期缓存）按 Job 切片聚合进程；Job 级 map + 直方图
  *             按 job_id 直接切片；速率由用户态差分。
  */
-class FSMetadataCollector : public ICollector {
+class FSMetadataCollector : public IPeriodicJobCollector {
 public:
-    bool init(const nlohmann::json& cfg) override;
+    bool init(const nlohmann::json& cfg, CollectorInitContext& context) override;
     CollectOutcome collect(const Job& job, OutputContext& output) override;
     void deinit() noexcept override;
     std::vector<OutputChannel> output_channels() const override;

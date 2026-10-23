@@ -109,10 +109,10 @@ struct CalibrationRef {
     std::string source_path;        // 校准数据来源 (summary.json路径)
 };
 
-class PowerCollector : public ICollector {
+class PowerCollector : public IPeriodicJobCollector {
 public:
     /* ── ICollector 生命周期 ──────────────────────────────────────── */
-    bool init(const nlohmann::json& cfg) override;   // 加载eBPF、检测RAPL、配置参数
+    bool init(const nlohmann::json& cfg, CollectorInitContext& context) override;   // 加载eBPF、检测RAPL、配置参数
     void deinit() noexcept override;                  // 卸载eBPF、清理资源
 
     /* Job-scoped: 全局缓存后按Job逐个归因 (对标IO/Net Collector) */   // 读缓存→归因单个Job

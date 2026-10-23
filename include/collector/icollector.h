@@ -19,31 +19,29 @@
 #include "core/collector_type.h"
 #include <nlohmann/json.hpp>
 
+class CollectorInitContext;
+
+// Lifecycle, output-channel declaration and Job observation are common to all
+// collectors. Work is expressed through exactly one of the four interfaces
+// below; the registry validates the compiled interface against the declared
+// scope/trigger pair.
 class ICollector {
 public:
     virtual ~ICollector() = default;
-    const CollectorScope scope() const { return scope_; }
-    // 生命周期
-    virtual bool init(const nlohmann::json& config)      = 0;   // 返回 false 表示失败
-    virtual void deinit() noexcept                       = 0;
 
-    // ------------------------------------------------------------------
-    // 原生输出接口（Collector-Controlled Output）
-    //
-    // Job 作用域绑定 collect(job, output)；System 作用域绑定 collect(output)，
-    // 上下文内携带合成 Job 0。默认实现返回 Skipped（没有可用样本）。
-    // ------------------------------------------------------------------
-    virtual CollectOutcome collect(const Job& job, OutputContext& output) {
-        (void)job; (void)output;
-        return {CollectState::Skipped, {}};
-    }
-    virtual CollectOutcome collect(OutputContext& output) {
-        (void)output;
-        return {CollectState::Skipped, {}};
-    }
+    CollectorScope scope() const { return scope_; }
+    CollectorTrigger trigger() const { return trigger_; }
+
+    // 生命周期
+    virtual bool init(const nlohmann::json& config, CollectorInitContext& context) = 0;
+    virtual void deinit() noexcept = 0;
 
     /// 采集器声明的输出通道。只有声明且被配置的通道会收到记录。
     virtual std::vector<OutputChannel> output_channels() const = 0;
+
+    /// Final/Both are rejected unless the collector explicitly implements the
+    /// scoped finish contract in a later task.
+    virtual bool supports_final() const { return false; }
 
     // ------------------------------------------------------------------
     // Job 生命周期钩子（同步调用，默认空实现，由采集器实例自行按需覆写）
@@ -70,21 +68,41 @@ public:
     virtual void on_job_updated(const Job& /*job*/) {}
     virtual void on_job_removed(const Job& /*job*/) {}
 
-    void set_type(std::string type){
-        type_ = std::move(type);
-    }
-    void set_name(std::string name){
-        name_ = std::move(name);
-    }
-    std::string get_name() const {
-        return name_;
-    }
-    std::string get_type() const {
-        return type_;
-    }
+    void set_type(std::string type) { type_ = std::move(type); }
+    void set_name(std::string name) { name_ = std::move(name); }
+    void set_scope(CollectorScope scope) { scope_ = scope; }
+    void set_trigger(CollectorTrigger trigger) { trigger_ = trigger; }
+
+    std::string get_name() const { return name_; }
+    std::string get_type() const { return type_; }
+
 protected:
-    CollectorScope scope_;
+    CollectorScope scope_ = CollectorScope::Undefined;
+    CollectorTrigger trigger_ = CollectorTrigger::Periodic;
+
 private:
     std::string name_;
     std::string type_;
+};
+
+class IPeriodicJobCollector : public virtual ICollector {
+public:
+    virtual CollectOutcome collect(const Job& job, OutputContext& output) = 0;
+};
+
+class IPeriodicSystemCollector : public virtual ICollector {
+public:
+    virtual CollectOutcome collect(OutputContext& output) = 0;
+};
+
+class IEventJobCollector : public virtual ICollector {
+public:
+    virtual DrainOutcome on_ready(const ReadySources& sources, const WorkBudget& budget,
+                                  JobEventContext& context) = 0;
+};
+
+class IEventSystemCollector : public virtual ICollector {
+public:
+    virtual DrainOutcome on_ready(const ReadySources& sources, const WorkBudget& budget,
+                                  SystemEventContext& context) = 0;
 };

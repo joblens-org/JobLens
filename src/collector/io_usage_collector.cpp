@@ -183,7 +183,7 @@ std::optional<IOUsageCollector::user_rw_stat> IOUsageCollector::get_fd_stat(pid_
     return usr;
 }
 
-bool IOUsageCollector::init(const nlohmann::json& cfg){
+bool IOUsageCollector::init(const nlohmann::json& cfg, CollectorInitContext& /*context*/){
     if(cfg.contains("summary") && cfg["summary"].get<std::string>() == "true"){
         summary = true;
     }else{

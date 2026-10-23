@@ -39,7 +39,8 @@ nlohmann::json serialize(const CollectorRuntime::Entry& entry,
     std::string state = entry.failed ? "error" : (entry.timer_active ? "scheduled" : "idle");
     if (entry.phase != "idle") state = entry.phase;
     else if (!entry.metrics.at("callback").active.empty()) state = "running";
-    return {{"name", entry.name}, {"scope", entry.scope}, {"config", entry.config},
+    return {{"name", entry.name}, {"scope", entry.scope}, {"trigger", entry.trigger},
+        {"output_policy", entry.output_policy}, {"config", entry.config},
         {"state", state}, {"has_error", entry.failed}, {"period_ms", entry.period_ms},
         {"job_count", entry.job_count}, {"timer_active", entry.timer_active},
         {"active_callback_count", entry.metrics.at("callback").active.size()},
@@ -48,12 +49,16 @@ nlohmann::json serialize(const CollectorRuntime::Entry& entry,
 }
 }
 void CollectorRuntime::configure(const std::string& name, const std::string& config,
-                                 const std::string& scope, double period_ms) {
+                                 const std::string& scope, double period_ms,
+                                 const std::string& trigger,
+                                 const std::string& output_policy) {
     std::lock_guard lock(mutex_);
     auto& entry = entries_[name];
     entry.name = name;
     entry.config = config;
     entry.scope = scope;
+    entry.trigger = trigger;
+    entry.output_policy = output_policy;
     entry.period_ms = period_ms;
     for (const auto* kind : {"init", "deinit", "callback", "lookup_job", "wait_collector_lock", "collect", "write"})
         entry.metrics.try_emplace(kind);

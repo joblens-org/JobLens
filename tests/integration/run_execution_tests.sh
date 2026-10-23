@@ -55,12 +55,31 @@ run_executor() {
     timeout 120 "$work/task_executor_test"
 }
 
+run_matrix() {
+    link=""
+    while IFS= read -r command; do
+        if [[ "$command" == *" -o JobLens "* ]]; then link=$command; fi
+    done < <(ninja -C "$build" -t commands JobLens)
+    [[ -n "$link" ]] || { printf '%s\n' 'Could not find the Ninja JobLens link command' >&2; exit 1; }
+    c++ -std=c++17 -O0 -g -DSPDLOG_COMPILED_LIB -DYAML_CPP_STATIC_DEFINE -DHAS_STRING_VIEW=1 \
+        -I"$build/include" -I"$root/include" -I/usr/include/libnl3 \
+        -c "$root/tests/integration/collector_execution_matrix_test.cpp" -o "$work/matrix_test.o"
+    command=${link/CMakeFiles\/JobLens.dir\/src\/main.cpp.o/\"$work\/matrix_test.o\"}
+    command=${command/ -o JobLens / -o \"$work\/matrix_test\" }
+    (cd "$build"; bash -c "$command")
+    timeout 60 "$work/matrix_test" "$work/matrix"
+}
+
 case "$suite" in
     executor)
         run_executor
         ;;
+    matrix)
+        run_matrix
+        ;;
     all)
         run_executor
+        run_matrix
         ;;
     *)
         printf 'Unknown execution suite: %s\n' "$suite" >&2

@@ -114,7 +114,7 @@ json io_counters_to_json(const IoCounters& io)
 
 }
 
-bool NewIOUsageCollector::init(const json& cfg){
+bool NewIOUsageCollector::init(const json& cfg, CollectorInitContext& /*context*/){
     include_process_details = !cfg.contains("include_process_details") ||
         cfg["include_process_details"].get<std::string>() == "true";
     spdlog::info("NewIOUsageCollector: configuration applied include_process_details={} details_configured={}",

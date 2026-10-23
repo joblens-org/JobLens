@@ -12,17 +12,39 @@
 
 using namespace std::chrono_literals;
 struct CollectorSchedulerTestAccess {
-    static CollectorHandle makeHandle(std::function<void(const Job&)> collect, CollectInitFunc init,
+    static CollectorHandle makeHandle(std::function<void(const Job&)> collect,
+                                      std::function<bool(const nlohmann::json&)> init,
                                       JobLifecycleFunc on_added = {},
                                       JobLifecycleFunc on_updated = {},
-                                      JobLifecycleFunc on_removed = {}) {
+                                      JobLifecycleFunc on_removed = {},
+                                      bool system = false) {
         CollectorHandle handle;
-        handle.init = std::move(init);
-        handle.collect_native = [collect](const Job& job, OutputContext& output) {
-            collect(job);
-            output.emit("text", Text{"probe"});
-            return CollectOutcome{};
+        handle.init = [init](const nlohmann::json& cfg, CollectorInitContext&) {
+            return init(cfg);
         };
+        if (system) {
+            handle.scope = CollectorScope::System;
+            handle.trigger = CollectorTrigger::Periodic;
+            handle.binding = PeriodicSystemBinding{
+                [collect](OutputContext& output) {
+                    Job system_job;
+                    system_job.JobID = 0;
+                    system_job.jobtype = JobType::Sys;
+                    system_job.subtype = JobSubType::Common;
+                    collect(system_job);
+                    (void)output.emit("text", Text{"probe"});
+                    return CollectOutcome{};
+                }};
+        } else {
+            handle.scope = CollectorScope::Job;
+            handle.trigger = CollectorTrigger::Periodic;
+            handle.binding = PeriodicJobBinding{
+                [collect](const Job& job, OutputContext& output) {
+                    collect(job);
+                    (void)output.emit("text", Text{"probe"});
+                    return CollectOutcome{};
+                }};
+        }
         handle.channels = {{"text", OutputKind::Text}};
         handle.deinit = [] {};
         handle.on_job_added = std::move(on_added);
@@ -31,20 +53,22 @@ struct CollectorSchedulerTestAccess {
         return handle;
     }
     static void add(CollectorScheduler& scheduler, const std::string& name,
-                    std::function<void(const Job&)> collect, CollectInitFunc init,
+                    std::function<void(const Job&)> collect,
+                    std::function<bool(const nlohmann::json&)> init,
                     JobLifecycleFunc on_added = {}, JobLifecycleFunc on_updated = {},
                     JobLifecycleFunc on_removed = {}) {
         scheduler.addJobCollectFunc(name, "TestCollector", "test",
             makeHandle(std::move(collect), std::move(init),
-                       std::move(on_added), std::move(on_updated), std::move(on_removed)));
+                       std::move(on_added), std::move(on_updated), std::move(on_removed), false));
     }
     static void addSystem(CollectorScheduler& scheduler, const std::string& name, const std::string& config,
-                          std::function<void(const Job&)> collect, CollectInitFunc init,
+                          std::function<void(const Job&)> collect,
+                          std::function<bool(const nlohmann::json&)> init,
                           JobLifecycleFunc on_added = {}, JobLifecycleFunc on_updated = {},
                           JobLifecycleFunc on_removed = {}) {
         scheduler.addSystemCollectFunc(name, "SystemTestCollector", config,
             makeHandle(std::move(collect), std::move(init),
-                       std::move(on_added), std::move(on_updated), std::move(on_removed)));
+                       std::move(on_added), std::move(on_updated), std::move(on_removed), true));
     }
     static Job makeJob(size_t jobid, std::vector<std::string> names) {
         Job job;

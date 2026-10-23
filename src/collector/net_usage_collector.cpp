@@ -538,7 +538,7 @@ void NetUsageCollector::init_netlink(){
 }
 
 
-bool NetUsageCollector::init(const nlohmann::json& cfg) {
+bool NetUsageCollector::init(const nlohmann::json& cfg, CollectorInitContext& /*context*/) {
     spdlog::debug("NetUsageCollector: init with config: {}", cfg.dump());
     if(cfg.contains("summary") && cfg["summary"].get<std::string>() == "true"){
         summary = true;

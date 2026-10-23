@@ -39,7 +39,7 @@ AUTO_REGISTER_JOB_COLLECTOR(
 )
 
 
-bool BasicInfoCollector::init(const nlohmann::json& cfg) {
+bool BasicInfoCollector::init(const nlohmann::json& cfg, CollectorInitContext& /*context*/) {
     if (inited) {
         spdlog::warn("BasicInfoCollector init twice with config: {}", cfg.dump());
         return false;

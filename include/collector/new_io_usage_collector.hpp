@@ -75,9 +75,9 @@ struct JobIOStat {
     std::unordered_map<pid_t, ProcIOStat> processes;
 };
 
-class NewIOUsageCollector : public ICollector {
+class NewIOUsageCollector : public IPeriodicJobCollector {
 public:
-    bool init(const nlohmann::json& cfg) override;
+    bool init(const nlohmann::json& cfg, CollectorInitContext& context) override;
     CollectOutcome collect(const Job& job, OutputContext& output) override;
     void deinit() noexcept override;
     std::vector<OutputChannel> output_channels() const override;

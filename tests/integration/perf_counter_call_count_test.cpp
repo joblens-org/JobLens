@@ -7,8 +7,8 @@
 #include <unistd.h>
 #include <iostream>
 
-struct CountingCollector : ICollector {
-    bool init(const nlohmann::json&) override { return true; }
+struct CountingCollector : IPeriodicJobCollector {
+    bool init(const nlohmann::json&, CollectorInitContext&) override { return true; }
     void deinit() noexcept override {}
     CollectOutcome collect(const Job& job, OutputContext&) override {
         if (job.JobID == 0) throw std::runtime_error("模拟采集失败");
@@ -30,12 +30,13 @@ int main(int argc, char** argv) {
     auto router = std::make_shared<OutputRouter>();
     auto sample = std::make_shared<SampleMetadata>();
     OutputContext context(router, sample);
+    const auto& collect = std::get<PeriodicJobBinding>(handle.binding).collect;
     Job job{};
     job.JobID = 1;
-    handle.collect_native(job, context);
-    handle.collect_native(job, context);
+    collect(job, context);
+    collect(job, context);
     job.JobID = 0;
-    try { handle.collect_native(job, context); } catch (const std::runtime_error&) {}
+    try { collect(job, context); } catch (const std::runtime_error&) {}
     rpc.start();
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     sockaddr_un address{};

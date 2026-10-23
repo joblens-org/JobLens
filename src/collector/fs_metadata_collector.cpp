@@ -62,7 +62,7 @@ static std::string op_name_from_id(uint32_t op_id) {
     }
 }
 
-bool FSMetadataCollector::init(const nlohmann::json& cfg) {
+bool FSMetadataCollector::init(const nlohmann::json& cfg, CollectorInitContext& /*context*/) {
     include_process_details = !cfg.contains("include_process_details") ||
         cfg["include_process_details"].get<std::string>() == "true";
 

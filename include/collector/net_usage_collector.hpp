@@ -68,9 +68,9 @@ struct NetInfo{
     std::vector<Connection>     connections;
 };
 
-class NetUsageCollector : public ICollector{
+class NetUsageCollector : public IPeriodicJobCollector{
 public:
-    bool init(const nlohmann::json& cfg) override;
+    bool init(const nlohmann::json& cfg, CollectorInitContext& context) override;
     CollectOutcome collect(const Job& job, OutputContext& output) override;
     void deinit() noexcept override;
     std::vector<OutputChannel> output_channels() const override;

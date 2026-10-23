@@ -719,7 +719,7 @@ double PowerCollector::read_ipmi_watts()
 
 /* ── ICollector lifecycle ───────────────────────────────────────────────── */
 
-bool PowerCollector::init(const nlohmann::json& cfg)
+bool PowerCollector::init(const nlohmann::json& cfg, CollectorInitContext& /*context*/)
 {
     if (inited_) {
         spdlog::warn("PowerCollector: already initialized");

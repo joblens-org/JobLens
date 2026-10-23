@@ -16,6 +16,7 @@
 #include "core/job_registry.hpp"
 #include "core/output_context.hpp"
 #include "core/output_router.hpp"
+#include "core/collector_execution_context.hpp"
 #include <sstream>
 #include "common/config.hpp"
 #include "common/utils.hpp"
@@ -79,7 +80,7 @@ CollectorScheduler::~CollectorScheduler() { shutdown(); }
 
 
 void CollectorScheduler::startCollector(std::string collector_name){
-    collector_info info; 
+    collector_info info;
     try {
         info = collector_info_dict.at(collector_name);
     }
@@ -92,12 +93,18 @@ void CollectorScheduler::startCollector(std::string collector_name){
         spdlog::error("CollectorScheduler: collector {} has an invalid output route, refusing to start", collector_name);
         return;
     }
+    if (info.trigger == CollectorTrigger::Event) {
+        spdlog::info("CollectorScheduler: collector {} is event-triggered; dispatch is wired in a later task", collector_name);
+        return;
+    }
     try
     {
         CollectorRuntime::Operation initializing(runtime_, collector_name, "init");
         auto config_node = Config::instance().getRawNode(info.config_name);
         auto j_config = Utils::yamlToJson(config_node);
-        if (!info.init_handle(j_config)) {
+        NullSourceRegistrar registrar;
+        CollectorInitContext init_context(info.scope, registrar);
+        if (!info.init_handle(j_config, init_context)) {
             initializing.fail("Collector initialization returned false");
             spdlog::error("CollectorScheduler: collector {} init failed", collector_name);
             return;
@@ -110,14 +117,93 @@ void CollectorScheduler::startCollector(std::string collector_name){
             std::chrono::milliseconds(static_cast<long long>(1000.0 / freq)),
             [this, collector_name](){
                 CollectorRuntime::Operation callback(runtime_, collector_name, "callback");
-                // 使用find代替operator[]，避免与持有m_的路径形成数据竞争
                 auto it_info = collector_info_dict.find(collector_name);
                 if (it_info == collector_info_dict.end()) return;
                 auto& info = it_info->second;
 
                 auto it_state = collector_state_dict.find(collector_name);
                 if (it_state == collector_state_dict.end()) return;
-                auto& collector_job = it_state->second;                
+                auto& collector_job = it_state->second;
+
+                const auto make_sample = [&](const Job& job) {
+                    auto& manager = WriterManager::instance();
+                    auto sample = std::make_shared<SampleMetadata>();
+                    sample->sample_id = fmt::format("{}:{}", manager.process_run_id(),
+                                                    manager.next_sample_counter());
+                    sample->collector_name = collector_name;
+                    sample->collector_type = info.type;
+                    sample->job = job;
+                    sample->sampled_at = std::chrono::system_clock::now();
+                    return sample;
+                };
+
+                if (info.scope == CollectorScope::System) {
+                    std::unique_lock<std::mutex> lg(collector_job.m_, std::defer_lock);
+                    {
+                        CollectorRuntime::Operation waiting(runtime_, collector_name, "wait_collector_lock");
+                        lg.lock();
+                    }
+                    if (!collector_job.running) return;
+
+                    Job system_job;
+                    system_job.JobID = 0;
+                    system_job.jobtype = JobType::Sys;
+                    system_job.subtype = JobSubType::Common;
+                    CommonJobAttr attr;
+                    attr.auto_update_child = false;
+                    system_job.sub_attr = attr;
+
+                    OutputContext output(info.router, make_sample(system_job));
+                    std::unique_ptr<CollectorRuntime::Operation> write_op;
+                    output.set_write_observer(
+                        [&](std::string_view /*channel*/) {
+                            write_op = std::make_unique<CollectorRuntime::Operation>(
+                                runtime_, collector_name, "write", 0);
+                        },
+                        [&](std::string_view channel, bool failed) {
+                            if (failed && write_op) {
+                                write_op->fail("output rejected on channel " + std::string(channel));
+                            }
+                            write_op.reset();
+                        });
+
+                    CollectOutcome outcome;
+                    std::string error;
+                    bool ok = true;
+                    try {
+                        CollectorRuntime::Operation collecting(runtime_, collector_name, "collect", 0);
+                        outcome = std::get<PeriodicSystemBinding>(info.binding).collect(output);
+                    } catch (const std::exception& e) {
+                        ok = false;
+                        error = e.what();
+                    } catch (...) {
+                        ok = false;
+                        error = "collector threw an unknown exception";
+                    }
+                    if (ok) {
+                        if (outcome.state == CollectState::Failed) {
+                            ok = false;
+                            error = outcome.error.empty() ? "collector reported failure" : outcome.error;
+                        } else if (outcome.state == CollectState::Skipped && output.submitted() > 0) {
+                            ok = false;
+                            error = "collector returned Skipped after emitting output";
+                        }
+                        if (output.had_error()) {
+                            ok = false;
+                            error = output.error_summary();
+                        }
+                    }
+                    if (!ok) {
+                        callback.fail(error);
+                        runtime_->error(collector_name, error);
+                        spdlog::error("CollectorScheduler: collector {} system collect failed: {}",
+                                      collector_name, error);
+                    } else if (outcome.state == CollectState::Success) {
+                        runtime_->clear_error(collector_name);
+                    }
+                    return;
+                }
+
                 std::vector<size_t> jobids_snapshot;
                 {
                     std::unique_lock<std::mutex> lg(collector_job.m_, std::defer_lock);
@@ -152,16 +238,7 @@ void CollectorScheduler::startCollector(std::string collector_name){
                     if(!collector_job.running) return; //采集器已经deinit
                     if(!job.has_value())continue;
 
-                    auto& manager = WriterManager::instance();
-                    auto sample = std::make_shared<SampleMetadata>();
-                    sample->sample_id = fmt::format("{}:{}", manager.process_run_id(),
-                                                    manager.next_sample_counter());
-                    sample->collector_name = collector_name;
-                    sample->collector_type = info.type;
-                    sample->job = job.value();
-                    sample->sampled_at = std::chrono::system_clock::now();
-                    OutputContext output(info.router, sample);
-
+                    OutputContext output(info.router, make_sample(job.value()));
                     std::unique_ptr<CollectorRuntime::Operation> write_op;
                     output.set_write_observer(
                         [&](std::string_view /*channel*/) {
@@ -181,7 +258,7 @@ void CollectorScheduler::startCollector(std::string collector_name){
                     {
                         try {
                             CollectorRuntime::Operation collecting(runtime_, collector_name, "collect", jobid);
-                            outcome = info.collect_native(job.value(), output);
+                            outcome = std::get<PeriodicJobBinding>(info.binding).collect(job.value(), output);
                         } catch (const std::exception& e) {
                             ok = false;
                             error = e.what();
@@ -212,10 +289,7 @@ void CollectorScheduler::startCollector(std::string collector_name){
                         // Skipped 表示没有可用样本，不能掩盖此前的错误。
                         runtime_->clear_error(collector_name);
                     }
-                    continue;
                 }
-                return;
-                
             }, collector_name
         );
         collector_job.running = true;
@@ -226,9 +300,7 @@ void CollectorScheduler::startCollector(std::string collector_name){
         spdlog::error("CollectorScheduler: start collector {} error: {}", collector_name, e.what());
     }
 
-
     spdlog::info("CollectorScheduler: start collector {}", collector_name);
-
 }
 
 bool CollectorScheduler::addJob2Collector(const Job& job, const std::string& collector){
@@ -391,73 +463,103 @@ void CollectorScheduler::buildOutputRoute(collector_info& info) {
                  info.name, info.channels.size());
 }
 
-void CollectorScheduler::addJobCollectFunc(std::string name, std::string type, std::string config, CollectorHandle handle) {
-    std::lock_guard lg(m_);
-    auto& info = collector_info_dict[name];
+bool CollectorScheduler::parse_output_policy(const std::string& raw, bool supports_final,
+                                             OutputPolicy& policy, std::string& error) {
+    if (raw == "stream") {
+        policy = OutputPolicy::Stream;
+        return true;
+    }
+    if (raw != "final" && raw != "both") {
+        error = "invalid output_policy '" + raw + "'";
+        return false;
+    }
+    policy = raw == "final" ? OutputPolicy::Final : OutputPolicy::Both;
+    if (!supports_final) {
+        error = "output_policy '" + raw + "' is not supported by this collector";
+        return false;
+    }
+    // Scoped finalization is added by a later task. Reject it explicitly instead
+    // of silently dropping the requested report.
+    error = "output_policy '" + raw + "' is not implemented in this build";
+    return false;
+}
+
+void CollectorScheduler::applyOutputPolicy(collector_info& info) {
+    const auto raw = Config::instance().getString(info.config_name, "output_policy", "stream");
+    std::string error;
+    if (!parse_output_policy(raw, info.supports_final, info.output_policy, error)) {
+        info.route_error = "collector " + info.name + ": " + error;
+    }
+}
+
+void CollectorScheduler::commonCollectorSetup(const std::string& name, const std::string& type,
+                                              const std::string& config, CollectorHandle& handle,
+                                              collector_info& info) {
     info.name = name;
-    info.type = std::move(type);
+    info.type = type;
     info.config_name = config;
-    info.collect_native = std::move(handle.collect_native);
+    info.scope = handle.scope;
+    info.trigger = handle.trigger;
+    info.supports_final = handle.supports_final;
+    info.binding = std::move(handle.binding);
     info.channels = std::move(handle.channels);
     info.init_handle = std::move(handle.init);
     info.deinit_handle = std::move(handle.deinit);
     info.on_job_added = std::move(handle.on_job_added);
     info.on_job_updated = std::move(handle.on_job_updated);
     info.on_job_removed = std::move(handle.on_job_removed);
-    info.scope = CollectorScope::Job;
+    if (!handle.error.empty()) info.route_error = handle.error;
 
-    if (Config::instance().has(config, "freq")) {
-        auto freq = Config::instance().getDouble(config, "freq");
-        info.freq = freq;
-    } else if (Config::instance().has(config, "period")) {
-        auto period = Config::instance().getDouble(config, "period");
-        auto freq = 1.0 / period;
-        info.freq = freq;
-    } else {
-        spdlog::info("CollectorScheduler: can not get collect {} freq, use default freq", name);
-        info.freq = default_freq;
+    if (info.trigger == CollectorTrigger::Periodic) {
+        if (Config::instance().has(config, "freq")) {
+            info.freq = Config::instance().getDouble(config, "freq");
+        } else if (Config::instance().has(config, "period")) {
+            const auto period = Config::instance().getDouble(config, "period");
+            info.freq = period > 0 ? 1.0 / period : 0;
+        } else {
+            info.freq = default_freq;
+        }
+        if (info.freq <= 0)
+            info.route_error = "collector " + name + " has an invalid frequency/period";
     }
 
+    applyOutputPolicy(info);
+}
+
+void CollectorScheduler::addJobCollectFunc(std::string name, std::string type, std::string config, CollectorHandle handle) {
+    std::lock_guard lg(m_);
+    auto& info = collector_info_dict[name];
+    commonCollectorSetup(name, std::move(type), config, handle, info);
+    if (!std::holds_alternative<PeriodicJobBinding>(info.binding) && info.route_error.empty())
+        info.route_error = "collector " + name + " is missing its periodic Job binding";
 
     collector_state_dict.try_emplace(name);
-    runtime_->configure(name, config, "job", 1000.0 / info.freq);
-
-    buildOutputRoute(info);
-}   
+    runtime_->configure(name, config, to_string(info.scope),
+                        info.freq > 0 ? 1000.0 / info.freq : 0,
+                        to_string(info.trigger), to_string(info.output_policy));
+    if (!info.route_error.empty()) runtime_->error(name, info.route_error);
+    else buildOutputRoute(info);
+}
 
 void CollectorScheduler::addSystemCollectFunc(std::string name, std::string type, std::string config, CollectorHandle handle){
     std::lock_guard lg(m_);
     auto& info = collector_info_dict[name];
-    info.name = name;
-    info.type = std::move(type);
-    info.config_name = config;
-    info.collect_native = std::move(handle.collect_native);
-    info.channels = std::move(handle.channels);
-    info.init_handle = std::move(handle.init);
-    info.deinit_handle = std::move(handle.deinit);
-    info.on_job_added = std::move(handle.on_job_added);
-    info.on_job_updated = std::move(handle.on_job_updated);
-    info.on_job_removed = std::move(handle.on_job_removed);
-    info.scope = CollectorScope::System;
-
-    try{
-        auto freq = Config::instance().getDouble(config, "freq");
-        info.freq = freq;
-    }
-    catch(const std::exception& e){
-        spdlog::info("CollectorScheduler: can not get collect {} freq, use default freq", name);
-        info.freq = default_freq;
-    }
+    commonCollectorSetup(name, std::move(type), config, handle, info);
+    if (!std::holds_alternative<PeriodicSystemBinding>(info.binding) && info.route_error.empty())
+        info.route_error = "collector " + name + " is missing its periodic System binding";
 
     collector_state_dict.try_emplace(name);
-    runtime_->configure(name, config, "system", 1000.0 / info.freq);
-
+    runtime_->configure(name, config, to_string(info.scope),
+                        info.freq > 0 ? 1000.0 / info.freq : 0,
+                        to_string(info.trigger), to_string(info.output_policy));
+    if (!info.route_error.empty()) {
+        runtime_->error(name, info.route_error);
+        return;
+    }
     buildOutputRoute(info);
 
-    try{
-        auto auto_start = Config::instance().getBool(config, "auto_start");
-        if(auto_start){
-            // Writers 与路由必须在 System 采集器自动启动前就绪。
+    try {
+        if (Config::instance().getBool(config, "auto_start")) {
             if (!info.route_ok()) {
                 spdlog::error("CollectorScheduler: collector {} route is invalid, skip auto start", name);
             } else {
@@ -467,9 +569,39 @@ void CollectorScheduler::addSystemCollectFunc(std::string name, std::string type
             }
         }
     }
-    catch(const std::exception& e){
+    catch(const std::exception& e) {
         spdlog::info("CollectorScheduler: can not get collect {} auto_start, do not start it", name);
     }
+}
+
+void CollectorScheduler::addJobEventCollectFunc(std::string name, std::string type,
+                                                std::string config, CollectorHandle handle) {
+    std::lock_guard lg(m_);
+    auto& info = collector_info_dict[name];
+    commonCollectorSetup(name, std::move(type), config, handle, info);
+    if (!std::holds_alternative<EventJobBinding>(info.binding) && info.route_error.empty())
+        info.route_error = "collector " + name + " is missing its Job event binding";
+    collector_state_dict.try_emplace(name);
+    runtime_->configure(name, config, to_string(info.scope), 0,
+                        to_string(info.trigger), to_string(info.output_policy));
+    if (!info.route_error.empty()) runtime_->error(name, info.route_error);
+    else buildOutputRoute(info);
+    spdlog::info("CollectorScheduler: collector {} is Job/Event; production dispatch is pending", name);
+}
+
+void CollectorScheduler::addSystemEventCollectFunc(std::string name, std::string type,
+                                                   std::string config, CollectorHandle handle) {
+    std::lock_guard lg(m_);
+    auto& info = collector_info_dict[name];
+    commonCollectorSetup(name, std::move(type), config, handle, info);
+    if (!std::holds_alternative<EventSystemBinding>(info.binding) && info.route_error.empty())
+        info.route_error = "collector " + name + " is missing its System event binding";
+    collector_state_dict.try_emplace(name);
+    runtime_->configure(name, config, to_string(info.scope), 0,
+                        to_string(info.trigger), to_string(info.output_policy));
+    if (!info.route_error.empty()) runtime_->error(name, info.route_error);
+    else buildOutputRoute(info);
+    spdlog::info("CollectorScheduler: collector {} is System/Event; production dispatch is pending", name);
 }
 
 
@@ -526,9 +658,13 @@ void CollectorScheduler::registerCollectFuncs() {
     for (const auto& collector : collectors) {
         
         auto collector_handle = collector_reg.createCollector(collector.type, collector.name);
-        if (!collector_handle.init) {
-            runtime_->error(collector.name, "Collector has no initialization handler");
-            spdlog::error("CollectorScheduler: {} init error",collector.name);
+        if (!collector_handle.valid()) {
+            const std::string error = collector_handle.error.empty()
+                ? "Collector has no valid initialization handler"
+                : collector_handle.error;
+            runtime_->error(collector.name, error);
+            spdlog::error("CollectorScheduler: {}: {}", collector.name, error);
+            continue;
         }
         auto scope = collector_reg.getScope(collector.type);
         if(scope == CollectorScope::Undefined){
@@ -536,23 +672,24 @@ void CollectorScheduler::registerCollectFuncs() {
             spdlog::error("CollectorScheduler: {} scope is undefined, skip it",collector.name);
             continue;
         }
+        const auto trigger = collector_reg.getTrigger(collector.type);
         if(scope == CollectorScope::Job){
-            addJobCollectFunc(
-                collector.name,
-                collector.type,
-                collector.config,
-                std::move(collector_handle)
-            );
-        }// 虽然这种实现不好看，但是可以隔离Job和System的逻辑
-        else if(scope == CollectorScope::System){
-            addSystemCollectFunc(
-                collector.name,
-                collector.type,
-                collector.config,
-                std::move(collector_handle)
-            );
-        }
-        else{
+            if (trigger == CollectorTrigger::Periodic) {
+                addJobCollectFunc(collector.name, collector.type, collector.config,
+                                  std::move(collector_handle));
+            } else {
+                addJobEventCollectFunc(collector.name, collector.type, collector.config,
+                                       std::move(collector_handle));
+            }
+        } else if(scope == CollectorScope::System){
+            if (trigger == CollectorTrigger::Periodic) {
+                addSystemCollectFunc(collector.name, collector.type, collector.config,
+                                     std::move(collector_handle));
+            } else {
+                addSystemEventCollectFunc(collector.name, collector.type, collector.config,
+                                          std::move(collector_handle));
+            }
+        } else {
             spdlog::error("CollectorScheduler: {} scope is error, skip it",collector.name);
             continue;
         }

@@ -17,7 +17,7 @@ AUTO_REGISTER_JOB_COLLECTOR(
 )
 
 /*================ 生命周期 ================*/
-bool __YOUR_COLLECTOR_NAME__Collector::init(const nlohmann::json& cfg) {
+bool __YOUR_COLLECTOR_NAME__Collector::init(const nlohmann::json& cfg, CollectorInitContext& /*context*/) {
     if (cfg.contains("freq")) freq_ = cfg["freq"].get<double>();
     if (cfg.contains("summary") && cfg["summary"].get<std::string>() == "true")
         summary_ = true;

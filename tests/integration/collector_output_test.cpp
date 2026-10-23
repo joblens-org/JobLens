@@ -64,8 +64,8 @@ enum class Behavior { Emit, NoEmit, Skipped, Failed, Throw, EmitThenSkipped, Emi
 std::atomic<Behavior> behavior{Behavior::Emit};
 std::atomic<int> native_calls{0};
 
-struct NativeJobCollector : ICollector {
-    bool init(const nlohmann::json&) override { return true; }
+struct NativeJobCollector : IPeriodicJobCollector {
+    bool init(const nlohmann::json&, CollectorInitContext&) override { return true; }
     void deinit() noexcept override {}
     CollectOutcome collect(const Job& job, OutputContext& output) override {
         ++native_calls;
@@ -98,8 +98,8 @@ struct NativeJobCollector : ICollector {
 
 std::atomic<int> system_calls{0};
 
-struct NativeSystemCollector : ICollector {
-    bool init(const nlohmann::json&) override { return true; }
+struct NativeSystemCollector : IPeriodicSystemCollector {
+    bool init(const nlohmann::json&, CollectorInitContext&) override { return true; }
     void deinit() noexcept override {}
     CollectOutcome collect(OutputContext& output) override {
         ++system_calls;

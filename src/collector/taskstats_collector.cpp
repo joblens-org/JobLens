@@ -42,7 +42,7 @@ bool TaskstatsCollector::init_taskstats() {
 
 
 
-bool TaskstatsCollector::init(const nlohmann::json& cfg) {
+bool TaskstatsCollector::init(const nlohmann::json& cfg, CollectorInitContext& /*context*/) {
     spdlog::info("TaskstatsCollector: Initializing with config: {}", cfg.dump());
     return init_taskstats();
 }
