@@ -684,7 +684,8 @@ size_t JobRegistry::delJobByRequest(const nlohmann::json& req) {
 }
 
 inline bool is_process_running(pid_t pid) {
-    return kill(pid, 0) == 0;
+    // EPERM 表示进程存在但当前用户无权限发送信号（例如 pid 1）。
+    return kill(pid, 0) == 0 || errno == EPERM;
 }
 
 inline void JobRegistry::update_job(Job& job){
