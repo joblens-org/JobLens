@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "id": "periodic_system",
+  "scope": "system",
+  "trigger": "periodic",
+  "interface": "IPeriodicSystemCollector",
+  "activation": "auto_start_or_explicit_start",
+  "invocation": "collect(output) once per tick, independently of the registered Job count",
+  "required_cases": [
+    {
+      "name": "zero_jobs",
+      "jobs": [],
+      "expected_invocations_per_tick": 1,
+      "envelope": {
+        "job_id": 0,
+        "job_type": "Sys",
+        "is_system_placeholder": true
+      }
+    },
+    {
+      "name": "one_job",
+      "jobs": [
+        {"job_id": 101, "pids": [1010], "type": "Job", "subtype": "Common"}
+      ],
+      "expected_invocations_per_tick": 1,
+      "envelope": {
+        "job_id": 0,
+        "job_type": "Sys",
+        "is_system_placeholder": true
+      }
+    },
+    {
+      "name": "two_jobs",
+      "jobs": [
+        {"job_id": 101, "pids": [1010], "type": "Job", "subtype": "Common"},
+        {"job_id": 202, "pids": [2020], "type": "Job", "subtype": "Common"}
+      ],
+      "expected_invocations_per_tick": 1,
+      "job_count_must_not_multiply_invocations": true
+    },
+    {
+      "name": "last_job_removed",
+      "jobs": [],
+      "expected_collector_state": "running",
+      "expected_output_after_removal": "continues with Job 0 envelope",
+      "expected_final_report": false
+    }
+  ],
+  "output_attribution": "synthetic Job 0/System envelope for every record",
+  "finish_boundary": "instance_stop",
+  "policies": {
+    "stream": "one System output set per tick",
+    "final": "aggregate over the instance run; one logical report when the run stops",
+    "both": "System samples plus one instance-run report"
+  }
+}
