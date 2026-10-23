@@ -1,4 +1,5 @@
 #include "collector/net_usage_collector.hpp"
+#include "core/collector_execution_context.hpp"
 #include "writer/prometheus_exporter_writer.hpp"
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -24,6 +25,13 @@ struct NetUsageCollectorTestAccess {
         return NetUsageCollector::ConnectionHash(connection);
     }
 };
+
+static bool init_collector(NetUsageCollector& collector, const nlohmann::json& cfg)
+{
+    NullSourceRegistrar registrar;
+    CollectorInitContext context(CollectorScope::Job, registrar);
+    return collector.init(cfg, context);
+}
 
 static void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -248,7 +256,7 @@ static void run(bool namespace_race) {
     const auto initial_fds = openFdCount();
     NetUsageCollector collector;
     if (namespace_race) {
-        collector.init({{"summary", "false"}, {"use_netlink", "false"}});
+        init_collector(collector, {{"summary", "false"}, {"use_netlink", "false"}});
         Job job; job.JobPIDs = {getpid()};
         const auto before = collector.sample_job(job);
         require(before.size() == 1 && before[0].connections.size() == 4,
@@ -267,7 +275,7 @@ static void run(bool namespace_race) {
         require(openFdCount() == initial_fds, "namespace race leaked FDs");
         return;
     }
-    collector.init({{"summary", "true"}, {"use_netlink", "true"}});
+    init_collector(collector, {{"summary", "true"}, {"use_netlink", "true"}});
     checkWriters(collector, true);
     Job job; job.JobID = 17; job.JobPIDs = {getpid(), child};
     mark("NET_BEGIN shared");
@@ -317,7 +325,7 @@ static void run(bool namespace_race) {
     checkWriters(collector, true);
     collector.deinit();
     require(openFdCount() == initial_fds, "netlink FD leaked after deinit");
-    collector.init({{"summary", "false"}, {"use_netlink", "false"}});
+    init_collector(collector, {{"summary", "false"}, {"use_netlink", "false"}});
     checkWriters(collector, false);
     job.JobPIDs = {getpid()};
     mark("NET_BEGIN without_netlink");

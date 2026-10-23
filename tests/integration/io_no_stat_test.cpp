@@ -1,4 +1,5 @@
 #include "collector/io_usage_collector.hpp"
+#include "core/collector_execution_context.hpp"
 #include <unistd.h>
 #include <iostream>
 #include <stdexcept>
@@ -16,7 +17,9 @@ void run_legacy_without_metadata() {
     LegacyTestFile file;
     require(file.fd >= 0 && unlink(file.path) == 0, "prepare deleted open file failed");
     IOUsageCollector collector;
-    require(collector.init(nlohmann::json::object()), "legacy collector init failed");
+    NullSourceRegistrar registrar;
+    CollectorInitContext context(CollectorScope::Job, registrar);
+    require(collector.init(nlohmann::json::object(), context), "legacy collector init failed");
     Job job{}; job.JobID = 7; job.JobPIDs = {getpid()};
 
     metadata_calls = 0;

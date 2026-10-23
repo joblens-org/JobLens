@@ -1,4 +1,5 @@
 #include "collector/cpumem_collector.hpp"
+#include "core/collector_execution_context.hpp"
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -13,6 +14,13 @@
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
+
+static bool init_collector(CPUMemCollector& collector, const nlohmann::json& cfg)
+{
+    NullSourceRegistrar registrar;
+    CollectorInitContext context(CollectorScope::Job, registrar);
+    return collector.init(cfg, context);
+}
 
 static std::string denied_stat;
 static int denied_stat_errno = EACCES;
@@ -217,7 +225,7 @@ int main() {
         const bool pss_supported = access("/proc/self/smaps_rollup", F_OK) == 0;
         Child child;
         CPUMemCollector collector;
-        require(collector.init({}), "collector init failed");
+        require(init_collector(collector, {}), "collector init failed");
         Job job;
         job.JobID = 7;
         job.JobPIDs = {getpid(), child.pid};
@@ -268,7 +276,7 @@ int main() {
 
         Child reused_child;
         CPUMemCollector reuse_collector;
-        require(reuse_collector.init({}), "reuse collector init failed");
+        require(init_collector(reuse_collector, {}), "reuse collector init failed");
         Job reuse_job;
         reuse_job.JobID = 8;
         reuse_job.JobPIDs = {reused_child.pid};
@@ -317,7 +325,7 @@ int main() {
             write_fake_stat(stat_path(workerA.pid), make_stat_line(workerA.pid, "workerA", 100, 0, 601));
             write_fake_stat(stat_path(workerB.pid), make_stat_line(workerB.pid, "workerB", 100, 0, 602));
             CPUMemCollector multi;
-            require(multi.init({}), "multi-job collector init failed");
+            require(init_collector(multi, {}), "multi-job collector init failed");
             Job jobA;
             jobA.JobID = 11;
             jobA.JobPIDs = {workerA.pid};
@@ -367,7 +375,7 @@ int main() {
             const unsigned long long interval = 100ULL * static_cast<unsigned long long>(cores);
             write_fake_stat("/proc/stat", make_proc_stat_line(t0));
             CPUMemCollector pruner;
-            require(pruner.init({}), "prune collector init failed");
+            require(init_collector(pruner, {}), "prune collector init failed");
             Job prune_job;
             prune_job.JobID = 21;
             prune_job.JobPIDs = {worker.pid};
