@@ -417,6 +417,9 @@ using CollectFunc = std::function<CollectResult(const Job&)>;
 using CollectInitFunc = std::function<bool(const nlohmann::json& config)>;
 using CollectDeinitFunc = std::function<void()>;
 
+/// Job 生命周期钩子签名 — 由 CollectorScheduler 同步调用，传入调用瞬间的 Job 快照
+using JobLifecycleFunc = std::function<void(const Job&)>;
+
 using CollectDataParseFunc = std::function<std::any(std::any)>;
 
 // ============================================================================
@@ -442,6 +445,11 @@ struct CollectorHandle {
     CollectInitFunc        init;   
     CollectFunc            collect;
     CollectDeinitFunc      deinit;
+    // Job 生命周期钩子（两种作用域都会绑定，作用域语义见 ICollector::on_job_added 注释）
+    // 未提供时为空 std::function，调度器会跳过调用
+    JobLifecycleFunc       on_job_added;
+    JobLifecycleFunc       on_job_updated;
+    JobLifecycleFunc       on_job_removed;
 };
 
 using ConfigParam = std::pair<std::string, std::string>; // <param_name, description>

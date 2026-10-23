@@ -180,34 +180,99 @@ void CollectorScheduler::startCollector(std::string collector_name){
 
 }
 
-void CollectorScheduler::addJob2Collector(size_t jobid, std::string collector){
+bool CollectorScheduler::addJob2Collector(const Job& job, const std::string& collector){
     auto& state = collector_state_dict[collector];
     std::lock_guard lg(state.m_);
     /* 去重: 避免同一JobID被重复push导致collect(Job) dedup命中返回空快照 */
-    if (std::find(state.jobid_list.begin(), state.jobid_list.end(), jobid) != state.jobid_list.end()) {
-        return;
+    if (std::find(state.jobid_list.begin(), state.jobid_list.end(), job.JobID) != state.jobid_list.end()) {
+        return false;
     }
-    state.jobid_list.push_back(jobid);
+    state.jobid_list.push_back(job.JobID);
     runtime_->jobs(collector, state.jobid_list.size());
     if(!state.running){
         startCollector(collector);
+    }
+    // init 失败时采集器没有进入运行态，不投递 Job 钩子，避免采集器在未初始化状态被回调
+    if (state.running) {
+        fireJobHook(collector, JobEvent::Added, job);
+    }
+    return true;
+}
+
+void CollectorScheduler::detachJobFromCollector(const std::string& collector_name, collector_state& state, const Job& job){
+    const size_t id = job.JobID;
+    auto new_end = std::remove_if(state.jobid_list.begin(), state.jobid_list.end(),
+                                  [id](size_t x){ return x == id; });
+    if (new_end == state.jobid_list.end()) {
+        // 本采集器并未绑定该 Job（例如采集器是在 Job 建立之后才注册的），不产生 Removed
+        return;
+    }
+    state.jobid_list.erase(new_end, state.jobid_list.end());
+    runtime_->jobs(collector_name, state.jobid_list.size());
+    fireJobHook(collector_name, JobEvent::Removed, job);
+}
+
+void CollectorScheduler::fireJobHook(const std::string& collector_name, JobEvent event, const Job& job){
+    // 调用方已持有该采集器的 collector_state::m_，保证钩子与 collect 互斥
+    auto it_info = collector_info_dict.find(collector_name);
+    if (it_info == collector_info_dict.end()) return;
+    // Job 作用域钩子只投递给 Job 级采集器；System 级由 notifySystemCollectors 统一广播
+    if (it_info->second.scope != CollectorScope::Job) return;
+    notifyJobHook(it_info->second, event, job);
+}
+
+void CollectorScheduler::notifySystemCollectors(const Job& job, JobEvent event){
+    // 调用方已持有 m_，保证遍历期间 collector_state_dict 不被并发插入
+    if (job.JobID == 0) return;  // 系统占位 Job 没有生命周期语义
+    for (auto& [name, state] : collector_state_dict) {
+        auto it_info = collector_info_dict.find(name);
+        if (it_info == collector_info_dict.end()) continue;
+        if (it_info->second.scope != CollectorScope::System) continue;
+        std::lock_guard lg(state.m_);
+        if (!state.running) continue;  // 未 init / 已 deinit 的采集器不接收 Job 事件
+        notifyJobHook(it_info->second, event, job);
+    }
+}
+
+void CollectorScheduler::notifyJobHook(const collector_info& info, JobEvent event, const Job& job){
+    const JobLifecycleFunc* hook = nullptr;
+    const char* event_name = "unknown";
+    switch (event) {
+        case JobEvent::Added:   hook = &info.on_job_added;   event_name = "added";   break;
+        case JobEvent::Updated: hook = &info.on_job_updated; event_name = "updated"; break;
+        case JobEvent::Removed: hook = &info.on_job_removed; event_name = "removed"; break;
+    }
+    if (!hook || !(*hook)) return;
+    try {
+        (*hook)(job);
+    }
+    catch (const std::exception& e) {
+        // 钩子异常不能冒泡到 JobRegistry 的增删流程
+        spdlog::error("CollectorScheduler: collector {} on_job_{} hook failed: {}",
+                      info.name, event_name, e.what());
+    }
+    catch (...) {
+        spdlog::error("CollectorScheduler: collector {} on_job_{} hook failed: unknown exception",
+                      info.name, event_name);
     }
 }
 
 void CollectorScheduler::addJobCollect(const Job& job){
     std::lock_guard lg(m_);
-    for(auto& collector_name:job.CollectorNames){
+    for(const auto& collector_name : job.CollectorNames){
         if (collector_info_dict.count(collector_name) == 0)
         {
             spdlog::error("CollectorScheduler: {} name is error, continue..", collector_name);
             continue;
         }
-        addJob2Collector(job.JobID, collector_name);
+        addJob2Collector(job, collector_name);
     }
+    notifySystemCollectors(job, JobEvent::Added);
 }
 
 void CollectorScheduler::rmJobCollect(const Job& job){
-    for(auto collector_name:job.CollectorNames){
+    std::lock_guard lg(m_);
+    for(const auto& collector_name : job.CollectorNames){
         // 使用find代替at，避免定时器回调并发修改容器时抛出out_of_range
         auto it = collector_state_dict.find(collector_name);
         if (it == collector_state_dict.end()) {
@@ -215,11 +280,10 @@ void CollectorScheduler::rmJobCollect(const Job& job){
             continue;
         }
         auto& state = it->second;
-        std::lock_guard lg(state.m_);
-        size_t id = job.JobID;
-        state.jobid_list.erase(std::remove_if(state.jobid_list.begin(),state.jobid_list.end(),[id](size_t x){return x==id;}), state.jobid_list.end());
-        runtime_->jobs(collector_name, state.jobid_list.size());
+        std::lock_guard lg_state(state.m_);
+        detachJobFromCollector(collector_name, state, job);
     }
+    notifySystemCollectors(job, JobEvent::Removed);
 }
 
 void CollectorScheduler::updateJobCollect(const Job& job){
@@ -235,35 +299,44 @@ void CollectorScheduler::updateJobCollect(const Job& job){
             to_remove.push_back(name);
     }
 
-    // 添加采集器
-    for(auto& collector_name:job.CollectorNames){
+    // 删除本 Job 不再需要的采集器绑定（被摘除的采集器收到 on_job_removed）
+    for(const auto& collector_name : to_remove){
+        // 使用find代替at，避免定时器回调并发修改容器时抛出out_of_range
+        auto it = collector_state_dict.find(collector_name);
+        if (it == collector_state_dict.end()) continue;
+        auto& state = it->second;
+        std::lock_guard lg_state(state.m_);
+        detachJobFromCollector(collector_name, state, job);
+    }
+    // 添加采集器（新的绑定收到 on_job_added），已在列表中的只收到 on_job_updated
+    for(const auto& collector_name : job.CollectorNames){
         if (collector_info_dict.count(collector_name) == 0)
         {
             spdlog::error("CollectorScheduler: {} name is error, continue..", collector_name);
             continue;
         }
-        addJob2Collector(job.JobID, collector_name);
-    }
-    // 删除采集器
-    for(auto& collector_name:to_remove){
-        // 使用find代替at，避免定时器回调并发修改容器时抛出out_of_range
+        if (addJob2Collector(job, collector_name)) continue;
+        // 已绑定：通知 Job 属性/PID 变化
         auto it = collector_state_dict.find(collector_name);
-        if (it == collector_state_dict.end()) continue;
-        auto& state = it->second;
-        std::lock_guard lg(state.m_);
-        size_t id = job.JobID;
-        state.jobid_list.erase(std::remove_if(state.jobid_list.begin(),state.jobid_list.end(),[id](size_t x){return x==id;}), state.jobid_list.end());
-        runtime_->jobs(collector_name, state.jobid_list.size());
+        auto it_info = collector_info_dict.find(collector_name);
+        if (it == collector_state_dict.end() || it_info == collector_info_dict.end()) continue;
+        std::lock_guard lg_state(it->second.m_);
+        if (!it->second.running) continue;
+        notifyJobHook(it_info->second, JobEvent::Updated, job);
     }
+    notifySystemCollectors(job, JobEvent::Updated);
 }
 
-void CollectorScheduler::addJobCollectFunc(std::string name, std::string config, CollectFunc collector_handle,CollectInitFunc init_handle,CollectDeinitFunc deinit_handle) {
+void CollectorScheduler::addJobCollectFunc(std::string name, std::string config, CollectorHandle handle) {
     std::lock_guard lg(m_);
     collector_info_dict[name].name = name;
     collector_info_dict[name].config_name = config;
-    collector_info_dict[name].collect_handle = collector_handle;
-    collector_info_dict[name].init_handle = init_handle;
-    collector_info_dict[name].deinit_handle = deinit_handle;
+    collector_info_dict[name].collect_handle = std::move(handle.collect);
+    collector_info_dict[name].init_handle = std::move(handle.init);
+    collector_info_dict[name].deinit_handle = std::move(handle.deinit);
+    collector_info_dict[name].on_job_added = std::move(handle.on_job_added);
+    collector_info_dict[name].on_job_updated = std::move(handle.on_job_updated);
+    collector_info_dict[name].on_job_removed = std::move(handle.on_job_removed);
     collector_info_dict[name].scope = CollectorScope::Job;
 
     if (Config::instance().has(config, "freq")) {
@@ -305,13 +378,16 @@ void CollectorScheduler::addJobCollectFunc(std::string name, std::string config,
     }
 }   
 
-void CollectorScheduler::addSystemCollectFunc(std::string name, std::string config, CollectFunc collector_handle,CollectInitFunc init_handle,CollectDeinitFunc deinit_handle){
+void CollectorScheduler::addSystemCollectFunc(std::string name, std::string config, CollectorHandle handle){
     std::lock_guard lg(m_);
     collector_info_dict[name].name = name;
     collector_info_dict[name].config_name = config;
-    collector_info_dict[name].collect_handle = collector_handle;
-    collector_info_dict[name].init_handle = init_handle;
-    collector_info_dict[name].deinit_handle = deinit_handle;
+    collector_info_dict[name].collect_handle = std::move(handle.collect);
+    collector_info_dict[name].init_handle = std::move(handle.init);
+    collector_info_dict[name].deinit_handle = std::move(handle.deinit);
+    collector_info_dict[name].on_job_added = std::move(handle.on_job_added);
+    collector_info_dict[name].on_job_updated = std::move(handle.on_job_updated);
+    collector_info_dict[name].on_job_removed = std::move(handle.on_job_removed);
     collector_info_dict[name].scope = CollectorScope::System;
 
     try{
@@ -370,23 +446,6 @@ void CollectorScheduler::addCallback(std::string name, OnFinish cb) {
         return;
     }
     finishCallbacks_[name] = cb;
-}
-
-void CollectorScheduler::onJobLifecycle(JobEvent ev, Job& job) {
-    switch (ev) {
-        case JobEvent::Added: {
-            spdlog::info("CollectorScheduler: job {} added, {} PIDs", job.JobID, job.JobPIDs.size());
-            addJobCollect(job);
-            break;
-        }
-        case JobEvent::Removed: {
-            spdlog::info("CollectorScheduler: job {} removed", job.JobID);
-            break;
-        }
-        default: {
-            spdlog::warn("CollectorScheduler: error job event");
-        }
-    }
 }
 
 void CollectorScheduler::start() {
@@ -455,18 +514,14 @@ void CollectorScheduler::registerCollectFuncs() {
             addJobCollectFunc(
                 collector.name,
                 collector.config,
-                collector_handle.collect,
-                collector_handle.init,
-                collector_handle.deinit
+                std::move(collector_handle)
             );
         }// 虽然这种实现不好看，但是可以隔离Job和System的逻辑
         else if(scope == CollectorScope::System){
             addSystemCollectFunc(
                 collector.name,
                 collector.config,
-                collector_handle.collect,
-                collector_handle.init,
-                collector_handle.deinit
+                std::move(collector_handle)
             );
         }
         else{

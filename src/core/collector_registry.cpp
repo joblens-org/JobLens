@@ -117,13 +117,20 @@ CollectorHandle CollectorRegistry::createCollector(const std::string& type, cons
         return {
             [inst](const nlohmann::json& cfg) { return inst->init(cfg); },
             c_func,
-            [inst](){ inst->deinit(); }
+            [inst](){ inst->deinit(); },
+            [inst](const Job& job){ inst->on_job_added(job); },
+            [inst](const Job& job){ inst->on_job_updated(job); },
+            [inst](const Job& job){ inst->on_job_removed(job); }
         };
     } else { // System scope
+        // Job 钩子同样绑定：系统级采集器会收到全机 Job 生命周期广播（见 CollectorScheduler）
         return {
             [inst](const nlohmann::json& cfg) { return inst->init(cfg); },
             c_func, //保证接口一致，忽略job参数
-            [inst](){ inst->deinit(); }
+            [inst](){ inst->deinit(); },
+            [inst](const Job& job){ inst->on_job_added(job); },
+            [inst](const Job& job){ inst->on_job_updated(job); },
+            [inst](const Job& job){ inst->on_job_removed(job); }
         };
     }
 }

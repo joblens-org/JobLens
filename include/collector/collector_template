@@ -19,6 +19,14 @@ public:
     bool init(const nlohmann::json& cfg) override;
     void deinit() noexcept override;
 
+    /*-------- Job 生命周期钩子（按需覆写，默认空实现）--------
+     * Job 级采集器只收到 CollectorNames 中包含自己的 Job；
+     * System 级采集器收到全机 Job 事件广播。
+     * 同步调用、持锁执行：必须快速返回且幂等，禁止回调 JobRegistry/CollectorScheduler。 */
+    void on_job_added(const Job& job) override;
+    void on_job_updated(const Job& job) override;
+    void on_job_removed(const Job& job) override;
+
     /*-------- 采集接口 --------*/
     CollectResult collect() override;                    // 系统级采集
     CollectResult collect(const Job& job) override;      // 进程级采集

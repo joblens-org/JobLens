@@ -10,21 +10,52 @@
 
 using namespace std::chrono_literals;
 struct CollectorSchedulerTestAccess {
+    static CollectorHandle makeHandle(CollectFunc collect, CollectInitFunc init,
+                                      JobLifecycleFunc on_added = {},
+                                      JobLifecycleFunc on_updated = {},
+                                      JobLifecycleFunc on_removed = {}) {
+        CollectorHandle handle;
+        handle.init = std::move(init);
+        handle.collect = std::move(collect);
+        handle.deinit = [] {};
+        handle.on_job_added = std::move(on_added);
+        handle.on_job_updated = std::move(on_updated);
+        handle.on_job_removed = std::move(on_removed);
+        return handle;
+    }
     static void add(CollectorScheduler& scheduler, const std::string& name,
-                    CollectFunc collect, CollectInitFunc init) {
-        scheduler.addJobCollectFunc(name, "test", collect, init, [] {});
+                    CollectFunc collect, CollectInitFunc init,
+                    JobLifecycleFunc on_added = {}, JobLifecycleFunc on_updated = {},
+                    JobLifecycleFunc on_removed = {}) {
+        scheduler.addJobCollectFunc(name, "test",
+            makeHandle(std::move(collect), std::move(init),
+                       std::move(on_added), std::move(on_updated), std::move(on_removed)));
+    }
+    static void addSystem(CollectorScheduler& scheduler, const std::string& name, const std::string& config,
+                          CollectFunc collect, CollectInitFunc init,
+                          JobLifecycleFunc on_added = {}, JobLifecycleFunc on_updated = {},
+                          JobLifecycleFunc on_removed = {}) {
+        scheduler.addSystemCollectFunc(name, config,
+            makeHandle(std::move(collect), std::move(init),
+                       std::move(on_added), std::move(on_updated), std::move(on_removed)));
     }
     static void writer(CollectorScheduler& scheduler, const std::string& name, OnFinish callback) {
         scheduler.collector_info_dict.at(name).finish_cbs.push_back(std::move(callback));
     }
-    static void attach(CollectorScheduler& scheduler, const std::string& name) {
-        scheduler.addJob2Collector(123, name);
-    }
-    static void remove(CollectorScheduler& scheduler, const std::string& name) {
+    static Job makeJob(size_t jobid, std::vector<std::string> names) {
         Job job;
-        job.JobID = 123;
-        job.CollectorNames = {name};
-        scheduler.rmJobCollect(job);
+        job.JobID = jobid;
+        job.CollectorNames = std::move(names);
+        return job;
+    }
+    static bool attach(CollectorScheduler& scheduler, const std::string& name, size_t jobid = 123) {
+        return scheduler.addJob2Collector(makeJob(jobid, {name}), name);
+    }
+    static void update(CollectorScheduler& scheduler, size_t jobid, std::vector<std::string> names) {
+        scheduler.updateJobCollect(makeJob(jobid, std::move(names)));
+    }
+    static void remove(CollectorScheduler& scheduler, const std::string& name, size_t jobid = 123) {
+        scheduler.rmJobCollect(makeJob(jobid, {name}));
     }
 };
 void check(bool condition, const char* message) {
@@ -57,6 +88,7 @@ void run(const std::string& base) {
               "collectors_config:\n  default_freq: 20\n  default_use_writers: []\n  collectors: []\n"
               "writers_config:\n  enable_writer_perf: false\n  writers: []\n"
               "job_registry_config:\n  job_db_path: " << base << ".db\n"
+              "sys_test:\n  freq: 20\n  use_writers: []\n  auto_start: true\n"
               "test:\n  freq: 20\n  use_writers: []\n";
     config.close();
     auto& server = RPCServer::instance(path);
@@ -174,6 +206,56 @@ void run(const std::string& base) {
     CollectorSchedulerTestAccess::remove(scheduler, "blocked");
     CollectorSchedulerTestAccess::remove(scheduler, "blocked");
     check(status("blocked")["job_count"] == 0, "remove and repeated removal");
+
+    // ---- Job 生命周期钩子：Job 级按绑定投递，System 级广播 ----
+    auto bump = [](std::atomic<int>& counter) {
+        return [&counter](const Job&) { counter++; };
+    };
+    std::atomic<int> life_added{0}, life_updated{0}, life_removed{0};
+    std::atomic<int> extra_added{0}, extra_removed{0};
+    std::atomic<int> sys_added{0}, sys_updated{0}, sys_removed{0};
+    CollectorSchedulerTestAccess::add(scheduler, "lifecycle",
+        [](const Job&) -> std::any { return 1; }, [](const nlohmann::json&) { return true; },
+        bump(life_added), bump(life_updated), bump(life_removed));
+    CollectorSchedulerTestAccess::add(scheduler, "extra",
+        [](const Job&) -> std::any { return 1; }, [](const nlohmann::json&) { return true; },
+        bump(extra_added), {}, bump(extra_removed));
+    CollectorSchedulerTestAccess::addSystem(scheduler, "sys_watch", "sys_test",
+        [](const Job&) -> std::any { return 1; }, [](const nlohmann::json&) { return true; },
+        bump(sys_added), bump(sys_updated), bump(sys_removed));
+
+    Job life_job = CollectorSchedulerTestAccess::makeJob(456, {"lifecycle"});
+    life_job.JobPIDs = {getpid()};
+    life_job.jobtype = JobType::Sys;
+    life_job.subtype = JobSubType::Common;
+    life_job.sub_attr = CommonJobAttr{.auto_update_child = false};
+    check(JobRegistry::instance().addJob(life_job), "register lifecycle job");
+    check(life_added.load() == 1, "on_job_added fired once for bound job collector");
+    check(extra_added.load() == 0, "unbound job collector must not receive added");
+    check(sys_added.load() == 1, "system collector must receive every job added");
+
+    check(!CollectorSchedulerTestAccess::attach(scheduler, "lifecycle", 456), "duplicate attach");
+    check(life_added.load() == 1, "duplicate attach must not fire added again");
+
+    // update: 已绑定 → updated；新增采集器 → added
+    CollectorSchedulerTestAccess::update(scheduler, 456, {"lifecycle", "extra"});
+    check(life_updated.load() == 1, "on_job_updated fired for retained collector");
+    check(life_added.load() == 1, "retained collector must not receive added twice");
+    check(extra_added.load() == 1, "collector added by update receives added");
+    check(sys_updated.load() == 1, "system collector must receive updated");
+
+    // update: 移除采集器 → removed
+    CollectorSchedulerTestAccess::update(scheduler, 456, {"lifecycle"});
+    check(extra_removed.load() == 1, "collector removed by update receives removed");
+    check(life_removed.load() == 0, "retained collector must not receive removed");
+
+    // Job 结束 → removed；重复摘除不重复投递
+    JobRegistry::instance().delJob(456);
+    check(life_removed.load() == 1, "on_job_removed fired on job removal");
+    check(sys_removed.load() == 1, "system collector must receive job removed");
+    CollectorSchedulerTestAccess::remove(scheduler, "lifecycle", 456);
+    check(life_removed.load() == 1, "repeated removal must not fire removed again");
+
     scheduler.shutdown();
     check(rpc(path, "CollectorScheduler/status")["lifecycle"] == "stopped", "stopped");
     check(status("blocked")["timer_active"] == false, "timer stopped");

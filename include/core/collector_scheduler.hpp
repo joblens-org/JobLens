@@ -59,20 +59,6 @@ public:
 private:
     friend struct CollectorSchedulerTestAccess;
     CollectorScheduler();
-    void addJobCollectFunc(std::string name, std::string config, CollectFunc collector_handle,CollectInitFunc init_handle,CollectDeinitFunc deinit_handle);
-    void addSystemCollectFunc(std::string name, std::string config, CollectFunc collector_handle,CollectInitFunc init_handle,CollectDeinitFunc deinit_handle);
-    void addCallback(std::string name, OnFinish cb);
-    void registerCollectFuncs();
-    void registerFinishCallbacks();
-    void onJobLifecycle(JobEvent ev, Job& job);
-    void addJobCollect(const Job& job);
-    void startCollector(std::string collector);
-    void addJob2Collector(size_t jobid, std::string collector);
-    void rmJobCollect(const Job& job);
-    void updateJobCollect(const Job& job);
-    Config& global_config = Config::instance();
-    std::shared_ptr<CollectorRuntime> runtime_ = std::make_shared<CollectorRuntime>();
-    TimerScheduler timerScheduler_;
 
     struct collector_state{
         std::vector<size_t> jobid_list;
@@ -90,9 +76,35 @@ private:
         CollectFunc collect_handle;
         CollectInitFunc init_handle;
         CollectDeinitFunc deinit_handle;
+        JobLifecycleFunc on_job_added;
+        JobLifecycleFunc on_job_updated;
+        JobLifecycleFunc on_job_removed;
         std::vector<OnFinish> finish_cbs;
     };
-    
+
+    void addJobCollectFunc(std::string name, std::string config, CollectorHandle handle);
+    void addSystemCollectFunc(std::string name, std::string config, CollectorHandle handle);
+    void addCallback(std::string name, OnFinish cb);
+    void registerCollectFuncs();
+    void registerFinishCallbacks();
+    void addJobCollect(const Job& job);
+    void rmJobCollect(const Job& job);
+    void updateJobCollect(const Job& job);
+    void startCollector(std::string collector);
+    /// 挂载 Job 到采集器；返回 true 表示这是一次新的挂载（已触发 on_job_added）
+    bool addJob2Collector(const Job& job, const std::string& collector);
+    /// 从采集器摘除 Job；仅在确实存在绑定时触发 on_job_removed（调用方需持有 state.m_）
+    void detachJobFromCollector(const std::string& collector_name, collector_state& state, const Job& job);
+    /// 分发 Job 作用域钩子；调用方需持有该采集器的 state.m_
+    void fireJobHook(const std::string& collector_name, JobEvent event, const Job& job);
+    /// 向所有运行中的 System 作用域采集器广播 Job 事件；调用方需持有 m_
+    void notifySystemCollectors(const Job& job, JobEvent event);
+    /// 实际调用钩子并吞掉异常（钩子抛异常不得污染 Job 生命周期流程）
+    void notifyJobHook(const collector_info& info, JobEvent event, const Job& job);
+
+    Config& global_config = Config::instance();
+    std::shared_ptr<CollectorRuntime> runtime_ = std::make_shared<CollectorRuntime>();
+    TimerScheduler timerScheduler_;
 
     std::mutex              m_;
     std::mutex shutdown_mutex_;
