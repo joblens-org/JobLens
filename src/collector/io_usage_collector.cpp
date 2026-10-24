@@ -1,3 +1,5 @@
+// 已被废弃，迁移到new_io
+
 /* Copyright 2026 - 2026 wzycc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
