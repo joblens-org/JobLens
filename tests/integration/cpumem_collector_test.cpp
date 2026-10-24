@@ -172,6 +172,9 @@ struct CPUMemCollectorTestAccess {
     static void force_smaps_mode(CPUMemCollector& collector) {
         collector.pss_mode = CPUMemCollector::PssMode::Smaps;
     }
+    static int pss_cap(const CPUMemCollector& collector) {
+        return collector.pss_max_processes;
+    }
 };
 
 static const CPUMemInfo& summary_of(const std::vector<CPUMemInfo>& infos) {
@@ -566,9 +569,58 @@ int main() {
             fake_file_fds.clear();
         }
 
+        // PSS 安全阀：作业进程数超过 pss_max_processes 时整体跳过，不做部分求和。
+        {
+            Child s1, s2;
+            CPUMemCollector capped;
+            require(capped.init({{"summary", "true"}, {"pss_max_processes", "1"}}),
+                    "pss_max_processes init failed");
+            require(CPUMemCollectorTestAccess::pss_cap(capped) == 1,
+                    "pss_max_processes config was not applied");
+            Job cap_job;
+            cap_job.JobID = 34;
+            cap_job.JobPIDs = {s1.pid, s2.pid};
+            write_fake_stat(stat_path(s1.pid), make_stat_line_with_children(s1.pid, "s1", 0, 0, 0, 0, 841));
+            write_fake_stat(stat_path(s2.pid), make_stat_line_with_children(s2.pid, "s2", 0, 0, 0, 0, 842));
+            write_fake_stat(status_path(s1.pid), make_status_line(4096, 32768, 5000, 0, 1));
+            write_fake_stat(status_path(s2.pid), make_status_line(4096, 32768, 5000, 0, 1));
+            write_fake_stat(rollup_path(s1.pid), make_rollup_line(2048));
+            write_fake_stat(rollup_path(s2.pid), make_rollup_line(2048));
+            fake_opens.clear();
+            const auto capped_sample = std::any_cast<std::vector<CPUMemInfo>>(capped.collect(cap_job));
+            require(fake_opens[rollup_path(s1.pid)] == 0 && fake_opens[rollup_path(s2.pid)] == 0,
+                    "over-cap job still read smaps_rollup");
+            require(summary_of(capped_sample).mem_pss_kb == -1 &&
+                    summary_of(capped_sample).mem_peak_pss_kb == -1,
+                    "over-cap job must report no PSS at all");
+            for (const auto& info : capped_sample) {
+                if (info.pid != 0) {
+                    require(info.mem_pss_kb == -1, "over-cap per-process PSS must be absent");
+                }
+            }
+            const auto capped_doc = std::any_cast<nlohmann::json>(
+                capped.get_writer_parser("ESWriter")(capped_sample));
+            require(!capped_doc.at("summary").contains("mem_pss_kb"),
+                    "over-cap summary rendered a PSS value");
+            capped.deinit();
+
+            // 0 = 不限：同一份数据和同一组进程必须重新给出完整 PSS。
+            CPUMemCollector uncapped;
+            require(uncapped.init({{"summary", "true"}, {"pss_max_processes", "0"}}),
+                    "pss_max_processes=0 init failed");
+            const auto uncapped_sample = std::any_cast<std::vector<CPUMemInfo>>(uncapped.collect(cap_job));
+            require(summary_of(uncapped_sample).mem_pss_kb == 4096,
+                    "pss_max_processes=0 must mean unlimited");
+            require(CPUMemCollectorTestAccess::pss_cap(uncapped) == 0,
+                    "pss_max_processes=0 was not accepted");
+            uncapped.deinit();
+            fake_files.clear();
+            fake_file_fds.clear();
+        }
+
         std::cout << "PASS CPUMem real proc samples, shared CPU inputs, comm fallback, PID reuse guard, "
                      "per-PID system baseline across jobs and identity-aware stale baseline pruning, "
-                     "job peak from aggregated series, VmSwap, PSS aggregate/switch/degrade, "
+                     "job peak from aggregated series, VmSwap, PSS aggregate/switch/degrade/cap, "
                      "reaped children CPU\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

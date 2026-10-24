@@ -48,6 +48,23 @@ bool ConfigBool(const nlohmann::json& cfg, const char* key, bool default_value) 
     return default_value;
 }
 
+// 整数配置：同样兼容 yamlToJson 的字符串形态与真实数字。
+int ConfigInt(const nlohmann::json& cfg, const char* key, int default_value) {
+    if (!cfg.is_object() || !cfg.contains(key) || cfg[key].is_null()) return default_value;
+    const auto& value = cfg[key];
+    if (value.is_number_integer()) return value.get<int>();
+    if (value.is_number_unsigned()) return static_cast<int>(value.get<unsigned int>());
+    if (value.is_number_float()) return static_cast<int>(value.get<double>());
+    if (value.is_string()) {
+        try {
+            return std::stoi(value.get<std::string>());
+        } catch (const std::exception&) {
+            return default_value;
+        }
+    }
+    return default_value;
+}
+
 // 单进程/汇总记录共用同一套字段映射，避免三份 parser（ES/File/V2）口径漂移。
 nlohmann::json ToJson(const CPUMemInfo& info) {
     nlohmann::json j;
@@ -151,6 +168,12 @@ bool CPUMemCollector::init(const nlohmann::json& cfg) {
     //   两者都不可用       → 关闭 PSS，输出中省略该字段而不是给出 0。
     pss_enabled = ConfigBool(cfg, "pss", true);
     pss_fallback_smaps = ConfigBool(cfg, "pss_fallback_smaps", true);
+    pss_max_processes = ConfigInt(cfg, "pss_max_processes", 64);
+    if (pss_max_processes < 0) {
+        spdlog::warn("CPUMemCollector: pss_max_processes={} is negative, treating as unlimited",
+                     pss_max_processes);
+        pss_max_processes = 0;
+    }
     std::error_code ec;
     if (!pss_enabled) {
         pss_mode = PssMode::Disabled;
@@ -450,6 +473,14 @@ CollectResult CPUMemCollector::collect(const Job& job) {
         sample.total = read_system_cpu();
     }
     infos.reserve(job.JobPIDs.size() + (summary ? 1 : 0));
+    // PSS 成本按进程数线性增长（实测单进程约 0.5-1.3ms），超过阈值时本样本整体跳过：
+    // 只对前 N 个进程求和会静默低估作业内存，全有或全无才能保证口径可解释。
+    const bool pss_over_cap = pss_mode != PssMode::Disabled && pss_max_processes > 0 &&
+                              job.JobPIDs.size() > static_cast<size_t>(pss_max_processes);
+    if (pss_over_cap) {
+        spdlog::debug("CPUMemCollector: job {} has {} pids > pss_max_processes={}, skipping PSS",
+                      job.JobID, job.JobPIDs.size(), pss_max_processes);
+    }
     for (int pid : job.JobPIDs) {
         if (! Utils::is_process_running(pid)){
             continue;
@@ -459,7 +490,7 @@ CollectResult CPUMemCollector::collect(const Job& job) {
         info.pid = pid;
         if (!CPUOf(pid, info, sample, now)) info.name = get_process_name(pid);
         // 进程已消失/无法读取 status 时不再尝试 PSS，省掉一次必然失败的 open。
-        if (MemOf(pid, info)) PssOf(pid, info);
+        if (MemOf(pid, info) && !pss_over_cap) PssOf(pid, info);
         if (!info.pid) continue;
         // job.JobInfo[fmt::format("proc_info_{}", pid)] = info.get();
         infos.push_back(info);

@@ -164,7 +164,8 @@ The collector's `init(json_cfg)` method receives a JSON object converted from th
 |----------------|------------------------|------------|-------------|------------------|
 | **CPUMemCollector** | `summary` | string | When `"true"`, aggregates CPU/memory data from all processes into a single summary record (pid=0) |
 | | `pss` | bool | Default `true`. Collects PSS (proportional set size, shared pages split across processes). `false` disables `smaps_rollup` reads entirely and omits `mem_pss_kb` from the output |
-| | `pss_fallback_smaps` | bool | Default `true`. On kernels without `smaps_rollup`, degrades to per-VMA `smaps` parsing (higher cost); set `false` to disable PSS instead | `cpumem_collector.cpp:42` |
+| | `pss_fallback_smaps` | bool | Default `true`. On kernels without `smaps_rollup`, degrades to per-VMA `smaps` parsing (higher cost); set `false` to disable PSS instead |
+| | `pss_max_processes` | int | Default `64`. When a job has more live pids than this, PSS is skipped for that sample (all-or-nothing, never a partial sum). `0` means unlimited | `cpumem_collector.cpp:42` |
 | **IOUsageCollector** | `summary` | string | When `"true"`, aggregates I/O data across all processes | `io_usage_collector.cpp:186` |
 | | `use_ebpf` | string | When `"true"`, uses eBPF to collect file‑level I/O data (requires root + kernel support) | `io_usage_collector.cpp:192` |
 | **NetUsageCollector** | `summary` | string | When `"true"`, aggregates network data across all processes | `net_usage_collector.cpp:477` |
@@ -187,8 +188,11 @@ The collector's `init(json_cfg)` method receives a JSON object converted from th
   processes that map them, so summing PSS over a job does not over-count shared
   libraries, `/dev/shm` staging or forked worker pages the way summing RSS does.
   Per-process cost is one `smaps_rollup` read (~0.1 ms for a 60 MB / 50-VMA
-  process), controlled by `pss` / `pss_fallback_smaps`. When PSS is unavailable
-  the field is omitted instead of reported as `0`.
+  process on WSL2, but 0.5-1.3 ms for 64-256 MB on an AlmaLinux 9 node: the cost
+  tracks RSS because the kernel walks page tables), controlled by `pss` /
+  `pss_fallback_smaps`. Jobs with more than `pss_max_processes` (default 64) live
+  pids skip PSS for that sample instead of producing a partial sum. When PSS is
+  unavailable the field is omitted instead of reported as `0`.
 - Job total CPU time is `utime + stime + cutime + cstime`: `cutime`/`cstime`
   carry the CPU of children that were already reaped, which is otherwise lost
   when a short-lived child exits between two samples. `cpuPercent` includes it.

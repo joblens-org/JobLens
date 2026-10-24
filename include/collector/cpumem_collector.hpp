@@ -83,6 +83,9 @@ private:
     bool summary = false;
     bool pss_enabled = true;
     bool pss_fallback_smaps = true;
+    // 单个作业的进程数超过该值时，本样本整体跳过 PSS（0 = 不限）。
+    // PSS 成本随进程数线性增长，大 MPI 作业不该为一个可选指标拖慢采集周期。
+    int pss_max_processes = 64;
     PssMode pss_mode = PssMode::Disabled;
 
     // 作业级峰值状态：按 JobID 保存“采样聚合值”的时序最大值。

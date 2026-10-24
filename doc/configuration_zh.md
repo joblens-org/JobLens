@@ -164,6 +164,7 @@ net_sys_collector_config:
 | **CPUMemCollector** | `summary` | string | 为 `"true"` 时，将所有进程的 CPU/内存数据聚合为一条摘要记录（pid=0） |
 | | `pss` | bool | 默认 `true`。采集 PSS（比例集大小，共享页按进程数均摊）；`false` 时完全不读 `smaps_rollup`，输出中省略 `mem_pss_kb` |
 | | `pss_fallback_smaps` | bool | 默认 `true`。内核无 `smaps_rollup` 时降级为逐 VMA 解析 `smaps`（成本更高）；设为 `false` 则直接关闭 PSS |
+| | `pss_max_processes` | int | 默认 `64`。作业存活进程数超过该值时本样本整体跳过 PSS（全有或全无，不做部分求和）；`0` 表示不限 |
 | **IOUsageCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的 I/O 数据 |
 | | `use_ebpf` | string | 为 `"true"` 时，使用 eBPF 采集文件级 I/O 数据（需要 root 权限和内核支持） |
 | **NetUsageCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的网络数据 |
@@ -182,9 +183,10 @@ net_sys_collector_config:
   不再是把各进程 `VmHWM` 相加（各进程峰值出现时刻不同，相加会系统性偏高）。
   进程级记录仍保留 `VmHWM` 语义；`sample_count` 表示峰值基于多少次采样（1 表示只采到一次）。
 - `mem_pss_kb` 为 PSS（比例集大小）：共享页按映射它的进程数均摊，因此跨进程求和不会像 RSS
-  那样重复计数（共享库、`/dev/shm` 暂存、fork 出的 worker 页）。单进程成本约为一次
-  `smaps_rollup` 读取（60MB / 50 个 VMA 的进程约 0.1ms），由 `pss` / `pss_fallback_smaps` 控制。
-  PSS 不可用时字段直接省略，而不是上报 0。
+  那样重复计数（共享库、`/dev/shm` 暂存、fork 出的 worker 页）。单进程成本为一次
+  `smaps_rollup` 读取（实测 64MB 约 0.5ms、256MB 约 1.3ms —— 内核按页表统计，成本随 RSS 增长），
+  由 `pss` / `pss_fallback_smaps` 控制；作业存活进程数超过 `pss_max_processes`（默认 64）时
+  本样本整体跳过 PSS，不做部分求和。PSS 不可用时字段直接省略，而不是上报 0。
 - 作业 CPU 总量为 `utime + stime + cutime + cstime`：`cutime`/`cstime` 保留已被回收子进程的 CPU，
   否则两次采样之间起停的短命令 CPU 会丢失；`cpuPercent` 同样计入这部分时间。
 

@@ -42,6 +42,7 @@ cpumem_collector_config:
   summary: false                             # false = per-process, true = aggregate summary
   pss: true                                  # Collect PSS (Proportional Set Size); false disables /proc/<pid>/smaps_rollup reads
   pss_fallback_smaps: true                   # Kernels without smaps_rollup fall back to per-VMA smaps parsing
+  pss_max_processes: 64                      # Skip PSS for jobs with more live pids (0 = unlimited)
   use_writers:
     - file_writer                            # Output to local file
 
