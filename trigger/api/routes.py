@@ -92,6 +92,14 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     def prmxs_writer_metrics():
         """获取Prometheus格式的指标数据"""
         try:
+            # The current core can pre-format the exposition text, avoiding a
+            # JSON parse and a second formatting pass here.
+            try:
+                text = rpc_call("prmxs_writer/metrics_text")
+                if isinstance(text, str):
+                    return Response(text, mimetype="text/plain")
+            except RPCError:
+                pass
             metrics = rpc_call("prmxs_writer/metrics")
             # 防御检查: C++ 返回 JSON 数组表示方法不存在/错误
             if not isinstance(metrics, dict):

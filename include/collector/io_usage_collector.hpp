@@ -15,7 +15,7 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "core/collector_type.h"
-#include "core/metric_data.h"
+#include "core/output_record.h"
 #include "icollector.h"
 #include <spdlog/spdlog.h>
 #include "common/ebpf_common.hpp"
@@ -98,7 +98,7 @@ public:
     std::vector<IOUsageInfo> sample_job(const Job& job);
     nlohmann::json to_document(const std::vector<IOUsageInfo>& infos) const;
     std::string to_text(const std::vector<IOUsageInfo>& infos) const;
-    MetricSnapshot to_metrics(const std::vector<IOUsageInfo>& infos) const;
+    MetricBatch to_metrics(const std::vector<IOUsageInfo>& infos) const;
 private:
     double collect_period;
     struct pid_state{

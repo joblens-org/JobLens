@@ -208,12 +208,25 @@ static void checkWriters(NetUsageCollector& collector, bool summary) {
     require(collector.to_text(data) == expected_file,
             "text format or field value changed");
     const auto prom = collector.to_metrics(data);
-    require(prom.processes_state.size() == (summary ? 2 : 1), "Prometheus process layout changed");
-    const auto& p = prom.processes_state[0];
-    require(p.pid == getpid() && p.net_sent_bytes_total == 100 && p.net_recv_bytes_total == 200 &&
-        p.net_send_bytes_per_sec == 1.25 && p.net_recv_bytes_per_sec == 2.5 &&
-        p.tcp_retrans_total == 3 && p.tcp_rtt_us == 150, "Prometheus field values changed");
-    if (summary) require(prom.processes_state[1].pid == 0 && prom.processes_state[1].net_sent_bytes_total == 100,
+    require(prom.samples.size() == (summary ? 12u : 6u), "Prometheus sample layout changed");
+    const auto find = [&](const std::string& name, const std::string& pid) -> const MetricSample& {
+        for (const auto& sample : prom.samples) {
+            if (sample.name != name) continue;
+            for (const auto& label : sample.labels) {
+                if (label.name == "pid" && label.value == pid) return sample;
+            }
+        }
+        throw std::runtime_error("missing metric " + name + " pid=" + pid);
+    };
+    const auto process_pid = std::to_string(getpid());
+    require(find("job_net_sent_bytes_total", process_pid).value == 100 &&
+        find("job_net_recv_bytes_total", process_pid).value == 200 &&
+        find("job_net_send_bytes_per_sec", process_pid).value == 1.25 &&
+        find("job_net_recv_bytes_per_sec", process_pid).value == 2.5 &&
+        find("job_net_tcp_retrans_total", process_pid).value == 3 &&
+        find("job_net_tcp_rtt_us", process_pid).value == 150,
+        "Prometheus metric values changed");
+    if (summary) require(find("job_net_sent_bytes_total", "0").value == 100,
                          "Prometheus summary changed");
 }
 

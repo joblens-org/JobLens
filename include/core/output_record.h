@@ -27,7 +27,6 @@
 #include <nlohmann/json.hpp>
 
 #include "core/collector_type.h"
-#include "core/metric_data.h"
 
 // ============================================================================
 // 采集器输出契约
@@ -45,7 +44,53 @@ struct Text { std::string value; };
 inline bool operator==(const Document& a, const Document& b) { return a.value == b.value; }
 inline bool operator==(const Text& a, const Text& b) { return a.value == b.value; }
 
-using OutputPayload = std::variant<Document, Text, MetricSnapshot>;
+// Generic metric payload. Collectors choose metric names, types and labels;
+// writers and the trigger do not need a per-collector schema.
+enum class MetricType { Gauge, Counter };
+
+inline const char* to_string(MetricType type)
+{
+    switch (type) {
+        case MetricType::Gauge:   return "gauge";
+        case MetricType::Counter: return "counter";
+    }
+    return "unknown";
+}
+
+struct MetricLabel {
+    std::string name;
+    std::string value;
+};
+
+struct MetricSample {
+    std::string name;
+    MetricType type = MetricType::Gauge;
+    std::string help;
+    std::vector<MetricLabel> labels;
+    double value = 0.0;
+};
+
+struct MetricBatch {
+    std::vector<MetricSample> samples;
+};
+
+inline bool operator==(const MetricLabel& a, const MetricLabel& b)
+{
+    return a.name == b.name && a.value == b.value;
+}
+
+inline bool operator==(const MetricSample& a, const MetricSample& b)
+{
+    return a.name == b.name && a.type == b.type && a.help == b.help &&
+           a.labels == b.labels && a.value == b.value;
+}
+
+inline bool operator==(const MetricBatch& a, const MetricBatch& b)
+{
+    return a.samples == b.samples;
+}
+
+using OutputPayload = std::variant<Document, Text, MetricBatch>;
 
 inline OutputKind kind_of(const OutputPayload& payload)
 {
@@ -137,10 +182,15 @@ inline size_t estimate_output_bytes(const OutputPayload& payload)
             total += output_size::estimate_json(value.value);
         } else if constexpr (std::is_same_v<T, Text>) {
             total += value.value.capacity() + 32;
-        } else if constexpr (std::is_same_v<T, MetricSnapshot>) {
-            total += value.processes_state.capacity() * sizeof(ProcessMetricSnapshot);
-            for (const auto& process : value.processes_state)
-                total += process.name.capacity() + 32;
+        } else if constexpr (std::is_same_v<T, MetricBatch>) {
+            total += value.samples.capacity() * sizeof(MetricSample);
+            for (const auto& sample : value.samples) {
+                total += sample.name.capacity() + sample.help.capacity();
+                total += sample.labels.capacity() * sizeof(MetricLabel);
+                for (const auto& label : sample.labels)
+                    total += label.name.capacity() + label.value.capacity();
+                total += 32;
+            }
         }
     }, payload);
     return total;

@@ -756,21 +756,33 @@ std::string NetUsageCollector::to_text(const std::vector<NetInfo>& infos) const 
     return out.str();
 }
 
-MetricSnapshot NetUsageCollector::to_metrics(const std::vector<NetInfo>& infos) const {
-    MetricSnapshot ret;
+MetricBatch NetUsageCollector::to_metrics(const std::vector<NetInfo>& infos) const {
+    MetricBatch ret;
+    ret.samples.reserve(infos.size() * 6);
     for (const auto& info : infos) {
-        ProcessMetricSnapshot state;
-        state.pid = info.pid;
-        for (const auto& c : info.connections){
-            state.net_recv_bytes_per_sec += c.recv_rate;
-            state.net_recv_bytes_total += c.recv;
-            state.net_send_bytes_per_sec += c.send_rate;
-            state.net_sent_bytes_total += c.sent;
-            state.tcp_retrans_total += c.retrans;
-            state.tcp_rtt_us += c.rtt;
+        double recv = 0, sent = 0, recv_rate = 0, send_rate = 0, retrans = 0, rtt = 0;
+        for (const auto& connection : info.connections) {
+            recv += connection.recv;
+            sent += connection.sent;
+            recv_rate += connection.recv_rate;
+            send_rate += connection.send_rate;
+            retrans += connection.retrans;
+            rtt += connection.rtt;
         }
-        if (!info.connections.empty()) state.tcp_rtt_us /= info.connections.size();
-        ret.processes_state.push_back(state);
+        if (!info.connections.empty()) rtt /= info.connections.size();
+        const std::vector<MetricLabel> labels{{"pid", std::to_string(info.pid)}};
+        ret.samples.push_back({"job_net_recv_bytes_total", MetricType::Counter,
+            "Total bytes received via network", labels, recv});
+        ret.samples.push_back({"job_net_sent_bytes_total", MetricType::Counter,
+            "Total bytes sent via network", labels, sent});
+        ret.samples.push_back({"job_net_recv_bytes_per_sec", MetricType::Gauge,
+            "Network receive rate in bytes per second", labels, recv_rate});
+        ret.samples.push_back({"job_net_send_bytes_per_sec", MetricType::Gauge,
+            "Network send rate in bytes per second", labels, send_rate});
+        ret.samples.push_back({"job_net_tcp_retrans_total", MetricType::Counter,
+            "Total TCP retransmissions", labels, retrans});
+        ret.samples.push_back({"job_net_tcp_rtt_us", MetricType::Gauge,
+            "Average TCP round-trip time in microseconds", labels, rtt});
     }
     return ret;
 }

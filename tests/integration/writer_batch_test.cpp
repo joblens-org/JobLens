@@ -276,46 +276,100 @@ nlohmann::json call_rpc(const std::string& path, const std::string& method) {
     return nlohmann::json::parse(response);
 }
 
-ProcessMetricSnapshot process(pid_t pid, const std::string& name, double cpu) {
-    ProcessMetricSnapshot p{};
-    p.pid = pid;
-    p.name = name;
-    p.cpu_usage_percent = cpu;
-    return p;
+MetricBatch metric_batch(std::initializer_list<MetricSample> samples) {
+    MetricBatch batch;
+    batch.samples = samples;
+    return batch;
 }
 
 void prometheus_batch(const std::string& socket_path) {
     TestPromWriter writer("prom_batch", "PrometheusExporterWriter", "es_test");
     const auto job = make_job(101);
-    auto cpu1 = MetricSnapshot{}; cpu1.processes_state = {process(33, "first", 3.5), process(11, "second", 1.5)};
-    cpu1.processes_state[0].mem_rss_kb = 330;
-    auto cpu2 = MetricSnapshot{}; cpu2.processes_state = {process(11, "second", 9.5), process(22, "third", 2.5)};
-    auto net = MetricSnapshot{}; net.processes_state = {process(11, "second", 0), process(44, "fourth", 0)};
-    net.processes_state[0].net_sent_bytes_total = 1100; net.processes_state[0].tcp_rtt_us = 42;
-    net.processes_state[0].name = "second"; net.processes_state[0].job_id = 101;
-    auto fs = MetricSnapshot{}; fs.processes_state = {process(44, "fourth", 0)};
-    fs.processes_state[0].fs_metadata_ops_total = 44;
-    fs.processes_state[0].fs_metadata_errors_per_sec = 0.5;
+
+    auto cpu1 = metric_batch({
+        {"job_cpu_usage_percent", MetricType::Gauge, "cpu", {{"pid", "33"}, {"name", "first"}}, 3.5},
+        {"job_mem_rss_kb", MetricType::Gauge, "rss", {{"pid", "33"}, {"name", "first"}}, 330},
+        {"job_cpu_usage_percent", MetricType::Gauge, "cpu", {{"pid", "11"}, {"name", "second"}}, 1.5},
+    });
+    auto net = metric_batch({
+        {"job_net_sent_bytes_total", MetricType::Counter, "sent", {{"pid", "11"}}, 1100},
+        {"job_net_sent_bytes_total", MetricType::Counter, "sent", {{"pid", "44"}}, 0},
+    });
+    auto cpu2 = metric_batch({
+        {"job_cpu_usage_percent", MetricType::Gauge, "cpu", {{"pid", "11"}, {"name", "second"}}, 9.5},
+        {"job_cpu_usage_percent", MetricType::Gauge, "cpu", {{"pid", "22"}, {"name", "third"}}, 2.5},
+    });
+    auto fs = metric_batch({
+        {"job_fs_metadata_ops_total", MetricType::Counter, "ops", {{"pid", "44"}}, 44},
+        {"job_fs_metadata_errors_per_sec", MetricType::Gauge, "errors", {{"pid", "44"}}, 0.5},
+    });
+
     check(writer.flush_impl({
               make_record("prom_cpu", job, 1, cpu1, "metrics", 1700000000000LL, "CPUMemCollector"),
               make_record("prom_net", job, 2, net, "metrics", 1700000000000LL, "NetUsageCollector"),
               make_record("prom_cpu", job, 3, cpu2, "metrics", 1700000000000LL, "CPUMemCollector"),
               make_record("prom_fs", job, 4, fs, "metrics", 1700000000000LL, "FSMetadataCollector")}),
           "Prometheus batch failed");
+
     const auto metrics = call_rpc(socket_path, "prom_batch/metrics");
-    const auto& processes = metrics.at("101").at("process_state");
-    check(processes.size() == 4 && processes[0]["pid"] == 33 && processes[1]["pid"] == 11
-              && processes[2]["pid"] == 44 && processes[3]["pid"] == 22,
-          "Prometheus changed insertion order or duplicated an existing PID");
-    check(processes[0]["cpu_usage_percent"] == 3.5 && processes[0]["mem_rss_kb"] == 330,
+    check(metrics.contains("metrics") && metrics.at("metrics").is_array(), "generic metrics schema missing");
+    const auto find = [&](const std::string& name, const std::string& pid) -> nlohmann::json {
+        for (const auto& sample : metrics.at("metrics")) {
+            if (sample.at("name") != name) continue;
+            if (sample.at("labels").at("pid") == pid) return sample;
+        }
+        throw std::runtime_error("missing metric " + name + " pid=" + pid);
+    };
+
+    check(find("job_cpu_usage_percent", "33").at("value") == 3.5,
           "Prometheus changed an untouched process");
-    check(processes[1]["cpu_usage_percent"] == 9.5 && processes[1]["net_sent_bytes_total"] == 1100
-              && processes[1]["tcp_rtt_us"] == 42 && processes[1]["name"] == "second"
-              && processes[1]["job_id"] == 101,
-          "Prometheus lost fields while merging collectors");
-    check(processes[2]["net_sent_bytes_total"] == 0 && processes[2]["fs_metadata_ops_total"] == 44
-              && processes[2]["fs_metadata_errors_per_sec"] == 0.5 && processes[3]["cpu_usage_percent"] == 2.5,
-          "Prometheus lost metadata fields or failed last-update-wins for a repeated PID");
+    check(find("job_mem_rss_kb", "33").at("value") == 330,
+          "Prometheus dropped a metric");
+    check(find("job_cpu_usage_percent", "11").at("value") == 9.5,
+          "Prometheus did not apply last-update-wins to a repeated series");
+    check(find("job_net_sent_bytes_total", "11").at("value") == 1100,
+          "Prometheus lost a sample from another collector");
+    check(find("job_fs_metadata_ops_total", "44").at("value") == 44 &&
+              find("job_fs_metadata_errors_per_sec", "44").at("value") == 0.5,
+          "Prometheus lost metadata metrics");
+    check(find("job_cpu_usage_percent", "11").at("labels").at("jobid") == "101",
+          "Prometheus did not inject the jobid label");
+    check(find("job_cpu_usage_percent", "11").at("labels").at("name") == "second",
+          "Prometheus lost a collector-provided label");
+
+    const auto text = call_rpc(socket_path, "prom_batch/metrics_text");
+    check(text.is_string(), "metrics_text is not a string");
+    const std::string exposition = text.get<std::string>();
+    check(exposition.find("# TYPE job_cpu_usage_percent gauge") != std::string::npos,
+          "missing gauge TYPE line");
+    check(exposition.find("# TYPE job_net_sent_bytes_total counter") != std::string::npos,
+          "missing counter TYPE line");
+    check(exposition.find("job_cpu_usage_percent{jobid=\"101\",name=\"second\",pid=\"11\"} 9.5") != std::string::npos,
+          "missing sorted CPU series");
+    check(exposition.find("job_net_sent_bytes_total{jobid=\"101\",pid=\"11\"} 1100") != std::string::npos,
+          "missing net series");
+
+    // A new collector only has to emit a MetricBatch; the writer needs no
+    // per-collector switch or central metric struct.
+    auto custom = metric_batch({
+        {"custom_gpu_power_watts", MetricType::Gauge, "GPU power", {{"device", "0"}}, 42.0},
+    });
+    check(writer.flush_impl({
+              make_record("prom_custom", job, 5, custom, "metrics", 1700000000000LL, "NewCollector")}),
+          "generic custom metric batch failed");
+    const auto extended = call_rpc(socket_path, "prom_batch/metrics");
+    bool custom_found = false;
+    for (const auto& sample : extended.at("metrics")) {
+        if (sample.at("name") != "custom_gpu_power_watts") continue;
+        custom_found = sample.at("labels").at("device") == "0" &&
+                       sample.at("labels").at("jobid") == "101" &&
+                       sample.at("value") == 42.0;
+    }
+    check(custom_found, "a new collector metric required writer changes");
+
+    const auto info = call_rpc(socket_path, "prom_batch/info");
+    check(info.at("series_count").get<size_t>() == 9, "series count changed");
+    check(info.at("job_count").get<size_t>() == 1, "job count changed");
     writer.shutdown();
 }
 

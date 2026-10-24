@@ -509,7 +509,7 @@ class JobEventContext;
 class SystemEventContext;
 
 // 输出通道与 payload 类型标签。定义在此以便 CollectorHandle 声明通道，
-// 具体 payload 容器（Document/Text/MetricSnapshot）位于 core/output_record.h。
+// 具体 payload 容器（Document/Text/MetricBatch）位于 core/output_record.h。
 enum class OutputKind { Document, Text, Metrics };
 
 inline const char* to_string(OutputKind kind)

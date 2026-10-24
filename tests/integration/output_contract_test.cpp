@@ -70,7 +70,7 @@ void too_large_and_unsupported() {
     std::string huge(2048, 'x');
     check(sink.try_enqueue(make_record("text", Text{huge})) == EnqueueCode::TooLarge, "oversized record accepted");
     sink.accept_all = false;
-    check(sink.try_enqueue(make_record("metrics", MetricSnapshot{})) == EnqueueCode::Unsupported,
+    check(sink.try_enqueue(make_record("metrics", MetricBatch{})) == EnqueueCode::Unsupported,
           "unsupported payload accepted");
     sink.shutdown();
     const auto status = sink.output_status();

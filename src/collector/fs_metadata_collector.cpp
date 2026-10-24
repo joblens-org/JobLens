@@ -383,36 +383,50 @@ std::string FSMetadataCollector::to_text(const JobFSMetaStat& s) const {
     return out.str();
 }
 
-MetricSnapshot FSMetadataCollector::to_metrics(const JobFSMetaStat& s) const {
-    MetricSnapshot ret;
-    ret.JobID = static_cast<int>(s.job_id);
+MetricBatch FSMetadataCollector::to_metrics(const JobFSMetaStat& s) const {
+    MetricBatch ret;
+    ret.samples.reserve(s.processes.size() * 4 + 4);
     uint64_t job_errors = 0;
     double job_errors_per_sec = 0.0;
-    for (const auto& [op, oc] : s.job_ops) {
-        job_errors += oc.errors;
-        job_errors_per_sec += oc.error_rate;
+    for (const auto& [op, counters] : s.job_ops) {
+        (void)op;
+        job_errors += counters.errors;
+        job_errors_per_sec += counters.error_rate;
     }
-    ProcessMetricSnapshot jobstate{};
-    jobstate.pid = 0;
-    jobstate.fs_metadata_ops_total = s.job_metadata_ops_total;
-    jobstate.fs_metadata_ops_per_sec = s.job_metadata_ops_rate;
-    jobstate.fs_metadata_errors_total = job_errors;
-    jobstate.fs_metadata_errors_per_sec = job_errors_per_sec;
-    ret.processes_state.push_back(std::move(jobstate));
-    for (const auto& [pid, p] : s.processes) {
+    const std::vector<MetricLabel> job_labels{{"pid", "0"}};
+    ret.samples.push_back({"job_fs_metadata_ops_total", MetricType::Counter,
+        "Total filesystem metadata operations", job_labels,
+        static_cast<double>(s.job_metadata_ops_total)});
+    ret.samples.push_back({"job_fs_metadata_ops_per_sec", MetricType::Gauge,
+        "Filesystem metadata operations per second", job_labels,
+        s.job_metadata_ops_rate});
+    ret.samples.push_back({"job_fs_metadata_errors_total", MetricType::Counter,
+        "Total filesystem metadata errors", job_labels,
+        static_cast<double>(job_errors)});
+    ret.samples.push_back({"job_fs_metadata_errors_per_sec", MetricType::Gauge,
+        "Filesystem metadata errors per second", job_labels,
+        job_errors_per_sec});
+
+    for (const auto& [pid, process] : s.processes) {
         uint64_t total_errors = 0;
         double errors_per_sec = 0.0;
-        for (const auto& [op, oc] : p.ops) {
-            total_errors += oc.errors;
-            errors_per_sec += oc.error_rate;
+        for (const auto& [op, counters] : process.ops) {
+            (void)op;
+            total_errors += counters.errors;
+            errors_per_sec += counters.error_rate;
         }
-        ProcessMetricSnapshot ps{};
-        ps.pid = p.pid;
-        ps.fs_metadata_ops_total = p.metadata_ops_total;
-        ps.fs_metadata_ops_per_sec = p.metadata_ops_rate;
-        ps.fs_metadata_errors_total = total_errors;
-        ps.fs_metadata_errors_per_sec = errors_per_sec;
-        ret.processes_state.push_back(std::move(ps));
+        const std::vector<MetricLabel> labels{{"pid", std::to_string(pid)}};
+        ret.samples.push_back({"job_fs_metadata_ops_total", MetricType::Counter,
+            "Total filesystem metadata operations", labels,
+            static_cast<double>(process.metadata_ops_total)});
+        ret.samples.push_back({"job_fs_metadata_ops_per_sec", MetricType::Gauge,
+            "Filesystem metadata operations per second", labels,
+            process.metadata_ops_rate});
+        ret.samples.push_back({"job_fs_metadata_errors_total", MetricType::Counter,
+            "Total filesystem metadata errors", labels,
+            static_cast<double>(total_errors)});
+        ret.samples.push_back({"job_fs_metadata_errors_per_sec", MetricType::Gauge,
+            "Filesystem metadata errors per second", labels, errors_per_sec});
     }
     return ret;
 }

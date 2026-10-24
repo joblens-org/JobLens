@@ -15,7 +15,7 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "core/collector_type.h"
-#include "core/metric_data.h"
+#include "core/output_record.h"
 #include "icollector.h"
 #include <spdlog/spdlog.h>
 #include "ebpf/fs_metadata.h"
@@ -101,7 +101,7 @@ private:
     JobFSMetaStat sample_job(const Job& job);
     nlohmann::json to_document(const JobFSMetaStat& s) const;
     std::string to_text(const JobFSMetaStat& s) const;
-    MetricSnapshot to_metrics(const JobFSMetaStat& s) const;
+    MetricBatch to_metrics(const JobFSMetaStat& s) const;
     bool init_ebpf();
     void deinit_ebpf();
 

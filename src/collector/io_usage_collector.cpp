@@ -501,16 +501,21 @@ std::string IOUsageCollector::to_text(const std::vector<IOUsageInfo>& infos) con
     return out.str();
 }
 
-MetricSnapshot IOUsageCollector::to_metrics(const std::vector<IOUsageInfo>& infos) const {
-    MetricSnapshot ret;
+MetricBatch IOUsageCollector::to_metrics(const std::vector<IOUsageInfo>& infos) const {
+    MetricBatch ret;
+    ret.samples.reserve(infos.size() * 4);
     for (const auto& info : infos) {
-        ProcessMetricSnapshot state;
-        state.pid = info.pid;
-        state.io_read_bytes_per_sec = info.read_speed;
-        state.io_read_bytes_total = info.read_bytes;
-        state.io_write_bytes_per_sec = info.write_speed;
-        state.io_write_bytes_total = info.write_bytes;
-        ret.processes_state.push_back(state);
+        const std::vector<MetricLabel> labels{{"pid", std::to_string(info.pid)}};
+        ret.samples.push_back({"job_io_read_bytes_total", MetricType::Counter,
+            "Total bytes read from the storage layer", labels,
+            static_cast<double>(info.read_bytes)});
+        ret.samples.push_back({"job_io_write_bytes_total", MetricType::Counter,
+            "Total bytes written to the storage layer", labels,
+            static_cast<double>(info.write_bytes)});
+        ret.samples.push_back({"job_io_read_bytes_per_sec", MetricType::Gauge,
+            "Storage read rate in bytes per second", labels, info.read_speed});
+        ret.samples.push_back({"job_io_write_bytes_per_sec", MetricType::Gauge,
+            "Storage write rate in bytes per second", labels, info.write_speed});
     }
     return ret;
 }

@@ -15,7 +15,7 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "core/collector_type.h"
-#include "core/metric_data.h"
+#include "core/output_record.h"
 #include "icollector.h"
 #include <chrono>
 #include <spdlog/spdlog.h>
@@ -66,7 +66,7 @@ public:
                         const std::string& writer_config_name,
                         uint64_t job_id,
                         std::chrono::system_clock::time_point sampled_at) const;
-    MetricSnapshot to_metrics(const std::vector<CPUMemInfo>& infos) const;
+    MetricBatch to_metrics(const std::vector<CPUMemInfo>& infos) const;
 
 private:
     struct CpuSample {

@@ -435,19 +435,51 @@ def get_joblens_version():
     }
 
 
-def joblens_format_metrics(jobs: dict) -> str:
-    if 'USE_MOCK_TOOLS' in globals() and USE_MOCK_TOOLS:
-        # 使用 mock 版本
-        return mock_joblens_format_metrics(jobs)
-    
-    """
-    把 Slurm 风格的嵌套 JSON 转成 Prometheus 文本协议。
-    jobs: {"102": {"JobID": 102, "process_state": [{...}, ...]}, ...}
-    返回: 多行字符串，可直接写入 /metrics 接口
-    """
-    lines = []
+def _prometheus_escape_label(value: str) -> str:
+    return str(value).replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
 
-    # 统一 TYPE 只写一次，避免重复
+
+def _prometheus_escape_help(value: str) -> str:
+    return str(value).replace('\\', '\\\\').replace('\n', '\\n')
+
+
+def _format_generic_metrics(metrics: list) -> str:
+    """Format the generic MetricBatch JSON emitted by the core."""
+    families = {}
+    for sample in metrics:
+        name = sample.get("name")
+        if not name:
+            continue
+        families.setdefault(name, []).append(sample)
+
+    lines = []
+    for name, samples in families.items():
+        first = samples[0]
+        help_text = first.get("help", "")
+        if help_text:
+            lines.append(f"# HELP {name} {_prometheus_escape_help(help_text)}")
+        metric_type = first.get("type", "gauge")
+        lines.append(f"# TYPE {name} {metric_type}")
+        for sample in samples:
+            labels = sample.get("labels") or {}
+            label_text = ",".join(
+                f'{key}="{_prometheus_escape_label(labels[key])}"'
+                for key in sorted(labels)
+            )
+            value = sample.get("value", 0)
+            if isinstance(value, float):
+                value = format(value, ".17g")
+            if label_text:
+                lines.append(f"{name}{{{label_text}}} {value}")
+            else:
+                lines.append(f"{name} {value}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _format_legacy_metrics(jobs: dict) -> str:
+    """Format the pre-MetricBatch JSON schema; kept during rolling upgrades."""
+    lines = []
     types_written = set()
 
     def write_type(metric: str, desc: str):
@@ -455,10 +487,6 @@ def joblens_format_metrics(jobs: dict) -> str:
             lines.append(f"# HELP {metric} {desc}")
             lines.append(f"# TYPE {metric} gauge")
             types_written.add(metric)
-
-    def _esc_label(v):
-        # Prometheus label 值转义：反斜杠、双引号、换行
-        return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
     for jobid_str, job_body in jobs.items():
         jobid = job_body["JobID"]
@@ -468,15 +496,13 @@ def joblens_format_metrics(jobs: dict) -> str:
             labels = (
                 f'jobid="{jobid}",'
                 f'pid="{proc["pid"]}",'
-                f'name="{_esc_label(proc["name"])}",'
-                f'group="{_esc_label(group)}"'
+                f'name="{_prometheus_escape_label(proc["name"])}",'
+                f'group="{_prometheus_escape_label(group)}"'
             )
 
-            # 1. CPU
             write_type("job_cpu_usage_percent", "Per-process CPU usage percent")
             lines.append(f'job_cpu_usage_percent{{{labels}}} {proc["cpu_usage_percent"]}')
 
-            # 2. 内存 RSS
             write_type("job_mem_rss_kb", "Per-process RSS memory in KB")
             lines.append(f'job_mem_rss_kb{{{labels}}} {proc["mem_rss_kb"]}')
 
@@ -491,29 +517,32 @@ def joblens_format_metrics(jobs: dict) -> str:
             write_type("job_mem_usage_percent", "Per-process memory usage percent")
             lines.append(f'job_mem_usage_percent{{{labels}}} {proc["mem_usage_percent"]}')
 
-            # 4. 磁盘读总量
             write_type("job_io_read_bytes_total", "Total bytes read from disk")
             lines.append(f'job_io_read_bytes_total{{{labels}}} {proc["io_read_bytes_total"]}')
 
-            # 5. 磁盘写总量
             write_type("job_io_write_bytes_total", "Total bytes written to disk")
             lines.append(f'job_io_write_bytes_total{{{labels}}} {proc["io_write_bytes_total"]}')
 
-            # 6. 网络收总量
             write_type("job_net_recv_bytes_total", "Total bytes received via network")
             lines.append(f'job_net_recv_bytes_total{{{labels}}} {proc["net_recv_bytes_total"]}')
 
-            # 7. 网络发总量
             write_type("job_net_sent_bytes_total", "Total bytes sent via network")
             lines.append(f'job_net_sent_bytes_total{{{labels}}} {proc["net_sent_bytes_total"]}')
 
-            # 8. 线程数
             write_type("job_threads_count", "Number of threads")
             lines.append(f'job_threads_count{{{labels}}} {proc["threads_cnt"]}')
 
-            lines.append("")  # 不同样本间空行分隔
+            lines.append("")
 
     return "\n".join(lines)
+
+
+def joblens_format_metrics(jobs: dict) -> str:
+    if 'USE_MOCK_TOOLS' in globals() and USE_MOCK_TOOLS:
+        return mock_joblens_format_metrics(jobs)
+    if isinstance(jobs, dict) and isinstance(jobs.get("metrics"), list):
+        return _format_generic_metrics(jobs["metrics"])
+    return _format_legacy_metrics(jobs)
 
 _RESTART_LOCK = threading.Lock()
 _last_restart_at = 0.0

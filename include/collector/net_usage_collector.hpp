@@ -15,7 +15,7 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "core/collector_type.h"
-#include "core/metric_data.h"
+#include "core/output_record.h"
 #include "icollector.h"
 #include <spdlog/spdlog.h>
 #include <cstdint>
@@ -77,7 +77,7 @@ public:
     std::vector<NetInfo> sample_job(const Job& job);
     nlohmann::json to_document(const std::vector<NetInfo>& infos) const;
     std::string to_text(const std::vector<NetInfo>& infos) const;
-    MetricSnapshot to_metrics(const std::vector<NetInfo>& infos) const;
+    MetricBatch to_metrics(const std::vector<NetInfo>& infos) const;
 
     static size_t ConnectionHash(const Connection& c);
 

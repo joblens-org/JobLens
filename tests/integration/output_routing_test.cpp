@@ -81,7 +81,7 @@ std::shared_ptr<OutputRouter> build(const std::string& config, std::string* erro
 void emit_all(OutputContext& context) {
     context.emit("document", Document{nlohmann::json{{"value", 1}}});
     context.emit("text", Text{"line\n"});
-    context.emit("metrics", MetricSnapshot{});
+    context.emit("metrics", MetricBatch{});
 }
 
 void explicit_channels() {

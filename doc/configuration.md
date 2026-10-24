@@ -174,7 +174,7 @@ The collector's `init(json_cfg)` method receives a JSON object converted from th
 | **BasicInfoCollector** | `summary` | string | When `"true"`, aggregates taskstats data across all processes (TGID-level summary) | `basic_info_collector.cpp:45` |
 | **GPUUsageCollector** | `summary` | string | When `"true"`, aggregates GPU usage data across all processes | `gpu_usage_collector.cpp:162` |
 | | `freq` | double | Additionally read in `init()`: used to calculate GPU cache refresh interval (`1.0 / (freq * 1.5)`). This is in addition to the scheduler-level `freq`. | `gpu_usage_collector.cpp:156-197` |
-| **TaskstatsCollector** | *(none)* | — | No init config parameters. Uses Linux taskstats netlink interface. **Note**: partially implemented — `collect()` method logs PIDs but does not produce data output; `get_writer_parser()` returns `nullptr`. | `taskstats_collector.cpp:44-47` |
+| **TaskstatsCollector** | *(none)* | — | No init config parameters. Uses Linux taskstats netlink interface. **Note**: partially implemented — the collector returns `Skipped` and produces no output until taskstats sampling is implemented. | `taskstats_collector.cpp:44-47` |
 | **FSMetadataCollector** | `include_process_details` | string | When `"true"` (default), emits a Job aggregate plus per-process detail. When `"false"`, emits the Job aggregate only. | `fs_metadata_collector.cpp:64` |
 | | `freq` | double | Scheduler-level sampling frequency (Hz), parsed by `CollectorScheduler`, not by FSMetadataCollector `init()`. Recommended: 1 Hz for metadata workloads | `collector_scheduler.cpp` |
 | **NewIOUsageCollector** | `include_process_details` | string | When `"true"` (default), emits Job aggregate plus per-process and per-file detail. When `"false"`, emits the Job aggregate only (empty `processes`/`files`), significantly reducing output volume for jobs with many open file handles. | `new_io_usage_collector.cpp:116` |
@@ -232,7 +232,10 @@ Code location: `src/core/writer_manager.cpp`, `src/writer/base_writer.cpp`
 writers_config:
   enable_writer_perf: true       # Whether to enable writer performance counters
   perf_window_size: 1000         # Sliding window size for performance counters
-  buffer_capacity: 4096          # Internal buffer capacity for BaseWriter (number of records)
+  buffer_capacity: 1024          # Reserve capacity per flush buffer (not a hard limit)
+  max_pending_records: 4096      # Hard bound on records pending in front/active buffers
+  max_pending_bytes: 67108864    # Hard bound on accounted bytes (64 MiB)
+  max_record_bytes: 8388608      # Reject a single record above this size (8 MiB)
   writers:                       # List of writer instances
     - name: es_writer
       type: ESWriter
@@ -244,7 +247,12 @@ writers_config:
 |-----|------|---------|-------------|------------------|
 | `enable_writer_perf` | bool | `true` | When enabled, records duration of each `flush`, supports RPC queries | `writer_manager.cpp:28` |
 | `perf_window_size` | int | `1000` | Performance window size | `writer_manager.cpp:30` |
-| `buffer_capacity` | int | none | Maximum number of messages in the BaseWriter's internal ring buffer | `base_writer.cpp:32` |
+| `buffer_capacity` | int | `1024` | Reserve capacity per flush buffer; it is **not** a queue limit | `base_writer.cpp` |
+| `max_pending_records` | int | `4096` | Hard bound on accepted records still owned by the writer (front + active buffers, including retained retries) | `base_writer.cpp` |
+| `max_pending_bytes` | int | `67108864` | Hard bound on accounted payload/metadata bytes; admission never waits or evicts accepted records | `base_writer.cpp` |
+| `max_record_bytes` | int | `8388608` | Reject a single record larger than this with `TooLarge`; must not exceed `max_pending_bytes` | `base_writer.cpp` |
+
+All queue limits may be overridden per writer instance inside that writer's config section (same key names). Zero or negative limits are configuration errors, not an unlimited mode. Admission is asynchronous: `Accepted` means the writer owns the record, not that it reached the backend.
 
 ### `writers` Array Elements
 
@@ -497,14 +505,15 @@ The entire rotation cascade happens before the triggering batch is written, so t
 
 Code location: `src/writer/prometheus_exporter_writer.cpp`
 
-Exposes collected metrics via RPC endpoints for Prometheus scraping. This writer maintains an in-memory metrics table organized by JobID → PID, covering CPU, memory, I/O, and network metrics.
+Exposes collected metrics via RPC endpoints for Prometheus scraping. This writer maintains a generic metric series table keyed by metric name plus labels; collectors choose the metric names, types, labels and values. The writer injects `jobid` when the collector omits it and does not contain a per-collector switch or a central metric schema.
 
 **RPC Endpoints** (automatically registered):
 
 | Endpoint | Description |
 |----------|-------------|
-| `/<writer_name>/metrics` | Returns all job metrics as JSON |
-| `/<writer_name>/info` | Returns writer metadata |
+| `/<writer_name>/metrics` | Returns generic metric samples as JSON |
+| `/<writer_name>/metrics_text` | Returns preformatted Prometheus exposition text |
+| `/<writer_name>/info` | Returns writer metadata and series/job counts |
 
 ```yaml
 prmxs_writer_config: {}    # Currently no config parameters; the section must exist for the `config` field to reference
@@ -562,85 +571,67 @@ slurm_job_watcher:
 
 ---
 
-## 10. Writer Parser V2 Context API
+## 10. Collector Output Channels
 
-Each collector provides a parser function per writer type, converting raw collection data into a writer-specific format. The V2 parser API extends the original V1 `std::any(std::any)` signature with a read-only `WriterParseContext` argument, giving parsers access to runtime metadata without breaking existing code.
+Collectors produce typed output records during `collect()` and submit them through an `OutputContext`. Writers never look up a collector instance or parser while flushing.
 
-### V1 Compatibility
+### Declaring channels
 
-The legacy `get_writer_parser()` interface (V1) **remains fully supported**. No existing collector or writer needs modification. V1 parsers are automatically wrapped by the default adapter in `ICollector::get_writer_parser_v2()`.
-
-### V2 is Opt-in
-
-A collector opts into V2 by overriding the virtual method:
+A collector declares the channels it can produce (`document`, `text`, `metrics`, or additional names) and implements:
 
 ```cpp
-// include/collector/icollector.h
-virtual CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type);
+CollectOutcome collect(const Job& job, OutputContext& output) override;
+std::vector<OutputChannel> output_channels() const override;
 ```
 
-The default implementation wraps the V1 parser transparently, discarding `WriterParseContext` and delegating to the old signature. Collectors that do not override this method continue to work as before.
+`CollectOutcome` distinguishes three states:
 
-### WriterParseContext
+| State | Meaning |
+|-------|---------|
+| `Success` | Sampling succeeded; zero emissions are allowed (for example unchanged values) |
+| `Skipped` | No sample was available; the collector must not emit anything |
+| `Failed` | Sampling failed; `error` carries a diagnostic. Exceptions are also collection failures. |
 
-The context struct is **read-only** and constructed at the call site per invocation. It contains:
+Returning `Skipped` after emitting is a contract error reported in scheduler status. An output rejection does not turn a successful sensor read into a failed read, but the scheduler reports it as a failed callback.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `writer_name` | `std::string` | Writer instance name (e.g. `"file_writer"`) |
-| `writer_type` | `std::string` | Writer type identifier (e.g. `"FileWriter"`) |
-| `writer_config_name` | `std::string` | Writer config section name (e.g. `"file_writer_config"`) |
-| `collector_name` | `std::string` | Collector instance name that triggered the write |
-| `job` | `Job` | The `Job` object being collected (contains JobID, PIDs, sub_attr, etc.) |
-| `timestamp` | `std::chrono::system_clock::time_point` | Timestamp when the parser was invoked |
+### Routing configuration
 
-Writers construct the context from their own metadata and the batch record before calling the parser:
-
-```cpp
-// src/writer/file_writer.cpp (simplified)
-WriterParseContext ctx{name_, type_, config_name_, collect_name, job, timestamp};
-auto parser = CollectorRegistry::instance().resolveBestParserV2(collect_name, type_);
+```yaml
+cpumem_collector_config:
+  freq: 1
+  summary: false
+  outputs:
+    document: [es_writer, kafka_writer]
+    text: [file_writer]
+    metrics: [prometheus_writer]
 ```
 
-### Parser Resolution (Fallback Order)
+Rules:
 
-The recommended entry point for writers is `CollectorRegistry::resolveBestParserV2()`, which resolves the best available parser in this order:
+1. `outputs` is explicit: omitted declared channels are disabled; `outputs: {}` disables all output.
+2. `outputs` and the legacy `use_writers` key are mutually exclusive.
+3. Without `outputs`, `use_writers` (collector level) or `collectors_config.default_use_writers` is used. An explicit empty list disables output and does not fall back.
+4. A legacy writer entry maps to the collector's unique channel that accepts its payload kind. No match or multiple matches is a binding error; configure `outputs` explicitly.
+5. Duplicate destinations within one channel are deduplicated. One writer referenced by two channels intentionally receives two records.
+6. Unknown writers/channels, duplicate writer instance names, wrong value types, and incompatible payload kinds make the collector's route invalid. That collector does not start; other collectors continue and the error appears in scheduler status.
 
-1. **V2 parser** — `get_writer_parser_v2()` returns a native V2 parser (collector has overridden the method)
-2. **V1 adapter** — the default `ICollector::get_writer_parser_v2()` wraps the V1 parser with a `WriterParseContext`-discarding lambda
-3. **V1 fallback** — explicit `get_writer_parser()` call as a defensive fallback
-4. **Writer-specific fallback** — returns `nullptr`; the writer handles raw data (e.g. FileWriter accepts plain `std::string`)
+Payload contracts: `FileWriter` accepts `Text`, `ESWriter` and `KafkaWriter` accept `Document` (JSON object), `PrometheusExporterWriter` accepts `Metrics` (`MetricBatch`).
 
-### First PoC: CPUMemCollector → FileWriter
+### Identity and timestamps
 
-`CPUMemCollector` is the first collector to provide a native V2 parser, specifically for `FileWriter`. When `writer_type == "FileWriter"`, the V2 parser:
+WriterManager creates a 128-bit process-run identifier at initialization and a monotonic per-sample counter. `sample_id` combines both values; every emit consumes a per-context sequence and `record_id = sample_id + ":" + sequence`. ES uses `record_id` as `_id`, so records sharing a timestamp no longer overwrite each other. `sampled_at` is captured once at collection entry and shared by all records of that sample.
 
-- Serializes CPU/memory data as JSON with per-process details and optional summary
-- Injects context metadata (`_writer_name`, `_collector_name`, `_job_id`, `_timestamp`) into the output for traceability
+### Queue observability
 
-For all other writer types, `CPUMemCollector::get_writer_parser_v2()` falls through to the default V1 adapter.
+`WriterManager/output_status` is always available (independent of performance counters) and returns per writer: `accepted`, `rejected_full`, `rejected_too_large`, `rejected_closed`, `rejected_invalid`, `rejected_failed`, `pending_records`, `pending_bytes`, high-water marks, `released_records`, and `flush_errors`. At a coherent snapshot `accepted = pending_records + released_records`.
 
-### Adding V2 Support to a New Collector
+### Scheduler status semantics
 
-```cpp
-// In your collector's header:
-CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type) override;
+`CollectorScheduler/status` reports `operation_semantics_version: 2`:
 
-// In your collector's implementation:
-CollectDataParseFuncV2 MyCollector::get_writer_parser_v2(const std::string& writer_type) {
-    if (writer_type == "FileWriter") {
-        return [this](const WriterParseContext& ctx, std::any data) -> std::any {
-            // Use ctx.writer_name, ctx.job.JobID, ctx.timestamp, etc.
-            // Return writer-specific formatted output
-            return formatted_output;
-        };
-    }
-    // Fall back to V1 adapter for other writer types
-    return ICollector::get_writer_parser_v2(writer_type);
-}
-```
-
-> **Note**: Only `CPUMemCollector` currently implements a native V2 parser. Other collectors continue to use the V1 parser interface and are automatically adapted. See `include/collector/icollector.h` and `include/core/collector_type.h` for the full API definition.
+- One `emit()`/`emit_to()` call counts as one `write` operation, including fan-out/admission. Zero emissions produce zero write operations; a disabled valid channel is a successful no-op write.
+- `collect` includes payload preparation and nested writes; `callback` wraps the whole invocation. Those durations overlap and must not be added together.
+- While an emission runs, `current_job.stage` is `write`; after it returns the stage is `collect` again.
 
 ---
 

@@ -589,19 +589,26 @@ std::string CPUMemCollector::to_text(const std::vector<CPUMemInfo>& infos,
     return ret.dump() + "\n";
 }
 
-MetricSnapshot CPUMemCollector::to_metrics(const std::vector<CPUMemInfo>& infos) const {
-    MetricSnapshot ret;
+MetricBatch CPUMemCollector::to_metrics(const std::vector<CPUMemInfo>& infos) const {
+    MetricBatch ret;
+    ret.samples.reserve(infos.size() * 6);
     for (const auto& info : infos) {
-        ProcessMetricSnapshot state;
-        state.pid = info.pid;
-        state.cpu_usage_percent = info.cpuPercent;
-        state.threads_cnt = info.numThreads;
-        state.mem_rss_kb = info.mem_rss_kb;
-        state.mem_usage_percent = info.memoryPercent;
-        state.mem_vm_kb = info.mem_vm_kb;
-        state.mem_pss_kb = info.mem_pss_kb;
-        state.name = info.name;
-        ret.processes_state.push_back(std::move(state));
+        const std::vector<MetricLabel> labels{{"pid", std::to_string(info.pid)},
+                                              {"name", info.name}};
+        ret.samples.push_back({"job_cpu_usage_percent", MetricType::Gauge,
+            "Per-process CPU usage percent", labels, info.cpuPercent});
+        ret.samples.push_back({"job_mem_usage_percent", MetricType::Gauge,
+            "Per-process memory usage percent", labels, info.memoryPercent});
+        ret.samples.push_back({"job_mem_rss_kb", MetricType::Gauge,
+            "Per-process RSS memory in KB", labels, static_cast<double>(info.mem_rss_kb)});
+        ret.samples.push_back({"job_mem_vm_kb", MetricType::Gauge,
+            "Per-process virtual memory in KB", labels, static_cast<double>(info.mem_vm_kb)});
+        if (info.mem_pss_kb >= 0) {
+            ret.samples.push_back({"job_mem_pss_kb", MetricType::Gauge,
+                "Per-process proportional set size in KB", labels, static_cast<double>(info.mem_pss_kb)});
+        }
+        ret.samples.push_back({"job_threads_count", MetricType::Gauge,
+            "Number of threads", labels, static_cast<double>(info.numThreads)});
     }
     return ret;
 }
