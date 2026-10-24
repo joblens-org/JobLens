@@ -82,10 +82,10 @@ CollectorScheduler::~CollectorScheduler() { shutdown(); }
 
 
 
-std::shared_ptr<CollectorScheduler::CollectorLane>
+std::shared_ptr<CollectorScheduler::CollectorLaneContext>
 CollectorScheduler::createLane(const std::string& name, const collector_info& info,
                                collector_state& state) {
-    auto lane = std::make_shared<CollectorLane>();
+    auto lane = std::make_shared<CollectorLaneContext>();
     lane->name = name;
     lane->info = info;
     lane->state = &state;
@@ -122,7 +122,7 @@ bool CollectorScheduler::initializeCollector(const std::string& name,
 bool CollectorScheduler::startEventCollectorLane(const std::string& name,
                                                  const collector_info& info,
                                                  collector_state& state,
-                                                 std::shared_ptr<CollectorLane> lane) {
+                                                 std::shared_ptr<CollectorLaneContext> lane) {
     auto sink = [this, state_ptr = &state, lane_handle = state.lane](
                     const ReadySources& ready) {
         {
@@ -165,7 +165,7 @@ bool CollectorScheduler::startEventCollectorLane(const std::string& name,
 bool CollectorScheduler::startPeriodicCollectorLane(const std::string& name,
                                                     const collector_info& info,
                                                     collector_state& state,
-                                                    std::shared_ptr<CollectorLane> lane) {
+                                                    std::shared_ptr<CollectorLaneContext> lane) {
     NullSourceRegistrar registrar;
     if (!initializeCollector(name, info, registrar)) {
         if (info.deinit_handle) info.deinit_handle();
@@ -223,7 +223,7 @@ void CollectorScheduler::startCollector(std::string collector_name) {
 void CollectorScheduler::startPeriodicJobCollector(const std::string& name,
                                                    const collector_info& info,
                                                    collector_state& state,
-                                                   std::shared_ptr<CollectorLane> lane) {
+                                                   std::shared_ptr<CollectorLaneContext> lane) {
     (void)lane;
     state.task_id = timerScheduler_.registerRepeatingWorkTimer(
         std::chrono::milliseconds(static_cast<long long>(1000.0 / info.freq)),
@@ -235,7 +235,7 @@ void CollectorScheduler::startPeriodicJobCollector(const std::string& name,
 void CollectorScheduler::startPeriodicSystemCollector(const std::string& name,
                                                       const collector_info& info,
                                                       collector_state& state,
-                                                      std::shared_ptr<CollectorLane> lane) {
+                                                      std::shared_ptr<CollectorLaneContext> lane) {
     (void)lane;
     state.task_id = timerScheduler_.registerRepeatingWorkTimer(
         std::chrono::milliseconds(static_cast<long long>(1000.0 / info.freq)),
@@ -247,7 +247,7 @@ void CollectorScheduler::startPeriodicSystemCollector(const std::string& name,
 void CollectorScheduler::startEventJobCollector(const std::string& name,
                                                 const collector_info& info,
                                                 collector_state& state,
-                                                std::shared_ptr<CollectorLane> lane) {
+                                                std::shared_ptr<CollectorLaneContext> lane) {
     (void)info;
     (void)lane;
     state.running = true;
@@ -257,20 +257,20 @@ void CollectorScheduler::startEventJobCollector(const std::string& name,
 void CollectorScheduler::startEventSystemCollector(const std::string& name,
                                                    const collector_info& info,
                                                    collector_state& state,
-                                                   std::shared_ptr<CollectorLane> lane) {
+                                                   std::shared_ptr<CollectorLaneContext> lane) {
     (void)info;
     (void)lane;
     state.running = true;
     runtime_->timer(name, false);
 }
 
-WorkResult CollectorScheduler::runCollectorLane(std::shared_ptr<CollectorLane> lane) {
+WorkResult CollectorScheduler::runCollectorLane(std::shared_ptr<CollectorLaneContext> lane) {
     if (lane->info.trigger == CollectorTrigger::Event) return runEventDrain(*lane);
     if (lane->info.scope == CollectorScope::System) return runPeriodicSystemTick(*lane);
     return runPeriodicJobSweep(*lane);
 }
 
-void CollectorScheduler::stopCollectorInstance(CollectorLane& lane) {
+void CollectorScheduler::stopCollectorInstance(CollectorLaneContext& lane) {
     auto& state = *lane.state;
     if (!state.running && !state.initialized && !state.registrar && !state.lane_valid) return;
 
@@ -301,13 +301,13 @@ void CollectorScheduler::stopCollectorInstance(CollectorLane& lane) {
 }
 
 void CollectorScheduler::stopAllCollectors() {
-    std::vector<CollectorLane> lanes;
+    std::vector<CollectorLaneContext> lanes;
     {
         std::lock_guard lock(m_);
         for (auto& [name, state] : collector_state_dict) {
             auto it = collector_info_dict.find(name);
             if (it == collector_info_dict.end()) continue;
-            CollectorLane lane;
+            CollectorLaneContext lane;
             lane.name = name;
             lane.info = it->second;
             lane.state = &state;
@@ -317,7 +317,7 @@ void CollectorScheduler::stopAllCollectors() {
     for (auto& lane : lanes) stopCollectorInstance(lane);
 }
 
-void CollectorScheduler::finalizePendingRemovals(CollectorLane& lane) {
+void CollectorScheduler::finalizePendingRemovals(CollectorLaneContext& lane) {
     auto& state = *lane.state;
     std::vector<uint64_t> closes;
     {

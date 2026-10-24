@@ -25,7 +25,7 @@
 
 #include <spdlog/spdlog.h>
 
-WorkResult CollectorScheduler::runPeriodicJobSweep(CollectorLane& lane) {
+WorkResult CollectorScheduler::runPeriodicJobSweep(CollectorLaneContext& lane) {
     CollectorRuntime::Operation callback(runtime_, lane.name, "callback");
     auto& state = *lane.state;
 
@@ -56,7 +56,7 @@ WorkResult CollectorScheduler::runPeriodicJobSweep(CollectorLane& lane) {
 }
 
 
-WorkResult CollectorScheduler::runPeriodicSystemTick(CollectorLane& lane) {
+WorkResult CollectorScheduler::runPeriodicSystemTick(CollectorLaneContext& lane) {
     CollectorRuntime::Operation callback(runtime_, lane.name, "callback");
     auto& state = *lane.state;
 
@@ -67,7 +67,7 @@ WorkResult CollectorScheduler::runPeriodicSystemTick(CollectorLane& lane) {
 }
 
 
-void CollectorScheduler::collectJobSample(CollectorLane& lane, size_t jobid,
+void CollectorScheduler::collectJobSample(CollectorLaneContext& lane, size_t jobid,
                                           CollectorRuntime::Operation& callback) {
     std::optional<Job> job = JobRegistry::instance().findJob(jobid);
     if (!job.has_value()) return;
@@ -81,7 +81,7 @@ void CollectorScheduler::collectJobSample(CollectorLane& lane, size_t jobid,
 }
 
 
-void CollectorScheduler::collectSystemSample(CollectorLane& lane,
+void CollectorScheduler::collectSystemSample(CollectorLaneContext& lane,
                                              CollectorRuntime::Operation& callback) {
     Job system_job;
     system_job.JobID = 0;

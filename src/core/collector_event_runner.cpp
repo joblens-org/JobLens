@@ -21,7 +21,7 @@
 
 #include <spdlog/spdlog.h>
 
-WorkResult CollectorScheduler::runEventDrain(CollectorLane& lane) {
+WorkResult CollectorScheduler::runEventDrain(CollectorLaneContext& lane) {
     auto& state = *lane.state;
     std::vector<ReadySource> ready;
     {

@@ -120,7 +120,7 @@ private:
         bool route_ok() const { return route_error.empty(); }
     };
 
-    struct CollectorLane {
+    struct CollectorLaneContext {
         std::string name;
         collector_info info;
         collector_state* state = nullptr;
@@ -148,36 +148,36 @@ private:
     void updateJobCollect(const Job& job);
     // Caller holds m_.
     void startCollector(std::string collector);
-    std::shared_ptr<CollectorLane> createLane(const std::string& name,
+    std::shared_ptr<CollectorLaneContext> createLane(const std::string& name,
                                               const collector_info& info,
                                               collector_state& state);
     bool initializeCollector(const std::string& name, const collector_info& info,
                              SourceRegistrar& registrar);
     void startPeriodicJobCollector(const std::string& name, const collector_info& info,
                                    collector_state& state,
-                                   std::shared_ptr<CollectorLane> lane);
+                                   std::shared_ptr<CollectorLaneContext> lane);
     void startPeriodicSystemCollector(const std::string& name, const collector_info& info,
                                       collector_state& state,
-                                      std::shared_ptr<CollectorLane> lane);
+                                      std::shared_ptr<CollectorLaneContext> lane);
     void startEventJobCollector(const std::string& name, const collector_info& info,
                                 collector_state& state,
-                                std::shared_ptr<CollectorLane> lane);
+                                std::shared_ptr<CollectorLaneContext> lane);
     void startEventSystemCollector(const std::string& name, const collector_info& info,
                                    collector_state& state,
-                                   std::shared_ptr<CollectorLane> lane);
+                                   std::shared_ptr<CollectorLaneContext> lane);
     bool startEventCollectorLane(const std::string& name, const collector_info& info,
                                  collector_state& state,
-                                 std::shared_ptr<CollectorLane> lane);
+                                 std::shared_ptr<CollectorLaneContext> lane);
     bool startPeriodicCollectorLane(const std::string& name, const collector_info& info,
                                     collector_state& state,
-                                    std::shared_ptr<CollectorLane> lane);
-    WorkResult runCollectorLane(std::shared_ptr<CollectorLane> lane);
-    WorkResult runPeriodicJobSweep(CollectorLane& lane);
-    WorkResult runPeriodicSystemTick(CollectorLane& lane);
-    WorkResult runEventDrain(CollectorLane& lane);
-    void collectJobSample(CollectorLane& lane, size_t jobid,
+                                    std::shared_ptr<CollectorLaneContext> lane);
+    WorkResult runCollectorLane(std::shared_ptr<CollectorLaneContext> lane);
+    WorkResult runPeriodicJobSweep(CollectorLaneContext& lane);
+    WorkResult runPeriodicSystemTick(CollectorLaneContext& lane);
+    WorkResult runEventDrain(CollectorLaneContext& lane);
+    void collectJobSample(CollectorLaneContext& lane, size_t jobid,
                           CollectorRuntime::Operation& callback);
-    void collectSystemSample(CollectorLane& lane,
+    void collectSystemSample(CollectorLaneContext& lane,
                              CollectorRuntime::Operation& callback);
     std::shared_ptr<SampleMetadata> makeSample(const std::string& name,
                                                const std::string& type,
@@ -191,8 +191,8 @@ private:
     void applyCollectResult(const std::string& name, std::optional<size_t> jobid,
                             const CollectInvocation& result, const OutputContext& output,
                             CollectorRuntime::Operation& callback);
-    void stopCollectorInstance(CollectorLane& lane);
-    void finalizePendingRemovals(CollectorLane& lane);
+    void stopCollectorInstance(CollectorLaneContext& lane);
+    void finalizePendingRemovals(CollectorLaneContext& lane);
     void recordRemovalAck(uint64_t jobID);
     void stopAllCollectors();
     /// 挂载 Job 到采集器；返回 true 表示这是一次新的挂载（已触发 on_job_added）
