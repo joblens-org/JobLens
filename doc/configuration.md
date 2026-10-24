@@ -162,7 +162,9 @@ The collector's `init(json_cfg)` method receives a JSON object converted from th
 
 | Collector Type | Configuration Parameter | Value Type | Description | Source Reference |
 |----------------|------------------------|------------|-------------|------------------|
-| **CPUMemCollector** | `summary` | string | When `"true"`, aggregates CPU/memory data from all processes into a single summary record (pid=0) | `cpumem_collector.cpp:42` |
+| **CPUMemCollector** | `summary` | string | When `"true"`, aggregates CPU/memory data from all processes into a single summary record (pid=0) |
+| | `pss` | bool | Default `true`. Collects PSS (proportional set size, shared pages split across processes). `false` disables `smaps_rollup` reads entirely and omits `mem_pss_kb` from the output |
+| | `pss_fallback_smaps` | bool | Default `true`. On kernels without `smaps_rollup`, degrades to per-VMA `smaps` parsing (higher cost); set `false` to disable PSS instead | `cpumem_collector.cpp:42` |
 | **IOUsageCollector** | `summary` | string | When `"true"`, aggregates I/O data across all processes | `io_usage_collector.cpp:186` |
 | | `use_ebpf` | string | When `"true"`, uses eBPF to collect file‑level I/O data (requires root + kernel support) | `io_usage_collector.cpp:192` |
 | **NetUsageCollector** | `summary` | string | When `"true"`, aggregates network data across all processes | `net_usage_collector.cpp:477` |
@@ -175,6 +177,21 @@ The collector's `init(json_cfg)` method receives a JSON object converted from th
 | | `freq` | double | Scheduler-level sampling frequency (Hz), parsed by `CollectorScheduler`, not by FSMetadataCollector `init()`. Recommended: 1 Hz for metadata workloads | `collector_scheduler.cpp` |
 | **NewIOUsageCollector** | `include_process_details` | string | When `"true"` (default), emits Job aggregate plus per-process and per-file detail. When `"false"`, emits the Job aggregate only (empty `processes`/`files`), significantly reducing output volume for jobs with many open file handles. | `new_io_usage_collector.cpp:116` |
 | | `freq` | double | Scheduler-level sampling frequency (Hz), parsed by `CollectorScheduler`, not by NewIOUsageCollector `init()` | `collector_scheduler.cpp` |
+
+**CPUMemCollector Notes**:
+- Job summary records (`summary: "true"`, `pid=0`) report `mem_peak_rss_kb` as the
+  maximum of the **per-sample aggregated** RSS, not the sum of each process's
+  `VmHWM`. Per-process records keep `VmHWM` semantics. `sample_count` states how
+  many samples the peak is based on (1 means the job was only seen once).
+- `mem_pss_kb` is PSS (proportional set size): shared pages are split across the
+  processes that map them, so summing PSS over a job does not over-count shared
+  libraries, `/dev/shm` staging or forked worker pages the way summing RSS does.
+  Per-process cost is one `smaps_rollup` read (~0.1 ms for a 60 MB / 50-VMA
+  process), controlled by `pss` / `pss_fallback_smaps`. When PSS is unavailable
+  the field is omitted instead of reported as `0`.
+- Job total CPU time is `utime + stime + cutime + cstime`: `cutime`/`cstime`
+  carry the CPU of children that were already reaped, which is otherwise lost
+  when a short-lived child exits between two samples. `cpuPercent` includes it.
 
 **FSMetadataCollector Notes**:
 - Generic filesystem metadata pressure collector capturing open/close/stat/readdir/rename/unlink/xattr/fsync operations

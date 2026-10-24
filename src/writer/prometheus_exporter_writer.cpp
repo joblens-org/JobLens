@@ -100,6 +100,7 @@ void PrometheusExporterWriter::update_job_metrics(const prometheus_job_state& da
                 update_ref->threads_cnt = s.threads_cnt;
                 update_ref->mem_usage_percent = s.mem_usage_percent;
                 update_ref->mem_vm_kb = s.mem_vm_kb;
+                update_ref->mem_pss_kb = s.mem_pss_kb;
                 break;
             
             case PrmxsCollectorType::IO:
@@ -218,6 +219,7 @@ json nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_process_state
         {"mem_usage_percent",          s.mem_usage_percent},
         {"mem_rss_kb",                 s.mem_rss_kb},
         {"mem_vm_kb",                  s.mem_vm_kb},
+        {"mem_pss_kb",                 s.mem_pss_kb},
         {"threads_cnt",                s.threads_cnt},
 
         {"io_read_bytes_total",        s.io_read_bytes_total},

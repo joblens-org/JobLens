@@ -46,6 +46,8 @@ public:
         double mem_usage_percent = 0.0; // job_memory_usage_percent (Gauge)
         int64_t mem_rss_kb = 0;   // job_memory_rss_kb        (Gauge)
         int64_t mem_vm_kb = 0;    // job_memory_vm_kb         (Gauge)
+        // job_memory_pss_kb (Gauge)；-1 表示本次未采到 PSS（未开启或内核不支持）
+        int64_t mem_pss_kb = -1;
         int32_t threads_cnt = 0;  // job_threads_count        (Gauge)
 
         /* ========== I/O ========== */

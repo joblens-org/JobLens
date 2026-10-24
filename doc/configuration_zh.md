@@ -162,6 +162,8 @@ net_sys_collector_config:
 | 收集器类型 | 配置参数 | 值类型 | 描述 |
 |-----------|---------|--------|------|
 | **CPUMemCollector** | `summary` | string | 为 `"true"` 时，将所有进程的 CPU/内存数据聚合为一条摘要记录（pid=0） |
+| | `pss` | bool | 默认 `true`。采集 PSS（比例集大小，共享页按进程数均摊）；`false` 时完全不读 `smaps_rollup`，输出中省略 `mem_pss_kb` |
+| | `pss_fallback_smaps` | bool | 默认 `true`。内核无 `smaps_rollup` 时降级为逐 VMA 解析 `smaps`（成本更高）；设为 `false` 则直接关闭 PSS |
 | **IOUsageCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的 I/O 数据 |
 | | `use_ebpf` | string | 为 `"true"` 时，使用 eBPF 采集文件级 I/O 数据（需要 root 权限和内核支持） |
 | **NetUsageCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的网络数据 |
@@ -174,6 +176,17 @@ net_sys_collector_config:
 | | `freq` | double | 调度器层采样频率（Hz），由 `CollectorScheduler` 解析，不在 FSMetadataCollector 的 `init()` 中解析。建议元数据负载场景使用 1 Hz |
 | **NewIOUsageCollector** | `include_process_details` | string | 为 `"true"`（默认）时，输出 Job 聚合数据和进程级/文件级明细；为 `"false"` 时，只输出 Job 聚合数据（`processes`/`files` 为空），可显著降低高文件句柄作业的输出量 |
 | | `freq` | double | 调度器层采样频率（Hz），由 `CollectorScheduler` 解析，不在 NewIOUsageCollector 的 `init()` 中解析 |
+
+**CPUMemCollector 说明**：
+- 摘要记录（`summary: "true"`，`pid=0`）中的 `mem_peak_rss_kb` 是**每次采样聚合值**的时序最大值，
+  不再是把各进程 `VmHWM` 相加（各进程峰值出现时刻不同，相加会系统性偏高）。
+  进程级记录仍保留 `VmHWM` 语义；`sample_count` 表示峰值基于多少次采样（1 表示只采到一次）。
+- `mem_pss_kb` 为 PSS（比例集大小）：共享页按映射它的进程数均摊，因此跨进程求和不会像 RSS
+  那样重复计数（共享库、`/dev/shm` 暂存、fork 出的 worker 页）。单进程成本约为一次
+  `smaps_rollup` 读取（60MB / 50 个 VMA 的进程约 0.1ms），由 `pss` / `pss_fallback_smaps` 控制。
+  PSS 不可用时字段直接省略，而不是上报 0。
+- 作业 CPU 总量为 `utime + stime + cutime + cstime`：`cutime`/`cstime` 保留已被回收子进程的 CPU，
+  否则两次采样之间起停的短命令 CPU 会丢失；`cpuPercent` 同样计入这部分时间。
 
 **FSMetadataCollector 说明**：
 - 通用文件系统元数据压力采集器，捕获 open/close/stat/readdir/rename/unlink/xattr/fsync 等操作

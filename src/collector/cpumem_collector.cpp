@@ -17,6 +17,8 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <filesystem>
 #include <unistd.h>
@@ -29,6 +31,50 @@ namespace {
 
 bool IsVanishedProcPath(int err) {
     return err == ENOENT || err == ENOTDIR;
+}
+
+// 采集器配置统一经由 yamlToJson 转成字符串，这里同时兼容字符串、bool 与整数写法。
+bool ConfigBool(const nlohmann::json& cfg, const char* key, bool default_value) {
+    if (!cfg.is_object() || !cfg.contains(key) || cfg[key].is_null()) return default_value;
+    const auto& value = cfg[key];
+    if (value.is_boolean()) return value.get<bool>();
+    if (value.is_number_integer()) return value.get<long long>() != 0;
+    if (value.is_string()) {
+        std::string text = value.get<std::string>();
+        std::transform(text.begin(), text.end(), text.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return text == "true" || text == "1" || text == "yes" || text == "on";
+    }
+    return default_value;
+}
+
+// 单进程/汇总记录共用同一套字段映射，避免三份 parser（ES/File/V2）口径漂移。
+nlohmann::json ToJson(const CPUMemInfo& info) {
+    nlohmann::json j;
+    j["pid"] = info.pid;
+    j["ppid"] = info.ppid;
+    j["name"] = info.name;
+    j["cpuPercent"] = info.cpuPercent;
+    j["utime"] = info.utime;
+    j["stime"] = info.stime;
+    // 已回收子进程的累计 CPU：子进程退出后只能从这里取回它的 CPU 时间。
+    j["cutime"] = info.cutime;
+    j["cstime"] = info.cstime;
+    j["starttime"] = info.starttime;
+    j["hz"] = info.hz;
+    j["mem_vm_kb"] = info.mem_vm_kb;
+    j["mem_rss_kb"] = info.mem_rss_kb;
+    j["mem_swap_kb"] = info.mem_swap_kb;
+    j["mem_peak_rss_kb"] = info.mem_peak_rss_kb;
+    // PSS 不可用时不出字段，避免把「没有数据」渲染成 0。
+    if (info.mem_pss_kb >= 0) j["mem_pss_kb"] = info.mem_pss_kb;
+    if (info.pid == 0) {
+        if (info.mem_peak_pss_kb >= 0) j["mem_peak_pss_kb"] = info.mem_peak_pss_kb;
+        j["sample_count"] = info.sample_count;
+    }
+    j["memoryPercent"] = info.memoryPercent;
+    j["numThreads"] = info.numThreads;
+    return j;
 }
 
 bool IsProcessStatusGone(int pid) {
@@ -71,6 +117,8 @@ ProcessStatRead ReadProcessStat(int pid, CPUMemInfo& info) {
     info.name = line.substr(p1 + 1, p2 - p1 - 1);
     info.utime = utime;
     info.stime = stime;
+    info.cutime = cutime;
+    info.cstime = cstime;
     info.starttime = starttime;
     info.ppid = ppid;
     return ProcessStatRead::Ok;
@@ -95,10 +143,27 @@ bool CPUMemCollector::init(const nlohmann::json& cfg) {
     }
     spdlog::info("CPUMemCollector init with config: {}", cfg.dump());
 
-    if(cfg.contains("summary") && cfg["summary"].get<std::string>() == "true"){
-        summary = true;
-    }else{
-        summary = false;
+    summary = ConfigBool(cfg, "summary", false);
+
+    // PSS 采集策略：能力探测 + 配置开关 + 降级。
+    //   smaps_rollup 可用   → 单次聚合读，成本最低；
+    //   仅 smaps 可用      → 逐 VMA 累加 Pss（旧内核降级路径，可关闭）；
+    //   两者都不可用       → 关闭 PSS，输出中省略该字段而不是给出 0。
+    pss_enabled = ConfigBool(cfg, "pss", true);
+    pss_fallback_smaps = ConfigBool(cfg, "pss_fallback_smaps", true);
+    std::error_code ec;
+    if (!pss_enabled) {
+        pss_mode = PssMode::Disabled;
+        spdlog::info("CPUMemCollector: PSS collection disabled by config");
+    } else if (std::filesystem::exists("/proc/self/smaps_rollup", ec)) {
+        pss_mode = PssMode::Rollup;
+        spdlog::info("CPUMemCollector: PSS enabled via smaps_rollup");
+    } else if (pss_fallback_smaps && std::filesystem::exists("/proc/self/smaps", ec)) {
+        pss_mode = PssMode::Smaps;
+        spdlog::warn("CPUMemCollector: smaps_rollup unavailable, PSS degrades to smaps (higher per-sample cost)");
+    } else {
+        pss_mode = PssMode::Disabled;
+        spdlog::warn("CPUMemCollector: no smaps_rollup/smaps available, mem_pss_kb will be omitted");
     }
 
     inited = true;
@@ -112,6 +177,7 @@ void CPUMemCollector::deinit() noexcept {
     }
     inited = false;
     pid_state_dict.clear();
+    job_peak_map.clear();
     last_prune_ = {};
     spdlog::info("CPUMemCollector deinit");
 }
@@ -143,6 +209,21 @@ void CPUMemCollector::prune_stale_pid_states(const std::chrono::steady_clock::ti
     if (removed > 0) {
         spdlog::debug("CPUMemCollector: pruned {} stale pid baselines", removed);
     }
+
+    // 作业级峰值同样按 TTL 回收：作业结束后不再有采样，条目会自然过期。
+    constexpr double kJobPeakTtlSeconds = 3600.0;
+    size_t pruned_jobs = 0;
+    for (auto it = job_peak_map.begin(); it != job_peak_map.end();) {
+        if (std::chrono::duration<double>(now - it->second.last_seen).count() > kJobPeakTtlSeconds) {
+            it = job_peak_map.erase(it);
+            ++pruned_jobs;
+        } else {
+            ++it;
+        }
+    }
+    if (pruned_jobs > 0) {
+        spdlog::debug("CPUMemCollector: pruned {} stale job peak states", pruned_jobs);
+    }
 }
 
 // 静态函数：读 /proc/stat 获取系统总 jiffies
@@ -167,7 +248,11 @@ bool CPUMemCollector::CPUOf(int pid, CPUMemInfo& info, const CpuSample& sample,
     /* ---- 计算 CPU 百分比 ---- */
     info.hz = sample.hz;
     if (info.hz > 0 && sample.numCores > 0) {
-        const unsigned long long currProc = info.utime + info.stime;
+        // 计入 cutime/cstime：短命令（gzip/tar/pre-post 脚本）在两个采样点之间
+        // fork 完就退出，其 /proc/<pid> 早已消失，只有父进程的 children 累计量
+        // 还留着这段 CPU。存活子进程的自身时间不会被父进程 cutime 重复统计，
+        // 因为内核只在子进程被 reap 时才把它累加进父进程。
+        const unsigned long long currProc = info.utime + info.stime + info.cutime + info.cstime;
         auto& cu = pid_state_dict[pid];
         const bool pidReused = cu.lastStarttime != 0 && cu.lastStarttime != info.starttime;
         unsigned long long deltaProc = 0;
@@ -247,6 +332,11 @@ bool CPUMemCollector::MemOf(int pid,CPUMemInfo& info){
             iss >> key >> val >> unit;
             info.mem_peak_rss_kb = val;
         }
+        else if (line.compare(0, 7, "VmSwap:") == 0)
+        {
+            iss >> key >> val >> unit;
+            info.mem_swap_kb = val;
+        }
         else if (line.compare(0, 8, "Threads:") == 0){
             iss >> key >> val;
             info.numThreads = val;
@@ -262,6 +352,72 @@ bool CPUMemCollector::MemOf(int pid,CPUMemInfo& info){
         }
         return false;
     }
+    return true;
+}
+
+// PSS：/proc/<pid>/smaps_rollup 的单次聚合读（内核 4.14+）。
+// 只取顶层 "Pss:" 行，"Pss_Anon:"/"Pss_File:"/"Pss_Shmem:" 不计入。
+bool CPUMemCollector::ReadRollupPssKb(int pid, long& pss_kb) {
+    errno = 0;
+    std::ifstream f(fmt::format("/proc/{}/smaps_rollup", pid));
+    if (!f) {
+        spdlog::debug("PSS: cannot open /proc/{}/smaps_rollup (errno={})", pid, errno);
+        return false;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.compare(0, 4, "Pss:") != 0) continue;
+        std::istringstream iss(line);
+        std::string key, unit;
+        long val = 0;
+        if (!(iss >> key >> val)) return false;
+        pss_kb = val;
+        return true;
+    }
+    // 僵尸进程的 smaps_rollup 为空，没有 Pss 行；它本来也不占用内存，按不可用处理。
+    return false;
+}
+
+// PSS 降级路径：旧内核没有 smaps_rollup，逐 VMA 累加 smaps 的 "Pss:" 行。
+bool CPUMemCollector::ReadSmapsPssKb(int pid, long& pss_kb) {
+    errno = 0;
+    std::ifstream f(fmt::format("/proc/{}/smaps", pid));
+    if (!f) {
+        spdlog::debug("PSS: cannot open /proc/{}/smaps (errno={})", pid, errno);
+        return false;
+    }
+    long total = 0;
+    bool found = false;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.compare(0, 4, "Pss:") != 0) continue;
+        std::istringstream iss(line);
+        std::string key;
+        long val = 0;
+        if (!(iss >> key >> val)) continue;
+        total += val;
+        found = true;
+    }
+    if (!found) return false;
+    pss_kb = total;
+    return true;
+}
+
+// 读取失败（进程刚退出 / 权限受限）不视为 0，而是标记为不可用；
+// 汇总时只有全部进程都取不到 PSS 才省略该字段，单个进程失败按 0 计入。
+bool CPUMemCollector::PssOf(int pid, CPUMemInfo& info) {
+    if (pss_mode == PssMode::Disabled) {
+        info.mem_pss_kb = -1;
+        return false;
+    }
+    long pss_kb = 0;
+    const bool ok = (pss_mode == PssMode::Rollup) ? ReadRollupPssKb(pid, pss_kb)
+                                                  : ReadSmapsPssKb(pid, pss_kb);
+    if (!ok) {
+        info.mem_pss_kb = -1;
+        return false;
+    }
+    info.mem_pss_kb = pss_kb;
     return true;
 }
 
@@ -302,7 +458,8 @@ CollectResult CPUMemCollector::collect(const Job& job) {
         if (pid <= 0) continue;
         info.pid = pid;
         if (!CPUOf(pid, info, sample, now)) info.name = get_process_name(pid);
-        MemOf(pid, info);
+        // 进程已消失/无法读取 status 时不再尝试 PSS，省掉一次必然失败的 open。
+        if (MemOf(pid, info)) PssOf(pid, info);
         if (!info.pid) continue;
         // job.JobInfo[fmt::format("proc_info_{}", pid)] = info.get();
         infos.push_back(info);
@@ -312,22 +469,55 @@ CollectResult CPUMemCollector::collect(const Job& job) {
         CPUMemInfo sum_info;
         sum_info.pid = 0;
         sum_info.name = "JOB-SUMMARY";
-        auto min_starttime = std::numeric_limits<unsigned long long>::max();
+        long pss_sum = 0;
+        bool pss_seen = false;
         for(const auto& info: infos){
             sum_info.cpuPercent += info.cpuPercent;
             sum_info.memoryPercent += info.memoryPercent;
             sum_info.utime += info.utime;
             sum_info.stime += info.stime;
+            // 汇总后的作业 CPU 总量 = 存活进程自身时间 + 已被回收的短命子进程时间
+            sum_info.cutime += info.cutime;
+            sum_info.cstime += info.cstime;
             sum_info.mem_vm_kb += info.mem_vm_kb;
             sum_info.mem_rss_kb += info.mem_rss_kb;
             sum_info.mem_swap_kb += info.mem_swap_kb;
-            sum_info.mem_peak_rss_kb += info.mem_peak_rss_kb;
+            // 注意：这里不再累加各进程的 VmHWM（mem_peak_rss_kb），
+            // 各进程峰值出现在不同时刻，相加只会得到系统性偏高的上界。
+            if (info.mem_pss_kb >= 0) {
+                pss_sum += info.mem_pss_kb;
+                pss_seen = true;
+            }
             sum_info.numThreads += info.numThreads;
             sum_info.starttime = std::min(sum_info.starttime, info.starttime);
         }
+        sum_info.mem_pss_kb = pss_seen ? pss_sum : -1;
+        // 作业级峰值 = 对「采样聚合值」序列取 max；见 update_job_peak()
+        update_job_peak(job, sum_info, now);
         infos.push_back(sum_info);
     }
     return infos;
+}
+
+// 作业级峰值必须对「每次采样的聚合值」取 max，而不是把各进程自身的峰值相加：
+// 500MB 的父进程和 500MB 的子进程可能先后达到峰值，求和会报出 1GB，
+// 而作业任一时刻的真实占用最多 500MB。sample_count 供下游判断峰值/均值
+// 是否只基于极少数采样（例如秒级短作业只被采到 1 次）。
+void CPUMemCollector::update_job_peak(const Job& job, CPUMemInfo& summary_info,
+                                      const std::chrono::steady_clock::time_point& now) {
+    auto& peak = job_peak_map[job.JobID];
+    peak.last_seen = now;
+    ++peak.samples;
+    if (summary_info.mem_rss_kb > peak.peak_rss_kb) {
+        peak.peak_rss_kb = summary_info.mem_rss_kb;
+    }
+    if (summary_info.mem_pss_kb >= 0 &&
+        summary_info.mem_pss_kb > peak.peak_pss_kb) {
+        peak.peak_pss_kb = summary_info.mem_pss_kb;
+    }
+    summary_info.mem_peak_rss_kb = peak.peak_rss_kb;
+    summary_info.mem_peak_pss_kb = peak.peak_pss_kb;
+    summary_info.sample_count = peak.samples;
 }
 
 CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& writer_type){
@@ -346,21 +536,7 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
             spdlog::trace("CPUMemCollector: parsing data for ESWriter, data length={}", parsed.size());
             for (const auto& info : parsed) {
                 
-                nlohmann::json j;
-                j["pid"] = info.pid;
-                j["ppid"] = info.ppid;
-                j["name"] = info.name;
-                j["cpuPercent"] = info.cpuPercent;
-                j["utime"] = info.utime;
-                j["stime"] = info.stime;
-                j["starttime"] = info.starttime;
-                j["hz"] = info.hz;
-                j["mem_vm_kb"] = info.mem_vm_kb;
-                j["mem_rss_kb"] = info.mem_rss_kb;
-                j["mem_swap_kb"] = info.mem_swap_kb;
-                j["mem_peak_rss_kb"] = info.mem_peak_rss_kb;
-                j["memoryPercent"] = info.memoryPercent;
-                j["numThreads"] = info.numThreads;
+                nlohmann::json j = ToJson(info);
                 if (spdlog::should_log(spdlog::level::trace)) {
                     spdlog::trace("CPUMemCollector: parsed data: {}", j.dump());
                 }
@@ -387,21 +563,7 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
             const auto& parsed = std::any_cast<const std::vector<CPUMemInfo>&>(data);
             spdlog::trace("CPUMemCollector: parsing data for FileWriter, data length={}", parsed.size());
             for (const auto& info : parsed) {
-                nlohmann::json j;
-                j["pid"] = info.pid;
-                j["ppid"] = info.ppid;
-                j["name"] = info.name;
-                j["cpuPercent"] = info.cpuPercent;
-                j["utime"] = info.utime;
-                j["stime"] = info.stime;
-                j["starttime"] = info.starttime;
-                j["hz"] = info.hz;
-                j["mem_vm_kb"] = info.mem_vm_kb;
-                j["mem_rss_kb"] = info.mem_rss_kb;
-                j["mem_swap_kb"] = info.mem_swap_kb;
-                j["mem_peak_rss_kb"] = info.mem_peak_rss_kb;
-                j["memoryPercent"] = info.memoryPercent;
-                j["numThreads"] = info.numThreads;
+                nlohmann::json j = ToJson(info);
                 if(info.pid == 0){
                     ret["summary"] = std::move(j);
                 }else{
@@ -432,6 +594,7 @@ CollectDataParseFunc CPUMemCollector::get_writer_parser(const std::string& write
                 state.mem_rss_kb = info.mem_rss_kb;
                 state.mem_usage_percent = info.memoryPercent;
                 state.mem_vm_kb = info.mem_vm_kb;
+                state.mem_pss_kb = info.mem_pss_kb;
                 state.name = info.name;
                 ret.processes_state.push_back(state);
             }
@@ -455,21 +618,7 @@ CollectDataParseFuncV2 CPUMemCollector::get_writer_parser_v2(const std::string& 
             const auto& parsed = std::any_cast<const std::vector<CPUMemInfo>&>(data);
             spdlog::trace("CPUMemCollector: V2 parsing data for FileWriter, data length={}", parsed.size());
             for (const auto& info : parsed) {
-                nlohmann::json j;
-                j["pid"] = info.pid;
-                j["ppid"] = info.ppid;
-                j["name"] = info.name;
-                j["cpuPercent"] = info.cpuPercent;
-                j["utime"] = info.utime;
-                j["stime"] = info.stime;
-                j["starttime"] = info.starttime;
-                j["hz"] = info.hz;
-                j["mem_vm_kb"] = info.mem_vm_kb;
-                j["mem_rss_kb"] = info.mem_rss_kb;
-                j["mem_swap_kb"] = info.mem_swap_kb;
-                j["mem_peak_rss_kb"] = info.mem_peak_rss_kb;
-                j["memoryPercent"] = info.memoryPercent;
-                j["numThreads"] = info.numThreads;
+                nlohmann::json j = ToJson(info);
                 if (info.pid == 0) {
                     ret["summary"] = std::move(j);
                 } else {

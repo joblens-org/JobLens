@@ -18,10 +18,23 @@ static std::string denied_stat;
 static int denied_stat_errno = EACCES;
 static std::map<std::string, std::string> fake_files;   // 目标 /proc 路径 -> 伪造文件路径
 static std::map<std::string, int> fake_file_fds;
+static std::map<std::string, int> fake_opens;           // 目标 /proc 路径被读取的次数
 static unsigned clock_queries = 0, core_queries = 0;
 
 static std::string stat_path(pid_t pid) {
     return "/proc/" + std::to_string(pid) + "/stat";
+}
+
+static std::string status_path(pid_t pid) {
+    return "/proc/" + std::to_string(pid) + "/status";
+}
+
+static std::string rollup_path(pid_t pid) {
+    return "/proc/" + std::to_string(pid) + "/smaps_rollup";
+}
+
+static std::string smaps_path(pid_t pid) {
+    return "/proc/" + std::to_string(pid) + "/smaps";
 }
 
 // 为某个 /proc 路径登记伪造内容；同一目标后续调用原地重写文件。
@@ -52,6 +65,57 @@ static std::string make_stat_line(pid_t pid, const std::string& comm,
     return os.str() + "\n";
 }
 
+// 带子进程累计量的 /proc/<pid>/stat：cutime/cstime 是已被回收子进程的 CPU 时间。
+static std::string make_stat_line_with_children(pid_t pid, const std::string& comm,
+                                                unsigned long long utime, unsigned long long stime,
+                                                unsigned long long cutime, unsigned long long cstime,
+                                                unsigned long long starttime) {
+    std::ostringstream os;
+    os << pid << " (" << comm << ") S 1 2 3 4 5 0 0 0 0 0 "
+       << utime << " " << stime << " " << cutime << " " << cstime
+       << " 20 0 1 0 " << starttime
+       << " 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
+    return os.str() + "\n";
+}
+
+static std::string make_status_line(unsigned long long rss_kb, unsigned long long vm_kb,
+                                    unsigned long long hwm_kb, unsigned long long swap_kb,
+                                    int threads) {
+    std::ostringstream os;
+    os << "Name:\tworker\n"
+       << "VmPeak:\t" << vm_kb << " kB\n"
+       << "VmSize:\t" << vm_kb << " kB\n"
+       << "VmHWM:\t" << hwm_kb << " kB\n"
+       << "VmRSS:\t" << rss_kb << " kB\n"
+       << "RssAnon:\t" << rss_kb << " kB\n"
+       << "VmSwap:\t" << swap_kb << " kB\n"
+       << "Threads:\t" << threads << "\n";
+    return os.str();
+}
+
+// smaps_rollup 只有一组聚合行，Pss_* 子项不能被计入顶层 Pss。
+static std::string make_rollup_line(unsigned long long pss_kb) {
+    std::ostringstream os;
+    os << "00400000-7ffc0000 r-xp 00000000 08:01 1 /usr/bin/worker\n"
+       << "Rss:\t\t" << pss_kb * 2 << " kB\n"
+       << "Pss:\t\t" << pss_kb << " kB\n"
+       << "Pss_Anon:\t" << pss_kb / 2 << " kB\n"
+       << "Pss_File:\t" << pss_kb / 2 << " kB\n"
+       << "Pss_Shmem:\t0 kB\n"
+       << "Swap:\t\t0 kB\n";
+    return os.str();
+}
+
+// 逐 VMA 的 smaps：每个映射各有一条 Pss 行，降级路径需要把它们累加。
+static std::string make_smaps_body(unsigned long long pss_a, unsigned long long pss_b) {
+    std::ostringstream os;
+    os << "00400000-00401000 r-xp 00000000 08:01 1 /usr/bin/worker\n"
+       << "Size:\t4 kB\nRss:\t4 kB\nPss:\t" << pss_a << " kB\nPss_Anon:\t0 kB\n\n"
+       << "7f000000-7f001000 rw-p 00000000 00:00 0 [heap]\n"
+       << "Size:\t4 kB\nRss:\t4 kB\nPss:\t" << pss_b << " kB\nPss_Anon:\t" << pss_b << " kB\n\n";
+    return os.str();
+}
+
 // 伪造 /proc/stat 第一行：read_system_cpu 求和该行所有数值字段。
 static std::string make_proc_stat_line(unsigned long long total) {
     std::ostringstream os;
@@ -70,6 +134,7 @@ extern "C" FILE* fopen64(const char* path, const char* mode) {
     }
     const auto it = fake_files.find(path ? std::string(path) : std::string());
     if (it != fake_files.end()) {
+        ++fake_opens[path];
         return real_open(it->second.c_str(), mode);
     }
     return real_open(path, mode);
@@ -98,7 +163,30 @@ struct CPUMemCollectorTestAccess {
     static void prune_now(CPUMemCollector& collector) {
         collector.prune_stale_pid_states(std::chrono::steady_clock::now());
     }
+    static size_t job_peaks(const CPUMemCollector& collector) {
+        return collector.job_peak_map.size();
+    }
+    static bool uses_rollup(const CPUMemCollector& collector) {
+        return collector.pss_mode == CPUMemCollector::PssMode::Rollup;
+    }
+    static void force_smaps_mode(CPUMemCollector& collector) {
+        collector.pss_mode = CPUMemCollector::PssMode::Smaps;
+    }
 };
+
+static const CPUMemInfo& summary_of(const std::vector<CPUMemInfo>& infos) {
+    for (const auto& info : infos) {
+        if (info.pid == 0) return info;
+    }
+    throw std::runtime_error("summary record missing");
+}
+
+static const CPUMemInfo& record_of(const std::vector<CPUMemInfo>& infos, pid_t pid) {
+    for (const auto& info : infos) {
+        if (info.pid == pid) return info;
+    }
+    throw std::runtime_error("process record missing");
+}
 
 static void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -123,6 +211,7 @@ int main() {
     spdlog::set_level(spdlog::level::warn);
     try {
         const double cores = static_cast<double>(__real_sysconf(_SC_NPROCESSORS_ONLN));
+        const bool pss_supported = access("/proc/self/smaps_rollup", F_OK) == 0;
         Child child;
         CPUMemCollector collector;
         require(collector.init({}), "collector init failed");
@@ -141,6 +230,12 @@ int main() {
                         std::isfinite(info.cpuPercent), "real proc sample invalid");
                 require(info.cpuPercent >= 0.0 && info.cpuPercent <= 100.0 * cores,
                         "cpuPercent outside physical machine range");
+                if (pss_supported) {
+                    require(info.mem_pss_kb >= 0 && info.mem_pss_kb <= info.mem_rss_kb,
+                            "real PSS sample outside [0, RSS]");
+                } else {
+                    require(info.mem_pss_kb == -1, "PSS unavailable but a value was reported");
+                }
                 if (info.pid == child.pid) expected_name = info.name;
             }
             require(core_queries - before_cores == 1, "online core count queried more than once per Job");
@@ -345,8 +440,136 @@ int main() {
             fake_file_fds.clear();
         }
 
+        // 作业级计量口径：peak 取「采样聚合值」的时序 max（而不是各进程峰值之和），
+        // 同时覆盖 VmSwap、PSS 聚合与 cutime/cstime 补齐短命子进程 CPU。
+        {
+            Child a, b;
+            CPUMemCollector agg;
+            require(agg.init({{"summary", "true"}}), "summary collector init failed");
+            if (access("/proc/self/smaps_rollup", F_OK) == 0) {
+                require(CPUMemCollectorTestAccess::uses_rollup(agg),
+                        "smaps_rollup capability probe did not pick the fast path");
+            }
+            Job agg_job;
+            agg_job.JobID = 31;
+            agg_job.JobPIDs = {a.pid, b.pid};
+            const unsigned long long t0 = 1000000000ULL;
+            const unsigned long long tick = 500ULL * static_cast<unsigned long long>(cores);
+
+            // 采样 1：A 10MB/PSS 4MB/swap 1MB，B 20MB/PSS 6MB/swap 2MB；两进程 VmHWM 都是 50MB
+            write_fake_stat(stat_path(a.pid), make_stat_line_with_children(a.pid, "a", 0, 0, 0, 0, 811));
+            write_fake_stat(stat_path(b.pid), make_stat_line_with_children(b.pid, "b", 0, 0, 0, 0, 812));
+            write_fake_stat(status_path(a.pid), make_status_line(10240, 65536, 51200, 1024, 2));
+            write_fake_stat(status_path(b.pid), make_status_line(20480, 65536, 51200, 2048, 3));
+            write_fake_stat(rollup_path(a.pid), make_rollup_line(4096));
+            write_fake_stat(rollup_path(b.pid), make_rollup_line(6144));
+            write_fake_stat("/proc/stat", make_proc_stat_line(t0));
+            const auto first_sample = std::any_cast<std::vector<CPUMemInfo>>(agg.collect(agg_job));
+            require(first_sample.size() == 3, "summary record missing");
+            const auto& sum1 = summary_of(first_sample);
+            require(sum1.mem_rss_kb == 30720 && sum1.mem_pss_kb == 10240 && sum1.mem_swap_kb == 3072,
+                    "summary aggregation of RSS/PSS/VmSwap is wrong");
+            require(sum1.mem_peak_rss_kb == 30720 && sum1.mem_peak_pss_kb == 10240 &&
+                    sum1.sample_count == 1, "first sample peak is not the aggregated value");
+            for (const auto& info : first_sample) {
+                if (info.pid != 0) {
+                    require(info.mem_peak_rss_kb == 51200, "per-process VmHWM semantics changed");
+                }
+            }
+
+            // 采样 2：A 40MB/PSS 10MB/swap 4MB + 已回收子进程 90 jiffies；B 30MB/PSS 8MB/swap 3MB
+            write_fake_stat(stat_path(a.pid), make_stat_line_with_children(a.pid, "a", 10, 0, 90, 0, 811));
+            write_fake_stat(stat_path(b.pid), make_stat_line_with_children(b.pid, "b", 0, 0, 0, 0, 812));
+            write_fake_stat(status_path(a.pid), make_status_line(40960, 65536, 51200, 4096, 2));
+            write_fake_stat(status_path(b.pid), make_status_line(30720, 65536, 51200, 3072, 3));
+            write_fake_stat(rollup_path(a.pid), make_rollup_line(10240));
+            write_fake_stat(rollup_path(b.pid), make_rollup_line(8192));
+            write_fake_stat("/proc/stat", make_proc_stat_line(t0 + tick));
+            const auto second_sample = std::any_cast<std::vector<CPUMemInfo>>(agg.collect(agg_job));
+            const auto& sum2 = summary_of(second_sample);
+            require(sum2.mem_rss_kb == 71680 && sum2.mem_pss_kb == 18432 && sum2.mem_swap_kb == 7168,
+                    "second sample aggregation is wrong");
+            // 各进程 VmHWM 之和是 100MB，真实作业峰值是两次采样聚合值的 max = 70MB
+            require(sum2.mem_peak_rss_kb == 71680, "job peak still sums per-process VmHWM");
+            require(sum2.mem_peak_pss_kb == 18432 && sum2.sample_count == 2,
+                    "job PSS peak or sample count is wrong");
+            require(sum2.cutime == 90 && sum2.cstime == 0,
+                    "reaped children CPU was not carried into the job summary");
+            require(std::abs(record_of(second_sample, a.pid).cpuPercent - 20.0) < 0.5,
+                    "cpuPercent does not include reaped children CPU");
+
+            const auto agg_doc = std::any_cast<nlohmann::json>(
+                agg.get_writer_parser("ESWriter")(second_sample));
+            const auto& sum_json = agg_doc.at("summary");
+            require(sum_json.at("mem_peak_rss_kb").get<long>() == 71680 &&
+                    sum_json.at("mem_pss_kb").get<long>() == 18432 &&
+                    sum_json.at("sample_count").get<unsigned long long>() == 2 &&
+                    sum_json.contains("cutime") && sum_json.contains("cstime"),
+                    "summary JSON lost the job-level accounting fields");
+            require(CPUMemCollectorTestAccess::job_peaks(agg) == 1, "job peak state is not per-job");
+            agg.deinit();
+            require(CPUMemCollectorTestAccess::job_peaks(agg) == 0,
+                    "deinit did not release job peak states");
+            fake_files.clear();
+            fake_file_fds.clear();
+        }
+
+        // PSS 开关：关闭后不得再读 smaps_rollup，且输出中省略字段而不是给 0。
+        {
+            Child c;
+            CPUMemCollector no_pss;
+            require(no_pss.init({{"summary", "true"}, {"pss", "false"}}), "pss=false init failed");
+            Job no_pss_job;
+            no_pss_job.JobID = 32;
+            no_pss_job.JobPIDs = {c.pid};
+            write_fake_stat(stat_path(c.pid), make_stat_line_with_children(c.pid, "c", 0, 0, 0, 0, 821));
+            write_fake_stat(status_path(c.pid), make_status_line(8192, 65536, 9000, 512, 1));
+            write_fake_stat(rollup_path(c.pid), make_rollup_line(4096));
+            fake_opens.clear();
+            const auto no_pss_sample = std::any_cast<std::vector<CPUMemInfo>>(no_pss.collect(no_pss_job));
+            require(fake_opens[rollup_path(c.pid)] == 0, "pss=false still read smaps_rollup");
+            require(summary_of(no_pss_sample).mem_pss_kb == -1 &&
+                    summary_of(no_pss_sample).mem_peak_pss_kb == -1,
+                    "disabled PSS must stay unavailable");
+            const auto no_pss_doc = std::any_cast<nlohmann::json>(
+                no_pss.get_writer_parser("ESWriter")(no_pss_sample));
+            require(!no_pss_doc.at("summary").contains("mem_pss_kb") &&
+                    !no_pss_doc.at("summary").contains("mem_peak_pss_kb"),
+                    "unavailable PSS was rendered as a value");
+            no_pss.deinit();
+            fake_files.clear();
+            fake_file_fds.clear();
+        }
+
+        // 降级路径：内核无 smaps_rollup 时逐 VMA 累加 smaps 的 Pss 行。
+        {
+            Child legacy_child;
+            CPUMemCollector legacy;
+            require(legacy.init({{"summary", "true"}}), "legacy collector init failed");
+            CPUMemCollectorTestAccess::force_smaps_mode(legacy);
+            Job legacy_job;
+            legacy_job.JobID = 33;
+            legacy_job.JobPIDs = {legacy_child.pid};
+            write_fake_stat(stat_path(legacy_child.pid),
+                            make_stat_line_with_children(legacy_child.pid, "legacy", 0, 0, 0, 0, 831));
+            write_fake_stat(status_path(legacy_child.pid),
+                            make_status_line(8192, 65536, 9000, 0, 1));
+            write_fake_stat(smaps_path(legacy_child.pid), make_smaps_body(12, 8));
+            const auto legacy_sample = std::any_cast<std::vector<CPUMemInfo>>(legacy.collect(legacy_job));
+            require(record_of(legacy_sample, legacy_child.pid).mem_pss_kb == 20,
+                    "smaps fallback did not accumulate per-VMA Pss");
+            require(summary_of(legacy_sample).mem_pss_kb == 20 &&
+                    summary_of(legacy_sample).mem_peak_pss_kb == 20,
+                    "smaps fallback PSS was not aggregated into the summary");
+            legacy.deinit();
+            fake_files.clear();
+            fake_file_fds.clear();
+        }
+
         std::cout << "PASS CPUMem real proc samples, shared CPU inputs, comm fallback, PID reuse guard, "
-                     "per-PID system baseline across jobs and identity-aware stale baseline pruning\n";
+                     "per-PID system baseline across jobs and identity-aware stale baseline pruning, "
+                     "job peak from aggregated series, VmSwap, PSS aggregate/switch/degrade, "
+                     "reaped children CPU\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

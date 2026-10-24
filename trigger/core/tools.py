@@ -464,6 +464,13 @@ def joblens_format_metrics(jobs: dict) -> str:
             write_type("job_mem_rss_kb", "Per-process RSS memory in KB")
             lines.append(f'job_mem_rss_kb{{{labels}}} {proc["mem_rss_kb"]}')
 
+            # 2.1 内存 PSS（比例集大小）：共享页按进程数均摊，跨进程求和不会重复计数。
+            #     缺失（未开启 PSS 或内核不支持）时输出 -1，此处跳过而不上报假数据。
+            pss_kb = proc.get("mem_pss_kb", -1)
+            if pss_kb is not None and int(pss_kb) >= 0:
+                write_type("job_mem_pss_kb", "Per-process proportional set size in KB")
+                lines.append(f'job_mem_pss_kb{{{labels}}} {pss_kb}')
+
             # 3. 内存占比
             write_type("job_mem_usage_percent", "Per-process memory usage percent")
             lines.append(f'job_mem_usage_percent{{{labels}}} {proc["mem_usage_percent"]}')
