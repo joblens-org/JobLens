@@ -40,6 +40,8 @@ public:
     virtual std::optional<SourceRegistration> watch_fd(int fd, Interest interest) = 0;
     virtual std::optional<SourceRegistration> watch_manual(std::string name) = 0;
     virtual void cancel(SourceHandle handle) = 0;
+    // Re-arm after the worker has drained a one-shot source.
+    virtual bool rearm(SourceHandle) { return false; }
 };
 
 class SourceRegistration {
@@ -146,6 +148,19 @@ class JobBindingResolver {
 public:
     virtual ~JobBindingResolver() = default;
     virtual std::optional<Job> resolve(uint64_t job_id, uint64_t monitoring_generation) = 0;
+};
+
+class CallbackJobBindingResolver final : public JobBindingResolver {
+public:
+    using Resolver = std::function<std::optional<Job>(uint64_t, uint64_t)>;
+    explicit CallbackJobBindingResolver(Resolver resolver) : resolver_(std::move(resolver)) {}
+    std::optional<Job> resolve(uint64_t job_id, uint64_t monitoring_generation) override
+    {
+        return resolver_ ? resolver_(job_id, monitoring_generation) : std::nullopt;
+    }
+
+private:
+    Resolver resolver_;
 };
 
 class JobEventContext {

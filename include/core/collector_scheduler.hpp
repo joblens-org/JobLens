@@ -71,6 +71,30 @@ private:
         std::mutex              m_;
         size_t task_id = 0;
         std::atomic<bool>        running{false};
+        bool initialized = false;
+
+        // One serial lane per collector instance. Periodic timers and event
+        // readiness both become requests on this handle.
+        WorkHandle lane{};
+        bool lane_valid = false;
+        std::shared_ptr<StagedSourceRegistrar> registrar;
+
+        // Poller-thread readiness is only staged here; the lane consumes it.
+        std::mutex ready_m_;
+        std::vector<ReadySource> ready;
+
+        // Immutable Job snapshots visible to event contexts. Closing snapshots
+        // stay until their lane tail has been finalized.
+        std::mutex snapshot_m_;
+        std::unordered_map<uint64_t, Job> job_snapshots;
+        std::unordered_map<uint64_t, uint64_t> job_generations;
+        std::unordered_map<uint64_t, uint64_t> job_generation_counter;
+
+        // Protected by m_.
+        std::vector<uint64_t> pending_close;
+        std::vector<size_t> sweep_jobs;
+        size_t sweep_cursor = 0;
+        bool sweep_active = false;
     };
 
     struct collector_info
@@ -96,6 +120,18 @@ private:
         bool route_ok() const { return route_error.empty(); }
     };
 
+    struct CollectorLane {
+        std::string name;
+        collector_info info;
+        collector_state* state = nullptr;
+    };
+
+    struct CollectInvocation {
+        CollectOutcome outcome;
+        std::string error;
+        bool ok = true;
+    };
+
     void addJobCollectFunc(std::string name, std::string type, std::string config, CollectorHandle handle);
     void addSystemCollectFunc(std::string name, std::string type, std::string config, CollectorHandle handle);
     void addJobEventCollectFunc(std::string name, std::string type, std::string config, CollectorHandle handle);
@@ -110,11 +146,55 @@ private:
     void addJobCollect(const Job& job);
     void rmJobCollect(const Job& job);
     void updateJobCollect(const Job& job);
+    // Caller holds m_.
     void startCollector(std::string collector);
+    std::shared_ptr<CollectorLane> createLane(const std::string& name,
+                                              const collector_info& info,
+                                              collector_state& state);
+    bool initializeCollector(const std::string& name, const collector_info& info,
+                             SourceRegistrar& registrar);
+    void startPeriodicJobCollector(const std::string& name, const collector_info& info,
+                                   collector_state& state,
+                                   std::shared_ptr<CollectorLane> lane);
+    void startPeriodicSystemCollector(const std::string& name, const collector_info& info,
+                                      collector_state& state,
+                                      std::shared_ptr<CollectorLane> lane);
+    void startEventJobCollector(const std::string& name, const collector_info& info,
+                                collector_state& state,
+                                std::shared_ptr<CollectorLane> lane);
+    void startEventSystemCollector(const std::string& name, const collector_info& info,
+                                   collector_state& state,
+                                   std::shared_ptr<CollectorLane> lane);
+    WorkResult runCollectorLane(std::shared_ptr<CollectorLane> lane);
+    WorkResult runPeriodicJobSweep(CollectorLane& lane);
+    WorkResult runPeriodicSystemTick(CollectorLane& lane);
+    WorkResult runEventDrain(CollectorLane& lane);
+    void collectJobSample(CollectorLane& lane, size_t jobid,
+                          CollectorRuntime::Operation& callback);
+    void collectSystemSample(CollectorLane& lane,
+                             CollectorRuntime::Operation& callback);
+    std::shared_ptr<SampleMetadata> makeSample(const std::string& name,
+                                               const std::string& type,
+                                               const Job& job) const;
+    void attachWriteObserver(OutputContext& output, const std::string& name,
+                             std::optional<size_t> jobid,
+                             std::unique_ptr<CollectorRuntime::Operation>& write_op);
+    CollectInvocation invokePeriodicJob(const collector_info& info, const Job& job,
+                                        OutputContext& output, size_t jobid);
+    CollectInvocation invokePeriodicSystem(const collector_info& info, OutputContext& output);
+    void applyCollectResult(const std::string& name, std::optional<size_t> jobid,
+                            const CollectInvocation& result, const OutputContext& output,
+                            CollectorRuntime::Operation& callback);
+    void stopCollectorInstance(CollectorLane& lane);
+    void finalizePendingRemovals(CollectorLane& lane);
+    void recordRemovalAck(uint64_t jobID);
+    void stopAllCollectors();
     /// 挂载 Job 到采集器；返回 true 表示这是一次新的挂载（已触发 on_job_added）
     bool addJob2Collector(const Job& job, const std::string& collector);
-    /// 从采集器摘除 Job；仅在确实存在绑定时触发 on_job_removed（调用方需持有 state.m_）
-    void detachJobFromCollector(const std::string& collector_name, collector_state& state, const Job& job);
+    /// 从采集器摘除 Job；返回 true 表示 Removed 钩子被延后到 event lane。
+    /// 调用方需持有 state.m_ 以及 m_。
+    bool detachJobFromCollector(const std::string& collector_name, collector_state& state,
+                                const Job& job, bool job_ending);
     /// 分发 Job 作用域钩子；调用方需持有该采集器的 state.m_
     void fireJobHook(const std::string& collector_name, JobEvent event, const Job& job);
     /// 向所有运行中的 System 作用域采集器广播 Job 事件；调用方需持有 m_
@@ -132,6 +212,8 @@ private:
 
     std::mutex              m_;
     std::mutex shutdown_mutex_;
+    std::mutex removal_m_;
+    std::unordered_map<uint64_t, size_t> removal_pending_;
     std::unordered_map<std::string, collector_info> collector_info_dict;
     std::unordered_map<std::string, collector_state> collector_state_dict;
     double default_freq;

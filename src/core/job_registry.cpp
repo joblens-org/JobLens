@@ -537,7 +537,7 @@ bool JobRegistry::addJob(const Job& job, bool from_db) {
             }
         }
         
-        if (jobs_.count(job.JobID)) {
+        if (jobs_.count(job.JobID) || closing_jobs_.count(job.JobID)) {
             spdlog::warn("JobRegistry: duplicate jobID {}, ignored", job.JobID);
             return false;
         }
@@ -575,23 +575,67 @@ bool JobRegistry::addJob(const Job& job, bool from_db) {
 
 void JobRegistry::delJob(uint64_t jobID) {
     Job removed;                // 先拷贝出来，再回调，避免锁内回调
+    bool has_callbacks = false;
     {
         std::lock_guard lg(mtx_);
         auto it = jobs_.find(jobID);
         if (it == jobs_.end()) return;
         removed = std::move(it->second);
         jobs_.erase(it);
+        closing_jobs_[jobID] = removed;
+        has_callbacks = !cbs_.empty();
     }
-    for (const auto& cb : cbs_) cb(JobEvent::Removed, removed);
-    remove_job_from_kernel(removed);
-    spdlog::info("JobRegistry: remove job with JobID {}", removed.JobID);
-    end_job_in_db(removed.JobID);
-    return;
+
+    if (has_callbacks) {
+        // Collectors retain the snapshot and acknowledge after their accepted
+        // tail has drained; kernel attribution and history wait for that ack.
+        for (const auto& cb : cbs_) cb(JobEvent::Removed, removed);
+        return;
+    }
+    finishJobRemoval(removed);
+}
+
+bool JobRegistry::acknowledgeJobRemoval(uint64_t jobID) {
+    Job removed;
+    {
+        std::lock_guard lg(mtx_);
+        auto it = closing_jobs_.find(jobID);
+        if (it == closing_jobs_.end()) return false;
+        removed = std::move(it->second);
+        closing_jobs_.erase(it);
+    }
+    finishJobRemoval(removed);
+    return true;
+}
+
+size_t JobRegistry::closingJobCount() const {
+    std::shared_lock lg(mtx_);
+    return closing_jobs_.size();
+}
+
+void JobRegistry::cleanupClosingJobs() {
+    std::vector<Job> closing;
+    {
+        std::lock_guard lg(mtx_);
+        for (auto& [id, job] : closing_jobs_) {
+            (void)id;
+            closing.push_back(std::move(job));
+        }
+        closing_jobs_.clear();
+    }
+    for (const auto& job : closing) finishJobRemoval(job);
+}
+
+void JobRegistry::finishJobRemoval(const Job& job) {
+    remove_job_from_kernel(job);
+    spdlog::info("JobRegistry: remove job with JobID {}", job.JobID);
+    end_job_in_db(job.JobID);
 }
 
 size_t JobRegistry::delJob(const SubAttrMatcher& matcher) {
     std::vector<Job> removed_jobs;
-    
+    bool has_callbacks = false;
+
     {
         std::lock_guard lg(mtx_);
         for (auto it = jobs_.begin(); it != jobs_.end(); ) {
@@ -602,16 +646,19 @@ size_t JobRegistry::delJob(const SubAttrMatcher& matcher) {
                 ++it;
             }
         }
+        for (const auto& job : removed_jobs) closing_jobs_[job.JobID] = job;
+        has_callbacks = !cbs_.empty();
     }
-    
-    // 在锁外进行回调和数据库操作
+
     for (const auto& job : removed_jobs) {
-        for (const auto& cb : cbs_) cb(JobEvent::Removed, job);
-        remove_job_from_kernel(job);
-        spdlog::info("JobRegistry: remove job with JobID {} by sub_attr matcher", job.JobID);
-        end_job_in_db(job.JobID);
+        if (has_callbacks) {
+            for (const auto& cb : cbs_) cb(JobEvent::Removed, job);
+        } else {
+            finishJobRemoval(job);
+            spdlog::info("JobRegistry: remove job with JobID {} by sub_attr matcher", job.JobID);
+        }
     }
-    
+
     spdlog::info("JobRegistry: removed {} jobs by sub_attr matcher", removed_jobs.size());
     return removed_jobs.size();
 }

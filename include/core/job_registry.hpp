@@ -39,6 +39,7 @@ class JobRegistry {
 public:
     static JobRegistry& instance();          // 仍保留单例，方便迁移；也可由 main() 构造
     ~JobRegistry(){
+        cleanupClosingJobs();
         stop_pid_tracker();
         if (db_running){
             deinit_job_db();
@@ -54,6 +55,10 @@ public:
     void delJob(uint64_t jobID);
     // 通过 sub_attr 匹配删除作业，返回删除的作业数量
     size_t delJob(const SubAttrMatcher& matcher);
+    // Finish the destructive cleanup after scoped collector work has drained.
+    bool acknowledgeJobRemoval(uint64_t jobID);
+    size_t closingJobCount() const;
+    void cleanupClosingJobs();
     std::optional<Job> findJob(uint64_t jobID);
     // 通过 sub_attr 匹配查找作业，返回匹配的作业列表
     std::vector<Job> findJob(const SubAttrMatcher& matcher) const;
@@ -77,6 +82,9 @@ private:
     inline void update_job(Job& job);
     mutable std::shared_mutex              mtx_;
     std::unordered_map<uint64_t, Job>           jobs_;   // key = JobID
+    // Removed but not yet acknowledged by the collector lanes. The snapshot
+    // keeps attribution alive for accepted tail input.
+    std::unordered_map<uint64_t, Job>       closing_jobs_;
     std::vector<Job>                       restore_jobs_;
     std::vector<JobLifecycleCb>            cbs_;
 
@@ -88,6 +96,7 @@ private:
     void persist_new_job(const Job& job);
     void update_job_info(const Job& job);
     void end_job_in_db(uint64_t jobID);
+    void finishJobRemoval(const Job& job);
     bool db_running{false};
     leveldb::DB* job_db = nullptr;    // LevelDB 实例，通过 delete 释放
     std::mutex db_mtx_;                 // 序列化job_db的并发事务操作

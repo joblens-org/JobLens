@@ -82,228 +82,541 @@ CollectorScheduler::~CollectorScheduler() { shutdown(); }
 
 
 
-void CollectorScheduler::startCollector(std::string collector_name){
-    collector_info info;
-    try {
-        info = collector_info_dict.at(collector_name);
+std::shared_ptr<CollectorScheduler::CollectorLane>
+CollectorScheduler::createLane(const std::string& name, const collector_info& info,
+                               collector_state& state) {
+    auto lane = std::make_shared<CollectorLane>();
+    lane->name = name;
+    lane->info = info;
+    lane->state = &state;
+
+    auto handle = taskExecutor_.registerTask(name, [this, lane] {
+        return runCollectorLane(lane);
+    });
+    if (!handle) {
+        const std::string error = "collector " + name + " has no available execution lane";
+        runtime_->error(name, error);
+        spdlog::error("CollectorScheduler: {}", error);
+        return nullptr;
     }
-    catch(const std::exception& e) {
-        spdlog::error("CollectorScheduler: start collector error, can not find {}!",collector_name);
+    state.lane = *handle;
+    state.lane_valid = true;
+    return lane;
+}
+
+bool CollectorScheduler::initializeCollector(const std::string& name,
+                                             const collector_info& info,
+                                             SourceRegistrar& registrar) {
+    CollectorRuntime::Operation initializing(runtime_, name, "init");
+    auto config_node = Config::instance().getRawNode(info.config_name);
+    auto j_config = Utils::yamlToJson(config_node);
+    CollectorInitContext init_context(info.scope, registrar);
+    if (!info.init_handle(j_config, init_context)) {
+        initializing.fail("Collector initialization returned false");
+        spdlog::error("CollectorScheduler: collector {} init failed", name);
+        return false;
+    }
+    return true;
+}
+
+void CollectorScheduler::startCollector(std::string collector_name) {
+    // Caller holds m_.
+    auto it = collector_info_dict.find(collector_name);
+    if (it == collector_info_dict.end()) {
+        spdlog::error("CollectorScheduler: start collector error, can not find {}!", collector_name);
         return;
     }
+
+    const collector_info info = it->second;
     if (!info.route_ok()) {
-        // 路由无效的采集器不启动，避免输出静默丢失；状态中保留错误。
-        spdlog::error("CollectorScheduler: collector {} has an invalid output route, refusing to start", collector_name);
+        spdlog::error("CollectorScheduler: collector {} has an invalid output route, refusing to start",
+                      collector_name);
         return;
     }
-    if (info.trigger == CollectorTrigger::Event) {
-        spdlog::info("CollectorScheduler: collector {} is event-triggered; dispatch is wired in a later task", collector_name);
-        return;
-    }
-    try
-    {
-        CollectorRuntime::Operation initializing(runtime_, collector_name, "init");
-        auto config_node = Config::instance().getRawNode(info.config_name);
-        auto j_config = Utils::yamlToJson(config_node);
-        NullSourceRegistrar registrar;
-        CollectorInitContext init_context(info.scope, registrar);
-        if (!info.init_handle(j_config, init_context)) {
-            initializing.fail("Collector initialization returned false");
-            spdlog::error("CollectorScheduler: collector {} init failed", collector_name);
-            return;
-        }
-        auto freq = info.freq;
 
-        auto& collector_job = collector_state_dict[collector_name];
+    auto& state = collector_state_dict[collector_name];
+    auto lane = createLane(collector_name, info, state);
+    if (!lane) return;
 
-        collector_job.task_id = timerScheduler_.registerRepeatingTimer(
-            std::chrono::milliseconds(static_cast<long long>(1000.0 / freq)),
-            [this, collector_name](){
-                CollectorRuntime::Operation callback(runtime_, collector_name, "callback");
-                auto it_info = collector_info_dict.find(collector_name);
-                if (it_info == collector_info_dict.end()) return;
-                auto& info = it_info->second;
-
-                auto it_state = collector_state_dict.find(collector_name);
-                if (it_state == collector_state_dict.end()) return;
-                auto& collector_job = it_state->second;
-
-                const auto make_sample = [&](const Job& job) {
-                    auto& manager = WriterManager::instance();
-                    auto sample = std::make_shared<SampleMetadata>();
-                    sample->sample_id = fmt::format("{}:{}", manager.process_run_id(),
-                                                    manager.next_sample_counter());
-                    sample->collector_name = collector_name;
-                    sample->collector_type = info.type;
-                    sample->job = job;
-                    sample->sampled_at = std::chrono::system_clock::now();
-                    return sample;
-                };
-
-                if (info.scope == CollectorScope::System) {
-                    std::unique_lock<std::mutex> lg(collector_job.m_, std::defer_lock);
-                    {
-                        CollectorRuntime::Operation waiting(runtime_, collector_name, "wait_collector_lock");
-                        lg.lock();
-                    }
-                    if (!collector_job.running) return;
-
-                    Job system_job;
-                    system_job.JobID = 0;
-                    system_job.jobtype = JobType::Sys;
-                    system_job.subtype = JobSubType::Common;
-                    CommonJobAttr attr;
-                    attr.auto_update_child = false;
-                    system_job.sub_attr = attr;
-
-                    OutputContext output(info.router, make_sample(system_job));
-                    std::unique_ptr<CollectorRuntime::Operation> write_op;
-                    output.set_write_observer(
-                        [&](std::string_view /*channel*/) {
-                            write_op = std::make_unique<CollectorRuntime::Operation>(
-                                runtime_, collector_name, "write", 0);
-                        },
-                        [&](std::string_view channel, bool failed) {
-                            if (failed && write_op) {
-                                write_op->fail("output rejected on channel " + std::string(channel));
-                            }
-                            write_op.reset();
-                        });
-
-                    CollectOutcome outcome;
-                    std::string error;
-                    bool ok = true;
-                    try {
-                        CollectorRuntime::Operation collecting(runtime_, collector_name, "collect", 0);
-                        outcome = std::get<PeriodicSystemBinding>(info.binding).collect(output);
-                    } catch (const std::exception& e) {
-                        ok = false;
-                        error = e.what();
-                    } catch (...) {
-                        ok = false;
-                        error = "collector threw an unknown exception";
-                    }
-                    if (ok) {
-                        if (outcome.state == CollectState::Failed) {
-                            ok = false;
-                            error = outcome.error.empty() ? "collector reported failure" : outcome.error;
-                        } else if (outcome.state == CollectState::Skipped && output.submitted() > 0) {
-                            ok = false;
-                            error = "collector returned Skipped after emitting output";
-                        }
-                        if (output.had_error()) {
-                            ok = false;
-                            error = output.error_summary();
-                        }
-                    }
-                    if (!ok) {
-                        callback.fail(error);
-                        runtime_->error(collector_name, error);
-                        spdlog::error("CollectorScheduler: collector {} system collect failed: {}",
-                                      collector_name, error);
-                    } else if (outcome.state == CollectState::Success) {
-                        runtime_->clear_error(collector_name);
-                    }
-                    return;
-                }
-
-                std::vector<size_t> jobids_snapshot;
+    try {
+        if (info.trigger == CollectorTrigger::Event) {
+            auto sink = [this, state_ptr = &state, lane_handle = state.lane](
+                            const ReadySources& ready) {
                 {
-                    std::unique_lock<std::mutex> lg(collector_job.m_, std::defer_lock);
-                    {
-                        CollectorRuntime::Operation waiting(runtime_, collector_name, "wait_collector_lock");
-                        lg.lock();
-                    }
-                    if(collector_job.jobid_list.empty() && collector_job.running){
-                        //由JobRegistry完成任务清理工作
-                        //没有任务，取消这个收集器，节省资源
-                        CollectorRuntime::Operation deinitializing(runtime_, collector_name, "deinit");
-                        info.deinit_handle();
-                        timerScheduler_.cancelTimer(collector_job.task_id);
-                        collector_job.running = false;
-                        runtime_->timer(collector_name, false);
-                        return;
-                    }
-                    jobids_snapshot = collector_job.jobid_list;
+                    std::lock_guard lock(state_ptr->ready_m_);
+                    state_ptr->ready.insert(state_ptr->ready.end(), ready.begin(), ready.end());
                 }
+                taskExecutor_.request(lane_handle, RequestPolicy::Remember);
+            };
+            auto registrar = std::make_shared<StagedSourceRegistrar>(eventPoller_, std::move(sink));
+            state.registrar = registrar;
 
-                for(auto jobid: jobids_snapshot){
-                    std::optional<Job> job;
-                    {
-                        CollectorRuntime::Operation looking_up(runtime_, collector_name, "lookup_job", jobid);
-                        job = JobRegistry::instance().findJob(jobid);
-                    }
-                    std::unique_lock<std::mutex> lg(collector_job.m_, std::defer_lock);
-                    {
-                        CollectorRuntime::Operation waiting(runtime_, collector_name, "wait_collector_lock", jobid);
-                        lg.lock();
-                    }
-                    if(!collector_job.running) return; //采集器已经deinit
-                    if(!job.has_value())continue;
+            if (!initializeCollector(collector_name, info, *registrar)) {
+                if (info.deinit_handle) info.deinit_handle();
+                state.initialized = false;
+                registrar->revoke();
+                taskExecutor_.invalidate(state.lane);
+                state.lane_valid = false;
+                state.registrar.reset();
+                return;
+            }
+            if (!registrar->commit()) {
+                if (info.deinit_handle) info.deinit_handle();
+                state.initialized = false;
+                registrar->revoke();
+                taskExecutor_.invalidate(state.lane);
+                state.lane_valid = false;
+                state.registrar.reset();
+                runtime_->error(collector_name, "collector source commit failed");
+                return;
+            }
+            state.initialized = true;
 
-                    OutputContext output(info.router, make_sample(job.value()));
-                    std::unique_ptr<CollectorRuntime::Operation> write_op;
-                    output.set_write_observer(
-                        [&](std::string_view /*channel*/) {
-                            write_op = std::make_unique<CollectorRuntime::Operation>(
-                                runtime_, collector_name, "write", jobid);
-                        },
-                        [&](std::string_view channel, bool failed) {
-                            if (failed && write_op) {
-                                write_op->fail("output rejected on channel " + std::string(channel));
-                            }
-                            write_op.reset();
-                        });
-
-                    CollectOutcome outcome;
-                    std::string error;
-                    bool ok = true;
-                    {
-                        try {
-                            CollectorRuntime::Operation collecting(runtime_, collector_name, "collect", jobid);
-                            outcome = std::get<PeriodicJobBinding>(info.binding).collect(job.value(), output);
-                        } catch (const std::exception& e) {
-                            ok = false;
-                            error = e.what();
-                        } catch (...) {
-                            ok = false;
-                            error = "collector threw an unknown exception";
-                        }
-                    }
-                    if (ok) {
-                        if (outcome.state == CollectState::Failed) {
-                            ok = false;
-                            error = outcome.error.empty() ? "collector reported failure" : outcome.error;
-                        } else if (outcome.state == CollectState::Skipped && output.submitted() > 0) {
-                            ok = false;
-                            error = "collector returned Skipped after emitting output";
-                        }
-                        if (output.had_error()) {
-                            ok = false;
-                            error = output.error_summary();
-                        }
-                    }
-                    if (!ok) {
-                        callback.fail(error);
-                        runtime_->error(collector_name, error);
-                        spdlog::error("CollectorScheduler: collector {} job {} native collect failed: {}",
-                                      collector_name, jobid, error);
-                    } else if (outcome.state == CollectState::Success) {
-                        // Skipped 表示没有可用样本，不能掩盖此前的错误。
-                        runtime_->clear_error(collector_name);
-                    }
-                }
-            }, collector_name
-        );
-        collector_job.running = true;
-        runtime_->timer(collector_name, true);
-    }
-    catch(const std::exception& e) {
-        runtime_->error(collector_name, e.what());
-        spdlog::error("CollectorScheduler: start collector {} error: {}", collector_name, e.what());
+            if (info.scope == CollectorScope::Job)
+                startEventJobCollector(collector_name, info, state, lane);
+            else
+                startEventSystemCollector(collector_name, info, state, lane);
+        } else {
+            NullSourceRegistrar registrar;
+            if (!initializeCollector(collector_name, info, registrar)) {
+                if (info.deinit_handle) info.deinit_handle();
+                state.initialized = false;
+                taskExecutor_.invalidate(state.lane);
+                state.lane_valid = false;
+                return;
+            }
+            state.initialized = true;
+            if (info.scope == CollectorScope::Job)
+                startPeriodicJobCollector(collector_name, info, state, lane);
+            else
+                startPeriodicSystemCollector(collector_name, info, state, lane);
+        }
+    } catch (const std::exception& error) {
+        runtime_->error(collector_name, error.what());
+        spdlog::error("CollectorScheduler: start collector {} error: {}", collector_name, error.what());
+        if (state.registrar) {
+            state.registrar->revoke();
+            state.registrar.reset();
+        }
+        if (state.lane_valid) {
+            taskExecutor_.invalidate(state.lane);
+            state.lane_valid = false;
+        }
+        state.running = false;
+        return;
     }
 
     spdlog::info("CollectorScheduler: start collector {}", collector_name);
+}
+
+void CollectorScheduler::startPeriodicJobCollector(const std::string& name,
+                                                   const collector_info& info,
+                                                   collector_state& state,
+                                                   std::shared_ptr<CollectorLane> lane) {
+    (void)lane;
+    state.task_id = timerScheduler_.registerRepeatingWorkTimer(
+        std::chrono::milliseconds(static_cast<long long>(1000.0 / info.freq)),
+        state.lane, RequestPolicy::SkipIfBusy, name);
+    state.running = true;
+    runtime_->timer(name, true);
+}
+
+void CollectorScheduler::startPeriodicSystemCollector(const std::string& name,
+                                                      const collector_info& info,
+                                                      collector_state& state,
+                                                      std::shared_ptr<CollectorLane> lane) {
+    (void)lane;
+    state.task_id = timerScheduler_.registerRepeatingWorkTimer(
+        std::chrono::milliseconds(static_cast<long long>(1000.0 / info.freq)),
+        state.lane, RequestPolicy::SkipIfBusy, name);
+    state.running = true;
+    runtime_->timer(name, true);
+}
+
+void CollectorScheduler::startEventJobCollector(const std::string& name,
+                                                const collector_info& info,
+                                                collector_state& state,
+                                                std::shared_ptr<CollectorLane> lane) {
+    (void)info;
+    (void)lane;
+    state.running = true;
+    runtime_->timer(name, false);
+}
+
+void CollectorScheduler::startEventSystemCollector(const std::string& name,
+                                                   const collector_info& info,
+                                                   collector_state& state,
+                                                   std::shared_ptr<CollectorLane> lane) {
+    (void)info;
+    (void)lane;
+    state.running = true;
+    runtime_->timer(name, false);
+}
+
+WorkResult CollectorScheduler::runCollectorLane(std::shared_ptr<CollectorLane> lane) {
+    if (lane->info.trigger == CollectorTrigger::Event) return runEventDrain(*lane);
+    if (lane->info.scope == CollectorScope::System) return runPeriodicSystemTick(*lane);
+    return runPeriodicJobSweep(*lane);
+}
+
+WorkResult CollectorScheduler::runPeriodicJobSweep(CollectorLane& lane) {
+    CollectorRuntime::Operation callback(runtime_, lane.name, "callback");
+    auto& state = *lane.state;
+
+    std::unique_lock<std::mutex> lock(state.m_);
+    if (!state.running) return WorkResult::Complete;
+
+    if (!state.sweep_active) {
+        if (state.jobid_list.empty()) {
+            lock.unlock();
+            stopCollectorInstance(lane);
+            return WorkResult::Complete;
+        }
+        state.sweep_jobs.assign(state.jobid_list.begin(), state.jobid_list.end());
+        state.sweep_cursor = 0;
+        state.sweep_active = true;
+    }
+
+    if (state.sweep_cursor >= state.sweep_jobs.size()) {
+        state.sweep_active = false;
+        return WorkResult::Complete;
+    }
+
+    const size_t jobid = state.sweep_jobs[state.sweep_cursor++];
+    const bool more = state.sweep_cursor < state.sweep_jobs.size();
+    collectJobSample(lane, jobid, callback);
+    if (!more) state.sweep_active = false;
+    return more ? WorkResult::Yield : WorkResult::Complete;
+}
+
+WorkResult CollectorScheduler::runPeriodicSystemTick(CollectorLane& lane) {
+    CollectorRuntime::Operation callback(runtime_, lane.name, "callback");
+    auto& state = *lane.state;
+
+    std::unique_lock<std::mutex> lock(state.m_);
+    if (!state.running) return WorkResult::Complete;
+    collectSystemSample(lane, callback);
+    return WorkResult::Complete;
+}
+
+WorkResult CollectorScheduler::runEventDrain(CollectorLane& lane) {
+    auto& state = *lane.state;
+    std::vector<ReadySource> ready;
+    {
+        std::lock_guard lock(state.ready_m_);
+        ready.swap(state.ready);
+    }
+
+    std::unique_lock<std::mutex> lock(state.m_);
+    if (!state.running) return WorkResult::Complete;
+
+    std::vector<uint64_t> closes;
+    closes.swap(state.pending_close);
+
+    WorkResult result = WorkResult::Complete;
+    if (!ready.empty()) {
+        CollectorRuntime::Operation callback(runtime_, lane.name, "callback");
+        CallbackJobBindingResolver resolver(
+            [state_ptr = &state](uint64_t job_id, uint64_t generation) -> std::optional<Job> {
+                std::lock_guard lock(state_ptr->snapshot_m_);
+                auto it = state_ptr->job_snapshots.find(job_id);
+                if (it == state_ptr->job_snapshots.end()) return std::nullopt;
+                auto gen = state_ptr->job_generations.find(job_id);
+                if (gen == state_ptr->job_generations.end() || gen->second != generation)
+                    return std::nullopt;
+                return it->second;
+            });
+        const auto sample_id = [name = lane.name] {
+            auto& manager = WriterManager::instance();
+            return fmt::format("{}:{}", manager.process_run_id(), manager.next_sample_counter());
+        };
+
+        WorkBudget budget{512, 1024 * 1024, 0,
+                          std::chrono::steady_clock::now() + std::chrono::milliseconds(5)};
+        bool ok = true;
+        std::string error;
+        DrainOutcome outcome;
+        bool context_error = false;
+
+        try {
+            if (lane.info.scope == CollectorScope::System) {
+                SystemEventContext context(lane.name, lane.info.type, lane.info.router, sample_id);
+                CollectorRuntime::Operation collecting(runtime_, lane.name, "event_drain");
+                outcome = std::get<EventSystemBinding>(lane.info.binding)
+                              .on_ready(ready, budget, context);
+                context_error = context.had_error();
+                if (context_error) error = context.error_summary();
+            } else {
+                JobEventContext context(lane.name, lane.info.type, lane.info.router,
+                                        sample_id, &resolver);
+                CollectorRuntime::Operation collecting(runtime_, lane.name, "event_drain");
+                outcome = std::get<EventJobBinding>(lane.info.binding)
+                              .on_ready(ready, budget, context);
+                context_error = context.had_error();
+                if (context_error) error = context.error_summary();
+            }
+        } catch (const std::exception& e) {
+            ok = false;
+            error = e.what();
+        } catch (...) {
+            ok = false;
+            error = "collector threw an unknown exception";
+        }
+
+        if (ok && outcome.outcome.state == CollectState::Failed) {
+            ok = false;
+            error = outcome.outcome.error.empty() ? "collector reported failure"
+                                                  : outcome.outcome.error;
+        }
+        if (ok && context_error) {
+            ok = false;
+            if (error.empty()) error = "event output admission failed";
+        }
+        if (!ok) {
+            callback.fail(error);
+            runtime_->error(lane.name, error);
+            spdlog::error("CollectorScheduler: collector {} event drain failed: {}",
+                          lane.name, error);
+        } else if (outcome.outcome.state == CollectState::Success) {
+            runtime_->clear_error(lane.name);
+        }
+        if (outcome.more) result = WorkResult::Yield;
+    }
+
+    if (!closes.empty()) {
+        std::vector<std::pair<uint64_t, Job>> snapshots;
+        {
+            std::lock_guard lock(state.snapshot_m_);
+            for (auto job_id : closes) {
+                auto it = state.job_snapshots.find(job_id);
+                if (it == state.job_snapshots.end()) continue;
+                snapshots.emplace_back(job_id, it->second);
+            }
+        }
+        for (const auto& [job_id, job] : snapshots) {
+            notifyJobHook(lane.info, JobEvent::Removed, job);
+            {
+                std::lock_guard lock(state.snapshot_m_);
+                state.job_snapshots.erase(job_id);
+                state.job_generations.erase(job_id);
+                state.job_generation_counter.erase(job_id);
+            }
+            recordRemovalAck(job_id);
+        }
+    }
+    return result;
+}
+
+void CollectorScheduler::collectJobSample(CollectorLane& lane, size_t jobid,
+                                          CollectorRuntime::Operation& callback) {
+    std::optional<Job> job = JobRegistry::instance().findJob(jobid);
+    if (!job.has_value()) return;
+
+    OutputContext output(lane.info.router, makeSample(lane.name, lane.info.type, *job));
+    std::unique_ptr<CollectorRuntime::Operation> write_op;
+    attachWriteObserver(output, lane.name, jobid, write_op);
+
+    const auto result = invokePeriodicJob(lane.info, *job, output, jobid);
+    applyCollectResult(lane.name, jobid, result, output, callback);
+}
+
+void CollectorScheduler::collectSystemSample(CollectorLane& lane,
+                                             CollectorRuntime::Operation& callback) {
+    Job system_job;
+    system_job.JobID = 0;
+    system_job.jobtype = JobType::Sys;
+    system_job.subtype = JobSubType::Common;
+    CommonJobAttr attr;
+    attr.auto_update_child = false;
+    system_job.sub_attr = attr;
+
+    OutputContext output(lane.info.router, makeSample(lane.name, lane.info.type, system_job));
+    std::unique_ptr<CollectorRuntime::Operation> write_op;
+    attachWriteObserver(output, lane.name, std::nullopt, write_op);
+
+    const auto result = invokePeriodicSystem(lane.info, output);
+    applyCollectResult(lane.name, std::nullopt, result, output, callback);
+}
+
+std::shared_ptr<SampleMetadata> CollectorScheduler::makeSample(
+    const std::string& name, const std::string& type, const Job& job) const {
+    auto& manager = WriterManager::instance();
+    auto sample = std::make_shared<SampleMetadata>();
+    sample->sample_id = fmt::format("{}:{}", manager.process_run_id(), manager.next_sample_counter());
+    sample->collector_name = name;
+    sample->collector_type = type;
+    sample->job = job;
+    sample->sampled_at = std::chrono::system_clock::now();
+    return sample;
+}
+
+void CollectorScheduler::attachWriteObserver(
+    OutputContext& output, const std::string& name, std::optional<size_t> jobid,
+    std::unique_ptr<CollectorRuntime::Operation>& write_op) {
+    output.set_write_observer(
+        [this, name, jobid, &write_op](std::string_view /*channel*/) {
+            write_op = std::make_unique<CollectorRuntime::Operation>(
+                runtime_, name, "write", jobid);
+        },
+        [&write_op](std::string_view channel, bool failed) {
+            if (failed && write_op)
+                write_op->fail("output rejected on channel " + std::string(channel));
+            write_op.reset();
+        });
+}
+
+CollectorScheduler::CollectInvocation CollectorScheduler::invokePeriodicJob(
+    const collector_info& info, const Job& job, OutputContext& output, size_t jobid) {
+    CollectInvocation result;
+    try {
+        CollectorRuntime::Operation collecting(runtime_, info.name, "collect", jobid);
+        result.outcome = std::get<PeriodicJobBinding>(info.binding).collect(job, output);
+    } catch (const std::exception& e) {
+        result.ok = false;
+        result.error = e.what();
+    } catch (...) {
+        result.ok = false;
+        result.error = "collector threw an unknown exception";
+    }
+    return result;
+}
+
+CollectorScheduler::CollectInvocation CollectorScheduler::invokePeriodicSystem(
+    const collector_info& info, OutputContext& output) {
+    CollectInvocation result;
+    try {
+        CollectorRuntime::Operation collecting(runtime_, info.name, "collect", 0);
+        result.outcome = std::get<PeriodicSystemBinding>(info.binding).collect(output);
+    } catch (const std::exception& e) {
+        result.ok = false;
+        result.error = e.what();
+    } catch (...) {
+        result.ok = false;
+        result.error = "collector threw an unknown exception";
+    }
+    return result;
+}
+
+void CollectorScheduler::applyCollectResult(const std::string& name,
+                                            std::optional<size_t> jobid,
+                                            const CollectInvocation& result,
+                                            const OutputContext& output,
+                                            CollectorRuntime::Operation& callback) {
+    bool ok = result.ok;
+    std::string error = result.error;
+    if (ok) {
+        if (result.outcome.state == CollectState::Failed) {
+            ok = false;
+            error = result.outcome.error.empty() ? "collector reported failure"
+                                                 : result.outcome.error;
+        } else if (result.outcome.state == CollectState::Skipped && output.submitted() > 0) {
+            ok = false;
+            error = "collector returned Skipped after emitting output";
+        }
+        if (output.had_error()) {
+            ok = false;
+            error = output.error_summary();
+        }
+    }
+    if (!ok) {
+        callback.fail(error);
+        runtime_->error(name, error);
+        if (jobid)
+            spdlog::error("CollectorScheduler: collector {} job {} native collect failed: {}",
+                          name, *jobid, error);
+        else
+            spdlog::error("CollectorScheduler: collector {} system collect failed: {}",
+                          name, error);
+    } else if (result.outcome.state == CollectState::Success) {
+        runtime_->clear_error(name);
+    }
+}
+
+void CollectorScheduler::stopCollectorInstance(CollectorLane& lane) {
+    auto& state = *lane.state;
+    if (!state.running && !state.initialized && !state.registrar && !state.lane_valid) return;
+
+    state.running = false;
+    if (state.task_id != 0) {
+        timerScheduler_.cancelTimer(state.task_id);
+        state.task_id = 0;
+    }
+    if (state.lane_valid) {
+        taskExecutor_.invalidate(state.lane);
+        state.lane_valid = false;
+    }
+    // Deinit first: collectors own their source registrations and may destroy
+    // them here. The registrar must still be alive for those destructors.
+    if (state.initialized && lane.info.deinit_handle) {
+        lane.info.deinit_handle();
+        state.initialized = false;
+    }
+    if (state.registrar) {
+        state.registrar->revoke();
+        state.registrar.reset();
+    }
+    runtime_->timer(lane.name, false);
+    state.sweep_active = false;
+    state.sweep_jobs.clear();
+    state.sweep_cursor = 0;
+    finalizePendingRemovals(lane);
+}
+
+void CollectorScheduler::stopAllCollectors() {
+    std::vector<CollectorLane> lanes;
+    {
+        std::lock_guard lock(m_);
+        for (auto& [name, state] : collector_state_dict) {
+            auto it = collector_info_dict.find(name);
+            if (it == collector_info_dict.end()) continue;
+            CollectorLane lane;
+            lane.name = name;
+            lane.info = it->second;
+            lane.state = &state;
+            lanes.push_back(std::move(lane));
+        }
+    }
+    for (auto& lane : lanes) stopCollectorInstance(lane);
+}
+
+void CollectorScheduler::finalizePendingRemovals(CollectorLane& lane) {
+    auto& state = *lane.state;
+    std::vector<uint64_t> closes;
+    {
+        std::lock_guard lock(state.m_);
+        closes.swap(state.pending_close);
+    }
+    for (auto job_id : closes) {
+        Job job;
+        bool found = false;
+        {
+            std::lock_guard lock(state.snapshot_m_);
+            auto it = state.job_snapshots.find(job_id);
+            if (it != state.job_snapshots.end()) {
+                job = it->second;
+                state.job_snapshots.erase(it);
+                state.job_generations.erase(job_id);
+                state.job_generation_counter.erase(job_id);
+                found = true;
+            }
+        }
+        if (found) notifyJobHook(lane.info, JobEvent::Removed, job);
+        recordRemovalAck(job_id);
+    }
+}
+
+void CollectorScheduler::recordRemovalAck(uint64_t jobID) {
+    bool last = false;
+    {
+        std::lock_guard lock(removal_m_);
+        auto it = removal_pending_.find(jobID);
+        if (it == removal_pending_.end()) return;
+        if (--it->second == 0) {
+            removal_pending_.erase(it);
+            last = true;
+        }
+    }
+    if (last) JobRegistry::instance().acknowledgeJobRemoval(jobID);
 }
 
 bool CollectorScheduler::addJob2Collector(const Job& job, const std::string& collector){
@@ -314,6 +627,11 @@ bool CollectorScheduler::addJob2Collector(const Job& job, const std::string& col
         return false;
     }
     state.jobid_list.push_back(job.JobID);
+    {
+        std::lock_guard snapshot_lock(state.snapshot_m_);
+        state.job_generations[job.JobID] = ++state.job_generation_counter[job.JobID];
+        state.job_snapshots[job.JobID] = job;
+    }
     runtime_->jobs(collector, state.jobid_list.size());
     if(!state.running){
         startCollector(collector);
@@ -325,17 +643,40 @@ bool CollectorScheduler::addJob2Collector(const Job& job, const std::string& col
     return true;
 }
 
-void CollectorScheduler::detachJobFromCollector(const std::string& collector_name, collector_state& state, const Job& job){
+bool CollectorScheduler::detachJobFromCollector(const std::string& collector_name,
+                                                collector_state& state, const Job& job,
+                                                bool job_ending){
     const size_t id = job.JobID;
     auto new_end = std::remove_if(state.jobid_list.begin(), state.jobid_list.end(),
                                   [id](size_t x){ return x == id; });
     if (new_end == state.jobid_list.end()) {
         // 本采集器并未绑定该 Job（例如采集器是在 Job 建立之后才注册的），不产生 Removed
-        return;
+        return false;
     }
     state.jobid_list.erase(new_end, state.jobid_list.end());
     runtime_->jobs(collector_name, state.jobid_list.size());
+
+    auto info_it = collector_info_dict.find(collector_name);
+    const bool event_scope = info_it != collector_info_dict.end() &&
+                             info_it->second.scope == CollectorScope::Job &&
+                             info_it->second.trigger == CollectorTrigger::Event;
+    if (job_ending && event_scope) {
+        // Keep the snapshot and let the event lane consume accepted tail input
+        // before the registry clears kernel attribution.
+        state.pending_close.push_back(id);
+        if (state.lane_valid)
+            taskExecutor_.request(state.lane, RequestPolicy::Remember);
+        return true;
+    }
+
     fireJobHook(collector_name, JobEvent::Removed, job);
+    {
+        std::lock_guard snapshot_lock(state.snapshot_m_);
+        state.job_snapshots.erase(id);
+        state.job_generations.erase(id);
+        state.job_generation_counter.erase(id);
+    }
+    return false;
 }
 
 void CollectorScheduler::fireJobHook(const std::string& collector_name, JobEvent event, const Job& job){
@@ -398,17 +739,38 @@ void CollectorScheduler::addJobCollect(const Job& job){
 
 void CollectorScheduler::rmJobCollect(const Job& job){
     std::lock_guard lg(m_);
+
+    std::vector<std::string> bound_job_collectors;
     for(const auto& collector_name : job.CollectorNames){
-        // 使用find代替at，避免定时器回调并发修改容器时抛出out_of_range
-        auto it = collector_state_dict.find(collector_name);
-        if (it == collector_state_dict.end()) {
+        auto state_it = collector_state_dict.find(collector_name);
+        auto info_it = collector_info_dict.find(collector_name);
+        if (state_it == collector_state_dict.end() || info_it == collector_info_dict.end()) {
             spdlog::error("CollectorScheduler: collector {} not found for removal", collector_name);
             continue;
         }
+        if (info_it->second.scope != CollectorScope::Job) continue;
+        const auto& jobs = state_it->second.jobid_list;
+        if (std::find(jobs.begin(), jobs.end(), job.JobID) != jobs.end())
+            bound_job_collectors.push_back(collector_name);
+    }
+
+    if (!bound_job_collectors.empty()) {
+        std::lock_guard removal_lock(removal_m_);
+        removal_pending_[job.JobID] = bound_job_collectors.size();
+    }
+
+    for (const auto& collector_name : bound_job_collectors) {
+        auto it = collector_state_dict.find(collector_name);
+        if (it == collector_state_dict.end()) continue;
         auto& state = it->second;
         std::lock_guard lg_state(state.m_);
-        detachJobFromCollector(collector_name, state, job);
+        const bool deferred = detachJobFromCollector(collector_name, state, job, true);
+        if (!deferred) recordRemovalAck(job.JobID);
     }
+
+    if (bound_job_collectors.empty())
+        JobRegistry::instance().acknowledgeJobRemoval(job.JobID);
+
     notifySystemCollectors(job, JobEvent::Removed);
 }
 
@@ -432,7 +794,7 @@ void CollectorScheduler::updateJobCollect(const Job& job){
         if (it == collector_state_dict.end()) continue;
         auto& state = it->second;
         std::lock_guard lg_state(state.m_);
-        detachJobFromCollector(collector_name, state, job);
+        detachJobFromCollector(collector_name, state, job, false);
     }
     // 添加采集器（新的绑定收到 on_job_added），已在列表中的只收到 on_job_updated
     for(const auto& collector_name : job.CollectorNames){
@@ -448,6 +810,10 @@ void CollectorScheduler::updateJobCollect(const Job& job){
         if (it == collector_state_dict.end() || it_info == collector_info_dict.end()) continue;
         std::lock_guard lg_state(it->second.m_);
         if (!it->second.running) continue;
+        {
+            std::lock_guard snapshot_lock(it->second.snapshot_m_);
+            it->second.job_snapshots[job.JobID] = job;
+        }
         notifyJobHook(it_info->second, JobEvent::Updated, job);
     }
     notifySystemCollectors(job, JobEvent::Updated);
@@ -589,7 +955,12 @@ void CollectorScheduler::addJobEventCollectFunc(std::string name, std::string ty
                         to_string(info.trigger), to_string(info.output_policy));
     if (!info.route_error.empty()) runtime_->error(name, info.route_error);
     else buildOutputRoute(info);
-    spdlog::info("CollectorScheduler: collector {} is Job/Event; production dispatch is pending", name);
+    try {
+        if (info.route_ok() && Config::instance().getBool(config, "auto_start"))
+            startCollector(name);
+    } catch (const std::exception& error) {
+        spdlog::info("CollectorScheduler: collector {} auto_start failed: {}", name, error.what());
+    }
 }
 
 void CollectorScheduler::addSystemEventCollectFunc(std::string name, std::string type,
@@ -604,7 +975,12 @@ void CollectorScheduler::addSystemEventCollectFunc(std::string name, std::string
                         to_string(info.trigger), to_string(info.output_policy));
     if (!info.route_error.empty()) runtime_->error(name, info.route_error);
     else buildOutputRoute(info);
-    spdlog::info("CollectorScheduler: collector {} is System/Event; production dispatch is pending", name);
+    try {
+        if (info.route_ok() && Config::instance().getBool(config, "auto_start"))
+            startCollector(name);
+    } catch (const std::exception& error) {
+        spdlog::info("CollectorScheduler: collector {} auto_start failed: {}", name, error.what());
+    }
 }
 
 
@@ -625,6 +1001,7 @@ void CollectorScheduler::shutdown() {
     eventPoller_.shutdown();
     timerScheduler_.shutdown();
     taskExecutor_.shutdown();
+    stopAllCollectors();
     runtime_->lifecycle("stopped");
     spdlog::info("CollectorScheduler: CollectorScheduler shutdown complete");
 }

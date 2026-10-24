@@ -84,6 +84,7 @@ public:
     std::optional<SourceRegistration> watch_fd(int fd, Interest interest) override;
     std::optional<SourceRegistration> watch_manual(std::string name) override;
     void cancel(SourceHandle handle) override;
+    bool rearm(SourceHandle handle) override;
 
     bool commit();
     void revoke();

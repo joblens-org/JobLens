@@ -60,7 +60,7 @@ void CollectorRuntime::configure(const std::string& name, const std::string& con
     entry.trigger = trigger;
     entry.output_policy = output_policy;
     entry.period_ms = period_ms;
-    for (const auto* kind : {"init", "deinit", "callback", "lookup_job", "wait_collector_lock", "collect", "write"})
+    for (const auto* kind : {"init", "deinit", "callback", "lookup_job", "wait_collector_lock", "collect", "event_drain", "write"})
         entry.metrics.try_emplace(kind);
 }
 void CollectorRuntime::jobs(const std::string& name, size_t count) {

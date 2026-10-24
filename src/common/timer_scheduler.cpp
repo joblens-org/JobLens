@@ -17,6 +17,7 @@
 #include <chrono>
 #include <exception>
 #include <map>
+#include <unordered_map>
 #include <stdexcept>
 #include <utility>
 
@@ -83,6 +84,7 @@ nlohmann::json TimerScheduler::State::snapshot()
         std::string name;
         std::string phase;
         bool canceled = false;
+        bool callback_timer = true;
         bool repeat = false;
         Duration interval{0};
         TimePoint queued_at{};
@@ -107,7 +109,7 @@ nlohmann::json TimerScheduler::State::snapshot()
         for (const auto& [id, timer] : timers) {
             (void)id;
             views.push_back({timer->id, timer->name, timer->phase, timer->canceled,
-                             timer->repeat, timer->interval, timer->queued_at,
+                             timer->callback_timer, timer->repeat, timer->interval, timer->queued_at,
                              timer->started_at, timer->skipped, timer->completed,
                              timer->errors, timer->last_wait_ms, timer->last_duration_ms});
         }
@@ -127,6 +129,12 @@ nlohmann::json TimerScheduler::State::snapshot()
     const nlohmann::json executor_status = executor
         ? executor->snapshot() : nlohmann::json::object();
 
+    std::unordered_map<std::string, const nlohmann::json*> executor_tasks;
+    if (executor_status.is_object() && executor_status.contains("tasks")) {
+        for (const auto& task : executor_status.at("tasks"))
+            executor_tasks[task.value("name", std::string{})] = &task;
+    }
+
     auto tasks = nlohmann::json::array();
     double wait_total = 0, wait_max = 0, wait_min = 0;
     size_t wait_count = 0;
@@ -138,16 +146,27 @@ nlohmann::json TimerScheduler::State::snapshot()
             wait_min = wait_count ? std::min(wait_min, wait) : wait;
             ++wait_count;
         }
+        std::string phase = view.phase;
+        double queued_elapsed = view.phase == "queued"
+            ? milliseconds(now - view.queued_at) : 0.0;
+        double running_elapsed = view.phase == "running"
+            ? milliseconds(now - view.started_at) : 0.0;
+        if (!view.callback_timer) {
+            auto found = executor_tasks.find(view.name);
+            if (found != executor_tasks.end()) {
+                phase = found->second->value("state", phase);
+                queued_elapsed = found->second->value("queued_elapsed_ms", 0.0);
+                running_elapsed = found->second->value("running_elapsed_ms", 0.0);
+            }
+        }
         tasks.push_back({
             {"task_id", view.id},
             {"name", view.name},
-            {"state", view.phase},
+            {"state", phase},
             {"cancelled", view.canceled},
             {"period_ms", view.interval.count()},
-            {"queued_elapsed_ms", view.phase == "queued"
-                ? milliseconds(now - view.queued_at) : 0.0},
-            {"running_elapsed_ms", view.phase == "running"
-                ? milliseconds(now - view.started_at) : 0.0},
+            {"queued_elapsed_ms", queued_elapsed},
+            {"running_elapsed_ms", running_elapsed},
             {"skipped_runs", view.skipped},
             {"completed_runs", view.completed},
             {"error_count", view.errors},

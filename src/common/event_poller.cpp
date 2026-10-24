@@ -327,6 +327,15 @@ void StagedSourceRegistrar::cancel(SourceHandle handle)
     entries_.erase(it);
 }
 
+bool StagedSourceRegistrar::rearm(SourceHandle handle)
+{
+    std::lock_guard lock(mutex_);
+    auto it = entries_.find(handle.id);
+    if (it == entries_.end() || it->second.staged.generation != handle.generation) return false;
+    if (!it->second.committed || it->second.manual) return false;
+    return poller_.rearm(it->second.poller);
+}
+
 bool StagedSourceRegistrar::commit()
 {
     std::lock_guard lock(mutex_);
