@@ -55,7 +55,13 @@ public:
     // One-shot readiness. The source stays disarmed until rearm() is called by
     // the worker after it has drained the descriptor. Cancelling never closes
     // the borrower's descriptor.
-    std::optional<SourceHandle> watch_fd(int fd, Interest interest, ReadySink sink);
+    std::optional<SourceHandle> watch_probe(const ProbeDescriptor& probe, ReadySink sink);
+
+    // Convenience for ordinary descriptors.
+    std::optional<SourceHandle> watch_fd(int fd, Interest /*interest*/, ReadySink sink)
+    {
+        return watch_probe(ProbeDescriptor{ProbeKind::Fd, fd, {}}, std::move(sink));
+    }
     bool rearm(SourceHandle handle);
     bool cancel(SourceHandle handle);
 
@@ -81,7 +87,7 @@ public:
     StagedSourceRegistrar(const StagedSourceRegistrar&) = delete;
     StagedSourceRegistrar& operator=(const StagedSourceRegistrar&) = delete;
 
-    std::optional<SourceRegistration> watch_fd(int fd, Interest interest) override;
+    std::optional<SourceRegistration> watch_probe(const ProbeDescriptor& probe) override;
     std::optional<SourceRegistration> watch_manual(std::string name) override;
     void cancel(SourceHandle handle) override;
     bool rearm(SourceHandle handle) override;
@@ -97,12 +103,10 @@ public:
 private:
     struct Entry {
         bool manual = false;
-        int fd = -1;
-        Interest interest = Interest::Readable;
+        ProbeDescriptor probe;
         SourceHandle staged{};
         SourceHandle poller{};
         bool committed = false;
-        std::string name;
     };
 
     EventPoller& poller_;

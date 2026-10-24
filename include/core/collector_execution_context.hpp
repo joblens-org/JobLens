@@ -31,15 +31,43 @@
 
 class SourceRegistration;
 
+// A probe is the uniform readiness descriptor used by the shared poller.
+// Both variants are epoll-compatible; the distinction is ownership and the
+// worker-side drain API.
+enum class ProbeKind {
+    Fd,
+    RingBuffer,
+};
+
+inline const char* to_string(ProbeKind kind)
+{
+    switch (kind) {
+        case ProbeKind::Fd:         return "fd";
+        case ProbeKind::RingBuffer: return "ring_buffer";
+    }
+    return "unknown";
+}
+
+struct ProbeDescriptor {
+    ProbeKind kind = ProbeKind::Fd;
+    // Borrowed readiness descriptor. For RingBuffer this is
+    // ring_buffer__epoll_fd(); the collector owns it and must not close it here.
+    int readiness_fd = -1;
+    std::string name;
+};
+
 class SourceRegistrar {
 public:
     virtual ~SourceRegistrar() = default;
 
     // The registrar borrows the descriptor. Cancelling a registration never
     // closes it; the collector owns the descriptor and its lifetime.
-    virtual std::optional<SourceRegistration> watch_fd(int fd, Interest interest) = 0;
+    virtual std::optional<SourceRegistration> watch_probe(const ProbeDescriptor& probe) = 0;
     virtual std::optional<SourceRegistration> watch_manual(std::string name) = 0;
     virtual void cancel(SourceHandle handle) = 0;
+
+    // Convenience for ordinary descriptors. Defined after SourceRegistration.
+    virtual std::optional<SourceRegistration> watch_fd(int fd, Interest);
     // Re-arm after the worker has drained a one-shot source.
     virtual bool rearm(SourceHandle) { return false; }
 };
@@ -88,9 +116,17 @@ private:
     SourceHandle handle_{};
 };
 
+inline std::optional<SourceRegistration> SourceRegistrar::watch_fd(int fd, Interest)
+{
+    return watch_probe(ProbeDescriptor{ProbeKind::Fd, fd, {}});
+}
+
 class NullSourceRegistrar final : public SourceRegistrar {
 public:
-    std::optional<SourceRegistration> watch_fd(int, Interest) override { return std::nullopt; }
+    std::optional<SourceRegistration> watch_probe(const ProbeDescriptor&) override
+    {
+        return std::nullopt;
+    }
     std::optional<SourceRegistration> watch_manual(std::string) override { return std::nullopt; }
     void cancel(SourceHandle) override {}
 };

@@ -150,14 +150,14 @@ struct TestRegistrar final : SourceRegistrar {
     size_t active = 0;
     size_t cancelled = 0;
 
-    std::optional<SourceRegistration> watch_fd(int, Interest) override
+    std::optional<SourceRegistration> watch_probe(const ProbeDescriptor&) override
     {
         ++active;
         return SourceRegistration(this, SourceHandle{++next_id, 1});
     }
     std::optional<SourceRegistration> watch_manual(std::string) override
     {
-        return watch_fd(-1, Interest::Readable);
+        return watch_probe(ProbeDescriptor{ProbeKind::Fd, -1, "manual"});
     }
     void cancel(SourceHandle) override
     {

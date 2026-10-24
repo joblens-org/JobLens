@@ -27,6 +27,8 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -456,6 +458,57 @@ void reader_failure_isolation()
     poller.shutdown();
 }
 
+// RingBuffer probes use ring_buffer__epoll_fd(): the shared poller watches an
+// inner epoll fd. This fixture uses an eventfd inside an inner epoll to verify
+// the nested-epoll, one-shot and rearm contract without requiring BPF.
+void nested_epoll_ring_buffer_probe()
+{
+    Sink sink;
+    EventPoller poller(16);
+    poller.start();
+
+    const int inner = epoll_create1(EPOLL_CLOEXEC);
+    const int signal = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    check(inner >= 0 && signal >= 0, "nested epoll setup");
+    epoll_event event{};
+    event.events = EPOLLIN;
+    event.data.fd = signal;
+    check(epoll_ctl(inner, EPOLL_CTL_ADD, signal, &event) == 0, "inner epoll add");
+
+    StagedSourceRegistrar registrar(poller, [&](const ReadySources& ready) { sink(ready); });
+    auto registration = registrar.watch_probe(
+        ProbeDescriptor{ProbeKind::RingBuffer, inner, "fake-ringbuf"});
+    check(registration.has_value(), "RingBuffer probe staging");
+    check(registrar.pending() == 1 && registrar.active() == 0,
+          "RingBuffer probe activated before commit");
+    check(registrar.commit(), "RingBuffer probe commit");
+    const auto handle = registration->handle();
+    check(poller.snapshot().at("sources").at(0).at("kind") == "ring_buffer",
+          "RingBuffer probe kind status");
+
+    uint64_t value = 1;
+    check(write(signal, &value, sizeof(value)) == sizeof(value), "signal inner epoll");
+    check(sink.wait_for(1), "nested epoll readiness");
+    check(sink.at(0).readiness & ready_flags::readable, "nested epoll readable flag");
+    check(read(signal, &value, sizeof(value)) == sizeof(value), "drain inner eventfd");
+
+    // Outer epoll is one-shot; no rearm means no second notification even when
+    // the inner epoll is readable again.
+    check(write(signal, &value, sizeof(value)) == sizeof(value), "signal disarmed inner epoll");
+    std::this_thread::sleep_for(50ms);
+    check(sink.size() == 1, "RingBuffer probe ignored one-shot disarm");
+
+    check(registrar.rearm(handle), "RingBuffer probe rearm");
+    check(sink.wait_for(2), "RingBuffer probe rearm readiness");
+    check(read(signal, &value, sizeof(value)) == sizeof(value), "drain rearmed eventfd");
+
+    registration->cancel();
+    check(fcntl(inner, F_GETFD) >= 0, "cancel closed the inner epoll fd");
+    poller.shutdown();
+    close(signal);
+    close(inner);
+}
+
 // I4: commit is the activation boundary for a new registration group.
 void activation_boundary()
 {
@@ -489,6 +542,7 @@ int main()
         tail_with_hangup();
         reader_failure_isolation();
         activation_boundary();
+        nested_epoll_ring_buffer_probe();
         std::cout << "PASS event poller: staged registration, one-shot rearm, manual readiness, "
                      "hangup, failure isolation and thread ownership\n";
         return 0;

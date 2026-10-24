@@ -26,6 +26,13 @@
 #include <spdlog/spdlog.h>
 
 namespace {
+uint32_t event_mask(ProbeKind kind)
+{
+    uint32_t mask = EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLONESHOT;
+    if (kind == ProbeKind::Fd) mask |= EPOLLRDHUP;
+    return mask;
+}
+
 uint32_t translate_events(uint32_t events)
 {
     uint32_t readiness = 0;
@@ -38,9 +45,10 @@ uint32_t translate_events(uint32_t events)
 
 struct EventPoller::State {
     struct Registration {
+        ProbeKind kind = ProbeKind::Fd;
         int fd = -1;
+        std::string name;
         SourceHandle handle{};
-        Interest interest = Interest::Readable;
         ReadySink sink;
         bool armed = true;
     };
@@ -132,26 +140,29 @@ void EventPoller::shutdown()
     state_->started = false;
 }
 
-std::optional<SourceHandle> EventPoller::watch_fd(int fd, Interest interest, ReadySink sink)
+std::optional<SourceHandle> EventPoller::watch_probe(const ProbeDescriptor& probe,
+                                                     ReadySink sink)
 {
-    if (fd < 0 || !sink) return std::nullopt;
+    if (probe.readiness_fd < 0 || !sink) return std::nullopt;
     std::lock_guard lock(state_->mutex);
     if (!state_->started || state_->stopped) return std::nullopt;
     if (state_->registrations.size() >= state_->max_sources) return std::nullopt;
 
     const uint64_t id = ++state_->next_id;
     epoll_event event{};
-    event.events = EPOLLIN | EPOLLHUP | EPOLLRDHUP | EPOLLERR | EPOLLONESHOT;
+    event.events = event_mask(probe.kind);
     event.data.u64 = id;
-    if (epoll_ctl(state_->epoll_fd, EPOLL_CTL_ADD, fd, &event) != 0) {
+    if (epoll_ctl(state_->epoll_fd, EPOLL_CTL_ADD, probe.readiness_fd, &event) != 0) {
         ++state_->errors;
-        spdlog::warn("EventPoller: cannot watch fd {}: {}", fd, std::strerror(errno));
+        spdlog::warn("EventPoller: cannot watch {} descriptor {}: {}",
+                     to_string(probe.kind), probe.readiness_fd, std::strerror(errno));
         return std::nullopt;
     }
     State::Registration registration;
-    registration.fd = fd;
+    registration.kind = probe.kind;
+    registration.fd = probe.readiness_fd;
+    registration.name = probe.name;
     registration.handle = SourceHandle{id, 1};
-    registration.interest = interest;
     registration.sink = std::move(sink);
     registration.armed = true;
     state_->registrations.emplace(id, std::move(registration));
@@ -166,7 +177,7 @@ bool EventPoller::rearm(SourceHandle handle)
     if (it == state_->registrations.end() || it->second.handle.generation != handle.generation)
         return false;
     epoll_event event{};
-    event.events = EPOLLIN | EPOLLHUP | EPOLLRDHUP | EPOLLERR | EPOLLONESHOT;
+    event.events = event_mask(it->second.kind);
     event.data.u64 = it->second.handle.id;
     if (epoll_ctl(state_->epoll_fd, EPOLL_CTL_MOD, it->second.fd, &event) != 0) {
         ++state_->errors;
@@ -259,6 +270,8 @@ nlohmann::json EventPoller::snapshot() const
         sources.push_back({
             {"source_id", registration.handle.id},
             {"generation", registration.handle.generation},
+            {"kind", to_string(registration.kind)},
+            {"name", registration.name},
             {"fd", registration.fd},
             {"armed", registration.armed},
         });
@@ -285,17 +298,17 @@ StagedSourceRegistrar::~StagedSourceRegistrar()
     revoke();
 }
 
-std::optional<SourceRegistration> StagedSourceRegistrar::watch_fd(int fd, Interest interest)
+std::optional<SourceRegistration> StagedSourceRegistrar::watch_probe(
+    const ProbeDescriptor& probe)
 {
-    if (fd < 0 || !sink_) return std::nullopt;
+    if (probe.readiness_fd < 0 || !sink_) return std::nullopt;
     std::lock_guard lock(mutex_);
     const SourceHandle staged{++next_id_, 1};
     Entry entry;
-    entry.fd = fd;
-    entry.interest = interest;
+    entry.probe = probe;
     entry.staged = staged;
     if (committed_) {
-        auto poller_handle = poller_.watch_fd(fd, interest, sink_);
+        auto poller_handle = poller_.watch_probe(probe, sink_);
         if (!poller_handle) return std::nullopt;
         entry.poller = *poller_handle;
         entry.committed = true;
@@ -311,8 +324,8 @@ std::optional<SourceRegistration> StagedSourceRegistrar::watch_manual(std::strin
     const SourceHandle staged{++next_id_, 1};
     Entry entry;
     entry.manual = true;
+    entry.probe.name = std::move(name);
     entry.staged = staged;
-    entry.name = std::move(name);
     entry.committed = committed_;
     entries_.emplace(staged.id, std::move(entry));
     return SourceRegistration(this, staged);
@@ -347,7 +360,7 @@ bool StagedSourceRegistrar::commit()
             continue;
         }
         if (entry.committed) continue;
-        auto poller_handle = poller_.watch_fd(entry.fd, entry.interest, sink_);
+        auto poller_handle = poller_.watch_probe(entry.probe, sink_);
         if (!poller_handle) {
             for (auto& [registered_id, registered] : entries_) {
                 (void)registered_id;
@@ -427,10 +440,11 @@ nlohmann::json StagedSourceRegistrar::snapshot() const
         sources.push_back({
             {"source_id", entry.staged.id},
             {"generation", entry.staged.generation},
-            {"fd", entry.fd},
+            {"kind", to_string(entry.probe.kind)},
+            {"fd", entry.probe.readiness_fd},
             {"manual", entry.manual},
             {"committed", entry.committed},
-            {"name", entry.name},
+            {"name", entry.probe.name},
         });
     }
     return {{"committed", committed_}, {"sources", std::move(sources)}};
