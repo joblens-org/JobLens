@@ -165,6 +165,12 @@ private:
     void startEventSystemCollector(const std::string& name, const collector_info& info,
                                    collector_state& state,
                                    std::shared_ptr<CollectorLane> lane);
+    bool startEventCollectorLane(const std::string& name, const collector_info& info,
+                                 collector_state& state,
+                                 std::shared_ptr<CollectorLane> lane);
+    bool startPeriodicCollectorLane(const std::string& name, const collector_info& info,
+                                    collector_state& state,
+                                    std::shared_ptr<CollectorLane> lane);
     WorkResult runCollectorLane(std::shared_ptr<CollectorLane> lane);
     WorkResult runPeriodicJobSweep(CollectorLane& lane);
     WorkResult runPeriodicSystemTick(CollectorLane& lane);
