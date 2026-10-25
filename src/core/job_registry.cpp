@@ -25,6 +25,7 @@
 #include <chrono>
 #include <filesystem>
 
+#include "core/job_identity.hpp"
 #include "common/utils.hpp"
 #include "common/condor_job.hpp"
 #include "common/slurm_job.hpp"
@@ -115,7 +116,17 @@ static Job persist_json_to_job(const std::string& json_str) {
 std::string json2JobOpt(const nlohmann::json& obj, Job& job) {
     auto opt = obj["opt"].get<std::string>();
 
-    job.JobID = obj.value("JobID", 0u);
+    // Internal IDs parse explicitly as uint64: a JSON number or a decimal
+    // string, never a 32-bit default. Absent keeps the legacy auto-allocate
+    // sentinel; reserved (0) keeps its historical meaning; anything else is
+    // an explicit request error.
+    const auto legacy_id = parse_legacy_job_id(
+        obj.contains("JobID") ? obj["JobID"] : nlohmann::json(nullptr));
+    if (legacy_id.status == LegacyIdStatus::Invalid) {
+        throw std::runtime_error(
+            "invalid JobID: expected a uint64 number or decimal string");
+    }
+    job.JobID = legacy_id.value;
     job.JobPIDs = obj.value("JobPIDs", nlohmann::json::array()).get<std::vector<pid_t>>();
     job.CollectorNames = obj.value("Lens", nlohmann::json::array()).get<std::vector<std::string>>();
     if (job.JobPIDs.size() == 0) {
