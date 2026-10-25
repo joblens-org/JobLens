@@ -750,3 +750,33 @@ def get_job_processes(job_id: str) -> List[Tuple[str, str, str]]:
                         pids.append((node, child_pid, cmd_name))
     
     return pids
+
+
+# ==================== 作业清单 / 采集控制 RPC ====================
+# doc/job_inventory_collection_decoupling_plan.md §9：Trigger 只校验并转发，
+# 不分配、不推导内部 ID，也不在 Core 不可用时伪造响应。
+
+INVENTORY_RPC_TIMEOUT_DEFAULT = 5.0
+RPC_SOCKET_DEFAULT = '/var/JobLens/rpc.sock'
+
+
+def _rpc_endpoint() -> Tuple[str, float]:
+    """从 lens_config 读取 RPC socket 路径与超时，与 job_opt 的配置来源保持一致。"""
+    lens_cfg = config.get('lens_config', {}) if isinstance(config, dict) else {}
+    socket_path = lens_cfg.get('rpc_socket_path') or RPC_SOCKET_DEFAULT
+    timeout = float(lens_cfg.get('rpc_timeout', INVENTORY_RPC_TIMEOUT_DEFAULT))
+    return socket_path, timeout
+
+
+def call_inventory_rpc(method: str, params=None, rpc_client=None):
+    """调用 Core 的清单/采集控制 RPC 方法。
+
+    优先使用 register_routes 注入的 rpc_client；Trigger 启动时 Core 未就绪
+    （rpc_client 为 None）则按 lens_config 现建客户端，语义与 job_opt 一致。
+    测试通过替换本函数来 mock Core。
+    """
+    client = rpc_client
+    if client is None:
+        socket_path, timeout = _rpc_endpoint()
+        client = RPCClient(socket_path, timeout)
+    return client.call(method, params if params is not None else {})

@@ -23,9 +23,11 @@ import time
 import subprocess
 from typing import Optional
 from werkzeug.exceptions import HTTPException
+from pydantic import ValidationError
 
 # 业务操作函数
-from trigger.core.tools import joblens_format_metrics, systemd_status, job_opt, add_condorjob, add_slurmjob
+from trigger.core.tools import joblens_format_metrics, systemd_status, job_opt, add_condorjob, add_slurmjob, restart_joblens
+from trigger.core import tools as core_tools
 from trigger.core.rpc_client import RPCError
 from trigger.api.auth import install_auth
 from trigger.api.errors import install_error_handlers
@@ -41,7 +43,10 @@ try:
         ConfigUpdateResponse, ConfigStatusResponse,
         RegistryStatusResponse, RegistryRegisterResponse,
         RulesListResponse, RulesSyncResponse, RuleStatusResponse,
-        VersionResponse, UpgradeResponse, HardwareInfoResponse, PidTrackerStatsResponse
+        VersionResponse, UpgradeResponse, HardwareInfoResponse, PidTrackerStatsResponse,
+        CollectionControlRequest, CollectionControlResponse, CollectionStatusResponse,
+        CollectionErrorResponse, InventoryListResponse, InventoryStatusResponse,
+        CapabilitiesResponse
     )
 except ImportError:
     from trigger.api.schemas import (
@@ -52,10 +57,140 @@ except ImportError:
         ConfigUpdateResponse, ConfigStatusResponse,
         RegistryStatusResponse, RegistryRegisterResponse,
         RulesListResponse, RulesSyncResponse, RuleStatusResponse,
-        VersionResponse, UpgradeResponse, HardwareInfoResponse, PidTrackerStatsResponse
+        VersionResponse, UpgradeResponse, HardwareInfoResponse, PidTrackerStatsResponse,
+        CollectionControlRequest, CollectionControlResponse, CollectionStatusResponse,
+        CollectionErrorResponse, InventoryListResponse, InventoryStatusResponse,
+        CapabilitiesResponse
     )
 
 logger = logging.getLogger(__name__)
+
+
+# 新接口（§9.2）Core 结构化错误码 -> HTTP 状态码。
+# Flask 只按这张表映射，不对 Core 语义做额外猜测；未知码按 503 处理并告警，
+# 保证任何 Core 错误都不会被吞成 200。
+_COLLECTION_ERROR_STATUS = {
+    # 400 invalid request
+    'invalid_request': 400,
+    'invalid_argument': 400,
+    'invalid_selector': 400,
+    'invalid_collectors': 400,
+    'unknown_collector': 400,
+    # 404 no verified current instance
+    'not_found': 404,
+    'no_verified_instance': 404,
+    'instance_not_found': 404,
+    'job_not_found': 404,
+    # 409 ambiguous selector / stale revision / closing generation / changed snapshot
+    'ambiguous_selector': 409,
+    'ambiguous': 409,
+    'stale_revision': 409,
+    'revision_conflict': 409,
+    'generation_closing': 409,
+    'closing_generation': 409,
+    'snapshot_changed': 409,
+    'cursor_invalidated': 409,
+    # 503 unavailable identity verification / persistence / control service
+    'unavailable': 503,
+    'identity_unavailable': 503,
+    'persistence_unavailable': 503,
+    'store_unavailable': 503,
+    'control_unavailable': 503,
+    'service_unavailable': 503,
+    'not_ready': 503,
+}
+
+
+def _error_response(status: int, code: str, message: str, candidates=None):
+    """§9.2 结构化错误响应：code + message [+ candidates]"""
+    body = CollectionErrorResponse(code=code, message=message, candidates=candidates)
+    return jsonify(body.model_dump(exclude_none=True)), status
+
+
+def _invalid_request(message: str):
+    return _error_response(400, 'invalid_request', message)
+
+
+def _rpc_unavailable(method: str, exc: Exception):
+    logger.error("Inventory/collection RPC unavailable: method=%s, error=%s", method, str(exc))
+    return _error_response(
+        503,
+        'rpc_unavailable',
+        f"JobLens core is unavailable while handling {method}: {str(exc)}",
+    )
+
+
+def _invalid_core_response(method: str, detail: str):
+    logger.error("Inventory/collection RPC contract mismatch: method=%s, detail=%s", method, detail)
+    return _error_response(
+        502,
+        'core_response_invalid',
+        f"JobLens core returned an invalid response for {method}: {detail}",
+    )
+
+
+def _format_validation_error(exc: ValidationError) -> str:
+    """把 Pydantic 校验错误压成一行，避免暴露内部 URL/文档链接。"""
+    parts = []
+    for err in exc.errors():
+        location = '.'.join(str(item) for item in err.get('loc', ())) or 'body'
+        message = str(err.get('msg', 'invalid value')).replace('Value error, ', '')
+        parts.append(f"{location}: {message}")
+    return '; '.join(parts) or 'invalid request body'
+
+
+def _candidate_instance_id(candidate):
+    """候选实例只暴露句柄，避免把内部结构当成契约泄漏出去。"""
+    if isinstance(candidate, dict):
+        for key in ('instance_id', 'instance'):
+            if candidate.get(key) is not None:
+                return str(candidate[key])
+        return str(candidate)
+    return str(candidate)
+
+
+def _structured_core_error(payload):
+    """把 Core 结构化错误翻译成 §9 的 HTTP 响应；非错误 payload 返回 None。
+
+    约定的 Core 错误信封：{"status": "error", "code": ..., "message": ...,
+    "candidates": [...]}。同时兼容嵌套 {"error": {...}}、候选人字段
+    candidate_instance_ids 与旧字段 msg，避免因信封细节丢失错误码。
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    nested = payload.get('error')
+    if isinstance(nested, dict):
+        source = nested
+    elif payload.get('status') == 'error':
+        source = payload
+    else:
+        return None
+
+    code = str(
+        source.get('code') or source.get('error_code')
+        or payload.get('code') or payload.get('error_code')
+        or 'core_error'
+    )
+    message = (
+        source.get('message') or source.get('msg')
+        or payload.get('message') or payload.get('msg')
+        or 'core reported an error'
+    )
+    raw_candidates = (
+        source.get('candidates') or source.get('candidate_instance_ids')
+        or payload.get('candidates') or payload.get('candidate_instance_ids')
+    )
+    candidates = (
+        [_candidate_instance_id(item) for item in raw_candidates]
+        if isinstance(raw_candidates, list) else None
+    )
+
+    status = _COLLECTION_ERROR_STATUS.get(code)
+    if status is None:
+        logger.warning("Unknown core error code %r on inventory/collection API; replying 503", code)
+        status = 503
+    return _error_response(status, code, str(message), candidates)
 
 
 def register_routes(app: Flask, rpc_client, config_manager, service_registrar, rule_manager):
@@ -350,6 +485,106 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             logger.error("Slurm job add exception: JobID=%s, error=%s", opt_data.get('JobID'), str(e), exc_info=True)
             return abort(500, description=str(e))
     
+    # ==================== 作业清单与采集控制接口 ====================
+    # 契约：doc/job_inventory_collection_decoupling_plan.md §9。
+    # 与现有控制接口（/joblens/job 等）一致，请求鉴权沿用部署层/网关策略，
+    # 路由内不再额外套 token。Trigger 只校验并转发，不分配内部 ID。
+
+    INVENTORY_DEFAULT_LIMIT = 100
+    INVENTORY_MAX_LIMIT = 1000
+
+    def inventory_rpc(method: str, params=None):
+        """调用 Core 清单/采集控制 RPC（tools.call_inventory_rpc 为唯一接缝）。"""
+        return core_tools.call_inventory_rpc(method, params, rpc_client)
+
+    def forward_inventory_rpc(method: str, params, response_model):
+        """转发一次 RPC：Core 错误按 §9 映射，成功则原样透传 Core payload。"""
+        try:
+            payload = inventory_rpc(method, params)
+        except RPCError as e:
+            return _rpc_unavailable(method, e)
+
+        error = _structured_core_error(payload)
+        if error is not None:
+            return error
+        if not isinstance(payload, dict):
+            return _invalid_core_response(method, 'payload is not a JSON object')
+        try:
+            response_model.model_validate(payload)
+        except ValidationError as e:
+            return _invalid_core_response(method, _format_validation_error(e))
+        return jsonify(payload)
+
+    @app.route('/joblens/inventory', methods=['GET'])
+    def inventory_list():
+        """分页查询作业清单（§9.3），支持 scheduler_type/native_job_id/state/limit/cursor"""
+        raw_limit = request.args.get('limit')
+        try:
+            limit = INVENTORY_DEFAULT_LIMIT if raw_limit in (None, '') else int(raw_limit)
+        except (TypeError, ValueError):
+            return _invalid_request(
+                f'limit must be an integer between 1 and {INVENTORY_MAX_LIMIT}'
+            )
+        if limit < 1 or limit > INVENTORY_MAX_LIMIT:
+            return _invalid_request(
+                f'limit must be between 1 and {INVENTORY_MAX_LIMIT}'
+            )
+
+        params = {'limit': limit}
+        for name in ('scheduler_type', 'native_job_id', 'state', 'cursor'):
+            value = request.args.get(name)
+            if value:
+                params[name] = value
+
+        return forward_inventory_rpc(
+            'JobRegistry/inventory_list', params, InventoryListResponse
+        )
+
+    @app.route('/joblens/inventory/status', methods=['GET'])
+    def inventory_status():
+        """透传 Core 的来源/持久化/队列/对账健康状态（§9.3）"""
+        return forward_inventory_rpc(
+            'JobRegistry/inventory_status', {}, InventoryStatusResponse
+        )
+
+    @app.route('/joblens/collection', methods=['POST'])
+    def collection_set():
+        """按实例句柄或原生身份设置/重置采集意图（§9.2）"""
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return _invalid_request('request body must be a JSON object')
+
+        try:
+            req = CollectionControlRequest.model_validate(data)
+        except ValidationError as e:
+            return _invalid_request(_format_validation_error(e))
+
+        payload = req.model_dump(exclude_none=True)
+        logger.info(
+            "Collection control request: operation=%s, scope=%s, ensure_registered=%s, selector=%s",
+            payload.get('operation'), payload.get('scope'),
+            payload.get('ensure_registered'), payload.get('selector'),
+        )
+        return forward_inventory_rpc('JobCollection/set', payload, CollectionControlResponse)
+
+    @app.route('/joblens/collection', methods=['GET'])
+    def collection_get():
+        """查询单个实例的期望/已生效采集选择与错误（§9.1）"""
+        instance_id = (request.args.get('instance_id') or '').strip()
+        if not instance_id:
+            return _invalid_request('instance_id query parameter is required')
+
+        return forward_inventory_rpc(
+            'JobCollection/get', {'instance_id': instance_id}, CollectionStatusResponse
+        )
+
+    @app.route('/joblens/capabilities', methods=['GET'])
+    def capabilities():
+        """只透传 Core 的能力声明；Core 不支持时返回 503，绝不代其声明能力（§9.3）"""
+        return forward_inventory_rpc(
+            'JobRegistry/capabilities', {}, CapabilitiesResponse
+        )
+
     @app.route('/joblens/jobs/count', methods=['GET'])
     def get_job_count():
         """获取当前注册的作业总数"""
