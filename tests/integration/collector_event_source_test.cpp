@@ -870,7 +870,8 @@ void run(const std::string& base)
                "System datagram burst was not fully consumed");
     check(DgramSystemEvent::ready_calls.load() >= 2,
           "turn bound of 3 did not require a continuation turn for 5 datagrams");
-    check(captured_count("dgram_sys") == 6, "System datagram output count mismatch");
+    eventually([] { return captured_count("dgram_sys") == 6; },
+               "System datagram output count mismatch");
 
     // ------------------------------------------------------------------
     // A2: oversize, malformed and end-marker datagrams are rejected without
@@ -880,7 +881,8 @@ void run(const std::string& base)
     send_raw_to(sys_dgram, oversize.data(), oversize.size());
     eventually([] { return DgramSystemEvent::counters.oversize.load() >= 1; },
                "oversize datagram was not detected via MSG_TRUNC");
-    check(captured_count("dgram_sys") == 6, "oversize datagram produced output");
+    eventually([] { return captured_count("dgram_sys") == 6; },
+               "oversize datagram produced output");
 
     send_raw_to(sys_dgram, "bad", 3);
     eventually([] { return DgramSystemEvent::counters.malformed.load() >= 1; },
@@ -891,7 +893,8 @@ void run(const std::string& base)
     send_to(sys_dgram, make_datagram(0, "", CEV_FLAG_END));
     eventually([] { return DgramSystemEvent::counters.end_markers.load() >= 1; },
                "end-marker datagram was not recorded");
-    check(captured_count("dgram_sys") == 6, "end-marker datagram produced output");
+    eventually([] { return captured_count("dgram_sys") == 6; },
+               "end-marker datagram produced output");
 
     // A valid message clears the error state and confirms the source stayed
     // healthy (EAGAIN remains a normal observation).
@@ -989,7 +992,8 @@ void run(const std::string& base)
     second.send_bytes("o", 1); // completes the buffered frame
     eventually([&] { return captured_contains("stream_sys", "two"); },
                "completed slow-client frame was not emitted");
-    check(captured_count("stream_sys") == 3, "stream output count mismatch");
+    eventually([] { return captured_count("stream_sys") == 3; },
+               "stream output count mismatch");
 
     // ------------------------------------------------------------------
     // Shutdown: owned endpoints are unlinked by their owners; a conflicting
