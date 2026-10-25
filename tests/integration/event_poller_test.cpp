@@ -186,7 +186,7 @@ void staged_commit_and_borrowed_descriptor()
     check(sink.wait_for(1), "I2 pre-existing data was not delivered");
     check(read_byte(reader.value) == 'a', "I2 readable data");
     const auto handle = sink.at(0).source;
-    check(poller.rearm(handle), "I2 rearm");
+    check(registrar.rearm(handle), "I2 rearm");
 
     registration->cancel();
     check(registrar.active() == 0, "I5 registration still active");
@@ -249,7 +249,7 @@ void dynamic_sources_and_fd_reuse()
     check(sink.wait_for(1), "I6 dynamic source readiness");
     const auto first_handle = sink.at(0).source;
     drain(reader.value);
-    check(poller.rearm(first_handle), "I6 rearm dynamic source");
+    check(registrar.rearm(first_handle), "I6 rearm dynamic source");
     dynamic->cancel();
     check(registrar.active() == 0, "I6 dynamic source cancel");
 

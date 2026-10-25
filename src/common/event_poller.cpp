@@ -289,13 +289,37 @@ nlohmann::json EventPoller::snapshot() const
 }
 
 StagedSourceRegistrar::StagedSourceRegistrar(EventPoller& poller, EventPoller::ReadySink sink)
-    : poller_(poller), sink_(std::move(sink))
+    : poller_(poller),
+      sink_(std::move(sink)),
+      poller_sink_([this](const ReadySources& ready) { forward_translated(ready); })
 {
 }
 
 StagedSourceRegistrar::~StagedSourceRegistrar()
 {
     revoke();
+}
+
+void StagedSourceRegistrar::forward_translated(const ReadySources& ready)
+{
+    ReadySources translated;
+    EventPoller::ReadySink sink;
+    {
+        std::lock_guard lock(mutex_);
+        translated.reserve(ready.size());
+        for (const auto& source : ready) {
+            for (auto& [id, entry] : entries_) {
+                (void)id;
+                if (!entry.manual && entry.committed && entry.poller.id == source.source.id) {
+                    translated.push_back(ReadySource{entry.staged, source.readiness});
+                    break;
+                }
+            }
+        }
+        sink = sink_;
+    }
+    if (translated.empty() || !sink) return;
+    sink(translated);
 }
 
 std::optional<SourceRegistration> StagedSourceRegistrar::watch_probe(
@@ -308,7 +332,7 @@ std::optional<SourceRegistration> StagedSourceRegistrar::watch_probe(
     entry.probe = probe;
     entry.staged = staged;
     if (committed_) {
-        auto poller_handle = poller_.watch_probe(probe, sink_);
+        auto poller_handle = poller_.watch_probe(probe, poller_sink_);
         if (!poller_handle) return std::nullopt;
         entry.poller = *poller_handle;
         entry.committed = true;
@@ -360,7 +384,7 @@ bool StagedSourceRegistrar::commit()
             continue;
         }
         if (entry.committed) continue;
-        auto poller_handle = poller_.watch_probe(entry.probe, sink_);
+        auto poller_handle = poller_.watch_probe(entry.probe, poller_sink_);
         if (!poller_handle) {
             for (auto& [registered_id, registered] : entries_) {
                 (void)registered_id;

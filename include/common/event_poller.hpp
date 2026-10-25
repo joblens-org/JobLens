@@ -109,8 +109,14 @@ private:
         bool committed = false;
     };
 
+    // Runs on the poll thread: translates poller handles back into the staged
+    // handles the collector received from watch_*. Unknown/stale poller ids
+    // are dropped. The user sink runs outside the registrar lock.
+    void forward_translated(const ReadySources& ready);
+
     EventPoller& poller_;
     EventPoller::ReadySink sink_;
+    EventPoller::ReadySink poller_sink_;
     mutable std::mutex mutex_;
     std::unordered_map<uint64_t, Entry> entries_;
     uint64_t next_id_ = 0;
