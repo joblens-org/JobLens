@@ -43,9 +43,14 @@ class CondorJobRequest(BaseModel):
 
 
 class SlurmJobRequest(BaseModel):
-    """Slurm作业专用请求"""
+    """Slurm作业专用请求
+
+    §9.4：JobID 是兼容提示，不是权威身份。原生身份以 sub_attr 的
+    job_id/step_id + 调度器命名空间为准，因此 identity-only 的
+    legacy add 可以不带 JobID。
+    """
     opt: str = Field(..., description="操作类型，目前仅支持 'add'")
-    JobID: int = Field(..., description="Slurm作业ID")
+    JobID: Optional[int] = Field(None, description="作业ID（兼容提示，可省略）")
     Lens: Optional[List[str]] = Field(None, description="采集器列表，默认 ['cpumem_collector', 'io_collector', 'net_collector']")
     sub_attr: Optional[Dict[str, Any]] = Field(None, description="子属性，包含job_id/step_id，不提供则用JobID/0")
 
