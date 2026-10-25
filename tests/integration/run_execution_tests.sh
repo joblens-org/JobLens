@@ -4,8 +4,8 @@
 # Usage:
 #   bash tests/integration/run_execution_tests.sh [build-dir] [--suite NAME]
 #
-# Suites: executor, all. Unknown suites fail. Later implementation tasks add
-# timers, matrix, poller, lifecycle, sources and finalization here.
+# Suites: executor, matrix, poller, lifecycle, sources, all. Unknown suites
+# fail. Later implementation tasks add timers and finalization here.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 
@@ -94,6 +94,21 @@ run_matrix() {
     timeout 60 "$work/matrix_test" "$work/matrix"
 }
 
+run_sources() {
+    link=""
+    while IFS= read -r command; do
+        if [[ "$command" == *" -o JobLens "* ]]; then link=$command; fi
+    done < <(ninja -C "$build" -t commands JobLens)
+    [[ -n "$link" ]] || { printf '%s\n' 'Could not find the Ninja JobLens link command' >&2; exit 1; }
+    c++ -std=c++17 -O0 -g -DSPDLOG_COMPILED_LIB -DYAML_CPP_STATIC_DEFINE -DHAS_STRING_VIEW=1 \
+        -I"$build/include" -I"$root/include" -I/usr/include/libnl3 \
+        -c "$root/tests/integration/collector_event_source_test.cpp" -o "$work/source_test.o"
+    command=${link/CMakeFiles\/JobLens.dir\/src\/main.cpp.o/\"$work\/source_test.o\"}
+    command=${command/ -o JobLens / -o \"$work\/source_test\" }
+    (cd "$build"; bash -c "$command")
+    timeout 120 "$work/source_test" "$work/sources"
+}
+
 case "$suite" in
     executor)
         run_executor
@@ -107,11 +122,15 @@ case "$suite" in
     lifecycle)
         run_lifecycle
         ;;
+    sources)
+        run_sources
+        ;;
     all)
         run_executor
         run_matrix
         run_poller
         run_lifecycle
+        run_sources
         ;;
     *)
         printf 'Unknown execution suite: %s\n' "$suite" >&2

@@ -57,6 +57,22 @@ process-sum summary semantics are retained, including shared-socket totals.
 Run same-load measurements on a deployment node to assess end-to-end gains;
 the syscall regression is not a timing benchmark.
 
+### 统一采集执行套件 / Unified collector execution suites
+
+```bash
+bash tests/integration/run_execution_tests.sh build --suite all
+# 单套件: --suite executor|matrix|poller|lifecycle|sources
+```
+
+无需特权。覆盖共享执行器(worker 上限/串行 lane/合并/续跑/异常恢复)、四契约矩阵、共享就绪轮询器(staged 注册、one-shot rearm、挂起、失败隔离、线程归属)、生命周期分发(事件分发、System 信封、closing 确认),以及采集器自持真实源:
+
+- `collector_event_source_test.cpp`:`collector_event_fixture.h` 协议下的 AF_UNIX 数据报(Job/System 两作用域、有界续跑、超限/畸形/结束标记拒绝、路径所有权)与流式连接夹具(非阻塞 accept、动态客户端注册、半帧缓冲、断连尾数据、连接上限、慢客户端隔离)。
+- `collector_event_bpf_test.cpp` + `run_event_bpf_test.sh`:私有 eBPF 探针(ring + 精确丢失统计),consume_n 与旧版回调预算两条有界消费路径、两种作用域信封、同 lane 混合 ring+socket 就绪。**需要 root/BPF 特权,无特权时显式跳过(exit 77)**:
+
+```bash
+sudo bash tests/integration/run_event_bpf_test.sh build
+```
+
 ### 原生输出契约 / 路由 / 调度集成回归
 
 在已配置 Ninja 构建目录、具备项目 C++ 编译依赖的本机运行：
