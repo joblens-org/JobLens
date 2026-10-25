@@ -13,6 +13,7 @@
  * limitations under the License. */
 #pragma once
 #include "core/collector_type.h"
+#include "core/job_identity.hpp"
 #include "core/group_probe_stats.hpp"
 #include "common/classad_decode.hpp"
 #include "common/utils.hpp"
@@ -21,7 +22,10 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <charconv>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -105,6 +109,58 @@ inline std::string getJobName(pid_t pid){
 /* 获取分区/队列名称 */
 inline std::string getPartition(pid_t pid){
     return get_env_field(pid, "SLURM_JOB_PARTITION");
+}
+
+// ---------------------------------------------------------------------------
+// Strict, error-reporting parsing for the discovery adapter
+// ---------------------------------------------------------------------------
+// getJobID()/getStepID() collapse "missing", "unparsable" and "zero" into 0. A
+// discovery observation must keep them apart: a guessed step merges two
+// executions, a guessed job id invents a job.
+
+namespace detail {
+inline std::optional<std::uint64_t> parse_decimal_u64(const std::string& raw){
+    if (raw.empty() || raw.size() > 20) return std::nullopt;
+    std::uint64_t value = 0;
+    const auto* begin = raw.data();
+    const auto* end = raw.data() + raw.size();
+    const auto parsed = std::from_chars(begin, end, value, 10);
+    if (parsed.ec != std::errc() || parsed.ptr != end) return std::nullopt;
+    return value;
+}
+} // namespace detail
+
+// SLURM_JOB_ID -> logical job number. Missing/garbage is an explicit failure.
+inline std::optional<std::uint64_t> parse_job_id(const std::string& raw, std::string& error){
+    const auto value = detail::parse_decimal_u64(raw);
+    if (!value) {
+        error = raw.empty() ? "SLURM_JOB_ID missing" : "SLURM_JOB_ID '" + raw + "' is not decimal";
+        return std::nullopt;
+    }
+    if (*value == 0) {
+        error = "SLURM_JOB_ID is 0";
+        return std::nullopt;
+    }
+    return value;
+}
+
+// SLURM_STEP_ID -> numeric step value. The special batch/extern constants stay
+// distinct from numeric steps (see slurm_step_name in core/job_identity.hpp).
+inline std::optional<std::uint32_t> parse_step_id(const std::string& raw, std::string& error){
+    const auto value = detail::parse_decimal_u64(raw);
+    if (!value || *value > std::numeric_limits<std::uint32_t>::max()) {
+        error = raw.empty() ? "SLURM_STEP_ID missing" : "SLURM_STEP_ID '" + raw + "' is not a step value";
+        return std::nullopt;
+    }
+    return static_cast<std::uint32_t>(*value);
+}
+
+// Adapter-boundary conversion: numeric step -> canonical wire step_id. batch and
+// extern keep their names, every other value is its decimal form; nothing is
+// ever mapped to a different step.
+inline std::string step_id_name(std::uint32_t numeric_step){
+    if (const auto special = slurm_step_name(numeric_step)) return *special;
+    return std::to_string(numeric_step);
 }
 
 /* 获取所有slurmstepd进程PID列表 */

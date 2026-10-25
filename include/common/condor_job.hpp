@@ -28,6 +28,9 @@
 #include <iostream>
 #include <optional>
 #include <variant>
+#include <algorithm>
+#include <cctype>
+#include <optional>
 #include <spdlog/spdlog.h>
 #include <fmt/core.h>
 
@@ -135,6 +138,117 @@ inline std::string get_ad_field(std::string ad_path, const std::string &field){
         }
     }
     return "";
+}
+
+// ---------------------------------------------------------------------------
+// Structured job-ad parsing for the discovery adapter
+// ---------------------------------------------------------------------------
+// The helpers above return "" for every failure, which cannot distinguish "no
+// ad" from "unreadable ad" from "ad without a GlobalJobId". The observation
+// adapter must tell the difference, because each of those is an *incomplete*
+// observation with its own reason, never a guessed identity.
+
+struct CondorAdIdentity {
+    std::string global_job_id;   // raw field value as written in the ad
+    std::string scheduler_name;  // schedd namespace, e.g. "scheduler@schedd07.example"
+    std::string scheduler_host;  // schedd host part, e.g. "schedd07.example"
+    std::string native_job_id;   // "ClusterId.ProcId" as written in the ad
+    std::string owner;
+};
+
+inline bool read_ad_content(const std::string& ad_path, std::string& content,
+                            std::string& error){
+    std::ifstream f(ad_path, std::ios::binary);
+    if (!f) {
+        error = "cannot open '" + ad_path + "'";
+        return false;
+    }
+    std::ostringstream buffer;
+    buffer << f.rdbuf();
+    if (f.bad()) {
+        error = "read error on '" + ad_path + "'";
+        return false;
+    }
+    content = buffer.str();
+    if (content.empty()) {
+        error = "job ad '" + ad_path + "' is empty";
+        return false;
+    }
+    return true;
+}
+
+inline std::string get_ad_field_from_content(const std::string& content,
+                                             const std::string &field){
+    std::istringstream stream(content);
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        auto p = line.find(" = ");
+        if (p != std::string::npos && line.compare(0, p, field) == 0) {
+            return line.substr(p + 3);
+        }
+    }
+    return "";
+}
+
+namespace detail {
+inline std::string strip_quotes(std::string value){
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+        return value.substr(1, value.size() - 2);
+    return value;
+}
+inline bool is_decimal_part(const std::string& part){
+    if (part.empty()) return false;
+    return std::all_of(part.begin(), part.end(),
+                       [](unsigned char c){ return std::isdigit(c) != 0; });
+}
+} // namespace detail
+
+// Parses the identity-bearing fields of a condor job ad. Returns nullopt with a
+// reason when the ad cannot name a job; the caller turns that into an
+// incomplete observation.
+inline std::optional<CondorAdIdentity> parse_ad_identity(const std::string& content,
+                                                         std::string& error){
+    CondorAdIdentity ad;
+    ad.global_job_id = detail::strip_quotes(get_ad_field_from_content(content, "GlobalJobId"));
+    if (ad.global_job_id.empty()) {
+        error = "no GlobalJobId field";
+        return std::nullopt;
+    }
+    ad.owner = detail::strip_quotes(get_ad_field_from_content(content, "Owner"));
+
+    // Format: "scheduler@schedd.example#ClusterId.ProcId#timestamp"
+    const auto first_sharp = ad.global_job_id.find('#');
+    if (first_sharp == std::string::npos) {
+        error = "GlobalJobId '" + ad.global_job_id + "' has no schedd segment";
+        return std::nullopt;
+    }
+    const auto second_sharp = ad.global_job_id.find('#', first_sharp + 1);
+    if (second_sharp == std::string::npos) {
+        error = "GlobalJobId '" + ad.global_job_id + "' has no job id segment";
+        return std::nullopt;
+    }
+
+    const auto quote = ad.global_job_id.find('"');
+    if (quote != std::string::npos && quote < first_sharp)
+        ad.scheduler_name = ad.global_job_id.substr(quote + 1, first_sharp - quote - 1);
+    else
+        ad.scheduler_name = ad.global_job_id.substr(0, first_sharp);
+
+    const auto at = ad.global_job_id.find('@');
+    if (at != std::string::npos && at < first_sharp)
+        ad.scheduler_host = ad.global_job_id.substr(at + 1, first_sharp - at - 1);
+
+    ad.native_job_id =
+        ad.global_job_id.substr(first_sharp + 1, second_sharp - first_sharp - 1);
+    const auto dot = ad.native_job_id.find('.');
+    if (dot == std::string::npos ||
+        !detail::is_decimal_part(ad.native_job_id.substr(0, dot)) ||
+        !detail::is_decimal_part(ad.native_job_id.substr(dot + 1))) {
+        error = "GlobalJobId '" + ad.global_job_id + "' has an unparsable native job id";
+        return std::nullopt;
+    }
+    return ad;
 }
 
 inline uint64_t getJobID(pid_t pid){
