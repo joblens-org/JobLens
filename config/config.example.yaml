@@ -23,6 +23,33 @@ lens_config:
 # ============================================================
 job_registry_config:
   job_db_path: /var/JobLens/job.db          # LevelDB database directory for job persistence
+  # Inventory maintenance (doc/job_inventory_collection_decoupling_plan.md
+  # section 8). `types` is opt-in: an absent list means [] (no broad discovery).
+  # `reconcile_interval_sec` defaults to 30 and must be >= 1; invalid values are
+  # rejected at startup.
+  inventory:
+    types: [condor, slurm]
+    reconcile_interval_sec: 30
+
+# Scheduler discovery. `auto_collect` is the per-type switch: an explicit value
+# here wins over the legacy job_registry_config.auto_add_condorjob /
+# auto_add_slurmjob flags (default false). Listing a type under
+# job_registry_config.inventory.types maintains every recognized local instance;
+# auto_collect only decides whether automatic policy may select collection for
+# those instances (policy itself ships separately).
+condor_job_watcher:
+  auto_collect: false
+  use_rules: true
+  rules_dir: /etc/JobLens/rules/condor_jobs
+  rules_prefix: condor_job_
+  auto_add_collectors: [cpumem_collector]
+
+slurm_job_watcher:
+  auto_collect: false
+  use_rules: false
+  rules_dir: /etc/JobLens/rules/slurm_jobs
+  rules_prefix: slurm_job_
+  auto_add_collectors: [cpumem_collector]
 
 # ============================================================
 # Collector Configuration — cpumem only

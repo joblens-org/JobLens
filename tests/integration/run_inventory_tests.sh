@@ -4,8 +4,8 @@
 # Usage:
 #   bash tests/integration/run_inventory_tests.sh [build-dir] [--suite NAME]
 #
-# Suites: identity, store, intent, all. Unknown suites fail. Later
-# implementation tasks add maintenance, binding and policy suites here.
+# Suites: identity, store, intent, maintenance, all. Unknown suites fail. Later
+# implementation tasks add binding and policy suites here.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 
@@ -78,6 +78,11 @@ run_intent() {
     link_test "$root/tests/integration/job_collection_intent_test.cpp" job_collection_intent_test
 }
 
+run_maintenance() {
+    link_test "$root/tests/integration/job_inventory_maintenance_test.cpp" \
+        job_inventory_maintenance_test
+}
+
 case "$suite" in
     identity)
         run_identity
@@ -88,10 +93,14 @@ case "$suite" in
     intent)
         run_intent
         ;;
+    maintenance)
+        run_maintenance
+        ;;
     all)
         run_identity
         run_store
         run_intent
+        run_maintenance
         ;;
     *)
         printf 'Unknown inventory suite: %s\n' "$suite" >&2

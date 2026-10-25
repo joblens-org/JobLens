@@ -18,11 +18,13 @@
 #include "core/writer_manager.hpp"
 #include "core/job_registry.hpp"
 #include "core/collector_scheduler.hpp"
+#include "core/job_inventory_maintenance.hpp"
 #include "common/permission_opt.hpp"
 #include "common/local_rpc.hpp"
 #include "common/version.h"
 
 #include <iostream>
+#include <memory>
 #include <spdlog/spdlog.h>
 #include <fmt/ranges.h>
 #include <signal.h>
@@ -132,6 +134,11 @@ bool already_running() {
 
 void onBecomeService() {
     spdlog::info("Main: app start as service mode.");
+    // Plan 5.1: inventory start is explicit and precedes the scheduler, so an
+    // inventory-only deployment never depends on CollectorScheduler.
+    if (!inventory_service::start()) {
+        spdlog::error("Main: inventory maintenance is unavailable; continuing without it");
+    }
     CollectorScheduler::instance().start();
 }
 
@@ -143,3 +150,122 @@ int version() {
 }
 
 } // namespace MainUtils
+
+namespace inventory_service {
+
+namespace {
+
+// Process-lifetime owners for the inventory stack. This is explicit lifecycle
+// state owned by MainUtils, not a new singleton: the controller must be
+// destructible independently of the scheduler and keeps the discovery adapters
+// alive for as long as its source closures reference them.
+struct InventoryRuntime {
+    std::unique_ptr<CondorJobWatcher> condor;
+    std::unique_ptr<SlurmJobWatcher> slurm;
+    std::unique_ptr<JobInventoryMaintenance> maintenance;
+};
+
+InventoryRuntime& runtime()
+{
+    static InventoryRuntime state;
+    return state;
+}
+
+// Discovery-adapter construction: the maintenance controller owns pacing and
+// policy, so the adapter must not read Config, must not poll on its own, and
+// must not start the rule engine (task 5 owns selection policy).
+WatcherRuntimeOptions make_watcher_options()
+{
+    WatcherRuntimeOptions options;
+    options.load_config = false;
+    options.enable_event_source = true;
+    options.scan_interval_ms = 0;
+    options.use_rules = false;
+    options.default_collectors.clear();
+    options.discovery = DiscoveryEnvironment{};
+    return options;
+}
+
+InventorySource bind_source(CondorJobWatcher& watcher, const std::string& name)
+{
+    InventorySource source;
+    source.name = name;
+    source.scheduler_type = SchedulerType::Condor;
+    source.start = [&watcher](ObservationSink sink) {
+        return watcher.start(std::move(sink));
+    };
+    source.stop = [&watcher]() { watcher.stop(); };
+    source.scan = [&watcher]() { return watcher.scan(); };
+    source.health = [&watcher]() { return watcher.health(); };
+    source.request_rescan = [&watcher]() { watcher.request_rescan(); };
+    return source;
+}
+
+InventorySource bind_source(SlurmJobWatcher& watcher, const std::string& name)
+{
+    InventorySource source;
+    source.name = name;
+    source.scheduler_type = SchedulerType::Slurm;
+    source.start = [&watcher](ObservationSink sink) {
+        return watcher.start(std::move(sink));
+    };
+    source.stop = [&watcher]() { watcher.stop(); };
+    source.scan = [&watcher]() { return watcher.scan(); };
+    source.health = [&watcher]() { return watcher.health(); };
+    source.request_rescan = [&watcher]() { watcher.request_rescan(); };
+    return source;
+}
+
+}  // namespace
+
+bool start()
+{
+    auto& state = runtime();
+    if (state.maintenance) return true;
+
+    // Section 8: validate at startup and reject malformed values instead of
+    // guessing. This throws std::invalid_argument, which main() reports.
+    const InventoryMaintenanceConfig config =
+        resolve_inventory_maintenance_config(Config::instance().dumpConfig());
+    if (config.types.empty()) {
+        spdlog::info("InventoryMaintenance: job_registry_config.inventory.types is empty; "
+                     "inventory maintenance is disabled");
+        return true;
+    }
+
+    const WatcherRuntimeOptions options = make_watcher_options();
+    std::vector<InventorySource> sources;
+    for (const auto type : config.types) {
+        if (type == InventoryType::Condor) {
+            state.condor = std::make_unique<CondorJobWatcher>(options);
+            sources.push_back(bind_source(*state.condor, "condor"));
+        } else {
+            state.slurm = std::make_unique<SlurmJobWatcher>(options);
+            sources.push_back(bind_source(*state.slurm, "slurm"));
+        }
+    }
+
+    state.maintenance = std::make_unique<JobInventoryMaintenance>(
+        JobRegistry::instance(), config, std::move(sources));
+    if (!state.maintenance->start()) {
+        spdlog::error("InventoryMaintenance: inventory maintenance did not start; "
+                      "inventory status will report it as unavailable");
+        return false;
+    }
+    spdlog::info("InventoryMaintenance: inventory maintenance running for {} type(s)",
+                 config.types.size());
+    return true;
+}
+
+void stop_discovery()
+{
+    if (runtime().maintenance) runtime().maintenance->stopDiscovery();
+}
+
+bool finalize()
+{
+    if (!runtime().maintenance) return true;
+    return runtime().maintenance->finalize();
+}
+
+}  // namespace inventory_service
