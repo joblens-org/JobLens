@@ -57,6 +57,22 @@ process-sum summary semantics are retained, including shared-socket totals.
 Run same-load measurements on a deployment node to assess end-to-end gains;
 the syscall regression is not a timing benchmark.
 
+### 原生输出契约 / 路由 / 调度集成回归
+
+在已配置 Ninja 构建目录、具备项目 C++ 编译依赖的本机运行：
+
+```bash
+bash tests/integration/run_output_tests.sh
+```
+
+可传入构建目录作为第一个参数，`SKIP_BUILD=1` 可跳过重新构建。三个测试分别覆盖：
+
+- `output_contract_test.cpp`：有界准入（`QueueFull`/`TooLarge`/`Closed`/`Unsupported`）、不可变记录扇出、并发投递、记账不变量与未知通道行为。
+- `output_routing_test.cpp`：`outputs` 显式路由、旧版 `use_writers` 回退、显式禁用、无效绑定诊断、重复目标去重、`emit_to` 限制、记录标识。
+- `collector_output_test.cpp`：真实调度器 + Unix socket RPC + 测试 writer；覆盖 System/Job 作用域分发、零输出、Skipped、Failed、异常、emit 后返回 Skipped 的契约错误、部分样本保留、`operation_semantics_version: 2` 与嵌套 write 计数。
+
+测试只使用本地临时 socket、配置与 LevelDB 目录，不连接生产后端，也不修改内核 map。
+
 ### ESWriter 退避重试与性能计数回归
 
 在已配置 Ninja 构建目录、具备项目 C++ 编译依赖的本机运行：

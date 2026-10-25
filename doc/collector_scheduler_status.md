@@ -55,15 +55,18 @@ wall-clock Unix milliseconds. Last duration is the most recently completed
 operation, including failures. Counters are lifetime counters, not rates.
 
 `callback` measures a whole timer sweep, including lock waiting, registry lookup,
-all job collections and writer calls. Repeated ticks do not overlap the same
-timer callback. `collect` is one
-invocation for one live job; `write` is the entire writer fan-out for that job
-(also completes successfully when no writers are configured). Caught collect /
-writer errors mark the sweep failed. `write` measures invoking writer callbacks
-(usually enqueueing into the existing writer buffers), not the background sink
-flush or network delivery. Empty/cancelled sweeps may count as success
-but do not clear collector errors. Successful init or writer fan-out clears
-current error state, retaining historical counters and last error text.
+all job collections and their emissions. Repeated ticks do not overlap the same
+timer callback. `collect` is one invocation for one live job and includes payload
+preparation plus nested emissions. `write` is one `emit()`/`emit_to()` call,
+including fan-out and queue admission; a valid but disabled channel counts as a
+successful no-op write, and zero emissions produce zero write operations.
+Caught collection errors and output rejections mark the sweep failed. `write`
+does not measure the background sink flush or network delivery.
+Responses carry `operation_semantics_version: 2`. Because `collect` contains its
+nested `write` operations, the two durations overlap and must not be added.
+Current error state is cleared only after a complete successful invocation with
+no output rejection; `Skipped` does not clear it. Historical counters and the
+last error text are retained.
 The last error is bounded to 512 bytes; non-ASCII bytes are replaced with `?`
 to keep arbitrary exception messages safe for JSON serialization.
 
@@ -71,7 +74,8 @@ to keep arbitrary exception messages safe for JSON serialization.
 and `elapsed_ms`. Stages are `lookup_job` (registry access),
 `wait_collector_lock` (waiting for the membership/lifecycle lock), `collect`,
 and `write`. The elapsed time covers the current stage rather than the whole
-job sweep. Lock waiting before the job list is copied has no JobID and is
+job sweep. While an emission runs the stage is `write`; after it returns the
+stage is `collect` again. Lock waiting before the job list is copied has no JobID and is
 visible in `operations.wait_collector_lock.in_progress`.
 
 Snapshots copy observational data under the runtime mutex and scheduling data
@@ -90,8 +94,10 @@ while that timer is busy increments `skipped_runs` instead of creating another
 callback. Skipped ticks are not replayed after completion; a future tick resumes
 normal sampling. The first repeating callback is still scheduled immediately.
 Consequently, pending callbacks cannot grow with the number of elapsed periods:
-their count is bounded by registered timers. There is no additional writer queue
-and no Job-level parallel collection.
+their count is bounded by registered timers. Writers additionally bound accepted
+records and bytes (`max_pending_records`/`max_pending_bytes`); check
+`WriterManager/output_status` for queue admission and release counters. There is
+no Job-level parallel collection.
 
 A collector's `scheduling` is `null` without a live timer, otherwise it contains:
 
@@ -148,11 +154,10 @@ scheduler totals remain for the scheduler lifetime.
 This prevents repeated callbacks for one slow collector from exhausting the
 pool. A slow job still delays the later jobs within that same collector's sweep;
 independently blocked collectors can still occupy every worker. No timeout or
-forced cancellation of a running system call is provided. Existing collector
-serialization, collector API, and writer behavior remain unchanged. In particular,
-writer double buffers are not changed into bounded queues: `buffer_capacity` is
-currently an initial vector reservation, not a hard record or memory limit.
-Failures swallowed inside collectors/writers are not detectable here. The existing RPC server has a single connection-processing
+forced cancellation of a running system call is provided. Collector serialization is unchanged. Writer admission is bounded and observable:
+`buffer_capacity` is only an initial vector reservation, while
+`max_pending_records`/`max_pending_bytes` are the hard limits. Failures swallowed
+inside collectors/writers are not detectable here. The existing RPC server has a single connection-processing
 thread; unrelated slow RPC requests can still delay status requests.
 
 ## Regression harness
