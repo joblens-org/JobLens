@@ -18,6 +18,7 @@
 #include <vector>
 #include <functional>
 #include <optional>
+#include <string>
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
 #include <thread>
@@ -26,6 +27,7 @@
 
 #include "common/streamer_watcher.hpp"
 #include "core/collector_type.h"
+#include "core/job_identity.hpp"
 #include "job_lifecycle_event.h"
 #include "ebpf/trace_condor_starter.h"
 #include "common/ebpf_common.hpp"
@@ -34,10 +36,132 @@
 #include "job_watcher/condor_job_watcher.hpp"
 #include "job_watcher/slurm_job_watcher.hpp"
 
+// ---------------------------------------------------------------------------
+// Inventory-grade storage (doc/job_inventory_collection_decoupling_plan.md)
+//
+// LevelDB namespaces:
+//   j:  active inventory facts (legacy namespace, additive schema-2 fields)
+//   h:  archived history (legacy namespace, final binding summary)
+//   c:  durable allocator high-water mark (legacy namespace)
+//   m:  schema version, Agent DB UUID, migration state
+//   i:  canonical identity key -> internal ID
+//   b:  per-instance collection binding intent
+// ---------------------------------------------------------------------------
+
+// Construction options. Production uses the singleton (all defaults); tests
+// and inventory-only service startup construct an isolated store without
+// watchers, eBPF or RPC registration (plan section 5.1).
+struct JobRegistryOptions {
+    std::string db_path;                 // empty: job_registry_config.job_db_path
+    bool enable_job_watchers = true;
+    bool enable_pid_tracker = true;
+    bool register_rpc = true;
+    // Test seam: stop a legacy migration after this many durable batches and
+    // leave it resumable. 0 = unlimited.
+    size_t migration_batch_limit = 0;
+};
+
+enum class UpsertDisposition {
+    Created,
+    Updated,
+    Unchanged,
+    Rejected,
+    Conflict,
+};
+
+// One scheduler observation. `facts` carries the typed scheduler attributes;
+// its JobID and CollectorNames are deliberately ignored: inventory upserts
+// never allocate a caller-chosen ID and never activate collection.
+struct ObservedExecution {
+    NativeSelector selector;
+    ExecutionGeneration generation;
+    std::vector<ProcessIdentity> processes;
+    Job facts;
+    int64_t observed_at_us = 0;          // 0 = now
+};
+
+struct InventoryRecord {
+    uint64_t internal_id = 0;
+    std::string instance_id;             // opaque handle derived from DB UUID
+    NativeSelector selector;             // original wire identity (verbatim)
+    CanonicalIdentity identity;          // valid only when identity_complete
+    bool identity_complete = false;
+    ExecutionGeneration generation;
+    std::vector<ProcessIdentity> processes;
+    uint64_t facts_revision = 0;
+    bool quarantined = false;
+    std::string state = "active";        // active | suspect | closing
+    int64_t first_seen_us = 0;
+    int64_t last_seen_us = 0;
+};
+
+struct UpsertResult {
+    bool ok = false;
+    UpsertDisposition disposition = UpsertDisposition::Rejected;
+    uint64_t internal_id = 0;
+    std::string instance_id;
+    uint64_t facts_revision = 0;
+    std::string error;                   // stable code
+    std::string message;
+};
+
+enum class CollectionMode {
+    Auto,
+    Manual,
+};
+
+inline const char* to_string(CollectionMode mode)
+{
+    return mode == CollectionMode::Manual ? "manual" : "auto";
+}
+
+std::optional<CollectionMode> collection_mode_from_string(const std::string& raw);
+
+// Per-instance collection intent. Revisions are monotonically increasing
+// per instance; revision 0 means "no intent recorded yet" (auto, empty).
+struct BindingRecord {
+    uint64_t internal_id = 0;
+    uint64_t revision = 0;
+    CollectionMode mode = CollectionMode::Auto;
+    std::vector<std::string> auto_collectors;
+    std::vector<std::string> manual_collectors;
+    std::string policy_revision;
+
+    // effective_collectors = manual if mode == manual, else auto. An explicit
+    // empty manual list is a persistent stop and must win over auto.
+    std::vector<std::string> effectiveCollectors() const;
+};
+
+struct StoreHealth {
+    bool db_running = false;
+    bool migration_complete = false;
+    std::string migration_state;         // empty | in_progress:<stage> | complete
+    uint32_t schema_version = 0;
+    std::string db_uuid;
+    bool degraded = false;
+    uint64_t write_failures = 0;
+    std::string last_write_error;
+    uint64_t incomplete_identities = 0;
+    uint64_t quarantined_identities = 0;
+    uint64_t corrupt_records = 0;
+    uint64_t active_instances = 0;
+};
+
+// Test-only fault injection. The next durable control-plane writes at
+// `skip` offset (0 = the very next one) fail. FailBeforeWrite models a LevelDB
+// write that never landed; FailAfterWrite models the ambiguous case where the
+// batch landed but the status reported failure. Either way the mutation is
+// reported as failed and store health records the error.
+enum class StoreFaultMode {
+    None,
+    FailBeforeWrite,
+    FailAfterWrite,
+};
 
 class JobRegistry {
 public:
     static JobRegistry& instance();          // 仍保留单例，方便迁移；也可由 main() 构造
+    explicit JobRegistry(const JobRegistryOptions& options);
     ~JobRegistry(){
         cleanupClosingJobs();
         stop_pid_tracker();
@@ -53,12 +177,16 @@ public:
     // Job 增删
     bool addJob(const Job& job);
     void delJob(uint64_t jobID);
+    // Inventory-grade retirement: archive atomically (active -> history,
+    // identity index and binding removed) and report durable success.
+    bool retireInstance(uint64_t jobID);
     // 通过 sub_attr 匹配删除作业，返回删除的作业数量
     size_t delJob(const SubAttrMatcher& matcher);
     // Finish the destructive cleanup after scoped collector work has drained.
     bool acknowledgeJobRemoval(uint64_t jobID);
     size_t closingJobCount() const;
     void cleanupClosingJobs();
+    // Read-only snapshot: no refresh, no PID pruning, no retirement.
     std::optional<Job> findJob(uint64_t jobID);
     // 通过 sub_attr 匹配查找作业，返回匹配的作业列表
     std::vector<Job> findJob(const SubAttrMatcher& matcher) const;
@@ -67,7 +195,7 @@ public:
     // 生命周期回调注册
     void addLifecycleCb(JobLifecycleCb cb);
 
-    // 获取下一个全局唯一递增的JobID
+    // 获取下一个全局唯一递增的JobID（durable 预留；失败返回 0）
     uint64_t getNextJobID();
 
     // 统一删除接口，通过 JSON 请求解析删除条件
@@ -75,37 +203,92 @@ public:
     // 返回删除的作业数量
     size_t delJobByRequest(const nlohmann::json& req);
 
+    // --- Inventory store ---------------------------------------------------
+    // Identity-resolving idempotent upsert. Incomplete identities and
+    // conflicting live generations are rejected explicitly and never indexed.
+    // An upsert never fires lifecycle callbacks or starts collection: runtime
+    // application is binding-driven (task 4).
+    UpsertResult upsertObservedJob(const ObservedExecution& observation);
+    std::optional<InventoryRecord> inventoryRecord(uint64_t jobID) const;
+    std::optional<InventoryRecord> inventoryRecordByIdentity(
+        const CanonicalIdentity& identity) const;
+    std::vector<InventoryRecord> inventoryRecords() const;
+    BindingRecord bindingRecord(uint64_t jobID) const;
+    // One durable transaction for every submitted binding. All targets must
+    // exist; on any write failure nothing is committed and `error` is set.
+    bool commitBindings(const std::vector<BindingRecord>& bindings, std::string& error);
+    bool hasInstance(uint64_t jobID) const;
+    std::string instanceId(uint64_t jobID) const;
+    StoreHealth storeHealth() const;
+    bool migrationComplete() const { return migration_complete_; }
+
+    // Test seam only (see StoreFaultMode).
+    void injectStoreFaultForTest(StoreFaultMode mode, size_t skip = 0, size_t count = 1);
+    void clearStoreFaultsForTest();
+
 private:
     JobRegistry();
+    bool run_migration();
+    bool migrate_allocator();
+    bool migrate_index(std::string& cursor, size_t& batches, size_t batch_limit);
+    bool migrate_finalize();
+    bool resume_migration_state(std::string& stage, std::string& cursor);
+    bool load_or_create_db_uuid();
+    void restore_records_from_db();
     void init_job_watcher();
-    void regRPChandle();
+    void regRPCHandle();
     inline void update_job(Job& job);
     mutable std::shared_mutex              mtx_;
     std::unordered_map<uint64_t, Job>           jobs_;   // key = JobID
     // Removed but not yet acknowledged by the collector lanes. The snapshot
     // keeps attribution alive for accepted tail input.
     std::unordered_map<uint64_t, Job>       closing_jobs_;
-    std::vector<Job>                       restore_jobs_;
+    std::unordered_map<uint64_t, InventoryRecord> records_;
+    std::unordered_map<std::string, uint64_t>     identity_ids_;
     std::vector<JobLifecycleCb>            cbs_;
+    // Serializes inventory admission (identity lookup -> allocate -> commit).
+    std::mutex                             upsert_mtx_;
 
     // 采集JobInfo持久化
     bool addJob(const Job& job, bool from_db);
-    bool init_job_db();
+    bool init_job_db(const JobRegistryOptions& options);
     void deinit_job_db();
-    void restore_jobs_from_db();
-    void persist_new_job(const Job& job);
-    void update_job_info(const Job& job);
-    void end_job_in_db(uint64_t jobID);
-    void finishJobRemoval(const Job& job);
+    bool persist_new_job(const Job& job);
+    bool update_job_info(const Job& job);
+    bool end_job_in_db(uint64_t jobID);
+    bool finishJobRemoval(const Job& job);
     bool db_running{false};
     leveldb::DB* job_db = nullptr;    // LevelDB 实例，通过 delete 释放
-    std::mutex db_mtx_;                 // 序列化job_db的并发事务操作
+    mutable std::mutex db_mtx_;         // 序列化job_db的并发事务操作
+
+    // Durable control-plane write. Caller must hold db_mtx_. Always uses
+    // `sync=true`; returns the effective status (including injected faults).
+    leveldb::Status write_batch_locked(leveldb::WriteBatch& batch, const char* operation);
+    void record_store_failure(const std::string& message);
+    void record_store_success();
+    bool store_ready() const;
+    uint64_t allocate_internal_id(std::string& error);
+    void note_record_in_memory(const InventoryRecord& meta, const Job& job);
 
     // JobID计数器相关
     void init_job_id_counter();      // 初始化计数器（从数据库加载最大值）
-    void persist_job_id_counter();   // 持久化当前计数器值
     uint64_t next_job_id_{1};        // 下一个可用的JobID，从1开始
+    bool job_id_exhausted_{false};
     std::mutex job_id_mtx_;          // JobID计数器的互斥锁
+
+    // Store metadata
+    std::string db_uuid_;
+    uint32_t schema_version_{0};
+    bool migration_complete_{false};
+    std::string migration_state_;
+    size_t migration_batch_limit_{0};
+    std::atomic<bool> store_degraded_{false};
+    std::atomic<uint64_t> store_write_failures_{0};
+    uint64_t corrupt_records_{0};
+    std::string last_store_error_;   // guarded by db_mtx_
+    StoreFaultMode fault_mode_{StoreFaultMode::None};
+    size_t fault_skip_{0};
+    size_t fault_count_{0};
 
     // Condor作业自动添加
     bool enable_auto_add_condor_job{false};
