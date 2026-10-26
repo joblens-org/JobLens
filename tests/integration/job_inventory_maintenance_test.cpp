@@ -264,6 +264,14 @@ public:
         health.last_error = error;
     }
 
+    // Simulates an adapter's ring-buffer callback: it only raises the rescan
+    // flag (plan 5.2 forbids discovery I/O on the polling thread).
+    void request_scan_now()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        health.rescan_requested = true;
+    }
+
 private:
     std::string name_;
     SchedulerType type_;
@@ -1209,6 +1217,110 @@ void case_a25(const std::string& base)
 }
 
 // ---------------------------------------------------------------------------
+// Legacy/manual registrations: no generation, no source, still maintained
+// ---------------------------------------------------------------------------
+
+void case_legacy_retirement(const std::string& base)
+{
+    JobRegistry registry(isolated(fresh_dir(base, "legacy")));
+    FakeProbes probes;
+    probes.set_process(4321, LivenessState::Alive);
+
+    Job job;
+    job.jobtype = JobType::Job;
+    job.subtype = JobSubType::Common;
+    job.JobPIDs = {4321};
+    job.CollectorNames = {"cpumem_collector"};
+    CommonJobAttr attr;
+    attr.auto_update_child = false;
+    job.sub_attr = attr;
+    check(registry.addJob(job), "legacy: manual registration must succeed");
+
+    const auto records = registry.inventoryRecords();
+    check(records.size() == 1, "legacy: the registration created no inventory record");
+    const uint64_t id = records.front().internal_id;
+    check(!records.front().generation.complete(),
+          "legacy: a manual registration must not invent an execution generation");
+
+    // Inventory discovery is disabled (no types, no sources) and the record is
+    // still refreshed and retired: reads no longer do it, so maintenance must.
+    InventoryMaintenanceConfig config;
+    std::vector<InventorySource> sources;
+    JobInventoryMaintenance maintenance(registry, config, std::move(sources));
+    maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
+    check(maintenance.start(), "legacy: maintenance must run without discovery sources");
+    check(maintenance.statusJson()["configured_types"].empty(),
+          "legacy: no discovery type should be configured");
+
+    maintenance.reconcileNow();
+    check(registry.findJob(id).has_value(),
+          "legacy: a live manual registration was retired");
+    check(registry.inventoryRecord(id).has_value() &&
+              registry.inventoryRecord(id)->state == "active",
+          "legacy: a live registration must stay active");
+
+    probes.set_process(4321, LivenessState::Dead);
+    maintenance.reconcileNow();
+    check(!registry.findJob(id).has_value(),
+          "legacy: a dead manual registration was not retired");
+    check(!registry.inventoryRecord(id).has_value(),
+          "legacy: the retired record was not archived");
+    maintenance.stop();
+
+    pass_case("LEGACY", "manual registrations retire on process evidence without a source");
+}
+
+// ---------------------------------------------------------------------------
+// Event-driven and on-demand passes (plan 5.2 / 4.3 ensure_registered)
+// ---------------------------------------------------------------------------
+
+void case_rescan(const std::string& base)
+{
+    JobRegistry registry(isolated(fresh_dir(base, "rescan")));
+    FakeClock clock;
+    FakeSource source("condor", SchedulerType::Condor);
+    FakeProbes probes;
+
+    const Observation job =
+        make_condor_observation("950.0", 9100, 191919, "htcondor01", "schedd-a", "/cg/slot-95");
+    source.set_scan([&]() { return scan_with({job}); });
+
+    std::vector<InventorySource> sources;
+    sources.push_back(source.make());
+    // A long interval proves the extra passes come from the event request, not
+    // from the periodic timer.
+    JobInventoryMaintenance maintenance(registry, condor_config(30), std::move(sources));
+    maintenance.setClock(clock.closure());
+    maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
+    check(maintenance.start(), "rescan: maintenance did not start");
+    check(find_native(registry, "950.0").has_value(), "rescan: initial scan missing");
+
+    const int scans_after_start = source.scans();
+    source.request_scan_now();
+    check(wait_until([&]() { return source.scans() > scans_after_start; }, 5000),
+          "rescan: an event request did not trigger an authoritative pass");
+
+    // On-demand pass used by `ensure_registered`.
+    const auto refresh = get_inventory_refresh_provider();
+    check(static_cast<bool>(refresh), "rescan: no on-demand refresh provider registered");
+    const int scans_before_refresh = source.scans();
+    check(refresh(), "rescan: on-demand refresh did not report a completed pass");
+    check(source.scans() > scans_before_refresh,
+          "rescan: on-demand refresh did not run a scan");
+
+    // Positive termination evidence still retires through the same pass.
+    source.set_scan([&]() { return scan_with({}); });
+    probes.set_process(9100, LivenessState::Dead);
+    probes.set_cgroup("/cg/slot-95", {}, true);
+    maintenance.reconcileNow();
+    check(!find_native(registry, "950.0").has_value(),
+          "rescan: positive termination evidence did not retire the instance");
+    maintenance.stop();
+
+    pass_case("RESCAN", "event-driven and on-demand passes run the same reconcile path");
+}
+
+// ---------------------------------------------------------------------------
 // Configuration contract (plan section 8)
 // ---------------------------------------------------------------------------
 
@@ -1312,6 +1424,8 @@ int main(int argc, char** argv)
         case_a14(base);
         case_a23(base);
         case_a25(base);
+        case_legacy_retirement(base);
+        case_rescan(base);
         std::cout << "ALL MAINTENANCE ASSERTIONS PASSED\n";
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';

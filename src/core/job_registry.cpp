@@ -681,7 +681,34 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
 };
 
 void JobRegistry::init_job_watcher() {
+    // One discovery source per scheduler type (plan 3.1). When a type is listed
+    // under job_registry_config.inventory.types, the inventory maintenance
+    // controller owns discovery; running the legacy auto-add watcher as well
+    // would load a second eBPF object and try to register a second record for
+    // the same native identity (rejected by the identity index), so automatic
+    // collection would silently never start.
+    std::vector<std::string> inventory_types;
+    try {
+        const auto node = Config::instance().getRawNode("job_registry_config")["inventory"]["types"];
+        if (node && node.IsSequence()) {
+            for (const auto& entry : node) {
+                if (entry.IsScalar()) {
+                    auto value = entry.as<std::string>();
+                    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+                    inventory_types.push_back(value);
+                }
+            }
+        }
+    } catch (const std::exception& error) {
+        spdlog::warn("JobRegistry: could not read inventory types: {}", error.what());
+    }
+
     enable_auto_add_condor_job = Config::instance().getBool("job_registry_config", "auto_add_condorjob", false);
+    if (enable_auto_add_condor_job && std::find(inventory_types.begin(), inventory_types.end(), "condor") != inventory_types.end()) {
+        spdlog::warn("JobRegistry: auto_add_condorjob is superseded by inventory discovery for condor; "
+                     "the legacy watcher is not started (automatic collection needs the policy layer)");
+        enable_auto_add_condor_job = false;
+    }
     if (enable_auto_add_condor_job) {
         condor_job_watcher_ = std::make_unique<CondorJobWatcher>();
         condor_job_watcher_->register_add_if(
@@ -693,6 +720,11 @@ void JobRegistry::init_job_watcher() {
     }
 
     enable_auto_add_slurm_job = Config::instance().getBool("job_registry_config", "auto_add_slurmjob", false);
+    if (enable_auto_add_slurm_job && std::find(inventory_types.begin(), inventory_types.end(), "slurm") != inventory_types.end()) {
+        spdlog::warn("JobRegistry: auto_add_slurmjob is superseded by inventory discovery for slurm; "
+                     "the legacy watcher is not started (automatic collection needs the policy layer)");
+        enable_auto_add_slurm_job = false;
+    }
     if (enable_auto_add_slurm_job) {
         slurm_job_watcher_ = std::make_unique<SlurmJobWatcher>();
         slurm_job_watcher_->register_add_if(
@@ -810,18 +842,36 @@ void JobRegistry::on_kernel_fork(uint32_t pid, uint64_t job_id) {
 
 // ringbuf EXIT: 内核已从 pid2job 删除, 这里同步移除用户态 Job.JobPIDs。
 void JobRegistry::on_kernel_exit(uint32_t pid, uint64_t job_id) {
-    std::unique_lock lg(mtx_);
-    auto it = jobs_.find(job_id);
-    if (it == jobs_.end()) {
-        spdlog::debug("JobRegistry: kernel EXIT event for unknown job_id={} pid={}, ignored", job_id, pid);
-        return;
+    std::function<void(pid_t)> observer;
+    {
+        std::unique_lock lg(mtx_);
+        auto it = jobs_.find(job_id);
+        if (it == jobs_.end()) {
+            spdlog::debug("JobRegistry: kernel EXIT event for unknown job_id={} pid={}, ignored", job_id, pid);
+        } else {
+            auto& pids = it->second.JobPIDs;
+            auto before = pids.size();
+            pids.erase(std::remove(pids.begin(), pids.end(), static_cast<pid_t>(pid)), pids.end());
+            if (pids.size() != before) {
+                spdlog::trace("JobRegistry: kernel EXIT removed pid={} from job_id={} (now {} pids)",
+                              pid, job_id, pids.size());
+            }
+        }
     }
-    auto& pids = it->second.JobPIDs;
-    auto before = pids.size();
-    pids.erase(std::remove(pids.begin(), pids.end(), static_cast<pid_t>(pid)), pids.end());
-    if (pids.size() != before) {
-        spdlog::trace("JobRegistry: kernel EXIT removed pid={} from job_id={} (now {} pids)",
-                      pid, job_id, pids.size());
+
+    // Maintenance owns fact refresh and retirement; the kernel callback only
+    // hands over a cheap hint (plan 5.2 "fork/exit hints trigger targeted
+    // refresh"), never discovery I/O.
+    {
+        std::lock_guard<std::mutex> lock(exit_observer_mtx_);
+        observer = exit_observer_;
+    }
+    if (observer) {
+        try {
+            observer(static_cast<pid_t>(pid));
+        } catch (const std::exception& error) {
+            spdlog::warn("JobRegistry: exit observer failed: {}", error.what());
+        }
     }
 }
 
@@ -1063,6 +1113,25 @@ bool namespace_matches(const CanonicalIdentity& stored, const NativeSelector& se
     return stored.cluster_namespace.rfind(requested.cluster_namespace + "@", 0) == 0;
 }
 
+// One on-demand authoritative pass through the maintenance controller. Returns
+// false when no controller is running, so callers keep an explicit "not found"
+// instead of inventing a record. Never allocates ids or guesses an identity.
+bool refresh_inventory_once()
+{
+#ifdef JOBLENS_HAS_INVENTORY_STATUS_PROVIDER
+    auto provider = get_inventory_refresh_provider();
+    if (!provider) return false;
+    try {
+        return provider();
+    } catch (const std::exception& error) {
+        spdlog::warn("JobRegistry: on-demand inventory refresh failed: {}", error.what());
+        return false;
+    }
+#else
+    return false;
+#endif
+}
+
 TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelector& selector,
                                        const std::string& scope, bool ensure_registered)
 {
@@ -1089,17 +1158,23 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
     sort_records(matches);
 
     if (matches.empty()) {
-        result.code = "not_found";
-        result.message = "no verified current instance for native job '" +
-                         selector.native_job_id + "' in cluster '" +
-                         selector.cluster_name + "'";
         if (ensure_registered) {
-            // No caller-supplied PID or native number authorizes an invented
-            // live record; the maintenance controller owns real discovery.
-            result.message +=
-                "; ensure_registered requires a live discovery source, which no local "
-                "source confirmed for this request";
+            // Plan 4.3: refresh discovery before declaring the target missing.
+            // Only a real source pass may create the record; no caller-supplied
+            // PID or native number authorizes an invented live instance.
+            if (refresh_inventory_once()) {
+                return resolve_native_target(registry, selector, scope,
+                                             /*ensure_registered=*/false);
+            }
+            result.message =
+                "no discovery source is running on this core, so ensure_registered "
+                "cannot confirm a live instance for this request";
+        } else {
+            result.message = "no verified current instance for native job '" +
+                             selector.native_job_id + "' in cluster '" +
+                             selector.cluster_name + "'";
         }
+        result.code = "not_found";
         return result;
     }
 
@@ -2132,6 +2207,9 @@ bool JobRegistry::retireInstance(uint64_t jobID) {
                 jobs_.erase(it);
             }
         }
+        // Visible lifecycle state while the drain is outstanding.
+        if (const auto record = records_.find(jobID); record != records_.end())
+            record->second.state = "closing";
         applied_collections_.erase(jobID);
     }
 
@@ -3477,6 +3555,21 @@ UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation
                 result.message = "record is quarantined after an identity conflict";
                 return result;
             }
+            {
+                // A retiring instance must never be resurrected into the active
+                // map by a late observation: the drain owns it until it is
+                // archived, and a new execution is registered as a new instance.
+                std::shared_lock lg(mtx_);
+                if (closing_jobs_.count(internal_id) != 0) {
+                    result.disposition = UpsertDisposition::Conflict;
+                    result.internal_id = internal_id;
+                    result.instance_id = instanceId(internal_id);
+                    result.facts_revision = meta.facts_revision;
+                    result.error = "instance_closing";
+                    result.message = "the instance is retiring and no longer accepts observations";
+                    return result;
+                }
+            }
             if (meta.identity_complete && meta.identity != *identity) {
                 result.disposition = UpsertDisposition::Conflict;
                 result.internal_id = internal_id;
@@ -3896,6 +3989,49 @@ void JobRegistry::mark_applied(uint64_t jobID, uint64_t revision,
     std::lock_guard lg(mtx_);
     if (jobs_.count(jobID) == 0) return;  // retired while the replay ran
     applied_collections_[jobID] = std::move(applied);
+}
+
+void JobRegistry::setInstanceState(uint64_t jobID, const std::string& state) {
+    std::lock_guard lg(mtx_);
+    const auto it = records_.find(jobID);
+    if (it == records_.end()) return;
+    if (it->second.state == state) return;
+    it->second.state = state;
+}
+
+void JobRegistry::setExitObserver(std::function<void(pid_t)> observer) {
+    std::lock_guard<std::mutex> lock(exit_observer_mtx_);
+    exit_observer_ = std::move(observer);
+}
+
+bool JobRegistry::refreshJobFacts(uint64_t jobID) {
+    Job job;
+    {
+        std::shared_lock lg(mtx_);
+        const auto it = jobs_.find(jobID);
+        if (it == jobs_.end()) return false;
+        job = it->second;
+    }
+
+    // /proc and scheduler metadata I/O strictly outside every registry lock.
+    update_job(job);
+    if (!update_job_info(job)) return false;
+
+    std::lock_guard lg(mtx_);
+    const auto it = records_.find(jobID);
+    if (it != records_.end()) {
+        // Records without a validated execution generation keep their process
+        // list as the only liveness evidence. Only replace it while the refresh
+        // still sees processes: an empty result is itself the termination
+        // evidence the retirement pass has to evaluate.
+        if (!it->second.generation.complete() && !job.JobPIDs.empty()) {
+            it->second.processes.clear();
+            for (const auto pid : job.JobPIDs)
+                it->second.processes.push_back(ProcessIdentity{pid, 0, ""});
+        }
+        it->second.last_seen_us = now_us();
+    }
+    return true;
 }
 
 StoreHealth JobRegistry::storeHealth() const {

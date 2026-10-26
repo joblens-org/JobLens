@@ -242,6 +242,15 @@ public:
     void setCollectionApplier(CollectionApplier applier);
     // Last runtime application result for one instance.
     AppliedCollection appliedCollection(uint64_t jobID) const;
+    // Re-read process/attribute facts for one stored job from the host and
+    // persist them. Used by maintenance for records no discovery source covers
+    // (legacy/manual registrations); reads never do this for themselves.
+    bool refreshJobFacts(uint64_t jobID);
+    // Lifecycle state is a maintenance decision, not a read side effect.
+    void setInstanceState(uint64_t jobID, const std::string& state);
+    // Cheap hint sink for kernel exit events. The maintenance controller uses it
+    // to schedule a coalesced refresh; the callback must not do I/O.
+    void setExitObserver(std::function<void(pid_t)> observer);
 
     // Test seam only (see StoreFaultMode).
     void injectStoreFaultForTest(StoreFaultMode mode, size_t skip = 0, size_t count = 1);
@@ -274,6 +283,9 @@ private:
     // Guards the installed collection applier. Never held while it runs.
     mutable std::mutex                     applier_mtx_;
     CollectionApplier                      collection_applier_;
+    // Guards the installed exit hint observer.
+    mutable std::mutex                     exit_observer_mtx_;
+    std::function<void(pid_t)>             exit_observer_;
 
     // 采集JobInfo持久化
     bool addJob(const Job& job, bool from_db);

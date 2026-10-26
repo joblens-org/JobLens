@@ -327,6 +327,30 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
         check(registry.inventoryRecords().size() == size_t{8},
               "a failed resolution must not invent inventory records");
     }
+    // --- A30: ensure_registered performs a verified discovery pass ---------
+    {
+        std::atomic<int> refreshes{0};
+        set_inventory_refresh_provider([&registry, &refreshes]() {
+            ++refreshes;
+            // A real source pass would create the instance; the resolver still
+            // has to find it by canonical identity afterwards.
+            seed(registry, condor_observation(condor_selector("950.0", "schedd-a"), 6600),
+                 "ensure_registered refresh");
+            return true;
+        });
+        const auto ensured = rpc(
+            "JobCollection/set",
+            collection_request(condor_selector_json("950.0", "schedd-a"), "set",
+                               json::array({"cpumem_collector"}), "instance", std::nullopt,
+                               true));
+        set_inventory_refresh_provider({});
+        check(refreshes.load() == 1,
+              "ensure_registered must run exactly one authoritative pass");
+        check(ensured["status"] == "accepted",
+              "ensure_registered must resolve the refreshed instance: " + ensured.dump());
+        check(ensured["targets"].size() == 1,
+              "ensure_registered must resolve exactly the refreshed target: " + ensured.dump());
+    }
     // --- A30: Slurm instance scope without a step is ambiguous -------------
     {
         const auto response = rpc(

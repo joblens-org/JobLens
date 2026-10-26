@@ -36,3 +36,12 @@ void set_inventory_status_provider(std::function<nlohmann::json()> provider);
 // Returns the currently installed provider, or an empty function when
 // inventory maintenance is not running.
 std::function<nlohmann::json()> get_inventory_status_provider();
+
+// Optional: one authoritative discovery pass on demand (plan 4.3
+// `ensure_registered`). The maintenance controller registers a closure that
+// runs and waits for a pass; the RPC layer calls it before resolving a native
+// selector that does not match yet. Returns false when no controller is
+// running, so the caller keeps its explicit "not found" answer instead of
+// inventing a record.
+void set_inventory_refresh_provider(std::function<bool()> provider);
+std::function<bool()> get_inventory_refresh_provider();

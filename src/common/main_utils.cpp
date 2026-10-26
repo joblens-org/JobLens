@@ -220,6 +220,10 @@ InventorySource bind_source(SlurmJobWatcher& watcher, const std::string& name)
 
 bool start()
 {
+    // Construct the registry (and its store) before the runtime holder so static
+    // destruction tears the maintenance controller down while the store is still
+    // alive: the controller may need to flush a closing record.
+    JobRegistry& registry = JobRegistry::instance();
     auto& state = runtime();
     if (state.maintenance) return true;
 
@@ -227,11 +231,6 @@ bool start()
     // guessing. This throws std::invalid_argument, which main() reports.
     const InventoryMaintenanceConfig config =
         resolve_inventory_maintenance_config(Config::instance().dumpConfig());
-    if (config.types.empty()) {
-        spdlog::info("InventoryMaintenance: job_registry_config.inventory.types is empty; "
-                     "inventory maintenance is disabled");
-        return true;
-    }
 
     const WatcherRuntimeOptions options = make_watcher_options();
     std::vector<InventorySource> sources;
@@ -245,14 +244,23 @@ bool start()
         }
     }
 
+    if (config.types.empty()) {
+        spdlog::info("InventoryMaintenance: job_registry_config.inventory.types is empty; "
+                     "broad discovery is disabled, existing records are still maintained");
+    }
+
+    // The controller runs even without discovery sources: legacy/manual records
+    // and records of a disabled type still need fact refresh and retirement
+    // (plan section 8: removing a type must not strand persisted live records).
     state.maintenance = std::make_unique<JobInventoryMaintenance>(
-        JobRegistry::instance(), config, std::move(sources));
+        registry, config, std::move(sources));
     if (!state.maintenance->start()) {
         spdlog::error("InventoryMaintenance: inventory maintenance did not start; "
                       "inventory status will report it as unavailable");
+        state.maintenance.reset();
         return false;
     }
-    spdlog::info("InventoryMaintenance: inventory maintenance running for {} type(s)",
+    spdlog::info("InventoryMaintenance: inventory maintenance running with {} discovery type(s)",
                  config.types.size());
     return true;
 }

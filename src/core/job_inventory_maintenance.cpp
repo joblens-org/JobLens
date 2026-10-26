@@ -46,6 +46,12 @@ std::function<nlohmann::json()>& provider_slot()
     return provider;
 }
 
+std::function<bool()>& refresh_slot()
+{
+    static std::function<bool()> provider;
+    return provider;
+}
+
 // ---------------------------------------------------------------------------
 // Configuration helpers
 // ---------------------------------------------------------------------------
@@ -211,6 +217,18 @@ std::function<nlohmann::json()> get_inventory_status_provider()
 {
     std::lock_guard<std::mutex> lock(provider_mutex());
     return provider_slot();
+}
+
+void set_inventory_refresh_provider(std::function<bool()> provider)
+{
+    std::lock_guard<std::mutex> lock(provider_mutex());
+    refresh_slot() = std::move(provider);
+}
+
+std::function<bool()> get_inventory_refresh_provider()
+{
+    std::lock_guard<std::mutex> lock(provider_mutex());
+    return refresh_slot();
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +633,8 @@ bool JobInventoryMaintenance::start()
     // coherent snapshot before the periodic producer starts.
     runPass(true, true);
     set_inventory_status_provider([this]() { return statusJson(); });
+    set_inventory_refresh_provider([this]() { return reconcileNow(); });
+    registry_.setExitObserver([this](pid_t pid) { notifyExit(pid); });
     {
         std::lock_guard<std::mutex> lock(mutex_);
         status_published_ = true;
@@ -745,6 +765,8 @@ bool JobInventoryMaintenance::finalize()
         set_inventory_status_provider({});
         status_published_ = false;
     }
+    set_inventory_refresh_provider({});
+    registry_.setExitObserver({});
     {
         std::lock_guard<std::mutex> lock(mutex_);
         explicit_stop_done_ = true;
@@ -832,7 +854,7 @@ void JobInventoryMaintenance::enqueue(PendingHint hint)
     wake_cv_.notify_one();
 }
 
-void JobInventoryMaintenance::reconcileNow()
+bool JobInventoryMaintenance::reconcileNow()
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -840,10 +862,24 @@ void JobInventoryMaintenance::reconcileNow()
         // pass it is itself inside of.
         if (worker_id_ != std::thread::id() &&
             worker_id_ == std::this_thread::get_id()) {
-            return;
+            return false;
         }
     }
-    runPass(true, true);
+    return runPass(true, true);
+}
+
+bool JobInventoryMaintenance::rescanRequested() const
+{
+    for (const auto& source : sources_) {
+        if (!source.health) continue;
+        try {
+            if (source.health().rescan_requested) return true;
+        } catch (const std::exception& error) {
+            spdlog::debug("InventoryMaintenance: source '{}' health failed: {}",
+                          source.name, error.what());
+        }
+    }
+    return false;
 }
 
 void JobInventoryMaintenance::runWorker()
@@ -862,13 +898,33 @@ void JobInventoryMaintenance::runWorker()
         if (stopping_) break;
 
         const bool due = std::chrono::steady_clock::now() >= next_full;
-        if (!due && !hint_wakeup_) continue;
+        if (!due && !hint_wakeup_) {
+            // Discovery events and queue overflows ask for an authoritative
+            // pass. Reading source health needs no controller lock.
+            lock.unlock();
+            const bool rescan = rescanRequested();
+            lock.lock();
+            if (!rescan || stopping_) continue;
+        }
 
         lock.unlock();
         bool executed = false;
         if (due) {
             executed = runPass(true, false);
             if (executed) next_full = std::chrono::steady_clock::now() + interval;
+        } else if (rescanRequested()) {
+            // Coalesce: one forced pass per second at most, so a job-start storm
+            // cannot turn into a /proc scan storm.
+            const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const bool allowed = last_forced_scan_ms_ == 0 ||
+                                 now_ms - last_forced_scan_ms_ >= 1000;
+            if (allowed) {
+                last_forced_scan_ms_ = now_ms;
+                executed = runPass(true, false);
+            } else {
+                executed = runPass(false, false);
+            }
         } else {
             executed = runPass(false, false);
         }
@@ -939,11 +995,22 @@ bool JobInventoryMaintenance::runPass(bool do_scan, bool wait)
 
     std::vector<PendingHint> hints;
     drainHints(hints);
+    bool needs_authoritative_pass = false;
     for (auto& hint : hints) {
         if (hint.kind == PendingHint::Kind::Observation) {
             processObservation(hint.observation, observed);
+        } else {
+            // Exit/refresh hints are cheap by design: they ask for one
+            // coalesced authoritative pass instead of doing discovery I/O on
+            // the producing callback (plan 5.2).
+            needs_authoritative_pass = true;
         }
     }
+    if (needs_authoritative_pass) requestRescan("process/attribute hint");
+
+    // Records no discovery source owns (legacy/manual registrations, or types
+    // whose inventory source was removed) are refreshed here; reads never do it.
+    if (do_scan) refreshLegacyRecords();
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1060,6 +1127,7 @@ void JobInventoryMaintenance::processObservation(const Observation& observation,
 
     if (result.error == "execution_generation_conflict" ||
         result.error == "identity_quarantined" ||
+        result.error == "instance_closing" ||
         result.error == "identity_index_mismatch") {
         std::lock_guard<std::mutex> lock(mutex_);
         ++upsert_conflicts_;
@@ -1071,6 +1139,16 @@ void JobInventoryMaintenance::processObservation(const Observation& observation,
 
     noteError("inventory upsert failed: " + result.error +
               (result.message.empty() ? "" : ": " + result.message));
+}
+
+void JobInventoryMaintenance::refreshLegacyRecords()
+{
+    for (const auto& record : registry_.inventoryRecords()) {
+        if (record.internal_id == kSystemSentinelJobId) continue;
+        if (record.generation.complete()) continue;  // discovery owns these facts
+        if (record.processes.empty()) continue;      // no liveness evidence yet
+        registry_.refreshJobFacts(record.internal_id);
+    }
 }
 
 void JobInventoryMaintenance::evaluateRetirements(
@@ -1109,9 +1187,43 @@ void JobInventoryMaintenance::evaluateRetirements(
             else suspect_.erase(record.internal_id);
         }
 
-        // Retirement needs a validated execution generation; a restored record
-        // without one stays visible and keeps being retried.
-        if (!record.generation.complete()) continue;
+        // Persisted lifecycle state is maintenance-owned; expose it through the
+        // inventory API instead of keeping it only in this controller.
+        if (absences > 0) {
+            registry_.setInstanceState(record.internal_id, "suspect");
+        } else if (record.state == "suspect") {
+            registry_.setInstanceState(record.internal_id, "active");
+        }
+
+        // Records without a validated execution generation (legacy/manual
+        // registrations, unresolved observations) have no manager to probe. The
+        // refreshed process list is their only evidence: live or unreadable pids
+        // keep the record, an all-dead list retires it exactly like the old
+        // read-time cleanup did.
+        if (!record.generation.complete()) {
+            std::vector<ProcessIdentity> pids = record.processes;
+            if (pids.empty()) {
+                if (const auto job = registry_.findJob(record.internal_id)) {
+                    for (const auto pid : job->JobPIDs) pids.push_back(ProcessIdentity{pid, 0, ""});
+                }
+            }
+            if (pids.empty()) continue;  // no evidence: retry on the next pass
+
+            bool any_live = false;
+            for (const auto& process : pids) {
+                const LivenessResult liveness = process_probe_
+                                                    ? process_probe_(process)
+                                                    : LivenessResult{};
+                if (liveness.state != LivenessState::Dead) {
+                    any_live = true;
+                    break;
+                }
+            }
+            if (!any_live)
+                retireIfConfirmed(
+                    record, "no live process for a legacy/manual registration");
+            continue;
+        }
 
         const ProcessIdentity manager{record.generation.manager_pid,
                                       record.generation.manager_start_ticks,

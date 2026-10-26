@@ -253,9 +253,10 @@ public:
     bool running() const;
 
     // One full reconciliation pass (scan -> upsert -> hint merge -> retirement).
-    // Also used by tests and by the startup path, so both run identical code.
-    // Reentrant calls return immediately.
-    void reconcileNow();
+    // Also used by tests, by the startup path and by on-demand
+    // `ensure_registered` refreshes, so all of them run identical code.
+    // Reentrant calls return immediately; returns true when a pass ran.
+    bool reconcileNow();
 
     // Event producers. Cheap, bounded and non-blocking with respect to
     // discovery I/O and storage.
@@ -306,6 +307,13 @@ private:
                     const ExecutionGeneration& generation) const;
     void drainHints(std::vector<PendingHint>& out);
     void requestRescan(const std::string& reason);
+    // True when a source asked for an authoritative pass (ring-buffer event,
+    // queue overflow). Consumed by the worker, never by the producer.
+    bool rescanRequested() const;
+    // Re-reads process/attribute facts for records no discovery source owns
+    // (legacy/manual registrations). Reads used to do this in place; now the
+    // maintenance pass is the only place that touches the host for them.
+    void refreshLegacyRecords();
     void noteError(const std::string& error);
     std::int64_t clockNow() const;
     std::string stateString() const;
@@ -347,6 +355,9 @@ private:
     std::int64_t last_scan_success_ms_ = 0;
     bool last_scan_complete_ = false;
     std::string last_error_;
+    // Throttles hint/event-driven full passes so a fork storm cannot turn into a
+    // /proc scan storm.
+    std::int64_t last_forced_scan_ms_ = 0;
 
     std::uint64_t stop_errors_ = 0;
     std::uint64_t events_received_ = 0;
