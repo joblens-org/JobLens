@@ -21,6 +21,7 @@
 #include "common/config.hpp"
 #include "core/job_observation.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -101,6 +102,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(life_mutex_);
             observation_sink_ = std::move(sink);
+            observation_mode_.store(true, std::memory_order_release);
         }
         return start_polling();
     }
@@ -505,6 +507,18 @@ private:
         ring_buffer_sample_fn fn  = [](void *ctx, void *data, size_t /*size*/){
             auto ptr = static_cast<CondorJobWatcher*>(ctx);
             auto event_ptr = static_cast<struct event*>(data);
+            if (ptr->observation_mode_.load(std::memory_order_acquire)) {
+                // Discovery adapter: ring-buffer callbacks must stay cheap (plan
+                // 5.2). Ask for an authoritative pass instead of building a Job,
+                // evaluating rules or touching storage on the polling thread.
+                ptr->request_rescan();
+                return 0;
+            }
+            if (!ptr->add_if_) {
+                spdlog::warn("CondorJobWatcher: exec event for pid {} has no discovery sink; ignored",
+                             event_ptr->pid);
+                return 0;
+            }
             bool use_rules = false;
             auto default_collectors = ptr->use_collectors;
             if (ptr->rules_manager_) {
@@ -584,6 +598,9 @@ private:
     bool polling_running_{false};
     std::unique_ptr<std::thread> poll_thread_;
     ObservationSink observation_sink_;
+    // True only for the discovery-adapter construction path (start(sink) was
+    // called). Read from the ring-buffer callback, so it is atomic.
+    std::atomic<bool> observation_mode_{false};
     // Serializes stop(): shutdown can arrive from the service lifecycle and
     // from the destructor.
     std::mutex stop_mutex_;
