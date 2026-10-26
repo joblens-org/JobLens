@@ -182,6 +182,9 @@ void manual_selection_wins_over_observations_and_policy(const std::string& base)
               "the automatic decision must still be recorded");
         check(binding.policy_revision == "rules-v1",
               "the policy revision must be recorded");
+        check(binding.revision == 1,
+              "an automatic decision under a manual override must not move the "
+              "client-visible binding revision");
     }
 }
 

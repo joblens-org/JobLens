@@ -73,6 +73,15 @@ CollectorScheduler::CollectorScheduler()
         }
     );
 
+    // Collection intent reaches the lanes through this sink (call #1 of the
+    // collection-control contract): the registry commits the binding durably and
+    // then asks us to apply it, so `applied_collectors` is real runtime state.
+    JobRegistry::instance().setCollectionApplier(
+        [this](const Job& job, std::vector<std::string>& applied, std::string& error) {
+            return applyJobBinding(job, applied, error);
+        });
+    collection_applier_installed_ = true;
+
     spdlog::info("CollectorScheduler: initialized with {} collector(s) and {} writer(s)",
                 collector_info_dict.size(), WriterManager::instance().names().size());
 }
@@ -478,18 +487,20 @@ void CollectorScheduler::addJobCollect(const Job& job){
 void CollectorScheduler::rmJobCollect(const Job& job){
     std::lock_guard lg(m_);
 
+    // Membership is authoritative here, not job.CollectorNames: intent can
+    // change after the collectors were attached (manual stop), and the Job
+    // snapshot handed to a removal already carries the *new* selection. Reading
+    // the list would then leave the collectors that actually hold the job
+    // attached to a dead instance forever.
     std::vector<std::string> bound_job_collectors;
-    for(const auto& collector_name : job.CollectorNames){
-        auto state_it = collector_state_dict.find(collector_name);
-        auto info_it = collector_info_dict.find(collector_name);
-        if (state_it == collector_state_dict.end() || info_it == collector_info_dict.end()) {
-            spdlog::error("CollectorScheduler: collector {} not found for removal", collector_name);
-            continue;
-        }
+    for (auto& [name, state] : collector_state_dict) {
+        auto info_it = collector_info_dict.find(name);
+        if (info_it == collector_info_dict.end()) continue;
         if (info_it->second.scope != CollectorScope::Job) continue;
-        const auto& jobs = state_it->second.jobid_list;
-        if (std::find(jobs.begin(), jobs.end(), job.JobID) != jobs.end())
-            bound_job_collectors.push_back(collector_name);
+        std::lock_guard lg_state(state.m_);
+        if (std::find(state.jobid_list.begin(), state.jobid_list.end(), job.JobID) !=
+            state.jobid_list.end())
+            bound_job_collectors.push_back(name);
     }
 
     if (!bound_job_collectors.empty()) {
@@ -512,49 +523,85 @@ void CollectorScheduler::rmJobCollect(const Job& job){
     notifySystemCollectors(job, JobEvent::Removed);
 }
 
-void CollectorScheduler::updateJobCollect(const Job& job){
+bool CollectorScheduler::applyJobBinding(const Job& job, std::vector<std::string>& applied,
+                                         std::string& error){
     std::lock_guard lg(m_);
-    
-    const std::set<std::string> needed{job.CollectorNames.begin(),
-                                                   job.CollectorNames.end()};
+
+    const std::set<std::string> needed{job.CollectorNames.begin(), job.CollectorNames.end()};
+
+    // An unknown collector name must fail the application instead of being
+    // silently skipped; otherwise the caller is told a collector is collecting
+    // when nothing was ever attached.
+    for (const auto& name : needed) {
+        if (collector_info_dict.count(name) == 0) {
+            error = "collector '" + name + "' is not configured on this core";
+            return false;
+        }
+    }
 
     std::vector<std::string> to_remove;
     to_remove.reserve(collector_state_dict.size());
     for (const auto& [name, state] : collector_state_dict) {
-        if (!needed.count(name))
-            to_remove.push_back(name);
+        if (!needed.count(name)) to_remove.push_back(name);
     }
 
-    // 删除本 Job 不再需要的采集器绑定（被摘除的采集器收到 on_job_removed）
-    for(const auto& collector_name : to_remove){
-        // 使用find代替at，避免定时器回调并发修改容器时抛出out_of_range
+    // Detach collectors the new selection no longer includes (on_job_removed).
+    for (const auto& collector_name : to_remove) {
         auto it = collector_state_dict.find(collector_name);
         if (it == collector_state_dict.end()) continue;
         auto& state = it->second;
         std::lock_guard lg_state(state.m_);
         detachJobFromCollector(collector_name, state, job, false);
     }
-    // 添加采集器（新的绑定收到 on_job_added），已在列表中的只收到 on_job_updated
-    for(const auto& collector_name : job.CollectorNames){
-        if (collector_info_dict.count(collector_name) == 0)
-        {
-            spdlog::error("CollectorScheduler: {} name is error, continue..", collector_name);
-            continue;
-        }
+
+    // Attach new collectors (on_job_added); refresh snapshots of existing ones so
+    // bound consumers see updated facts/PIDs (on_job_updated).
+    for (const auto& collector_name : job.CollectorNames) {
         if (addJob2Collector(job, collector_name)) continue;
-        // 已绑定：通知 Job 属性/PID 变化
         auto it = collector_state_dict.find(collector_name);
         auto it_info = collector_info_dict.find(collector_name);
         if (it == collector_state_dict.end() || it_info == collector_info_dict.end()) continue;
-        std::lock_guard lg_state(it->second.m_);
-        if (!it->second.running) continue;
         {
-            std::lock_guard snapshot_lock(it->second.snapshot_m_);
-            it->second.job_snapshots[job.JobID] = job;
+            std::lock_guard lg_state(it->second.m_);
+            if (!it->second.running) continue;
+            {
+                std::lock_guard snapshot_lock(it->second.snapshot_m_);
+                it->second.job_snapshots[job.JobID] = job;
+            }
+            notifyJobHook(it_info->second, JobEvent::Updated, job);
         }
-        notifyJobHook(it_info->second, JobEvent::Updated, job);
     }
+
+    // Report exactly the collectors that hold the job and are running.
+    for (const auto& collector_name : job.CollectorNames) {
+        auto it = collector_state_dict.find(collector_name);
+        if (it == collector_state_dict.end()) continue;
+        std::lock_guard lg_state(it->second.m_);
+        if (!it->second.running) {
+            if (error.empty())
+                error = "collector '" + collector_name + "' is not running";
+            continue;
+        }
+        if (std::find(it->second.jobid_list.begin(), it->second.jobid_list.end(),
+                      job.JobID) == it->second.jobid_list.end()) {
+            if (error.empty())
+                error = "collector '" + collector_name + "' did not attach the job";
+            continue;
+        }
+        applied.push_back(collector_name);
+    }
+
     notifySystemCollectors(job, JobEvent::Updated);
+    return error.empty();
+}
+
+void CollectorScheduler::updateJobCollect(const Job& job){
+    std::vector<std::string> applied;
+    std::string error;
+    applyJobBinding(job, applied, error);
+    if (!error.empty())
+        spdlog::warn("CollectorScheduler: applying binding for JobID {} reported: {}",
+                     job.JobID, error);
 }
 
 void CollectorScheduler::buildOutputRoute(collector_info& info) {
@@ -731,6 +778,12 @@ void CollectorScheduler::start() {
 
 void CollectorScheduler::shutdown() {
     std::lock_guard shutdown_lock(shutdown_mutex_);
+    if (collection_applier_installed_) {
+        // Stop receiving intent the moment shutdown begins: a collector lane
+        // must not be attached while it is being torn down.
+        JobRegistry::instance().setCollectionApplier({});
+        collection_applier_installed_ = false;
+    }
     runtime_->lifecycle("stopping");
     {
         std::lock_guard lg(m_);

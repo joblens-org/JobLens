@@ -73,6 +73,9 @@ struct CollectionTargetOutcome {
     uint64_t internal_id = 0;
     std::string instance_id;
     BindingRecord binding;
+    // Runtime result reported by the collection applier; `applied.applied` is
+    // false when no runtime exists or it rejected the intent.
+    AppliedCollection applied;
     bool changed = false;
 };
 

@@ -132,6 +132,17 @@ struct BindingRecord {
     std::vector<std::string> effectiveCollectors() const;
 };
 
+// Runtime state of a committed binding. Intent is owned by the store; applied
+// state is owned by whatever consumes it (CollectorScheduler). An Agent with no
+// collection runtime reports `applied=false` and an explicit error instead of
+// echoing the desired list back as if it were in effect.
+struct AppliedCollection {
+    bool applied = false;
+    uint64_t revision = 0;
+    std::vector<std::string> collectors;
+    std::string error;
+};
+
 struct StoreHealth {
     bool db_running = false;
     bool migration_complete = false;
@@ -222,6 +233,16 @@ public:
     StoreHealth storeHealth() const;
     bool migrationComplete() const { return migration_complete_; }
 
+    // --- Collection runtime seam ------------------------------------------
+    // The component that actually runs collectors (CollectorScheduler) installs
+    // this sink. It is called outside every registry lock, after the durable
+    // intent transaction, and reports which collectors really took effect.
+    using CollectionApplier = std::function<bool(
+        const Job& job, std::vector<std::string>& applied_collectors, std::string& error)>;
+    void setCollectionApplier(CollectionApplier applier);
+    // Last runtime application result for one instance.
+    AppliedCollection appliedCollection(uint64_t jobID) const;
+
     // Test seam only (see StoreFaultMode).
     void injectStoreFaultForTest(StoreFaultMode mode, size_t skip = 0, size_t count = 1);
     void clearStoreFaultsForTest();
@@ -246,8 +267,13 @@ private:
     std::unordered_map<uint64_t, InventoryRecord> records_;
     std::unordered_map<std::string, uint64_t>     identity_ids_;
     std::vector<JobLifecycleCb>            cbs_;
+    // Runtime application results, guarded by mtx_.
+    std::unordered_map<uint64_t, AppliedCollection> applied_collections_;
     // Serializes inventory admission (identity lookup -> allocate -> commit).
     std::mutex                             upsert_mtx_;
+    // Guards the installed collection applier. Never held while it runs.
+    mutable std::mutex                     applier_mtx_;
+    CollectionApplier                      collection_applier_;
 
     // 采集JobInfo持久化
     bool addJob(const Job& job, bool from_db);
@@ -269,6 +295,17 @@ private:
     bool store_ready() const;
     uint64_t allocate_internal_id(std::string& error);
     void note_record_in_memory(const InventoryRecord& meta, const Job& job);
+    // Lifecycle fan-out copied under the lock and invoked without it, so a
+    // callback can never re-enter the registry while it is locked.
+    std::vector<JobLifecycleCb> lifecycle_callbacks() const;
+    void broadcast_lifecycle(JobEvent event, const Job& job);
+    // Calls the installed collection applier (if any) for one job and records
+    // the runtime result. Never called with a registry lock held.
+    void apply_collection_intent(const Job& job, const BindingRecord& binding,
+                                 AppliedCollection& applied);
+    // Records an application that the lifecycle broadcast itself performed
+    // (registration, startup replay).
+    void mark_applied(uint64_t jobID, uint64_t revision, std::vector<std::string> collectors);
 
     // JobID计数器相关
     void init_job_id_counter();      // 初始化计数器（从数据库加载最大值）

@@ -1145,24 +1145,15 @@ TargetResolution resolve_instance_handle(JobRegistry& registry, const std::strin
     return result;
 }
 
-// Desired intent is authoritative. Applied state is whatever the current
-// scheduler consumes through the persisted CollectorNames snapshot (task 4
-// replaces this with real lane acknowledgement and per-target errors).
+// Desired intent is authoritative; applied state comes from the collection
+// runtime that actually owns the collector lanes (plan section 4.2). A core
+// with no runtime reports the intent as accepted-but-not-applied, never as
+// "collecting".
 nlohmann::json collection_target_json(JobRegistry& registry, const InventoryRecord& record,
                                       const BindingRecord& binding, bool changed)
 {
-    std::vector<std::string> applied;
-    if (const auto job = registry.findJob(record.internal_id)) applied = job->CollectorNames;
-    auto desired = binding.effectiveCollectors();
-
-    auto sorted_applied = applied;
-    std::sort(sorted_applied.begin(), sorted_applied.end());
-    sorted_applied.erase(std::unique(sorted_applied.begin(), sorted_applied.end()),
-                         sorted_applied.end());
-    auto sorted_desired = desired;
-    std::sort(sorted_desired.begin(), sorted_desired.end());
-    sorted_desired.erase(std::unique(sorted_desired.begin(), sorted_desired.end()),
-                         sorted_desired.end());
+    const auto desired = binding.effectiveCollectors();
+    const AppliedCollection applied = registry.appliedCollection(record.internal_id);
 
     nlohmann::json out;
     out["instance_id"] = record.instance_id;
@@ -1171,10 +1162,17 @@ nlohmann::json collection_target_json(JobRegistry& registry, const InventoryReco
     out["binding_revision"] = binding.revision;
     out["mode"] = to_string(binding.mode);
     out["desired_collectors"] = desired;
-    out["applied_collectors"] = applied;
-    out["applied_revision"] =
-        sorted_applied == sorted_desired ? binding.revision : uint64_t{0};
+    out["applied_collectors"] = applied.applied ? applied.collectors
+                                                : std::vector<std::string>{};
+    out["applied_revision"] = applied.applied ? applied.revision : uint64_t{0};
     out["errors"] = nlohmann::json::array();
+    if (!applied.applied && !desired.empty()) {
+        out["errors"].push_back(nlohmann::json{
+            {"code", "apply_failed"},
+            {"message", applied.error.empty() ? "collection runtime is unavailable"
+                                              : applied.error},
+        });
+    }
     out["changed"] = changed;
     return out;
 }
@@ -1275,6 +1273,20 @@ std::optional<nlohmann::json> try_legacy_add_by_identity(JobRegistry& registry,
     out["binding_revision"] = target.binding.revision;
     out["mode"] = to_string(target.binding.mode);
     out["desired_collectors"] = target.binding.effectiveCollectors();
+    // Accepted versus applied stays explicit for legacy callers too: the request
+    // is accepted when the intent is durable, but collection only starts if the
+    // runtime confirmed it.
+    out["applied_collectors"] = target.applied.applied ? target.applied.collectors
+                                                       : std::vector<std::string>{};
+    out["applied_revision"] = target.applied.applied ? target.applied.revision : uint64_t{0};
+    out["errors"] = nlohmann::json::array();
+    if (!target.applied.applied && !out["desired_collectors"].empty()) {
+        out["errors"].push_back(nlohmann::json{
+            {"code", "apply_failed"},
+            {"message", target.applied.error.empty() ? "collection runtime is unavailable"
+                                                     : target.applied.error},
+        });
+    }
     out["duplicate_observation"] = !target.changed;
 
     const auto hint = parse_legacy_job_id(
@@ -1344,6 +1356,7 @@ nlohmann::json legacy_remove(JobRegistry& registry, JobCollectionManager& manage
     }
 
     std::vector<std::string> stopped_instances;
+    nlohmann::json apply_errors = nlohmann::json::array();
     size_t stopped = 0;
     size_t retired = 0;
     for (const auto id : targets) {
@@ -1368,6 +1381,15 @@ nlohmann::json legacy_remove(JobRegistry& registry, JobCollectionManager& manage
         }
         ++stopped;
         stopped_instances.push_back(outcome.targets.front().instance_id);
+        if (!outcome.targets.front().applied.applied) {
+            apply_errors.push_back(nlohmann::json{
+                {"instance_id", outcome.targets.front().instance_id},
+                {"code", "apply_failed"},
+                {"message", outcome.targets.front().applied.error.empty()
+                                ? "collection runtime is unavailable"
+                                : outcome.targets.front().applied.error},
+            });
+        }
     }
 
     if (!targets.empty()) {
@@ -1382,6 +1404,7 @@ nlohmann::json legacy_remove(JobRegistry& registry, JobCollectionManager& manage
     out["deleted_count"] = retired;
     out["stopped_count"] = stopped;
     out["stopped_instances"] = stopped_instances;
+    out["apply_errors"] = std::move(apply_errors);
     out["inventory_retained"] = true;
     out["deprecated"] = true;
     out["msg"] = "legacy remove now stops collection; inventory records are retained";
@@ -2068,7 +2091,21 @@ bool JobRegistry::addJob(const Job& job, bool from_db) {
         job_for_cb = it->second;
     }
 
-    for (const auto& cb : cbs_) cb(JobEvent::Added, job_for_cb);
+    const auto callbacks = lifecycle_callbacks();
+    for (const auto& cb : callbacks) cb(JobEvent::Added, job_for_cb);
+    // The Added broadcast is the runtime application for a registration, so the
+    // applied state is recorded from it instead of asking the runtime twice.
+    if (!job_for_cb.CollectorNames.empty()) {
+        if (callbacks.empty()) {
+            AppliedCollection applied;
+            applied.error = "no_collection_runtime";
+            std::lock_guard lg(mtx_);
+            applied_collections_[job.JobID] = applied;
+        } else {
+            mark_applied(job.JobID, bindingRecord(job.JobID).revision,
+                         job_for_cb.CollectorNames);
+        }
+    }
     sync_job_to_kernel(job_for_cb);
     spdlog::info("JobRegistry: add job with JobID {}", job.JobID);
     return true;
@@ -2095,12 +2132,13 @@ bool JobRegistry::retireInstance(uint64_t jobID) {
                 jobs_.erase(it);
             }
         }
+        applied_collections_.erase(jobID);
     }
 
     if (has_callbacks) {
         // Collectors retain the snapshot and acknowledge after their accepted
         // tail has drained; kernel attribution and history wait for that ack.
-        for (const auto& cb : cbs_) cb(JobEvent::Removed, removed);
+        broadcast_lifecycle(JobEvent::Removed, removed);
         return true;
     }
 
@@ -2197,7 +2235,7 @@ size_t JobRegistry::delJob(const SubAttrMatcher& matcher) {
 
     for (const auto& job : removed_jobs) {
         if (has_callbacks) {
-            for (const auto& cb : cbs_) cb(JobEvent::Removed, job);
+            broadcast_lifecycle(JobEvent::Removed, job);
         } else if (finishJobRemoval(job)) {
             std::lock_guard lg(mtx_);
             closing_jobs_.erase(job.JobID);
@@ -3258,6 +3296,7 @@ bool JobRegistry::end_job_in_db(uint64_t jobID){
         spdlog::warn("JobRegistry: job {} not found in db when ending", jobID);
         std::unique_lock lg(mtx_);
         records_.erase(jobID);
+        applied_collections_.erase(jobID);
         return true;
     }
     if (!s.ok()) {
@@ -3327,6 +3366,7 @@ bool JobRegistry::end_job_in_db(uint64_t jobID){
     {
         std::unique_lock lg(mtx_);
         records_.erase(jobID);
+        applied_collections_.erase(jobID);
         if (stored.meta.identity_complete) {
             const auto index_key = identity_index_key(stored.meta.identity);
             auto it = identity_ids_.find(index_key);
@@ -3360,8 +3400,9 @@ UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation
         return result;
     }
 
-    std::lock_guard<std::mutex> admission(upsert_mtx_);
+    std::unique_lock<std::mutex> admission(upsert_mtx_);
     const std::string index_key = key_identity(identity_index_key(*identity));
+
     const int64_t observed_at = observation.observed_at_us != 0
                                     ? observation.observed_at_us : now_us();
 
@@ -3533,6 +3574,13 @@ UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation
             result.facts_revision = updated.facts_revision;
             spdlog::debug("JobRegistry: inventory facts updated for JobID {} (revision {})",
                           internal_id, updated.facts_revision);
+
+            // Fact changes reach already bound consumers (fresh PIDs/attributes)
+            // and the collection runtime outside every registry lock.
+            admission.unlock();
+            const BindingRecord binding = bindingRecord(internal_id);
+            AppliedCollection applied;
+            apply_collection_intent(merged, binding, applied);
             return result;
         }
     }
@@ -3605,6 +3653,11 @@ UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation
     result.facts_revision = meta.facts_revision;
     spdlog::info("JobRegistry: created inventory instance {} for {} '{}'",
                  allocated, to_string(identity->scheduler_type), identity->native_job_id);
+
+    // Facts only: an unbound instance creates no collector work, but System
+    // collectors must still learn the job exists (plan section 6.3).
+    admission.unlock();
+    broadcast_lifecycle(JobEvent::Added, job);
     return result;
 }
 
@@ -3672,20 +3725,21 @@ bool JobRegistry::commitBindings(const std::vector<BindingRecord>& bindings,
 
     // Serialize the binding read-modify-write with observation upserts so the
     // derived CollectorNames snapshot cannot be lost by a racing fact update.
-    std::lock_guard<std::mutex> admission(upsert_mtx_);
-
-    {
-        std::shared_lock lg(mtx_);
-        for (const auto& binding : bindings) {
-            if (closing_jobs_.count(binding.internal_id) != 0) {
-                error = "instance_closing";
-                return false;
-            }
-        }
-    }
-
+    // The runtime application happens outside this admission window: collector
+    // hooks must never run while the store transaction is in progress.
     std::vector<std::pair<uint64_t, std::vector<std::string>>> collector_updates;
     {
+        std::lock_guard<std::mutex> admission(upsert_mtx_);
+        {
+            std::shared_lock lg(mtx_);
+            for (const auto& binding : bindings) {
+                if (closing_jobs_.count(binding.internal_id) != 0) {
+                    error = "instance_closing";
+                    return false;
+                }
+            }
+        }
+
         std::lock_guard<std::mutex> db_lock(db_mtx_);
         leveldb::WriteBatch batch;
         for (const auto& binding : bindings) {
@@ -3722,12 +3776,35 @@ bool JobRegistry::commitBindings(const std::vector<BindingRecord>& bindings,
         }
     }
 
+    std::vector<uint64_t> apply_ids;
     {
         std::unique_lock lg(mtx_);
         for (const auto& [internal_id, collectors] : collector_updates) {
             auto it = jobs_.find(internal_id);
-            if (it != jobs_.end()) it->second.CollectorNames = collectors;
+            if (it == jobs_.end()) continue;
+            if (it->second.CollectorNames == collectors) continue;
+            it->second.CollectorNames = collectors;
+            apply_ids.push_back(internal_id);
         }
+    }
+
+    // Publish to the collection runtime only after the durable commit succeeded.
+    // A runtime failure is recorded per instance and reported by the API; the
+    // intent itself stays accepted (plan section 6.1). Auto bookkeeping can move
+    // without changing the effective selection (manual override), so only real
+    // membership changes reach the runtime.
+    for (const auto& binding : bindings) {
+        if (std::find(apply_ids.begin(), apply_ids.end(), binding.internal_id) == apply_ids.end())
+            continue;
+        Job job;
+        {
+            std::shared_lock lg(mtx_);
+            const auto it = jobs_.find(binding.internal_id);
+            if (it == jobs_.end()) continue;  // retired meanwhile: nothing to apply
+            job = it->second;
+        }
+        AppliedCollection applied;
+        apply_collection_intent(job, binding, applied);
     }
     return true;
 }
@@ -3740,6 +3817,85 @@ bool JobRegistry::hasInstance(uint64_t jobID) const {
 std::string JobRegistry::instanceId(uint64_t jobID) const {
     if (jobID == kSystemSentinelJobId) return "";
     return derive_instance_id(db_uuid_, jobID);
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle fan-out and collection runtime seam
+// ---------------------------------------------------------------------------
+
+std::vector<JobLifecycleCb> JobRegistry::lifecycle_callbacks() const {
+    std::shared_lock lg(mtx_);
+    return cbs_;
+}
+
+void JobRegistry::broadcast_lifecycle(JobEvent event, const Job& job) {
+    for (const auto& cb : lifecycle_callbacks()) cb(event, job);
+}
+
+void JobRegistry::setCollectionApplier(CollectionApplier applier) {
+    std::lock_guard<std::mutex> lock(applier_mtx_);
+    collection_applier_ = std::move(applier);
+}
+
+void JobRegistry::apply_collection_intent(const Job& job, const BindingRecord& binding,
+                                          AppliedCollection& applied) {
+    CollectionApplier applier;
+    {
+        std::lock_guard<std::mutex> lock(applier_mtx_);
+        applier = collection_applier_;
+    }
+
+    applied = AppliedCollection{};
+    applied.revision = binding.revision;
+    if (!applier) {
+        // No collection runtime on this Agent (inventory-only core, tests).
+        // The intent is durable, but nothing was applied: say so.
+        applied.error = "no_collection_runtime";
+    } else {
+        std::vector<std::string> collectors;
+        std::string error;
+        bool ok = false;
+        try {
+            ok = applier(job, collectors, error);
+        } catch (const std::exception& failure) {
+            error = std::string("collection runtime threw: ") + failure.what();
+        }
+        applied.applied = ok;
+        applied.collectors = ok ? std::move(collectors) : std::vector<std::string>{};
+        if (!ok && error.empty()) error = "collection runtime rejected the binding";
+        applied.error = error;
+        if (!ok)
+            spdlog::warn("JobRegistry: collection intent for JobID {} not applied: {}",
+                         job.JobID, error);
+    }
+
+    std::lock_guard lg(mtx_);
+    if (jobs_.count(job.JobID) == 0) {
+        // The instance was retired while the runtime was applying the intent;
+        // its applied state no longer has an owner.
+        return;
+    }
+    applied_collections_[job.JobID] = applied;
+}
+
+AppliedCollection JobRegistry::appliedCollection(uint64_t jobID) const {
+    std::shared_lock lg(mtx_);
+    const auto it = applied_collections_.find(jobID);
+    if (it != applied_collections_.end()) return it->second;
+    return AppliedCollection{};
+}
+
+void JobRegistry::mark_applied(uint64_t jobID, uint64_t revision,
+                               std::vector<std::string> collectors) {
+    std::sort(collectors.begin(), collectors.end());
+    collectors.erase(std::unique(collectors.begin(), collectors.end()), collectors.end());
+    AppliedCollection applied;
+    applied.applied = true;
+    applied.revision = revision;
+    applied.collectors = std::move(collectors);
+    std::lock_guard lg(mtx_);
+    if (jobs_.count(jobID) == 0) return;  // retired while the replay ran
+    applied_collections_[jobID] = std::move(applied);
 }
 
 StoreHealth JobRegistry::storeHealth() const {
@@ -3834,5 +3990,12 @@ void JobRegistry::addLifecycleCb(JobLifecycleCb cb) {
 
     for (const auto& job : replay) {
         cb(JobEvent::Added, job);
+    }
+
+    // The replay is how persisted intent is applied after a restart, so record
+    // the same applied state a fresh registration would report.
+    for (const auto& job : replay) {
+        if (job.CollectorNames.empty()) continue;
+        mark_applied(job.JobID, bindingRecord(job.JobID).revision, job.CollectorNames);
     }
 }

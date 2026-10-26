@@ -191,6 +191,10 @@ CollectionOutcome JobCollectionManager::mutate(const CollectionRequest& request,
         }
     }
 
+    // Applied state always comes from the runtime, never from the desired list.
+    for (auto& target : planned)
+        target.applied = registry_.appliedCollection(target.internal_id);
+
     outcome.ok = true;
     outcome.targets = std::move(planned);
     return outcome;
@@ -256,14 +260,22 @@ CollectionOutcome JobCollectionManager::applyAutoPolicy(
         next.internal_id = selection.internal_id;
         next.auto_collectors = names;
         next.policy_revision = selection.policy_revision;
-        next.revision = current.revision + 1;
         // Manual mode, including an empty manual list, is never overwritten.
+        // Only the stored automatic decision is refreshed, so the client-visible
+        // binding revision (and any expected_revision guard) does not move for a
+        // change the client cannot observe.
         if (current.mode == CollectionMode::Manual) {
             ++outcome.skipped_manual_override;
             next.mode = current.mode;
             next.manual_collectors = current.manual_collectors;
+            target.binding = next;
+            target.changed = false;
+            planned.push_back(std::move(target));
+            pending.push_back(std::move(next));
+            continue;
         }
 
+        next.revision = current.revision + 1;
         target.binding = next;
         target.changed = true;
         planned.push_back(std::move(target));
@@ -284,6 +296,9 @@ CollectionOutcome JobCollectionManager::applyAutoPolicy(
             return outcome;
         }
     }
+
+    for (auto& target : planned)
+        target.applied = registry_.appliedCollection(target.internal_id);
 
     outcome.ok = true;
     outcome.targets = std::move(planned);

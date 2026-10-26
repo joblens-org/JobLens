@@ -16,6 +16,7 @@
 #include "core/collector_execution_context.hpp"
 #include "core/collector_registry.hpp"
 #include "core/collector_scheduler.hpp"
+#include "core/job_collection_manager.hpp"
 #include "core/job_registry.hpp"
 #include "core/writer_manager.hpp"
 #include "writer/base_writer.hpp"
@@ -149,6 +150,9 @@ struct FakeJobEvent : IEventJobCollector {
     static inline std::atomic<int> unknown{0};
     static inline std::atomic<int> writer_fd{-1};
     static inline std::atomic<int> reader_fd{-1};
+    // Target of byte '3', so a test can drive an event for a job id allocated at
+    // runtime by the inventory.
+    static inline std::atomic<uint64_t> extra_job_id{0};
 
     bool init(const nlohmann::json&, CollectorInitContext& context) override
     {
@@ -193,6 +197,7 @@ struct FakeJobEvent : IEventJobCollector {
                 uint64_t job_id = 0;
                 if (buffer[index] == '1') job_id = 101;
                 else if (buffer[index] == '2') job_id = 202;
+                else if (buffer[index] == '3') job_id = extra_job_id.load();
                 else if (buffer[index] == 'x') job_id = 999;
                 else continue;
                 ++consumed;
@@ -426,6 +431,111 @@ void run(const std::string& base)
     const auto system_after = CaptureWriter::wait_for("sys_event", 2);
     check(system_after[1]->sample->job.JobID == 0,
           "System event lost its Job 0 envelope after Job removal");
+
+    // ---------------------------------------------------------------------
+    // Collection intent reaches the lanes (decoupling task 4/6).
+    //
+    // An inventoried-but-unbound instance must create no collector work; a
+    // committed binding must attach the lane and report itself as applied; a
+    // persistent stop must detach it; retirement must still acknowledge.
+    // ---------------------------------------------------------------------
+    JobCollectionManager collection(JobRegistry::instance());
+    collection.setCollectorValidator([](const std::string& name) {
+        return name == "job_event" || name == "job_periodic";
+    });
+
+    const auto upsert = [](const std::string& native) {
+        ObservedExecution execution;
+        execution.selector.scheduler_type = SchedulerType::Condor;
+        execution.selector.cluster_name = "htcondor01";
+        execution.selector.native_job_id = native;
+        execution.generation.boot_id = "test-boot";
+        execution.generation.manager_pid = getpid();
+        execution.generation.manager_start_ticks = 1;
+        execution.generation.cgroup_identity = "";
+        execution.processes.push_back(ProcessIdentity{getpid(), 1, "test-boot"});
+        Job facts;
+        facts.jobtype = JobType::Job;
+        facts.subtype = JobSubType::Condor;
+        CondorJobAttr attr;
+        attr.auto_update_child = false;
+        attr.starter_pid = getpid();
+        facts.sub_attr = attr;
+        execution.facts = facts;
+        return JobRegistry::instance().upsertObservedJob(execution);
+    };
+
+    const auto bound = upsert("700.0");
+    check(bound.ok && bound.disposition == UpsertDisposition::Created,
+          "inventory upsert must create the instance");
+    check(collector_status(scheduler, "job_event").at("job_count").get<size_t>() == 0,
+          "an unbound inventory instance must not attach a collector lane");
+    const int added_before_bind = FakeJobEvent::added.load();
+
+    CollectionRequest bind;
+    bind.targets = {bound.internal_id};
+    bind.collectors = std::vector<std::string>{"job_event"};
+    const auto bound_outcome = collection.setCollectors(bind);
+    check(bound_outcome.ok, "set must be accepted: " + bound_outcome.message);
+    const auto& target = bound_outcome.targets.front();
+    check(target.binding.revision == 1, "first binding is revision 1");
+    check(target.applied.applied,
+          "binding must be applied by the runtime, got: " + target.applied.error);
+    check(target.applied.collectors == std::vector<std::string>{"job_event"},
+          "applied collectors must name the attached lane");
+    check(target.applied.revision == target.binding.revision,
+          "applied revision must match the committed revision");
+    check(FakeJobEvent::added.load() > added_before_bind,
+          "on_job_added must run when intent attaches a lane");
+    check(collector_status(scheduler, "job_event").at("job_count").get<size_t>() == 1,
+          "the lane must hold exactly the bound instance");
+
+    // The bound instance produces events through the existing source.
+    FakeJobEvent::extra_job_id.store(bound.internal_id);
+    send_byte(FakeJobEvent::writer_fd.load(), '3');
+    eventually([&] {
+        return CaptureWriter::count("job_event") >= 3;
+    }, "bound inventory instance did not produce output");
+
+    // A persistent stop detaches the lane but keeps the inventory record.
+    const int removed_before_stop = FakeJobEvent::removed.load();
+    CollectionRequest stop;
+    stop.targets = {bound.internal_id};
+    stop.collectors = std::vector<std::string>{};
+    const auto stopped = collection.setCollectors(stop);
+    check(stopped.ok, "stop must be accepted: " + stopped.message);
+    check(stopped.targets.front().applied.applied, "stop must be applied");
+    check(stopped.targets.front().applied.collectors.empty(),
+          "nothing may remain applied after a persistent stop");
+    check(FakeJobEvent::removed.load() > removed_before_stop,
+          "on_job_removed must run when a stop detaches the lane");
+    check(collector_status(scheduler, "job_event").at("job_count").get<size_t>() == 0,
+          "the stopped instance must leave the lane");
+    check(JobRegistry::instance().findJob(bound.internal_id).has_value(),
+          "stopping collection must keep the inventory record");
+
+    // Retirement of a stopped instance is acknowledged without leaving a lane.
+    check(JobRegistry::instance().retireInstance(bound.internal_id),
+          "retire the stopped instance");
+    eventually([&] { return JobRegistry::instance().closingJobCount() == 0; },
+               "stopped instance was not acknowledged after retirement");
+
+    // Natural completion while bound must detach the lane exactly once.
+    const auto bound_two = upsert("701.0");
+    check(bound_two.ok, "second inventory upsert");
+    CollectionRequest bind_two;
+    bind_two.targets = {bound_two.internal_id};
+    bind_two.collectors = std::vector<std::string>{"job_event"};
+    check(collection.setCollectors(bind_two).ok, "second bind");
+    const int removed_before_retire = FakeJobEvent::removed.load();
+    check(JobRegistry::instance().retireInstance(bound_two.internal_id),
+          "retire the bound instance");
+    eventually([&] { return JobRegistry::instance().closingJobCount() == 0; },
+               "bound instance was not acknowledged after retirement");
+    check(FakeJobEvent::removed.load() > removed_before_retire,
+          "natural completion must detach a still-bound lane");
+    check(collector_status(scheduler, "job_event").at("job_count").get<size_t>() == 0,
+          "the retired instance must leave the lane");
 
     scheduler.shutdown();
     WriterManager::instance().shutdown();

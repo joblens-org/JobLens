@@ -146,6 +146,13 @@ private:
     void addJobCollect(const Job& job);
     void rmJobCollect(const Job& job);
     void updateJobCollect(const Job& job);
+    // Reconciles the scheduler's job -> collector membership with the registry's
+    // intent and reports which collectors really hold the job. Installed as the
+    // registry's collection applier, so intent changes reach the lanes without
+    // waiting for a restart. Returns false (with `error`) when a requested
+    // collector is unknown or failed to start.
+    bool applyJobBinding(const Job& job, std::vector<std::string>& applied,
+                         std::string& error);
     // Caller holds m_.
     void startCollector(std::string collector);
     std::shared_ptr<CollectorLaneContext> createLane(const std::string& name,
@@ -224,4 +231,6 @@ private:
     std::unordered_map<std::string, collector_state> collector_state_dict;
     double default_freq;
     bool                    running_ = false;
+    // Cleared on shutdown so the registry never calls a destroyed scheduler.
+    bool                    collection_applier_installed_ = false;
 };

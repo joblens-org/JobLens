@@ -442,6 +442,16 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
               "desired collectors must match");
         check(target["applied_collectors"].is_array() && target["errors"].is_array(),
               "applied state and errors must be shaped as arrays: " + target.dump());
+        // This core has no collection runtime: the intent is durable, but the
+        // response must not pretend it is collecting (plan 6.1 / A26).
+        check(target["applied_collectors"].empty(),
+              "a core without a collection runtime must not claim applied collectors: " +
+                  target.dump());
+        check(target["applied_revision"] == 0,
+              "unapplied intent must report applied_revision 0: " + target.dump());
+        check(target["errors"].size() == 1 &&
+                  target["errors"][0]["message"] == "no_collection_runtime",
+              "unapplied intent must report the runtime gap: " + target.dump());
 
         const auto repeated = rpc(
             "JobCollection/set",
