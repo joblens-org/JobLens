@@ -89,6 +89,13 @@ bash tests/integration/run_watcher_scan_test.sh build
 无绑定的清单实例不产生采集、提交绑定时挂载 lane 并报告 applied、持久停止后摘除且保留清单、
 无论停止后退休还是绑定中自然结束都能被确认且不残留 lane。
 
+`run_inventory_tests.sh --suite lifecycle`（`job_registry_lifecycle_test.cpp`）验证
+JobRegistry 自己的生命周期与自动选择：构造即启动清单栈（providers 发布）、
+`stopInventoryDiscovery` 幂等且排空期间状态可见、`deinit` 归档并关库且幂等；
+`auto_add` 折算后新实例自动获得配置的采集器、手工覆盖不被覆盖、
+defaults/rules/reject 三种选择语义直接断言。exec hint 的定向观察（不触发全量扫描）
+在 maintenance 套件的 `EXEC` 用例中验证。
+
 ### 统一采集执行套件 / Unified collector execution suites
 
 ```bash

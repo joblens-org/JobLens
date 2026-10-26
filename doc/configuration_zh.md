@@ -83,18 +83,34 @@ job_registry_config:
 | `inventory.reconcile_interval_sec` | int | 30 | 周期性全量对账间隔，单位秒，最小 1 |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs`（Condor）或 `{JobLensRootDir}/../config/rules/slurm_jobs`（Slurm） | Lua 规则文件目录，CondorJobWatcher 和 SlurmJobWatcher 在 `use_rules` 启用时使用。注意：默认值因 watcher 而异。 |
 
-**清单维护**与**自动采集**是两个独立开关：
+**清单维护**与**自动采集**是两个独立开关，旧的 `auto_add_*` 旗标折算进它们：
 
 | `inventory.types` 包含该类型 | `<type>_job_watcher.auto_collect` | 行为 |
 |---|---|---|
-| 是 | 否 | 维护全部本地实例的清单；只有显式采集请求（`POST /joblens/collection` 或旧版 add 接口）才会开始采集 |
-| 是 | 是 | 维护清单；自动选择采集需要策略层（Lua 规则/默认采集器列表）。当前版本只保存意图，尚未评估策略，因此新实例不会自动采集 |
-| 否 | 是 | 兼容模式：自动添加 watcher 登记通过规则的作业，不保证完整清单 |
+| 是 | 否 | 维护全部本地实例的清单；只有显式采集请求才会开始采集 |
+| 是 | 是 | 维护清单；每个新登记的实例自动获得采集器（见下表） |
+| 否 | 是（显式或经 `auto_add_<type>job` 折算） | 与上一行等价：折算会自动把该类型纳入清单 |
 | 否 | 否 | 不做广泛发现；显式且经过校验的登记/控制仍然可用 |
 
-两者同时配置时 `<type>_job_watcher.auto_collect` 优先于旧的
-`job_registry_config.auto_add_<type>job`。发现源集中：类型出现在 `inventory.types`
-时不会再启动旧版 watcher，每个调度器类型只需要一个 eBPF 源。
+自动采集列表的来源：
+
+| `use_rules` | 首次登记时的选择 |
+|---|---|
+| `false`/缺省 | `<type>_job_watcher.auto_add_collectors`，逐字加给每个作业 |
+| `true` | Lua 规则引擎逐作业判定：accept = 规则给出的采集器，reject = 空选择（作业仍在清单中） |
+
+因此 `job_registry_config.auto_add_<type>job: true` 等价于"该类型入清单，
+所有作业都加这些采集器"（`use_rules` 只决定列表怎么选）。显式的
+`<type>_job_watcher.auto_collect` 或 `inventory.types` 永远胜过旧旗标。
+规则 reject 不会把作业从清单里删掉——规则只决定采集器，不决定存在性。
+
+`<type>_job_watcher.cluster_name`（可选）在环境变量
+（`COLLECTOR_HOST` / `SLURM_CLUSTER_NAME`）无法推导命名空间时显式指定；
+完全没有来源时观测保持 incomplete，并在清单状态中可见。
+
+发现集中在 `JobRegistry`：构造函数为每个已配置类型建一个 watcher 并启动
+维护控制器（含首次全量扫描），整个栈通过 `stopInventoryDiscovery()` 与
+`deinit()` 关闭。每个调度器类型只有一个 eBPF 源。
 
 采集意图（期望选择）持久化在 LevelDB 中，由运行中的调度器应用到采集通道。
 `JobCollection/get` 区分 `desired_collectors` 与 `applied_collectors`：请求可以被

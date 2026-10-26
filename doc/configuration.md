@@ -84,19 +84,39 @@ job_registry_config:
 | `inventory.reconcile_interval_sec` | int | 30 | Periodic full reconciliation interval in seconds (minimum 1) |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` (Condor) or `{JobLensRootDir}/../config/rules/slurm_jobs` (Slurm) | Directory for Lua rule files, used by CondorJobWatcher and SlurmJobWatcher when `use_rules` is enabled. Note: the default varies by watcher context. |
 
-**Inventory and automatic collection** are separate switches:
+**Inventory and automatic collection** are separate switches, and the legacy
+`auto_add_*` flags are folded into them:
 
 | `inventory.types` contains the type | `<type>_job_watcher.auto_collect` | Behavior |
 |---|---|---|
-| Yes | No | Keep an inventory of every local instance; collection only starts through an explicit collection request (`POST /joblens/collection` or the legacy add route) |
-| Yes | Yes | Keep the inventory; automatic selection requires the policy layer (Lua rules / default collector list). This build stores the intent but does not evaluate policy yet, so new instances are not collected automatically |
-| No | Yes | Legacy mode: the auto-add watcher registers accepted jobs for collection, without a full-inventory guarantee |
+| Yes | No | Keep an inventory of every local instance; collection only starts through an explicit collection request |
+| Yes | Yes | Keep the inventory; every newly registered instance gets collectors automatically (see below) |
+| No | Yes (explicit or via `auto_add_<type>job`) | Same as above: the type is inventoried automatically through the fold |
 | No | No | No broad discovery; explicit verified registration/control still works |
 
-`<type>_job_watcher.auto_collect` wins over the deprecated
-`job_registry_config.auto_add_<type>job` when both are set. Discovery is
-centralized: a type listed under `inventory.types` does not also start the
-legacy watcher, so one eBPF source per scheduler type is enough.
+How the automatic list is chosen:
+
+| `use_rules` | Selection on first registration |
+|---|---|
+| `false`/absent | `<type>_job_watcher.auto_add_collectors`, verbatim, for every job |
+| `true` | The Lua rule engine decides per job: accept = the rule's collector list, reject = empty selection (the job stays in the inventory) |
+
+`job_registry_config.auto_add_<type>job: true` is therefore equivalent to
+"inventory this type and add these collectors to every job" (`use_rules`
+only decides how the list is chosen). An explicit
+`<type>_job_watcher.auto_collect` or `inventory.types` entry always wins over
+the legacy flag. A rejected job is never dropped from the inventory - rules
+decide collectors, never existence.
+
+`<type>_job_watcher.cluster_name` (optional) pins the scheduler namespace used
+for identity when it cannot be derived from the environment
+(`COLLECTOR_HOST` / `SLURM_CLUSTER_NAME`); without any source the observation
+stays incomplete and is visible in the inventory status.
+
+Discovery is centralized in `JobRegistry`: its constructor builds exactly one
+watcher per configured type and starts the maintenance controller (initial
+scan included), and the whole stack stops through `stopInventoryDiscovery()`
+and `deinit()`. There is no second eBPF source per scheduler type.
 
 Collection intent (desired selection) is stored in LevelDB and applied to the
 collector lanes by the running scheduler. `JobCollection/get` distinguishes
