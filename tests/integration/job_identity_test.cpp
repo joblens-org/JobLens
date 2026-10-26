@@ -203,6 +203,14 @@ void slurm_steps_and_pid_reuse()
           "batch conversion");
     check(slurm_step_name(kSlurmExternStepValue) == std::string("extern"),
           "extern conversion");
+    // These are the real slurm/slurm.h constants, not self-referential checks:
+    // a swapped table would label every batch step as extern.
+    check(kSlurmBatchStepValue == 0xfffffffeu, "SLURM_BATCH_SCRIPT must be 0xfffffffe");
+    check(kSlurmExternStepValue == 0xfffffffdu, "SLURM_EXTERN_CONT must be 0xfffffffd");
+    check(slurm_step_name(0xfffffffeu) == std::string("batch"),
+          "SLURM_BATCH_SCRIPT numeric value must map to batch");
+    check(slurm_step_name(0xfffffffdu) == std::string("extern"),
+          "SLURM_EXTERN_CONT numeric value must map to extern");
     check(!slurm_step_name(5).has_value(), "plain numbers have no special name");
     check(slurm_step_value("batch") == kSlurmBatchStepValue, "batch numeric value");
     check(slurm_step_value("extern") == kSlurmExternStepValue, "extern numeric value");
