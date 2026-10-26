@@ -771,6 +771,22 @@ void JobRegistry::init_inventory()
                      "existing records are still maintained");
     }
 
+    // Automatic selection is armed per scheduler type: use_rules=false adds the
+    // configured defaults to every job, use_rules=true asks the rule engine
+    // per job (reject = empty selection, the job stays inventoried).
+    auto_policies_.clear();
+    for (const auto& [type, settings] : config.settings) {
+        if (!settings.auto_collect) continue;
+        const SchedulerType scheduler =
+            type == InventoryType::Condor ? SchedulerType::Condor : SchedulerType::Slurm;
+        if (settings.use_rules)
+            auto_policies_[scheduler] =
+                AutoCollectorPolicy::rules(settings.rules_dir, settings.rules_prefix);
+        else
+            auto_policies_[scheduler] =
+                AutoCollectorPolicy::defaults(settings.default_collectors);
+    }
+
     inventory_ = std::make_unique<JobInventoryMaintenance>(*this, config, std::move(sources));
     if (!inventory_->start()) {
         spdlog::error("JobRegistry: inventory maintenance did not start; "
@@ -782,6 +798,38 @@ void JobRegistry::init_inventory()
     }
     spdlog::info("JobRegistry: inventory maintenance running with {} discovery type(s)",
                  config.types.size());
+}
+
+void JobRegistry::apply_auto_policy(const Job& job, SchedulerType type)
+{
+    const auto policy = auto_policies_.find(type);
+    if (policy == auto_policies_.end() || !policy->second.enabled()) return;
+
+    std::string revision;
+    std::string error;
+    const auto collectors = policy->second.select(job, revision, error);
+    if (!error.empty()) {
+        spdlog::warn("JobRegistry: automatic selection failed for JobID {}; keeping the "
+                     "previous decision: {}",
+                     job.JobID, error);
+        return;
+    }
+    applyAutoSelection(job.JobID, collectors, revision);
+}
+
+bool JobRegistry::applyAutoSelection(uint64_t internal_id,
+                                     const std::vector<std::string>& collectors,
+                                     const std::string& policy_revision)
+{
+    if (!collection_manager_) return false;
+    const auto outcome = collection_manager_->applyAutoPolicy(
+        {AutoSelection{internal_id, collectors, policy_revision}});
+    if (!outcome.ok) {
+        spdlog::warn("JobRegistry: automatic selection for JobID {} was rejected: {}",
+                     internal_id, outcome.message);
+        return false;
+    }
+    return true;
 }
 
 void JobRegistry::stopInventoryDiscovery()
@@ -3817,6 +3865,9 @@ UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation
     // collectors must still learn the job exists (plan section 6.3).
     admission.unlock();
     broadcast_lifecycle(JobEvent::Added, job);
+    // First complete registration is an automatic-selection trigger (plan
+    // 6.2); Lua evaluation happens outside every registry lock.
+    apply_auto_policy(job, identity->scheduler_type);
     return result;
 }
 

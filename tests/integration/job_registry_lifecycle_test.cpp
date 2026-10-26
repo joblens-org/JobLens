@@ -23,6 +23,7 @@
  */
 #include "common/config.hpp"
 #include "core/inventory_status_provider.hpp"
+#include "core/job_collection_manager.hpp"
 #include "core/job_registry.hpp"
 
 #include <filesystem>
@@ -51,6 +52,16 @@ std::string fresh_dir(const std::string& base, const std::string& name)
     return path.string();
 }
 
+const char* COLLECTORS_BLOCK =
+    "collectors_config:\n"
+    "  default_freq: 1\n"
+    "  default_use_writers: []\n"
+    "  collectors:\n"
+    "    - {name: cpumem_collector, type: CPUMemCollector, config: cpumem_collector_config}\n"
+    "    - {name: io_collector, type: IOUsageCollector, config: io_collector_config}\n"
+    "cpumem_collector_config:\n  freq: 1\n  use_writers: []\n"
+    "io_collector_config:\n  freq: 1\n  use_writers: []\n";
+
 Job make_common_job()
 {
     Job job;
@@ -66,14 +77,45 @@ Job make_common_job()
 
 void run(const std::string& base)
 {
-    // A minimal configuration: no inventory types, so the maintenance
-    // controller starts with zero discovery sources.
-    const auto config_path = std::filesystem::path(base) / "config.yaml";
+    // One configuration file for the whole binary (Config::instance keeps the
+    // first path): the first cases run with no inventory types, the automatic
+    // selection cases get their own registry instances but read the same file.
+    const auto rules_root = std::filesystem::path(base) / "rules";
     std::filesystem::create_directories(base);
+    std::filesystem::create_directories(rules_root / "condor_jobs");
+    {
+        std::ofstream accept(rules_root / "condor_jobs" / "condor_job_accept.lua");
+        accept << "local rule = {}\n"
+                  "rule.name = \"accept_cpumem\"\n"
+                  "rule.description = \"always accept and collect cpumem\"\n"
+                  "rule.priority = 10\n"
+                  "function rule.condition(job)\n"
+                  "    return {passed = true, collectors = {\"cpumem_collector\"}}\n"
+                  "end\n"
+                  "return rule\n";
+        std::ofstream reject(rules_root / "condor_jobs" / "condor_job_reject.lua");
+        reject << "local rule = {}\n"
+                  "rule.name = \"reject_everything\"\n"
+                  "rule.description = \"reject: no collectors, job stays inventoried\"\n"
+                  "rule.priority = 5\n"
+                  "function rule.condition(job)\n"
+                  "    return {passed = false, collectors = {}}\n"
+                  "end\n"
+                  "return rule\n";
+    }
+    const auto config_path = std::filesystem::path(base) / "config.yaml";
     {
         std::ofstream config(config_path);
         config << "job_registry_config:\n"
-                  "  job_db_path: " << base << "/cfg.db\n";
+                  "  auto_add_condorjob: true\n"
+                  "  job_db_path: " << base << "/cfg.db\n"
+                  << COLLECTORS_BLOCK
+                  << "condor_job_watcher:\n"
+                  "  auto_add_collectors: [cpumem_collector, io_collector]\n"
+                  "  use_rules: false\n"
+                  "  cluster_name: htcondor01\n"
+                  "  rules_dir: \"" << rules_root.string() << "/condor_jobs\"\n"
+                  "  rules_prefix: condor_job_\n";
     }
     Config::instance(config_path.string());
 
@@ -130,8 +172,93 @@ void run(const std::string& base)
         check(registry.deinit(), "deinit after retirement must succeed");
     }
 
+    // Automatic selection (S5): with auto_add folded on, every created
+    // instance receives the configured collectors; a manual override still
+    // wins; rule evaluation is covered by the policy object below.
+    {
+        JobRegistryOptions options;
+        options.db_path = fresh_dir(base, "lifecycle-autopolicy");
+        options.enable_pid_tracker = false;
+        options.register_rpc = false;
+        JobRegistry registry(options);
+
+        ObservedExecution observation;
+        observation.selector.scheduler_type = SchedulerType::Condor;
+        observation.selector.cluster_name = "htcondor01";
+        observation.selector.native_job_id = "700.0";
+        observation.generation.boot_id = "boot";
+        observation.generation.manager_pid = 4242;
+        observation.generation.manager_start_ticks = 900000;
+        observation.processes.push_back(ProcessIdentity{4242, 900000, "boot"});
+        observation.facts.jobtype = JobType::Job;
+        observation.facts.subtype = JobSubType::Condor;
+
+        const auto created = registry.upsertObservedJob(observation);
+        check(created.ok && created.disposition == UpsertDisposition::Created,
+              "auto policy: the instance must be created");
+        const auto binding = registry.bindingRecord(created.internal_id);
+        check(binding.mode == CollectionMode::Auto,
+              "auto policy: the selection must be automatic");
+        check(binding.auto_collectors.size() == 2 &&
+                  binding.auto_collectors[0] == "cpumem_collector",
+              "auto policy: defaults mode must add every configured collector");
+        check(binding.effectiveCollectors() == binding.auto_collectors,
+              "auto policy: without a manual override the defaults are effective");
+        check(binding.policy_revision == "defaults",
+              "auto policy: the revision must identify the defaults source");
+        check(registry.findJob(created.internal_id)->CollectorNames.size() == 2,
+              "auto policy: the derived snapshot must follow the selection");
+
+        // A manual override keeps winning over the automatic decision.
+        JobCollectionManager manager(registry);
+        manager.setCollectorValidator([](const std::string& name) {
+            return name == "cpumem_collector" || name == "io_collector";
+        });
+        CollectionRequest stop;
+        stop.targets = {created.internal_id};
+        stop.collectors = std::vector<std::string>{};
+        check(manager.setCollectors(stop).ok, "auto policy: manual stop must be accepted");
+        const auto second = registry.upsertObservedJob(observation);
+        check(second.ok, "auto policy: a repeated observation must succeed");
+        const auto after = registry.bindingRecord(created.internal_id);
+        check(after.mode == CollectionMode::Manual && after.manual_collectors.empty(),
+              "auto policy: the manual override must survive re-registration");
+        check(registry.deinit(), "auto policy: deinit after defaults");
+    }
+
+    // The policy object itself: defaults add the list verbatim, rules decide
+    // per job (accept = the rule's collectors, reject = empty) and an error
+    // keeps the previous decision.
+    {
+        const Job job = make_common_job();
+
+        auto defaults = AutoCollectorPolicy::defaults({"cpumem_collector"});
+        std::string revision;
+        std::string error;
+        const auto selected = defaults.select(job, revision, error);
+        check(error.empty() && revision == "defaults" && selected.size() == 1 &&
+                  selected.front() == "cpumem_collector",
+              "auto policy: defaults must return the configured list verbatim");
+
+        auto rules = AutoCollectorPolicy::rules(
+            (rules_root / "condor_jobs").string(), "condor_job_");
+        const auto accepted = rules.select(job, revision, error);
+        check(error.empty(), "auto policy: rule evaluation must not fail: " + error);
+        check(revision.rfind("rules:", 0) == 0,
+              "auto policy: the rules revision must identify the source");
+        check(accepted.size() == 1 && accepted.front() == "cpumem_collector",
+              "auto policy: an accepting rule must select its collectors");
+
+        auto broken = AutoCollectorPolicy::rules(
+            (rules_root / "does-not-exist").string(), "nope_");
+        const auto none = broken.select(job, revision, error);
+        check(none.empty(), "auto policy: a rules policy with no rules selects nothing");
+    }
+
     pass_case("LIFECYCLE",
               "construction starts inventory, stop/deinit are idempotent and ordered");
+    pass_case("AUTOPOLICY",
+              "auto_add folding selects collectors on registration; rules decide per job");
 }
 
 }  // namespace

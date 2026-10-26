@@ -32,6 +32,7 @@
 #include "ebpf/trace_condor_starter.h"
 #include "common/ebpf_common.hpp"
 #include "core/job_pid_tracker.hpp"
+#include "core/job_auto_policy.hpp"
 
 #include "job_watcher/condor_job_watcher.hpp"
 #include "job_watcher/slurm_job_watcher.hpp"
@@ -261,6 +262,12 @@ public:
     // destructor calls it as a fallback.
     bool deinit();
 
+    // Automatic selection entry point: record the decision as the instance's
+    // automatic intent (manual overrides are never touched). Returns false
+    // when the transaction was rejected.
+    bool applyAutoSelection(uint64_t internal_id, const std::vector<std::string>& collectors,
+                            const std::string& policy_revision);
+
     // Test seam only (see StoreFaultMode).
     void injectStoreFaultForTest(StoreFaultMode mode, size_t skip = 0, size_t count = 1);
     void clearStoreFaultsForTest();
@@ -280,6 +287,9 @@ private:
     // inputs. Invalid configuration degrades to "no inventory" with an error
     // log instead of aborting the service.
     void init_inventory();
+    // Automatic selection for one newly created instance, evaluated outside
+    // every registry lock (plan 6.2: Lua never runs under a lock).
+    void apply_auto_policy(const Job& job, SchedulerType type);
     void regRPCHandle();
     inline void update_job(Job& job);
     mutable std::shared_mutex              mtx_;
@@ -307,6 +317,9 @@ private:
     std::unique_ptr<SlurmJobWatcher> slurm_source_;
     std::unique_ptr<JobInventoryMaintenance> inventory_;
     std::shared_ptr<JobCollectionManager> collection_manager_;
+    // Automatic collector selection per scheduler type, armed from the
+    // resolved inventory configuration. A disabled entry selects nothing.
+    std::map<SchedulerType, AutoCollectorPolicy> auto_policies_;
     bool deinit_done_{false};
     bool deinit_ok_{true};
 
