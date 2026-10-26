@@ -132,70 +132,89 @@ ScanResult empty_scan()
     return result;
 }
 
-class FakeSource {
+class FakeSource final : public IDiscoverySource {
 public:
     FakeSource(std::string name, SchedulerType type)
         : name_(std::move(name)), type_(type)
     {
     }
 
-    InventorySource make()
+    // ---- IDiscoverySource ---------------------------------------------------
+    const std::string& name() const override { return name_; }
+    SchedulerType schedulerType() const override { return type_; }
+
+    bool start(const DiscoverySink& sink) override
     {
-        InventorySource source;
-        source.name = name_;
-        source.scheduler_type = type_;
-        source.start = [this](ObservationSink sink) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            ++start_calls;
-            sink_ = std::move(sink);
-            started = true;
-            health.polling = true;
-            health.state = SourceState::Healthy;
-            return start_result;
-        };
-        source.stop = [this]() {
-            std::lock_guard<std::mutex> lock(mutex_);
-            ++stop_calls;
-            started = false;
-            health.polling = false;
-        };
-        source.scan = [this]() {
-            std::function<ScanResult()> scan;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                ++scan_calls;
-                if (!started) scan_without_start = true;
-                scan = scan_fn;
-            }
-            ScanResult result = scan ? scan() : empty_scan();
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                last_result = result;
-                health.last_scan_start_ms = result.started_at_ms;
-                if (result.complete) {
-                    health.state = SourceState::Healthy;
-                    health.last_scan_success_ms = result.finished_at_ms;
-                    health.consecutive_failures = 0;
-                } else {
-                    health.state = SourceState::Degraded;
-                    health.last_error = result.error;
-                    ++health.consecutive_failures;
-                }
-            }
-            return result;
-        };
-        source.health = [this]() {
-            std::lock_guard<std::mutex> lock(mutex_);
-            return health;
-        };
-        source.request_rescan = [this]() {
-            std::lock_guard<std::mutex> lock(mutex_);
-            ++rescan_calls;
-            health.rescan_requested = true;
-        };
-        return source;
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++start_calls;
+        if (start_throws_) throw std::runtime_error("event source init failed");
+        sink_ = sink;
+        started = true;
+        health_state_.polling = true;
+        health_state_.state = SourceState::Healthy;
+        return start_result;
     }
 
+    void stop() override
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stop_calls;
+        started = false;
+        health_state_.polling = false;
+    }
+
+    ScanResult scan() override
+    {
+        std::function<ScanResult()> runner;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++scan_calls;
+            if (!started) scan_without_start = true;
+            runner = scan_fn;
+        }
+        ScanResult result = runner ? runner() : empty_scan();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            last_result = result;
+            health_state_.last_scan_start_ms = result.started_at_ms;
+            if (result.complete) {
+                health_state_.state = SourceState::Healthy;
+                health_state_.last_scan_success_ms = result.finished_at_ms;
+                health_state_.consecutive_failures = 0;
+            } else {
+                health_state_.state = SourceState::Degraded;
+                health_state_.last_error = result.error;
+                ++health_state_.consecutive_failures;
+            }
+        }
+        return result;
+    }
+
+    SourceHealth health() const override
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return health_state_;
+    }
+
+    void requestRescan() override
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++rescan_calls;
+        health_state_.rescan_requested = true;
+    }
+
+    std::optional<Observation> observeForHint(pid_t hint_pid) override
+    {
+        std::function<std::optional<Observation>(pid_t)> observe;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++observe_calls;
+            observe = observe_fn;
+        }
+        return observe ? observe(hint_pid) : std::nullopt;
+    }
+
+    // ---- Test drivers ---------------------------------------------------------
     // Invokes the installed observation sink exactly like an adapter's poll
     // thread would (outside the source lock).
     void inject(const Observation& observation)
@@ -203,7 +222,7 @@ public:
         ObservationSink sink;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            sink = sink_;
+            sink = sink_.on_observation;
         }
         check(static_cast<bool>(sink), "source " + name_ + ": sink is not installed");
         sink(observation);
@@ -213,6 +232,14 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         scan_fn = std::move(fn);
+    }
+
+    // Targeted-observation behaviour for exec-hint cases; defaults to
+    // "this pid is not mine" like a source whose filter does not match.
+    void set_observe(std::function<std::optional<Observation>(pid_t)> fn)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        observe_fn = std::move(fn);
     }
 
     int scans() const
@@ -239,6 +266,12 @@ public:
         return rescan_calls;
     }
 
+    int observations_for_hint() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return observe_calls;
+    }
+
     bool scanned_without_start() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -260,33 +293,35 @@ public:
     void set_health_error(const std::string& error)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        health.state = SourceState::Degraded;
-        health.last_error = error;
+        health_state_.state = SourceState::Degraded;
+        health_state_.last_error = error;
     }
 
-    // Simulates an adapter's ring-buffer callback: it only raises the rescan
-    // flag (plan 5.2 forbids discovery I/O on the polling thread).
-    void request_scan_now()
+    // A25: model a source whose start() throws.
+    void set_start_throw(bool value)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        health.rescan_requested = true;
+        start_throws_ = value;
     }
 
 private:
     std::string name_;
     SchedulerType type_;
     mutable std::mutex mutex_;
-    ObservationSink sink_;
+    DiscoverySink sink_;
     std::function<ScanResult()> scan_fn;
-    SourceHealth health;
+    std::function<std::optional<Observation>(pid_t)> observe_fn;
+    SourceHealth health_state_;
     ScanResult last_result;
     bool started = false;
     bool start_result = true;
+    bool start_throws_ = false;
     bool scan_without_start = false;
     int start_calls = 0;
     int stop_calls = 0;
     int scan_calls = 0;
     int rescan_calls = 0;
+    int observe_calls = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -471,8 +506,8 @@ void case_a08(const std::string& base)
         return scan_with({observed_by_scan});
     });
 
-    std::vector<InventorySource> sources;
-    sources.push_back(source.make());
+    std::vector<IDiscoverySource*> sources;
+    sources.push_back(&source);
     JobInventoryMaintenance maintenance(registry, condor_config(), std::move(sources));
     maintenance.setClock(clock.closure());
     maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
@@ -547,8 +582,8 @@ void case_a09(const std::string& base)
             return scan_with({job});
         });
 
-        std::vector<InventorySource> sources;
-        sources.push_back(source.make());
+        std::vector<IDiscoverySource*> sources;
+        sources.push_back(&source);
         JobInventoryMaintenance maintenance(registry, condor_config(), std::move(sources));
         maintenance.setClock(clock.closure());
         maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
@@ -584,8 +619,8 @@ void case_a09(const std::string& base)
             return scan_with({});
         });
 
-        std::vector<InventorySource> sources;
-        sources.push_back(source.make());
+        std::vector<IDiscoverySource*> sources;
+        sources.push_back(&source);
         JobInventoryMaintenance maintenance(registry, condor_config(), std::move(sources));
         maintenance.setClock(clock.closure());
         maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
@@ -622,8 +657,8 @@ void case_a09(const std::string& base)
             return scan_with({});
         });
 
-        std::vector<InventorySource> sources;
-        sources.push_back(source.make());
+        std::vector<IDiscoverySource*> sources;
+        sources.push_back(&source);
         JobInventoryMaintenance maintenance(registry, condor_config(), std::move(sources));
         maintenance.setClock(clock.closure());
         maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
@@ -664,8 +699,8 @@ void case_a10(const std::string& base)
 
     source.set_scan([&]() { return scan_with({job}); });
 
-    std::vector<InventorySource> sources;
-    sources.push_back(source.make());
+    std::vector<IDiscoverySource*> sources;
+    sources.push_back(&source);
     JobInventoryMaintenance maintenance(registry, condor_config(), std::move(sources));
     maintenance.setClock(clock.closure());
     maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
@@ -726,8 +761,8 @@ void case_a11(const std::string& base)
         return scan_with({});
     });
 
-    std::vector<InventorySource> sources;
-    sources.push_back(source.make());
+    std::vector<IDiscoverySource*> sources;
+    sources.push_back(&source);
     JobInventoryMaintenance maintenance(registry, condor_config(), std::move(sources));
     maintenance.setClock(clock.closure());
     maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
@@ -807,8 +842,8 @@ void case_a12(const std::string& base)
 
     JobInventoryMaintenance::Options options;
     options.queue_capacity = 4;
-    std::vector<InventorySource> sources;
-    sources.push_back(source.make());
+    std::vector<IDiscoverySource*> sources;
+    sources.push_back(&source);
     JobInventoryMaintenance maintenance(registry, condor_config(), std::move(sources), options);
     maintenance.setClock(clock.closure());
     maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
@@ -876,8 +911,8 @@ void case_a13(const std::string& base)
         make_condor_observation("600.0", 5800, 1414, "htcondor01", "schedd-a", "/cg/slot-10");
     source.set_scan([&]() { return scan_with({job}); });
 
-    std::vector<InventorySource> sources;
-    sources.push_back(source.make());
+    std::vector<IDiscoverySource*> sources;
+    sources.push_back(&source);
     JobInventoryMaintenance maintenance(registry, condor_config(), std::move(sources));
     maintenance.setClock(clock.closure());
     maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
@@ -931,8 +966,8 @@ void case_a14(const std::string& base)
         make_condor_observation("700.0", 5900, 1515, "htcondor01", "schedd-a", "/cg/slot-11");
     source.set_scan([&]() { return scan_with({old_job}); });
 
-    std::vector<InventorySource> sources;
-    sources.push_back(source.make());
+    std::vector<IDiscoverySource*> sources;
+    sources.push_back(&source);
     JobInventoryMaintenance maintenance(registry, condor_config(), std::move(sources));
     maintenance.setClock(clock.closure());
     maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
@@ -1010,8 +1045,8 @@ void case_a23(const std::string& base)
         return scan_with({first});
     });
 
-    std::vector<InventorySource> sources;
-    sources.push_back(source.make());
+    std::vector<IDiscoverySource*> sources;
+    sources.push_back(&source);
     JobInventoryMaintenance maintenance(registry, condor_config(), std::move(sources));
     maintenance.setClock(clock.closure());
     maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
@@ -1088,8 +1123,8 @@ void case_a25(const std::string& base)
         FakeClock clock;
         FakeSource source("condor", SchedulerType::Condor);
         FakeProbes probes;
-        std::vector<InventorySource> sources;
-        sources.push_back(source.make());
+        std::vector<IDiscoverySource*> sources;
+        sources.push_back(&source);
         JobInventoryMaintenance maintenance(registry, condor_config(), std::move(sources));
         maintenance.setClock(clock.closure());
         maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
@@ -1116,8 +1151,8 @@ void case_a25(const std::string& base)
         FakeClock clock;
         FakeSource source("condor", SchedulerType::Condor);
         FakeProbes probes;
-        std::vector<InventorySource> sources;
-        sources.push_back(source.make());
+        std::vector<IDiscoverySource*> sources;
+        sources.push_back(&source);
         auto maintenance = std::make_unique<JobInventoryMaintenance>(
             *registry, condor_config(), std::move(sources));
         maintenance->setClock(clock.closure());
@@ -1156,12 +1191,9 @@ void case_a25(const std::string& base)
         FakeClock clock;
         FakeSource source("condor", SchedulerType::Condor);
         FakeProbes probes;
-        InventorySource raw = source.make();
-        raw.start = [](ObservationSink) -> bool {
-            throw std::runtime_error("event source init failed");
-        };
-        std::vector<InventorySource> sources;
-        sources.push_back(raw);
+        source.set_start_throw(true);
+        std::vector<IDiscoverySource*> sources;
+        sources.push_back(&source);
         JobInventoryMaintenance maintenance(registry, condor_config(), std::move(sources));
         maintenance.setClock(clock.closure());
         maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
@@ -1189,8 +1221,8 @@ void case_a25(const std::string& base)
         const Observation job =
             make_condor_observation("900.0", 6100, 1919, "htcondor01", "schedd-a", "/cg/slot-14");
         source.set_scan([&]() { return scan_with({job}); });
-        std::vector<InventorySource> sources;
-        sources.push_back(source.make());
+        std::vector<IDiscoverySource*> sources;
+        sources.push_back(&source);
         JobInventoryMaintenance maintenance(registry, condor_config(), std::move(sources));
         maintenance.setClock(clock.closure());
         maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
@@ -1245,7 +1277,7 @@ void case_legacy_retirement(const std::string& base)
     // Inventory discovery is disabled (no types, no sources) and the record is
     // still refreshed and retired: reads no longer do it, so maintenance must.
     InventoryMaintenanceConfig config;
-    std::vector<InventorySource> sources;
+    std::vector<IDiscoverySource*> sources;
     JobInventoryMaintenance maintenance(registry, config, std::move(sources));
     maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
     check(maintenance.start(), "legacy: maintenance must run without discovery sources");
@@ -1285,8 +1317,8 @@ void case_rescan(const std::string& base)
         make_condor_observation("950.0", 9100, 191919, "htcondor01", "schedd-a", "/cg/slot-95");
     source.set_scan([&]() { return scan_with({job}); });
 
-    std::vector<InventorySource> sources;
-    sources.push_back(source.make());
+    std::vector<IDiscoverySource*> sources;
+    sources.push_back(&source);
     // A long interval proves the extra passes come from the event request, not
     // from the periodic timer.
     JobInventoryMaintenance maintenance(registry, condor_config(30), std::move(sources));
@@ -1296,7 +1328,7 @@ void case_rescan(const std::string& base)
     check(find_native(registry, "950.0").has_value(), "rescan: initial scan missing");
 
     const int scans_after_start = source.scans();
-    source.request_scan_now();
+    source.requestRescan();
     check(wait_until([&]() { return source.scans() > scans_after_start; }, 5000),
           "rescan: an event request did not trigger an authoritative pass");
 
@@ -1318,6 +1350,59 @@ void case_rescan(const std::string& base)
     maintenance.stop();
 
     pass_case("RESCAN", "event-driven and on-demand passes run the same reconcile path");
+}
+
+// ---------------------------------------------------------------------------
+// Exec hints: targeted observation without a full scan (plan 5.2)
+// ---------------------------------------------------------------------------
+
+void case_exec_hint(const std::string& base)
+{
+    JobRegistry registry(isolated(fresh_dir(base, "exec-hint")));
+    FakeClock clock;
+    FakeSource source("condor", SchedulerType::Condor);
+    FakeProbes probes;
+
+    // The authoritative pass would find nothing: only the targeted path can
+    // create the instance here.
+    source.set_scan([&]() { return scan_with({}); });
+
+    const Observation job =
+        make_condor_observation("960.0", 9700, 292929, "htcondor01", "schedd-a", "/cg/slot-96");
+    source.set_observe([&](pid_t pid) -> std::optional<Observation> {
+        if (pid != 4242) return std::nullopt;
+        return job;
+    });
+
+    std::vector<IDiscoverySource*> sources{&source};
+    JobInventoryMaintenance maintenance(registry, condor_config(30), std::move(sources));
+    maintenance.setClock(clock.closure());
+    maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
+    check(maintenance.start(), "exec hint: maintenance did not start");
+    const int scans_after_start = source.scans();
+
+    maintenance.onExecHint(4242);
+    check(wait_until([&]() { return find_native(registry, "960.0").has_value(); }, 5000),
+          "exec hint: the targeted observation did not create the instance");
+    check(source.observations_for_hint() >= 1,
+          "exec hint: the source was never asked for a targeted observation");
+    check(source.scans() == scans_after_start,
+          "exec hint: resolving one pid must not trigger a full scan");
+
+    // An unresolvable hint is counted, never turned into a record.
+    const auto unresolved_before =
+        maintenance.statusJson()["unresolved_hints"].get<std::uint64_t>();
+    maintenance.onExecHint(9999);
+    check(wait_until([&]() {
+              return maintenance.statusJson()["unresolved_hints"].get<std::uint64_t>() >
+                     unresolved_before;
+          }, 5000),
+          "exec hint: an unresolvable pid was not counted");
+    check(registry.inventoryRecords().size() == 1,
+          "exec hint: an unresolvable pid must not create a record");
+
+    maintenance.stop();
+    pass_case("EXEC", "exec hints resolve to targeted observations without a full scan");
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,7 +1478,7 @@ void case_config()
     try {
         InventoryMaintenanceConfig config = condor_config();
         config.reconcile_interval_sec = 0;
-        std::vector<InventorySource> sources;
+        std::vector<IDiscoverySource*> sources;
         JobRegistry registry(isolated("/tmp/opencode/joblens-maint-config-check"));
         JobInventoryMaintenance maintenance(registry, config, std::move(sources));
     } catch (const std::invalid_argument&) {
@@ -1426,6 +1511,7 @@ int main(int argc, char** argv)
         case_a25(base);
         case_legacy_retirement(base);
         case_rescan(base);
+        case_exec_hint(base);
         std::cout << "ALL MAINTENANCE ASSERTIONS PASSED\n";
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << '\n';

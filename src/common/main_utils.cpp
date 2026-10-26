@@ -183,45 +183,6 @@ DiscoveryOptions make_watcher_options()
     return options;
 }
 
-InventorySource bind_source(CondorJobWatcher& watcher, const std::string& name)
-{
-    InventorySource source;
-    source.name = name;
-    source.scheduler_type = SchedulerType::Condor;
-    source.start = [&watcher](ObservationSink observations) {
-        DiscoverySink sink;
-        sink.on_observation = std::move(observations);
-        // S1 keeps the event path alive until the maintenance controller
-        // consumes exec hints directly: an exec event still asks for an
-        // authoritative pass.
-        sink.on_exec_hint = [&watcher](pid_t) { watcher.request_rescan(); };
-        return watcher.start(sink);
-    };
-    source.stop = [&watcher]() { watcher.stop(); };
-    source.scan = [&watcher]() { return watcher.scan(); };
-    source.health = [&watcher]() { return watcher.health(); };
-    source.request_rescan = [&watcher]() { watcher.request_rescan(); };
-    return source;
-}
-
-InventorySource bind_source(SlurmJobWatcher& watcher, const std::string& name)
-{
-    InventorySource source;
-    source.name = name;
-    source.scheduler_type = SchedulerType::Slurm;
-    source.start = [&watcher](ObservationSink observations) {
-        DiscoverySink sink;
-        sink.on_observation = std::move(observations);
-        sink.on_exec_hint = [&watcher](pid_t) { watcher.request_rescan(); };
-        return watcher.start(sink);
-    };
-    source.stop = [&watcher]() { watcher.stop(); };
-    source.scan = [&watcher]() { return watcher.scan(); };
-    source.health = [&watcher]() { return watcher.health(); };
-    source.request_rescan = [&watcher]() { watcher.request_rescan(); };
-    return source;
-}
-
 }  // namespace
 
 bool start()
@@ -239,14 +200,14 @@ bool start()
         resolve_inventory_maintenance_config(Config::instance().dumpConfig());
 
     const DiscoveryOptions options = make_watcher_options();
-    std::vector<InventorySource> sources;
+    std::vector<IDiscoverySource*> sources;
     for (const auto type : config.types) {
         if (type == InventoryType::Condor) {
             state.condor = std::make_unique<CondorJobWatcher>(options);
-            sources.push_back(bind_source(*state.condor, "condor"));
+            sources.push_back(state.condor.get());
         } else {
             state.slurm = std::make_unique<SlurmJobWatcher>(options);
-            sources.push_back(bind_source(*state.slurm, "slurm"));
+            sources.push_back(state.slurm.get());
         }
     }
 

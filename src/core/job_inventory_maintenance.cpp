@@ -493,18 +493,22 @@ CgroupMembershipProbe make_cgroup_membership_probe()
 namespace {
 constexpr int kAbsencesBeforeRetirement = 2;
 constexpr std::size_t kEndedGenerationCapacity = 4096;
+// Exec-hint FIFO bound. With one watcher per scheduler type and a bounded job
+// population this only trips on a fork storm; overflow degrades the source and
+// asks for an authoritative rescan instead of growing without bound.
+constexpr std::size_t kExecHintCapacity = 1024;
 }  // namespace
 
 JobInventoryMaintenance::JobInventoryMaintenance(JobRegistry& registry,
                                                  InventoryMaintenanceConfig config,
-                                                 std::vector<InventorySource> sources)
+                                                 std::vector<IDiscoverySource*> sources)
     : JobInventoryMaintenance(registry, std::move(config), std::move(sources), Options{})
 {
 }
 
 JobInventoryMaintenance::JobInventoryMaintenance(JobRegistry& registry,
                                                  InventoryMaintenanceConfig config,
-                                                 std::vector<InventorySource> sources,
+                                                 std::vector<IDiscoverySource*> sources,
                                                  Options options)
     : registry_(registry),
       config_(std::move(config)),
@@ -519,10 +523,10 @@ JobInventoryMaintenance::JobInventoryMaintenance(JobRegistry& registry,
     }
     if (options_.queue_capacity == 0) options_.queue_capacity = 1;
     if (options_.wait_slice_ms == 0) options_.wait_slice_ms = 100;
-    for (const auto& source : sources_) {
-        if (source.scheduler_type == SchedulerType::Unknown) {
+    for (const auto* source : sources_) {
+        if (source->schedulerType() == SchedulerType::Unknown) {
             throw std::invalid_argument(
-                "inventory maintenance: source '" + source.name +
+                "inventory maintenance: source '" + source->name() +
                 "' has no scheduler type");
         }
     }
@@ -560,62 +564,53 @@ std::int64_t JobInventoryMaintenance::clockNow() const
     return scan_clock_now(clock_);
 }
 
-bool JobInventoryMaintenance::start()
+bool JobInventoryMaintenance::prepare()
 {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (admitted_ && running_) return true;
-    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (admitted_ && running_) return false;
+    admitted_ = true;
+    stopping_ = false;
+    running_ = false;
+    explicit_stop_done_ = false;
+    worker_id_ = std::thread::id();
+    hint_wakeup_ = false;
+    degraded_ = false;
+    incomplete_drain_ = false;
+    last_error_.clear();
+    queue_.clear();
+    exec_hint_queue_.clear();
+    exec_hint_seen_.clear();
+    exec_hint_overflow_ = false;
+    tracked_.clear();
+    suspect_.clear();
+    ended_.clear();
+    closing_.clear();
+    last_scan_start_ms_ = 0;
+    last_scan_success_ms_ = 0;
+    last_scan_complete_ = false;
+    passes_ = 0;
 
-    const auto store = registry_.storeHealth();
-    if (!store.db_running) {
-        noteError("inventory store is not running");
-        spdlog::error("InventoryMaintenance: refusing to start, the inventory store is not running");
-        return false;
-    }
-
-    spdlog::info("InventoryMaintenance: resolved configuration {}",
-                 config_.to_json().dump());
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        admitted_ = true;
-        stopping_ = false;
-        running_ = false;
-        explicit_stop_done_ = false;
-        worker_id_ = std::thread::id();
-        hint_wakeup_ = false;
-        degraded_ = false;
-        incomplete_drain_ = false;
-        last_error_.clear();
-        queue_.clear();
-        tracked_.clear();
-        suspect_.clear();
-        ended_.clear();
-        closing_.clear();
-        last_scan_start_ms_ = 0;
-        last_scan_success_ms_ = 0;
-        last_scan_complete_ = false;
-        passes_ = 0;
-    }
-
-    // Plan 5.1 step 3/4: the sink exists before any source starts, and the
-    // initial full scan runs after every source is running.
-    const ObservationSink sink = [this](const Observation& observation) {
+    // The sink exists before any source starts (plan 5.1); every callback is
+    // cheap by contract and only enqueues.
+    sink_ = DiscoverySink{};
+    sink_.on_observation = [this](const Observation& observation) {
         onObservation(observation);
     };
+    sink_.on_exec_hint = [this](pid_t pid) { onExecHint(pid); };
+    return true;
+}
+
+bool JobInventoryMaintenance::startSources()
+{
+    // Plan 5.1 step 3/4: the sink exists before any source starts, and the
+    // initial full scan runs after every source is running.
     source_started_.assign(sources_.size(), false);
     source_start_note_.assign(sources_.size(), std::string());
     for (std::size_t index = 0; index < sources_.size(); ++index) {
-        auto& source = sources_[index];
-        if (!source.start) {
-            source_start_note_[index] = "scan-only source (no event callback)";
-            spdlog::info("InventoryMaintenance: source '{}' is scan-only", source.name);
-            continue;
-        }
+        auto* source = sources_[index];
         bool started = false;
         try {
-            started = source.start(sink);
+            started = source->start(sink_);
         } catch (const std::exception& error) {
             source_start_note_[index] = std::string("start failed: ") + error.what();
         }
@@ -625,26 +620,84 @@ bool JobInventoryMaintenance::start()
                 source_start_note_[index] = "event source unavailable (scan-only)";
             spdlog::warn("InventoryMaintenance: source '{}' has no event source, "
                          "continuing with scans only: {}",
-                         source.name, source_start_note_[index]);
-        }
-    }
-
-    // Plan 5.1 step 5/6: the initial pass retires stale records and publishes a
-    // coherent snapshot before the periodic producer starts.
-    runPass(true, true);
-    set_inventory_status_provider([this]() { return statusJson(); });
-    set_inventory_refresh_provider([this]() { return reconcileNow(); });
-    registry_.setExitObserver([this](pid_t pid) { notifyExit(pid); });
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        status_published_ = true;
-        if (!stopping_) {
-            running_ = true;
-            worker_ = std::thread([this]() { runWorker(); });
-            worker_id_ = worker_.get_id();
+                         source->name(), source_start_note_[index]);
         }
     }
     return true;
+}
+
+bool JobInventoryMaintenance::initialPass()
+{
+    // Plan 5.1 step 5/6: the initial pass retires stale records and publishes a
+    // coherent snapshot before the periodic producer starts.
+    return runPass(true, true);
+}
+
+void JobInventoryMaintenance::publish()
+{
+    set_inventory_status_provider([this]() { return statusJson(); });
+    set_inventory_refresh_provider([this]() { return reconcileNow(); });
+    registry_.setExitObserver([this](pid_t pid) { notifyExit(pid); });
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_published_ = true;
+}
+
+bool JobInventoryMaintenance::startWorker()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_ || running_) return false;
+    running_ = true;
+    worker_ = std::thread([this]() { runWorker(); });
+    worker_id_ = worker_.get_id();
+    return true;
+}
+
+bool JobInventoryMaintenance::start()
+{
+    if (!prepare()) return false;
+
+    const auto store = registry_.storeHealth();
+    if (!store.db_running) {
+        noteError("inventory store is not running");
+        spdlog::error("InventoryMaintenance: refusing to start, the inventory store is not running");
+        std::lock_guard<std::mutex> lock(mutex_);
+        admitted_ = false;
+        return false;
+    }
+
+    spdlog::info("InventoryMaintenance: resolved configuration {}",
+                 config_.to_json().dump());
+
+    startSources();
+    initialPass();
+    publish();
+    startWorker();
+    return true;
+}
+
+void JobInventoryMaintenance::stopSources()
+{
+    // Plan 5.3: stop discovery polling before touching the producer thread.
+    for (auto* source : sources_) {
+        try {
+            source->stop();
+        } catch (const std::exception& error) {
+            spdlog::error("InventoryMaintenance: source '{}' stop failed: {}",
+                          source->name(), error.what());
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++stop_errors_;
+        }
+    }
+}
+
+void JobInventoryMaintenance::retractPublish()
+{
+    if (status_published_) {
+        set_inventory_status_provider({});
+        status_published_ = false;
+    }
+    set_inventory_refresh_provider({});
+    registry_.setExitObserver({});
 }
 
 void JobInventoryMaintenance::stopDiscovery()
@@ -656,19 +709,6 @@ void JobInventoryMaintenance::stopDiscovery()
         stopping_ = true;
     }
     wake_cv_.notify_all();
-
-    // Plan 5.3: stop discovery polling before touching the producer thread.
-    for (auto& source : sources_) {
-        if (!source.stop) continue;
-        try {
-            source.stop();
-        } catch (const std::exception& error) {
-            spdlog::error("InventoryMaintenance: source '{}' stop failed: {}",
-                          source.name, error.what());
-            std::lock_guard<std::mutex> lock(mutex_);
-            ++stop_errors_;
-        }
-    }
 
     if (worker_.joinable()) {
         if (worker_.get_id() == std::this_thread::get_id()) {
@@ -699,6 +739,8 @@ void JobInventoryMaintenance::stopDiscovery()
     // closed). A pass never waits for another pass, so this cannot deadlock.
     std::unique_lock<std::mutex> pass_guard(pass_mutex_, std::defer_lock);
     if (!on_maintenance_thread) pass_guard.lock();
+
+    stopSources();
 
     // "Finish queued bounded maintenance": accepted observations are committed
     // while the store is still open, never silently discarded.
@@ -761,12 +803,7 @@ bool JobInventoryMaintenance::finalize()
         spdlog::error("InventoryMaintenance: shutdown could not finalize every retirement; "
                       "the incomplete closing state is persisted for recovery");
     }
-    if (status_published_) {
-        set_inventory_status_provider({});
-        status_published_ = false;
-    }
-    set_inventory_refresh_provider({});
-    registry_.setExitObserver({});
+    retractPublish();
     {
         std::lock_guard<std::mutex> lock(mutex_);
         explicit_stop_done_ = true;
@@ -799,6 +836,34 @@ void JobInventoryMaintenance::onObservation(const Observation& observation)
     hint.observation = observation;
     hint.reason = "observation";
     enqueue(std::move(hint));
+}
+
+void JobInventoryMaintenance::onExecHint(pid_t pid)
+{
+    if (pid <= 0) return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++events_received_;
+        if (!admitted_ || stopping_) {
+            ++events_dropped_;
+            return;
+        }
+        // Many events for one execution carry one piece of information: the
+        // first hint per pid is kept, repeats are dropped silently.
+        if (exec_hint_seen_.insert(pid).second) {
+            exec_hint_queue_.push_back(pid);
+            if (exec_hint_queue_.size() > kExecHintCapacity) {
+                exec_hint_seen_.erase(exec_hint_queue_.front());
+                exec_hint_queue_.pop_front();
+                ++events_dropped_;
+                exec_hint_overflow_ = true;
+            }
+        } else {
+            ++events_dropped_;
+        }
+        hint_wakeup_ = true;
+    }
+    wake_cv_.notify_one();
 }
 
 void JobInventoryMaintenance::notifyExit(pid_t pid)
@@ -870,13 +935,12 @@ bool JobInventoryMaintenance::reconcileNow()
 
 bool JobInventoryMaintenance::rescanRequested() const
 {
-    for (const auto& source : sources_) {
-        if (!source.health) continue;
+    for (const auto* source : sources_) {
         try {
-            if (source.health().rescan_requested) return true;
+            if (source->health().rescan_requested) return true;
         } catch (const std::exception& error) {
             spdlog::debug("InventoryMaintenance: source '{}' health failed: {}",
-                          source.name, error.what());
+                          source->name(), error.what());
         }
     }
     return false;
@@ -959,30 +1023,26 @@ bool JobInventoryMaintenance::runPass(bool do_scan, bool wait)
     std::string error;
 
     if (do_scan) {
-        for (auto& source : sources_) {
+        for (auto* source : sources_) {
             ScanResult result;
-            if (source.scan) {
-                try {
-                    result = source.scan();
-                } catch (const std::exception& exception) {
-                    result.complete = false;
-                    result.error = std::string("scan threw: ") + exception.what();
-                }
-            } else {
+            try {
+                result = source->scan();
+            } catch (const std::exception& exception) {
                 result.complete = false;
-                result.error = "source has no scan implementation";
+                result.error = std::string("scan threw: ") + exception.what();
             }
             if (!result.complete) {
                 const std::string detail =
                     result.error.empty() ? "incomplete source pass" : result.error;
                 if (error.empty()) {
-                    error = source.name.empty() ? detail : source.name + ": " + detail;
+                    error = source->name().empty() ? detail : source->name() + ": " + detail;
                 }
             }
             complete = complete && result.complete;
-            const auto inserted = source_complete.emplace(source.scheduler_type, result.complete);
+            const auto inserted =
+                source_complete.emplace(source->schedulerType(), result.complete);
             if (!inserted.second) inserted.first->second = inserted.first->second && result.complete;
-            results.emplace_back(source.scheduler_type, std::move(result));
+            results.emplace_back(source->schedulerType(), std::move(result));
         }
     }
 
@@ -1007,6 +1067,28 @@ bool JobInventoryMaintenance::runPass(bool do_scan, bool wait)
         }
     }
     if (needs_authoritative_pass) requestRescan("process/attribute hint");
+
+    // Exec hints become targeted observations on this worker thread: O(job)
+    // reads through the source, never a full-node scan and never on the
+    // polling thread.
+    {
+        std::vector<pid_t> exec_hints;
+        bool overflow = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            exec_hints.assign(exec_hint_queue_.begin(), exec_hint_queue_.end());
+            exec_hint_queue_.clear();
+            exec_hint_seen_.clear();
+            overflow = exec_hint_overflow_;
+            exec_hint_overflow_ = false;
+        }
+        if (overflow) {
+            spdlog::warn("InventoryMaintenance: exec hint queue overflowed; "
+                         "requesting an authoritative rescan");
+            requestRescan("exec hint overflow");
+        }
+        for (const pid_t pid : exec_hints) processExecHint(pid, observed);
+    }
 
     // Records no discovery source owns (legacy/manual registrations, or types
     // whose inventory source was removed) are refreshed here; reads never do it.
@@ -1041,6 +1123,27 @@ bool JobInventoryMaintenance::runPass(bool do_scan, bool wait)
         if (queue_.empty()) hint_wakeup_ = false;
     }
     return true;
+}
+
+void JobInventoryMaintenance::processExecHint(pid_t pid, std::set<uint64_t>& observed_ids)
+{
+    for (auto* source : sources_) {
+        std::optional<Observation> observation;
+        try {
+            observation = source->observeForHint(pid);
+        } catch (const std::exception& error) {
+            spdlog::debug("InventoryMaintenance: source '{}' could not resolve hint {}: {}",
+                          source->name(), pid, error.what());
+            continue;
+        }
+        if (!observation) continue;  // not this source's execution
+        processObservation(*observation, observed_ids);
+        return;
+    }
+    // Unresolvable hints are not errors: the pid may be gone already or belong
+    // to no execution; the authoritative scan covers whatever remains.
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++unresolved_hints_;
 }
 
 ObservedExecution JobInventoryMaintenance::to_execution(
@@ -1351,13 +1454,12 @@ void JobInventoryMaintenance::requestRescan(const std::string& reason)
         std::lock_guard<std::mutex> lock(mutex_);
         ++rescan_requests_;
     }
-    for (auto& source : sources_) {
-        if (!source.request_rescan) continue;
+    for (auto* source : sources_) {
         try {
-            source.request_rescan();
+            source->requestRescan();
         } catch (const std::exception& error) {
             spdlog::error("InventoryMaintenance: source '{}' rescan request failed ({}): {}",
-                          source.name, reason, error.what());
+                          source->name(), reason, error.what());
         }
     }
 }
@@ -1408,18 +1510,16 @@ nlohmann::json JobInventoryMaintenance::sourcesJson() const
 {
     nlohmann::json out = nlohmann::json::array();
     for (std::size_t index = 0; index < sources_.size(); ++index) {
-        const auto& source = sources_[index];
+        const auto* source = sources_[index];
         SourceHealth health;
-        if (source.health) {
-            try {
-                health = source.health();
-            } catch (const std::exception&) {
-                health.state = SourceState::Degraded;
-            }
+        try {
+            health = source->health();
+        } catch (const std::exception&) {
+            health.state = SourceState::Degraded;
         }
         nlohmann::json entry;
-        entry["name"] = source.name;
-        entry["type"] = to_string(source.scheduler_type);
+        entry["name"] = source->name();
+        entry["type"] = to_string(source->schedulerType());
         entry["state"] = to_string(health.state);
         entry["polling"] = health.polling;
         entry["started"] = index < source_started_.size() ? source_started_[index] : false;
@@ -1528,6 +1628,7 @@ nlohmann::json JobInventoryMaintenance::statusJson() const
     out["queue_depth"] = queue_depth;
     out["rescan_requests"] = rescan_requests;
     out["obsolete_hints"] = obsolete_hints;
+    out["unresolved_hints"] = unresolved_hints_;
     out["incomplete_observations"] = incomplete_observations;
     out["upsert_conflicts"] = upsert_conflicts;
     out["retirements"] = retirements;

@@ -55,6 +55,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <unordered_set>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -122,22 +123,13 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
 // Discovery-source seam
 // ---------------------------------------------------------------------------
 
-// One discovery source (production: a CondorJobWatcher/SlurmJobWatcher
-// discovery-adapter instance wrapped in closures). `start` installs the
-// sink before creating its poll thread, exactly like the adapters, so "start
-// before callback installation" is unrepresentable here too. `start` returning
-// false means "scan-only adapter" (no event source), which is not an error.
-// Any of `start`, `stop`, `scan`, `health`, `request_rescan` may be empty;
-// empty closures behave as no-ops / scan-only.
-struct InventorySource {
-    std::string name;  // "condor" / "slurm"
-    SchedulerType scheduler_type = SchedulerType::Unknown;
-    std::function<bool(ObservationSink)> start;
-    std::function<void()> stop;
-    std::function<ScanResult()> scan;
-    std::function<SourceHealth()> health;
-    std::function<void()> request_rescan;
-};
+// Sources are non-owning: JobRegistry::init_inventory constructs exactly one
+// watcher per configured scheduler type (implementing IDiscoverySource) and
+// hands the pointers to the controller. `start` installs the sink before
+// creating its poll thread, exactly like the adapters, so "start before
+// callback installation" is unrepresentable here too. `start` returning false
+// means "scan-only adapter" (no event source), which is not an error. Any of
+// the interface methods may be exercised at any time after construction.
 
 // ---------------------------------------------------------------------------
 // Liveness seam (plan 5.2)
@@ -217,10 +209,10 @@ public:
 
     JobInventoryMaintenance(JobRegistry& registry,
                             InventoryMaintenanceConfig config,
-                            std::vector<InventorySource> sources);
+                            std::vector<IDiscoverySource*> sources);
     JobInventoryMaintenance(JobRegistry& registry,
                             InventoryMaintenanceConfig config,
-                            std::vector<InventorySource> sources,
+                            std::vector<IDiscoverySource*> sources,
                             Options options);
     ~JobInventoryMaintenance();
 
@@ -261,6 +253,9 @@ public:
     // Event producers. Cheap, bounded and non-blocking with respect to
     // discovery I/O and storage.
     void onObservation(const Observation& observation);  // the ObservationSink
+    // One exec event: only the pid. Deduplicated in a bounded FIFO; overflow
+    // counts drops, degrades the source and asks for an authoritative rescan.
+    void onExecHint(pid_t pid);
     void notifyExit(pid_t pid);
     void notifyRefresh(const std::string& reason);
 
@@ -295,9 +290,21 @@ private:
     // the caller block until it can run, otherwise a concurrent pass makes it
     // return false.
     bool runPass(bool do_scan, bool wait);
+    // start() phases, in order; each is individually simple and testable.
+    bool prepare();          // reset state, build the DiscoverySink
+    bool startSources();     // install the sink, start every source
+    bool initialPass();      // the first authoritative scan
+    void publish();          // status/refresh providers + exit observer
+    bool startWorker();      // the reconciliation worker thread
+    // stopDiscovery() counterparts.
+    void stopSources();
+    void retractPublish();   // providers live until finalize (drain visibility)
     void enqueue(PendingHint hint);
     void processObservation(const Observation& observation,
                             std::set<uint64_t>& observed_ids);
+    // Targeted observation for one exec-event pid: the first source that can
+    // resolve the hint wins; an unresolvable hint is counted, never guessed.
+    void processExecHint(pid_t pid, std::set<uint64_t>& observed_ids);
     ObservedExecution to_execution(const Observation& observation) const;
     void evaluateRetirements(const std::set<uint64_t>& observed_ids,
                              const std::map<SchedulerType, bool>& source_complete);
@@ -323,7 +330,9 @@ private:
 
     JobRegistry& registry_;
     InventoryMaintenanceConfig config_;
-    std::vector<InventorySource> sources_;
+    // Non-owning: the registry owns exactly one watcher per configured type.
+    std::vector<IDiscoverySource*> sources_;
+    DiscoverySink sink_;
     Options options_;
     std::vector<bool> source_started_;
     std::vector<std::string> source_start_note_;
@@ -336,6 +345,12 @@ private:
     std::mutex pass_mutex_;  // serialises passes (worker vs explicit reconciles)
     std::condition_variable wake_cv_;
     std::deque<PendingHint> queue_;
+    // Exec hints are deduplicated per pid in a bounded FIFO: a job-start burst
+    // produces many events for the same execution, and only one targeted
+    // observation per pid carries information.
+    std::deque<pid_t> exec_hint_queue_;
+    std::unordered_set<pid_t> exec_hint_seen_;
+    bool exec_hint_overflow_ = false;
     std::map<uint64_t, TrackedInstance> tracked_;
     std::set<uint64_t> suspect_;                        // absent on the last pass
     std::map<std::string, ExecutionGeneration> ended_;   // retired generations
@@ -364,6 +379,7 @@ private:
     std::uint64_t events_dropped_ = 0;
     std::uint64_t rescan_requests_ = 0;
     std::uint64_t obsolete_hints_ = 0;
+    std::uint64_t unresolved_hints_ = 0;
     std::uint64_t incomplete_observations_ = 0;
     std::uint64_t upsert_conflicts_ = 0;
     std::uint64_t retirements_ = 0;
