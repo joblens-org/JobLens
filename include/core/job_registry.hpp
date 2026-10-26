@@ -265,7 +265,6 @@ private:
     bool resume_migration_state(std::string& stage, std::string& cursor);
     bool load_or_create_db_uuid();
     void restore_records_from_db();
-    void init_job_watcher();
     void regRPCHandle();
     inline void update_job(Job& job);
     mutable std::shared_mutex              mtx_;
@@ -338,14 +337,6 @@ private:
     StoreFaultMode fault_mode_{StoreFaultMode::None};
     size_t fault_skip_{0};
     size_t fault_count_{0};
-
-    // Condor作业自动添加
-    bool enable_auto_add_condor_job{false};
-    std::unique_ptr<CondorJobWatcher> condor_job_watcher_;
-    
-    // Slurm作业自动添加
-    bool enable_auto_add_slurm_job{false};
-    std::unique_ptr<SlurmJobWatcher> slurm_job_watcher_;
 
     // 共享 pid2job / cgroup2job 维护: JobPidTracker 加载生命周期追踪 bpf,
     // JobRegistry 通过它向内核登记 Job 归属并消费 fork/exit 事件。

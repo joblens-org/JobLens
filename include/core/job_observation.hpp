@@ -206,38 +206,69 @@ struct SourceHealth {
 };
 
 // ---------------------------------------------------------------------------
-// Adapter runtime options
+// Adapter runtime options and source interface
 // ---------------------------------------------------------------------------
 
-// Consumed by both watchers. The default-constructed watchers keep the legacy
-// behavior (Config-driven, eBPF event source started from the constructor);
-// the discovery-adapter construction path takes these options explicitly and
-// does not poll until start() is called.
-struct WatcherRuntimeOptions {
-    // Read collectors/rules settings from Config (legacy behavior). When
-    // false, `default_collectors`/`use_rules` below are used instead and
-    // Config is never touched.
-    bool load_config = true;
-    // Load the eBPF ring buffer used for incremental discovery. It is always
-    // started by start(), never by the constructor of the explicit path.
+// A discovery adapter never reads Config, never loads eBPF and never starts a
+// thread in its constructor: the assembly layer (JobRegistry::init_inventory)
+// builds these options explicitly and start() begins operation.
+struct DiscoveryOptions {
+    // Load the eBPF ring buffer used for incremental discovery hints. It is
+    // always started by start(), never by the constructor.
     bool enable_event_source = true;
-    // Periodic scan tick of the adapter's poll thread; 0 disables (legacy
-    // adapters only poll events).
+    // Periodic scan tick of the adapter's poll thread; 0 disables it (the
+    // maintenance controller owns pacing and runs the authoritative passes).
     std::uint32_t scan_interval_ms = 0;
-
-    bool use_rules = false;
-    std::vector<std::string> default_collectors;
-    std::string rules_dir;
-    std::string rules_prefix;
 
     DiscoveryEnvironment discovery;
     ScanClock clock;
 };
 
-// Receives observations produced by the adapter's poll thread. Must be cheap
-// and non-blocking: the plan forbids slow policy/storage work on the polling
+// Receives observations produced by a scan or a targeted probe. Cheap and
+// non-blocking: the plan forbids slow policy/storage work on the producing
 // callback path, so the sink belongs to a queue, not to a repository.
 using ObservationSink = std::function<void(const Observation&)>;
+
+// Receives discovery output from a source. Both callbacks run on the source's
+// poll thread or the maintenance worker and must stay cheap: no policy
+// evaluation, no storage writes, no slow disk work.
+struct DiscoverySink {
+    // Observations produced by a scan (or a periodic scan tick).
+    ObservationSink on_observation;
+    // An exec event for a process whose parent is the execution manager. Only
+    // the pid is handed over; building an observation is the consumer's job.
+    std::function<void(pid_t)> on_exec_hint;
+};
+
+// One discovery source for one scheduler type. Implemented by the
+// Condor/Slurm watchers; the maintenance controller drives sources through
+// this interface and owns no adapter details.
+class IDiscoverySource {
+public:
+    virtual ~IDiscoverySource() = default;
+
+    virtual const std::string& name() const = 0;
+    virtual SchedulerType schedulerType() const = 0;
+
+    // Installs the sink and then starts polling (the sink exists before any
+    // callback can run). Returns false when the adapter has nothing to poll
+    // for (no event source and no scan interval); the sink stays installed and
+    // scan()/observeForHint() keep working.
+    virtual bool start(const DiscoverySink& sink) = 0;
+    // Idempotent: stops and joins the poll thread, releases the event source.
+    virtual void stop() = 0;
+    // One synchronous authoritative source pass.
+    virtual ScanResult scan() = 0;
+    virtual SourceHealth health() const = 0;
+    // Ask for an out-of-band authoritative pass; consumed by the owner.
+    virtual void requestRescan() = 0;
+    // Targeted observation for one exec-event pid. The BPF filter guarantees
+    // the parent is the execution manager, so the manager is the ppid; only
+    // this execution's files are read (O(job), not O(node)). Returns nullopt
+    // when the hint cannot be resolved (process gone, parent is not the
+    // expected manager); the caller then falls back to a full scan.
+    virtual std::optional<Observation> observeForHint(pid_t hint_pid) = 0;
+};
 
 // ---------------------------------------------------------------------------
 // Observation accumulation

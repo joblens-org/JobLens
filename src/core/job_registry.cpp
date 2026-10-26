@@ -675,66 +675,10 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
         spdlog::warn("JobRegistry: job db not running");
     }
 
-    if (options.enable_job_watchers) init_job_watcher();
     if (options.enable_pid_tracker) init_pid_tracker();
     if (options.register_rpc) regRPCHandle();
 };
 
-void JobRegistry::init_job_watcher() {
-    // One discovery source per scheduler type (plan 3.1). When a type is listed
-    // under job_registry_config.inventory.types, the inventory maintenance
-    // controller owns discovery; running the legacy auto-add watcher as well
-    // would load a second eBPF object and try to register a second record for
-    // the same native identity (rejected by the identity index), so automatic
-    // collection would silently never start.
-    std::vector<std::string> inventory_types;
-    try {
-        const auto node = Config::instance().getRawNode("job_registry_config")["inventory"]["types"];
-        if (node && node.IsSequence()) {
-            for (const auto& entry : node) {
-                if (entry.IsScalar()) {
-                    auto value = entry.as<std::string>();
-                    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                    inventory_types.push_back(value);
-                }
-            }
-        }
-    } catch (const std::exception& error) {
-        spdlog::warn("JobRegistry: could not read inventory types: {}", error.what());
-    }
-
-    enable_auto_add_condor_job = Config::instance().getBool("job_registry_config", "auto_add_condorjob", false);
-    if (enable_auto_add_condor_job && std::find(inventory_types.begin(), inventory_types.end(), "condor") != inventory_types.end()) {
-        spdlog::warn("JobRegistry: auto_add_condorjob is superseded by inventory discovery for condor; "
-                     "the legacy watcher is not started (automatic collection needs the policy layer)");
-        enable_auto_add_condor_job = false;
-    }
-    if (enable_auto_add_condor_job) {
-        condor_job_watcher_ = std::make_unique<CondorJobWatcher>();
-        condor_job_watcher_->register_add_if(
-            [this](Job job){
-                this->addJob(job);
-            }
-        );
-        spdlog::info("JobRegistry: enabled auto add condor job");
-    }
-
-    enable_auto_add_slurm_job = Config::instance().getBool("job_registry_config", "auto_add_slurmjob", false);
-    if (enable_auto_add_slurm_job && std::find(inventory_types.begin(), inventory_types.end(), "slurm") != inventory_types.end()) {
-        spdlog::warn("JobRegistry: auto_add_slurmjob is superseded by inventory discovery for slurm; "
-                     "the legacy watcher is not started (automatic collection needs the policy layer)");
-        enable_auto_add_slurm_job = false;
-    }
-    if (enable_auto_add_slurm_job) {
-        slurm_job_watcher_ = std::make_unique<SlurmJobWatcher>();
-        slurm_job_watcher_->register_add_if(
-            [this](Job job){
-                this->addJob(job);
-            }
-        );
-        spdlog::info("JobRegistry: enabled auto add slurm job");
-    }
-}
 
 // 从 Job 取 cgroup 路径: Slurm 用 cgroup_path, Condor 用 slots_cgroup_path。
 static std::string job_cgroup_path(const Job& job) {

@@ -209,10 +209,9 @@ void make_fixture(Fixture& fixture, const std::string& base)
     fs::create_directories(fixture.slurmd / "not-a-job-directory");
 }
 
-WatcherRuntimeOptions fixture_options(const Fixture& fixture)
+DiscoveryOptions fixture_options(const Fixture& fixture)
 {
-    WatcherRuntimeOptions options;
-    options.load_config = false;
+    DiscoveryOptions options;
     options.enable_event_source = false;  // unprivileged fixture: no eBPF
     options.discovery.proc_root = fixture.proc.string();
     options.discovery.cgroup_root = fixture.cgroup.string();
@@ -248,6 +247,15 @@ bool has_source_note(const ScanResult& result)
         if (contains(note, "eBPF")) return true;
     }
     return false;
+}
+
+// A DiscoverySink carrying only an observation callback (the fixture has no
+// eBPF, so no exec hints can arrive).
+DiscoverySink scan_sink(ObservationSink on_observation)
+{
+    DiscoverySink sink;
+    sink.on_observation = std::move(on_observation);
+    return sink;
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +440,80 @@ void rescan_request_is_consumed(const Fixture& fixture)
     check(!watcher.health().rescan_requested, "a scan satisfies the pending rescan request");
 }
 
+void construction_does_nothing_until_start(const Fixture& fixture)
+{
+    // The only construction path: no Config read, no eBPF load, no thread.
+    CondorJobWatcher watcher(fixture_options(fixture));
+    check(!watcher.polling(), "a fresh adapter must not poll");
+    check(!watcher.thread_joinable(), "a fresh adapter must not own a thread");
+    check(!watcher.health().polling, "health must not report polling before start()");
+    check(watcher.health().state == SourceState::Initializing,
+          "a fresh adapter is initializing until a pass ran");
+
+    // A scan before start() works and stays usable for a scan-only owner.
+    const auto early = watcher.scan();
+    check(early.ok(), "scan() must work without start() (scan-only owner)");
+}
+
+void observe_hint_targets_one_execution(const Fixture& fixture)
+{
+    CondorJobWatcher condor(fixture_options(fixture));
+    // 4110 is a member process whose parent is the starter 4101.
+    const auto observation = condor.observeForHint(4110);
+    check(observation.has_value(), "a hint under a starter must resolve");
+    check(observation->identity_complete, "the targeted observation must be complete");
+    check(observation->selector.native_job_id == "76226337.0",
+          "the targeted observation must name the fixture job");
+    check(observation->generation.manager_pid == 4101,
+          "the manager is the hint's parent (the starter)");
+    check(member_pids(*observation).size() == 2,
+          "the targeted observation keeps the cgroup member list");
+
+    // Unresolvable hints fall back to the caller (full scan).
+    check(!condor.observeForHint(9999).has_value(), "a dead pid must not resolve");
+    check(!condor.observeForHint(4101).has_value(),
+          "a pid whose parent is not a starter must not resolve");
+
+    auto slurm_options = fixture_options(fixture);
+    slurm_options.discovery.slurm_spool_dir = (fixture.slurmd).string();
+    SlurmJobWatcher slurm(slurm_options);
+    // 5110's parent is the stepd 5101 of job 9002 step 3.
+    const auto step = slurm.observeForHint(5110);
+    check(step.has_value(), "a hint under a stepd must resolve");
+    check(step->identity_complete, "the targeted slurm observation must be complete");
+    check(step->selector.native_job_id == "9002" && step->selector.step_id == "3",
+          "the targeted slurm observation must name job and step");
+    check(step->generation.manager_pid == 5101, "the manager is the hint's parent (the stepd)");
+}
+
+void polymorphic_source_interface(const Fixture& fixture)
+{
+    CondorJobWatcher condor(fixture_options(fixture));
+    SlurmJobWatcher slurm(fixture_options(fixture));
+
+    IDiscoverySource* sources[] = {&condor, &slurm};
+    check(sources[0]->name() == "condor", "the condor source must name itself");
+    check(sources[0]->schedulerType() == SchedulerType::Condor, "condor type");
+    check(sources[1]->name() == "slurm", "the slurm source must name itself");
+    check(sources[1]->schedulerType() == SchedulerType::Slurm, "slurm type");
+
+    for (IDiscoverySource* source : sources) {
+        source->requestRescan();
+        check(source->health().rescan_requested,
+              "the interface must expose the rescan request");
+        const ScanResult result = source->scan();
+        check(source->health().rescan_requested == false,
+              "an interface scan satisfies the rescan request");
+        check(result.complete, "the interface scan must complete against the fixture");
+        check(source->health().state == SourceState::Healthy,
+              "the interface health must recover");
+    }
+
+    // A started scan-only source has nothing to poll; the sink stays installed.
+    check(!sources[0]->start(DiscoverySink{}),
+          "start() without an event source and interval must report nothing to poll");
+}
+
 void lifecycle_is_safe(const Fixture& fixture)
 {
     auto options = fixture_options(fixture);
@@ -443,7 +525,7 @@ void lifecycle_is_safe(const Fixture& fixture)
     check(delivered.load() == 0,
           "no callback may run before start(): the sink is a start() argument");
 
-    check(watcher.start([&delivered](const Observation&) { delivered.fetch_add(1); }),
+    check(watcher.start(scan_sink([&delivered](const Observation&) { delivered.fetch_add(1); })),
           "start() must run with a scan interval even without eBPF");
     check(watcher.polling(), "start() must report polling");
     check(watcher.thread_joinable(), "start() must own a joinable poll thread");
@@ -461,7 +543,7 @@ void lifecycle_is_safe(const Fixture& fixture)
     watcher.stop();  // idempotent
     check(!watcher.thread_joinable(), "a second stop() must stay a no-op");
 
-    check(watcher.start([&delivered](const Observation&) { delivered.fetch_add(1); }),
+    check(watcher.start(scan_sink([&delivered](const Observation&) { delivered.fetch_add(1); })),
           "start() after stop() must work");
     check(watcher.polling(), "restart must poll again");
     watcher.stop();
@@ -473,7 +555,7 @@ void lifecycle_is_safe(const Fixture& fixture)
 
     // Nothing to poll: no event source and no interval.
     CondorJobWatcher idle(fixture_options(fixture));
-    check(!idle.start([](const Observation&) {}),
+    check(!idle.start(scan_sink([](const Observation&) {})),
           "start() must refuse to spin a thread with no event source and no interval");
     check(!idle.polling(), "a refused start() must not report polling");
     idle.stop();
@@ -484,7 +566,7 @@ void lifecycle_is_safe(const Fixture& fixture)
     slurm_options.scan_interval_ms = 20;
     SlurmJobWatcher slurm(slurm_options);
     std::atomic<int> slurm_delivered{0};
-    check(slurm.start([&slurm_delivered](const Observation&) { slurm_delivered.fetch_add(1); }),
+    check(slurm.start(scan_sink([&slurm_delivered](const Observation&) { slurm_delivered.fetch_add(1); })),
           "the Slurm adapter must start its scan thread");
     check(slurm.polling() && slurm.thread_joinable(), "the Slurm adapter owns a joined thread");
     const auto slurm_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -494,41 +576,6 @@ void lifecycle_is_safe(const Fixture& fixture)
     slurm.stop();
     slurm.stop();
     check(!slurm.polling() && !slurm.thread_joinable(), "Slurm stop() is idempotent and joined");
-}
-
-void legacy_construction_still_works(const Fixture& fixture)
-{
-    // The legacy default constructors keep reading Config and stay usable for
-    // the existing JobRegistry call site; only the new explicit path skips
-    // polling until start().
-    const auto config_path = fixture.root / "config.yaml";
-    write_file(config_path,
-               "condor_job_watcher:\n"
-               "  auto_add_collectors: []\n"
-               "  use_rules: false\n"
-               "slurm_job_watcher:\n"
-               "  auto_add_collectors: []\n"
-               "  use_rules: false\n"
-               "job_registry_config:\n"
-               "  rules_dir: \"" + fixture.root.string() + "/rules\"\n");
-    Config::instance(config_path.string());
-
-    CondorJobWatcher condor;
-    condor.register_add_if([](Job) {});
-    const auto condor_added = condor.add_all_condor_job();
-    condor.stop();
-    check(!condor.polling() && !condor.thread_joinable(),
-          "the legacy Condor watcher must stop cleanly");
-
-    SlurmJobWatcher slurm;
-    slurm.register_add_if([](Job) {});
-    const auto slurm_added = slurm.add_all_slurm_job();
-    slurm.stop();
-    check(!slurm.polling() && !slurm.thread_joinable(),
-          "the legacy Slurm watcher must stop cleanly");
-
-    (void)condor_added;
-    (void)slurm_added;
 }
 
 } // namespace
@@ -554,8 +601,10 @@ int main(int argc, char** argv)
             {"slurm_scan_finds_fixture_job", slurm_scan_finds_fixture_job},
             {"health_degrades_and_recovers", health_degrades_and_recovers},
             {"rescan_request_is_consumed", rescan_request_is_consumed},
+            {"construction_does_nothing_until_start", construction_does_nothing_until_start},
+            {"observe_hint_targets_one_execution", observe_hint_targets_one_execution},
+            {"polymorphic_source_interface", polymorphic_source_interface},
             {"lifecycle_is_safe", lifecycle_is_safe},
-            {"legacy_construction_still_works", legacy_construction_still_works},
         };
 
         for (const auto& test : tests) {

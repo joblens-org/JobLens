@@ -172,16 +172,13 @@ InventoryRuntime& runtime()
 }
 
 // Discovery-adapter construction: the maintenance controller owns pacing and
-// policy, so the adapter must not read Config, must not poll on its own, and
-// must not start the rule engine (task 5 owns selection policy).
-WatcherRuntimeOptions make_watcher_options()
+// the automatic policy, so the adapter must not read Config and must not poll
+// on its own.
+DiscoveryOptions make_watcher_options()
 {
-    WatcherRuntimeOptions options;
-    options.load_config = false;
+    DiscoveryOptions options;
     options.enable_event_source = true;
     options.scan_interval_ms = 0;
-    options.use_rules = false;
-    options.default_collectors.clear();
     options.discovery = DiscoveryEnvironment{};
     return options;
 }
@@ -191,8 +188,14 @@ InventorySource bind_source(CondorJobWatcher& watcher, const std::string& name)
     InventorySource source;
     source.name = name;
     source.scheduler_type = SchedulerType::Condor;
-    source.start = [&watcher](ObservationSink sink) {
-        return watcher.start(std::move(sink));
+    source.start = [&watcher](ObservationSink observations) {
+        DiscoverySink sink;
+        sink.on_observation = std::move(observations);
+        // S1 keeps the event path alive until the maintenance controller
+        // consumes exec hints directly: an exec event still asks for an
+        // authoritative pass.
+        sink.on_exec_hint = [&watcher](pid_t) { watcher.request_rescan(); };
+        return watcher.start(sink);
     };
     source.stop = [&watcher]() { watcher.stop(); };
     source.scan = [&watcher]() { return watcher.scan(); };
@@ -206,8 +209,11 @@ InventorySource bind_source(SlurmJobWatcher& watcher, const std::string& name)
     InventorySource source;
     source.name = name;
     source.scheduler_type = SchedulerType::Slurm;
-    source.start = [&watcher](ObservationSink sink) {
-        return watcher.start(std::move(sink));
+    source.start = [&watcher](ObservationSink observations) {
+        DiscoverySink sink;
+        sink.on_observation = std::move(observations);
+        sink.on_exec_hint = [&watcher](pid_t) { watcher.request_rescan(); };
+        return watcher.start(sink);
     };
     source.stop = [&watcher]() { watcher.stop(); };
     source.scan = [&watcher]() { return watcher.scan(); };
@@ -232,7 +238,7 @@ bool start()
     const InventoryMaintenanceConfig config =
         resolve_inventory_maintenance_config(Config::instance().dumpConfig());
 
-    const WatcherRuntimeOptions options = make_watcher_options();
+    const DiscoveryOptions options = make_watcher_options();
     std::vector<InventorySource> sources;
     for (const auto type : config.types) {
         if (type == InventoryType::Condor) {
