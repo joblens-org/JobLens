@@ -545,6 +545,135 @@ Get hardware information including CPU model, memory size, disk info, etc.
 
 ---
 
+## 12. Job Inventory and Collection Control
+
+These routes proxy the Core inventory/collection contract
+(`doc/job_inventory_collection_decoupling_plan.md` §9). Trigger validates and
+forwards only: it never allocates or derives internal IDs, and a Core error is
+never turned into HTTP 200.
+
+### `GET /joblens/inventory`
+
+Bounded, read-only inventory snapshot.
+
+| Query | Type | Description |
+|---|---|---|
+| `limit` | int | Page size, 1–1000, default 100 |
+| `scheduler_type` | string | `condor` or `slurm` |
+| `native_job_id` | string | Native scheduler ID (exact match) |
+| `state` | string | `active`, `suspect` or `closing` |
+| `cursor` | string | Opaque cursor from the previous page |
+
+**Response (200):**
+```json
+{
+  "status": "ok",
+  "snapshot_revision": 1234567890,
+  "records": [{
+    "instance_id": "ji1-...",
+    "internal_job_id": "42",
+    "schema_version": 2,
+    "facts_revision": 3,
+    "state": "active",
+    "source": "condor",
+    "identity_complete": true,
+    "scheduler_type": "condor",
+    "cluster_name": "htcondor01",
+    "cluster_tag": "schedd-a",
+    "native_job_id": "172.0",
+    "step_id": "",
+    "generation": {"boot_id": "...", "manager_pid": 1234, "manager_start_ticks": 999},
+    "processes": [{"pid": 1235, "start_ticks": 1000, "boot_id": "..."}],
+    "attributes": {"owner": "alice"}
+  }],
+  "next_cursor": null
+}
+```
+
+A cursor is only valid while the snapshot is unchanged; otherwise the request
+fails with `409 cursor_invalidated`. Internal IDs are decimal strings so
+JavaScript consumers keep uint64 precision.
+
+### `GET /joblens/inventory/status`
+
+Source, reconciliation, queue and persistence health (active/suspect/closing
+counts, scan timestamps, dropped events, store degradation, incomplete and
+quarantined identities, applied/drain state). Served verbatim from the Core;
+`200` even when the reported state is `degraded`.
+
+### `POST /joblens/collection`
+
+Set or reset collection intent for one exact target set.
+
+**Request body:**
+```json
+{
+  "selector": {"scheduler_type": "condor", "cluster_name": "htcondor01",
+               "cluster_tag": "schedd-a", "native_job_id": "172.0"},
+  "scope": "instance",
+  "ensure_registered": true,
+  "operation": "set",
+  "collectors": ["cpumem_collector"],
+  "expected_revision": 0
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `selector` | Yes | Exactly one form: `instance_id`, or `scheduler_type` + `cluster_name` + `native_job_id` (+ optional `cluster_tag`, `step_id`) |
+| `scope` | No | `instance` (default) or `job`. `instance_id` only supports `instance`; Slurm `job` targets every currently observed local step |
+| `ensure_registered` | No | Run one authoritative discovery pass before matching |
+| `operation` | Yes | `set` or `reset_auto` |
+| `collectors` | For `set` | Explicit list; `[]` is a persistent stop. Must be omitted for `reset_auto` |
+| `expected_revision` | No | Binding revision guard, single-instance requests only (`0` = no intent yet) |
+
+**Response (200):**
+```json
+{
+  "status": "accepted",
+  "operation": "set",
+  "scope": "instance",
+  "targets": [{
+    "instance_id": "ji1-...",
+    "internal_job_id": "42",
+    "native_job_id": "172.0",
+    "binding_revision": 1,
+    "mode": "manual",
+    "desired_collectors": ["cpumem_collector"],
+    "applied_collectors": ["cpumem_collector"],
+    "applied_revision": 1,
+    "errors": [],
+    "changed": true
+  }]
+}
+```
+
+`applied_collectors` is runtime state: it is empty (with an entry in `errors`)
+when the Agent has no collection runtime or a collector refused the binding.
+`status: accepted` only means the intent is durable.
+
+### `GET /joblens/collection?instance_id=...`
+
+Desired/applied selection, mode, revisions, policy revision and per-collector
+errors for one instance handle. `404` when the handle does not name a verified
+current instance, `409` when it names a closing generation.
+
+### `GET /joblens/capabilities`
+
+Advertises `inventory_version`, `collection_control_version`,
+`native_identity_selectors`, `job_scope` and the DB schema version. Trigger
+never declares a capability the Core did not report.
+
+**Status Codes:**
+- `200` - Success
+- `400` - Invalid request (unknown collector, missing `collectors`, bad selector)
+- `404` - No verified current instance
+- `409` - Ambiguous selector, stale `expected_revision`, closing generation, invalidated cursor
+- `502` - Core returned a response that violates the contract
+- `503` - Core RPC unavailable, store unavailable or inventory still migrating
+
+---
+
 ## Response Status Code Summary
 
 | Code | Description |
@@ -555,5 +684,7 @@ Get hardware information including CPU model, memory size, disk info, etc.
 | `401` | Unauthorized (missing or invalid auth header) |
 | `403` | Forbidden (invalid token) |
 | `404` | Resource not found |
+| `409` | Conflict (ambiguous selector, stale revision, closing generation, invalidated cursor) |
 | `500` | Internal server error |
-| `503` | Service unavailable (RPC failure or dependency not initialized) |
+| `502` | Core returned a response that violates the contract |
+| `503` | Service unavailable (RPC failure, store unavailable or inventory initializing) |

@@ -546,6 +546,128 @@ Slurm 作业专用操作，目前仅支持 `"add"`。
 
 ---
 
+## 12. 作业清单与采集控制
+
+以下接口透传 Core 的清单/采集契约（`doc/job_inventory_collection_decoupling_plan.md` §9）。
+Trigger 只做校验与转发：不分配、不推导内部 ID，Core 的错误绝不会被包装成 HTTP 200。
+
+### `GET /joblens/inventory`
+
+有界、只读的清单快照。
+
+| 查询参数 | 类型 | 说明 |
+|---|---|---|
+| `limit` | int | 每页条数，1–1000，默认 100 |
+| `scheduler_type` | string | `condor` 或 `slurm` |
+| `native_job_id` | string | 调度器原生 ID（精确匹配） |
+| `state` | string | `active`、`suspect` 或 `closing` |
+| `cursor` | string | 上一页返回的不透明游标 |
+
+**响应（200）：**
+```json
+{
+  "status": "ok",
+  "snapshot_revision": 1234567890,
+  "records": [{
+    "instance_id": "ji1-...",
+    "internal_job_id": "42",
+    "schema_version": 2,
+    "facts_revision": 3,
+    "state": "active",
+    "source": "condor",
+    "identity_complete": true,
+    "scheduler_type": "condor",
+    "cluster_name": "htcondor01",
+    "cluster_tag": "schedd-a",
+    "native_job_id": "172.0",
+    "step_id": "",
+    "generation": {"boot_id": "...", "manager_pid": 1234, "manager_start_ticks": 999},
+    "processes": [{"pid": 1235, "start_ticks": 1000, "boot_id": "..."}],
+    "attributes": {"owner": "alice"}
+  }],
+  "next_cursor": null
+}
+```
+
+游标仅在快照未变化时有效，否则返回 `409 cursor_invalidated`。新增接口中的内部 ID
+一律为十进制字符串，避免 JavaScript 的 uint64 精度丢失。
+
+### `GET /joblens/inventory/status`
+
+来源、对账、队列与持久化健康状态（active/suspect/closing 计数、扫描时间、
+丢弃事件、存储降级、不完整/隔离身份、已生效与待排空状态）。原样透传 Core，
+即使状态为 `degraded` 也返回 `200`。
+
+### `POST /joblens/collection`
+
+对一个精确解析出的目标集合设置或重置采集意图。
+
+**请求体：**
+```json
+{
+  "selector": {"scheduler_type": "condor", "cluster_name": "htcondor01",
+               "cluster_tag": "schedd-a", "native_job_id": "172.0"},
+  "scope": "instance",
+  "ensure_registered": true,
+  "operation": "set",
+  "collectors": ["cpumem_collector"],
+  "expected_revision": 0
+}
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `selector` | 是 | 二选一：`instance_id`，或 `scheduler_type` + `cluster_name` + `native_job_id`（可选 `cluster_tag`、`step_id`） |
+| `scope` | 否 | `instance`（默认）或 `job`。`instance_id` 只支持 `instance`；Slurm `job` 覆盖当前已观测的所有本地 step |
+| `ensure_registered` | 否 | 匹配前先执行一次权威发现 |
+| `operation` | 是 | `set` 或 `reset_auto` |
+| `collectors` | `set` 必填 | 显式列表；`[]` 表示持久停止。`reset_auto` 必须省略 |
+| `expected_revision` | 否 | 绑定修订号校验，仅单实例请求可携带（`0` 表示尚无意图） |
+
+**响应（200）：**
+```json
+{
+  "status": "accepted",
+  "operation": "set",
+  "scope": "instance",
+  "targets": [{
+    "instance_id": "ji1-...",
+    "internal_job_id": "42",
+    "native_job_id": "172.0",
+    "binding_revision": 1,
+    "mode": "manual",
+    "desired_collectors": ["cpumem_collector"],
+    "applied_collectors": ["cpumem_collector"],
+    "applied_revision": 1,
+    "errors": [],
+    "changed": true
+  }]
+}
+```
+
+`applied_collectors` 是运行时状态：Agent 没有采集运行时、或采集器拒绝绑定时，
+它是空的并在 `errors` 中给出原因。`status: accepted` 只表示意图已持久化。
+
+### `GET /joblens/collection?instance_id=...`
+
+查询单个实例句柄的期望/已生效选择、模式、修订号、策略修订号与逐采集器错误。
+句柄不存在时 `404`，指向正在关闭的代际时 `409`。
+
+### `GET /joblens/capabilities`
+
+声明 `inventory_version`、`collection_control_version`、`native_identity_selectors`、
+`job_scope` 与 DB schema 版本。Trigger 绝不代替 Core 声明能力。
+
+**状态码：**
+- `200` - 成功
+- `400` - 请求非法（未知采集器、缺少 `collectors`、选择器不合法）
+- `404` - 没有已验证的当前实例
+- `409` - 选择器歧义、`expected_revision` 过期、代际正在关闭、游标失效
+- `502` - Core 返回的响应不符合契约
+- `503` - Core RPC 不可用、存储不可用或清单仍在迁移
+
+---
+
 ## 响应状态码汇总
 
 | 状态码 | 描述 |
@@ -556,5 +678,7 @@ Slurm 作业专用操作，目前仅支持 `"add"`。
 | `401` | 未授权（缺失或无效的认证头） |
 | `403` | 禁止访问（无效 token） |
 | `404` | 资源未找到 |
+| `409` | 冲突（选择器歧义、修订号过期、代际正在关闭、游标失效） |
 | `500` | 内部服务器错误 |
-| `503` | 服务不可用（RPC 故障或依赖未初始化） |
+| `502` | Core 返回的响应不符合契约 |
+| `503` | 服务不可用（RPC 故障、存储不可用或清单初始化中） |

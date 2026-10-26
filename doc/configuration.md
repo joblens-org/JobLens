@@ -68,19 +68,45 @@ lens_config:
 ```yaml
 job_registry_config:
   job_db_path: /var/JobLens/job.db      # LevelDB database directory path for persisting job state
-  auto_add_condorjob: true               # Whether to automatically monitor Condor jobs
-  auto_add_slurmjob: true                # Whether to automatically monitor Slurm jobs
+  auto_add_condorjob: true               # Deprecated: automatic Condor monitoring (see inventory below)
+  auto_add_slurmjob: true                # Deprecated: automatic Slurm monitoring (see inventory below)
+  inventory:
+    types: [condor, slurm]               # Types with a full local inventory (opt-in, absent = [])
+    reconcile_interval_sec: 30           # Reconciliation interval, must be >= 1
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `job_db_path` | string | none | LevelDB database directory path. If the database cannot be opened, no exception is thrown; it only degrades operation |
-| `auto_add_condorjob` | bool | false | Automatically start CondorJobWatcher, trace `condor_starter` processes via eBPF, and auto-add Condor jobs |
-| `auto_add_slurmjob` | bool | false | Automatically start SlurmJobWatcher, trace `slurm_stepd` processes via eBPF, and auto-add Slurm jobs |
+| `auto_add_condorjob` | bool | false | **Deprecated.** Automatically start the legacy CondorJobWatcher and auto-add jobs. Ignored for a type listed in `inventory.types` (the inventory discovery source owns it) |
+| `auto_add_slurmjob` | bool | false | **Deprecated.** Same as above for Slurm |
+| `inventory.types` | list | `[]` | Scheduler types that get a complete local inventory, including unselected jobs. `condor` / `slurm`; unknown values are rejected at startup |
+| `inventory.reconcile_interval_sec` | int | 30 | Periodic full reconciliation interval in seconds (minimum 1) |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` (Condor) or `{JobLensRootDir}/../config/rules/slurm_jobs` (Slurm) | Directory for Lua rule files, used by CondorJobWatcher and SlurmJobWatcher when `use_rules` is enabled. Note: the default varies by watcher context. |
 
+**Inventory and automatic collection** are separate switches:
+
+| `inventory.types` contains the type | `<type>_job_watcher.auto_collect` | Behavior |
+|---|---|---|
+| Yes | No | Keep an inventory of every local instance; collection only starts through an explicit collection request (`POST /joblens/collection` or the legacy add route) |
+| Yes | Yes | Keep the inventory; automatic selection requires the policy layer (Lua rules / default collector list). This build stores the intent but does not evaluate policy yet, so new instances are not collected automatically |
+| No | Yes | Legacy mode: the auto-add watcher registers accepted jobs for collection, without a full-inventory guarantee |
+| No | No | No broad discovery; explicit verified registration/control still works |
+
+`<type>_job_watcher.auto_collect` wins over the deprecated
+`job_registry_config.auto_add_<type>job` when both are set. Discovery is
+centralized: a type listed under `inventory.types` does not also start the
+legacy watcher, so one eBPF source per scheduler type is enough.
+
+Collection intent (desired selection) is stored in LevelDB and applied to the
+collector lanes by the running scheduler. `JobCollection/get` distinguishes
+`desired_collectors` from `applied_collectors`: a request can be accepted while
+runtime application fails (`errors`), and the response never claims collection
+is active when it is not. Stopping collection (`collectors: []`) keeps the
+inventory record; the instance is retired by maintenance, not by the request.
+
 **Job data storage** (LevelDB key-value store):
-- Keys use prefixes `job_`, `job_history_`, `counter_` with values serialized as JSON
+- Keys use prefixes `j:` (active jobs), `h:` (history), `c:` (ID allocator), `m:` (schema/DB UUID/migration), `i:` (canonical identity index) and `b:` (collection intent) with values serialized as JSON
 - Internally managed by `JobRegistry`; backed by LevelDB for persistence
 
 ---

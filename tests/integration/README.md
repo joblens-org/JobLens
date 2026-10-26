@@ -57,6 +57,38 @@ process-sum summary semantics are retained, including shared-socket totals.
 Run same-load measurements on a deployment node to assess end-to-end gains;
 the syscall regression is not a timing benchmark.
 
+### 作业清单 / 采集解耦回归
+
+在已配置 Ninja 构建目录、具备项目 C++ 编译依赖的本机运行（无需特权、无需 eBPF）：
+
+```bash
+bash tests/integration/run_inventory_tests.sh build            # 可加 --suite identity|store|intent|maintenance
+bash tests/integration/run_collection_rpc_test.sh build
+bash tests/integration/run_watcher_scan_test.sh build
+```
+
+- `job_identity_test.cpp`：Condor/Slurm 规范身份、uint64 内部 ID、Slurm step 归一化
+  （`batch` = `SLURM_BATCH_SCRIPT` 0xfffffffe、`extern` = `SLURM_EXTERN_CONT` 0xfffffffd）、
+  PID 复用、实例句柄与序列化。
+- `job_inventory_store_test.cpp`：零绑定 upsert 幂等、旧 schema 迁移与恢复、冲突隔离、
+  持久写失败与 ID 不复用。
+- `job_collection_intent_test.cpp`：手工选择优先级、持久停止与 `reset_auto`、重复/过期修订、
+  重启后的意图恢复；自动策略在手工覆盖下不推进客户端可见修订。
+- `job_inventory_maintenance_test.cpp`：启动竞争、事件回放、两次完整缺席才退休、EPERM 不算死亡、
+  队列溢出与重扫、tracker 不可用、旧代际迟到清理；另含**无发现源时手工登记记录的刷新与退休**
+  以及**事件触发/按需（`ensure_registered`）的全量对账**。
+- `collection_rpc_test.cpp`：§9 全部方法通过真实 AF_UNIX RPC 驱动，覆盖选择器形式、
+  分页游标失效、409/503/404 分类、`ensure_registered` 实际触发一次权威发现、
+  以及“无采集运行时不虚报 applied_collectors”的契约。
+- `job_watcher_scan_test.cpp`：fixture procfs/cgroup/job-ad 下的扫描、健康状态与
+  start/stop 幂等。`run_watcher_scan_test.sh` 默认优先使用 `build-watcher/`（若存在），
+  因此改动头文件后请勿设置 `SKIP_BUILD=1` 复用过期的私有构建目录。
+
+采集意图真正落到采集器的端到端验证在
+`run_execution_tests.sh --suite lifecycle`（`collector_execution_lifecycle_test.cpp`）：
+无绑定的清单实例不产生采集、提交绑定时挂载 lane 并报告 applied、持久停止后摘除且保留清单、
+无论停止后退休还是绑定中自然结束都能被确认且不残留 lane。
+
 ### 统一采集执行套件 / Unified collector execution suites
 
 ```bash

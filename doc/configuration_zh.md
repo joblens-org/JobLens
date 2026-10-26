@@ -67,19 +67,42 @@ lens_config:
 ```yaml
 job_registry_config:
   job_db_path: /var/JobLens/job.db      # 持久化作业状态的 LevelDB 数据库目录路径
-  auto_add_condorjob: true               # 是否自动监控 Condor 作业
-  auto_add_slurmjob: true                # 是否自动监控 Slurm 作业
+  auto_add_condorjob: true               # 已弃用：Condor 自动监控（改用 inventory）
+  auto_add_slurmjob: true                # 已弃用：Slurm 自动监控（改用 inventory）
+  inventory:
+    types: [condor, slurm]               # 需要完整本地清单的调度器类型（opt-in，缺省为 []）
+    reconcile_interval_sec: 30           # 对账周期，最小 1 秒
 ```
 
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
 | `job_db_path` | string | 无 | LevelDB 数据库目录路径。无法打开数据库时仅降级运行，不抛异常 |
-| `auto_add_condorjob` | bool | false | 自动启动 CondorJobWatcher，通过 eBPF 追踪 `condor_starter` 进程并自动添加 Condor 作业 |
-| `auto_add_slurmjob` | bool | false | 自动启动 SlurmJobWatcher，通过 eBPF 追踪 `slurm_stepd` 进程并自动添加 Slurm 作业 |
+| `auto_add_condorjob` | bool | false | **已弃用**。启动旧版 CondorJobWatcher 并自动登记作业。该类型出现在 `inventory.types` 时忽略（由清单发现源负责） |
+| `auto_add_slurmjob` | bool | false | **已弃用**。同上，作用于 Slurm |
+| `inventory.types` | list | `[]` | 需要完整本地清单的调度器类型（包含未被采集的作业）。取值 `condor` / `slurm`，未知值启动即拒绝 |
+| `inventory.reconcile_interval_sec` | int | 30 | 周期性全量对账间隔，单位秒，最小 1 |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs`（Condor）或 `{JobLensRootDir}/../config/rules/slurm_jobs`（Slurm） | Lua 规则文件目录，CondorJobWatcher 和 SlurmJobWatcher 在 `use_rules` 启用时使用。注意：默认值因 watcher 而异。 |
 
+**清单维护**与**自动采集**是两个独立开关：
+
+| `inventory.types` 包含该类型 | `<type>_job_watcher.auto_collect` | 行为 |
+|---|---|---|
+| 是 | 否 | 维护全部本地实例的清单；只有显式采集请求（`POST /joblens/collection` 或旧版 add 接口）才会开始采集 |
+| 是 | 是 | 维护清单；自动选择采集需要策略层（Lua 规则/默认采集器列表）。当前版本只保存意图，尚未评估策略，因此新实例不会自动采集 |
+| 否 | 是 | 兼容模式：自动添加 watcher 登记通过规则的作业，不保证完整清单 |
+| 否 | 否 | 不做广泛发现；显式且经过校验的登记/控制仍然可用 |
+
+两者同时配置时 `<type>_job_watcher.auto_collect` 优先于旧的
+`job_registry_config.auto_add_<type>job`。发现源集中：类型出现在 `inventory.types`
+时不会再启动旧版 watcher，每个调度器类型只需要一个 eBPF 源。
+
+采集意图（期望选择）持久化在 LevelDB 中，由运行中的调度器应用到采集通道。
+`JobCollection/get` 区分 `desired_collectors` 与 `applied_collectors`：请求可以被
+受理而运行时应用失败（见 `errors`），接口绝不会把未生效的绑报成"正在采集"。
+停止采集（`collectors: []`）会保留清单记录，实例由维护流程退休，而不是由请求删除。
+
 **作业数据存储**（LevelDB 键值存储）：
-- 键使用前缀 `job_`、`job_history_`、`counter_`，值以 JSON 序列化
+- 键使用前缀 `j:`（活跃作业）、`h:`（历史）、`c:`（ID 分配器）、`m:`（schema/DB UUID/迁移）、`i:`（规范身份索引）、`b:`（采集意图），值以 JSON 序列化
 - 由 `JobRegistry` 内部管理；基于 LevelDB 持久化
 
 ---
