@@ -85,6 +85,14 @@ void merge_members(std::vector<ProcessIdentity>& into, const std::vector<Process
     }
 }
 
+// Disambiguation key of one local execution: two observations merge only when
+// they agree on the manager identity (boot id, pid, start ticks).
+std::string generation_key(const ExecutionGeneration& generation)
+{
+    return generation.boot_id + '|' + std::to_string(generation.manager_pid) + '|' +
+           std::to_string(generation.manager_start_ticks);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -118,8 +126,16 @@ const char* to_string(SourceState state)
 
 void ObservationAccumulator::add(Observation observation)
 {
-    if (observation.identity_complete && observation.canonical_identity) {
-        const auto key = observation.canonical_identity->key();
+    // One accumulated observation per *execution generation* of one canonical
+    // identity. Two managers for the same logical job must never merge: the
+    // member lists of two executions would be combined into one record and the
+    // registry would lose the chance to reject the second generation with
+    // execution_generation_conflict. Observations with an incomplete identity
+    // or an unresolved generation are never merged at all.
+    if (observation.identity_complete && observation.canonical_identity &&
+        observation.generation.complete()) {
+        const auto key = observation.canonical_identity->key() + '#' +
+                         generation_key(observation.generation);
         const auto found = by_identity_.find(key);
         if (found != by_identity_.end()) {
             auto& existing = observations_[found->second];
@@ -292,6 +308,28 @@ std::vector<pid_t> read_cgroup_members(const std::string& cgroup_dir)
     pid_t pid = 0;
     while (lines >> pid) members.push_back(pid);
     return members;
+}
+
+bool read_cgroup_members(const std::string& cgroup_dir, std::vector<pid_t>& members,
+                         std::string& error)
+{
+    members.clear();
+    error.clear();
+    if (cgroup_dir.empty()) {
+        error = "no cgroup path";
+        return false;
+    }
+
+    std::string content;
+    if (!read_file(fs::path(cgroup_dir) / "cgroup.procs", content, error)) {
+        error = "cannot read '" + cgroup_dir + "/cgroup.procs': " + error;
+        return false;
+    }
+
+    std::istringstream lines(content);
+    pid_t pid = 0;
+    while (lines >> pid) members.push_back(pid);
+    return true;
 }
 
 ProcessIdentity read_process_identity(const std::string& proc_root,

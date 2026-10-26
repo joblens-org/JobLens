@@ -57,6 +57,12 @@ std::vector<std::string> AutoCollectorPolicy::select(const Job& job,
     // use_rules=true: the rule engine decides per job. A rejected job gets an
     // empty selection but stays inventoried; an evaluation error is reported
     // so the caller keeps the previous decision instead of guessing.
+    //
+    // The overall verdict is authoritative: a rule that passes late (high
+    // priority) and a rule that rejects after it must yield an empty
+    // selection, not the passing rule's list. evaluate_all() stops at the
+    // first rejecting rule precisely so `!all_passed` disqualifies whatever
+    // collectors were gathered before it.
     try {
         std::lock_guard<std::mutex> lock(rules_->mutex);
         if (!rules_->manager) {
@@ -65,6 +71,7 @@ std::vector<std::string> AutoCollectorPolicy::select(const Job& job,
         }
         const auto result = rules_->manager->evaluate_all<Job>(job);
         policy_revision = "rules:" + rules_prefix_;
+        if (!result.first) return {};
         return result.second;
     } catch (const std::exception& failure) {
         error = std::string("rule evaluation failed: ") + failure.what();

@@ -434,6 +434,66 @@ void durable_intent_survives_restart_and_generation_change(const std::string& ba
     }
 }
 
+// A27 -----------------------------------------------------------------------
+
+// A repeated request must repair a runtime that never converged: whether the
+// runtime is called depends on the applied state, not on whether the desired
+// list changed.
+void repeated_requests_converge_a_failed_application(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a27-retry");
+    JobRegistry registry(isolated(path));
+    JobCollectionManager manager(registry);
+    manager.setCollectorValidator([](const std::string& name) {
+        return name == "cpumem_collector";
+    });
+
+    // A runtime that fails the first application, then recovers.
+    int calls = 0;
+    bool healthy = false;
+    registry.setCollectionApplier([&](const Job& job, std::vector<std::string>& applied,
+                                      std::string& error) {
+        ++calls;
+        if (!healthy) {
+            error = "runtime not ready";
+            return false;
+        }
+        applied = job.CollectorNames;
+        return true;
+    });
+
+    const auto created = registry.upsertObservedJob(condor_observation("172.0"));
+    check(created.ok, "baseline registration must succeed");
+
+    const auto first = manager.setCollectors(
+        set_request({created.internal_id}, {"cpumem_collector"}));
+    check(first.ok, "the intent must be accepted even when the runtime fails");
+    check(calls == 1, "the first request must reach the runtime");
+    check(!first.targets.front().applied.applied,
+          "a failed runtime application must not be reported as applied");
+
+    // The identical repeat must retry the runtime instead of reporting
+    // unchanged against a broken state.
+    const auto repeat = manager.setCollectors(
+        set_request({created.internal_id}, {"cpumem_collector"}));
+    check(repeat.ok && repeat.unchanged == 1,
+          "the identical repeat changes no intent");
+    check(calls == 2, "the repeated request must retry the runtime");
+
+    healthy = true;
+    const auto repaired = manager.setCollectors(
+        set_request({created.internal_id}, {"cpumem_collector"}));
+    check(repaired.ok && repaired.unchanged == 1, "the repair repeat changes no intent");
+    check(calls == 3, "the repair attempt must reach the runtime");
+    check(repaired.targets.front().applied.applied &&
+              repaired.targets.front().applied.collectors ==
+                  std::vector<std::string>{"cpumem_collector"},
+          "a converged runtime must report the applied collector set");
+    check(repaired.targets.front().applied.revision ==
+              repaired.targets.front().binding.revision,
+          "the applied revision must identify the binding the runtime saw");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -445,10 +505,12 @@ int main(int argc, char** argv)
         persistent_stop_survives_rescan_and_reset_restores_auto(base);
         duplicate_requests_stale_revisions_and_invalid_targets(base);
         durable_intent_survives_restart_and_generation_change(base);
+        repeated_requests_converge_a_failed_application(base);
         std::cout << "PASS collection intent: A05 manual over discovery and "
                      "policy, A06 persistent stop and reset_auto, A07 "
                      "duplicate/stale/invalid request atomicity, A22 durable "
-                     "intent across restart and generation change\n";
+                     "intent across restart and generation change, A27 "
+                     "repeated requests converge a failed application\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

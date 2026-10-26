@@ -258,6 +258,21 @@ DiscoverySink scan_sink(ObservationSink on_observation)
     return sink;
 }
 
+Observation make_condor_observation(const std::string& native, pid_t manager_pid,
+                                    std::uint64_t manager_ticks)
+{
+    Observation observation;
+    observation.scheduler_type = SchedulerType::Condor;
+    observation.selector.scheduler_type = SchedulerType::Condor;
+    observation.selector.cluster_name = "htcondor-fixture";
+    observation.selector.native_job_id = native;
+    observation.generation.boot_id = "boot-fixture-0001";
+    observation.generation.manager_pid = manager_pid;
+    observation.generation.manager_start_ticks = manager_ticks;
+    finalize_observation(observation);
+    return observation;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -578,6 +593,102 @@ void lifecycle_is_safe(const Fixture& fixture)
     check(!slurm.polling() && !slurm.thread_joinable(), "Slurm stop() is idempotent and joined");
 }
 
+// ---------------------------------------------------------------------------
+// Regression: the classic HTCondor layout where _CONDOR_JOB_AD lives on the
+// job child process, not on the starter (the old exec-event watcher read it
+// there). The scan path and the exec-hint path must both still find it.
+// ---------------------------------------------------------------------------
+
+void condor_ad_on_member_process_is_found(const Fixture& fixture)
+{
+    // Reuse the fixture root for the extra ad file; the extra processes get
+    // their own slot cgroup.
+    const auto ad = fixture.ads / "76226340.0.ad";
+    write_file(ad,
+               "GlobalJobId = \"scheduler@schedd07.fixture#76226340.0#1775723895\"\n"
+               "Owner = \"carol\"\n"
+               "Cmd = \"/bin/sleep\"\n");
+
+    make_process(fixture.proc, 4401, "condor_starter", 1, 7101, {}, "/htcondor/slot4");
+    make_process(fixture.proc, 4410, "sleep", 4401, 7110,
+                 {{"_CONDOR_JOB_AD", ad.string()}}, "/htcondor/slot4");
+    make_cgroup(fixture.cgroup, "/htcondor/slot4", {4401, 4410});
+
+    CondorJobWatcher watcher(fixture_options(fixture));
+    const auto result = watcher.scan();
+    check(result.ok(), "the scan must succeed: " + result.error);
+    const auto* job = find_complete(result, "76226340.0");
+    check(job != nullptr,
+          "an ad that lives on the job process must be discovered by the scan");
+    check(job->owner == "carol", "the ad metadata must come from the member's ad");
+
+    // The exec-hint path must prefer the hinted pid's own environment.
+    CondorJobWatcher hints(fixture_options(fixture));
+    const auto targeted = hints.observeForHint(4410);
+    check(targeted.has_value(), "a hint for the job process must resolve");
+    check(targeted->identity_complete && targeted->selector.native_job_id == "76226340.0",
+          "the targeted observation must resolve the ad from the hinted pid");
+    bool ad_note = false;
+    for (const auto& note : targeted->notes) {
+        if (contains(note, "_CONDOR_JOB_AD read from job process")) ad_note = true;
+    }
+    check(ad_note, "reading the ad from a member must stay visible in the notes");
+}
+
+void condor_without_cgroup_still_resolves_members(const Fixture& fixture)
+{
+    // Starter with the ad in its own environment but no usable cgroup
+    // ("0::/" resolves to no execution cgroup). Members must still be
+    // discovered through the starter's children, flagged as partial.
+    const auto ad = fixture.ads / "76226341.0.ad";
+    write_file(ad,
+               "GlobalJobId = \"scheduler@schedd07.fixture#76226341.0#1775723895\"\n"
+               "Owner = \"dave\"\n"
+               "Cmd = \"/bin/sleep\"\n");
+
+    make_process(fixture.proc, 4501, "condor_starter", 1, 7201,
+                 {{"_CONDOR_JOB_AD", ad.string()}}, "/");
+    make_process(fixture.proc, 4510, "sleep", 4501, 7210, {{}}, "/");
+    make_process(fixture.proc, 4511, "sleep", 4501, 7211, {{}}, "/");
+
+    CondorJobWatcher watcher(fixture_options(fixture));
+    const auto result = watcher.scan();
+    check(result.ok(), "the scan must succeed: " + result.error);
+    const auto* job = find_complete(result, "76226341.0");
+    check(job != nullptr, "an execution without a cgroup must still be identified");
+    const auto members = member_pids(*job);
+    check(members.size() == 2,
+          "the starter's children must be discovered as members without a cgroup, got " +
+              std::to_string(members.size()));
+    check(!job->members_complete,
+          "members resolved without a cgroup must be reported as partial evidence");
+}
+
+void accumulator_keeps_generations_separate(const Fixture& /*fixture*/)
+{
+    ObservationAccumulator accumulator;
+
+    Observation first = make_condor_observation("76226337.0", 4101, 7001);
+    Observation second = make_condor_observation("76226337.0", 4101, 7001);
+    Observation other_manager = make_condor_observation("76226337.0", 4202, 7002);
+    first.members.push_back(ProcessIdentity{4110, 7010, "boot-fixture-0001"});
+    second.members.push_back(ProcessIdentity{4111, 7011, "boot-fixture-0001"});
+    other_manager.members.push_back(ProcessIdentity{4212, 7012, "boot-fixture-0001"});
+
+    accumulator.add(std::move(first));
+    accumulator.add(std::move(second));       // same generation: merged
+    accumulator.add(std::move(other_manager)); // different manager: kept apart
+
+    const auto observations = accumulator.take();
+    check(observations.size() == 2,
+          "two executions of one identity must stay separate, got " +
+              std::to_string(observations.size()));
+    std::size_t total_members = 0;
+    for (const auto& observation : observations) total_members += observation.members.size();
+    check(total_members == 3,
+          "no member of a different execution may merge into the other generation");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -605,6 +716,13 @@ int main(int argc, char** argv)
             {"observe_hint_targets_one_execution", observe_hint_targets_one_execution},
             {"polymorphic_source_interface", polymorphic_source_interface},
             {"lifecycle_is_safe", lifecycle_is_safe},
+            // Regressions appended last: they extend the shared fixture with
+            // extra processes and would change the counts the cases above
+            // assert.
+            {"condor_ad_on_member_process_is_found", condor_ad_on_member_process_is_found},
+            {"condor_without_cgroup_still_resolves_members",
+             condor_without_cgroup_still_resolves_members},
+            {"accumulator_keeps_generations_separate", accumulator_keeps_generations_separate},
         };
 
         for (const auto& test : tests) {

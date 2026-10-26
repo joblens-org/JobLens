@@ -83,8 +83,9 @@ void run(const std::string& base)
     const auto rules_root = std::filesystem::path(base) / "rules";
     std::filesystem::create_directories(base);
     std::filesystem::create_directories(rules_root / "condor_jobs");
+    std::filesystem::create_directories(rules_root / "condor_accept_only");
     {
-        std::ofstream accept(rules_root / "condor_jobs" / "condor_job_accept.lua");
+        std::ofstream accept(rules_root / "condor_accept_only" / "condor_job_accept.lua");
         accept << "local rule = {}\n"
                   "rule.name = \"accept_cpumem\"\n"
                   "rule.description = \"always accept and collect cpumem\"\n"
@@ -93,6 +94,15 @@ void run(const std::string& base)
                   "    return {passed = true, collectors = {\"cpumem_collector\"}}\n"
                   "end\n"
                   "return rule\n";
+        std::ofstream accept_shared(rules_root / "condor_jobs" / "condor_job_accept.lua");
+        accept_shared << "local rule = {}\n"
+                         "rule.name = \"accept_cpumem\"\n"
+                         "rule.description = \"always accept and collect cpumem\"\n"
+                         "rule.priority = 10\n"
+                         "function rule.condition(job)\n"
+                         "    return {passed = true, collectors = {\"cpumem_collector\"}}\n"
+                         "end\n"
+                         "return rule\n";
         std::ofstream reject(rules_root / "condor_jobs" / "condor_job_reject.lua");
         reject << "local rule = {}\n"
                   "rule.name = \"reject_everything\"\n"
@@ -226,9 +236,57 @@ void run(const std::string& base)
         check(registry.deinit(), "auto policy: deinit after defaults");
     }
 
+    // An observation whose execution generation is not verified yet must be
+    // inventoried but never auto-collected. Completing the generation later is
+    // the first complete registration and triggers the selection then.
+    {
+        JobRegistryOptions options;
+        options.db_path = fresh_dir(base, "lifecycle-incomplete-generation");
+        options.enable_pid_tracker = false;
+        options.register_rpc = false;
+        JobRegistry registry(options);
+
+        ObservedExecution observation;
+        observation.selector.scheduler_type = SchedulerType::Condor;
+        observation.selector.cluster_name = "htcondor01";
+        observation.selector.native_job_id = "710.0";
+        observation.generation.boot_id = "boot";
+        observation.generation.manager_pid = 4343;
+        observation.generation.manager_start_ticks = 0;  // unknown: not verified
+        observation.processes.push_back(ProcessIdentity{4343, 0, "boot"});
+        observation.facts.jobtype = JobType::Job;
+        observation.facts.subtype = JobSubType::Condor;
+
+        const auto created = registry.upsertObservedJob(observation);
+        check(created.ok && created.disposition == UpsertDisposition::Created,
+              "incomplete generation: the instance must still be inventoried");
+        check(registry.bindingRecord(created.internal_id).revision == 0 &&
+                  registry.bindingRecord(created.internal_id).effectiveCollectors().empty(),
+              "incomplete generation: an unverified execution must not be auto-collected");
+        check(registry.findJob(created.internal_id)->CollectorNames.empty(),
+              "incomplete generation: no collector may reach the derived snapshot");
+
+        // The observation that completes the generation selects automatically.
+        auto completed = observation;
+        completed.generation.manager_start_ticks = 910000;
+        completed.processes.front().start_ticks = 910000;
+        const auto updated = registry.upsertObservedJob(completed);
+        check(updated.ok && updated.disposition == UpsertDisposition::Updated,
+              "incomplete generation: the completing observation must update the record");
+        const auto binding = registry.bindingRecord(created.internal_id);
+        check(binding.revision == 1 && binding.effectiveCollectors().size() == 2,
+              "incomplete generation: the completed generation must trigger the "
+              "automatic selection");
+        check(registry.findJob(created.internal_id)->CollectorNames.size() == 2,
+              "incomplete generation: the derived snapshot must follow the late selection");
+
+        check(registry.deinit(), "incomplete generation: deinit");
+    }
+
     // The policy object itself: defaults add the list verbatim, rules decide
     // per job (accept = the rule's collectors, reject = empty) and an error
-    // keeps the previous decision.
+    // keeps the previous decision. A rejection is authoritative: a later
+    // rejecting rule voids the collectors an earlier rule gathered.
     {
         const Job job = make_common_job();
 
@@ -241,13 +299,22 @@ void run(const std::string& base)
               "auto policy: defaults must return the configured list verbatim");
 
         auto rules = AutoCollectorPolicy::rules(
-            (rules_root / "condor_jobs").string(), "condor_job_");
+            (rules_root / "condor_accept_only").string(), "condor_job_");
         const auto accepted = rules.select(job, revision, error);
         check(error.empty(), "auto policy: rule evaluation must not fail: " + error);
         check(revision.rfind("rules:", 0) == 0,
               "auto policy: the rules revision must identify the source");
         check(accepted.size() == 1 && accepted.front() == "cpumem_collector",
               "auto policy: an accepting rule must select its collectors");
+
+        // The shared dir accepts with a high-priority rule and rejects with a
+        // lower-priority one. The overall verdict must win: an empty
+        // selection, not the passing rule's collectors.
+        auto mixed = AutoCollectorPolicy::rules(
+            (rules_root / "condor_jobs").string(), "condor_job_");
+        const auto rejected = mixed.select(job, revision, error);
+        check(error.empty() && rejected.empty(),
+              "auto policy: a rejecting rule must void earlier collectors");
 
         auto broken = AutoCollectorPolicy::rules(
             (rules_root / "does-not-exist").string(), "nope_");

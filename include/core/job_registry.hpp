@@ -78,10 +78,16 @@ enum class UpsertDisposition {
 // One scheduler observation. `facts` carries the typed scheduler attributes;
 // its JobID and CollectorNames are deliberately ignored: inventory upserts
 // never allocate a caller-chosen ID and never activate collection.
+//
+// `members_complete` mirrors the discovery flag: true means the process list
+// is authoritative, an empty list included ("read succeeded, no members");
+// false means the member set is only partially known, so an empty list must
+// never erase stored members.
 struct ObservedExecution {
     NativeSelector selector;
     ExecutionGeneration generation;
     std::vector<ProcessIdentity> processes;
+    bool members_complete = true;
     Job facts;
     int64_t observed_at_us = 0;          // 0 = now
 };
@@ -194,9 +200,10 @@ public:
     // 通过 sub_attr 匹配删除作业，返回删除的作业数量
     size_t delJob(const SubAttrMatcher& matcher);
     // Finish the destructive cleanup after scoped collector work has drained.
+    // Returns false when at least one closing record could not be archived.
     bool acknowledgeJobRemoval(uint64_t jobID);
     size_t closingJobCount() const;
-    void cleanupClosingJobs();
+    bool cleanupClosingJobs();
     // Read-only snapshot: no refresh, no PID pruning, no retirement.
     std::optional<Job> findJob(uint64_t jobID);
     // 通过 sub_attr 匹配查找作业，返回匹配的作业列表
@@ -242,6 +249,13 @@ public:
     void setCollectionApplier(CollectionApplier applier);
     // Last runtime application result for one instance.
     AppliedCollection appliedCollection(uint64_t jobID) const;
+    // Converges one instance's runtime to its current durable binding. A call
+    // is a no-op when the applied state already matches (same revision, same
+    // collector set, applied); otherwise the binding is applied again — this is
+    // the retry path for a failed application and the reconciliation path for
+    // state that drifted (a crash between intent and runtime, a runtime that
+    // started late). Cheap enough to run every maintenance pass.
+    void reconcileCollectionIntent(uint64_t jobID);
     // Re-read process/attribute facts for one stored job from the host and
     // persist them. Used by maintenance for records no discovery source covers
     // (legacy/manual registrations); reads never do this for themselves.
@@ -307,6 +321,11 @@ private:
     // Guards the installed collection applier. Never held while it runs.
     mutable std::mutex                     applier_mtx_;
     CollectionApplier                      collection_applier_;
+    // Serializes collection-runtime applications. Ordering rule: every applier
+    // call reads the current durable binding inside this section, so the last
+    // application always reflects the latest committed intent — an older
+    // caller can never overwrite a newer binding's runtime state.
+    std::mutex                             apply_mtx_;
     // Guards the installed exit hint observer.
     mutable std::mutex                     exit_observer_mtx_;
     std::function<void(pid_t)>             exit_observer_;
@@ -347,13 +366,16 @@ private:
     // callback can never re-enter the registry while it is locked.
     std::vector<JobLifecycleCb> lifecycle_callbacks() const;
     void broadcast_lifecycle(JobEvent event, const Job& job);
-    // Calls the installed collection applier (if any) for one job and records
-    // the runtime result. Never called with a registry lock held.
-    void apply_collection_intent(const Job& job, const BindingRecord& binding,
-                                 AppliedCollection& applied);
-    // Records an application that the lifecycle broadcast itself performed
-    // (registration, startup replay).
-    void mark_applied(uint64_t jobID, uint64_t revision, std::vector<std::string> collectors);
+    // Calls the installed collection applier for one job and records the
+    // runtime result. The binding is re-read and the desired set derived from
+    // it *inside* a serialized section (apply_mtx_), so two concurrent
+    // applications always converge on the latest durable intent instead of
+    // letting a stale fact-update overwrite a newer binding. Never called with
+    // a registry lock held.
+    void applyLatestCollectionIntent(uint64_t internal_id);
+    // Durable lifecycle-state write for one record (the closing transition).
+    // In-memory state changes alone cannot survive a crash during the drain.
+    bool persist_record_state(uint64_t jobID, const std::string& state);
 
     // JobID计数器相关
     void init_job_id_counter();      // 初始化计数器（从数据库加载最大值）

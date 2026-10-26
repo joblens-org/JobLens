@@ -84,9 +84,17 @@ private:
 
     // Builds one observation from a condor_starter candidate using the same
     // sources the scan path reads (starter environ, _CONDOR_JOB_AD file, slot
-    // cgroup), through the injectable discovery roots.
+    // cgroup), through the injectable discovery roots. `preferred_member_pid`
+    // (exec-hint path) is probed for the job ad before the other members.
     Observation observe_starter(const DiscoveryEnvironment& env, const std::string& boot_id,
-                                pid_t starter_pid);
+                                pid_t starter_pid, pid_t preferred_member_pid = 0);
+
+    // Member pids of one starter: cgroup members when the cgroup is readable,
+    // otherwise the starter's live children in /proc (the classic layout where
+    // the job ad is exported to the job process instead of the starter).
+    std::vector<pid_t> collect_member_pids(const DiscoveryEnvironment& env,
+                                           Observation& observation,
+                                           pid_t starter_pid, bool& membership_known);
 
     bool init_event_source();
     // Idempotent counterpart of init_event_source().
@@ -276,7 +284,9 @@ inline std::optional<Observation> CondorJobWatcher::observeForHint(pid_t hint_pi
         cmdline.find("condor_starter") == std::string::npos)
         return std::nullopt;
     const std::string boot_id = read_boot_id(env.proc_root);
-    return observe_starter(env, boot_id, *ppid);
+    // The hinted pid is the exec'd job process: probe it for the job ad first,
+    // mirroring the old exec-event watcher that read _CONDOR_JOB_AD there.
+    return observe_starter(env, boot_id, *ppid, hint_pid);
 }
 
 // ---------------------------------------------------------------------------
@@ -402,9 +412,42 @@ inline ScanResult CondorJobWatcher::finish_scan(ScanResult result)
     return result;
 }
 
+inline std::vector<pid_t> CondorJobWatcher::collect_member_pids(
+    const DiscoveryEnvironment& env, Observation& observation, pid_t starter_pid,
+    bool& membership_known)
+{
+    membership_known = false;
+    std::vector<pid_t> members;
+    std::string members_error;
+    if (!observation.cgroup_path.empty() &&
+        read_cgroup_members(observation.cgroup_path, members, members_error)) {
+        membership_known = true;  // the read succeeded, an empty list included
+        return members;
+    }
+
+    // No readable cgroup: fall back to the starter's live children so member
+    // PIDs (and the job ad that usually lives on them) survive without cgroup
+    // v2. The enumeration cannot prove completeness, so consumers must treat
+    // the member list as partial (members_complete == false).
+    if (!observation.cgroup_path.empty())
+        observation.notes.push_back("cgroup membership unreadable: " + members_error);
+    for (pid_t pid : list_proc_pids(env.proc_root)) {
+        if (pid == starter_pid) continue;
+        const auto ppid = read_proc_ppid(env.proc_root, pid);
+        if (ppid && *ppid == starter_pid) members.push_back(pid);
+    }
+    std::sort(members.begin(), members.end());
+    if (!members.empty())
+        observation.notes.push_back(fmt::format(
+            "cgroup unavailable; {} member pid(s) resolved from the starter's children",
+            members.size()));
+    return members;
+}
+
 inline Observation CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,
                                                      const std::string& boot_id,
-                                                     pid_t starter_pid)
+                                                     pid_t starter_pid,
+                                                     pid_t preferred_member_pid)
 {
     Observation observation;
     std::vector<std::string> reasons;
@@ -418,14 +461,77 @@ inline Observation CondorJobWatcher::observe_starter(const DiscoveryEnvironment&
         reasons.push_back("condor cluster namespace unresolved (COLLECTOR_HOST unavailable)");
     observation.selector.cluster_name = cluster_name;
 
+    const auto manager = read_process_identity(env.proc_root, boot_id, starter_pid);
+    observation.generation.boot_id = manager.boot_id;
+    observation.generation.manager_pid = starter_pid;
+    observation.generation.manager_start_ticks = manager.start_ticks;
+
+    observation.cgroup_path =
+        read_proc_cgroup_path(env.proc_root, starter_pid, env.cgroup_root);
+    observation.generation.cgroup_identity = observation.cgroup_path;
+    if (observation.cgroup_path.empty()) {
+        observation.notes.push_back(fmt::format(
+            "cgroup path unavailable for starter pid {}", starter_pid));
+    }
+
+    // Members first: the job ad usually lives on a member process, so the
+    // membership must be known before the ad resolution can fall back to it.
+    bool membership_known = false;
+    const auto member_pids =
+        collect_member_pids(env, observation, starter_pid, membership_known);
+    observation.members_complete = membership_known;
+    for (pid_t member_pid : member_pids) {
+        if (member_pid == starter_pid) continue;
+        const auto member =
+            read_process_identity(env.proc_root, boot_id, member_pid);
+        if (!member.complete()) observation.members_complete = false;
+        observation.members.push_back(member);
+    }
+    if (member_pids.empty() && membership_known)
+        observation.notes.push_back("cgroup " + observation.cgroup_path +
+                                    " has no member processes");
+
+    // Job ad resolution: the starter's own _CONDOR_JOB_AD first, then the job
+    // child processes. HTCondor exports the ad to the job environment, and the
+    // previous exec-event watcher read it from there; requiring it on the
+    // starter regressed that discovery path.
     std::string ad_path;
     std::string env_error;
-    if (!read_proc_env(env.proc_root, starter_pid, "_CONDOR_JOB_AD", ad_path, env_error)) {
-        reasons.push_back(fmt::format("condor job ad path unreadable for pid {}: {}",
-                                      starter_pid, env_error));
-    } else if (ad_path.empty()) {
-        reasons.push_back(fmt::format(
-            "condor job ad path unavailable for pid {}: _CONDOR_JOB_AD missing", starter_pid));
+    bool ad_from_starter = false;
+    if (read_proc_env(env.proc_root, starter_pid, "_CONDOR_JOB_AD", ad_path, env_error) &&
+        !ad_path.empty()) {
+        ad_from_starter = true;
+    } else {
+        std::vector<pid_t> ad_candidates;
+        if (preferred_member_pid > 0) ad_candidates.push_back(preferred_member_pid);
+        for (pid_t member_pid : member_pids) {
+            if (member_pid != preferred_member_pid && member_pid != starter_pid)
+                ad_candidates.push_back(member_pid);
+        }
+        for (pid_t candidate : ad_candidates) {
+            std::string candidate_error;
+            if (read_proc_env(env.proc_root, candidate, "_CONDOR_JOB_AD", ad_path,
+                              candidate_error) &&
+                !ad_path.empty()) {
+                observation.notes.push_back(fmt::format(
+                    "_CONDOR_JOB_AD read from job process {} (starter has none)", candidate));
+                break;
+            }
+            ad_path.clear();
+        }
+    }
+
+    if (ad_path.empty()) {
+        if (ad_from_starter) {
+            reasons.push_back(fmt::format(
+                "condor job ad path unavailable for pid {}: _CONDOR_JOB_AD missing",
+                starter_pid));
+        } else {
+            reasons.push_back(fmt::format(
+                "condor job ad unavailable: _CONDOR_JOB_AD missing on starter {} and on "
+                "every job process",
+                starter_pid));
+        }
     } else {
         std::string ad_content;
         std::string ad_error;
@@ -442,31 +548,6 @@ inline Observation CondorJobWatcher::observe_starter(const DiscoveryEnvironment&
                 observation.owner = ad->owner;
                 observation.scheduler_host = ad->scheduler_host;
             }
-        }
-    }
-
-    const auto manager = read_process_identity(env.proc_root, boot_id, starter_pid);
-    observation.generation.boot_id = manager.boot_id;
-    observation.generation.manager_pid = starter_pid;
-    observation.generation.manager_start_ticks = manager.start_ticks;
-
-    observation.cgroup_path =
-        read_proc_cgroup_path(env.proc_root, starter_pid, env.cgroup_root);
-    observation.generation.cgroup_identity = observation.cgroup_path;
-    if (observation.cgroup_path.empty()) {
-        observation.notes.push_back(fmt::format(
-            "cgroup path unavailable for starter pid {}", starter_pid));
-    } else {
-        const auto cgroup_pids = read_cgroup_members(observation.cgroup_path);
-        if (cgroup_pids.empty())
-            observation.notes.push_back("cgroup " + observation.cgroup_path +
-                                        " has no member processes");
-        for (pid_t member_pid : cgroup_pids) {
-            if (member_pid == starter_pid) continue;
-            const auto member =
-                read_process_identity(env.proc_root, boot_id, member_pid);
-            if (!member.complete()) observation.members_complete = false;
-            observation.members.push_back(member);
         }
     }
 

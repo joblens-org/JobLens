@@ -191,9 +191,19 @@ CollectionOutcome JobCollectionManager::mutate(const CollectionRequest& request,
         }
     }
 
-    // Applied state always comes from the runtime, never from the desired list.
-    for (auto& target : planned)
+    // Phase 3: convergence. Whether an application should run depends on the
+    // runtime state, not on whether the desired list changed: a repeat of a
+    // request whose first application failed (or was lost to a crash) must
+    // retry the runtime instead of reporting "unchanged" against a broken
+    // state. Targets the commit above already applied are not retried here —
+    // the retry belongs to the next identical request or the next maintenance
+    // pass, not to a double call inside one request.
+    const bool commit_applied = !pending.empty();
+    for (auto& target : planned) {
+        if (!(commit_applied && target.changed))
+            registry_.reconcileCollectionIntent(target.internal_id);
         target.applied = registry_.appliedCollection(target.internal_id);
+    }
 
     outcome.ok = true;
     outcome.targets = std::move(planned);
@@ -297,8 +307,14 @@ CollectionOutcome JobCollectionManager::applyAutoPolicy(
         }
     }
 
-    for (auto& target : planned)
+    // Same convergence rule as an explicit request: targets the transaction
+    // above applied are not retried inside this call.
+    const bool commit_applied = !pending.empty();
+    for (auto& target : planned) {
+        if (!(commit_applied && target.changed))
+            registry_.reconcileCollectionIntent(target.internal_id);
         target.applied = registry_.appliedCollection(target.internal_id);
+    }
 
     outcome.ok = true;
     outcome.targets = std::move(planned);

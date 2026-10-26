@@ -431,7 +431,12 @@ static bool merge_common_attr(CommonJobAttr& target, const CommonJobAttr& source
 // Merge observation facts into the stored facts. Empty/default observation
 // fields never erase known facts; CollectorNames is never taken from an
 // observation because selection is intent, not a discovery fact.
-static bool merge_job_facts(Job& target, const Job& observed) {
+//
+// `replace_members` upgrades the PID list to an authoritative replacement: an
+// empty list then means "the source read the membership and found none", which
+// must clear stale PIDs instead of silently keeping them. Without the flag
+// (membership only partially known) an empty list is ignored.
+static bool merge_job_facts(Job& target, const Job& observed, bool replace_members) {
     bool changed = false;
 
     if (observed.subtype != JobSubType::Unknown && target.subtype != observed.subtype) {
@@ -446,12 +451,15 @@ static bool merge_job_facts(Job& target, const Job& observed) {
     changed |= merge_text(target.cluster_name, observed.cluster_name);
     changed |= merge_text(target.clusterTag, observed.clusterTag);
 
-    if (!observed.JobPIDs.empty()) {
-        auto pids = observed.JobPIDs;
-        std::sort(pids.begin(), pids.end());
-        pids.erase(std::unique(pids.begin(), pids.end()), pids.end());
-        if (pids != target.JobPIDs) {
-            target.JobPIDs = std::move(pids);
+    std::vector<pid_t> observed_pids = observed.JobPIDs;
+    std::sort(observed_pids.begin(), observed_pids.end());
+    observed_pids.erase(std::unique(observed_pids.begin(), observed_pids.end()),
+                        observed_pids.end());
+    // Authoritative replacement (possibly empty), or a non-empty merge list;
+    // a partial member set never erases stored members.
+    if (replace_members || !observed_pids.empty()) {
+        if (observed_pids != target.JobPIDs) {
+            target.JobPIDs = std::move(observed_pids);
             changed = true;
         }
     }
@@ -847,12 +855,16 @@ bool JobRegistry::deinit()
     if (inventory_ && !inventory_->stoppedDiscovery()) stopInventoryDiscovery();
 
     bool ok = true;
+    // Archive leftover closing records (an interrupted retirement restored
+    // from the db, a drain whose ack never arrived) before the controller's
+    // finalize: otherwise a restored closing record would be reported as an
+    // incomplete drain even though the archive below succeeds.
+    if (!cleanupClosingJobs()) ok = false;
     if (inventory_ && !inventory_->finalize()) ok = false;
     inventory_.reset();
     condor_source_.reset();
     slurm_source_.reset();
 
-    cleanupClosingJobs();
     stop_pid_tracker();
     if (db_running) deinit_job_db();
 
@@ -998,6 +1010,15 @@ void JobRegistry::reconcile_loop() {
         auto jobs = snapshot();
         for (auto& job : jobs) {
             sync_job_to_kernel(job);
+            // Write the resolved cgroup id back to the stored job: removal
+            // needs the cached id when the cgroup directory may already be
+            // gone (a snapshot copy is discarded here).
+            if (job.cgroup_id != 0) {
+                std::unique_lock lg(mtx_);
+                if (auto it = jobs_.find(job.JobID); it != jobs_.end() &&
+                                                       it->second.cgroup_id != job.cgroup_id)
+                    it->second.cgroup_id = job.cgroup_id;
+            }
         }
         spdlog::debug("JobRegistry: pid tracker reconcile pass done, resynced {} jobs to kernel", jobs.size());
 
@@ -2282,19 +2303,11 @@ bool JobRegistry::addJob(const Job& job, bool from_db) {
 
     const auto callbacks = lifecycle_callbacks();
     for (const auto& cb : callbacks) cb(JobEvent::Added, job_for_cb);
-    // The Added broadcast is the runtime application for a registration, so the
-    // applied state is recorded from it instead of asking the runtime twice.
-    if (!job_for_cb.CollectorNames.empty()) {
-        if (callbacks.empty()) {
-            AppliedCollection applied;
-            applied.error = "no_collection_runtime";
-            std::lock_guard lg(mtx_);
-            applied_collections_[job.JobID] = applied;
-        } else {
-            mark_applied(job.JobID, bindingRecord(job.JobID).revision,
-                         job_for_cb.CollectorNames);
-        }
-    }
+    // The Added broadcast performs the runtime application; the serialized
+    // reconcile records the *verified* runtime state afterwards instead of
+    // assuming the broadcast succeeded (a plain observer callback proves
+    // nothing about collector initialization).
+    reconcileCollectionIntent(job.JobID);
     sync_job_to_kernel(job_for_cb);
     spdlog::info("JobRegistry: add job with JobID {}", job.JobID);
     return true;
@@ -2321,13 +2334,21 @@ bool JobRegistry::retireInstance(uint64_t jobID) {
                 jobs_.erase(it);
             }
         }
-        // Visible lifecycle state while the drain is outstanding.
+        // Visible lifecycle state while the drain is outstanding. The closing
+        // fact is durable: a crash (or a failed archive) followed by a restart
+        // must not resurrect the instance as active while its retirement was
+        // already accepted.
         if (const auto record = records_.find(jobID); record != records_.end())
             record->second.state = "closing";
         applied_collections_.erase(jobID);
     }
 
     if (has_callbacks) {
+        if (!persist_record_state(jobID, "closing")) {
+            spdlog::error("JobRegistry: could not persist the closing state for JobID {}; "
+                          "a crash before the archive would resurrect the instance",
+                          jobID);
+        }
         // Collectors retain the snapshot and acknowledge after their accepted
         // tail has drained; kernel attribution and history wait for that ack.
         broadcast_lifecycle(JobEvent::Removed, removed);
@@ -2376,7 +2397,8 @@ size_t JobRegistry::closingJobCount() const {
     return closing_jobs_.size();
 }
 
-void JobRegistry::cleanupClosingJobs() {
+bool JobRegistry::cleanupClosingJobs() {
+    bool all_archived = true;
     std::vector<Job> closing;
     {
         std::shared_lock lg(mtx_);
@@ -2389,11 +2411,13 @@ void JobRegistry::cleanupClosingJobs() {
             std::lock_guard lg(mtx_);
             closing_jobs_.erase(job.JobID);
         } else {
+            all_archived = false;
             spdlog::error("JobRegistry: shutdown could not archive closing JobID {}; "
                           "the incomplete closing state is persisted for recovery",
                           job.JobID);
         }
     }
+    return all_archived;
 }
 
 bool JobRegistry::finishJobRemoval(const Job& job) {
@@ -2423,6 +2447,15 @@ size_t JobRegistry::delJob(const SubAttrMatcher& matcher) {
         }
         for (const auto& job : removed_jobs) closing_jobs_[job.JobID] = job;
         has_callbacks = !cbs_.empty();
+    }
+
+    // The closing fact is durable before any drain starts (see retireInstance).
+    for (const auto& job : removed_jobs) {
+        if (!persist_record_state(job.JobID, "closing")) {
+            spdlog::error("JobRegistry: could not persist the closing state for JobID {}; "
+                          "a crash before the archive would resurrect the instance",
+                          job.JobID);
+        }
     }
 
     for (const auto& job : removed_jobs) {
@@ -3070,6 +3103,13 @@ void JobRegistry::restore_records_from_db() {
             if (jobID == kSystemSentinelJobId) continue;
             try {
                 auto stored = parse_job_record(it->value().ToString(), jobID);
+                if (stored.meta.state == "closing") {
+                    // An interrupted retirement: the drain owns the record, it
+                    // must not come back as an active instance. It stays out of
+                    // the active map and is archived by the closing cleanup.
+                    restored.push_back(std::move(stored));
+                    continue;
+                }
                 // Validate restored executions before publishing them: a
                 // stale generation is marked suspect (never replayed), dead
                 // PIDs are dropped and never replayed into kernel maps.
@@ -3109,8 +3149,22 @@ void JobRegistry::restore_records_from_db() {
 
     {
         std::unique_lock lg(mtx_);
+        size_t closing_restored = 0;
         for (auto& stored : restored) {
             stored.meta.instance_id = derive_instance_id(db_uuid_, stored.meta.internal_id);
+            if (stored.meta.state == "closing") {
+                // Interrupted retirement: keep the identity index entry in
+                // place (observations must resolve to it and be rejected as
+                // closing), but never publish it as an active instance.
+                if (stored.meta.identity_complete && !stored.meta.quarantined) {
+                    identity_ids_[identity_index_key(stored.meta.identity)] =
+                        stored.meta.internal_id;
+                }
+                records_[stored.meta.internal_id] = stored.meta;
+                closing_jobs_[stored.meta.internal_id] = stored.job;
+                ++closing_restored;
+                continue;
+            }
             if (stored.meta.identity_complete && !stored.meta.quarantined) {
                 const auto index_key = identity_index_key(stored.meta.identity);
                 const auto existing = identity_ids_.find(index_key);
@@ -3126,6 +3180,11 @@ void JobRegistry::restore_records_from_db() {
             }
             jobs_[stored.meta.internal_id] = stored.job;
             records_[stored.meta.internal_id] = stored.meta;
+        }
+        if (closing_restored > 0) {
+            spdlog::warn("JobRegistry: restored {} interrupted closing record(s); they "
+                         "will be archived by the closing cleanup",
+                         closing_restored);
         }
     }
 
@@ -3436,6 +3495,38 @@ void JobRegistry::note_record_in_memory(const InventoryRecord& meta, const Job& 
 }
 
 
+bool JobRegistry::persist_record_state(uint64_t jobID, const std::string& state) {
+    if (!db_running || job_db == nullptr) return false;
+
+    // Serialize with observation upserts: the record read-modify-write must
+    // not lose a concurrent fact update's fields.
+    std::lock_guard<std::mutex> admission(upsert_mtx_);
+    std::lock_guard<std::mutex> db_lock(db_mtx_);
+
+    std::string raw;
+    auto status = job_db->Get(leveldb::ReadOptions(), key_job(jobID), &raw);
+    if (status.IsNotFound()) return true;   // nothing durable left to mark
+    if (!status.ok()) {
+        record_store_failure("LevelDB read failed (record state): " + status.ToString());
+        return false;
+    }
+
+    StoredRecord stored;
+    try {
+        stored = parse_job_record(raw, jobID);
+    } catch (const std::exception& error) {
+        record_store_failure("corrupt job record during state persist");
+        return false;
+    }
+    if (stored.meta.state == state) return true;
+
+    stored.meta.state = state;
+    leveldb::WriteBatch batch;
+    batch.Put(key_job(jobID), job_record_json(stored.job, stored.meta).dump());
+    status = write_batch_locked(batch, "persist record state");
+    return status.ok();
+}
+
 bool JobRegistry::update_job_info(const Job& job){
     if(!db_running) return false;
     std::lock_guard<std::mutex> admission(upsert_mtx_);
@@ -3709,20 +3800,26 @@ UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation
                 return result;
             }
 
-            // Merge facts idempotently.
+            // Merge facts idempotently. The member list is authoritative only
+            // when the source says so: an empty list from a partially-known
+            // membership must never erase stored members.
             Job observed_job = observation.facts;
             observed_job.JobID = internal_id;
             observed_job.CollectorNames = stored.CollectorNames;
             apply_identity_to_facts(observed_job, observation.selector, *identity);
+            const bool authoritative_members = observation.members_complete;
             if (!observation.processes.empty()) {
                 observed_job.JobPIDs.clear();
                 for (const auto& process : observation.processes) {
                     observed_job.JobPIDs.push_back(process.pid);
                 }
+            } else if (observation.members_complete) {
+                // Read succeeded, no members: an authoritative empty set.
+                observed_job.JobPIDs.clear();
             }
 
             Job merged = stored;
-            merge_job_facts(merged, observed_job);
+            merge_job_facts(merged, observed_job, authoritative_members);
             merged.JobID = internal_id;
             merged.CollectorNames = stored.CollectorNames;
 
@@ -3732,9 +3829,14 @@ UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation
             // last_seen is memory-first: it is persisted with the next real
             // fact change rather than on every observation (task 3 checkpoints
             // heartbeats at reconciliation boundaries).
+            const bool generation_became_complete =
+                !meta.generation.complete() && observation.generation.complete();
             if (observation.generation.complete()) updated.generation = observation.generation;
             if (!observation.processes.empty()) {
                 updated.processes = normalized_processes(observation.processes);
+            } else if (observation.members_complete) {
+                // Confirmed empty membership replaces the stored evidence.
+                updated.processes.clear();
             } else if (!observed_job.JobPIDs.empty()) {
                 updated.processes.clear();
                 for (const auto pid : observed_job.JobPIDs) {
@@ -3783,11 +3885,17 @@ UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation
                           internal_id, updated.facts_revision);
 
             // Fact changes reach already bound consumers (fresh PIDs/attributes)
-            // and the collection runtime outside every registry lock.
+            // and the collection runtime outside every registry lock. The
+            // application re-reads the durable binding inside a serialized
+            // section, so a fact update can never re-apply a binding a newer
+            // commit has already superseded.
             admission.unlock();
-            const BindingRecord binding = bindingRecord(internal_id);
-            AppliedCollection applied;
-            apply_collection_intent(merged, binding, applied);
+            applyLatestCollectionIntent(internal_id);
+            // A record registered from an incomplete observation has never seen
+            // an automatic selection. The pass that completes its execution
+            // generation is its first complete registration.
+            if (generation_became_complete)
+                apply_auto_policy(merged, identity->scheduler_type);
             return result;
         }
     }
@@ -3862,12 +3970,29 @@ UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation
                  allocated, to_string(identity->scheduler_type), identity->native_job_id);
 
     // Facts only: an unbound instance creates no collector work, but System
-    // collectors must still learn the job exists (plan section 6.3).
+    // collectors must still learn the job exists (plan section 6.3). Kernel
+    // attribution is initialized here, exactly like the legacy registration:
+    // eBPF attribution and the cgroup map must not wait ~30s for the tracker
+    // reconcile, and the cached cgroup id must exist for the later removal.
     admission.unlock();
+    {
+        Job kernel_job = job;
+        sync_job_to_kernel(kernel_job);   // resolves + caches the cgroup id
+        // Write the cached id back: removal later needs it when the cgroup
+        // directory may already be gone.
+        if (kernel_job.cgroup_id != 0) {
+            std::lock_guard lg(mtx_);
+            if (auto it = jobs_.find(kernel_job.JobID); it != jobs_.end())
+                it->second.cgroup_id = kernel_job.cgroup_id;
+        }
+    }
     broadcast_lifecycle(JobEvent::Added, job);
     // First complete registration is an automatic-selection trigger (plan
-    // 6.2); Lua evaluation happens outside every registry lock.
-    apply_auto_policy(job, identity->scheduler_type);
+    // 6.2); Lua evaluation happens outside every registry lock. An observation
+    // whose execution generation is not verified yet is never auto-collected:
+    // the update that completes the generation re-runs the selection instead.
+    if (observation.generation.complete())
+        apply_auto_policy(job, identity->scheduler_type);
     return result;
 }
 
@@ -4006,15 +4131,9 @@ bool JobRegistry::commitBindings(const std::vector<BindingRecord>& bindings,
     for (const auto& binding : bindings) {
         if (std::find(apply_ids.begin(), apply_ids.end(), binding.internal_id) == apply_ids.end())
             continue;
-        Job job;
-        {
-            std::shared_lock lg(mtx_);
-            const auto it = jobs_.find(binding.internal_id);
-            if (it == jobs_.end()) continue;  // retired meanwhile: nothing to apply
-            job = it->second;
-        }
-        AppliedCollection applied;
-        apply_collection_intent(job, binding, applied);
+        // Serialized application: the binding re-read inside makes a racing
+        // fact-update application converge on this commit, never the reverse.
+        applyLatestCollectionIntent(binding.internal_id);
     }
     return true;
 }
@@ -4047,45 +4166,95 @@ void JobRegistry::setCollectionApplier(CollectionApplier applier) {
     collection_applier_ = std::move(applier);
 }
 
-void JobRegistry::apply_collection_intent(const Job& job, const BindingRecord& binding,
-                                          AppliedCollection& applied) {
+void JobRegistry::applyLatestCollectionIntent(uint64_t internal_id) {
     CollectionApplier applier;
     {
         std::lock_guard<std::mutex> lock(applier_mtx_);
         applier = collection_applier_;
     }
 
-    applied = AppliedCollection{};
+    // Serialize all runtime applications. Whoever holds apply_mtx_ re-reads
+    // the durable binding and derives the desired set from it, so concurrent
+    // applications always converge on the latest committed intent: a stale
+    // fact-update can apply only what is current when it finally runs, never
+    // the snapshot it started with.
+    std::lock_guard<std::mutex> apply_lock(apply_mtx_);
+
+    const AppliedCollection previous = appliedCollection(internal_id);
+    const BindingRecord binding = bindingRecord(internal_id);
+
+    const auto converged = [&]() {
+        return previous.applied && previous.revision == binding.revision &&
+               previous.collectors == binding.effectiveCollectors();
+    };
+    if (binding.revision == 0) {
+        // No intent was ever recorded: nothing to converge, and inventing an
+        // error state for an unbound instance would misreport it.
+        return;
+    }
+    if (converged()) return;
+
+    Job job;
+    {
+        std::shared_lock lg(mtx_);
+        const auto it = jobs_.find(internal_id);
+        if (it == jobs_.end()) return;  // retired meanwhile: nothing to apply
+        job = it->second;
+    }
+
+    AppliedCollection applied;
     applied.revision = binding.revision;
     if (!applier) {
         // No collection runtime on this Agent (inventory-only core, tests).
         // The intent is durable, but nothing was applied: say so.
         applied.error = "no_collection_runtime";
     } else {
+        // The desired set comes from the binding, never from a job snapshot
+        // that may have been read before a newer binding committed.
+        Job desired = job;
+        desired.CollectorNames = binding.effectiveCollectors();
         std::vector<std::string> collectors;
         std::string error;
         bool ok = false;
         try {
-            ok = applier(job, collectors, error);
+            ok = applier(desired, collectors, error);
         } catch (const std::exception& failure) {
             error = std::string("collection runtime threw: ") + failure.what();
         }
+        // A partially successful application stays visible: collectors holds
+        // exactly what the runtime reported as bound, applied=false says the
+        // binding is not fully in effect.
         applied.applied = ok;
-        applied.collectors = ok ? std::move(collectors) : std::vector<std::string>{};
+        applied.collectors = collectors;
         if (!ok && error.empty()) error = "collection runtime rejected the binding";
         applied.error = error;
-        if (!ok)
+        const bool changed_state =
+            previous.applied != applied.applied || previous.collectors != applied.collectors ||
+            previous.revision != applied.revision || previous.error != applied.error;
+        if (!ok && !changed_state)
+            spdlog::debug("JobRegistry: collection intent for JobID {} still not applied: {}",
+                          job.JobID, error);
+        else if (!ok)
             spdlog::warn("JobRegistry: collection intent for JobID {} not applied: {}",
                          job.JobID, error);
     }
 
-    std::lock_guard lg(mtx_);
-    if (jobs_.count(job.JobID) == 0) {
-        // The instance was retired while the runtime was applying the intent;
-        // its applied state no longer has an owner.
-        return;
+    {
+        std::lock_guard lg(mtx_);
+        if (jobs_.count(internal_id) == 0) {
+            // The instance was retired while the runtime was applying the
+            // intent; its applied state no longer has an owner.
+            return;
+        }
+        applied_collections_[internal_id] = applied;
     }
-    applied_collections_[job.JobID] = applied;
+}
+
+void JobRegistry::reconcileCollectionIntent(uint64_t internal_id) {
+    // Retry/repair semantics live in the serialized application; this wrapper
+    // exists so callers (maintenance pass, collection manager) express intent
+    // ("make the runtime match the store") instead of mechanism.
+    applyLatestCollectionIntent(internal_id);
 }
 
 AppliedCollection JobRegistry::appliedCollection(uint64_t jobID) const {
@@ -4093,19 +4262,6 @@ AppliedCollection JobRegistry::appliedCollection(uint64_t jobID) const {
     const auto it = applied_collections_.find(jobID);
     if (it != applied_collections_.end()) return it->second;
     return AppliedCollection{};
-}
-
-void JobRegistry::mark_applied(uint64_t jobID, uint64_t revision,
-                               std::vector<std::string> collectors) {
-    std::sort(collectors.begin(), collectors.end());
-    collectors.erase(std::unique(collectors.begin(), collectors.end()), collectors.end());
-    AppliedCollection applied;
-    applied.applied = true;
-    applied.revision = revision;
-    applied.collectors = std::move(collectors);
-    std::lock_guard lg(mtx_);
-    if (jobs_.count(jobID) == 0) return;  // retired while the replay ran
-    applied_collections_[jobID] = std::move(applied);
 }
 
 void JobRegistry::setInstanceState(uint64_t jobID, const std::string& state) {
@@ -4234,9 +4390,17 @@ void JobRegistry::addLifecycleCb(JobLifecycleCb cb) {
         // Restored records are already published; replay them once to this
         // subscriber instead of re-adding them (which used to reject
         // empty-binding inventory records).
+        //
+        // A record restored as suspect was already judged unverifiable (stale
+        // execution generation, no live process). Replaying it would re-arm
+        // collection on an execution nobody has revalidated, so the replay
+        // skips it; maintenance re-admits it (state back to active) as soon as
+        // a fresh observation proves the execution again.
         replay.reserve(jobs_.size());
         for (const auto& [id, job] : jobs_) {
             if (id == kSystemSentinelJobId) continue;
+            const auto record = records_.find(id);
+            if (record != records_.end() && record->second.state != "active") continue;
             replay.push_back(job);
         }
     }
@@ -4245,10 +4409,11 @@ void JobRegistry::addLifecycleCb(JobLifecycleCb cb) {
         cb(JobEvent::Added, job);
     }
 
-    // The replay is how persisted intent is applied after a restart, so record
-    // the same applied state a fresh registration would report.
+    // The replay is how persisted intent is applied after a restart. Record
+    // the verified runtime state per instance instead of assuming the replay
+    // succeeded (the subscriber may lack a runtime or reject the binding).
     for (const auto& job : replay) {
         if (job.CollectorNames.empty()) continue;
-        mark_applied(job.JobID, bindingRecord(job.JobID).revision, job.CollectorNames);
+        reconcileCollectionIntent(job.JobID);
     }
 }

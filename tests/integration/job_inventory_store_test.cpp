@@ -541,6 +541,138 @@ void write_failures_reject_mutations_without_id_reuse(const std::string& base)
     registry.clearStoreFaultsForTest();
 }
 
+// A24 -----------------------------------------------------------------------
+
+void closing_state_is_durable_and_not_resurrected(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a24-closing");
+    uint64_t internal_id = 0;
+
+    {
+        JobRegistry registry(isolated(path));
+        const auto created = registry.upsertObservedJob(condor_observation("172.0"));
+        check(created.ok, "baseline registration must succeed");
+        internal_id = created.internal_id;
+
+        // A subscriber makes the retirement a drain: the record must survive
+        // the process as closing, not as an active instance. The injected
+        // fault models the archive failing (or the process dying) before the
+        // drain completes — exactly the restart scenario being tested.
+        registry.addLifecycleCb([](JobEvent, const Job&) {});
+        check(registry.retireInstance(internal_id),
+              "retirement with a subscriber must be accepted");
+        check(!registry.hasInstance(internal_id),
+              "a closing instance must leave the active map");
+        check(registry.inventoryRecord(internal_id).has_value(),
+              "a closing instance stays visible until the archive");
+        registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite);
+        check(!registry.deinit(),
+              "deinit must report a shutdown that could not archive the drain");
+    }
+
+    {
+        // Restart on the same DB: the interrupted retirement must be restored
+        // as closing, never as an active job, and observations of the same
+        // identity must be refused instead of resurrecting the instance.
+        JobRegistry registry(isolated(path));
+        const auto record = registry.inventoryRecord(internal_id);
+        check(record.has_value(), "the closing record must be restored");
+        check(record->state == "closing",
+              "the restored record must carry the durable closing state, got " +
+                  record->state);
+        check(!registry.hasInstance(internal_id),
+              "a restored closing instance must not be an active job");
+        check(!registry.findJob(internal_id).has_value(),
+              "a restored closing instance must not be findable as active");
+
+        const auto late = registry.upsertObservedJob(condor_observation("172.0"));
+        check(!late.ok && late.error == "instance_closing",
+              "a closing instance must reject late observations, got " + late.error);
+
+        // The closing cleanup finishes the interrupted retirement.
+        check(registry.cleanupClosingJobs(), "the closing cleanup must archive the record");
+        check(!registry.inventoryRecord(internal_id).has_value(),
+              "the archive must remove the closing record");
+        const auto history = registry.upsertObservedJob(condor_observation("172.0"));
+        check(history.ok && history.disposition == UpsertDisposition::Created,
+              "after the archive the identity can register again as a new instance");
+    }
+}
+
+// A25 -----------------------------------------------------------------------
+
+void restored_suspect_instances_are_not_replayed(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a25-suspect");
+    const pid_t manager_pid = 2000002;   // no such process
+    uint64_t internal_id = 0;
+
+    {
+        JobRegistry registry(isolated(path));
+        auto observation = condor_observation("172.0");
+        observation.generation = ExecutionGeneration{
+            "boot-does-not-exist", manager_pid, 123456, ""};
+        observation.processes = {
+            ProcessIdentity{manager_pid, 123456, "boot-does-not-exist"}};
+        const auto created = registry.upsertObservedJob(observation);
+        check(created.ok, "registration must succeed");
+        internal_id = created.internal_id;
+    }
+
+    {
+        JobRegistry registry(isolated(path));
+        check(registry.inventoryRecord(internal_id).has_value() &&
+                  registry.inventoryRecord(internal_id)->state == "suspect",
+              "the stale generation must be restored as suspect");
+
+        size_t added = 0;
+        registry.addLifecycleCb([&added, internal_id](JobEvent event, const Job& job) {
+            if (event == JobEvent::Added && job.JobID == internal_id) ++added;
+        });
+        check(added == 0,
+              "a suspect execution must not be replayed to collectors after a restart");
+    }
+}
+
+// A26 -----------------------------------------------------------------------
+
+void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a26-members");
+    JobRegistry registry(isolated(path));
+
+    const auto created = registry.upsertObservedJob(condor_observation("172.0"));
+    check(created.ok && created.disposition == UpsertDisposition::Created,
+          "baseline registration must succeed");
+    check(registry.findJob(created.internal_id)->JobPIDs.size() == 1,
+          "the fixture must register one member pid");
+
+    // A partially-known membership with an empty list must not erase members:
+    // the source could not read everything, so "no members" is not proven.
+    auto partial = condor_observation("172.0");
+    partial.processes.clear();
+    partial.members_complete = false;
+    const auto kept = registry.upsertObservedJob(partial);
+    check(kept.ok && kept.disposition == UpsertDisposition::Unchanged,
+          "a non-authoritative empty list must change nothing");
+    check(registry.findJob(created.internal_id)->JobPIDs.size() == 1,
+          "a non-authoritative empty list must not erase members");
+
+    // An authoritative empty list is positive evidence: the stored members
+    // are replaced by the confirmed empty set.
+    auto confirmed_empty = condor_observation("172.0");
+    confirmed_empty.processes.clear();
+    confirmed_empty.members_complete = true;
+    const auto cleared = registry.upsertObservedJob(confirmed_empty);
+    check(cleared.ok && cleared.disposition == UpsertDisposition::Updated,
+          "a confirmed empty membership must be applied to facts");
+    check(registry.findJob(created.internal_id)->JobPIDs.empty(),
+          "a confirmed empty membership must clear stale member pids");
+    const auto record = registry.inventoryRecord(created.internal_id);
+    check(record.has_value() && record->processes.empty(),
+          "the stored process evidence must follow the confirmed empty set");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -554,10 +686,15 @@ int main(int argc, char** argv)
         conflicting_live_identities_are_quarantined(base);
         stale_generation_is_not_replayed(base);
         write_failures_reject_mutations_without_id_reuse(base);
+        closing_state_is_durable_and_not_resurrected(base);
+        restored_suspect_instances_are_not_replayed(base);
+        member_semantics_distinguish_unknown_from_confirmed_empty(base);
         std::cout << "PASS inventory store: A04 empty-binding upsert idempotency, "
                      "A19 legacy restore and manual migration, A20 resumable "
                      "migration, quarantine and stale-generation rejection, A21 "
-                     "durable-write failure handling and no ID reuse\n";
+                     "durable-write failure handling and no ID reuse, A24 "
+                     "durable closing state, A25 suspect replay filter, A26 "
+                     "member semantics (unknown vs confirmed empty)\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

@@ -1194,6 +1194,7 @@ ObservedExecution JobInventoryMaintenance::to_execution(
     execution.selector = observation.selector;
     execution.generation = observation.generation;
     execution.processes = observation.members;
+    execution.members_complete = observation.members_complete;
 
     Job facts;
     facts.jobtype = JobType::Job;
@@ -1289,6 +1290,7 @@ void JobInventoryMaintenance::refreshLegacyRecords()
 {
     for (const auto& record : registry_.inventoryRecords()) {
         if (record.internal_id == kSystemSentinelJobId) continue;
+        if (record.state == "closing") continue;  // the drain owns it
         if (record.generation.complete()) continue;  // discovery owns these facts
         if (record.processes.empty()) continue;      // no liveness evidence yet
         registry_.refreshJobFacts(record.internal_id);
@@ -1304,7 +1306,15 @@ void JobInventoryMaintenance::evaluateRetirements(
 
     for (const auto& record : records) {
         if (record.internal_id == 0) continue;
-        if (isClosing(record.internal_id)) continue;
+        if (record.state == "closing" || isClosing(record.internal_id)) continue;
+
+        // Desired/applied reconciliation runs for every *active* instance on
+        // every pass: a binding whose runtime application failed, or whose
+        // application was lost to a crash, converges here without waiting for
+        // an observation to change facts. A suspect execution is never
+        // (re)armed from here — it must be observed again first.
+        if (record.state == "active")
+            registry_.reconcileCollectionIntent(record.internal_id);
 
         int absences = 0;
         {
@@ -1379,13 +1389,18 @@ void JobInventoryMaintenance::evaluateRetirements(
         // A live manager always wins, whatever the PID list or cgroup says.
         if (manager_liveness.state == LivenessState::Alive) continue;
 
-        bool cgroup_known = false;
+        bool cgroup_empty_confirmed = false;
         bool cgroup_live = false;
+        bool cgroup_inconclusive = false;
         if (!record.generation.cgroup_identity.empty() && cgroup_probe_) {
             const CgroupMembership membership =
                 cgroup_probe_(record.generation.cgroup_identity);
-            cgroup_known = membership.readable;
             if (membership.readable) {
+                if (membership.members.empty()) {
+                    // The read succeeded and found nothing: this is positive
+                    // "cgroup is empty" evidence, not missing data.
+                    cgroup_empty_confirmed = true;
+                }
                 for (const pid_t pid : membership.members) {
                     const LivenessResult member = process_probe_
                                                       ? process_probe_(ProcessIdentity{pid, 0, ""})
@@ -1394,11 +1409,17 @@ void JobInventoryMaintenance::evaluateRetirements(
                         cgroup_live = true;
                         break;
                     }
+                    if (member.state == LivenessState::Unknown)
+                        cgroup_inconclusive = true;
                 }
             }
         }
 
-        if (manager_liveness.state == LivenessState::Dead && cgroup_known && !cgroup_live) {
+        // Retire only on positive termination evidence: a dead manager plus a
+        // cgroup that was read and is confirmed empty. A readable but
+        // non-empty cgroup whose members could not be stat'ed is NOT an empty
+        // cgroup, and an unreadable cgroup is no evidence at all.
+        if (manager_liveness.state == LivenessState::Dead && cgroup_empty_confirmed) {
             retireIfConfirmed(
                 record,
                 "positive termination evidence (manager ended, execution cgroup empty)");
@@ -1409,19 +1430,23 @@ void JobInventoryMaintenance::evaluateRetirements(
         // Unknown is not death: an unreadable manager blocks the absence rule
         // exactly like a live one does.
         if (manager_liveness.state != LivenessState::Dead) continue;
-        if (cgroup_live) continue;
+        if (cgroup_live || cgroup_inconclusive) continue;
 
         bool live_member = false;
+        bool member_inconclusive = false;
         for (const auto& member : record.processes) {
-            if (!member.complete()) continue;  // unvalidated, never proof of life
             const LivenessResult liveness = process_probe_ ? process_probe_(member)
                                                            : LivenessResult{};
             if (liveness.state == LivenessState::Alive) {
                 live_member = true;
                 break;
             }
+            // An unreadable member (including one with an unvalidated
+            // identity) might be alive: it can never be read as death
+            // evidence, so it blocks the absence rule like a live member.
+            if (liveness.state == LivenessState::Unknown) member_inconclusive = true;
         }
-        if (live_member) continue;
+        if (live_member || member_inconclusive) continue;
 
         retireIfConfirmed(
             record,

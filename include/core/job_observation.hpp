@@ -274,11 +274,12 @@ public:
 // Observation accumulation
 // ---------------------------------------------------------------------------
 
-// Merges per-candidate observations into one observation per canonical
-// identity. Complete observations with the same key are merged (member
-// processes, cgroup path, notes union); incomplete observations are never
-// merged, because an unresolved identity must not silently absorb another
-// candidate.
+// Merges per-candidate observations into one observation per execution
+// generation of a canonical identity. Complete observations with the same
+// identity AND the same manager identity are merged (member processes, cgroup
+// path, notes union). Incomplete observations are never merged, and two
+// different managers of one logical job stay separate so the registry can
+// reject the second generation explicitly instead of seeing a blended record.
 class ObservationAccumulator {
 public:
     void add(Observation observation);
@@ -326,6 +327,12 @@ std::string read_proc_cgroup_path(const std::string& proc_root, pid_t pid,
 
 // PIDs listed in <cgroup_dir>/cgroup.procs. Empty when unreadable.
 std::vector<pid_t> read_cgroup_members(const std::string& cgroup_dir);
+
+// Error-reporting variant: false means the membership is unknown ("not empty"
+// can never be concluded from it); true means the list is authoritative, an
+// empty list included.
+bool read_cgroup_members(const std::string& cgroup_dir, std::vector<pid_t>& members,
+                         std::string& error);
 
 // Process identity from the fake or real procfs. Fields that cannot be read
 // stay zero; ProcessIdentity::complete() reports whether the evidence is

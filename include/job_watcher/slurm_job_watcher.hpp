@@ -560,7 +560,10 @@ inline Observation SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& en
         reasons.push_back("slurm cluster namespace unresolved (SLURM_CLUSTER_NAME unavailable)");
 
     // Member processes: stepd children plus step-cgroup members, so a child
-    // created before registration is still attributed.
+    // created before registration is still attributed. The member list is
+    // authoritative (members_complete stays true) only when the step cgroup
+    // was actually readable: a failed read must never be reported as a
+    // confirmed member set, an empty list included.
     observation.cgroup_path =
         read_proc_cgroup_path(env.proc_root, stepd_pid, env.cgroup_root);
     if (observation.cgroup_path.empty() && !member_pids.empty()) {
@@ -573,11 +576,23 @@ inline Observation SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& en
     observation.generation.cgroup_identity = observation.cgroup_path;
 
     std::vector<pid_t> effective_members = member_pids;
-    for (pid_t cgroup_pid : read_cgroup_members(observation.cgroup_path)) {
-        if (std::find(effective_members.begin(), effective_members.end(), cgroup_pid) ==
-            effective_members.end()) {
-            effective_members.push_back(cgroup_pid);
+    std::vector<pid_t> cgroup_members;
+    std::string cgroup_error;
+    if (!observation.cgroup_path.empty()) {
+        if (read_cgroup_members(observation.cgroup_path, cgroup_members, cgroup_error)) {
+            for (pid_t cgroup_pid : cgroup_members) {
+                if (std::find(effective_members.begin(), effective_members.end(),
+                              cgroup_pid) == effective_members.end()) {
+                    effective_members.push_back(cgroup_pid);
+                }
+            }
+        } else {
+            observation.members_complete = false;
+            observation.notes.push_back("step cgroup membership unreadable: " + cgroup_error);
         }
+    } else if (!member_pids.empty()) {
+        // Members are known from children only; the cgroup may hold more.
+        observation.members_complete = false;
     }
     for (pid_t member_pid : effective_members) {
         if (member_pid == stepd_pid) continue;

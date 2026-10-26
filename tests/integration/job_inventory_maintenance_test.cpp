@@ -823,6 +823,59 @@ void case_a11(const std::string& base)
 }
 
 // ---------------------------------------------------------------------------
+// A28 - a readable but unprobeable cgroup is not an empty cgroup
+// ---------------------------------------------------------------------------
+
+void case_a28(const std::string& base)
+{
+    JobRegistry registry(isolated(fresh_dir(base, "a28")));
+    FakeClock clock;
+    FakeSource source("condor", SchedulerType::Condor);
+    FakeProbes probes;
+    const Observation job =
+        make_condor_observation("600.0", 5800, 1414, "htcondor01", "schedd-a", "/cg/slot-10");
+
+    bool first = true;
+    source.set_scan([&]() {
+        if (first) {
+            first = false;
+            return scan_with({job});
+        }
+        return scan_with({});
+    });
+
+    std::vector<IDiscoverySource*> sources;
+    sources.push_back(&source);
+    JobInventoryMaintenance maintenance(registry, condor_config(), std::move(sources));
+    maintenance.setClock(clock.closure());
+    maintenance.setLivenessProbes(probes.process_probe(), probes.cgroup_probe());
+    check(maintenance.start(), "A28: maintenance did not start");
+
+    // The manager exited, the cgroup still lists a member, but the member's
+    // stat is unreadable (Unknown). "Readable and non-empty" is never "empty",
+    // so the first pass must not retire — the old rule treated Unknown members
+    // as dead and retired a possibly-running execution.
+    probes.set_process(5800, LivenessState::Dead);
+    probes.set_process(6101, LivenessState::Unknown);
+    probes.set_cgroup("/cg/slot-10", {6101}, true);
+    maintenance.reconcileNow();
+    maintenance.reconcileNow();
+    maintenance.reconcileNow();
+    check(find_native(registry, "600.0").has_value(),
+          "A28: unknown cgroup members were read as death evidence");
+
+    // Once the member reads as dead the execution is conclusively gone: the
+    // cgroup member is dead and no other member evidence exists.
+    probes.set_process(6101, LivenessState::Dead);
+    maintenance.reconcileNow();
+    check(!find_native(registry, "600.0").has_value(),
+          "A28: a conclusively dead execution was not retired");
+
+    maintenance.stop();
+    pass_case("A28", "unknown cgroup members are not death evidence; confirmed death retires");
+}
+
+// ---------------------------------------------------------------------------
 // A12 - bounded queue overflow, degradation, rescan, repair
 // ---------------------------------------------------------------------------
 
@@ -1556,6 +1609,7 @@ int main(int argc, char** argv)
         case_a14(base);
         case_a23(base);
         case_a25(base);
+        case_a28(base);
         case_legacy_retirement(base);
         case_rescan(base);
         case_exec_hint(base);
