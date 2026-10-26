@@ -70,7 +70,7 @@ JobRegistryOptions isolated(const std::string& path, size_t migration_batch_limi
 {
     JobRegistryOptions options;
     options.db_path = path;
-    options.enable_job_watchers = false;
+    options.enable_inventory_maintenance = false;
     options.enable_pid_tracker = false;
     options.register_rpc = false;
     options.migration_batch_limit = migration_batch_limit;

@@ -21,9 +21,9 @@
 
 #include "common/config.hpp"
 #include "core/collector_registry.hpp"
+#include "core/job_registry.hpp"
 #include "core/writer_manager.hpp"
 #include "core/collector_scheduler.hpp"
-#include "core/job_inventory_maintenance.hpp"
 #include "common/utils.hpp"
 
 /* ---------- collector 子命令 ---------- */
@@ -124,14 +124,13 @@ int runJobLensService(const cxxopts::ParseResult& result){
     if (mode.compare("service") == 0){
         // Plan 5.3 shutdown order: stop inventory admission and discovery
         // polling, drain the scheduler's accepted work, then finalize the
-        // retirement acknowledgements. The PID tracker and the DB belong to
-        // JobRegistry and close after this, in its destructor.
-        inventory_service::stop_discovery();
+        // retirement acknowledgements and close the registry-owned store.
+        JobRegistry::instance().stopInventoryDiscovery();
         CollectorScheduler::instance().shutdown();
         WriterManager::instance().shutdown();
         CollectorRegistry::instance().shutdown();
-        if (!inventory_service::finalize()) {
-            spdlog::error("Main: inventory shutdown incomplete; the closing state is "
+        if (!JobRegistry::instance().deinit()) {
+            spdlog::error("Main: registry shutdown incomplete; the closing state is "
                           "persisted for recovery");
         }
     }

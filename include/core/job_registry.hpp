@@ -36,6 +36,9 @@
 #include "job_watcher/condor_job_watcher.hpp"
 #include "job_watcher/slurm_job_watcher.hpp"
 
+class JobCollectionManager;
+class JobInventoryMaintenance;
+
 // ---------------------------------------------------------------------------
 // Inventory-grade storage (doc/job_inventory_collection_decoupling_plan.md)
 //
@@ -53,7 +56,9 @@
 // watchers, eBPF or RPC registration (plan section 5.1).
 struct JobRegistryOptions {
     std::string db_path;                 // empty: job_registry_config.job_db_path
-    bool enable_job_watchers = true;
+    // Start the inventory stack (watchers + maintenance controller) in the
+    // constructor. Tests and store-only instances disable it.
+    bool enable_inventory_maintenance = true;
     bool enable_pid_tracker = true;
     bool register_rpc = true;
     // Test seam: stop a legacy migration after this many durable batches and
@@ -173,13 +178,7 @@ class JobRegistry {
 public:
     static JobRegistry& instance();          // 仍保留单例，方便迁移；也可由 main() 构造
     explicit JobRegistry(const JobRegistryOptions& options);
-    ~JobRegistry(){
-        cleanupClosingJobs();
-        stop_pid_tracker();
-        if (db_running){
-            deinit_job_db();
-        }
-    };
+    ~JobRegistry();
 
     // 禁止拷贝
     JobRegistry(const JobRegistry&)            = delete;
@@ -252,6 +251,16 @@ public:
     // to schedule a coalesced refresh; the callback must not do I/O.
     void setExitObserver(std::function<void(pid_t)> observer);
 
+    // --- Lifecycle -----------------------------------------------------------
+    // Plan 5.3: stop discovery admission and polling. Must run before the
+    // collector scheduler drains. Idempotent.
+    void stopInventoryDiscovery();
+    // Finalize retirements, stop the pid tracker, archive closing records and
+    // close the store. Returns false when a closing record could not be
+    // archived (the incomplete state stays persisted). Idempotent; the
+    // destructor calls it as a fallback.
+    bool deinit();
+
     // Test seam only (see StoreFaultMode).
     void injectStoreFaultForTest(StoreFaultMode mode, size_t skip = 0, size_t count = 1);
     void clearStoreFaultsForTest();
@@ -265,6 +274,12 @@ private:
     bool resume_migration_state(std::string& stage, std::string& cursor);
     bool load_or_create_db_uuid();
     void restore_records_from_db();
+    // Construction step 3: resolve the inventory configuration, build exactly
+    // one discovery watcher per configured type, start the maintenance
+    // controller (initial scan included) and arm the automatic-selection
+    // inputs. Invalid configuration degrades to "no inventory" with an error
+    // log instead of aborting the service.
+    void init_inventory();
     void regRPCHandle();
     inline void update_job(Job& job);
     mutable std::shared_mutex              mtx_;
@@ -285,6 +300,15 @@ private:
     // Guards the installed exit hint observer.
     mutable std::mutex                     exit_observer_mtx_;
     std::function<void(pid_t)>             exit_observer_;
+
+    // Owned discovery/maintenance stack (construction order: db -> manager ->
+    // inventory -> pid tracker -> RPC; destruction runs deinit()).
+    std::unique_ptr<CondorJobWatcher> condor_source_;
+    std::unique_ptr<SlurmJobWatcher> slurm_source_;
+    std::unique_ptr<JobInventoryMaintenance> inventory_;
+    std::shared_ptr<JobCollectionManager> collection_manager_;
+    bool deinit_done_{false};
+    bool deinit_ok_{true};
 
     // 采集JobInfo持久化
     bool addJob(const Job& job, bool from_db);

@@ -52,7 +52,7 @@ JobRegistryOptions isolated(const std::string& path)
 {
     JobRegistryOptions options;
     options.db_path = path;
-    options.enable_job_watchers = false;
+    options.enable_inventory_maintenance = false;
     options.enable_pid_tracker = false;
     options.register_rpc = false;
     return options;

@@ -852,6 +852,12 @@ void JobInventoryMaintenance::stop()
     finalize();
 }
 
+bool JobInventoryMaintenance::stoppedDiscovery() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !admitted_;
+}
+
 bool JobInventoryMaintenance::running() const
 {
     std::lock_guard<std::mutex> lock(mutex_);

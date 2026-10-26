@@ -18,7 +18,6 @@
 #include "core/writer_manager.hpp"
 #include "core/job_registry.hpp"
 #include "core/collector_scheduler.hpp"
-#include "core/job_inventory_maintenance.hpp"
 #include "common/permission_opt.hpp"
 #include "common/local_rpc.hpp"
 #include "common/version.h"
@@ -134,11 +133,10 @@ bool already_running() {
 
 void onBecomeService() {
     spdlog::info("Main: app start as service mode.");
-    // Plan 5.1: inventory start is explicit and precedes the scheduler, so an
-    // inventory-only deployment never depends on CollectorScheduler.
-    if (!inventory_service::start()) {
-        spdlog::error("Main: inventory maintenance is unavailable; continuing without it");
-    }
+    // The registry constructor is the single assembly point (plan 5.1): it
+    // opens the store, starts inventory discovery and maintenance (initial
+    // scan included) before any collector can subscribe.
+    JobRegistry::instance();
     CollectorScheduler::instance().start();
 }
 
@@ -150,111 +148,3 @@ int version() {
 }
 
 } // namespace MainUtils
-
-namespace inventory_service {
-
-namespace {
-
-// Process-lifetime owners for the inventory stack. This is explicit lifecycle
-// state owned by MainUtils, not a new singleton: the controller must be
-// destructible independently of the scheduler and keeps the discovery adapters
-// alive for as long as its source closures reference them.
-struct InventoryRuntime {
-    std::unique_ptr<CondorJobWatcher> condor;
-    std::unique_ptr<SlurmJobWatcher> slurm;
-    std::unique_ptr<JobInventoryMaintenance> maintenance;
-};
-
-InventoryRuntime& runtime()
-{
-    static InventoryRuntime state;
-    return state;
-}
-
-namespace {
-
-// Splits the resolved per-type settings into the adapter's DiscoveryOptions.
-// The maintenance controller owns pacing and the automatic policy, so the
-// adapter must not read Config and must not poll on its own. The explicit
-// cluster_name (when set) is the namespace fallback that wins over
-// environment-derived values.
-DiscoveryOptions discovery_options_for(const InventoryTypeSettings& settings,
-                                       SchedulerType type)
-{
-    DiscoveryOptions options;
-    options.enable_event_source = true;
-    options.scan_interval_ms = 0;
-    if (!settings.cluster_name.empty()) {
-        if (type == SchedulerType::Condor)
-            options.discovery.condor_cluster_name = settings.cluster_name;
-        else
-            options.discovery.slurm_cluster_name = settings.cluster_name;
-    }
-    return options;
-}
-
-}  // namespace
-
-}  // namespace
-
-bool start()
-{
-    // Construct the registry (and its store) before the runtime holder so static
-    // destruction tears the maintenance controller down while the store is still
-    // alive: the controller may need to flush a closing record.
-    JobRegistry& registry = JobRegistry::instance();
-    auto& state = runtime();
-    if (state.maintenance) return true;
-
-    // Section 8: validate at startup and reject malformed values instead of
-    // guessing. This throws std::invalid_argument, which main() reports.
-    const InventoryMaintenanceConfig config =
-        resolve_inventory_maintenance_config(Config::instance().dumpConfig());
-
-    std::vector<IDiscoverySource*> sources;
-    for (const auto type : config.types) {
-        const auto& settings = config.settings.at(type);
-        if (type == InventoryType::Condor) {
-            state.condor = std::make_unique<CondorJobWatcher>(
-                discovery_options_for(settings, SchedulerType::Condor));
-            sources.push_back(state.condor.get());
-        } else {
-            state.slurm = std::make_unique<SlurmJobWatcher>(
-                discovery_options_for(settings, SchedulerType::Slurm));
-            sources.push_back(state.slurm.get());
-        }
-    }
-
-    if (config.types.empty()) {
-        spdlog::info("InventoryMaintenance: job_registry_config.inventory.types is empty; "
-                     "broad discovery is disabled, existing records are still maintained");
-    }
-
-    // The controller runs even without discovery sources: legacy/manual records
-    // and records of a disabled type still need fact refresh and retirement
-    // (plan section 8: removing a type must not strand persisted live records).
-    state.maintenance = std::make_unique<JobInventoryMaintenance>(
-        registry, config, std::move(sources));
-    if (!state.maintenance->start()) {
-        spdlog::error("InventoryMaintenance: inventory maintenance did not start; "
-                      "inventory status will report it as unavailable");
-        state.maintenance.reset();
-        return false;
-    }
-    spdlog::info("InventoryMaintenance: inventory maintenance running with {} discovery type(s)",
-                 config.types.size());
-    return true;
-}
-
-void stop_discovery()
-{
-    if (runtime().maintenance) runtime().maintenance->stopDiscovery();
-}
-
-bool finalize()
-{
-    if (!runtime().maintenance) return true;
-    return runtime().maintenance->finalize();
-}
-
-}  // namespace inventory_service

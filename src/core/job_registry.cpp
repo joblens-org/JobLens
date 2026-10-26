@@ -32,6 +32,7 @@
 
 #include "core/job_identity.hpp"
 #include "core/job_collection_manager.hpp"
+#include "core/job_inventory_maintenance.hpp"
 #include "core/collector_registry.hpp"
 #include "common/utils.hpp"
 #include "common/condor_job.hpp"
@@ -43,6 +44,30 @@
 
 #include <set>
 #include <type_traits>
+
+// Forward declaration: defined in the RPC section below, needed by the
+// constructor (collector-name validator for the collection manager).
+namespace {
+std::set<std::string> known_collector_names();
+
+// Resolved per-type settings -> adapter options. The explicit cluster_name
+// (when set) is the namespace fallback that wins over environment-derived
+// values; without it the adapter derives the namespace from the source.
+DiscoveryOptions discovery_options_for_type(const InventoryTypeSettings& settings,
+                                            SchedulerType type)
+{
+    DiscoveryOptions options;
+    options.enable_event_source = true;
+    options.scan_interval_ms = 0;
+    if (!settings.cluster_name.empty()) {
+        if (type == SchedulerType::Condor)
+            options.discovery.condor_cluster_name = settings.cluster_name;
+        else
+            options.discovery.slurm_cluster_name = settings.cluster_name;
+    }
+    return options;
+}
+}  // namespace
 
 // Maintenance-side inventory health (source/queue/reconciliation state) is
 // published by the maintenance controller through this seam. When no provider
@@ -675,6 +700,17 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
         spdlog::warn("JobRegistry: job db not running");
     }
 
+    // The collection manager is shared by the RPC surface and the automatic
+    // selection path; one instance per registry.
+    collection_manager_ = std::make_shared<JobCollectionManager>(*this);
+    {
+        const auto known = known_collector_names();
+        collection_manager_->setCollectorValidator(
+            [known](const std::string& name) { return known.count(name) != 0; });
+    }
+
+    if (options.enable_inventory_maintenance) init_inventory();
+
     if (options.enable_pid_tracker) init_pid_tracker();
     if (options.register_rpc) regRPCHandle();
 };
@@ -700,6 +736,91 @@ static void resolve_and_cache_cgroup_id(Job& job) {
     if (cg.empty()) return;
     if (auto cgid = EbpfCommon::cgroup_path_to_id(cg)) {
         job.cgroup_id = *cgid;
+    }
+}
+
+void JobRegistry::init_inventory()
+{
+    InventoryMaintenanceConfig config;
+    try {
+        config = resolve_inventory_maintenance_config(Config::instance().dumpConfig());
+    } catch (const std::exception& error) {
+        spdlog::error("JobRegistry: invalid inventory configuration; inventory maintenance "
+                      "is disabled: {}",
+                      error.what());
+        return;
+    }
+
+    // Exactly one discovery watcher per configured scheduler type; the
+    // controller drives them through IDiscoverySource and owns no adapters.
+    std::vector<IDiscoverySource*> sources;
+    for (const auto type : config.types) {
+        const auto& settings = config.settings.at(type);
+        if (type == InventoryType::Condor) {
+            condor_source_ = std::make_unique<CondorJobWatcher>(
+                discovery_options_for_type(settings, SchedulerType::Condor));
+            sources.push_back(condor_source_.get());
+        } else {
+            slurm_source_ = std::make_unique<SlurmJobWatcher>(
+                discovery_options_for_type(settings, SchedulerType::Slurm));
+            sources.push_back(slurm_source_.get());
+        }
+    }
+    if (config.types.empty()) {
+        spdlog::info("JobRegistry: no inventory types configured; discovery is disabled and "
+                     "existing records are still maintained");
+    }
+
+    inventory_ = std::make_unique<JobInventoryMaintenance>(*this, config, std::move(sources));
+    if (!inventory_->start()) {
+        spdlog::error("JobRegistry: inventory maintenance did not start; "
+                      "inventory status will report it as unavailable");
+        inventory_.reset();
+        condor_source_.reset();
+        slurm_source_.reset();
+        return;
+    }
+    spdlog::info("JobRegistry: inventory maintenance running with {} discovery type(s)",
+                 config.types.size());
+}
+
+void JobRegistry::stopInventoryDiscovery()
+{
+    if (inventory_) inventory_->stopDiscovery();
+}
+
+bool JobRegistry::deinit()
+{
+    if (deinit_done_) return deinit_ok_;
+
+    // Plan 5.3 shutdown order: discovery admission stopped first (the service
+    // calls stopInventoryDiscovery() before draining the scheduler), then the
+    // retirements are finalized, then the tracker, then the store.
+    if (inventory_ && !inventory_->stoppedDiscovery()) stopInventoryDiscovery();
+
+    bool ok = true;
+    if (inventory_ && !inventory_->finalize()) ok = false;
+    inventory_.reset();
+    condor_source_.reset();
+    slurm_source_.reset();
+
+    cleanupClosingJobs();
+    stop_pid_tracker();
+    if (db_running) deinit_job_db();
+
+    deinit_done_ = true;
+    deinit_ok_ = ok;
+    if (!ok)
+        spdlog::error("JobRegistry: deinit could not archive every closing record; "
+                      "the incomplete state is persisted for recovery");
+    return ok;
+}
+
+JobRegistry::~JobRegistry()
+{
+    if (!deinit_done_) {
+        spdlog::warn("JobRegistry: destroyed without an explicit deinit; deiniting now");
+        deinit();
     }
 }
 
@@ -1554,9 +1675,10 @@ void JobRegistry::regRPCHandle() {
     //     "Lens": ["cpumem_collector"],
     //      "auto_update_child": true
     // }
-    // One control manager per registry. Intent mutations are serialized inside
+    // One control manager per registry, created in the constructor and shared
+    // with the automatic-selection path. Intent mutations are serialized inside
     // it and committed through JobRegistry::commitBindings.
-    auto manager = std::make_shared<JobCollectionManager>(*this);
+    auto manager = collection_manager_;
     {
         const auto known = known_collector_names();
         manager->setCollectorValidator(

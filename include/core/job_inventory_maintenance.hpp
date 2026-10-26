@@ -250,6 +250,10 @@ public:
 
     bool running() const;
 
+    // True once stopDiscovery() ran (admission closed). deinit() uses this to
+    // keep the shutdown order without double-stopping.
+    bool stoppedDiscovery() const;
+
     // One full reconciliation pass (scan -> upsert -> hint merge -> retirement).
     // Also used by tests, by the startup path and by on-demand
     // `ensure_registered` refreshes, so all of them run identical code.
