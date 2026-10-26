@@ -1443,6 +1443,53 @@ void case_config()
               "config: legacy auto_add_slurmjob did not resolve");
     }
 
+    // Legacy auto-add folding (user-defined semantics): auto_add_<type>job=true
+    // inventories the type and turns automatic collection on with the
+    // configured default collectors; use_rules only decides how the list is
+    // chosen when adding.
+    {
+        nlohmann::json root;
+        root["job_registry_config"]["auto_add_condorjob"] = true;
+        root["condor_job_watcher"]["auto_add_collectors"] = {"cpumem_collector", "io_collector"};
+        root["condor_job_watcher"]["use_rules"] = false;
+        root["condor_job_watcher"]["cluster_name"] = "htcondor01";
+        const auto config = resolve_inventory_maintenance_config(root);
+        check(config.types.size() == 1 && config.types.front() == InventoryType::Condor,
+              "config: legacy auto_add_condorjob did not fold into inventory");
+        const auto& condor = config.settings.at(InventoryType::Condor);
+        check(condor.inventory && condor.auto_collect,
+              "config: folded type must be inventoried with automatic collection");
+        check(condor.legacy_auto_collect, "config: the legacy origin must stay visible");
+        check(!condor.use_rules, "config: use_rules defaults to false");
+        check(condor.default_collectors.size() == 2 &&
+                  condor.default_collectors[0] == "cpumem_collector",
+              "config: default collectors were not resolved");
+        check(condor.cluster_name == "htcondor01",
+              "config: the explicit cluster namespace was not resolved");
+    }
+
+    // auto_add=false (or absent) adds nothing and inventories nothing.
+    {
+        nlohmann::json root;
+        root["job_registry_config"]["auto_add_condorjob"] = false;
+        const auto config = resolve_inventory_maintenance_config(root);
+        check(config.types.empty(),
+              "config: auto_add=false must not enable inventory or collection");
+        check(!config.settings.at(InventoryType::Condor).auto_collect,
+              "config: auto_add=false must not select collectors");
+    }
+
+    // An explicit auto_collect beats the folded legacy flag even when the flag
+    // is true and the type is not listed explicitly.
+    {
+        nlohmann::json root;
+        root["job_registry_config"]["auto_add_condorjob"] = true;
+        root["condor_job_watcher"]["auto_collect"] = false;
+        const auto config = resolve_inventory_maintenance_config(root);
+        check(config.types.empty() || !config.settings.at(InventoryType::Condor).auto_collect,
+              "config: explicit auto_collect=false must win over the fold");
+    }
+
     // Unknown type, bad interval values.
     bool threw = false;
     try {

@@ -98,6 +98,12 @@ struct InventoryTypeSettings {
     bool use_rules = false;
     std::string rules_dir;
     std::string rules_prefix;
+    // Legacy auto_add_* folding: collectors added to every job of this type
+    // when automatic collection is on and use_rules is false.
+    std::vector<std::string> default_collectors;
+    // Explicit cluster namespace fallback for discovery (wins over the
+    // environment-derived value, empty = derive from the source).
+    std::string cluster_name;
 };
 
 struct InventoryMaintenanceConfig {

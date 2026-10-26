@@ -171,17 +171,29 @@ InventoryRuntime& runtime()
     return state;
 }
 
-// Discovery-adapter construction: the maintenance controller owns pacing and
-// the automatic policy, so the adapter must not read Config and must not poll
-// on its own.
-DiscoveryOptions make_watcher_options()
+namespace {
+
+// Splits the resolved per-type settings into the adapter's DiscoveryOptions.
+// The maintenance controller owns pacing and the automatic policy, so the
+// adapter must not read Config and must not poll on its own. The explicit
+// cluster_name (when set) is the namespace fallback that wins over
+// environment-derived values.
+DiscoveryOptions discovery_options_for(const InventoryTypeSettings& settings,
+                                       SchedulerType type)
 {
     DiscoveryOptions options;
     options.enable_event_source = true;
     options.scan_interval_ms = 0;
-    options.discovery = DiscoveryEnvironment{};
+    if (!settings.cluster_name.empty()) {
+        if (type == SchedulerType::Condor)
+            options.discovery.condor_cluster_name = settings.cluster_name;
+        else
+            options.discovery.slurm_cluster_name = settings.cluster_name;
+    }
     return options;
 }
+
+}  // namespace
 
 }  // namespace
 
@@ -199,14 +211,16 @@ bool start()
     const InventoryMaintenanceConfig config =
         resolve_inventory_maintenance_config(Config::instance().dumpConfig());
 
-    const DiscoveryOptions options = make_watcher_options();
     std::vector<IDiscoverySource*> sources;
     for (const auto type : config.types) {
+        const auto& settings = config.settings.at(type);
         if (type == InventoryType::Condor) {
-            state.condor = std::make_unique<CondorJobWatcher>(options);
+            state.condor = std::make_unique<CondorJobWatcher>(
+                discovery_options_for(settings, SchedulerType::Condor));
             sources.push_back(state.condor.get());
         } else {
-            state.slurm = std::make_unique<SlurmJobWatcher>(options);
+            state.slurm = std::make_unique<SlurmJobWatcher>(
+                discovery_options_for(settings, SchedulerType::Slurm));
             sources.push_back(state.slurm.get());
         }
     }

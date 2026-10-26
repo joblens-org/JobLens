@@ -276,6 +276,8 @@ nlohmann::json InventoryMaintenanceConfig::to_json() const
             {"use_rules", entry.second.use_rules},
             {"rules_dir", entry.second.rules_dir},
             {"rules_prefix", entry.second.rules_prefix},
+            {"default_collectors", entry.second.default_collectors},
+            {"cluster_name", entry.second.cluster_name},
         });
     }
     out["sources"] = std::move(sources);
@@ -359,6 +361,16 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
             if (const auto* use_rules = member(*node, "use_rules")) {
                 settings.use_rules = parse_bool(*use_rules, prefix + "use_rules");
             }
+            if (const auto* defaults = member(*node, "auto_add_collectors")) {
+                if (!defaults->is_array())
+                    config_error(prefix + "auto_add_collectors must be a list");
+                for (const auto& item : *defaults) {
+                    settings.default_collectors.push_back(
+                        scalar_text(item, prefix + "auto_add_collectors[]"));
+                }
+            }
+            settings.cluster_name =
+                scalar_field(*node, "cluster_name", section, std::string{});
             settings.rules_prefix = scalar_field(
                 *node, "rules_prefix", section,
                 std::string(type == InventoryType::Condor ? "condor_job_" : "slurm_job_"));
@@ -392,6 +404,29 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
     if (!legacy_rules_dir.empty()) {
         spdlog::warn("inventory configuration: job_registry_config.rules_dir is deprecated; "
                      "set condor_job_watcher.rules_dir / slurm_job_watcher.rules_dir");
+    }
+
+    // Legacy auto-add folding (user-defined semantics): auto_add_<type>job=true
+    // means "inventory this type and add collectors to every discovered job";
+    // use_rules only decides whether the collector list comes from the rule
+    // engine (accept = rule result, reject = empty) or verbatim from
+    // auto_add_collectors. An explicit per-type auto_collect or an explicit
+    // inventory.types entry always wins over the legacy flag.
+    for (const auto type : {InventoryType::Condor, InventoryType::Slurm}) {
+        auto& settings = resolved.settings[type];
+        const bool explicit_type =
+            std::find(resolved.types.begin(), resolved.types.end(), type) != resolved.types.end();
+        if (!settings.legacy_auto_collect || explicit_type || settings.auto_collect_explicit)
+            continue;
+        const char* section = type == InventoryType::Condor ? "condor_job_watcher"
+                                                            : "slurm_job_watcher";
+        resolved.types.push_back(type);
+        settings.inventory = true;
+        settings.auto_collect = true;
+        spdlog::warn("inventory configuration: job_registry_config.auto_add_{}job is folded "
+                     "into inventory discovery with automatic collection; set {}.auto_collect "
+                     "explicitly to override",
+                     type == InventoryType::Condor ? "condor" : "slurm", section);
     }
     return resolved;
 }
