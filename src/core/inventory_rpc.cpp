@@ -493,6 +493,12 @@ nlohmann::json collection_target_json(JobRegistry& registry, const JobRecord& re
                                               : applied.error},
         });
     }
+    // Generic collection status (v2 G6): the scheduler's actual holders.
+    if (const auto job = registry.findJob(record.internal_id)) {
+        out["in_pipeline"] = job->collection.in_pipeline;
+    } else {
+        out["in_pipeline"] = false;
+    }
     out["changed"] = changed;
     return out;
 }

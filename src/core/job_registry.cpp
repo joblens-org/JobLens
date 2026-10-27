@@ -1769,6 +1769,13 @@ void JobRegistry::applyLatestCollectionIntent(uint64_t internal_id) {
     // recordApplied is a no-op when the instance was retired meanwhile; its
     // applied state then no longer has an owner.
     store_->recordApplied(internal_id, applied);
+    // Stamp the runtime-reported holders onto the stored projection (in-memory
+    // only: collection status never survives a restart as true — the replay
+    // re-attaches and the next application re-stamps it).
+    store_->mutateRecord(internal_id, [&applied](JobRecord& record) {
+        record.job.collection.in_pipeline = !applied.collectors.empty();
+        record.job.collection.collectors = applied.collectors;
+    });
 }
 
 void JobRegistry::reconcileCollectionIntent(uint64_t internal_id) {

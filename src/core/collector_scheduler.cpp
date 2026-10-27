@@ -591,6 +591,19 @@ bool CollectorScheduler::applyJobBinding(const Job& job, std::vector<std::string
         applied.push_back(collector_name);
     }
 
+    // Stamp the actual holders onto the per-collector snapshots: the generic
+    // collection status is scheduler-reported runtime state (v2 G6), partial
+    // success included, never inferred from the desired list.
+    for (const auto& collector_name : applied) {
+        auto it = collector_state_dict.find(collector_name);
+        if (it == collector_state_dict.end()) continue;
+        std::lock_guard snapshot_lock(it->second.snapshot_m_);
+        auto snap = it->second.job_snapshots.find(job.JobID);
+        if (snap == it->second.job_snapshots.end()) continue;
+        snap->second.collection.in_pipeline = true;
+        snap->second.collection.collectors = applied;
+    }
+
     notifySystemCollectors(job, JobEvent::Updated);
     return error.empty();
 }

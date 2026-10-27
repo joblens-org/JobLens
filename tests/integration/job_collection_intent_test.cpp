@@ -480,6 +480,15 @@ void repeated_requests_converge_a_failed_application(const std::string& base)
           "the identical repeat changes no intent");
     check(calls == 2, "the repeated request must retry the runtime");
 
+    // The status mirrors the runtime: false while the runtime fails, even
+    // though the desired list is non-empty.
+    {
+        const auto job = registry.findJob(created.internal_id);
+        check(job.has_value() && !job->collection.in_pipeline &&
+                  job->collection.collectors.empty(),
+              "the collection status must be false while the runtime failed");
+    }
+
     healthy = true;
     const auto repaired = manager.setCollectors(
         set_request({created.internal_id}, {"cpumem_collector"}));
@@ -492,6 +501,23 @@ void repeated_requests_converge_a_failed_application(const std::string& base)
     check(repaired.targets.front().applied.revision ==
               repaired.targets.front().binding.revision,
           "the applied revision must identify the binding the runtime saw");
+
+    // The generic collection status reflects the runtime's actual holders,
+    // never the desired list: true once the runtime reported holders.
+    {
+        const auto job = registry.findJob(created.internal_id);
+        check(job.has_value() && job->collection.in_pipeline &&
+                  job->collection.collectors == std::vector<std::string>{"cpumem_collector"},
+              "the collection status must name the runtime's actual holders");
+    }
+    const auto stopped = manager.setCollectors(set_request({created.internal_id}, {}));
+    check(stopped.ok, "the stop must be accepted");
+    {
+        const auto job = registry.findJob(created.internal_id);
+        check(job.has_value() && !job->collection.in_pipeline &&
+                  job->collection.collectors.empty(),
+              "an explicit stop must clear the collection status");
+    }
 }
 
 } // namespace

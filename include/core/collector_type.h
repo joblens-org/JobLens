@@ -311,8 +311,15 @@ struct Job {
 
     SubAttr                                 sub_attr;
 
-    // 运行时缓存已移入 KernelAttribution（cgroup_id 归属能力组件）。
-    // 仅内存缓存, 不参与序列化/持久化 (cgroup inode 重启后可能变化)。
+    // 通用采集状态 (v2 G6)：表示"已进入采集管线"——调度器当前实际持有本 Job
+    // 的 collector 集合（部分成功保留实际生效子集）。只由采集运行时的
+    // attach/detach 完成结果写入，绝不从 CollectorNames 推断，也绝不跨重启
+    // 恢复为 true（重启后由 replay 重新 attach 时再置位）。不参与序列化。
+    struct CollectionStatus {
+        bool in_pipeline{false};
+        std::vector<std::string> collectors;   // 实际持有者
+    };
+    CollectionStatus                        collection;
 
     // 组字段探测状态（仅内存，不序列化、不进 reflection）：
     // group_probed 仅在“成功读到来源（ad 文件 / env）”后置位——读失败不置位，
