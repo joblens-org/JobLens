@@ -38,7 +38,7 @@
 
 #include "core/job_identity.hpp"
 #include "core/job_collection_manager.hpp"
-#include "core/job_inventory_maintenance.hpp"
+#include "core/inventory_config.hpp"
 #include "core/inventory_rpc.hpp"
 #include "core/collector_registry.hpp"
 #include "common/utils.hpp"
@@ -114,6 +114,13 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
         spdlog::warn("JobRegistry: job db not running");
     }
 
+    // Heartbeat test seams (copied: the options object may not outlive us).
+    options_test_sources_ = options.test_sources;
+    options_test_process_probe_ = options.test_process_probe;
+    options_test_cgroup_probe_ = options.test_cgroup_probe;
+    options_test_facts_encoder_ = options.test_facts_encoder;
+    options_test_heartbeat_ = options.test_heartbeat;
+
     // The collection manager is shared by the RPC surface and the automatic
     // selection path; one instance per registry.
     collection_manager_ = std::make_shared<JobCollectionManager>(*this);
@@ -135,11 +142,710 @@ JobRegistry& JobRegistry::instance() {
 }
 
 // ---------------------------------------------------------------------------
-// Inventory stack wiring (replaced by the heartbeat in stage S5)
+// Inventory heartbeat (v2 §2.3) — the maintenance function of the registry.
+// Thread-free policy components (probes, retirement rules, absence counters)
+// are driven from one periodic worker; there is no separate service object.
 // ---------------------------------------------------------------------------
+
+namespace {
+constexpr int kAbsencesBeforeRetirement = 2;
+constexpr std::size_t kEndedGenerationCapacity = 4096;
+constexpr std::size_t kExecHintCapacity = 1024;
+constexpr std::size_t kHintQueueCapacity = 512;
+constexpr std::uint32_t kWaitSliceMs = 100;
+}  // namespace
+
+std::int64_t JobRegistry::clockNow() const {
+    return now_epoch_ms();
+}
+
+void JobRegistry::noteHeartbeatError(const std::string& error) {
+    std::lock_guard<std::mutex> lock(hb_mtx_);
+    degraded_ = true;
+    hb_last_error_ = error;
+}
+
+void JobRegistry::enqueueHint(HeartbeatHint hint) {
+    bool overflow = false;
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        ++hb_events_received_;
+        if (!hb_admitted_ || hb_stopping_) {
+            ++hb_events_dropped_;
+            return;
+        }
+        if (hints_.size() >= kHintQueueCapacity) {
+            ++hb_events_dropped_;
+            overflow = true;
+        } else {
+            hints_.push_back(std::move(hint));
+            hint_wakeup_ = true;
+        }
+    }
+    if (overflow) {
+        // Bounded queue: the producer is never blocked; the drop is counted,
+        // the heartbeat degrades and an authoritative rescan repairs whatever
+        // the dropped hint would have refreshed.
+        noteHeartbeatError("invariant hint queue overflow; awaiting authoritative rescan");
+        spdlog::warn("JobRegistry: hint queue full, dropping event; requesting a rescan");
+        requestRescan("hint queue overflow");
+        return;
+    }
+    hb_cv_.notify_one();
+}
+
+void JobRegistry::notifyExit(pid_t pid) {
+    HeartbeatHint hint;
+    hint.kind = HeartbeatHint::Kind::Exit;
+    hint.pid = pid;
+    enqueueHint(std::move(hint));
+}
+
+void JobRegistry::requestRescan(const std::string& reason) {
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        ++hb_rescan_requests_;
+    }
+    for (const auto& [name, source] : hb_sources_) {
+        try {
+            source->requestRescan();
+        } catch (const std::exception& error) {
+            spdlog::error("JobRegistry: rescan request failed ({}): {}", reason, error.what());
+        }
+    }
+}
+
+bool JobRegistry::rescanRequested() const {
+    for (const auto& [name, source] : hb_sources_) {
+        try {
+            if (source->health().rescan_requested) return true;
+        } catch (const std::exception& error) {
+            spdlog::debug("JobRegistry: source health failed: {}", error.what());
+        }
+    }
+    return false;
+}
+
+void JobRegistry::drainHints(std::deque<HeartbeatHint>& out) {
+    std::lock_guard<std::mutex> lock(hb_mtx_);
+    while (!hints_.empty()) {
+        out.push_back(std::move(hints_.front()));
+        hints_.pop_front();
+    }
+}
+
+ObservedExecution JobRegistry::toExecution(const Observation& observation) const {
+    ObservedExecution execution;
+    execution.selector = observation.selector;
+    execution.generation = observation.generation;
+    execution.processes = observation.members;
+    execution.members_complete = observation.members_complete;
+    if (facts_encoder_) execution.facts = facts_encoder_(observation);
+    return execution;
+}
+
+void JobRegistry::processObservation(const Observation& observation,
+                                     std::set<uint64_t>& observed) {
+    const auto identity = canonicalize(observation.selector);
+    if (identity && observation.generation.complete() &&
+        isObsolete(*identity, observation.generation)) {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        ++hb_obsolete_hints_;
+        spdlog::debug("JobRegistry: discarded hint for the ended execution of '{}'",
+                      identity->native_job_id);
+        return;
+    }
+
+    if (!observation.identity_complete) {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        ++hb_incomplete_observations_;
+        spdlog::debug("JobRegistry: incomplete observation '{}': {}",
+                      observation.selector.native_job_id, observation.incomplete_reason);
+    }
+
+    const auto result = upsertObservedJob(toExecution(observation));
+    if (result.ok) {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        observed.insert(result.internal_id);
+        auto& entry = absences_[result.internal_id];
+        entry.generation = observation.generation;
+        entry.complete_absences = 0;
+        entry.last_seen_ms = clockNow();
+        suspect_ids_.erase(result.internal_id);
+        return;
+    }
+
+    if (result.error == "incomplete_identity") {
+        // An unresolvable identity is not an error of the pass: it stays out
+        // of the identity index and is retried on the next observation.
+        return;
+    }
+
+    if (result.error == "execution_generation_conflict" ||
+        result.error == "identity_quarantined" ||
+        result.error == "instance_closing" ||
+        result.error == "identity_index_mismatch") {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        ++hb_upsert_conflicts_;
+        hb_last_error_ = result.error + (result.message.empty() ? "" : ": " + result.message);
+        spdlog::warn("JobRegistry: observation for '{}' rejected: {}",
+                     observation.selector.native_job_id, result.error);
+        return;
+    }
+
+    noteHeartbeatError("inventory upsert failed: " + result.error +
+                       (result.message.empty() ? "" : ": " + result.message));
+}
+
+void JobRegistry::processExecHint(pid_t pid, std::set<uint64_t>& observed) {
+    for (const auto& [name, source] : hb_sources_) {
+        std::optional<Observation> observation;
+        try {
+            observation = source->observeForHint(pid);
+        } catch (const std::exception& error) {
+            spdlog::debug("JobRegistry: source '{}' could not resolve hint {}: {}",
+                          name, pid, error.what());
+            continue;
+        }
+        if (!observation) continue;   // not this source's execution
+        processObservation(*observation, observed);
+        return;
+    }
+    // Unresolvable hints are not errors: the pid may be gone already or belong
+    // to no execution; the authoritative scan covers whatever remains.
+    std::lock_guard<std::mutex> lock(hb_mtx_);
+    ++hb_unresolved_hints_;
+}
+
+void JobRegistry::refreshLegacyRecords() {
+    for (const auto& record : store_->records()) {
+        if (record.internal_id == kSystemSentinelJobId) continue;
+        if (record.state == kStateClosing) continue;   // the drain owns it
+        if (record.generation.complete()) continue;    // discovery owns these facts
+        if (record.members.empty()) continue;          // no liveness evidence yet
+        refreshJobFacts(record.internal_id);
+    }
+}
+
+bool JobRegistry::retireIfConfirmed(const JobRecord& record, const std::string& reason) {
+    // Only retire the generation the evidence was gathered for. A late
+    // decision for an older execution must never remove newer ownership.
+    const auto current = store_->record(record.internal_id);
+    if (!current) return false;
+    if (!(current->generation == record.generation)) {
+        spdlog::info("JobRegistry: JobID {} changed execution generation before "
+                     "retirement; keeping current ownership", record.internal_id);
+        return false;
+    }
+
+    rememberEnded(record);
+    if (!retireInstance(record.internal_id)) {
+        noteHeartbeatError("inventory retirement failed for JobID " +
+                           std::to_string(record.internal_id));
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        ++hb_retirements_;
+        closing_generations_.emplace_back(record.internal_id, record.generation);
+        absences_.erase(record.internal_id);
+        suspect_ids_.erase(record.internal_id);
+    }
+    spdlog::info("JobRegistry: retired JobID {}: {}", record.internal_id, reason);
+    return true;
+}
+
+void JobRegistry::rememberEnded(const JobRecord& record) {
+    const auto identity = canonicalize(record.selector);
+    if (!identity) return;
+    std::lock_guard<std::mutex> lock(hb_mtx_);
+    ended_generations_[identity->key()] = record.generation;
+    while (ended_generations_.size() > kEndedGenerationCapacity) {
+        ended_generations_.erase(ended_generations_.begin());
+    }
+}
+
+bool JobRegistry::isObsolete(const CanonicalIdentity& identity,
+                             const ExecutionGeneration& generation) {
+    std::lock_guard<std::mutex> lock(hb_mtx_);
+    const auto it = ended_generations_.find(identity.key());
+    return it != ended_generations_.end() && it->second == generation;
+}
+
+void JobRegistry::evaluateRetirements(
+    const std::set<uint64_t>& observed_ids,
+    const std::map<SchedulerType, bool>& source_complete) {
+    const auto records = store_->records();
+    const std::int64_t now = clockNow();
+
+    for (const auto& record : records) {
+        if (record.internal_id == 0) continue;
+        if (record.state == kStateClosing) continue;
+
+        // Desired/applied reconciliation runs for every *active* instance on
+        // every pass: a binding whose runtime application failed, or whose
+        // application was lost to a crash, converges here without waiting for
+        // an observation to change facts. A suspect execution is never
+        // (re)armed from here — it must be observed again first.
+        if (record.state == kStateActive)
+            reconcileCollectionIntent(record.internal_id);
+
+        int absences = 0;
+        {
+            std::lock_guard<std::mutex> lock(hb_mtx_);
+            auto& entry = absences_[record.internal_id];
+            if (!(entry.generation == record.generation)) {
+                entry.generation = record.generation;
+                entry.complete_absences = 0;
+            }
+            if (observed_ids.count(record.internal_id) != 0) {
+                entry.complete_absences = 0;
+                entry.last_seen_ms = now;
+                suspect_ids_.erase(record.internal_id);
+                continue;
+            }
+            const auto coverage = source_complete.find(
+                record.identity_complete
+                    ? record.identity.scheduler_type
+                    : record.selector.scheduler_type);
+            const bool absence_allowed =
+                coverage != source_complete.end() && coverage->second;
+            if (absence_allowed && entry.complete_absences < kAbsencesBeforeRetirement) {
+                ++entry.complete_absences;
+            }
+            absences = entry.complete_absences;
+            if (absences > 0) suspect_ids_.insert(record.internal_id);
+            else suspect_ids_.erase(record.internal_id);
+        }
+
+        // Persisted lifecycle state is heartbeat-owned; expose it through the
+        // inventory API instead of keeping it only here.
+        if (absences > 0) {
+            setInstanceState(record.internal_id, kStateSuspect);
+        } else if (record.state == kStateSuspect) {
+            setInstanceState(record.internal_id, kStateActive);
+        }
+
+        // Records without a validated execution generation (legacy/manual
+        // registrations, unresolved observations) have no manager to probe.
+        // The refreshed member list is their only evidence: live or unreadable
+        // pids keep the record, an all-dead list retires it.
+        if (!record.generation.complete()) {
+            std::vector<ProcessIdentity> pids = record.members;
+            if (pids.empty()) {
+                if (const auto job = findJob(record.internal_id)) {
+                    for (const auto pid : job->JobPIDs)
+                        pids.push_back(ProcessIdentity{pid, 0, ""});
+                }
+            }
+            if (pids.empty()) continue;   // no evidence: retry on the next pass
+
+            bool any_live = false;
+            for (const auto& process : pids) {
+                const LivenessResult liveness = process_probe_
+                                                    ? process_probe_(process)
+                                                    : LivenessResult{};
+                if (liveness.state != LivenessState::Dead) {
+                    any_live = true;
+                    break;
+                }
+            }
+            if (!any_live)
+                retireIfConfirmed(record, "no live process for a legacy/manual registration");
+            continue;
+        }
+
+        const ProcessIdentity manager{record.generation.manager_pid,
+                                      record.generation.manager_start_ticks,
+                                      record.generation.boot_id};
+        const LivenessResult manager_liveness = process_probe_
+                                                    ? process_probe_(manager)
+                                                    : LivenessResult{};
+
+        // A live manager always wins, whatever the PID list or cgroup says.
+        if (manager_liveness.state == LivenessState::Alive) continue;
+
+        bool cgroup_empty_confirmed = false;
+        bool cgroup_live = false;
+        bool cgroup_inconclusive = false;
+        if (!record.generation.cgroup_identity.empty() && cgroup_probe_) {
+            const CgroupMembership membership =
+                cgroup_probe_(record.generation.cgroup_identity);
+            if (membership.readable) {
+                if (membership.members.empty()) {
+                    // The read succeeded and found nothing: positive "cgroup
+                    // is empty" evidence, not missing data.
+                    cgroup_empty_confirmed = true;
+                }
+                for (const pid_t pid : membership.members) {
+                    const LivenessResult member = process_probe_
+                                                      ? process_probe_(ProcessIdentity{pid, 0, ""})
+                                                      : LivenessResult{};
+                    if (member.state == LivenessState::Alive) {
+                        cgroup_live = true;
+                        break;
+                    }
+                    if (member.state == LivenessState::Unknown)
+                        cgroup_inconclusive = true;
+                }
+            }
+        }
+
+        // Retire only on positive termination evidence: a dead manager plus a
+        // cgroup that was read and is confirmed empty. A readable but
+        // non-empty cgroup whose members could not be stat'ed is NOT an empty
+        // cgroup, and an unreadable cgroup is no evidence at all.
+        if (manager_liveness.state == LivenessState::Dead && cgroup_empty_confirmed) {
+            retireIfConfirmed(
+                record, "positive termination evidence (manager ended, execution cgroup empty)");
+            continue;
+        }
+
+        if (absences < kAbsencesBeforeRetirement) continue;
+        // Unknown is not death: an unreadable manager blocks the absence rule
+        // exactly like a live one does.
+        if (manager_liveness.state != LivenessState::Dead) continue;
+        if (cgroup_live || cgroup_inconclusive) continue;
+
+        bool live_member = false;
+        bool member_inconclusive = false;
+        for (const auto& member : record.members) {
+            const LivenessResult liveness = process_probe_ ? process_probe_(member)
+                                                           : LivenessResult{};
+            if (liveness.state == LivenessState::Alive) {
+                live_member = true;
+                break;
+            }
+            // An unreadable member (including one with an unvalidated
+            // identity) might be alive: it can never be read as death
+            // evidence, so it blocks the absence rule like a live member.
+            if (liveness.state == LivenessState::Unknown) member_inconclusive = true;
+        }
+        if (live_member || member_inconclusive) continue;
+
+        retireIfConfirmed(
+            record, "two complete source passes without an observation and no live member");
+    }
+
+    // Prune heartbeat state for records that no longer exist.
+    {
+        std::set<uint64_t> live;
+        for (const auto& record : records) live.insert(record.internal_id);
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        for (auto it = absences_.begin(); it != absences_.end();) {
+            if (live.count(it->first) == 0) it = absences_.erase(it);
+            else ++it;
+        }
+        for (auto it = suspect_ids_.begin(); it != suspect_ids_.end();) {
+            if (live.count(*it) == 0) it = suspect_ids_.erase(it);
+            else ++it;
+        }
+    }
+}
+
+bool JobRegistry::runPass(bool do_scan, bool wait) {
+    // Passes are serialized by pass_mtx_. The worker never waits for a pass
+    // (it retries on the next slice), while an on-demand reconcile waits so
+    // that returning means "a pass completed".
+    std::unique_lock<std::mutex> pass_lock(pass_mtx_, std::defer_lock);
+    if (wait) {
+        pass_lock.lock();
+    } else if (!pass_lock.try_lock()) {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        if (!hb_admitted_ || hb_stopping_) return false;
+    }
+
+    const std::int64_t started_ms = clockNow();
+    std::vector<std::pair<SchedulerType, ScanResult>> results;
+    std::map<SchedulerType, bool> source_complete;
+    bool complete = true;
+    std::string error;
+
+    if (do_scan) {
+        for (const auto& [name, source] : hb_sources_) {
+            ScanResult result;
+            try {
+                result = source->scan();
+            } catch (const std::exception& exception) {
+                result.complete = false;
+                result.error = std::string("scan threw: ") + exception.what();
+            }
+            if (!result.complete) {
+                const std::string detail =
+                    result.error.empty() ? "incomplete source pass" : result.error;
+                if (error.empty()) {
+                    error = name.empty() ? detail : name + ": " + detail;
+                }
+            }
+            complete = complete && result.complete;
+            const auto inserted =
+                source_complete.emplace(source->schedulerType(), result.complete);
+            if (!inserted.second)
+                inserted.first->second = inserted.first->second && result.complete;
+            results.emplace_back(source->schedulerType(), std::move(result));
+        }
+    }
+
+    std::set<uint64_t> observed;
+    for (const auto& entry : results) {
+        for (const auto& observation : entry.second.observations) {
+            processObservation(observation, observed);
+        }
+    }
+
+    std::deque<HeartbeatHint> hints;
+    drainHints(hints);
+    bool needs_authoritative_pass = false;
+    for (auto& hint : hints) {
+        if (hint.kind == HeartbeatHint::Kind::Observation) {
+            processObservation(hint.observation, observed);
+        } else {
+            // Exit/refresh hints are cheap by design: they ask for one
+            // coalesced authoritative pass instead of doing discovery I/O on
+            // the producing callback.
+            needs_authoritative_pass = true;
+        }
+    }
+    if (needs_authoritative_pass) requestRescan("process/attribute hint");
+
+    // Exec hints become targeted observations on this worker thread: O(job)
+    // reads through the source, never a full-node scan and never on the
+    // polling thread.
+    {
+        std::vector<pid_t> exec_batch;
+        bool overflow = false;
+        {
+            std::lock_guard<std::mutex> lock(hb_mtx_);
+            exec_batch.assign(exec_hints_.begin(), exec_hints_.end());
+            exec_hints_.clear();
+            exec_seen_.clear();
+            overflow = exec_overflow_;
+            exec_overflow_ = false;
+        }
+        if (overflow) {
+            spdlog::warn("JobRegistry: exec hint queue overflowed; requesting a rescan");
+            requestRescan("exec hint overflow");
+        }
+        for (const pid_t pid : exec_batch) processExecHint(pid, observed);
+    }
+
+    // Records no discovery source owns (legacy/manual registrations, or types
+    // whose inventory source was removed) are refreshed here; reads never do.
+    if (do_scan) refreshLegacyRecords();
+
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        ++hb_passes_;
+        if (do_scan) {
+            last_scan_start_ms_ = started_ms;
+            last_scan_complete_ = complete;
+            if (complete) {
+                last_scan_success_ms_ = clockNow();
+                degraded_ = false;
+                hb_last_error_.clear();
+            } else {
+                degraded_ = true;
+                hb_last_error_ = error.empty() ? "source pass incomplete" : error;
+            }
+        }
+    }
+
+    // A targeted pass has no authoritative source coverage, so it never counts
+    // as an absence; only positive termination evidence applies.
+    static const std::map<SchedulerType, bool> no_coverage;
+    evaluateRetirements(observed, do_scan ? source_complete : no_coverage);
+
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        // Only clear the wake-up when this pass consumed everything; a hint
+        // that arrived after the drain must wake the next slice.
+        if (hints_.empty()) hint_wakeup_ = false;
+    }
+    return true;
+}
+
+bool JobRegistry::runInventoryPass(bool do_scan) {
+    const bool result = runPass(do_scan, /*wait=*/true);
+    return result;
+}
+
+bool JobRegistry::reconcileInventoryNow() {
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        // A callback running on the heartbeat thread must never wait for a
+        // pass it is itself inside of.
+        if (hb_worker_id_ != std::thread::id() &&
+            hb_worker_id_ == std::this_thread::get_id()) {
+            return false;
+        }
+        if (!hb_admitted_ && !hb_running_) return false;
+    }
+    return runPass(true, /*wait=*/true);
+}
+
+void JobRegistry::heartbeatLoop() {
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        hb_worker_id_ = std::this_thread::get_id();
+    }
+    const auto interval =
+        std::chrono::milliseconds(static_cast<long long>(reconcile_interval_sec_) * 1000);
+    const auto slice = std::chrono::milliseconds(kWaitSliceMs);
+    auto next_full = std::chrono::steady_clock::now() + interval;
+
+    std::unique_lock<std::mutex> lock(hb_mtx_);
+    while (!hb_stopping_) {
+        // A slice-bounded wait keeps stop() bounded; hints are picked up on
+        // the next slice (at most wait_slice_ms) without ever spinning.
+        hb_cv_.wait_for(lock, slice, [this]() { return hb_stopping_; });
+        if (hb_stopping_) break;
+
+        const bool due = std::chrono::steady_clock::now() >= next_full;
+        bool rescan = false;
+        if (!due && !hint_wakeup_) {
+            // Discovery events and queue overflows ask for an authoritative
+            // pass. Reading source health needs no heartbeat lock.
+            lock.unlock();
+            rescan = rescanRequested();
+            lock.lock();
+            if (!rescan || hb_stopping_) continue;
+        }
+
+        lock.unlock();
+        bool executed = false;
+        if (due) {
+            executed = runPass(true, false);
+            if (executed) next_full = std::chrono::steady_clock::now() + interval;
+        } else if (rescan) {
+            // Coalesce: one forced pass per second at most, so a job-start
+            // storm cannot turn into a /proc scan storm.
+            const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const bool allowed =
+                last_forced_scan_ms_ == 0 || now_ms - last_forced_scan_ms_ >= 1000;
+            if (allowed) {
+                last_forced_scan_ms_ = now_ms;
+                executed = runPass(true, false);
+            } else {
+                executed = runPass(false, false);
+            }
+        } else {
+            executed = runPass(false, false);
+        }
+        lock.lock();
+        // A pass already in flight (an explicit reconcile, for example) owns
+        // the queued hints; retry on the next slice.
+        if (!executed) hint_wakeup_ = true;
+    }
+}
+
+void JobRegistry::startHeartbeat() {
+    std::lock_guard<std::mutex> lock(hb_mtx_);
+    if (hb_stopping_ || hb_running_) return;
+    hb_running_ = true;
+    heartbeat_thread_ = std::make_unique<std::thread>([this]() { heartbeatLoop(); });
+}
+
+void JobRegistry::installHeartbeatSink() {
+    // The sink entries are the same bounded producers tests and out-of-band
+    // callers use; adapters go through them too.
+    heartbeat_sink_.on_observation = [this](const Observation& observation) {
+        onDiscoveryObservation(observation);
+    };
+    heartbeat_sink_.on_exec_hint = [this](pid_t pid) {
+        onDiscoveryExecHint(pid);
+    };
+}
+
+void JobRegistry::publishStatusProvider() {
+    set_inventory_status_provider([this]() { return heartbeatStatusJson(); });
+    set_inventory_refresh_provider([this]() { return reconcileInventoryNow(); });
+    {
+        std::lock_guard<std::mutex> lock(exit_observer_mtx_);
+        exit_observer_ = [this](pid_t pid) { notifyExit(pid); };
+    }
+    std::lock_guard<std::mutex> lock(hb_mtx_);
+    status_published_ = true;
+}
+
+void JobRegistry::retractStatusProvider() {
+    if (status_published_) {
+        set_inventory_status_provider({});
+        status_published_ = false;
+    }
+    set_inventory_refresh_provider({});
+    {
+        std::lock_guard<std::mutex> lock(exit_observer_mtx_);
+        exit_observer_ = {};
+    }
+}
 
 void JobRegistry::init_inventory()
 {
+    // Prepare heartbeat state (idempotent across test registries).
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        hb_admitted_ = true;
+        hb_stopping_ = false;
+        hb_running_ = false;
+        hint_wakeup_ = false;
+        degraded_ = false;
+        incomplete_drain_ = false;
+        hb_last_error_.clear();
+        hints_.clear();
+        exec_hints_.clear();
+        exec_seen_.clear();
+        exec_overflow_ = false;
+        absences_.clear();
+        suspect_ids_.clear();
+        ended_generations_.clear();
+        closing_generations_.clear();
+        last_scan_start_ms_ = 0;
+        last_scan_success_ms_ = 0;
+        last_scan_complete_ = false;
+        hb_passes_ = 0;
+        hb_stop_errors_ = 0;
+    }
+    installHeartbeatSink();
+
+    if (!options_test_sources_.empty() || options_test_heartbeat_) {
+        // Test wiring: pre-built sources, injected probes and encoder, no
+        // configuration and no automatic selection.
+        hb_sources_ = options_test_sources_;
+        process_probe_ = options_test_process_probe_;
+        cgroup_probe_ = options_test_cgroup_probe_;
+        facts_encoder_ = options_test_facts_encoder_;
+        reconcile_interval_sec_ = 30;
+        source_started_.clear();
+        source_start_notes_.clear();
+        for (const auto& [name, source] : options_test_sources_) {
+            bool started = false;
+            std::string note;
+            try {
+                started = source->start(heartbeat_sink_);
+            } catch (const std::exception& error) {
+                note = std::string("start failed: ") + error.what();
+            }
+            if (!started && note.empty())
+                note = "event source unavailable (scan-only)";
+            source_started_.emplace_back(name, started);
+            source_start_notes_.push_back(std::move(note));
+        }
+        if (!runPass(true, /*wait=*/true)) {
+            spdlog::warn("JobRegistry: the initial inventory pass did not run");
+        }
+        publishStatusProvider();
+        startHeartbeat();
+        spdlog::info("JobRegistry: heartbeat running with {} test source(s)",
+                     options_test_sources_.size());
+        return;
+    }
+
     InventoryMaintenanceConfig config;
     try {
         config = resolve_inventory_maintenance_config(Config::instance().dumpConfig());
@@ -149,11 +855,11 @@ void JobRegistry::init_inventory()
                       error.what());
         return;
     }
+    reconcile_interval_sec_ = config.reconcile_interval_sec;
 
     // Exactly one adapter per configured scheduler type, built through the
-    // self-registration registry; the controller drives them through
+    // self-registration registry; the heartbeat drives them through
     // IDiscoverySource and owns no adapter details.
-    std::vector<IDiscoverySource*> sources;
     adapters_.clear();
     for (const auto type : config.types) {
         const auto& settings = config.settings.at(type);
@@ -167,7 +873,6 @@ void JobRegistry::init_inventory()
             adapters_.clear();
             return;
         }
-        sources.push_back(&adapter->source());
         adapters_.push_back(std::move(adapter));
     }
     if (config.types.empty()) {
@@ -191,6 +896,22 @@ void JobRegistry::init_inventory()
                 AutoCollectorPolicy::defaults(settings.default_collectors);
     }
 
+    hb_sources_.clear();
+    for (const auto& adapter : adapters_) {
+        hb_sources_.emplace_back(adapter->name(), &adapter->source());
+    }
+
+    // Liveness probes and the adapter facts encoder.
+    process_probe_ = make_proc_liveness_probe();
+    cgroup_probe_ = make_cgroup_membership_probe();
+    facts_encoder_ = [this](const Observation& observation) -> Job {
+        for (const auto& adapter : adapters_) {
+            if (adapter->source().schedulerType() == observation.scheduler_type)
+                return adapter->encodeFacts(observation);
+        }
+        return Job{};   // no adapter: facts stay empty, the store normalizes
+    };
+
     // Kernel attribution capability gate: only adapters with the trait
     // register into pid2job/cgroup2job; legacy/manual rows (unknown adapter)
     // keep participating. Installed before the initial pass can activate
@@ -207,26 +928,108 @@ void JobRegistry::init_inventory()
         });
     }
 
-    inventory_ = std::make_unique<JobInventoryMaintenance>(*this, config, std::move(sources));
-    // Observation -> typed facts goes through the adapters (the controller
-    // itself stays scheduler-agnostic).
-    inventory_->setFactsEncoder([this](const Observation& observation) -> Job {
-        for (const auto& adapter : adapters_) {
-            if (adapter->source().schedulerType() == observation.scheduler_type)
-                return adapter->encodeFacts(observation);
+    // Sink first, then the poll threads, the initial authoritative pass, the
+    // status provider and finally the worker.
+    source_started_.clear();
+    source_start_notes_.clear();
+    for (const auto& adapter : adapters_) {
+        bool started = false;
+        std::string note;
+        try {
+            started = adapter->source().start(heartbeat_sink_);
+        } catch (const std::exception& error) {
+            note = std::string("start failed: ") + error.what();
         }
-        return Job{};   // no adapter: facts stay empty, the store normalizes
-    });
-    if (!inventory_->start()) {
-        spdlog::error("JobRegistry: inventory maintenance did not start; "
-                      "inventory status will report it as unavailable");
-        inventory_.reset();
-        adapters_.clear();
-        return;
+        if (!started && note.empty())
+            note = "event source unavailable (scan-only)";
+        source_started_.emplace_back(adapter->name(), started);
+        source_start_notes_.push_back(std::move(note));
+        if (!started)
+            spdlog::warn("JobRegistry: source '{}' has no event source, continuing with "
+                         "scans only: {}",
+                         adapter->name(), source_start_notes_.back());
     }
-    spdlog::info("JobRegistry: inventory maintenance running with {} discovery type(s)",
+    if (!runPass(true, /*wait=*/true)) {
+        spdlog::warn("JobRegistry: the initial inventory pass did not run");
+    }
+    publishStatusProvider();
+    startHeartbeat();
+    spdlog::info("JobRegistry: inventory heartbeat running with {} discovery type(s)",
                  config.types.size());
 }
+
+void JobRegistry::stopInventoryDiscovery() {
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        if (!hb_admitted_ && !hb_running_ &&
+            !(heartbeat_thread_ && heartbeat_thread_->joinable()))
+            return;
+        hb_admitted_ = false;
+        hb_stopping_ = true;
+    }
+    hb_cv_.notify_all();
+
+    bool on_hb_thread = false;
+    {
+        std::unique_ptr<std::thread> thread;
+        {
+            std::lock_guard<std::mutex> lock(hb_mtx_);
+            thread = std::move(heartbeat_thread_);
+            on_hb_thread = hb_worker_id_ != std::thread::id() &&
+                           hb_worker_id_ == std::this_thread::get_id();
+            hb_running_ = false;
+            hb_worker_id_ = std::thread::id();
+        }
+        if (thread && thread->joinable()) {
+            if (on_hb_thread) {
+                // A callback from the heartbeat thread must never self-join;
+                // shutdown is reported as incomplete instead of deadlocking.
+                spdlog::error("JobRegistry: stop() called from the heartbeat thread; "
+                              "detaching instead of self-joining");
+                std::lock_guard<std::mutex> lock(hb_mtx_);
+                ++hb_stop_errors_;
+                thread->detach();
+            } else {
+                thread->join();
+            }
+        }
+    }
+
+    // Wait for an in-flight pass so no pass can touch the store after this
+    // returns (the stop path runs before the DB is closed).
+    {
+        std::unique_lock<std::mutex> pass_lock(pass_mtx_, std::defer_lock);
+        if (!on_hb_thread) pass_lock.lock();
+    }
+
+    // Stop discovery polling before finishing the queued work.
+    for (const auto& [name, source] : hb_sources_) {
+        try {
+            source->stop();
+        } catch (const std::exception& error) {
+            spdlog::error("JobRegistry: source '{}' stop failed: {}", name, error.what());
+            std::lock_guard<std::mutex> lock(hb_mtx_);
+            ++hb_stop_errors_;
+        }
+    }
+
+    // "Finish queued bounded maintenance": accepted observations are committed
+    // while the store is still open, never silently discarded.
+    std::deque<HeartbeatHint> hints;
+    drainHints(hints);
+    std::set<uint64_t> observed;
+    for (auto& hint : hints) {
+        if (hint.kind == HeartbeatHint::Kind::Observation)
+            processObservation(hint.observation, observed);
+    }
+    if (!hints.empty()) {
+        spdlog::info("JobRegistry: discovery stopped, {} buffered hint(s) completed",
+                     hints.size());
+    } else {
+        spdlog::info("JobRegistry: discovery stopped");
+    }
+}
+
 
 void JobRegistry::apply_auto_policy(const Job& job, SchedulerType type)
 {
@@ -260,27 +1063,51 @@ bool JobRegistry::applyAutoSelection(uint64_t internal_id,
     return true;
 }
 
-void JobRegistry::stopInventoryDiscovery()
-{
-    if (inventory_) inventory_->stopDiscovery();
-}
-
 bool JobRegistry::deinit()
 {
     if (deinit_done_) return deinit_ok_;
 
-    // Plan 5.3 shutdown order: discovery admission stopped first (the service
-    // calls stopInventoryDiscovery() before draining the scheduler), then the
+    // Shutdown order: discovery admission stopped first (the service calls
+    // stopInventoryDiscovery() before draining the scheduler), then the
     // retirements are finalized, then attribution, then the store.
-    if (inventory_ && !inventory_->stoppedDiscovery()) stopInventoryDiscovery();
+    stopInventoryDiscovery();
 
     bool ok = true;
-    // Archive leftover closing records before the controller's finalize so a
-    // restored closing record is not reported as an incomplete drain even
-    // though the archive below succeeds.
+    // Archive leftover closing records first so a restored closing record is
+    // not reported as an incomplete drain even though the archive succeeds.
     if (!cleanupClosingJobs()) ok = false;
-    if (inventory_ && !inventory_->finalize()) ok = false;
-    inventory_.reset();
+
+    // Finalize: acknowledge the retirements this heartbeat made. The collector
+    // drain has completed by now; a late acknowledgement for an old generation
+    // is discarded.
+    {
+        std::vector<std::pair<uint64_t, ExecutionGeneration>> closing;
+        {
+            std::lock_guard<std::mutex> lock(hb_mtx_);
+            closing.swap(closing_generations_);
+        }
+        for (const auto& [internal_id, generation] : closing) {
+            const auto record = store_->record(internal_id);
+            if (record && !(record->generation == generation)) {
+                spdlog::info("JobRegistry: JobID {} no longer carries the retired "
+                             "generation; acknowledgement discarded", internal_id);
+                continue;
+            }
+            if (!record) continue;   // already archived
+            if (!acknowledgeJobRemoval(internal_id) && store_->record(internal_id)) {
+                ok = false;
+                std::lock_guard<std::mutex> lock(hb_mtx_);
+                closing_generations_.emplace_back(internal_id, generation);
+            }
+        }
+        if (store_->closingCount() > 0) ok = false;
+    }
+
+    retractStatusProvider();
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        incomplete_drain_ = !ok || hb_stop_errors_ > 0;
+    }
     adapters_.clear();
 
     stop_pid_tracker();
@@ -978,4 +1805,178 @@ void JobRegistry::regRPCHandle() {
         [](const nlohmann::json&) -> nlohmann::json {
             return {{"status", "ok"}, {"stats", GroupProbeStats::instance().to_json()}};
         });
+}
+
+void JobRegistry::onDiscoveryObservation(const Observation& observation) {
+    HeartbeatHint hint;
+    hint.kind = HeartbeatHint::Kind::Observation;
+    hint.observation = observation;
+    enqueueHint(std::move(hint));
+}
+
+void JobRegistry::onDiscoveryExecHint(pid_t pid) {
+    if (pid <= 0) return;
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        ++hb_events_received_;
+        if (!hb_admitted_ || hb_stopping_) {
+            ++hb_events_dropped_;
+            return;
+        }
+        if (exec_seen_.insert(pid).second) {
+            exec_hints_.push_back(pid);
+            if (exec_hints_.size() > kExecHintCapacity) {
+                exec_seen_.erase(exec_hints_.front());
+                exec_hints_.pop_front();
+                ++hb_events_dropped_;
+                exec_overflow_ = true;
+            }
+        } else {
+            ++hb_events_dropped_;
+        }
+        hint_wakeup_ = true;
+    }
+    hb_cv_.notify_one();
+}
+
+nlohmann::json JobRegistry::heartbeatStatusJson() const {
+    // Registry/store queries happen without holding the heartbeat mutex; they
+    // take their own locks briefly and never re-enter here.
+    const StoreHealth store = storeHealth();
+    const auto records = inventoryRecords();
+    const std::size_t closing_records = closingJobCount();
+
+    std::vector<std::pair<uint64_t, ExecutionGeneration>> closing_ids;
+    std::set<uint64_t> suspect_ids;
+    std::uint64_t events_received = 0;
+    std::uint64_t events_dropped = 0;
+    std::uint64_t rescan_requests = 0;
+    std::uint64_t obsolete_hints = 0;
+    std::uint64_t incomplete_observations = 0;
+    std::uint64_t upsert_conflicts = 0;
+    std::uint64_t retirements = 0;
+    std::uint64_t passes = 0;
+    std::size_t queue_depth = 0;
+    std::int64_t last_scan_start_ms = 0;
+    std::int64_t last_scan_success_ms = 0;
+    bool last_scan_complete = false;
+    bool incomplete_drain = false;
+    bool admitted = false;
+    bool degraded = false;
+    std::string last_error;
+    bool tracker_unavailable = false;
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        closing_ids = closing_generations_;
+        suspect_ids = suspect_ids_;
+        events_received = hb_events_received_;
+        events_dropped = hb_events_dropped_;
+        rescan_requests = hb_rescan_requests_;
+        obsolete_hints = hb_obsolete_hints_;
+        incomplete_observations = hb_incomplete_observations_;
+        upsert_conflicts = hb_upsert_conflicts_;
+        retirements = hb_retirements_;
+        passes = hb_passes_;
+        queue_depth = hints_.size();
+        last_scan_start_ms = last_scan_start_ms_;
+        last_scan_success_ms = last_scan_success_ms_;
+        last_scan_complete = last_scan_complete_;
+        incomplete_drain = incomplete_drain_;
+        admitted = hb_admitted_;
+        degraded = degraded_;
+        last_error = hb_last_error_;
+    }
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        for (const auto& started : source_started_) {
+            if (!started.second) tracker_unavailable = true;
+        }
+    }
+
+    std::size_t closing_present = 0;
+    for (const auto& entry : closing_ids) {
+        // Closing records stay in the store until the acknowledgement archives
+        // them, so this is the accurate overlap with the active count.
+        if (inventoryRecord(entry.first).has_value()) ++closing_present;
+    }
+
+    std::size_t active_count = 0;
+    std::size_t suspect_count = 0;
+    std::size_t incomplete_count = 0;
+    std::size_t quarantined_count = 0;
+    for (const auto& record : records) {
+        if (record.internal_id == 0) continue;   // system sentinel is never inventory
+        if (!record.identity_complete) ++incomplete_count;
+        if (record.quarantined) ++quarantined_count;
+        const bool suspect = record.state == kStateSuspect ||
+                             suspect_ids.count(record.internal_id) != 0;
+        if (suspect) ++suspect_count;
+        else if (record.state == kStateActive) ++active_count;
+    }
+    if (active_count >= closing_present) active_count -= closing_present;
+    else active_count = 0;
+
+    std::string state;
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        if (!admitted) state = "stopped";
+        else if (passes == 0) state = "initializing";
+        else if (degraded || !last_scan_complete) state = "degraded";
+        else state = "healthy";
+    }
+
+    nlohmann::json configured_types = nlohmann::json::array();
+    for (const auto& adapter : adapters_) configured_types.push_back(adapter->name());
+
+    nlohmann::json sources = nlohmann::json::array();
+    {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        for (std::size_t index = 0; index < source_started_.size(); ++index) {
+            nlohmann::json entry;
+            entry["name"] = source_started_[index].first;
+            entry["started"] = source_started_[index].second;
+            entry["start_note"] = index < source_start_notes_.size()
+                                      ? source_start_notes_[index]
+                                      : std::string();
+            sources.push_back(std::move(entry));
+        }
+    }
+
+    nlohmann::json out;
+    out["state"] = state;
+    out["configured_types"] = std::move(configured_types);
+    out["reconcile_interval_sec"] = reconcile_interval_sec_;
+    out["last_scan_start_ms"] = last_scan_start_ms;
+    out["last_scan_success_ms"] = last_scan_success_ms;
+    out["last_scan_complete"] = last_scan_complete;
+    out["last_error"] = last_error;
+    out["active_count"] = active_count;
+    out["suspect_count"] = suspect_count;
+    out["closing_count"] = closing_records;
+    out["incomplete_count"] = incomplete_count;
+    out["quarantined_count"] = quarantined_count;
+    out["events_received"] = events_received;
+    out["events_dropped"] = events_dropped;
+    out["queue_depth"] = queue_depth;
+    out["rescan_requests"] = rescan_requests;
+    out["obsolete_hints"] = obsolete_hints;
+    out["unresolved_hints"] = hb_unresolved_hints_;
+    out["incomplete_observations"] = incomplete_observations;
+    out["upsert_conflicts"] = upsert_conflicts;
+    out["retirements"] = retirements;
+    out["pass_count"] = passes;
+    out["tracker_unavailable"] = tracker_unavailable;
+    out["incomplete_drain"] = incomplete_drain;
+    out["store"] = nlohmann::json{
+        {"db_running", store.db_running},
+        {"migration_complete", store.migration_complete},
+        {"migration_state", store.migration_state},
+        {"schema_version", store.schema_version},
+        {"degraded", store.degraded},
+        {"write_failures", store.write_failures},
+        {"last_write_error", store.last_write_error},
+        {"active_instances", store.active_instances},
+    };
+    out["sources"] = std::move(sources);
+    return out;
 }

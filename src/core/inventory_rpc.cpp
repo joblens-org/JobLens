@@ -31,7 +31,8 @@
 #include "common/utils.hpp"
 #include "core/collector_registry.hpp"
 #include "core/job_collection_manager.hpp"
-#include "core/job_inventory_maintenance.hpp"
+#include "core/inventory_config.hpp"
+#include "core/inventory_status_provider.hpp"
 #include "common/local_rpc.hpp"
 
 #if __has_include("core/inventory_status_provider.hpp")

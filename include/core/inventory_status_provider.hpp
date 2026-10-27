@@ -19,7 +19,7 @@
 // store health it reads itself. This header is deliberately header-only in
 // contract and definition-stable: the RPC task compiles against these two
 // declarations, and the only implementation lives in
-// src/core/job_inventory_maintenance.cpp.
+// src/core/inventory_status.cpp.
 //
 // Threading: both accessors are safe from any thread. The provider may be
 // invoked while maintenance is running; it returns an empty function once

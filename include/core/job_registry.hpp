@@ -27,6 +27,11 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <set>
 
 #include "common/streamer_watcher.hpp"
 #include "core/collector_type.h"
@@ -37,20 +42,20 @@
 #include "core/job_store.hpp"
 #include "core/kernel_attribution.hpp"
 #include "core/job_auto_policy.hpp"
+#include "core/liveness.hpp"
 #include "core/scheduler_adapter.hpp"
 
 #include "job_watcher/condor_adapter.hpp"
 #include "job_watcher/slurm_adapter.hpp"
 
 class JobCollectionManager;
-class JobInventoryMaintenance;
 
 // Construction options. Production uses the singleton (all defaults); tests
 // and inventory-only service startup construct an isolated store without
 // watchers, eBPF or RPC registration.
 struct JobRegistryOptions {
     std::string db_path;                 // empty: job_registry_config.job_db_path
-    // Start the inventory stack (watchers + maintenance heartbeat) in the
+    // Start the inventory heartbeat (discovery adapters + maintenance) in the
     // constructor. Tests and store-only instances disable it.
     bool enable_inventory_maintenance = true;
     bool enable_pid_tracker = true;
@@ -58,6 +63,19 @@ struct JobRegistryOptions {
     // Test seam: stop a legacy migration after this many durable batches and
     // leave it resumable. 0 = unlimited.
     size_t migration_batch_limit = 0;
+    // --- heartbeat test seams (used instead of the config-driven adapters) --
+    // Pre-built discovery sources to drive, with the adapter name each
+    // observation belongs to. When non-empty, the configuration is not
+    // consulted and automatic selection stays disabled.
+    std::vector<std::pair<std::string, IDiscoverySource*>> test_sources;
+    // With this flag the heartbeat runs without reading Config (test wiring;
+    // combine with test_sources, or leave it empty for legacy-only upkeep).
+    bool test_heartbeat = false;
+    // Liveness probe overrides (empty = production /proc/cgroup probes).
+    ProcessLivenessProbe test_process_probe;
+    CgroupMembershipProbe test_cgroup_probe;
+    // Observation -> typed facts override (empty = the registered adapters).
+    std::function<Job(const Observation&)> test_facts_encoder;
 };
 
 class JobRegistry : private KernelAttribution::Host {
@@ -146,14 +164,30 @@ public:
     void setExitObserver(std::function<void(pid_t)> observer);
 
     // --- Lifecycle -----------------------------------------------------------
-    // Plan 5.3: stop discovery admission and polling. Must run before the
-    // collector scheduler drains. Idempotent.
+    // Stop discovery admission and polling. Must run before the collector
+    // scheduler drains. Idempotent.
     void stopInventoryDiscovery();
     // Finalize retirements, stop the heartbeat, archive closing records and
     // close the store. Returns false when a closing record could not be
     // archived (the incomplete state stays persisted). Idempotent; the
     // destructor calls it as a fallback.
     bool deinit();
+
+    // --- Inventory heartbeat (v2 §2.3) ---------------------------------------
+    // One maintenance tick: scan -> upsert -> hint merge -> retirement ->
+    // desired/applied reconciliation. Public so tests and the on-demand
+    // refresh path run exactly what the periodic worker runs. Returns true
+    // when a pass ran.
+    bool runInventoryPass(bool do_scan = true);
+    // One on-demand authoritative pass (the `ensure_registered` refresh
+    // provider). Returns false when the heartbeat is not running.
+    bool reconcileInventoryNow();
+    // Discovery event entries (the sink the adapters get, exposed for tests
+    // and out-of-band producers). Cheap and bounded: they only enqueue.
+    void onDiscoveryObservation(const Observation& observation);
+    void onDiscoveryExecHint(pid_t pid);
+    // Kernel exit hint entry (cheap; schedules a coalesced refresh).
+    void notifyExit(pid_t pid);
 
     // Automatic selection entry point: record the decision as the instance's
     // automatic intent (manual overrides are never touched). Returns false
@@ -199,17 +233,109 @@ private:
     std::function<void(pid_t)>             exit_observer_;
 
     // Owned discovery/maintenance stack (construction order: store -> manager
-    // -> inventory -> attribution -> RPC; destruction runs deinit()).
+    // -> heartbeat -> attribution -> RPC; destruction runs deinit()).
     // Adapters are built from the resolved configuration through the
     // SchedulerAdapterRegistry; the registry never names a scheduler.
     std::vector<std::unique_ptr<ISchedulerAdapter>> adapters_;
-    std::unique_ptr<JobInventoryMaintenance> inventory_;
+
+    // --- inventory heartbeat state (guarded by hb_mtx_ unless noted) --------
+    struct HeartbeatHint {
+        enum class Kind { Observation = 0, Exit, Refresh };
+        Kind kind = Kind::Observation;
+        Observation observation;
+        pid_t pid = 0;
+    };
+    struct AbsenceEntry {
+        ExecutionGeneration generation;
+        int complete_absences = 0;
+        std::int64_t last_seen_ms = 0;
+    };
+    mutable std::mutex hb_mtx_;
+    std::condition_variable hb_cv_;
+    std::deque<HeartbeatHint> hints_;
+    std::deque<pid_t> exec_hints_;
+    std::set<pid_t> exec_seen_;
+    bool exec_overflow_ = false;
+    std::map<uint64_t, AbsenceEntry> absences_;
+    std::set<uint64_t> suspect_ids_;
+    std::map<std::string, ExecutionGeneration> ended_generations_;
+    std::vector<std::pair<uint64_t, ExecutionGeneration>> closing_generations_;
+    bool hb_admitted_ = false;     // false after stopInventoryDiscovery()
+    bool hb_running_ = false;      // worker thread alive
+    bool hb_stopping_ = false;
+    bool hint_wakeup_ = false;
+    bool rescan_flag_ = false;
+    bool degraded_ = false;
+    bool incomplete_drain_ = false;
+    bool status_published_ = false;
+    bool last_scan_complete_ = false;
+    std::int64_t last_scan_start_ms_ = 0;
+    std::int64_t last_scan_success_ms_ = 0;
+    std::int64_t last_forced_scan_ms_ = 0;
+    std::string hb_last_error_;
+    std::thread::id hb_worker_id_;
+    std::uint32_t reconcile_interval_sec_ = 30;
+    std::uint64_t hb_events_received_ = 0;
+    std::uint64_t hb_events_dropped_ = 0;
+    std::uint64_t hb_rescan_requests_ = 0;
+    std::uint64_t hb_obsolete_hints_ = 0;
+    std::uint64_t hb_unresolved_hints_ = 0;
+    std::uint64_t hb_incomplete_observations_ = 0;
+    std::uint64_t hb_upsert_conflicts_ = 0;
+    std::uint64_t hb_retirements_ = 0;
+    std::uint64_t hb_passes_ = 0;
+    std::uint64_t hb_stop_errors_ = 0;
+    std::vector<std::pair<std::string, bool>> source_started_;  // name, started
+    std::vector<std::string> source_start_notes_;
+    // Serializes passes (worker vs on-demand reconciles). Never held while
+    // taking hb_mtx_.
+    std::mutex pass_mtx_;
+    std::unique_ptr<std::thread> heartbeat_thread_;
+    // Liveness probes (production or test-injected) and the observation ->
+    // typed-facts encoder. Set once during init, read during passes.
+    ProcessLivenessProbe process_probe_;
+    CgroupMembershipProbe cgroup_probe_;
+    std::function<Job(const Observation&)> facts_encoder_;
+    // Constructor-provided test seams and the sink handed to the sources.
+    std::vector<std::pair<std::string, IDiscoverySource*>> options_test_sources_;
+    // Every discovery source the heartbeat drives (adapters or test sources),
+    // populated during init_inventory.
+    std::vector<std::pair<std::string, IDiscoverySource*>> hb_sources_;
+    ProcessLivenessProbe options_test_process_probe_;
+    CgroupMembershipProbe options_test_cgroup_probe_;
+    std::function<Job(const Observation&)> options_test_facts_encoder_;
+    bool options_test_heartbeat_ = false;
+    DiscoverySink heartbeat_sink_;
     std::shared_ptr<JobCollectionManager> collection_manager_;
     // Automatic collector selection per scheduler type, armed from the
     // resolved inventory configuration. A disabled entry selects nothing.
     std::map<SchedulerType, AutoCollectorPolicy> auto_policies_;
     bool deinit_done_{false};
     bool deinit_ok_{true};
+
+    // Heartbeat internals.
+    void startHeartbeat();
+    void heartbeatLoop();
+    bool runPass(bool do_scan, bool wait);
+    void processObservation(const Observation& observation, std::set<uint64_t>& observed);
+    void processExecHint(pid_t pid, std::set<uint64_t>& observed);
+    ObservedExecution toExecution(const Observation& observation) const;
+    void enqueueHint(HeartbeatHint hint);
+    void requestRescan(const std::string& reason);
+    bool rescanRequested() const;
+    void refreshLegacyRecords();
+    void evaluateRetirements(const std::set<uint64_t>& observed_ids,
+                             const std::map<SchedulerType, bool>& source_complete);
+    bool retireIfConfirmed(const JobRecord& record, const std::string& reason);
+    void rememberEnded(const JobRecord& record);
+    bool isObsolete(const CanonicalIdentity& identity, const ExecutionGeneration& gen);
+    void publishStatusProvider();
+    void retractStatusProvider();
+    void noteHeartbeatError(const std::string& error);
+    nlohmann::json heartbeatStatusJson() const;
+    void installHeartbeatSink();
+    std::int64_t clockNow() const;
+    void drainHints(std::deque<HeartbeatHint>& out);
 
     // Lifecycle fan-out copied under the lock and invoked without it, so a
     // callback can never re-enter the registry while it is locked.
