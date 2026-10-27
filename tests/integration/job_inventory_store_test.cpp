@@ -669,7 +669,7 @@ void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string
     check(registry.findJob(created.internal_id)->JobPIDs.empty(),
           "a confirmed empty membership must clear stale member pids");
     const auto record = registry.inventoryRecord(created.internal_id);
-    check(record.has_value() && record->processes.empty(),
+    check(record.has_value() && record->members.empty(),
           "the stored process evidence must follow the confirmed empty set");
 }
 

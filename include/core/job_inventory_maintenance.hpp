@@ -67,6 +67,11 @@
 
 #include "core/job_observation.hpp"
 #include "core/job_registry.hpp"
+#include "core/job_store.hpp"
+
+// Transitional alias: the maintenance controller predates the JobRecord fold
+// and is deleted in v2 stage S5.
+using InventoryRecord = JobRecord;
 
 // ---------------------------------------------------------------------------
 // Configuration contract (plan section 8)

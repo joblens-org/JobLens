@@ -1292,7 +1292,7 @@ void JobInventoryMaintenance::refreshLegacyRecords()
         if (record.internal_id == kSystemSentinelJobId) continue;
         if (record.state == "closing") continue;  // the drain owns it
         if (record.generation.complete()) continue;  // discovery owns these facts
-        if (record.processes.empty()) continue;      // no liveness evidence yet
+        if (record.members.empty()) continue;      // no liveness evidence yet
         registry_.refreshJobFacts(record.internal_id);
     }
 }
@@ -1355,7 +1355,7 @@ void JobInventoryMaintenance::evaluateRetirements(
         // keep the record, an all-dead list retires it exactly like the old
         // read-time cleanup did.
         if (!record.generation.complete()) {
-            std::vector<ProcessIdentity> pids = record.processes;
+            std::vector<ProcessIdentity> pids = record.members;
             if (pids.empty()) {
                 if (const auto job = registry_.findJob(record.internal_id)) {
                     for (const auto pid : job->JobPIDs) pids.push_back(ProcessIdentity{pid, 0, ""});
@@ -1434,7 +1434,7 @@ void JobInventoryMaintenance::evaluateRetirements(
 
         bool live_member = false;
         bool member_inconclusive = false;
-        for (const auto& member : record.processes) {
+        for (const auto& member : record.members) {
             const LivenessResult liveness = process_probe_ ? process_probe_(member)
                                                            : LivenessResult{};
             if (liveness.state == LivenessState::Alive) {

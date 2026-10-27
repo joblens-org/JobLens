@@ -469,7 +469,7 @@ std::size_t count_records(JobRegistry& registry)
     return count;
 }
 
-std::optional<InventoryRecord> find_native(JobRegistry& registry, const std::string& native,
+std::optional<JobRecord> find_native(JobRegistry& registry, const std::string& native,
                                            const std::string& cluster = "htcondor01",
                                            const std::string& tag = "schedd-a")
 {
@@ -714,7 +714,7 @@ void case_a10(const std::string& base)
     probes.set_cgroup("/cg/slot-4", {6001}, true);
     const auto record = find_native(registry, "300.0");
     check(record.has_value(), "A10: record missing");
-    check(record->processes.empty(), "A10: fixture should have an empty PID list");
+    check(record->members.empty(), "A10: fixture should have an empty PID list");
 
     source.set_scan([&]() { return scan_with({}); });
     maintenance.reconcileNow();
