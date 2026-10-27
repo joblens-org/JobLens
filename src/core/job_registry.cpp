@@ -725,6 +725,8 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
 
 
 // 从 Job 取 cgroup 路径: Slurm 用 cgroup_path, Condor 用 slots_cgroup_path。
+// (KernelAttribution owns the cgroup-id cache; this helper stays only for the
+// registry-side queries that report a job's cgroup path.)
 static std::string job_cgroup_path(const Job& job) {
     try {
         if (job.subtype == JobSubType::Slurm)
@@ -734,17 +736,6 @@ static std::string job_cgroup_path(const Job& job) {
     } catch (const std::bad_variant_access&) {
     }
     return {};
-}
-
-// 解析 Job 的 cgroup 路径为 cgroup_id 并缓存到 job.cgroup_id(仅解析一次)。
-// 删除作业时直接复用缓存的 id, 不依赖 cgroup 目录仍存在(作业结束后调度器可能已删除该目录)。
-static void resolve_and_cache_cgroup_id(Job& job) {
-    if (job.cgroup_id != 0) return;  // 已缓存, 跳过重复 stat
-    const auto cg = job_cgroup_path(job);
-    if (cg.empty()) return;
-    if (auto cgid = EbpfCommon::cgroup_path_to_id(cg)) {
-        job.cgroup_id = *cgid;
-    }
 }
 
 void JobRegistry::init_inventory()
@@ -885,155 +876,82 @@ JobRegistry::~JobRegistry()
 }
 
 void JobRegistry::init_pid_tracker() {
-    pid_tracker_ = std::make_unique<JobPidTracker>();
-    pid_tracker_->set_fork_cb([this](uint32_t pid, uint64_t job_id) { on_kernel_fork(pid, job_id); });
-    pid_tracker_->set_exit_cb([this](uint32_t pid, uint64_t job_id) { on_kernel_exit(pid, job_id); });
-    if (!pid_tracker_->start()) {
-        spdlog::warn("JobRegistry: pid tracker start failed, kernel pid2job maintenance disabled");
-        pid_tracker_.reset();
-        return;
+    attribution_ = std::make_unique<KernelAttribution>(
+        static_cast<KernelAttribution::Host&>(*this));
+    if (!attribution_->start()) {
+        spdlog::warn("JobRegistry: kernel attribution start failed, pid2job maintenance "
+                     "disabled");
+        attribution_.reset();
     }
-    reconcile_running_ = true;
-    reconcile_thread_ = std::make_unique<std::thread>([this]() { reconcile_loop(); });
-    spdlog::info("JobRegistry: pid tracker enabled");
 }
 
 void JobRegistry::stop_pid_tracker() {
-    if (reconcile_running_) {
-        reconcile_running_ = false;
-        if (reconcile_thread_ && reconcile_thread_->joinable()) reconcile_thread_->join();
-        reconcile_thread_.reset();
-    }
-    if (pid_tracker_) {
-        pid_tracker_->stop();
-        pid_tracker_.reset();
+    if (attribution_) {
+        attribution_->stop();
+        attribution_.reset();
     }
 }
 
-// JobEvent::Added 时调用: 向内核登记 cgroup 归属 + 写入根 pid 种子, 内核 fork hook 据此繁衍。
-void JobRegistry::sync_job_to_kernel(Job& job) {
-    if (!pid_tracker_ || job.JobID == 0) return;
-    // 确保 cgroup_id 已缓存(从 db 恢复的旧 job 可能未缓存, 此处兜底解析一次)。
-    resolve_and_cache_cgroup_id(job);
-    if (job.cgroup_id != 0) {
-        if (pid_tracker_->set_cgroup_job(job.cgroup_id, job.JobID)) {
-            spdlog::debug("JobRegistry: kernel cgroup2job registered job_id={} cgroup_id={}",
-                          job.JobID, job.cgroup_id);
-        } else {
-            spdlog::warn("JobRegistry: kernel cgroup2job write failed job_id={} cgroup_id={}",
-                         job.JobID, job.cgroup_id);
-        }
-    }
-    for (pid_t pid : job.JobPIDs) {
-        if (!pid_tracker_->set_pid_job(static_cast<uint32_t>(pid), job.JobID)) {
-            spdlog::warn("JobRegistry: kernel pid2job seed write failed job_id={} pid={}", job.JobID, pid);
-        }
-    }
-    spdlog::debug("JobRegistry: synced job to kernel job_id={} seed_pids={} has_cgroup={}",
-                  job.JobID, job.JobPIDs.size(), job.cgroup_id != 0);
+// --- KernelAttribution::Host (registry-side projection updates) -----------
+
+bool JobRegistry::attributionJobExists(uint64_t internal_id) {
+    std::shared_lock lg(mtx_);
+    return jobs_.count(internal_id) != 0;
 }
 
-// JobEvent::Removed 时调用: 删 cgroup2job + 清理该 Job 在 pid2job 的所有已知 pid。
-void JobRegistry::remove_job_from_kernel(const Job& job) {
-    if (!pid_tracker_ || job.JobID == 0) return;
-    if (job.cgroup_id != 0) {
-        pid_tracker_->del_cgroup_job(job.cgroup_id);
-        spdlog::debug("JobRegistry: kernel cgroup2job removed job_id={} cgroup_id={}",
-                      job.JobID, job.cgroup_id);
-    }
-    for (pid_t pid : job.JobPIDs) {
-        pid_tracker_->del_pid_job(static_cast<uint32_t>(pid));
-    }
-    spdlog::debug("JobRegistry: removed job from kernel job_id={} cleared_pids={} has_cgroup={}",
-                  job.JobID, job.JobPIDs.size(), job.cgroup_id != 0);
-}
-
-// ringbuf FORK: 内核已将 child 写入 pid2job, 这里同步更新用户态 Job.JobPIDs。
-void JobRegistry::on_kernel_fork(uint32_t pid, uint64_t job_id) {
+void JobRegistry::attributionJobAddPid(uint64_t internal_id, pid_t pid) {
     std::unique_lock lg(mtx_);
-    auto it = jobs_.find(job_id);
-    if (it == jobs_.end()) {
-        spdlog::debug("JobRegistry: kernel FORK event for unknown job_id={} pid={}, ignored "
-                      "(job may have just been removed)", job_id, pid);
-        return;
-    }
+    auto it = jobs_.find(internal_id);
+    if (it == jobs_.end()) return;
     auto& pids = it->second.JobPIDs;
-    if (std::find(pids.begin(), pids.end(), static_cast<pid_t>(pid)) == pids.end()) {
-        pids.push_back(static_cast<pid_t>(pid));
+    if (std::find(pids.begin(), pids.end(), pid) == pids.end()) {
+        pids.push_back(pid);
         spdlog::trace("JobRegistry: kernel FORK added pid={} to job_id={} (now {} pids)",
-                      pid, job_id, pids.size());
+                      pid, internal_id, pids.size());
     }
 }
 
-// ringbuf EXIT: 内核已从 pid2job 删除, 这里同步移除用户态 Job.JobPIDs。
-void JobRegistry::on_kernel_exit(uint32_t pid, uint64_t job_id) {
-    std::function<void(pid_t)> observer;
-    {
-        std::unique_lock lg(mtx_);
-        auto it = jobs_.find(job_id);
-        if (it == jobs_.end()) {
-            spdlog::debug("JobRegistry: kernel EXIT event for unknown job_id={} pid={}, ignored", job_id, pid);
-        } else {
-            auto& pids = it->second.JobPIDs;
-            auto before = pids.size();
-            pids.erase(std::remove(pids.begin(), pids.end(), static_cast<pid_t>(pid)), pids.end());
-            if (pids.size() != before) {
-                spdlog::trace("JobRegistry: kernel EXIT removed pid={} from job_id={} (now {} pids)",
-                              pid, job_id, pids.size());
-            }
-        }
+void JobRegistry::attributionJobRemovePid(uint64_t internal_id, pid_t pid) {
+    std::unique_lock lg(mtx_);
+    auto it = jobs_.find(internal_id);
+    if (it == jobs_.end()) return;
+    auto& pids = it->second.JobPIDs;
+    const auto before = pids.size();
+    pids.erase(std::remove(pids.begin(), pids.end(), pid), pids.end());
+    if (pids.size() != before) {
+        spdlog::trace("JobRegistry: kernel EXIT removed pid={} from job_id={} (now {} pids)",
+                      pid, internal_id, pids.size());
     }
+}
 
-    // Maintenance owns fact refresh and retirement; the kernel callback only
-    // hands over a cheap hint (plan 5.2 "fork/exit hints trigger targeted
-    // refresh"), never discovery I/O.
+void JobRegistry::attributionEnumerateJobs(
+    const std::function<void(const Job&)>& fn) {
+    // Snapshot under the lock; the callback runs per copy without it.
+    for (const auto& job : snapshot()) fn(job);
+}
+
+void JobRegistry::attributionExitHint(pid_t pid) {
+    std::function<void(pid_t)> observer;
     {
         std::lock_guard<std::mutex> lock(exit_observer_mtx_);
         observer = exit_observer_;
     }
     if (observer) {
         try {
-            observer(static_cast<pid_t>(pid));
+            observer(pid);
         } catch (const std::exception& error) {
             spdlog::warn("JobRegistry: exit observer failed: {}", error.what());
         }
     }
 }
 
-// 低频对账: 周期性把当前所有 Job 的归属重新写回内核, 校正 ringbuf 丢事件导致的漂移。
-void JobRegistry::reconcile_loop() {
-    while (reconcile_running_) {
-        for (int i = 0; i < 300 && reconcile_running_; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        if (!reconcile_running_) break;
-        auto jobs = snapshot();
-        for (auto& job : jobs) {
-            sync_job_to_kernel(job);
-            // Write the resolved cgroup id back to the stored job: removal
-            // needs the cached id when the cgroup directory may already be
-            // gone (a snapshot copy is discarded here).
-            if (job.cgroup_id != 0) {
-                std::unique_lock lg(mtx_);
-                if (auto it = jobs_.find(job.JobID); it != jobs_.end() &&
-                                                       it->second.cgroup_id != job.cgroup_id)
-                    it->second.cgroup_id = job.cgroup_id;
-            }
-        }
-        spdlog::debug("JobRegistry: pid tracker reconcile pass done, resynced {} jobs to kernel", jobs.size());
+// 内核登记入口（Added/ Removed 由生命周期路径调用）。
+void JobRegistry::sync_job_to_kernel(const Job& job) {
+    if (attribution_) attribution_->activate(job.JobID, job);
+}
 
-        // ringbuf 溢出是静默的: 一旦发生, JobPIDs 会悄悄失真。按对账周期上报增量,
-        // 让"归属信息是否可信"有据可查(可用 JobRegistry/pid_tracker_stats 查累计值)。
-        if (pid_tracker_) {
-            const uint64_t dropped = pid_tracker_->dropped_events();
-            if (dropped > last_dropped_events_) {
-                spdlog::warn("JobRegistry: job_event ringbuf overflow, {} new pid attribution events dropped "
-                             "(cumulative {}); JobPIDs may be incomplete until the next cgroup resync",
-                             dropped - last_dropped_events_, dropped);
-                last_dropped_events_ = dropped;
-            }
-        }
-    }
+void JobRegistry::remove_job_from_kernel(const Job& job) {
+    if (attribution_) attribution_->deactivate(job.JobID, job);
 }
 
 // ---------------------------------------------------------------------------
@@ -1846,9 +1764,9 @@ void JobRegistry::regRPCHandle() {
             (void)req;
             nlohmann::json j;
             j["status"] = "ok";
-            j["running"] = static_cast<bool>(pid_tracker_);
-            j["pushed_events"] = pid_tracker_ ? pid_tracker_->pushed_events() : 0;
-            j["dropped_events"] = pid_tracker_ ? pid_tracker_->dropped_events() : 0;
+            j["running"] = attribution_ && attribution_->running();
+            j["pushed_events"] = attribution_ ? attribution_->pushedEvents() : 0;
+            j["dropped_events"] = attribution_ ? attribution_->droppedEvents() : 0;
             return j;
         }
     );
@@ -2247,9 +2165,7 @@ bool JobRegistry::addJob(const Job& job) {
 }
 
 bool JobRegistry::addJob(const Job& job, bool from_db) {
-    // 锁外解析 cgroup_id(stat 可能较慢), 缓存到待存储副本, 删除作业时直接复用。
-    Job job_with_cgroup = job;
-    resolve_and_cache_cgroup_id(job_with_cgroup);
+    const Job job_with_cgroup = job;   // cgroup-id caching now lives in KernelAttribution
     {
         std::lock_guard lg(mtx_);
         SubAttrMatcher matcher;
@@ -3972,20 +3888,11 @@ UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation
     // Facts only: an unbound instance creates no collector work, but System
     // collectors must still learn the job exists (plan section 6.3). Kernel
     // attribution is initialized here, exactly like the legacy registration:
-    // eBPF attribution and the cgroup map must not wait ~30s for the tracker
-    // reconcile, and the cached cgroup id must exist for the later removal.
+    // eBPF attribution and the cgroup map must not wait a reconcile interval,
+    // and the cgroup-id cache inside KernelAttribution must exist for the
+    // later removal.
     admission.unlock();
-    {
-        Job kernel_job = job;
-        sync_job_to_kernel(kernel_job);   // resolves + caches the cgroup id
-        // Write the cached id back: removal later needs it when the cgroup
-        // directory may already be gone.
-        if (kernel_job.cgroup_id != 0) {
-            std::lock_guard lg(mtx_);
-            if (auto it = jobs_.find(kernel_job.JobID); it != jobs_.end())
-                it->second.cgroup_id = kernel_job.cgroup_id;
-        }
-    }
+    sync_job_to_kernel(job);
     broadcast_lifecycle(JobEvent::Added, job);
     // First complete registration is an automatic-selection trigger (plan
     // 6.2); Lua evaluation happens outside every registry lock. An observation

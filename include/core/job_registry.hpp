@@ -31,7 +31,7 @@
 #include "job_lifecycle_event.h"
 #include "ebpf/trace_condor_starter.h"
 #include "common/ebpf_common.hpp"
-#include "core/job_pid_tracker.hpp"
+#include "core/kernel_attribution.hpp"
 #include "core/job_auto_policy.hpp"
 
 #include "job_watcher/condor_job_watcher.hpp"
@@ -181,7 +181,7 @@ enum class StoreFaultMode {
     FailAfterWrite,
 };
 
-class JobRegistry {
+class JobRegistry : private KernelAttribution::Host {
 public:
     static JobRegistry& instance();          // 仍保留单例，方便迁移；也可由 main() 构造
     explicit JobRegistry(const JobRegistryOptions& options);
@@ -397,18 +397,20 @@ private:
     size_t fault_skip_{0};
     size_t fault_count_{0};
 
-    // 共享 pid2job / cgroup2job 维护: JobPidTracker 加载生命周期追踪 bpf,
-    // JobRegistry 通过它向内核登记 Job 归属并消费 fork/exit 事件。
+    // Kernel-side attribution capability (pid2job/cgroup2job). Owned here,
+    // driven by lifecycle calls and its own reconcile thread; the cgroup-id
+    // cache lives inside it, so removal never depends on a still-readable
+    // cgroup directory.
     void init_pid_tracker();
     void stop_pid_tracker();
-    void sync_job_to_kernel(Job& job);            // Added: 写 cgroup2job + 种子 pid2job
-    void remove_job_from_kernel(const Job& job);  // Removed: 删 cgroup2job + 清 pid2job 残留
-    void on_kernel_fork(uint32_t pid, uint64_t job_id);  // ringbuf FORK: 给 Job 加 pid
-    void on_kernel_exit(uint32_t pid, uint64_t job_id);  // ringbuf EXIT: 从 Job 删 pid
-    void reconcile_loop();                         // 低频对账, 防 ringbuf 丢事件导致漂移
-    std::unique_ptr<JobPidTracker> pid_tracker_;
-    std::atomic<bool> reconcile_running_{false};
-    std::unique_ptr<std::thread> reconcile_thread_;
-    // 上一次对账时的 ringbuf 丢弃计数, 用于只上报增量而非每次重复告警。
-    uint64_t last_dropped_events_{0};
+    std::unique_ptr<KernelAttribution> attribution_;
+    // 内核登记入口：KernelAttribution 的生命周期调用薄封装（Added/Removed）。
+    void sync_job_to_kernel(const Job& job);
+    void remove_job_from_kernel(const Job& job);
+    // KernelAttribution::Host — the registry-side projection updates.
+    bool attributionJobExists(uint64_t internal_id) override;
+    void attributionJobAddPid(uint64_t internal_id, pid_t pid) override;
+    void attributionJobRemovePid(uint64_t internal_id, pid_t pid) override;
+    void attributionEnumerateJobs(const std::function<void(const Job&)>& fn) override;
+    void attributionExitHint(pid_t pid) override;
 };
