@@ -12,7 +12,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #pragma once
+#ifndef SPDLOG_ACTIVE_LEVEL
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
+#endif
 
 #include <functional>
 #include <memory>

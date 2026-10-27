@@ -1,0 +1,131 @@
+/* Copyright 2026 - 2026 wzycc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License. */
+// ISchedulerAdapter — the extension point that turns one scheduler type into
+// an inventory citizen (doc/job_inventory_v2_architecture.md §2.2).
+//
+// Everything scheduler-specific lives behind this interface: discovery
+// (through IDiscoverySource), observation -> typed facts encoding, legacy-row
+// decoding, identity validation and capability traits. Nothing in the store,
+// the registry or the RPC surface names a scheduler.
+//
+// Adding a scheduler type = implement ISchedulerAdapter in a self-contained
+// header/TU + one REGISTER_SCHEDULER_ADAPTER line + one inventory.types entry.
+#pragma once
+
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+#include "core/collector_type.h"
+#include "core/job_observation.hpp"
+
+// Resolved settings for one scheduler type (v2: keyed by adapter name).
+// `inventory` mirrors job_registry_config.inventory.types membership;
+// `auto_collect` resolution precedence:
+//   explicit <type>_job_watcher.auto_collect  wins
+//   otherwise   job_registry_config.auto_add_<type>job (legacy)
+//   otherwise   false
+struct InventoryTypeSettings {
+    bool inventory = false;
+    bool auto_collect = false;
+    bool auto_collect_explicit = false;
+    bool legacy_auto_collect = false;
+    bool use_rules = false;
+    std::string rules_dir;
+    std::string rules_prefix;
+    // Legacy auto_add_* folding: collectors added to every job of this type
+    // when automatic collection is on and use_rules is false.
+    std::vector<std::string> default_collectors;
+    // Explicit cluster namespace fallback for discovery (wins over the
+    // environment-derived value, empty = derive from the source).
+    std::string cluster_name;
+};
+
+// Capability traits of one adapter. A trait being absent is a normal state,
+// never an error: jobs of an adapter without the cgroup trait simply never
+// get cgroup-based retirement evidence or kernel attribution.
+struct AdapterTraits {
+    bool cgroup_scoped_membership = false;  // cgroup.procs is authoritative membership
+    bool kernel_attribution = false;        // participates in pid2job/cgroup2job
+};
+
+class ISchedulerAdapter {
+public:
+    virtual ~ISchedulerAdapter() = default;
+
+    // Registry key and config section ("condor" -> "condor_job_watcher").
+    virtual const std::string& name() const = 0;
+    virtual std::string configSection() const = 0;
+
+    // Discovery: the authoritative passes and targeted hints.
+    virtual IDiscoverySource& source() = 0;
+    // Per-type discovery options derived from the resolved settings.
+    virtual DiscoveryOptions discoveryOptions(const InventoryTypeSettings& settings) const = 0;
+
+    // Typed facts for one observation, identity fields included: subtype,
+    // typed attributes, NativeJobID and cluster namespaces derived from the
+    // canonical identity (the store never guesses them). JobID, JobPIDs and
+    // CollectorNames are store/intent owned and must stay empty.
+    virtual Job encodeFacts(const Observation& observation) const = 0;
+
+    // Legacy (schema < 2) decode: typed facts from a stored JSON row.
+    virtual Job decodeFacts(const nlohmann::json& row) const = 0;
+    // Best-effort selector reconstruction for a legacy row (no scheduler
+    // identity -> incomplete selector, never a guess).
+    virtual NativeSelector legacySelector(const Job& job) const = 0;
+
+    virtual AdapterTraits traits() const = 0;
+};
+
+// Self-registration registry (same convention as collectors/writers).
+class SchedulerAdapterRegistry {
+public:
+    using Factory = std::function<std::unique_ptr<ISchedulerAdapter>(
+        const InventoryTypeSettings& settings)>;
+
+    static SchedulerAdapterRegistry& instance();
+
+    // Registers (or replaces) the factory for `name`. Replacement keeps the
+    // deterministic test harness simple.
+    void registerAdapter(const std::string& name, Factory factory);
+
+    bool known(const std::string& name) const;
+    std::vector<std::string> names() const;
+    // Builds one adapter; nullptr for an unknown name (callers report the
+    // registered names instead of guessing).
+    std::unique_ptr<ISchedulerAdapter> build(const std::string& name,
+                                             const InventoryTypeSettings& settings) const;
+
+private:
+    mutable std::mutex mutex_;
+    std::map<std::string, Factory> factories_;
+};
+
+// Registers an adapter factory at TU scope (dynamic init), mirroring
+// AUTO_REGISTER_COLLECTOR. Example:
+//   REGISTER_SCHEDULER_ADAPTER("condor", CondorSchedulerAdapter)
+#define REGISTER_SCHEDULER_ADAPTER(NAME, CLASS)                                \
+    static bool joblens_adapter_reg_##CLASS = [] {                             \
+        SchedulerAdapterRegistry::instance().registerAdapter(                  \
+            NAME, [](const InventoryTypeSettings& settings)                    \
+                  -> std::unique_ptr<ISchedulerAdapter> {                      \
+                      return std::make_unique<CLASS>(settings);                \
+                  });                                                          \
+        return true;                                                           \
+    }();

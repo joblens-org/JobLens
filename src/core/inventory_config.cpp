@@ -1,0 +1,315 @@
+/* Copyright 2026 - 2026 wzycc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License. */
+#include "core/inventory_config.hpp"
+
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
+#include <cctype>
+#include <sstream>
+#include <stdexcept>
+
+#include "common/utils.hpp"
+
+namespace {
+
+[[noreturn]] void config_error(const std::string& message)
+{
+    throw std::invalid_argument("inventory configuration: " + message);
+}
+
+const nlohmann::json* member(const nlohmann::json& node, const char* key)
+{
+    if (!node.is_object()) return nullptr;
+    const auto it = node.find(key);
+    if (it == node.end() || it->is_null()) return nullptr;
+    return &*it;
+}
+
+std::string scalar_text(const nlohmann::json& node, const std::string& path)
+{
+    if (node.is_string()) return node.get<std::string>();
+    if (node.is_boolean()) return node.get<bool>() ? "true" : "false";
+    if (node.is_number_integer()) return std::to_string(node.get<long long>());
+    if (node.is_number_unsigned()) return std::to_string(node.get<unsigned long long>());
+    if (node.is_number_float()) {
+        std::ostringstream out;
+        out << node.get<double>();
+        return out.str();
+    }
+    config_error(path + " must be a scalar value");
+}
+
+bool parse_bool(const nlohmann::json& node, const std::string& path)
+{
+    if (node.is_boolean()) return node.get<bool>();
+    if (node.is_number_integer()) {
+        const auto value = node.get<long long>();
+        if (value == 0) return false;
+        if (value == 1) return true;
+        config_error(path + " must be a boolean");
+    }
+    if (node.is_number_unsigned()) {
+        const auto value = node.get<unsigned long long>();
+        if (value == 0) return false;
+        if (value == 1) return true;
+        config_error(path + " must be a boolean");
+    }
+    const std::string text = scalar_text(node, path);
+    if (text == "true" || text == "True" || text == "TRUE" || text == "yes" || text == "1")
+        return true;
+    if (text == "false" || text == "False" || text == "FALSE" || text == "no" || text == "0")
+        return false;
+    config_error(path + " must be a boolean (true/false), got '" + text + "'");
+}
+
+std::uint32_t parse_interval_sec(const nlohmann::json& node, const std::string& path)
+{
+    long long value = 0;
+    if (node.is_number_unsigned()) {
+        const auto raw = node.get<unsigned long long>();
+        if (raw > 0xffffffffull) config_error(path + " is out of range");
+        value = static_cast<long long>(raw);
+    } else if (node.is_number_integer()) {
+        value = node.get<long long>();
+    } else if (node.is_number_float()) {
+        config_error(path + " must be an integer number of seconds");
+    } else {
+        const std::string text = scalar_text(node, path);
+        if (text.empty()) config_error(path + " must be an integer number of seconds");
+        const bool digits = std::all_of(text.begin(), text.end(), [](unsigned char c) {
+            return std::isdigit(c) != 0;
+        });
+        if (!digits)
+            config_error(path + " must be an integer number of seconds, got '" + text + "'");
+        try {
+            value = std::stoll(text);
+        } catch (const std::out_of_range&) {
+            config_error(path + " is out of range");
+        }
+    }
+    if (value < 1) config_error(path + " must be at least 1 second");
+    return static_cast<std::uint32_t>(value);
+}
+
+std::string scalar_field(const nlohmann::json& node, const char* key, const std::string& path,
+                         const std::string& fallback)
+{
+    const auto* child = member(node, key);
+    if (child == nullptr) return fallback;
+    return scalar_text(*child, path + "." + key);
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Configuration contract (plan section 8)
+// ---------------------------------------------------------------------------
+
+const char* to_string(InventoryType type)
+{
+    switch (type) {
+        case InventoryType::Condor: return "condor";
+        case InventoryType::Slurm: return "slurm";
+    }
+    return "unknown";
+}
+
+std::optional<InventoryType> inventory_type_from_string(const std::string& raw)
+{
+    std::string normalized;
+    normalized.reserve(raw.size());
+    for (const char c : raw) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;
+        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    if (normalized == "condor") return InventoryType::Condor;
+    if (normalized == "slurm") return InventoryType::Slurm;
+    return std::nullopt;
+}
+
+nlohmann::json InventoryMaintenanceConfig::to_json() const
+{
+    nlohmann::json types_json = nlohmann::json::array();
+    for (const auto type : types) types_json.push_back(to_string(type));
+
+    nlohmann::json out;
+    out["types"] = std::move(types_json);
+    out["reconcile_interval_sec"] = reconcile_interval_sec;
+    nlohmann::json sources = nlohmann::json::array();
+    for (const auto& entry : settings) {
+        sources.push_back(nlohmann::json{
+            {"type", to_string(entry.first)},
+            {"inventory", entry.second.inventory},
+            {"auto_collect", entry.second.auto_collect},
+            {"auto_collect_explicit", entry.second.auto_collect_explicit},
+            {"legacy_auto_collect", entry.second.legacy_auto_collect},
+            {"use_rules", entry.second.use_rules},
+            {"rules_dir", entry.second.rules_dir},
+            {"rules_prefix", entry.second.rules_prefix},
+            {"default_collectors", entry.second.default_collectors},
+            {"cluster_name", entry.second.cluster_name},
+        });
+    }
+    out["sources"] = std::move(sources);
+    return out;
+}
+
+InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::json& config)
+{
+    if (!config.is_object())
+        config_error("the document root must be a mapping");
+
+    const auto* registry = member(config, "job_registry_config");
+    static const nlohmann::json empty_object = nlohmann::json::object();
+    const nlohmann::json& registry_node = registry != nullptr ? *registry : empty_object;
+    if (!registry_node.is_object())
+        config_error("job_registry_config must be a mapping");
+
+    InventoryMaintenanceConfig resolved;
+    for (const auto type : {InventoryType::Condor, InventoryType::Slurm}) {
+        InventoryTypeSettings settings;
+        settings.legacy_auto_collect = [&]() {
+            const char* key = type == InventoryType::Condor ? "auto_add_condorjob"
+                                                            : "auto_add_slurmjob";
+            const auto* node = member(registry_node, key);
+            if (node == nullptr) return false;
+            return parse_bool(*node, std::string("job_registry_config.") + key);
+        }();
+        resolved.settings.emplace(type, settings);
+    }
+
+    const auto* inventory = member(registry_node, "inventory");
+    if (inventory != nullptr) {
+        if (!inventory->is_object())
+            config_error("job_registry_config.inventory must be a mapping");
+
+        if (const auto* types = member(*inventory, "types")) {
+            if (!types->is_array())
+                config_error("job_registry_config.inventory.types must be a list");
+            for (const auto& entry : *types) {
+                const std::string raw = scalar_text(
+                    entry, "job_registry_config.inventory.types[]");
+                const auto type = inventory_type_from_string(raw);
+                if (!type) {
+                    config_error("unknown inventory type '" + raw +
+                                 "' (expected condor or slurm)");
+                }
+                if (std::find(resolved.types.begin(), resolved.types.end(), *type) ==
+                    resolved.types.end()) {
+                    resolved.types.push_back(*type);
+                }
+            }
+        }
+
+        if (const auto* interval = member(*inventory, "reconcile_interval_sec")) {
+            resolved.reconcile_interval_sec = parse_interval_sec(
+                *interval, "job_registry_config.inventory.reconcile_interval_sec");
+        }
+    }
+
+    const std::string legacy_rules_dir =
+        scalar_field(registry_node, "rules_dir", "job_registry_config", std::string());
+
+    for (const auto type : resolved.types) {
+        resolved.settings[type].inventory = true;
+    }
+
+    for (const auto type : {InventoryType::Condor, InventoryType::Slurm}) {
+        const char* section = type == InventoryType::Condor ? "condor_job_watcher"
+                                                            : "slurm_job_watcher";
+        const std::string prefix = std::string(section) + ".";
+        const auto* node = member(config, section);
+        if (node != nullptr && !node->is_object())
+            config_error(std::string(section) + " must be a mapping");
+
+        auto& settings = resolved.settings[type];
+        if (node != nullptr) {
+            if (const auto* auto_collect = member(*node, "auto_collect")) {
+                settings.auto_collect_explicit = true;
+                settings.auto_collect = parse_bool(*auto_collect, prefix + "auto_collect");
+            }
+            if (const auto* use_rules = member(*node, "use_rules")) {
+                settings.use_rules = parse_bool(*use_rules, prefix + "use_rules");
+            }
+            if (const auto* defaults = member(*node, "auto_add_collectors")) {
+                if (!defaults->is_array())
+                    config_error(prefix + "auto_add_collectors must be a list");
+                for (const auto& item : *defaults) {
+                    settings.default_collectors.push_back(
+                        scalar_text(item, prefix + "auto_add_collectors[]"));
+                }
+            }
+            settings.cluster_name =
+                scalar_field(*node, "cluster_name", section, std::string{});
+            settings.rules_prefix = scalar_field(
+                *node, "rules_prefix", section,
+                std::string(type == InventoryType::Condor ? "condor_job_" : "slurm_job_"));
+            const std::string fallback_rules_dir =
+                Utils::JobLensRootDir() + "../config/rules/" +
+                (type == InventoryType::Condor ? "condor_jobs" : "slurm_jobs");
+            // Per-type rules_dir wins over the legacy shared one, otherwise the
+            // existing per-type default stays in place (plan section 8).
+            settings.rules_dir = scalar_field(*node, "rules_dir", section,
+                                              legacy_rules_dir.empty() ? fallback_rules_dir
+                                                                       : legacy_rules_dir);
+        } else {
+            settings.rules_prefix = type == InventoryType::Condor ? "condor_job_"
+                                                                  : "slurm_job_";
+            settings.rules_dir = legacy_rules_dir.empty()
+                                     ? Utils::JobLensRootDir() + "../config/rules/" +
+                                           (type == InventoryType::Condor ? "condor_jobs"
+                                                                          : "slurm_jobs")
+                                     : legacy_rules_dir;
+        }
+        if (!settings.auto_collect_explicit) {
+            settings.auto_collect = settings.legacy_auto_collect;
+            if (settings.legacy_auto_collect) {
+                spdlog::warn("inventory configuration: job_registry_config.auto_add_{}job is "
+                             "deprecated; set {}.auto_collect instead",
+                             type == InventoryType::Condor ? "condor" : "slurm", section);
+            }
+        }
+    }
+
+    if (!legacy_rules_dir.empty()) {
+        spdlog::warn("inventory configuration: job_registry_config.rules_dir is deprecated; "
+                     "set condor_job_watcher.rules_dir / slurm_job_watcher.rules_dir");
+    }
+
+    // Legacy auto-add folding (user-defined semantics): auto_add_<type>job=true
+    // means "inventory this type and add collectors to every discovered job";
+    // use_rules only decides whether the collector list comes from the rule
+    // engine (accept = rule result, reject = empty) or verbatim from
+    // auto_add_collectors. An explicit per-type auto_collect or an explicit
+    // inventory.types entry always wins over the legacy flag.
+    for (const auto type : {InventoryType::Condor, InventoryType::Slurm}) {
+        auto& settings = resolved.settings[type];
+        const bool explicit_type =
+            std::find(resolved.types.begin(), resolved.types.end(), type) != resolved.types.end();
+        if (!settings.legacy_auto_collect || explicit_type || settings.auto_collect_explicit)
+            continue;
+        const char* section = type == InventoryType::Condor ? "condor_job_watcher"
+                                                            : "slurm_job_watcher";
+        resolved.types.push_back(type);
+        settings.inventory = true;
+        settings.auto_collect = true;
+        spdlog::warn("inventory configuration: job_registry_config.auto_add_{}job is folded "
+                     "into inventory discovery with automatic collection; set {}.auto_collect "
+                     "explicitly to override",
+                     type == InventoryType::Condor ? "condor" : "slurm", section);
+    }
+    return resolved;
+}
+

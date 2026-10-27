@@ -65,6 +65,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "core/inventory_config.hpp"
 #include "core/job_observation.hpp"
 #include "core/job_registry.hpp"
 #include "core/job_store.hpp"
@@ -72,63 +73,6 @@
 // Transitional alias: the maintenance controller predates the JobRecord fold
 // and is deleted in v2 stage S5.
 using InventoryRecord = JobRecord;
-
-// ---------------------------------------------------------------------------
-// Configuration contract (plan section 8)
-// ---------------------------------------------------------------------------
-
-enum class InventoryType {
-    Condor = 0,
-    Slurm,
-};
-
-const char* to_string(InventoryType type);
-std::optional<InventoryType> inventory_type_from_string(const std::string& raw);
-
-// Resolved settings for one scheduler type. `inventory` mirrors
-// job_registry_config.inventory.types membership; `auto_collect` is the
-// field-specific resolution described in section 8:
-//
-//   explicit <type>_job_watcher.auto_collect  wins
-//   otherwise   job_registry_config.auto_add_<type>job
-//   otherwise   false
-//
-// Supplying a type in inventory.types never erases an explicit or legacy
-// auto-collection choice.
-struct InventoryTypeSettings {
-    bool inventory = false;
-    bool auto_collect = false;
-    bool auto_collect_explicit = false;
-    bool legacy_auto_collect = false;
-    bool use_rules = false;
-    std::string rules_dir;
-    std::string rules_prefix;
-    // Legacy auto_add_* folding: collectors added to every job of this type
-    // when automatic collection is on and use_rules is false.
-    std::vector<std::string> default_collectors;
-    // Explicit cluster namespace fallback for discovery (wins over the
-    // environment-derived value, empty = derive from the source).
-    std::string cluster_name;
-};
-
-struct InventoryMaintenanceConfig {
-    // Types that opted into broad discovery. Empty means "inventory off",
-    // preserving the pre-decoupling opt-in behavior.
-    std::vector<InventoryType> types;
-    // Default 30 s; minimum 1 s (validated at startup).
-    std::uint32_t reconcile_interval_sec = 30;
-    // Always contains both types so the resolved picture is complete.
-    std::map<InventoryType, InventoryTypeSettings> settings;
-
-    nlohmann::json to_json() const;
-};
-
-// Resolves and validates the configuration from the JSON form of the YAML root
-// (what Config::dumpConfig() returns; scalars may therefore be strings).
-// Throws std::invalid_argument with a stable message for an unknown inventory
-// type, a non-numeric or non-integral reconcile_interval_sec, an interval
-// below 1 s, or a malformed section. Startup rejects rather than guessing.
-InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::json& config);
 
 // ---------------------------------------------------------------------------
 // Discovery-source seam
@@ -233,6 +177,10 @@ public:
     // Test seams. Call before start(): passes read them without the mutex.
     void setLivenessProbes(ProcessLivenessProbe process_probe,
                            CgroupMembershipProbe cgroup_probe);
+    // Observation -> typed facts through the scheduler adapters. When set,
+    // to_execution() delegates to it; the inline Condor/Slurm branches in the
+    // .cpp are only the encoder-less fallback (direct-construction tests).
+    void setFactsEncoder(std::function<Job(const Observation&)> encoder);
     // Wall-clock injection; also drives the status timestamps.
     void setClock(ScanClock clock);
 
@@ -354,6 +302,8 @@ private:
 
     ProcessLivenessProbe process_probe_;
     CgroupMembershipProbe cgroup_probe_;
+    // Adapter facts encoder (registry-installed); empty = inline fallback.
+    std::function<Job(const Observation&)> facts_encoder_;
     ScanClock clock_;
 
     mutable std::mutex mutex_;

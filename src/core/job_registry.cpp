@@ -52,28 +52,6 @@
 #include <set>
 #include <type_traits>
 
-// Forward declaration: the collector-name validator for the collection
-// manager. Defined below (internal linkage).
-namespace {
-// Resolved per-type settings -> adapter options. The explicit cluster_name
-// (when set) is the namespace fallback that wins over environment-derived
-// values; without it the adapter derives the namespace from the source.
-DiscoveryOptions discovery_options_for_type(const InventoryTypeSettings& settings,
-                                            SchedulerType type)
-{
-    DiscoveryOptions options;
-    options.enable_event_source = true;
-    options.scan_interval_ms = 0;
-    if (!settings.cluster_name.empty()) {
-        if (type == SchedulerType::Condor)
-            options.discovery.condor_cluster_name = settings.cluster_name;
-        else
-            options.discovery.slurm_cluster_name = settings.cluster_name;
-    }
-    return options;
-}
-}  // namespace
-
 // Maintenance-side inventory health (source/queue/reconciliation state) is
 // published by the maintenance controller through this seam. When no provider
 // is registered, the status handler serves the explicit "not_configured"
@@ -172,20 +150,25 @@ void JobRegistry::init_inventory()
         return;
     }
 
-    // Exactly one discovery watcher per configured scheduler type; the
-    // controller drives them through IDiscoverySource and owns no adapters.
+    // Exactly one adapter per configured scheduler type, built through the
+    // self-registration registry; the controller drives them through
+    // IDiscoverySource and owns no adapter details.
     std::vector<IDiscoverySource*> sources;
+    adapters_.clear();
     for (const auto type : config.types) {
         const auto& settings = config.settings.at(type);
-        if (type == InventoryType::Condor) {
-            condor_source_ = std::make_unique<CondorJobWatcher>(
-                discovery_options_for_type(settings, SchedulerType::Condor));
-            sources.push_back(condor_source_.get());
-        } else {
-            slurm_source_ = std::make_unique<SlurmJobWatcher>(
-                discovery_options_for_type(settings, SchedulerType::Slurm));
-            sources.push_back(slurm_source_.get());
+        auto adapter = SchedulerAdapterRegistry::instance().build(
+            adapter_name_of(type), settings);
+        if (!adapter) {
+            spdlog::error("JobRegistry: no adapter registered for inventory type '{}'; "
+                          "registered: {}",
+                          adapter_name_of(type),
+                          fmt::join(SchedulerAdapterRegistry::instance().names(), ", "));
+            adapters_.clear();
+            return;
         }
+        sources.push_back(&adapter->source());
+        adapters_.push_back(std::move(adapter));
     }
     if (config.types.empty()) {
         spdlog::info("JobRegistry: no inventory types configured; discovery is disabled and "
@@ -208,13 +191,37 @@ void JobRegistry::init_inventory()
                 AutoCollectorPolicy::defaults(settings.default_collectors);
     }
 
+    // Kernel attribution capability gate: only adapters with the trait
+    // register into pid2job/cgroup2job; legacy/manual rows (unknown adapter)
+    // keep participating. Installed before the initial pass can activate
+    // anything.
+    if (attribution_) {
+        attribution_->setCapabilityLookup([this](uint64_t internal_id) {
+            auto record = store_->record(internal_id);
+            if (!record) return false;
+            for (const auto& adapter : adapters_) {
+                if (adapter->name() == record->adapter)
+                    return adapter->traits().kernel_attribution;
+            }
+            return true;
+        });
+    }
+
     inventory_ = std::make_unique<JobInventoryMaintenance>(*this, config, std::move(sources));
+    // Observation -> typed facts goes through the adapters (the controller
+    // itself stays scheduler-agnostic).
+    inventory_->setFactsEncoder([this](const Observation& observation) -> Job {
+        for (const auto& adapter : adapters_) {
+            if (adapter->source().schedulerType() == observation.scheduler_type)
+                return adapter->encodeFacts(observation);
+        }
+        return Job{};   // no adapter: facts stay empty, the store normalizes
+    });
     if (!inventory_->start()) {
         spdlog::error("JobRegistry: inventory maintenance did not start; "
                       "inventory status will report it as unavailable");
         inventory_.reset();
-        condor_source_.reset();
-        slurm_source_.reset();
+        adapters_.clear();
         return;
     }
     spdlog::info("JobRegistry: inventory maintenance running with {} discovery type(s)",
@@ -274,8 +281,7 @@ bool JobRegistry::deinit()
     if (!cleanupClosingJobs()) ok = false;
     if (inventory_ && !inventory_->finalize()) ok = false;
     inventory_.reset();
-    condor_source_.reset();
-    slurm_source_.reset();
+    adapters_.clear();
 
     stop_pid_tracker();
     store_.reset();   // closes the db

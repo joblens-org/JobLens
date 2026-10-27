@@ -37,9 +37,10 @@
 #include "core/job_store.hpp"
 #include "core/kernel_attribution.hpp"
 #include "core/job_auto_policy.hpp"
+#include "core/scheduler_adapter.hpp"
 
-#include "job_watcher/condor_job_watcher.hpp"
-#include "job_watcher/slurm_job_watcher.hpp"
+#include "job_watcher/condor_adapter.hpp"
+#include "job_watcher/slurm_adapter.hpp"
 
 class JobCollectionManager;
 class JobInventoryMaintenance;
@@ -199,8 +200,9 @@ private:
 
     // Owned discovery/maintenance stack (construction order: store -> manager
     // -> inventory -> attribution -> RPC; destruction runs deinit()).
-    std::unique_ptr<CondorJobWatcher> condor_source_;
-    std::unique_ptr<SlurmJobWatcher> slurm_source_;
+    // Adapters are built from the resolved configuration through the
+    // SchedulerAdapterRegistry; the registry never names a scheduler.
+    std::vector<std::unique_ptr<ISchedulerAdapter>> adapters_;
     std::unique_ptr<JobInventoryMaintenance> inventory_;
     std::shared_ptr<JobCollectionManager> collection_manager_;
     // Automatic collector selection per scheduler type, armed from the
