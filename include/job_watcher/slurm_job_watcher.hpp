@@ -18,7 +18,6 @@
 #include "common/ebpf_common.hpp"
 #include "common/utils.hpp"
 #include "core/job_observation.hpp"
-#include "job_watcher/rb_event_wait.hpp"
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -120,9 +119,6 @@ private:
     std::vector<bpf_link*> bpf_links_;
     bpf_object* bpf_obj_{nullptr};
     ring_buffer* bpf_rb_{nullptr};
-    // Blocks on the ring-buffer epoll fd + a stop eventfd so exec events are
-    // delivered in kernel-wakeup time; empty when init failed (slice fallback).
-    RbEventWait rb_wait_;
     bool event_source_ready_{false};
     std::string event_source_note_;
 };
@@ -164,7 +160,6 @@ inline void SlurmJobWatcher::stop()
         polling_running_ = false;
     }
     poll_cv_.notify_all();
-    rb_wait_.wake();
 
     std::unique_ptr<std::thread> thread;
     {
@@ -172,7 +167,6 @@ inline void SlurmJobWatcher::stop()
         thread = std::move(poll_thread_);
     }
     if (thread && thread->joinable()) thread->join();
-    rb_wait_.close();
 
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -349,11 +343,6 @@ inline bool SlurmJobWatcher::start_polling()
                      "or scan interval, nothing to poll");
         return false;
     }
-    // Init before the thread exists: a stop() that lands between the flag and
-    // the first wait must find a wakeable fd (see rb_wait_.wake() in stop()).
-    if (!rb_wait_.init(bpf_rb_ ? ring_buffer__epoll_fd(bpf_rb_) : -1))
-        spdlog::warn("SlurmJobWatcher: epoll/eventfd unavailable; falling back "
-                     "to 100ms slice polling");
     polling_running_ = true;
     {
         std::lock_guard<std::mutex> state_lock(state_mutex_);
@@ -365,48 +354,36 @@ inline bool SlurmJobWatcher::start_polling()
 
 inline void SlurmJobWatcher::poll_loop()
 {
-    const bool wakeup_ready = rb_wait_.ready();
-    if (!wakeup_ready)
-        spdlog::warn("SlurmJobWatcher: poll loop running in slice-fallback mode");
     auto next_scan = std::chrono::steady_clock::now();
     while (true) {
         {
-            std::unique_lock<std::mutex> lock(life_mutex_);
+            std::lock_guard<std::mutex> lock(life_mutex_);
             if (!polling_running_) return;
-            if (!wakeup_ready)
-                poll_cv_.wait_for(lock, std::chrono::milliseconds(100),
-                                  [this](){ return !polling_running_; });
         }
-        if (!polling_running_) return;
 
-        if (wakeup_ready) {
-            // Block until an exec event, a stop, or (with a self-scan
-            // interval) the next scan deadline.
-            int timeout_ms = -1;
-            if (options_.scan_interval_ms > 0) {
-                const auto now = std::chrono::steady_clock::now();
-                timeout_ms = now >= next_scan
-                    ? 0
-                    : static_cast<int>(std::chrono::duration_cast<
-                          std::chrono::milliseconds>(next_scan - now).count());
-            }
-            const auto reason = rb_wait_.wait(timeout_ms);
-            if (reason == RbEventWait::Wakeup::Stop) return;
-            if (reason == RbEventWait::Wakeup::Data && bpf_rb_) {
-                const int err = ring_buffer__consume(bpf_rb_);
-                // EINTR is a plain wakeup (signal); the next turn re-drains.
-                if (err < 0 && err != -EINTR)
-                    spdlog::error("SlurmJobWatcher: ring consume error {}", err);
-            }
-        } else if (bpf_rb_) {
-            int err = ring_buffer__poll(bpf_rb_, 0);
-            if (err == -EINTR){
-                spdlog::error("SlurmJobWatcher: error EINTR");
-                return;
-            }
-            if (err < 0){
-                spdlog::error("SlurmJobWatcher: error {}", err);
-            }
+        // Block inside libbpf's own epoll: data arrives at kernel-wakeup
+        // speed — the timeout never delays an event, it only bounds how long
+        // a stop() can go unnoticed and fires the self-scan deadline.
+        int timeout_ms = 100;   // stop-check cadence
+        if (options_.scan_interval_ms > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            timeout_ms = now >= next_scan
+                ? 0
+                : std::min<int>(100,
+                                static_cast<int>(std::chrono::duration_cast<
+                                    std::chrono::milliseconds>(
+                                        next_scan - now).count()));
+        }
+        if (bpf_rb_) {
+            int err = ring_buffer__poll(bpf_rb_, timeout_ms);
+            if (err == -EINTR) continue;   // plain signal wakeup; re-check stop
+            if (err < 0) spdlog::error("SlurmJobWatcher: error {}", err);
+        } else {
+            // No event source: wait out the same timeout on the cv so stop()
+            // stays immediate and the scan deadline still fires.
+            std::unique_lock<std::mutex> lock(life_mutex_);
+            poll_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                              [this](){ return !polling_running_; });
         }
 
         if (options_.scan_interval_ms > 0) {

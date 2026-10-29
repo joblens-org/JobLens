@@ -69,8 +69,9 @@ Two structural rules govern the whole line:
 
 Latency-critical discovery never waits for a heartbeat pass:
 
-1. The watcher's poll thread wakes on the **epoll** the moment the kernel
-   delivers the exec event (`RbEventWait`; no polling slice in between).
+1. The watcher's poll thread wakes the moment the kernel delivers the exec
+   event (`ring_buffer__poll` blocks inside libbpf's epoll; no polling slice
+   in between).
 2. `sink.on_exec_hint(pid)` lands in a bounded queue owned by the registry's
    **ingest worker** — a dedicated thread, started with the heartbeat, that
    resolves pids immediately: `observeForHint` → `processObservation` → store
@@ -201,15 +202,15 @@ private:
 Implementation checklist (all of these are load-bearing in the Condor
 watcher — copy the patterns, not just the shape):
 
-- `poll_loop()`: **event-blocked**, not slice-polled — `RbEventWait`
-  (`include/job_watcher/rb_event_wait.hpp`) holds an epoll with libbpf's
-  `ring_buffer__epoll_fd(rb)` plus a stop `eventfd`, so exec events reach the
-  sink in kernel-wakeup time; data wakeups drain with
-  `ring_buffer__consume(rb)`. If `init` fails the watcher falls back to the
-  legacy ~100 ms slice loop (a latency regression, never an outage).
-  Self-scan only if `options.scan_interval_ms > 0` (driven by the epoll
-  timeout) — in production the registry heartbeat owns pacing and the
-  interval is 0.
+- `poll_loop()`: **event-blocked**, not slice-polled — a single
+  `ring_buffer__poll(rb, timeout)` call blocks inside libbpf's own epoll, so
+  exec events reach the sink at kernel-wakeup speed; the timeout only bounds
+  how long a `stop()` can go unnoticed (100 ms cadence) and fires the
+  self-scan deadline when `scan_interval_ms > 0`. The old slice design's
+  latency came from sleeping on a condition variable *before* a non-blocking
+  drain — don't reintroduce that split. Self-scan only if
+  `options.scan_interval_ms > 0` — in production the registry heartbeat owns
+  pacing and the interval is 0.
 - `scan()`: check `proc_root` readability first (failure ⇒ `complete=false`);
   read `boot_id`; enumerate candidate managers from the process table;
   `skipped` entries are counted and noted, never fabricated into

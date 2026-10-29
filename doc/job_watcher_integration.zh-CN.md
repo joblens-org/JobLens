@@ -63,8 +63,9 @@ src/ebpf/trace_ssh_session.bpf.c          # 可选：exec-hint 事件源
 
 延迟敏感的发现永远不等心跳 pass：
 
-1. 内核送达 exec 事件的瞬间，watcher 轮询线程被 **epoll** 唤醒
-   （`RbEventWait`；中间没有任何轮询切片）。
+1. 内核送达 exec 事件的瞬间，watcher 轮询线程即被唤醒
+   （`ring_buffer__poll` 阻塞在 libbpf 自己的 epoll 里；中间没有任何
+   轮询切片）。
 2. `sink.on_exec_hint(pid)` 落进 registry **ingest worker** 的有界队列——
    一个与心跳同时启动的专用线程，立即解析 pid：`observeForHint` →
    `processObservation` → store upsert → 生命周期/attach。心跳只保留扫描、
@@ -186,13 +187,13 @@ private:
 实现清单（以下每一条在 Condor watcher 里都是承重的——抄的是模式，
 不只是形状）：
 
-- `poll_loop()`：**事件阻塞**而非切片轮询——`RbEventWait`
-  （`include/job_watcher/rb_event_wait.hpp`）用一个 epoll 同时挂 libbpf 的
-  `ring_buffer__epoll_fd(rb)` 和 stop `eventfd`，exec 事件以内核唤醒的速度
-  送达；数据唤醒用 `ring_buffer__consume(rb)` 排干。`init` 失败则退回旧的
-  ~100ms 切片循环（只是延迟退化，绝不是故障）。仅当
-  `options.scan_interval_ms > 0` 才自扫（由 epoll 超时驱动）——生产环境节奏
-  归 registry 心跳管，间隔是 0。
+- `poll_loop()`：**事件阻塞**而非切片轮询——单次
+  `ring_buffer__poll(rb, timeout)` 直接阻塞在 libbpf 自己的 epoll 里，exec
+  事件以内核唤醒的速度送达；超时只用来限定 `stop()` 最长多久被察觉
+  （100ms 节拍）以及在 `scan_interval_ms > 0` 时触发自扫截止线。旧切片设计
+  的延迟来自"先在条件变量上睡觉、再做非阻塞抽干"——不要再引入这种拆分。
+  仅当 `options.scan_interval_ms > 0` 才自扫——生产环境节奏归 registry
+  心跳管，间隔是 0。
 - `scan()`：先检查 `proc_root` 可读（失败 ⇒ `complete=false`）；读
   `boot_id`；从进程表枚举候选 manager；`skipped` 只计数加 note，**绝不
   伪造观测**；候选过一遍 `ObservationAccumulator`；用同一个健康更新路径
