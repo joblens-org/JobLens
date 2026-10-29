@@ -89,6 +89,10 @@ run_lifecycle() {
         job_registry_lifecycle_test
 }
 
+run_rbevent() {
+    link_test "$root/tests/integration/rb_event_wait_test.cpp" rb_event_wait_test
+}
+
 case "$suite" in
     identity)
         run_identity
@@ -105,12 +109,16 @@ case "$suite" in
     lifecycle)
         run_lifecycle
         ;;
+    rbevent)
+        run_rbevent
+        ;;
     all)
         run_identity
         run_store
         run_intent
         run_maintenance
         run_lifecycle
+        run_rbevent
         ;;
     *)
         printf 'Unknown inventory suite: %s\n' "$suite" >&2
