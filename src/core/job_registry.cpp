@@ -994,6 +994,15 @@ JobRegistry::resolve_inventory_components(const JobRegistryOptions& options)
         hb_sources_.emplace_back(adapter->name(), &adapter->source());
     }
 
+    // Adapter-owned identity->facts derivation: the store never branches on
+    // a scheduler (test-wired registries share the same injection).
+    store_->setIdentityApplier(
+        [this](Job& facts, const NativeSelector& selector, const CanonicalIdentity& identity) {
+            for (const auto& adapter : adapters_)
+                if (adapter->name() == identity.adapter)
+                    adapter->applyIdentityToFacts(facts, selector, identity);
+        });
+
     // Liveness probes and the adapter facts encoder.
     process_probe_ = make_proc_liveness_probe();
     cgroup_probe_ = make_cgroup_membership_probe();
@@ -1294,6 +1303,17 @@ void JobRegistry::attributionExitHint(pid_t pid) {
             spdlog::warn("JobRegistry: exit observer failed: {}", error.what());
         }
     }
+}
+
+std::string JobRegistry::attributionCgroupPath(uint64_t internal_id) {
+    // Adapter-owned: cgroupPathOf is the only place that knows where the
+    // cgroup lives in the typed facts. Manual/unknown adapters have none.
+    const auto record = store_->record(internal_id);
+    if (!record) return {};
+    for (const auto& adapter : adapters_)
+        if (adapter->name() == record->adapter)
+            return adapter->cgroupPathOf(record->job);
+    return {};
 }
 
 // 内核登记入口（Added/Removed 由生命周期路径调用）。

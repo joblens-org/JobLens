@@ -51,6 +51,14 @@ public:
         // A pid exited: the heartbeat may schedule a targeted refresh. Must
         // not do I/O on this thread.
         virtual void attributionExitHint(pid_t pid) = 0;
+        // The execution cgroup of one instance as told by its adapter
+        // (cgroupPathOf); empty = none. Lets this component stay free of
+        // scheduler-facts knowledge.
+        virtual std::string attributionCgroupPath(uint64_t internal_id)
+        {
+            (void)internal_id;
+            return {};
+        }
     };
 
     explicit KernelAttribution(Host& host);

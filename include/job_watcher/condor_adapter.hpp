@@ -101,6 +101,39 @@ public:
         return selector;
     }
 
+    // The native string and namespace are authoritative; scheduler numeric
+    // fields derive from the canonical form so they can never disagree with
+    // the identity index. Moved from the store's apply_identity_to_facts.
+    void applyIdentityToFacts(Job& job, const NativeSelector& selector,
+                              const CanonicalIdentity& identity) const override
+    {
+        job.subtype = JobSubType::Condor;
+        if (!selector.cluster_name.empty()) job.cluster_name = selector.cluster_name;
+        if (!selector.cluster_tag.empty()) job.clusterTag = selector.cluster_tag;
+        if (job.jobtype != JobType::Job && job.jobtype != JobType::Sys) {
+            job.jobtype = JobType::Job;
+        }
+        if (!std::holds_alternative<CondorJobAttr>(job.sub_attr)) {
+            job.sub_attr = CondorJobAttr{};
+        }
+        auto& attr = std::get<CondorJobAttr>(job.sub_attr);
+        const auto dot = identity.canonical_native.find('.');
+        if (dot != std::string::npos) {
+            try {
+                attr.cluster_id = std::stoull(identity.canonical_native.substr(0, dot));
+                attr.proc_id = std::stoull(identity.canonical_native.substr(dot + 1));
+            } catch (const std::exception&) {
+                // Canonical validation already guaranteed decimal parts.
+            }
+        }
+    }
+
+    std::string cgroupPathOf(const Job& job) const override
+    {
+        const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr);
+        return attr ? attr->slots_cgroup_path : std::string{};
+    }
+
 private:
     // The native string and namespace are authoritative; scheduler numeric
     // fields derive from the canonical form so they can never disagree with

@@ -230,6 +230,7 @@ std::vector<ProcessIdentity> normalized_processes(std::vector<ProcessIdentity> p
 void write_job_fields(nlohmann::json& out, const Job& job) {
     out["jobtype"]       = static_cast<int>(job.jobtype);
     out["subtype"]       = static_cast<int>(job.subtype);
+    if (!job.subtype_name.empty()) out["subtype_name"] = job.subtype_name;
     out["pids"]          = job.JobPIDs;
     out["collectors"]    = job.CollectorNames;
     out["native_job_id"] = job.NativeJobID;
@@ -277,6 +278,7 @@ Job decode_legacy_job(const std::string& json_str) {
     Job job;
     job.jobtype       = static_cast<JobType>(j.value("jobtype", 0));
     job.subtype       = static_cast<JobSubType>(j.value("subtype", 0));
+    job.subtype_name  = j.value("subtype_name", "");
     job.JobPIDs       = j.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>();
     job.CollectorNames = j.value("collectors", nlohmann::json::array()).get<std::vector<std::string>>();
     job.NativeJobID   = j.value("native_job_id", "");
@@ -295,6 +297,13 @@ Job decode_legacy_job(const std::string& json_str) {
         } else {
             job.sub_attr = SlurmJobAttr{};
         }
+    } else if (!job.subtype_name.empty()) {
+        // Open-world scheduler: the adapter owns the facts schema; the JSON
+        // object is carried verbatim (the adapter's decodeFacts is the only
+        // interpreter).
+        job.sub_attr = j.contains("sub_attr") && j["sub_attr"].is_object()
+                           ? j["sub_attr"]
+                           : nlohmann::json::object();
     } else {
         job.sub_attr = CommonJobAttr{.auto_update_child = true};
     }
@@ -571,46 +580,22 @@ NativeSelector selector_from_legacy_job(const Job& job) {
     return selector;
 }
 
-// Apply a resolved logical identity to typed facts. The native string and
-// namespace are authoritative; scheduler numeric fields are derived from the
-// canonical form so they can never disagree with the identity index.
-void apply_identity_to_facts(Job& job, const NativeSelector& selector,
-                             const CanonicalIdentity& identity) {
+// Apply a resolved logical identity to typed facts through the registry's
+// injected applier (adapter-owned derivation). The generic parts — the
+// authoritative native string and namespace — apply here; the scheduler
+// typed-attr derivation lives in the adapters. Without an applier (store-only
+// tests) the observed facts are stored verbatim: no branch, no misfiling of
+// an open-world scheduler into a built-in schema.
+void apply_identity_via_applier(
+    const std::function<void(Job&, const NativeSelector&, const CanonicalIdentity&)>& applier,
+    Job& job, const NativeSelector& selector, const CanonicalIdentity& identity) {
     job.NativeJobID = identity.native_job_id;
     if (!selector.cluster_name.empty()) job.cluster_name = selector.cluster_name;
     if (!selector.cluster_tag.empty()) job.clusterTag = selector.cluster_tag;
     if (job.jobtype != JobType::Job && job.jobtype != JobType::Sys) {
         job.jobtype = JobType::Job;
     }
-
-    if (identity.adapter == kAdapterCondor) {
-        job.subtype = JobSubType::Condor;
-        if (!std::holds_alternative<CondorJobAttr>(job.sub_attr)) {
-            job.sub_attr = CondorJobAttr{};
-        }
-        auto& attr = std::get<CondorJobAttr>(job.sub_attr);
-        const auto dot = identity.canonical_native.find('.');
-        if (dot != std::string::npos) {
-            try {
-                attr.cluster_id = std::stoull(identity.canonical_native.substr(0, dot));
-                attr.proc_id = std::stoull(identity.canonical_native.substr(dot + 1));
-            } catch (const std::exception&) {
-                // Canonical validation already guaranteed decimal parts.
-            }
-        }
-    } else {
-        job.subtype = JobSubType::Slurm;
-        if (!std::holds_alternative<SlurmJobAttr>(job.sub_attr)) {
-            job.sub_attr = SlurmJobAttr{};
-        }
-        auto& attr = std::get<SlurmJobAttr>(job.sub_attr);
-        if (attr.cluster_name.empty()) attr.cluster_name = selector.cluster_name;
-        if (!selector.step_id.empty()) {
-            if (const auto numeric = slurm_step_value(selector.step_id)) {
-                attr.step_id = *numeric;
-            }
-        }
-    }
+    if (applier) applier(job, selector, identity);
 }
 
 }  // namespace
@@ -1609,7 +1594,7 @@ UpsertResult JobStore::upsert(const ObservedExecution& observation, JobRecord& o
             Job observed_job = observation.facts;
             observed_job.JobID = internal_id;
             observed_job.CollectorNames = stored.job.CollectorNames;
-            apply_identity_to_facts(observed_job, observation.selector, *identity);
+            apply_identity_via_applier(identity_applier_, observed_job, observation.selector, *identity);
             const bool authoritative_members = observation.members_complete;
             if (!observation.processes.empty()) {
                 observed_job.JobPIDs.clear();
@@ -1704,7 +1689,7 @@ UpsertResult JobStore::upsert(const ObservedExecution& observation, JobRecord& o
     record.job = observation.facts;
     record.job.JobID = allocated;
     record.job.CollectorNames.clear();
-    apply_identity_to_facts(record.job, observation.selector, *identity);
+    apply_identity_via_applier(identity_applier_, record.job, observation.selector, *identity);
     record.job.JobPIDs.clear();
     if (!observation.processes.empty()) {
         for (const auto& process : observation.processes) record.job.JobPIDs.push_back(process.pid);

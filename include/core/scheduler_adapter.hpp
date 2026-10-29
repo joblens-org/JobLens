@@ -90,6 +90,26 @@ public:
     // identity -> incomplete selector, never a guess).
     virtual NativeSelector legacySelector(const Job& job) const = 0;
 
+    // Applies a resolved identity to the typed facts (derives the typed attr
+    // fields the schema defines from the canonical form). The store calls it
+    // through the registry-injected applier on upsert; encoders that already
+    // applied the identity (encodeFacts normally does) are idempotent here.
+    // Default: nothing to derive — open-world (JSON) facts are kept verbatim.
+    virtual void applyIdentityToFacts(Job& facts, const NativeSelector& selector,
+                                      const CanonicalIdentity& identity) const
+    {
+        (void)facts; (void)selector; (void)identity;
+    }
+
+    // The execution cgroup of one job as told by its typed facts, used by
+    // kernel attribution (empty = none; the kernel_attribution trait gates
+    // whether the answer is ever consumed). Replaces subtype dispatch.
+    virtual std::string cgroupPathOf(const Job& job) const
+    {
+        (void)job;
+        return {};
+    }
+
     virtual AdapterTraits traits() const = 0;
 };
 

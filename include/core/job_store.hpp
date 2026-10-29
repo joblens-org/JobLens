@@ -213,6 +213,16 @@ public:
     bool migrationComplete() const { return migration_complete_; }
     void injectFaultForTest(StoreFaultMode mode, size_t skip = 0, size_t count = 1);
     void clearFaultsForTest();
+
+    // Adapter-owned identity->facts derivation, injected by the registry
+    // (dispatches through the scheduler adapters by identity.adapter). The
+    // store itself never branches on a scheduler; without an applier the
+    // observed facts are stored verbatim.
+    void setIdentityApplier(
+        std::function<void(Job&, const NativeSelector&, const CanonicalIdentity&)> applier)
+    {
+        identity_applier_ = std::move(applier);
+    }
     std::string dbUuid() const { return db_uuid_; }
 
     // --- restore (once, right after construction) ------------------------
@@ -280,6 +290,10 @@ public:
     std::string instanceId(uint64_t id) const;
 
 private:
+    // Injected by the registry; see setIdentityApplier.
+    std::function<void(Job&, const NativeSelector&, const CanonicalIdentity&)>
+        identity_applier_;
+
     bool init_db(const Options& options);
     void close_db();
     bool load_or_create_db_uuid();

@@ -389,4 +389,5 @@ private:
     void attributionJobRemovePid(uint64_t internal_id, pid_t pid) override;
     void attributionEnumerateJobs(const std::function<void(const Job&)>& fn) override;
     void attributionExitHint(pid_t pid) override;
+    std::string attributionCgroupPath(uint64_t internal_id) override;
 };

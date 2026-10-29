@@ -113,6 +113,20 @@ public:
         return selector;
     }
 
+    // Delegates to the same derivation encodeFacts uses (moved from the
+    // store's apply_identity_to_facts; idempotent for encoded facts).
+    void applyIdentityToFacts(Job& job, const NativeSelector& selector,
+                              const CanonicalIdentity& identity) const override
+    {
+        apply_identity(job, selector, identity);
+    }
+
+    std::string cgroupPathOf(const Job& job) const override
+    {
+        const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr);
+        return attr ? attr->cgroup_path : std::string{};
+    }
+
 private:
     static void apply_identity(Job& job, const NativeSelector& selector,
                                const CanonicalIdentity& identity)

@@ -23,17 +23,8 @@
 
 namespace {
 
-// 从 Job 取 cgroup 路径: Slurm 用 cgroup_path, Condor 用 slots_cgroup_path。
-std::string job_cgroup_path(const Job& job) {
-    try {
-        if (job.subtype == JobSubType::Slurm)
-            return std::get<SlurmJobAttr>(job.sub_attr).cgroup_path;
-        if (job.subtype == JobSubType::Condor)
-            return std::get<CondorJobAttr>(job.sub_attr).slots_cgroup_path;
-    } catch (const std::bad_variant_access&) {
-    }
-    return {};
-}
+// （job_cgroup_path 已移除：cgroup 路径由 Host::attributionCgroupPath 提供，
+// registry 在那里按 record.adapter 分派到 adapter 的 cgroupPathOf。）
 
 }  // namespace
 
@@ -110,7 +101,7 @@ uint64_t KernelAttribution::resolveCgroupId(const Job& job)
         const auto cached = cgroup_ids_.find(job.JobID);
         if (cached != cgroup_ids_.end()) return cached->second;
     }
-    const auto cg = job_cgroup_path(job);
+    const auto cg = host_.attributionCgroupPath(job.JobID);
     if (cg.empty()) return 0;
     const auto id = EbpfCommon::cgroup_path_to_id(cg).value_or(0);
     if (id != 0) {

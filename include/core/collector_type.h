@@ -229,7 +229,11 @@ inline void from_json(const nlohmann::json& j, SlurmJobAttr& t) {
     rd_i64("unix_gid", t.unix_gid);
 }
 
-using SubAttr = std::variant<CondorJobAttr, CommonJobAttr, SlurmJobAttr>;
+using SubAttr = std::variant<CondorJobAttr, CommonJobAttr, SlurmJobAttr, nlohmann::json>;
+// The json alternative is the open-world facts channel (v2 G4): a scheduler
+// whose adapter registered after the built-ins carries its typed facts as a
+// JSON object the adapter owns (schema, keys, evolution). Built-in attrs
+// stay strongly typed so existing collectors and matchers are untouched.
 
 // SubAttr 匹配器，用于通过 sub_attr 字段匹配作业
 struct SubAttrMatcher {
@@ -250,7 +254,12 @@ struct SubAttrMatcher {
     std::optional<pid_t> slurm_stepd_pid;
     
     // CommonJobAttr 匹配字段（如果需要可以添加）
-    
+
+    // 开放世界匹配（新调度器）：subtype_name 与 Job::subtype_name 比对；
+    // json_fields 对 sub_attr 的 JSON 成员做字段级子集匹配。
+    std::optional<std::string> subtype_name;
+    std::optional<nlohmann::json> json_fields;
+
     // 检查是否匹配给定的 SubAttr
     bool matches(const SubAttr& attr) const {
         // 首先检查子类型
@@ -291,6 +300,15 @@ struct SubAttrMatcher {
                 // CommonJobAttr 目前没有特殊字段需要匹配
                 spdlog::debug("SubAttrMatcher: matching CommonJobAttr is not implemented, returning false");
                 return false;
+            } else {
+                // Open-world JSON facts: field-level subset match. Without
+                // json_fields the match is by presence (callers combine it
+                // with subtype_name at the Job level).
+                if (!json_fields.has_value()) return true;
+                for (auto it = json_fields->begin(); it != json_fields->end(); ++it) {
+                    if (!a.contains(it.key()) || a.at(it.key()) != it.value()) return false;
+                }
+                return true;
             }
             return false;
         }, attr);
@@ -304,6 +322,10 @@ struct Job {
     std::string                           cluster_name{};  // 集群名称（公共属性：Condor=COLLECTOR_HOST, Slurm=SLURM_CLUSTER_NAME）
     JobType                                 jobtype;
     JobSubType                              subtype;
+    // Adapter name for open-world schedulers ("" for the built-ins, whose
+    // JobSubType carries the same information). Persisted next to the numeric
+    // subtype; readers accept either.
+    std::string                             subtype_name;
     std::vector<pid_t>                        JobPIDs;
     // std::chrono::system_clock::time_point   JobCreateTime{std::chrono::system_clock::now()};
     // std::unordered_map<std::string, void*>  JobInfo; //目前没有启用
