@@ -1,8 +1,12 @@
 # Job Watcher Integration Guide
 
-**Status:** Matches the v2 inventory architecture on `feature/collector-output-refactor`
-(see [job_inventory_v2_architecture.md](job_inventory_v2_architecture.md), §2.2).
-**Chinese version:** [job_watcher_integration.zh-CN.md](job_watcher_integration.zh-CN.md)
+**Status:** Implemented on `feature/collector-output-refactor` (2026-10-29,
+commits 76dc9ea..): scheduler identity is the adapter name end to end —
+`SchedulerType`/`InventoryType` enums deleted, native-id rules and config
+sections self-register/by-convention, facts ride the `SubAttr` JSON
+alternative for post-built-in schedulers. See the "File touch list" — it now
+contains only the watcher's own files. Chinese version:
+[job_watcher_integration.zh-CN.md](job_watcher_integration.zh-CN.md)
 
 This guide describes how to add a **new scheduler type** to the job inventory —
 for example an `ssh` session source — by writing one *job watcher* (a discovery
@@ -154,21 +158,17 @@ changes the collector lifecycle contract.
 
 ## 4. Step by step
 
-### Step 1 — shared-code edits (mechanical, ~4 files)
+### Step 1 — no shared-code edits
 
-The v2 goal is "no enum, no switch in shared code"; today the *config and
-type* layer still carries the built-in list, so adding a type touches:
-
-| File | Edit |
-|---|---|
-| `include/core/collector_type.h` | `SchedulerType`: add `Ssh`. `JobSubType`: add `Ssh`. Add a `SshJobAttr` struct (typed facts) with its JSON pair list, and extend `SubAttr` + `SubAttrMatcher` the way `SlurmJobAttr` is wired. |
-| `include/core/inventory_config.hpp` | `enum class InventoryType`: add `Ssh`; extend `adapter_name_of()`. |
-| `src/core/inventory_config.cpp` | `to_string()` / `inventory_type_from_string()`: recognize `"ssh"`. In `resolve_inventory_maintenance_config()`: add the type to the `{Condor, Slurm}` iteration lists (legacy `auto_add_*` key, per-type config section `ssh_job_watcher`, rules-dir fallback). |
-| `src/core/job_identity.cpp` | `scheduler_type_from_string()`: recognize `"ssh"`. `canonicalize()`: add a native-id validation rule if your ids are not plain numbers (Condor validates `cluster.proc`; unknown formats fall through to generic stripping). |
-
-Optionally extend `DiscoveryEnvironment`
-(`include/core/job_observation.hpp`) with a namespace/spool field for the new
-type, the way `slurm_spool_dir` exists for Slurm.
+Since the G4 completion, adding a scheduler type touches **no shared file**.
+The adapter name is the scheduler identity everywhere: config `types` are
+registry names validated at startup, `<name>_job_watcher` sections resolve by
+convention, native-id rules self-register (`REGISTER_NATIVE_ID_RULE`), facts
+for non-built-in schedulers ride the `SubAttr` JSON alternative with
+`subtype_name`, and identity/cgroup derivation dispatches through
+`ISchedulerAdapter` methods. The only optional edit is a
+`DiscoveryEnvironment` field if your source needs a special root (like
+Slurm's spool dir); generic roots (`proc_root`, `cgroup_root`) already exist.
 
 ### Step 2 — write the watcher
 
@@ -337,15 +337,14 @@ For eBPF-dependent tests, guard on namespace availability the way
 
 | Edited | Purpose |
 |---|---|
-| `include/core/collector_type.h` | `SchedulerType`, `JobSubType`, `SubAttr` facts struct |
-| `include/core/inventory_config.hpp` / `src/core/inventory_config.cpp` | `InventoryType`, name mapping, config section, legacy folding |
-| `src/core/job_identity.cpp` | scheduler-name parsing, native-id canonicalization rule |
-| `include/core/job_registry.hpp` | include the adapter header (option (a)) |
-| `include/core/job_observation.hpp` | optional `DiscoveryEnvironment` field for the new namespace |
-| `config/config.example.yaml` | `<t>_job_watcher` section |
+| `include/core/job_registry.hpp` | include the adapter header (option (a)); nothing else |
+| `include/core/job_observation.hpp` | optional: a special `DiscoveryEnvironment` root (e.g. a spool dir) |
+| `config/config.example.yaml` | `<t>_job_watcher` section + `inventory.types` entry |
 
-No changes are needed in `JobStore`, the heartbeat/retirement logic,
-`KernelAttribution`, the RPC methods or the trigger.
+No changes are needed in `collector_type.h`, `job_identity`, `inventory_config`,
+`JobStore`, the heartbeat/retirement logic, `KernelAttribution`, the RPC methods
+or the trigger: identity, config sections, native-id rules, facts (JSON
+alternative), matching and cgroup derivation are all adapter-driven.
 
 ## 6. Final checklist
 

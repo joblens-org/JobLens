@@ -1,8 +1,11 @@
 # Job Watcher 接入指南
 
-**状态：** 对应 `feature/collector-output-refactor` 分支上的 v2 inventory 架构
-（见 [job_inventory_v2_architecture.md](job_inventory_v2_architecture.md) §2.2）。
-**English version:** [job_watcher_integration.md](job_watcher_integration.md)
+**状态：** 已在 `feature/collector-output-refactor` 落地（2026-10-29，
+commits 76dc9ea..）：调度器身份端到端就是 adapter 名字——`SchedulerType`/
+`InventoryType` 枚举已删除，native-id 规则与配置节自注册/按约定解析，
+新调度器的 facts 走 `SubAttr` 的 JSON 通道。"文件清单"里现在只剩
+watcher 自己的文件。English version:
+[job_watcher_integration.md](job_watcher_integration.md)
 
 本指南描述如何向作业清单（inventory）接入一种**新的调度器类型**——例如一个
 `ssh` 会话源：写一个 *job watcher*（发现源）和一个 *scheduler adapter*
@@ -139,21 +142,15 @@ exec tracer 自己写入 provisional `pid2job` 条目可以关掉这个窗口—
 
 ## 4. 分步操作
 
-### 第 1 步 — 共享代码修改（机械性，约 4 个文件）
+### 第 1 步 — 无共享代码修改
 
-v2 的目标是"共享代码里没有枚举、没有 switch"；目前**配置与类型层**仍
-携带内建清单，所以新增类型会触碰：
-
-| 文件 | 修改 |
-|---|---|
-| `include/core/collector_type.h` | `SchedulerType`：加 `Ssh`。`JobSubType`：加 `Ssh`。仿照 `SlurmJobAttr` 添加 `SshJobAttr` 结构（typed facts）+ JSON pair 列表，并扩展 `SubAttr` variant 与 `SubAttrMatcher`。 |
-| `include/core/inventory_config.hpp` | `enum class InventoryType`：加 `Ssh`；扩展 `adapter_name_of()`。 |
-| `src/core/inventory_config.cpp` | `to_string()` / `inventory_type_from_string()`：识别 `"ssh"`。在 `resolve_inventory_maintenance_config()` 里把新类型加进各处 `{Condor, Slurm}` 迭代（legacy `auto_add_*` 键、per-type 配置节 `ssh_job_watcher`、rules_dir 回退）。 |
-| `src/core/job_identity.cpp` | `scheduler_type_from_string()`：识别 `"ssh"`。`canonicalize()`：若你的原生 id 不是纯数字，加一条校验规则（Condor 校验 `cluster.proc`；未知格式走通用去前导零路径）。 |
-
-可选：在 `DiscoveryEnvironment`
-（`include/core/job_observation.hpp`）里为新类型加一个命名空间/spool
-字段——就像 Slurm 的 `slurm_spool_dir` 那样。
+G4 完成后，接入一种调度器类型**不再触碰任何共享文件**。adapter 名字就是
+处处通行的调度器身份：配置 `types` 是启动时对注册表校验的名字，
+`<name>_job_watcher` 配置节按约定解析，native-id 规则自注册
+（`REGISTER_NATIVE_ID_RULE`），非内置调度器的 facts 走 `SubAttr` 的 JSON
+通道（配 `subtype_name`），身份/cgroup 推导经 `ISchedulerAdapter` 接口分派。
+唯一可能的可选修改是给 `DiscoveryEnvironment` 加一个特殊根字段（如 Slurm
+的 spool 目录）；通用根（`proc_root`、`cgroup_root`）已经存在。
 
 ### 第 2 步 — 写 watcher
 
@@ -313,15 +310,14 @@ ssh_job_watcher:
 
 | 修改 | 用途 |
 |---|---|
-| `include/core/collector_type.h` | `SchedulerType`、`JobSubType`、`SubAttr` facts 结构 |
-| `include/core/inventory_config.hpp` / `src/core/inventory_config.cpp` | `InventoryType`、名字映射、配置节、legacy 折叠 |
-| `src/core/job_identity.cpp` | 调度器名解析、原生 id canonicalization 规则 |
-| `include/core/job_registry.hpp` | include adapter 头（做法 (a)） |
-| `include/core/job_observation.hpp` | 可选：为新命名空间加 `DiscoveryEnvironment` 字段 |
-| `config/config.example.yaml` | `<t>_job_watcher` 配置节 |
+| `include/core/job_registry.hpp` | include adapter 头（做法 (a)）；仅此而已 |
+| `include/core/job_observation.hpp` | 可选：特殊 `DiscoveryEnvironment` 根字段（如 spool 目录） |
+| `config/config.example.yaml` | `<t>_job_watcher` 配置节 + `inventory.types` 一项 |
 
-`JobStore`、心跳/退休逻辑、`KernelAttribution`、RPC 方法、trigger 均
-**不需要改动**。
+`collector_type.h`、`job_identity`、`inventory_config`、`JobStore`、
+心跳/退休逻辑、`KernelAttribution`、RPC 方法、trigger 均**不需要改动**：
+身份、配置节、native-id 规则、facts（JSON 通道）、匹配与 cgroup 推导全部
+由 adapter 驱动。
 
 ## 6. 最终检查清单
 
