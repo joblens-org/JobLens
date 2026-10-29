@@ -953,18 +953,17 @@ JobRegistry::resolve_inventory_components(const JobRegistryOptions& options)
     }
     reconcile_interval_sec_ = config.reconcile_interval_sec;
 
-    // Exactly one adapter per configured scheduler type, built through the
+    // Exactly one adapter per configured scheduler name, built through the
     // self-registration registry; the heartbeat drives them through
     // IDiscoverySource and owns no adapter details.
     adapters_.clear();
-    for (const auto type : config.types) {
-        const auto& settings = config.settings.at(type);
-        auto adapter = SchedulerAdapterRegistry::instance().build(
-            adapter_name_of(type), settings);
+    for (const auto& name : config.types) {
+        const auto& settings = config.settings.at(name);
+        auto adapter = SchedulerAdapterRegistry::instance().build(name, settings);
         if (!adapter) {
             spdlog::error("JobRegistry: no adapter registered for inventory type '{}'; "
                           "registered: {}",
-                          adapter_name_of(type),
+                          name,
                           fmt::join(SchedulerAdapterRegistry::instance().names(), ", "));
             adapters_.clear();
             return InventoryWiring::Disabled;
@@ -980,14 +979,13 @@ JobRegistry::resolve_inventory_components(const JobRegistryOptions& options)
     // configured defaults to every job, use_rules=true asks the rule engine
     // per job (reject = empty selection, the job stays inventoried).
     auto_policies_.clear();
-    for (const auto& [type, settings] : config.settings) {
+    for (const auto& [adapter_name, settings] : config.settings) {
         if (!settings.auto_collect) continue;
-        const std::string adapter = adapter_name_of(type);
         if (settings.use_rules)
-            auto_policies_[adapter] =
+            auto_policies_[adapter_name] =
                 AutoCollectorPolicy::rules(settings.rules_dir, settings.rules_prefix);
         else
-            auto_policies_[adapter] =
+            auto_policies_[adapter_name] =
                 AutoCollectorPolicy::defaults(settings.default_collectors);
     }
 

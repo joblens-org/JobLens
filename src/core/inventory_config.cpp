@@ -17,8 +17,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 
 #include "common/utils.hpp"
 
@@ -29,7 +31,7 @@ namespace {
     throw std::invalid_argument("inventory configuration: " + message);
 }
 
-const nlohmann::json* member(const nlohmann::json& node, const char* key)
+const nlohmann::json* member(const nlohmann::json& node, const std::string& key)
 {
     if (!node.is_object()) return nullptr;
     const auto it = node.find(key);
@@ -113,36 +115,10 @@ std::string scalar_field(const nlohmann::json& node, const char* key, const std:
 
 }  // namespace
 
-// ---------------------------------------------------------------------------
-// Configuration contract (plan section 8)
-// ---------------------------------------------------------------------------
-
-const char* to_string(InventoryType type)
-{
-    switch (type) {
-        case InventoryType::Condor: return "condor";
-        case InventoryType::Slurm: return "slurm";
-    }
-    return "unknown";
-}
-
-std::optional<InventoryType> inventory_type_from_string(const std::string& raw)
-{
-    std::string normalized;
-    normalized.reserve(raw.size());
-    for (const char c : raw) {
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;
-        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-    }
-    if (normalized == "condor") return InventoryType::Condor;
-    if (normalized == "slurm") return InventoryType::Slurm;
-    return std::nullopt;
-}
-
 nlohmann::json InventoryMaintenanceConfig::to_json() const
 {
     nlohmann::json types_json = nlohmann::json::array();
-    for (const auto type : types) types_json.push_back(to_string(type));
+    for (const auto& name : types) types_json.push_back(name);
 
     nlohmann::json out;
     out["types"] = std::move(types_json);
@@ -150,7 +126,7 @@ nlohmann::json InventoryMaintenanceConfig::to_json() const
     nlohmann::json sources = nlohmann::json::array();
     for (const auto& entry : settings) {
         sources.push_back(nlohmann::json{
-            {"type", to_string(entry.first)},
+            {"type", entry.first},
             {"inventory", entry.second.inventory},
             {"auto_collect", entry.second.auto_collect},
             {"auto_collect_explicit", entry.second.auto_collect_explicit},
@@ -166,6 +142,28 @@ nlohmann::json InventoryMaintenanceConfig::to_json() const
     return out;
 }
 
+namespace {
+
+constexpr std::string_view kSectionSuffix = "_job_watcher";
+
+// The legacy auto_add flags predate the adapter model; they stay explicit
+// built-in special cases forever (folding semantics, deprecation warnings).
+struct LegacyFlag {
+    const char* adapter;
+    const char* key;
+};
+constexpr LegacyFlag kLegacyFlags[] = {
+    {"condor", "auto_add_condorjob"},
+    {"slurm", "auto_add_slurmjob"},
+};
+
+std::string section_of(const std::string& adapter)
+{
+    return adapter + std::string(kSectionSuffix);
+}
+
+}  // namespace
+
 InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::json& config)
 {
     if (!config.is_object())
@@ -178,16 +176,36 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
         config_error("job_registry_config must be a mapping");
 
     InventoryMaintenanceConfig resolved;
-    for (const auto type : {InventoryType::Condor, InventoryType::Slurm}) {
-        InventoryTypeSettings settings;
-        settings.legacy_auto_collect = [&]() {
-            const char* key = type == InventoryType::Condor ? "auto_add_condorjob"
-                                                            : "auto_add_slurmjob";
-            const auto* node = member(registry_node, key);
-            if (node == nullptr) return false;
-            return parse_bool(*node, std::string("job_registry_config.") + key);
-        }();
-        resolved.settings.emplace(type, settings);
+
+    // Candidate names, open world: every REGISTERED adapter (so the resolved
+    // picture is complete and a new scheduler appears without edits), every
+    // top-level "<name>_job_watcher" section the configuration carries, and
+    // the two legacy auto_add flags.
+    std::set<std::string> candidates;
+    for (const auto& name : SchedulerAdapterRegistry::instance().names())
+        candidates.insert(name);
+    for (auto it = config.begin(); it != config.end(); ++it) {
+        const std::string& key = it.key();
+        if (key.size() <= kSectionSuffix.size() ||
+            key.compare(key.size() - kSectionSuffix.size(), kSectionSuffix.size(),
+                        kSectionSuffix) != 0)
+            continue;
+        candidates.insert(key.substr(0, key.size() - kSectionSuffix.size()));
+    }
+    for (const auto& legacy : kLegacyFlags) {
+        if (member(registry_node, legacy.key) != nullptr)
+            candidates.insert(legacy.adapter);
+    }
+
+    for (const auto& name : candidates)
+        resolved.settings.emplace(name, InventoryTypeSettings{});
+
+    // Legacy flags resolve first (per-type precedence input).
+    for (const auto& legacy : kLegacyFlags) {
+        const auto* node = member(registry_node, legacy.key);
+        if (node == nullptr) continue;
+        resolved.settings.at(legacy.adapter).legacy_auto_collect =
+            parse_bool(*node, std::string("job_registry_config.") + legacy.key);
     }
 
     const auto* inventory = member(registry_node, "inventory");
@@ -201,14 +219,23 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
             for (const auto& entry : *types) {
                 const std::string raw = scalar_text(
                     entry, "job_registry_config.inventory.types[]");
-                const auto type = inventory_type_from_string(raw);
-                if (!type) {
-                    config_error("unknown inventory type '" + raw +
-                                 "' (expected condor or slurm)");
+                const std::string name = normalize_adapter_name(raw);
+                if (name.empty() || name == "unknown")
+                    config_error("unknown inventory type '" + raw + "'");
+                if (!SchedulerAdapterRegistry::instance().known(name)) {
+                    config_error("unknown inventory type '" + raw + "' (registered: " +
+                                 [&] {
+                                     std::string joined;
+                                     for (const auto& known :
+                                          SchedulerAdapterRegistry::instance().names())
+                                         joined += (joined.empty() ? "" : ", ") + known;
+                                     return joined;
+                                 }() +
+                                 ")");
                 }
-                if (std::find(resolved.types.begin(), resolved.types.end(), *type) ==
+                if (std::find(resolved.types.begin(), resolved.types.end(), name) ==
                     resolved.types.end()) {
-                    resolved.types.push_back(*type);
+                    resolved.types.push_back(name);
                 }
             }
         }
@@ -222,19 +249,26 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
     const std::string legacy_rules_dir =
         scalar_field(registry_node, "rules_dir", "job_registry_config", std::string());
 
-    for (const auto type : resolved.types) {
-        resolved.settings[type].inventory = true;
+    for (const auto& name : resolved.types) {
+        resolved.settings[name].inventory = true;
     }
 
-    for (const auto type : {InventoryType::Condor, InventoryType::Slurm}) {
-        const char* section = type == InventoryType::Condor ? "condor_job_watcher"
-                                                            : "slurm_job_watcher";
-        const std::string prefix = std::string(section) + ".";
+    // Per-adapter sections resolve by convention: <name>_job_watcher. The
+    // defaults follow the same convention (prefix <name>_job_, rules under
+    // config/rules/<name>_jobs), so a new scheduler needs no resolver edit.
+    for (auto& [name, settings] : resolved.settings) {
+        const std::string section = section_of(name);
+        const std::string prefix = section + ".";
         const auto* node = member(config, section);
         if (node != nullptr && !node->is_object())
-            config_error(std::string(section) + " must be a mapping");
+            config_error(section + " must be a mapping");
+        if (node != nullptr && !SchedulerAdapterRegistry::instance().known(name))
+            spdlog::warn("inventory configuration: section '{}' present but no adapter "
+                         "'{}' is registered; the settings stay inert",
+                         section, name);
 
-        auto& settings = resolved.settings[type];
+        settings.rules_prefix = name + "_job_";
+        settings.rules_dir = Utils::JobLensRootDir() + "../config/rules/" + name + "_jobs";
         if (node != nullptr) {
             if (const auto* auto_collect = member(*node, "auto_collect")) {
                 settings.auto_collect_explicit = true;
@@ -253,39 +287,23 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
             }
             settings.cluster_name =
                 scalar_field(*node, "cluster_name", section, std::string{});
-            settings.rules_prefix = scalar_field(
-                *node, "rules_prefix", section,
-                std::string(type == InventoryType::Condor ? "condor_job_" : "slurm_job_"));
-            const std::string fallback_rules_dir =
-                Utils::JobLensRootDir() + "../config/rules/" +
-                (type == InventoryType::Condor ? "condor_jobs" : "slurm_jobs");
-            // Per-type rules_dir wins over the legacy shared one, otherwise the
-            // existing per-type default stays in place (plan section 8).
-            settings.rules_dir = scalar_field(*node, "rules_dir", section,
-                                              legacy_rules_dir.empty() ? fallback_rules_dir
-                                                                       : legacy_rules_dir);
-        } else {
-            settings.rules_prefix = type == InventoryType::Condor ? "condor_job_"
-                                                                  : "slurm_job_";
-            settings.rules_dir = legacy_rules_dir.empty()
-                                     ? Utils::JobLensRootDir() + "../config/rules/" +
-                                           (type == InventoryType::Condor ? "condor_jobs"
-                                                                          : "slurm_jobs")
-                                     : legacy_rules_dir;
+            settings.rules_prefix = scalar_field(*node, "rules_prefix", section,
+                                                 settings.rules_prefix);
+            // Per-type rules_dir wins over the legacy shared one; otherwise
+            // the per-type convention default stays in place (plan section 8).
+            settings.rules_dir = scalar_field(
+                *node, "rules_dir", section,
+                legacy_rules_dir.empty() ? settings.rules_dir : legacy_rules_dir);
+        } else if (!legacy_rules_dir.empty()) {
+            settings.rules_dir = legacy_rules_dir;
         }
-        if (!settings.auto_collect_explicit) {
+        if (!settings.auto_collect_explicit)
             settings.auto_collect = settings.legacy_auto_collect;
-            if (settings.legacy_auto_collect) {
-                spdlog::warn("inventory configuration: job_registry_config.auto_add_{}job is "
-                             "deprecated; set {}.auto_collect instead",
-                             type == InventoryType::Condor ? "condor" : "slurm", section);
-            }
-        }
     }
 
     if (!legacy_rules_dir.empty()) {
         spdlog::warn("inventory configuration: job_registry_config.rules_dir is deprecated; "
-                     "set condor_job_watcher.rules_dir / slurm_job_watcher.rules_dir");
+                     "set <adapter>_job_watcher.rules_dir instead");
     }
 
     // Legacy auto-add folding (user-defined semantics): auto_add_<type>job=true
@@ -294,22 +312,20 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
     // engine (accept = rule result, reject = empty) or verbatim from
     // auto_add_collectors. An explicit per-type auto_collect or an explicit
     // inventory.types entry always wins over the legacy flag.
-    for (const auto type : {InventoryType::Condor, InventoryType::Slurm}) {
-        auto& settings = resolved.settings[type];
+    for (const auto& legacy : kLegacyFlags) {
+        auto& settings = resolved.settings.at(legacy.adapter);
         const bool explicit_type =
-            std::find(resolved.types.begin(), resolved.types.end(), type) != resolved.types.end();
+            std::find(resolved.types.begin(), resolved.types.end(),
+                      legacy.adapter) != resolved.types.end();
         if (!settings.legacy_auto_collect || explicit_type || settings.auto_collect_explicit)
             continue;
-        const char* section = type == InventoryType::Condor ? "condor_job_watcher"
-                                                            : "slurm_job_watcher";
-        resolved.types.push_back(type);
+        resolved.types.push_back(legacy.adapter);
         settings.inventory = true;
         settings.auto_collect = true;
-        spdlog::warn("inventory configuration: job_registry_config.auto_add_{}job is folded "
+        spdlog::warn("inventory configuration: job_registry_config.{} is folded "
                      "into inventory discovery with automatic collection; set {}.auto_collect "
                      "explicitly to override",
-                     type == InventoryType::Condor ? "condor" : "slurm", section);
+                     legacy.key, section_of(legacy.adapter));
     }
     return resolved;
 }
-

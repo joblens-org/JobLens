@@ -459,7 +459,7 @@ void case_config()
         const auto config = resolve_inventory_maintenance_config(nlohmann::json::object());
         check(config.types.empty(), "config: absent types must default to []");
         check(config.reconcile_interval_sec == 30, "config: default interval is 30");
-        check(!config.settings.at(InventoryType::Condor).auto_collect,
+        check(!config.settings.at("condor").auto_collect,
               "config: auto_collect defaults to false");
     }
     {
@@ -484,11 +484,11 @@ void case_config()
         });
         check(config.types.size() == 2, "config: both types resolved");
         check(config.reconcile_interval_sec == 5, "config: explicit interval wins");
-        const auto& condor = config.settings.at(InventoryType::Condor);
+        const auto& condor = config.settings.at("condor");
         check(condor.auto_collect && !condor.use_rules &&
                   condor.default_collectors.size() == 1,
               "config: explicit condor settings win");
-        const auto& slurm = config.settings.at(InventoryType::Slurm);
+        const auto& slurm = config.settings.at("slurm");
         check(!slurm.auto_collect && slurm.use_rules && slurm.rules_dir == "/tmp/rules",
               "config: slurm rules settings resolved");
     }
@@ -497,9 +497,9 @@ void case_config()
         const auto config = resolve_inventory_maintenance_config(nlohmann::json{
             {"job_registry_config", nlohmann::json{{"auto_add_condorjob", true}}},
         });
-        check(config.types.size() == 1 && config.types.front() == InventoryType::Condor,
+        check(config.types.size() == 1 && config.types.front() == "condor",
               "config: legacy auto_add folds into inventory discovery");
-        check(config.settings.at(InventoryType::Condor).auto_collect,
+        check(config.settings.at("condor").auto_collect,
               "config: legacy folding turns auto collection on");
     }
     {

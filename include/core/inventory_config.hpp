@@ -12,9 +12,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 // Inventory configuration contract (plan section 8). Split out of the
-// maintenance controller in v2 stage S4; the resolver stays Condor/Slurm
-// compatible (including the legacy auto_add_* folding) and is generalized to
-// adapter names by the registry wiring.
+// maintenance controller in v2 stage S4. The scheduler identity here is the
+// ADAPTER REGISTRY NAME (open world, no enum): a new scheduler appears the
+// moment it registers and gets a `<name>_job_watcher` config section. The
+// resolver keeps the legacy auto_add_condorjob/auto_add_slurmjob folding as
+// explicit built-in special cases.
 #pragma once
 
 #include <map>
@@ -26,27 +28,18 @@
 
 #include "core/scheduler_adapter.hpp"
 
-enum class InventoryType {
-    Condor = 0,
-    Slurm,
-};
-
-const char* to_string(InventoryType type);
-std::optional<InventoryType> inventory_type_from_string(const std::string& raw);
-// Adapter-registry names for the built-in types.
-inline const char* adapter_name_of(InventoryType type)
-{
-    return type == InventoryType::Condor ? "condor" : "slurm";
-}
-
+// Inventory maintenance configuration. Names listed in `types` are validated
+// against the adapter registry at startup; an unknown name is a startup
+// error that lists the registered names.
 struct InventoryMaintenanceConfig {
-    // Types that opted into broad discovery. Empty means "inventory off",
-    // preserving the pre-decoupling opt-in behavior.
-    std::vector<InventoryType> types;
+    // Adapter names that opted into broad discovery. Empty means "inventory
+    // off", preserving the pre-decoupling opt-in behavior.
+    std::vector<std::string> types;
     // Default 30 s; minimum 1 s (validated at startup).
     std::uint32_t reconcile_interval_sec = 30;
-    // Always contains both types so the resolved picture is complete.
-    std::map<InventoryType, InventoryTypeSettings> settings;
+    // Keyed by adapter name; contains every registered adapter plus every
+    // type the configuration mentions, so the resolved picture is complete.
+    std::map<std::string, InventoryTypeSettings> settings;
 
     nlohmann::json to_json() const;
 };
