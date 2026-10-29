@@ -261,8 +261,7 @@ struct SubAttrMatcher {
     std::optional<nlohmann::json> json_fields;
 
     // 检查是否匹配给定的 SubAttr
-    bool matches(const SubAttr& attr) const {
-        // 首先检查子类型
+    bool matches(const SubAttr& attr) const {        // 首先检查子类型
         if (subtype.has_value()) {
             JobSubType actual_subtype;
             std::visit([&actual_subtype](const auto& a) {
@@ -368,7 +367,13 @@ struct Job {
     }
 };
 
-// // variant 的序列化：visit 到具体类型
+// Job 级匹配：开放世界名字（subtype_name）先于字段匹配——新调度器的作业
+// 无需 typed variant 成员即可被 find/del 精确命中。
+inline bool matches_job(const SubAttrMatcher& matcher, const Job& job) {
+    if (matcher.subtype_name.has_value() && job.subtype_name != *matcher.subtype_name)
+        return false;
+    return matcher.matches(job.sub_attr);
+}
 // inline void variant_to_json(nlohmann::json& j, const SubAttr& v) {
 //     std::visit([&j](const auto& obj) { j = obj; }, v);
 // }

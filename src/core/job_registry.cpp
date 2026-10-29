@@ -1376,7 +1376,7 @@ bool JobRegistry::addJob(const Job& job) {
         matcher.slurm_step_id = attr.step_id;
     }
     if (!store_->findActive([&matcher](const Job& existing) {
-            return matcher.matches(existing.sub_attr); }).empty()) {
+            return matches_job(matcher, existing); }).empty()) {
         spdlog::warn("JobRegistry: job with matching sub_attr already exists, ignored");
         return false;
     }
@@ -1510,7 +1510,7 @@ bool JobRegistry::finishJobRemoval(const Job& job) {
 
 size_t JobRegistry::delJob(const SubAttrMatcher& matcher) {
     const auto matched = store_->findActive(
-        [&matcher](const Job& job) { return matcher.matches(job.sub_attr); });
+        [&matcher](const Job& job) { return matches_job(matcher, job); });
     const bool has_callbacks = !lifecycle_callbacks().empty();
 
     for (const auto& record : matched) {
@@ -1631,7 +1631,7 @@ std::optional<Job> JobRegistry::findJob(uint64_t jobID) {
 std::vector<Job> JobRegistry::findJob(const SubAttrMatcher& matcher) const {
     std::vector<Job> matched_jobs;
     for (const auto& record : store_->findActive(
-             [&matcher](const Job& job) { return matcher.matches(job.sub_attr); })) {
+             [&matcher](const Job& job) { return matches_job(matcher, job); })) {
         matched_jobs.push_back(record.job);
     }
     spdlog::debug("JobRegistry: found {} jobs matching the criteria", matched_jobs.size());

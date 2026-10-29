@@ -120,6 +120,16 @@ std::string json2JobOpt(const nlohmann::json& obj, Job& job) {
         job.sub_attr = CommonJobAttr{
             .auto_update_child = obj.value("auto_update_child", true)
         };
+    }else{
+        // 开放世界：任何其它 subtype 名字即 adapter 名，typed facts 以 JSON
+        // 原样入库（该 adapter 的 encodeFacts/decodeFacts 是唯一解释者）。
+        if (!normalize_adapter_name(subtype).empty()) {
+            job.subtype_name = normalize_adapter_name(subtype);
+            job.sub_attr = obj.value("sub_attr", nlohmann::json::object());
+            job.NativeJobID = obj.value("NativeJobID", "");
+        } else {
+            throw std::runtime_error("invalid job subtype: " + subtype);
+        }
     }
 
     spdlog::info("JobRegistry: json2JobOpt parsed opt={}, type={}, subtype={}, JobID={}, "
@@ -636,7 +646,13 @@ SubAttrMatcher parse_legacy_matcher(const nlohmann::json& matcher_json)
         if (subtype == "Condor") matcher.subtype = JobSubType::Condor;
         else if (subtype == "Slurm") matcher.subtype = JobSubType::Slurm;
         else if (subtype == "Common") matcher.subtype = JobSubType::Common;
+        else {
+            // 开放世界：任意 adapter 名字按名字匹配（Job::subtype_name）。
+            matcher.subtype_name = normalize_adapter_name(subtype);
+        }
     }
+    if (matcher_json.contains("facts_fields") && matcher_json["facts_fields"].is_object())
+        matcher.json_fields = matcher_json["facts_fields"];
     if (matcher_json.contains("condor_cluster_id"))
         matcher.condor_cluster_id = matcher_json["condor_cluster_id"].get<size_t>();
     if (matcher_json.contains("condor_proc_id"))
