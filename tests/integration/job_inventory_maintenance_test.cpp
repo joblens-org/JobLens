@@ -39,6 +39,8 @@
  *   LEGACY  manual registrations retire on process evidence without a source
  *   RESCAN  event-driven and on-demand passes run the same reconcile path
  *   EXEC    exec hints resolve to targeted observations without a full scan
+ *   EXEC2   an incomplete exec observation (job ad not yet written) retries
+ *           on a short ladder instead of waiting for the next reconcile
  */
 #include "core/inventory_config.hpp"
 #include "core/inventory_status_provider.hpp"
@@ -1376,6 +1378,51 @@ void run_exec_hint(const std::string& base)
     pass_case("EXEC", "exec hints resolve to targeted observations without a full scan");
 }
 
+// EXEC2 - the exec-hint fast path retries incomplete observations (scheduler
+// state not yet written at exec time) on a short ladder before any rescan.
+void run_exec_hint_retry(const std::string& base)
+{
+    FakeSource source("condor", SchedulerType::Condor);
+    FakeProbes probes;
+    JobRegistry registry(heartbeat_options(fresh_dir(base, "exec-retry"), source, probes));
+
+    // The authoritative pass would find nothing: only the retry ladder can
+    // create the instance here.
+    source.set_scan([&]() { return scan_with({}); });
+    const int scans_after_start = source.scans();
+
+    int observe_attempts = 0;
+    source.set_observe([&](pid_t pid) -> std::optional<Observation> {
+        if (pid != 4242) return std::nullopt;
+        ++observe_attempts;
+        Observation observation = make_condor_observation("961.0", 9701, 292930,
+                                                          "htcondor01", "schedd-a", "/cg/slot-97");
+        if (observe_attempts == 1) {
+            // The job ad is not written yet at exec time: the native id is
+            // unknown, so the observation is explicitly incomplete and must
+            // not create a record.
+            observation.identity_complete = false;
+            observation.canonical_identity.reset();
+            observation.selector.native_job_id.clear();
+            observation.incomplete_reason = "condor job ad unavailable";
+        }
+        return observation;
+    });
+
+    registry.onDiscoveryExecHint(4242);
+    check(wait_until([&]() { return find_native(registry, "961.0").has_value(); }, 5000),
+          "exec retry: the incomplete observation was never retried to completion");
+    check(observe_attempts >= 2,
+          "exec retry: the source was not re-observed after the incomplete pass");
+    check(source.observations_for_hint() >= 2,
+          "exec retry: the re-observation did not go through the hint path");
+    check(source.scans() == scans_after_start,
+          "exec retry: the ladder must resolve without a full scan");
+
+    registry.deinit();
+    pass_case("EXEC2", "incomplete exec observations retry before any rescan");
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -1398,6 +1445,7 @@ int main(int argc, char** argv)
         run_legacy(base);
         run_rescan(base);
         run_exec_hint(base);
+        run_exec_hint_retry(base);
         std::cout << "ALL PASS\n";
         return 0;
     } catch (const std::exception& error) {

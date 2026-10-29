@@ -206,7 +206,16 @@ public:
 
 private:
     JobRegistry();
-    void init_inventory();
+    // Which wiring the heartbeat was assembled from: injected test seams or
+    // the production configuration/adapter stack.
+    enum class InventoryWiring { Disabled, Test, Production };
+    // Decides WHICH discovery sources, probes and facts encoder the heartbeat
+    // drives, once, before any source starts. Test wiring copies the
+    // constructor-provided seams verbatim; production resolves the
+    // configuration and builds one adapter per configured type.
+    InventoryWiring resolve_inventory_components(const JobRegistryOptions& options);
+    void init_inventory(const JobRegistryOptions& options);
+    void startDiscoverySources(InventoryWiring wiring);
     // Automatic selection for one newly created instance, evaluated outside
     // every registry lock (plan 6.2: Lua never runs under a lock).
     void apply_auto_policy(const Job& job, SchedulerType type);
@@ -253,9 +262,25 @@ private:
     mutable std::mutex hb_mtx_;
     std::condition_variable hb_cv_;
     std::deque<HeartbeatHint> hints_;
-    std::deque<pid_t> exec_hints_;
-    std::set<pid_t> exec_seen_;
-    bool exec_overflow_ = false;
+    // --- exec-hint ingest (fast path) ---------------------------------------
+    // Exec hints resolve on this dedicated worker instead of a heartbeat
+    // pass: ring-buffer wakeups reach the store without waiting for a pass
+    // slice, and incomplete observations (scheduler state not yet written at
+    // exec time) retry on a short ladder before falling back to a rescan.
+    struct ExecRetry {
+        pid_t pid = 0;
+        int attempt = 0;          // 0 = first resolution, 1.. = ladder steps
+        std::int64_t due_ms = 0;
+    };
+    mutable std::mutex ingest_mtx_;
+    std::condition_variable ingest_cv_;
+    std::deque<pid_t> ingest_queue_;           // bounded by kIngestQueueCapacity
+    std::set<pid_t> ingest_inflight_;          // queued or retrying (dedup)
+    std::vector<ExecRetry> ingest_retries_;    // bounded by kIngestRetryCapacity
+    std::unique_ptr<std::thread> ingest_thread_;
+    std::thread::id ingest_worker_id_;
+    bool ingest_running_ = false;
+    std::atomic<bool> ingest_stopping_{false};
     std::map<uint64_t, AbsenceEntry> absences_;
     std::set<uint64_t> suspect_ids_;
     std::map<std::string, ExecutionGeneration> ended_generations_;
@@ -296,15 +321,9 @@ private:
     ProcessLivenessProbe process_probe_;
     CgroupMembershipProbe cgroup_probe_;
     std::function<Job(const Observation&)> facts_encoder_;
-    // Constructor-provided test seams and the sink handed to the sources.
-    std::vector<std::pair<std::string, IDiscoverySource*>> options_test_sources_;
     // Every discovery source the heartbeat drives (adapters or test sources),
-    // populated during init_inventory.
+    // populated by resolve_inventory_components().
     std::vector<std::pair<std::string, IDiscoverySource*>> hb_sources_;
-    ProcessLivenessProbe options_test_process_probe_;
-    CgroupMembershipProbe options_test_cgroup_probe_;
-    std::function<Job(const Observation&)> options_test_facts_encoder_;
-    bool options_test_heartbeat_ = false;
     DiscoverySink heartbeat_sink_;
     std::shared_ptr<JobCollectionManager> collection_manager_;
     // Automatic collector selection per scheduler type, armed from the
@@ -318,7 +337,6 @@ private:
     void heartbeatLoop();
     bool runPass(bool do_scan, bool wait);
     void processObservation(const Observation& observation, std::set<uint64_t>& observed);
-    void processExecHint(pid_t pid, std::set<uint64_t>& observed);
     ObservedExecution toExecution(const Observation& observation) const;
     void enqueueHint(HeartbeatHint hint);
     void requestRescan(const std::string& reason);
@@ -336,6 +354,13 @@ private:
     void installHeartbeatSink();
     std::int64_t clockNow() const;
     void drainHints(std::deque<HeartbeatHint>& out);
+
+    // Exec-hint ingest internals (the fast path; see the members above).
+    void startExecIngest();
+    void stopExecIngest();
+    void ingestLoop();
+    enum class ExecResolution { Resolved, Incomplete, Unresolved };
+    ExecResolution resolveExecHintOnce(pid_t pid);
 
     // Lifecycle fan-out copied under the lock and invoked without it, so a
     // callback can never re-enter the registry while it is locked.

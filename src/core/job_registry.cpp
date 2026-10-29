@@ -114,13 +114,6 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
         spdlog::warn("JobRegistry: job db not running");
     }
 
-    // Heartbeat test seams (copied: the options object may not outlive us).
-    options_test_sources_ = options.test_sources;
-    options_test_process_probe_ = options.test_process_probe;
-    options_test_cgroup_probe_ = options.test_cgroup_probe;
-    options_test_facts_encoder_ = options.test_facts_encoder;
-    options_test_heartbeat_ = options.test_heartbeat;
-
     // The collection manager is shared by the RPC surface and the automatic
     // selection path; one instance per registry.
     collection_manager_ = std::make_shared<JobCollectionManager>(*this);
@@ -130,7 +123,7 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
             [known](const std::string& name) { return known.count(name) != 0; });
     }
 
-    if (options.enable_inventory_maintenance) init_inventory();
+    if (options.enable_inventory_maintenance) init_inventory(options);
 
     if (options.enable_pid_tracker) init_pid_tracker();
     if (options.register_rpc) regRPCHandle();
@@ -150,7 +143,12 @@ JobRegistry& JobRegistry::instance() {
 namespace {
 constexpr int kAbsencesBeforeRetirement = 2;
 constexpr std::size_t kEndedGenerationCapacity = 4096;
-constexpr std::size_t kExecHintCapacity = 1024;
+constexpr std::size_t kIngestQueueCapacity = 1024;
+constexpr std::size_t kIngestRetryCapacity = 256;
+// The exec-hint retry ladder: scheduler state (job ad, spool dir) may not be
+// written yet at exec time. Sub-second retries cover the race; the ladder's
+// exhaustion hands the pid to one coalesced authoritative rescan.
+constexpr int kExecRetryDelaysMs[] = {5, 25, 100, 500};
 constexpr std::size_t kHintQueueCapacity = 512;
 constexpr std::uint32_t kWaitSliceMs = 100;
 }  // namespace
@@ -297,7 +295,7 @@ void JobRegistry::processObservation(const Observation& observation,
                        (result.message.empty() ? "" : ": " + result.message));
 }
 
-void JobRegistry::processExecHint(pid_t pid, std::set<uint64_t>& observed) {
+JobRegistry::ExecResolution JobRegistry::resolveExecHintOnce(pid_t pid) {
     for (const auto& [name, source] : hb_sources_) {
         std::optional<Observation> observation;
         try {
@@ -308,13 +306,123 @@ void JobRegistry::processExecHint(pid_t pid, std::set<uint64_t>& observed) {
             continue;
         }
         if (!observation) continue;   // not this source's execution
+        std::set<uint64_t> observed;
         processObservation(*observation, observed);
-        return;
+        return observation->identity_complete ? ExecResolution::Resolved
+                                              : ExecResolution::Incomplete;
     }
     // Unresolvable hints are not errors: the pid may be gone already or belong
     // to no execution; the authoritative scan covers whatever remains.
     std::lock_guard<std::mutex> lock(hb_mtx_);
     ++hb_unresolved_hints_;
+    return ExecResolution::Unresolved;
+}
+
+void JobRegistry::ingestLoop() {
+    {
+        std::lock_guard<std::mutex> lock(ingest_mtx_);
+        ingest_worker_id_ = std::this_thread::get_id();
+    }
+    std::unique_lock<std::mutex> lock(ingest_mtx_);
+    while (!ingest_stopping_) {
+        std::int64_t wait_ms = -1;
+        if (!ingest_retries_.empty()) {
+            std::int64_t next_due = std::numeric_limits<std::int64_t>::max();
+            for (const auto& retry : ingest_retries_)
+                next_due = std::min(next_due, retry.due_ms);
+            const std::int64_t now = now_epoch_ms();
+            wait_ms = next_due > now ? next_due - now : 0;
+            wait_ms = std::min<std::int64_t>(wait_ms, 1000);
+        }
+        ingest_cv_.wait_for(lock, std::chrono::milliseconds(wait_ms), [this]() {
+            return ingest_stopping_ || !ingest_queue_.empty();
+        });
+        if (ingest_stopping_) break;
+
+        // One batch: fresh hints plus retries whose deadline passed. Each
+        // entry carries its attempt so failures ladder without re-counting.
+        std::vector<ExecRetry> batch;
+        for (const pid_t pid : ingest_queue_) batch.push_back(ExecRetry{pid, 0, 0});
+        ingest_queue_.clear();
+        const std::int64_t now = now_epoch_ms();
+        std::vector<ExecRetry> pending;
+        for (auto& retry : ingest_retries_) {
+            if (retry.due_ms <= now) batch.push_back(retry);
+            else pending.push_back(retry);
+        }
+        ingest_retries_.swap(pending);
+        lock.unlock();
+
+        for (const auto& item : batch) {
+            if (ingest_stopping_) break;
+            const auto resolution = resolveExecHintOnce(item.pid);
+            if (resolution != ExecResolution::Incomplete) {
+                std::lock_guard<std::mutex> guard(ingest_mtx_);
+                ingest_inflight_.erase(item.pid);
+                continue;
+            }
+            // Incomplete (scheduler state not yet written): ladder or hand
+            // over to one coalesced authoritative rescan.
+            const std::size_t next = static_cast<std::size_t>(item.attempt);
+            bool laddered = false;
+            {
+                std::lock_guard<std::mutex> guard(ingest_mtx_);
+                if (next < std::size(kExecRetryDelaysMs) &&
+                    ingest_retries_.size() < kIngestRetryCapacity) {
+                    ingest_retries_.push_back(ExecRetry{
+                        item.pid, item.attempt + 1,
+                        now_epoch_ms() + kExecRetryDelaysMs[next]});
+                    laddered = true;
+                } else {
+                    ingest_inflight_.erase(item.pid);
+                }
+            }
+            if (!laddered) requestRescan("exec hint unresolved after retries");
+        }
+        if (ingest_stopping_) break;
+        // Re-acquire before the next wait; the break paths exit with the
+        // unique_lock unlocked, which its destructor handles state-aware.
+        lock.lock();
+    }
+}
+
+void JobRegistry::startExecIngest() {
+    std::lock_guard<std::mutex> lock(ingest_mtx_);
+    if (ingest_stopping_ || (ingest_thread_ && ingest_thread_->joinable())) return;
+    ingest_running_ = true;
+    ingest_thread_ = std::make_unique<std::thread>([this]() { ingestLoop(); });
+}
+
+void JobRegistry::stopExecIngest() {
+    std::unique_ptr<std::thread> thread;
+    {
+        std::lock_guard<std::mutex> lock(ingest_mtx_);
+        ingest_stopping_ = true;
+        if (!ingest_running_ && !(ingest_thread_ && ingest_thread_->joinable()))
+            return;
+        thread = std::move(ingest_thread_);
+        ingest_running_ = false;
+    }
+    ingest_cv_.notify_all();
+    if (thread && thread->joinable()) {
+        const bool on_ingest_thread =
+            ingest_worker_id_ != std::thread::id() &&
+            ingest_worker_id_ == std::this_thread::get_id();
+        if (on_ingest_thread) {
+            // Same rule as the heartbeat worker: a callback from the ingest
+            // thread must never self-join; report incomplete instead.
+            spdlog::error("JobRegistry: exec ingest stop() called from its own "
+                          "worker; shutdown reported incomplete instead of "
+                          "deadlocking");
+            thread.release();
+        } else {
+            thread->join();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(ingest_mtx_);
+        ingest_worker_id_ = std::thread::id();
+    }
 }
 
 void JobRegistry::refreshLegacyRecords() {
@@ -613,26 +721,8 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
     }
     if (needs_authoritative_pass) requestRescan("process/attribute hint");
 
-    // Exec hints become targeted observations on this worker thread: O(job)
-    // reads through the source, never a full-node scan and never on the
-    // polling thread.
-    {
-        std::vector<pid_t> exec_batch;
-        bool overflow = false;
-        {
-            std::lock_guard<std::mutex> lock(hb_mtx_);
-            exec_batch.assign(exec_hints_.begin(), exec_hints_.end());
-            exec_hints_.clear();
-            exec_seen_.clear();
-            overflow = exec_overflow_;
-            exec_overflow_ = false;
-        }
-        if (overflow) {
-            spdlog::warn("JobRegistry: exec hint queue overflowed; requesting a rescan");
-            requestRescan("exec hint overflow");
-        }
-        for (const pid_t pid : exec_batch) processExecHint(pid, observed);
-    }
+    // Exec hints never reach the pass: the ingest worker owns them (the
+    // fast path) and resolves pids through observeForHint directly.
 
     // Records no discovery source owns (legacy/manual registrations, or types
     // whose inventory source was removed) are refreshed here; reads never do.
@@ -785,7 +875,7 @@ void JobRegistry::retractStatusProvider() {
     }
 }
 
-void JobRegistry::init_inventory()
+void JobRegistry::init_inventory(const JobRegistryOptions& options)
 {
     // Prepare heartbeat state (idempotent across test registries).
     {
@@ -798,9 +888,6 @@ void JobRegistry::init_inventory()
         incomplete_drain_ = false;
         hb_last_error_.clear();
         hints_.clear();
-        exec_hints_.clear();
-        exec_seen_.clear();
-        exec_overflow_ = false;
         absences_.clear();
         suspect_ids_.clear();
         ended_generations_.clear();
@@ -811,39 +898,48 @@ void JobRegistry::init_inventory()
         hb_passes_ = 0;
         hb_stop_errors_ = 0;
     }
+    {
+        std::lock_guard<std::mutex> lock(ingest_mtx_);
+        ingest_stopping_ = false;
+        ingest_queue_.clear();
+        ingest_inflight_.clear();
+        ingest_retries_.clear();
+    }
     installHeartbeatSink();
 
-    if (!options_test_sources_.empty() || options_test_heartbeat_) {
-        // Test wiring: pre-built sources, injected probes and encoder, no
-        // configuration and no automatic selection.
-        hb_sources_ = options_test_sources_;
-        process_probe_ = options_test_process_probe_;
-        cgroup_probe_ = options_test_cgroup_probe_;
-        facts_encoder_ = options_test_facts_encoder_;
-        reconcile_interval_sec_ = 30;
-        source_started_.clear();
-        source_start_notes_.clear();
-        for (const auto& [name, source] : options_test_sources_) {
-            bool started = false;
-            std::string note;
-            try {
-                started = source->start(heartbeat_sink_);
-            } catch (const std::exception& error) {
-                note = std::string("start failed: ") + error.what();
-            }
-            if (!started && note.empty())
-                note = "event source unavailable (scan-only)";
-            source_started_.emplace_back(name, started);
-            source_start_notes_.push_back(std::move(note));
-        }
-        if (!runPass(true, /*wait=*/true)) {
-            spdlog::warn("JobRegistry: the initial inventory pass did not run");
-        }
-        publishStatusProvider();
-        startHeartbeat();
+    const InventoryWiring wiring = resolve_inventory_components(options);
+    if (wiring == InventoryWiring::Disabled) return;
+
+    // Sink first, then the poll threads, the initial authoritative pass, the
+    // status provider and finally the worker.
+    startDiscoverySources(wiring);
+    if (!runPass(true, /*wait=*/true)) {
+        spdlog::warn("JobRegistry: the initial inventory pass did not run");
+    }
+    publishStatusProvider();
+    startHeartbeat();
+    startExecIngest();
+
+    if (wiring == InventoryWiring::Test)
         spdlog::info("JobRegistry: heartbeat running with {} test source(s)",
-                     options_test_sources_.size());
-        return;
+                     hb_sources_.size());
+    else
+        spdlog::info("JobRegistry: inventory heartbeat running with {} discovery type(s)",
+                     hb_sources_.size());
+}
+
+JobRegistry::InventoryWiring
+JobRegistry::resolve_inventory_components(const JobRegistryOptions& options)
+{
+    // Test wiring: pre-built sources, injected probes and encoder, no
+    // configuration and no automatic selection.
+    if (!options.test_sources.empty() || options.test_heartbeat) {
+        hb_sources_ = options.test_sources;
+        process_probe_ = options.test_process_probe;
+        cgroup_probe_ = options.test_cgroup_probe;
+        facts_encoder_ = options.test_facts_encoder;
+        reconcile_interval_sec_ = 30;
+        return InventoryWiring::Test;
     }
 
     InventoryMaintenanceConfig config;
@@ -853,7 +949,7 @@ void JobRegistry::init_inventory()
         spdlog::error("JobRegistry: invalid inventory configuration; inventory maintenance "
                       "is disabled: {}",
                       error.what());
-        return;
+        return InventoryWiring::Disabled;
     }
     reconcile_interval_sec_ = config.reconcile_interval_sec;
 
@@ -871,7 +967,7 @@ void JobRegistry::init_inventory()
                           adapter_name_of(type),
                           fmt::join(SchedulerAdapterRegistry::instance().names(), ", "));
             adapters_.clear();
-            return;
+            return InventoryWiring::Disabled;
         }
         adapters_.push_back(std::move(adapter));
     }
@@ -928,37 +1024,36 @@ void JobRegistry::init_inventory()
         });
     }
 
-    // Sink first, then the poll threads, the initial authoritative pass, the
-    // status provider and finally the worker.
+    return InventoryWiring::Production;
+}
+
+void JobRegistry::startDiscoverySources(InventoryWiring wiring)
+{
     source_started_.clear();
     source_start_notes_.clear();
-    for (const auto& adapter : adapters_) {
+    for (const auto& [name, source] : hb_sources_) {
         bool started = false;
         std::string note;
         try {
-            started = adapter->source().start(heartbeat_sink_);
+            started = source->start(heartbeat_sink_);
         } catch (const std::exception& error) {
             note = std::string("start failed: ") + error.what();
         }
         if (!started && note.empty())
             note = "event source unavailable (scan-only)";
-        source_started_.emplace_back(adapter->name(), started);
+        source_started_.emplace_back(name, started);
         source_start_notes_.push_back(std::move(note));
-        if (!started)
+        if (!started && wiring == InventoryWiring::Production)
             spdlog::warn("JobRegistry: source '{}' has no event source, continuing with "
                          "scans only: {}",
-                         adapter->name(), source_start_notes_.back());
+                         name, source_start_notes_.back());
     }
-    if (!runPass(true, /*wait=*/true)) {
-        spdlog::warn("JobRegistry: the initial inventory pass did not run");
-    }
-    publishStatusProvider();
-    startHeartbeat();
-    spdlog::info("JobRegistry: inventory heartbeat running with {} discovery type(s)",
-                 config.types.size());
 }
 
 void JobRegistry::stopInventoryDiscovery() {
+    // The ingest worker produces upserts: stop it before the heartbeat so a
+    // final pass never races a targeted resolution.
+    stopExecIngest();
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         if (!hb_admitted_ && !hb_running_ &&
@@ -1673,6 +1768,8 @@ std::string JobRegistry::instanceId(uint64_t jobID) const {
 }
 
 StoreHealth JobRegistry::storeHealth() const {
+    // Callable after deinit(): the store was reset, which reads as "closed".
+    if (!store_) return StoreHealth{};
     return store_->health();
 }
 
@@ -1830,20 +1927,28 @@ void JobRegistry::onDiscoveryExecHint(pid_t pid) {
             ++hb_events_dropped_;
             return;
         }
-        if (exec_seen_.insert(pid).second) {
-            exec_hints_.push_back(pid);
-            if (exec_hints_.size() > kExecHintCapacity) {
-                exec_seen_.erase(exec_hints_.front());
-                exec_hints_.pop_front();
-                ++hb_events_dropped_;
-                exec_overflow_ = true;
-            }
-        } else {
-            ++hb_events_dropped_;
-        }
-        hint_wakeup_ = true;
     }
-    hb_cv_.notify_one();
+    // The ingest worker resolves the pid immediately (the fast path); the
+    // dedup keeps one entry per pid while it is queued or retrying.
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lock(ingest_mtx_);
+        if (!ingest_stopping_ && ingest_inflight_.insert(pid).second) {
+            if (ingest_queue_.size() < kIngestQueueCapacity) {
+                ingest_queue_.push_back(pid);
+                queued = true;
+            } else {
+                ingest_inflight_.erase(pid);
+            }
+        }
+    }
+    if (queued) {
+        ingest_cv_.notify_one();
+        return;
+    }
+    // Duplicate or overflowing hint: counted, never blocking the producer.
+    std::lock_guard<std::mutex> lock(hb_mtx_);
+    ++hb_events_dropped_;
 }
 
 nlohmann::json JobRegistry::heartbeatStatusJson() const {
@@ -1864,6 +1969,7 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     std::uint64_t retirements = 0;
     std::uint64_t passes = 0;
     std::size_t queue_depth = 0;
+    std::size_t exec_ingest_depth = 0;
     std::int64_t last_scan_start_ms = 0;
     std::int64_t last_scan_success_ms = 0;
     bool last_scan_complete = false;
@@ -1885,13 +1991,16 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
         retirements = hb_retirements_;
         passes = hb_passes_;
         queue_depth = hints_.size();
-        last_scan_start_ms = last_scan_start_ms_;
-        last_scan_success_ms = last_scan_success_ms_;
+        last_scan_start_ms = last_scan_start_ms_;        last_scan_success_ms = last_scan_success_ms_;
         last_scan_complete = last_scan_complete_;
         incomplete_drain = incomplete_drain_;
         admitted = hb_admitted_;
         degraded = degraded_;
         last_error = hb_last_error_;
+    }
+    {
+        std::lock_guard<std::mutex> lock(ingest_mtx_);
+        exec_ingest_depth = ingest_queue_.size() + ingest_retries_.size();
     }
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
@@ -1965,6 +2074,7 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     out["events_received"] = events_received;
     out["events_dropped"] = events_dropped;
     out["queue_depth"] = queue_depth;
+    out["exec_ingest_depth"] = exec_ingest_depth;
     out["rescan_requests"] = rescan_requests;
     out["obsolete_hints"] = obsolete_hints;
     out["unresolved_hints"] = hb_unresolved_hints_;
