@@ -90,7 +90,7 @@ NativeSelector condor_selector(const std::string& native = "172.0",
                                const std::string& tag = "schedd-a")
 {
     NativeSelector selector;
-    selector.scheduler_type = SchedulerType::Condor;
+    selector.adapter = "condor";
     selector.cluster_name = cluster;
     selector.cluster_tag = tag;
     selector.native_job_id = native;

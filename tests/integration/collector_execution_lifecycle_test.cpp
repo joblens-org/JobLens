@@ -446,7 +446,7 @@ void run(const std::string& base)
 
     const auto upsert = [](const std::string& native) {
         ObservedExecution execution;
-        execution.selector.scheduler_type = SchedulerType::Condor;
+        execution.selector.adapter = "condor";
         execution.selector.cluster_name = "htcondor01";
         execution.selector.native_job_id = native;
         execution.generation.boot_id = "test-boot";

@@ -28,32 +28,30 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 
 #include <nlohmann/json.hpp>
 
 // ---------------------------------------------------------------------------
-// Scheduler type
+// Scheduler identity — the adapter name (string)
 // ---------------------------------------------------------------------------
+//
+// v2 G4 completion: shared code never branches on a scheduler. The adapter
+// registry name IS the identity ("condor", "slurm", "ssh", ...); the built-in
+// names below are data, not a type. Empty string means "unresolved" (the old
+// Unknown). Per-scheduler native-id knowledge lives in self-registered rules
+// (NativeIdRuleRegistry), mirroring REGISTER_SCHEDULER_ADAPTER.
+inline constexpr const char* kAdapterCondor = "condor";
+inline constexpr const char* kAdapterSlurm = "slurm";
 
-enum class SchedulerType {
-    Unknown = 0,
-    Condor,
-    Slurm,
-};
-
-inline const char* to_string(SchedulerType type)
-{
-    switch (type) {
-        case SchedulerType::Condor: return "condor";
-        case SchedulerType::Slurm:  return "slurm";
-        case SchedulerType::Unknown: break;
-    }
-    return "unknown";
-}
-
-std::optional<SchedulerType> scheduler_type_from_string(const std::string& raw);
+// Normalizes a wire/persisted scheduler name: lowercase, whitespace-stripped.
+// Unknown names are NOT errors here (open world); call sites that need a
+// registered adapter validate against SchedulerAdapterRegistry.
+std::string normalize_adapter_name(const std::string& raw);
 
 // ---------------------------------------------------------------------------
 // Internal IDs (uint64-safe parse/format)
@@ -105,7 +103,7 @@ std::optional<uint32_t> slurm_step_value(const std::string& step_id);
 // ---------------------------------------------------------------------------
 
 struct NativeSelector {
-    SchedulerType scheduler_type = SchedulerType::Unknown;
+    std::string adapter;            // adapter registry name; empty = unresolved
     std::string cluster_name;  // resolved cluster namespace (never empty)
     // Condor schedd / tag namespace; required by Condor when the cluster has
     // more than one schedd. Optional for Slurm.
@@ -117,7 +115,7 @@ struct NativeSelector {
 };
 
 struct CanonicalIdentity {
-    SchedulerType scheduler_type = SchedulerType::Unknown;
+    std::string adapter;             // adapter registry name (never empty)
     std::string cluster_namespace;  // cluster_name plus tag when applicable
     std::string native_job_id;      // original native string, preserved
     std::string canonical_native;   // numeric-normalized form used for keys
@@ -132,18 +130,62 @@ bool operator==(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs);
 bool operator!=(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs);
 bool operator<(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs);
 
-// Validates and completes a selector. Condor native ids must be
-// "<ClusterId>.<ProcId>" with decimal parts; leading zeros are tolerated and
-// canonicalized ("012.3" == "12.3") while the original string is preserved,
-// so digit concatenation can never merge two different jobs ("12.34" versus
-// "123.4"). Slurm native ids are the logical job number without a step.
-// A missing cluster namespace, an unknown scheduler type or an unparsable
-// native id yields nullopt: an incomplete observation, never a guess.
+// ---------------------------------------------------------------------------
+// Native-id rules (per-adapter, self-registered)
+// ---------------------------------------------------------------------------
+
+// What one adapter's rule derives from a selector: the canonical native form
+// used in identity keys, the cluster namespace and the normalized step. The
+// rule owns every scheduler-specific detail (Condor: "cluster.proc" plus the
+// schedd tag namespace, no steps; Slurm: job number with optional normalized
+// step). Returning nullopt means "this selector cannot name a job of mine" —
+// an incomplete observation, never a guess.
+struct CanonicalParts {
+    std::string canonical_native;
+    std::string cluster_namespace;
+    std::string step_id;   // normalized, or empty
+};
+using NativeIdRule =
+    std::function<std::optional<CanonicalParts>(const NativeSelector&)>;
+
+class NativeIdRuleRegistry {
+public:
+    static NativeIdRuleRegistry& instance();
+
+    // Registers (or replaces) the rule for one adapter name. Replacement is
+    // intentional (last wins), mirroring SchedulerAdapterRegistry.
+    void registerRule(const std::string& adapter, NativeIdRule rule);
+    // nullptr when no rule exists: callers must treat the selector as
+    // unresolvable, never fall back to a generic guess.
+    const NativeIdRule* find(const std::string& adapter) const;
+
+private:
+    mutable std::mutex mutex_;
+    std::map<std::string, NativeIdRule> rules_;
+};
+
+// Registers a native-id rule at TU scope. The built-ins (condor, slurm) are
+// registered by job_identity.cpp itself; a new scheduler registers its rule
+// next to its adapter, e.g.
+//   REGISTER_NATIVE_ID_RULE("ssh", [](const NativeSelector& s) { ... })
+#define REGISTER_NATIVE_ID_RULE(NAME, FN)                                       \
+    static bool joblens_native_id_reg_##__COUNTER__ = [] {                      \
+        NativeIdRuleRegistry::instance().registerRule(NAME, FN);                \
+        return true;                                                            \
+    }()
+
+// Validates and completes a selector through the adapter's registered rule.
+// No rule, an empty adapter name, a missing cluster namespace or an
+// unparsable native id yields nullopt: an incomplete observation, never a
+// guess. The generic parts (key assembly, verbatim native preservation) live
+// here; everything scheduler-specific lives in the rule.
 std::optional<CanonicalIdentity> canonicalize(const NativeSelector& selector);
 
 // Serialization round trips preserve the original native string, the
-// normalized step and every namespace field. scheduler_type serializes as its
-// lowercase name; unknown values fail deserialization instead of guessing.
+// normalized step and every namespace field. The adapter name is written
+// under BOTH "adapter" and the legacy "scheduler_type" key (same lowercase
+// name, byte-identical to what to_string(SchedulerType) produced, so old
+// readers and persisted rows keep working); deserialization accepts either.
 void to_json(nlohmann::json& out, const NativeSelector& selector);
 void from_json(const nlohmann::json& in, NativeSelector& selector);
 void to_json(nlohmann::json& out, const CanonicalIdentity& identity);

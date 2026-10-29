@@ -86,11 +86,10 @@ std::string fresh_dir(const std::string& base, const std::string& name)
 
 class FakeSource final : public IDiscoverySource {
 public:
-    FakeSource(std::string name, SchedulerType type)
-        : name_(std::move(name)), type_(type) {}
+    explicit FakeSource(std::string name)
+        : name_(std::move(name)) {}
 
     const std::string& name() const override { return name_; }
-    SchedulerType schedulerType() const override { return type_; }
 
     bool start(const DiscoverySink& sink) override
     {
@@ -196,7 +195,6 @@ public:
 
 private:
     std::string name_;
-    SchedulerType type_;
     mutable std::mutex mutex_;
     DiscoverySink sink_;
     std::function<ScanResult()> scan_fn_;
@@ -291,8 +289,8 @@ Observation make_condor_observation(const std::string& native,
                                     const std::vector<pid_t>& members = {})
 {
     Observation observation;
-    observation.scheduler_type = SchedulerType::Condor;
-    observation.selector.scheduler_type = SchedulerType::Condor;
+    observation.adapter = "condor";
+    observation.selector.adapter = "condor";
     observation.selector.cluster_name = cluster;
     observation.selector.cluster_tag = tag;
     observation.selector.native_job_id = native;
@@ -342,7 +340,7 @@ Job encode_test_facts(const Observation& observation)
 {
     Job facts;
     facts.jobtype = JobType::Job;
-    if (observation.scheduler_type == SchedulerType::Condor) {
+    if (observation.adapter == "condor") {
         facts.subtype = JobSubType::Condor;
         CondorJobAttr attributes{};
         attributes.auto_update_child = false;
@@ -353,7 +351,7 @@ Job encode_test_facts(const Observation& observation)
         attributes.owner = observation.owner;
         attributes.collector_host = observation.selector.cluster_name;
         facts.sub_attr = attributes;
-    } else if (observation.scheduler_type == SchedulerType::Slurm) {
+    } else if (observation.adapter == "slurm") {
         facts.subtype = JobSubType::Slurm;
         SlurmJobAttr attributes{};
         attributes.auto_update_child = false;
@@ -412,7 +410,7 @@ std::optional<JobRecord> find_native(JobRegistry& registry, const std::string& n
                                      const std::string& tag = "schedd-a")
 {
     NativeSelector selector;
-    selector.scheduler_type = SchedulerType::Condor;
+    selector.adapter = "condor";
     selector.cluster_name = cluster;
     selector.cluster_tag = tag;
     selector.native_job_id = native;
@@ -540,7 +538,7 @@ void case_config()
 
 void run_a08(const std::string& base)
 {
-    FakeSource source("condor", SchedulerType::Condor);
+    FakeSource source("condor");
     FakeProbes probes;
     const Observation scanned =
         make_condor_observation("100.0", 5100, 554, "htcondor01", "schedd-a", "/cg/slot-2");
@@ -611,7 +609,7 @@ void run_a09(const std::string& base)
 {
     // Scenario 1: one missed scan recovers; only a second retires.
     {
-        FakeSource source("condor", SchedulerType::Condor);
+        FakeSource source("condor");
         FakeProbes probes;
         const Observation job =
             make_condor_observation("200.0", 5200, 666, "htcondor01", "schedd-a", "/cg/slot-1");
@@ -636,7 +634,7 @@ void run_a09(const std::string& base)
 
     // Scenario 2: two complete absences with positive evidence retire.
     {
-        FakeSource source("condor", SchedulerType::Condor);
+        FakeSource source("condor");
         FakeProbes probes;
         const Observation job =
             make_condor_observation("210.0", 5301, 777, "htcondor01", "schedd-a", "/cg/slot-2");
@@ -661,7 +659,7 @@ void run_a09(const std::string& base)
 
     // Scenario 3: failed/incomplete scans never count as absence.
     {
-        FakeSource source("condor", SchedulerType::Condor);
+        FakeSource source("condor");
         FakeProbes probes;
         const Observation job =
             make_condor_observation("220.0", 5300, 666, "htcondor01", "schedd-a", "/cg/slot-3");
@@ -699,7 +697,7 @@ void run_a09(const std::string& base)
 
 void run_a10(const std::string& base)
 {
-    FakeSource source("condor", SchedulerType::Condor);
+    FakeSource source("condor");
     FakeProbes probes;
     const Observation job =
         make_condor_observation("300.0", 5400, 777, "htcondor01", "schedd-a", "/cg/slot-4");
@@ -745,7 +743,7 @@ void run_a10(const std::string& base)
 
 void run_a11(const std::string& base)
 {
-    FakeSource source("condor", SchedulerType::Condor);
+    FakeSource source("condor");
     FakeProbes probes;
     JobRegistry registry(heartbeat_options(fresh_dir(base, "a11"), source, probes));
     const Observation job =
@@ -820,7 +818,7 @@ void run_a11(const std::string& base)
 
 void run_a12(const std::string& base)
 {
-    FakeSource source("condor", SchedulerType::Condor);
+    FakeSource source("condor");
     FakeProbes probes;
     JobRegistry registry(heartbeat_options(fresh_dir(base, "a12"), source, probes));
 
@@ -873,7 +871,7 @@ void run_a12(const std::string& base)
 
 void run_a13(const std::string& base)
 {
-    FakeSource source("condor", SchedulerType::Condor);
+    FakeSource source("condor");
     FakeProbes probes;
     auto options = heartbeat_options(fresh_dir(base, "a13"), source, probes);
     source.set_start_result(false);   // scan-only source
@@ -912,7 +910,7 @@ void run_a13(const std::string& base)
 
 void run_a14(const std::string& base)
 {
-    FakeSource source("condor", SchedulerType::Condor);
+    FakeSource source("condor");
     FakeProbes probes;
     const Observation old_job =
         make_condor_observation("700.0", 5900, 1515, "htcondor01", "schedd-a", "/cg/slot-11");
@@ -989,7 +987,7 @@ void run_a14(const std::string& base)
 
 void run_a23(const std::string& base)
 {
-    FakeSource source("condor", SchedulerType::Condor);
+    FakeSource source("condor");
     FakeProbes probes;
     JobRegistry registry(heartbeat_options(fresh_dir(base, "a23"), source, probes));
 
@@ -1075,7 +1073,7 @@ void run_a25(const std::string& base)
     // stopInventoryDiscovery is idempotent and keeps the status visible while
     // records drain; deinit retracts the providers.
     {
-        FakeSource source("condor", SchedulerType::Condor);
+        FakeSource source("condor");
         FakeProbes probes;
         JobRegistry registry(heartbeat_options(fresh_dir(base, "a25-repeat"), source, probes));
 
@@ -1100,7 +1098,7 @@ void run_a25(const std::string& base)
 
     // Stop while a pass is blocked inside a source scan stays bounded.
     {
-        FakeSource source("condor", SchedulerType::Condor);
+        FakeSource source("condor");
         FakeProbes probes;
         auto registry = std::make_unique<JobRegistry>(
             heartbeat_options(fresh_dir(base, "a25-blocked"), source, probes));
@@ -1133,7 +1131,7 @@ void run_a25(const std::string& base)
 
     // Source initialization failure is not fatal.
     {
-        FakeSource source("condor", SchedulerType::Condor);
+        FakeSource source("condor");
         FakeProbes probes;
         source.set_start_throw(true);
         JobRegistry registry(heartbeat_options(fresh_dir(base, "a25-startfail"),
@@ -1148,7 +1146,7 @@ void run_a25(const std::string& base)
     // restart on the same store archives the restored closing record.
     {
         const auto path = fresh_dir(base, "a25-drain");
-        FakeSource source("condor", SchedulerType::Condor);
+        FakeSource source("condor");
         FakeProbes probes;
         std::mutex observer_mutex;
         std::vector<uint64_t> removed;
@@ -1184,7 +1182,7 @@ void run_a25(const std::string& base)
         {
             // Restart: the interrupted retirement is restored as closing and
             // the cleanup archives it.
-            FakeSource source2("condor", SchedulerType::Condor);
+            FakeSource source2("condor");
             JobRegistry registry(heartbeat_options(path, source2, probes));
             const auto record = registry.inventoryRecord(closing_id);
             check(record.has_value() && record->state == "closing",
@@ -1205,7 +1203,7 @@ void run_a25(const std::string& base)
 
 void run_a28(const std::string& base)
 {
-    FakeSource source("condor", SchedulerType::Condor);
+    FakeSource source("condor");
     FakeProbes probes;
     JobRegistry registry(heartbeat_options(fresh_dir(base, "a28"), source, probes));
     const Observation job =
@@ -1298,7 +1296,7 @@ void run_legacy(const std::string& base)
 
 void run_rescan(const std::string& base)
 {
-    FakeSource source("condor", SchedulerType::Condor);
+    FakeSource source("condor");
     FakeProbes probes;
     const Observation job =
         make_condor_observation("950.0", 9100, 191919, "htcondor01", "schedd-a", "/cg/slot-95");
@@ -1337,7 +1335,7 @@ void run_rescan(const std::string& base)
 
 void run_exec_hint(const std::string& base)
 {
-    FakeSource source("condor", SchedulerType::Condor);
+    FakeSource source("condor");
     FakeProbes probes;
     JobRegistry registry(heartbeat_options(fresh_dir(base, "exec-hint"), source, probes));
 
@@ -1382,7 +1380,7 @@ void run_exec_hint(const std::string& base)
 // state not yet written at exec time) on a short ladder before any rescan.
 void run_exec_hint_retry(const std::string& base)
 {
-    FakeSource source("condor", SchedulerType::Condor);
+    FakeSource source("condor");
     FakeProbes probes;
     JobRegistry registry(heartbeat_options(fresh_dir(base, "exec-retry"), source, probes));
 

@@ -193,7 +193,7 @@ void run(const std::string& base)
         JobRegistry registry(options);
 
         ObservedExecution observation;
-        observation.selector.scheduler_type = SchedulerType::Condor;
+        observation.selector.adapter = "condor";
         observation.selector.cluster_name = "htcondor01";
         observation.selector.native_job_id = "700.0";
         observation.generation.boot_id = "boot";
@@ -247,7 +247,7 @@ void run(const std::string& base)
         JobRegistry registry(options);
 
         ObservedExecution observation;
-        observation.selector.scheduler_type = SchedulerType::Condor;
+        observation.selector.adapter = "condor";
         observation.selector.cluster_name = "htcondor01";
         observation.selector.native_job_id = "710.0";
         observation.generation.boot_id = "boot";

@@ -83,8 +83,7 @@ struct DiscoveryEnvironment {
     // Resolved scheduler cluster namespaces. Empty means "derive from the
     // source itself" (Condor: COLLECTOR_HOST, Slurm: SLURM_CLUSTER_NAME).
     // Neither value is ever guessed from a native job number.
-    std::string condor_cluster_name;
-    std::string slurm_cluster_name;
+    std::string cluster_name;
 };
 
 // ---------------------------------------------------------------------------
@@ -100,7 +99,9 @@ struct DiscoveryEnvironment {
 // start ticks); the two-level split lets a consumer show enrichment progress
 // without ever indexing a partial identity.
 struct Observation {
-    SchedulerType scheduler_type = SchedulerType::Unknown;
+    // Adapter registry name of the source that produced this observation
+    // ("" must never happen: the watcher fills its own name).
+    std::string adapter;
 
     NativeSelector selector;
     std::optional<CanonicalIdentity> canonical_identity;
@@ -241,14 +242,14 @@ struct DiscoverySink {
 };
 
 // One discovery source for one scheduler type. Implemented by the
-// Condor/Slurm watchers; the maintenance controller drives sources through
-// this interface and owns no adapter details.
+// watchers; the registry drives sources through this interface and owns no
+// adapter details. The adapter NAME (see name()) is the scheduler identity —
+// there is no per-scheduler enum to implement.
 class IDiscoverySource {
 public:
     virtual ~IDiscoverySource() = default;
 
     virtual const std::string& name() const = 0;
-    virtual SchedulerType schedulerType() const = 0;
 
     // Installs the sink and then starts polling (the sink exists before any
     // callback can run). Returns false when the adapter has nothing to poll

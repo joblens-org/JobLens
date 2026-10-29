@@ -483,7 +483,7 @@ bool JobRegistry::isObsolete(const CanonicalIdentity& identity,
 
 void JobRegistry::evaluateRetirements(
     const std::set<uint64_t>& observed_ids,
-    const std::map<SchedulerType, bool>& source_complete) {
+    const std::map<std::string, bool>& source_complete) {
     const auto records = store_->records();
     const std::int64_t now = clockNow();
 
@@ -513,10 +513,7 @@ void JobRegistry::evaluateRetirements(
                 suspect_ids_.erase(record.internal_id);
                 continue;
             }
-            const auto coverage = source_complete.find(
-                record.identity_complete
-                    ? record.identity.scheduler_type
-                    : record.selector.scheduler_type);
+            const auto coverage = source_complete.find(record.adapter);
             const bool absence_allowed =
                 coverage != source_complete.end() && coverage->second;
             if (absence_allowed && entry.complete_absences < kAbsencesBeforeRetirement) {
@@ -669,8 +666,8 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
     }
 
     const std::int64_t started_ms = clockNow();
-    std::vector<std::pair<SchedulerType, ScanResult>> results;
-    std::map<SchedulerType, bool> source_complete;
+    std::vector<std::pair<std::string, ScanResult>> results;
+    std::map<std::string, bool> source_complete;
     bool complete = true;
     std::string error;
 
@@ -691,11 +688,14 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
                 }
             }
             complete = complete && result.complete;
+            // Coverage is keyed by adapter name; a record of one adapter is
+            // only absence-eligible when that adapter's source covered its
+            // inputs (records with no adapter — manual/legacy — never are).
             const auto inserted =
-                source_complete.emplace(source->schedulerType(), result.complete);
+                source_complete.emplace(name, result.complete);
             if (!inserted.second)
                 inserted.first->second = inserted.first->second && result.complete;
-            results.emplace_back(source->schedulerType(), std::move(result));
+            results.emplace_back(name, std::move(result));
         }
     }
 
@@ -747,7 +747,7 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
 
     // A targeted pass has no authoritative source coverage, so it never counts
     // as an absence; only positive termination evidence applies.
-    static const std::map<SchedulerType, bool> no_coverage;
+    static const std::map<std::string, bool> no_coverage;
     evaluateRetirements(observed, do_scan ? source_complete : no_coverage);
 
     {
@@ -976,19 +976,18 @@ JobRegistry::resolve_inventory_components(const JobRegistryOptions& options)
                      "existing records are still maintained");
     }
 
-    // Automatic selection is armed per scheduler type: use_rules=false adds the
+    // Automatic selection is armed per adapter name: use_rules=false adds the
     // configured defaults to every job, use_rules=true asks the rule engine
     // per job (reject = empty selection, the job stays inventoried).
     auto_policies_.clear();
     for (const auto& [type, settings] : config.settings) {
         if (!settings.auto_collect) continue;
-        const SchedulerType scheduler =
-            type == InventoryType::Condor ? SchedulerType::Condor : SchedulerType::Slurm;
+        const std::string adapter = adapter_name_of(type);
         if (settings.use_rules)
-            auto_policies_[scheduler] =
+            auto_policies_[adapter] =
                 AutoCollectorPolicy::rules(settings.rules_dir, settings.rules_prefix);
         else
-            auto_policies_[scheduler] =
+            auto_policies_[adapter] =
                 AutoCollectorPolicy::defaults(settings.default_collectors);
     }
 
@@ -1002,7 +1001,7 @@ JobRegistry::resolve_inventory_components(const JobRegistryOptions& options)
     cgroup_probe_ = make_cgroup_membership_probe();
     facts_encoder_ = [this](const Observation& observation) -> Job {
         for (const auto& adapter : adapters_) {
-            if (adapter->source().schedulerType() == observation.scheduler_type)
+            if (adapter->name() == observation.adapter)
                 return adapter->encodeFacts(observation);
         }
         return Job{};   // no adapter: facts stay empty, the store normalizes
@@ -1126,9 +1125,9 @@ void JobRegistry::stopInventoryDiscovery() {
 }
 
 
-void JobRegistry::apply_auto_policy(const Job& job, SchedulerType type)
+void JobRegistry::apply_auto_policy(const Job& job, const std::string& adapter)
 {
-    const auto policy = auto_policies_.find(type);
+    const auto policy = auto_policies_.find(adapter);
     if (policy == auto_policies_.end() || !policy->second.enabled()) return;
 
     std::string revision;
@@ -1705,7 +1704,7 @@ UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation
         // auto-collected: the update that completes the generation re-runs
         // the selection instead.
         if (observation.generation.complete())
-            apply_auto_policy(record.job, record.identity.scheduler_type);
+            apply_auto_policy(record.job, record.identity.adapter);
     } else if (result.disposition == UpsertDisposition::Updated) {
         // Fact changes reach already bound consumers (fresh PIDs/attributes)
         // and the collection runtime outside every registry lock. The
@@ -1717,7 +1716,7 @@ UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation
         // an automatic selection. The pass that completes its execution
         // generation is its first complete registration.
         if (result.generation_became_complete)
-            apply_auto_policy(record.job, record.identity.scheduler_type);
+            apply_auto_policy(record.job, record.identity.adapter);
     }
     return result;
 }

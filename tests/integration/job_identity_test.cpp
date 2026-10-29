@@ -39,7 +39,7 @@ NativeSelector condor(const std::string& native, const std::string& tag = "sched
                       const std::string& cluster = "htcondor01")
 {
     NativeSelector selector;
-    selector.scheduler_type = SchedulerType::Condor;
+    selector.adapter = "condor";
     selector.cluster_name = cluster;
     selector.cluster_tag = tag;
     selector.native_job_id = native;
@@ -50,7 +50,7 @@ NativeSelector slurm(const std::string& native, const std::string& step = "",
                      const std::string& cluster = "slurm-prod")
 {
     NativeSelector selector;
-    selector.scheduler_type = SchedulerType::Slurm;
+    selector.adapter = "slurm";
     selector.cluster_name = cluster;
     selector.native_job_id = native;
     selector.step_id = step;
@@ -102,7 +102,7 @@ void condor_namespace_separation()
     no_cluster.cluster_name.clear();
     check(!canonicalize(no_cluster), "missing cluster namespace must fail");
     NativeSelector unknown_type = condor("12.34");
-    unknown_type.scheduler_type = SchedulerType::Unknown;
+    unknown_type.adapter.clear();
     check(!canonicalize(unknown_type), "unknown scheduler type must fail");
     NativeSelector with_step = condor("12.34");
     with_step.step_id = "1";
@@ -260,7 +260,7 @@ void serialization_round_trip()
     const NativeSelector selector = condor("012.34");
     const nlohmann::json wire = selector;
     const NativeSelector restored = wire.get<NativeSelector>();
-    check(restored.scheduler_type == SchedulerType::Condor &&
+    check(restored.adapter == "condor" &&
               restored.cluster_name == "htcondor01" &&
               restored.cluster_tag == "schedd-a" &&
               restored.native_job_id == "012.34" && restored.step_id.empty(),
@@ -275,16 +275,18 @@ void serialization_round_trip()
     check(identity_back == *identity,
           "CanonicalIdentity round trip is lossless");
 
-    bool threw = false;
-    try {
-        const auto bad = nlohmann::json{{"scheduler_type", "pbs"},
+    // Open-world names: an unregistered adapter deserializes verbatim (never
+    // guessed, never dropped — records of an uninstalled adapter stay
+    // readable), and canonicalize refuses it: no rule means the selector
+    // cannot name a job, an incomplete observation.
+    const auto foreign = nlohmann::json{{"scheduler_type", "pbs"},
                                         {"cluster_name", "x"},
-                                        {"native_job_id", "1"}};
-        bad.get<NativeSelector>();
-    } catch (const std::exception&) {
-        threw = true;
-    }
-    check(threw, "unknown scheduler types must fail deserialization explicitly");
+                                        {"native_job_id", "1"}}
+                             .get<NativeSelector>();
+    check(foreign.adapter == "pbs" && foreign.native_job_id == "1",
+          "unknown adapter names round trip verbatim");
+    check(!canonicalize(foreign).has_value(),
+          "unknown adapter names never canonicalize (no rule, no guess)");
 }
 
 void run()

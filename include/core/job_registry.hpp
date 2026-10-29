@@ -218,7 +218,7 @@ private:
     void startDiscoverySources(InventoryWiring wiring);
     // Automatic selection for one newly created instance, evaluated outside
     // every registry lock (plan 6.2: Lua never runs under a lock).
-    void apply_auto_policy(const Job& job, SchedulerType type);
+    void apply_auto_policy(const Job& job, const std::string& adapter);
     void regRPCHandle();
     // Guards lifecycle callbacks and the sentinel job.
     mutable std::shared_mutex mtx_;
@@ -326,9 +326,9 @@ private:
     std::vector<std::pair<std::string, IDiscoverySource*>> hb_sources_;
     DiscoverySink heartbeat_sink_;
     std::shared_ptr<JobCollectionManager> collection_manager_;
-    // Automatic collector selection per scheduler type, armed from the
+    // Automatic collector selection keyed by adapter name, armed from the
     // resolved inventory configuration. A disabled entry selects nothing.
-    std::map<SchedulerType, AutoCollectorPolicy> auto_policies_;
+    std::map<std::string, AutoCollectorPolicy> auto_policies_;
     bool deinit_done_{false};
     bool deinit_ok_{true};
 
@@ -343,7 +343,7 @@ private:
     bool rescanRequested() const;
     void refreshLegacyRecords();
     void evaluateRetirements(const std::set<uint64_t>& observed_ids,
-                             const std::map<SchedulerType, bool>& source_complete);
+                             const std::map<std::string, bool>& source_complete);
     bool retireIfConfirmed(const JobRecord& record, const std::string& reason);
     void rememberEnded(const JobRecord& record);
     bool isObsolete(const CanonicalIdentity& identity, const ExecutionGeneration& gen);

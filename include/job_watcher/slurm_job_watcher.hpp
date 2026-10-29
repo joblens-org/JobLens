@@ -52,7 +52,6 @@ public:
 
     // ---- IDiscoverySource -------------------------------------------------
     const std::string& name() const override { return name_; }
-    SchedulerType schedulerType() const override { return SchedulerType::Slurm; }
     bool start(const DiscoverySink& sink) override;
     void stop() override;
     ScanResult scan() override;
@@ -467,8 +466,8 @@ inline Observation SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& en
 {
     Observation observation;
     std::vector<std::string> reasons;
-    observation.scheduler_type = SchedulerType::Slurm;
-    observation.selector.scheduler_type = SchedulerType::Slurm;
+    observation.adapter = name_;
+    observation.selector.adapter = name_;
     observation.source_timestamp_ms = scan_clock_now(options_.clock);
 
     const auto manager = read_process_identity(env.proc_root, boot_id, stepd_pid);
@@ -564,7 +563,7 @@ inline Observation SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& en
         observation.selector.step_id = SlurmJob::step_id_name(*step_id);
     }
     if (observation.selector.cluster_name.empty())
-        observation.selector.cluster_name = env.slurm_cluster_name;
+        observation.selector.cluster_name = env.cluster_name;
     if (observation.selector.cluster_name.empty())
         reasons.push_back("slurm cluster namespace unresolved (SLURM_CLUSTER_NAME unavailable)");
 
@@ -619,10 +618,10 @@ inline Observation SlurmJobWatcher::observe_spool_entry(const DiscoveryEnvironme
 {
     Observation observation;
     std::vector<std::string> reasons;
-    observation.scheduler_type = SchedulerType::Slurm;
-    observation.selector.scheduler_type = SchedulerType::Slurm;
+    observation.adapter = name_;
+    observation.selector.adapter = name_;
     observation.source_timestamp_ms = scan_clock_now(options_.clock);
-    observation.selector.cluster_name = env.slurm_cluster_name;
+    observation.selector.cluster_name = env.cluster_name;
 
     const bool has_prefix = dir_name.size() > 3 && dir_name.compare(0, 3, "job") == 0;
     if (has_prefix) {

@@ -41,7 +41,7 @@ public:
         options.enable_event_source = true;
         options.scan_interval_ms = 0;
         if (!settings.cluster_name.empty())
-            options.discovery.condor_cluster_name = settings.cluster_name;
+            options.discovery.cluster_name = settings.cluster_name;
         return options;
     }
 
@@ -89,7 +89,7 @@ public:
     {
         NativeSelector selector;
         if (job.subtype != JobSubType::Condor) return selector;
-        selector.scheduler_type = SchedulerType::Condor;
+        selector.adapter = name_;
         selector.cluster_name = job.cluster_name;
         selector.cluster_tag = job.clusterTag;
         selector.native_job_id = job.NativeJobID;

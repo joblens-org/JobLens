@@ -87,7 +87,7 @@ std::string key_binding(uint64_t jobID) {
 std::string identity_index_key(const CanonicalIdentity& identity) {
     std::string key;
     key.reserve(identity.cluster_namespace.size() + identity.canonical_native.size() + 32);
-    key += to_string(identity.scheduler_type);
+    key += identity.adapter;
     key += '|';
     key += std::to_string(identity.cluster_namespace.size());
     key += ':';
@@ -251,7 +251,7 @@ nlohmann::json record_json(const JobRecord& record) {
     out["last_seen_us"]   = record.last_seen_us;
     out["members_authoritative"] = record.members_authoritative;
     if (!record.adapter.empty()) out["adapter"] = record.adapter;
-    if (record.selector.scheduler_type == SchedulerType::Unknown) {
+    if (record.selector.adapter.empty()) {
         out["selector"] = nullptr;
     } else {
         out["selector"] = record.selector;
@@ -320,6 +320,8 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
 
     if (j.contains("selector") && j["selector"].is_object() &&
         j["selector"].value("scheduler_type", std::string{"unknown"}) != "unknown") {
+        // Legacy rows carry "scheduler_type": "unknown" for "no selector";
+        // the selector round trip itself accepts either key (adapter wins).
         try {
             record.selector = j["selector"].get<NativeSelector>();
         } catch (const std::exception& error) {
@@ -539,7 +541,7 @@ nlohmann::json facts_fingerprint(const Job& job, const JobRecord& record) {
 NativeSelector selector_from_legacy_job(const Job& job) {
     NativeSelector selector;
     if (job.subtype == JobSubType::Condor) {
-        selector.scheduler_type = SchedulerType::Condor;
+        selector.adapter = kAdapterCondor;
         selector.cluster_name = job.cluster_name;
         selector.cluster_tag = job.clusterTag;
         selector.native_job_id = job.NativeJobID;
@@ -549,7 +551,7 @@ NativeSelector selector_from_legacy_job(const Job& job) {
             }
         }
     } else if (job.subtype == JobSubType::Slurm) {
-        selector.scheduler_type = SchedulerType::Slurm;
+        selector.adapter = kAdapterSlurm;
         selector.cluster_name = job.cluster_name;
         selector.native_job_id = job.NativeJobID;
         if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr)) {
@@ -581,7 +583,7 @@ void apply_identity_to_facts(Job& job, const NativeSelector& selector,
         job.jobtype = JobType::Job;
     }
 
-    if (identity.scheduler_type == SchedulerType::Condor) {
+    if (identity.adapter == kAdapterCondor) {
         job.subtype = JobSubType::Condor;
         if (!std::holds_alternative<CondorJobAttr>(job.sub_attr)) {
             job.sub_attr = CondorJobAttr{};
@@ -963,7 +965,7 @@ bool JobStore::migrate_index(std::string& cursor, size_t& batches, size_t batch_
                 } else if (owner_it == index_owners.end()) {
                     batch.Put(index_key, nlohmann::json{
                         {"internal_id", internal_id},
-                        {"scheduler_type", to_string(identity->scheduler_type)},
+                        {"scheduler_type", identity->adapter},
                         {"cluster_namespace", identity->cluster_namespace},
                         {"native_job_id", identity->native_job_id},
                         {"canonical_native", identity->canonical_native},
@@ -1383,11 +1385,11 @@ bool JobStore::insertManual(JobRecord record) {
     if (record.first_seen_us == 0) record.first_seen_us = now_us();
     if (record.last_seen_us == 0) record.last_seen_us = record.first_seen_us;
     record.instance_id = derive_instance_id(db_uuid_, record.internal_id);
-    if (record.selector.scheduler_type == SchedulerType::Unknown) {
+    if (record.selector.adapter.empty()) {
         // Legacy registrations carry their identity only inside the typed
         // facts; reconstruct the selector, never a guess.
         record.selector = selector_from_legacy_job(record.job);
-        record.adapter = to_string(record.selector.scheduler_type);
+        record.adapter = record.selector.adapter;
         if (const auto identity = canonicalize(record.selector)) {
             record.identity = *identity;
             record.identity_complete = true;
@@ -1426,7 +1428,7 @@ bool JobStore::insertManual(JobRecord record) {
         if (s.IsNotFound()) {
             batch.Put(index_key, nlohmann::json{
                 {"internal_id", record.internal_id},
-                {"scheduler_type", to_string(record.identity.scheduler_type)},
+                {"scheduler_type", record.identity.adapter},
                 {"cluster_namespace", record.identity.cluster_namespace},
                 {"native_job_id", record.identity.native_job_id},
                 {"canonical_native", record.identity.canonical_native},
@@ -1447,7 +1449,7 @@ bool JobStore::insertManual(JobRecord record) {
             }
             batch.Put(index_key, nlohmann::json{
                 {"internal_id", record.internal_id},
-                {"scheduler_type", to_string(record.identity.scheduler_type)},
+                {"scheduler_type", record.identity.adapter},
                 {"cluster_namespace", record.identity.cluster_namespace},
                 {"native_job_id", record.identity.native_job_id},
                 {"canonical_native", record.identity.canonical_native},
@@ -1713,7 +1715,7 @@ UpsertResult JobStore::upsert(const ObservedExecution& observation, JobRecord& o
 
     record.internal_id = allocated;
     record.instance_id = instanceId(allocated);
-    record.adapter = to_string(observation.selector.scheduler_type);
+    record.adapter = observation.selector.adapter;
     record.selector = observation.selector;
     record.identity = *identity;
     record.identity_complete = true;
@@ -1737,7 +1739,7 @@ UpsertResult JobStore::upsert(const ObservedExecution& observation, JobRecord& o
         batch.Put(key_job(allocated), record_json(record).dump());
         batch.Put(index_key, nlohmann::json{
             {"internal_id", allocated},
-            {"scheduler_type", to_string(identity->scheduler_type)},
+            {"scheduler_type", identity->adapter},
             {"cluster_namespace", identity->cluster_namespace},
             {"native_job_id", identity->native_job_id},
             {"canonical_native", identity->canonical_native},
@@ -1758,7 +1760,7 @@ UpsertResult JobStore::upsert(const ObservedExecution& observation, JobRecord& o
     result.instance_id = record.instance_id;
     result.facts_revision = record.facts_revision;
     spdlog::info("JobStore: created inventory instance {} for {} '{}'",
-                 allocated, to_string(identity->scheduler_type), identity->native_job_id);
+                 allocated, identity->adapter, identity->native_job_id);
     out = std::move(record);
     return result;
 }

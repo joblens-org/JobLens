@@ -20,6 +20,7 @@
 #include <spdlog/spdlog.h>
 #include <fmt/core.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <algorithm>
 #include <set>
@@ -30,6 +31,7 @@
 #include "common/slurm_job.hpp"
 #include "common/utils.hpp"
 #include "core/collector_registry.hpp"
+#include "core/scheduler_adapter.hpp"
 #include "core/job_collection_manager.hpp"
 #include "core/inventory_config.hpp"
 #include "core/inventory_status_provider.hpp"
@@ -268,12 +270,7 @@ uint64_t inventory_snapshot_revision(const std::vector<JobRecord>& records)
 
 std::string inventory_source(const JobRecord& record)
 {
-    switch (record.selector.scheduler_type) {
-        case SchedulerType::Condor: return "condor";
-        case SchedulerType::Slurm:  return "slurm";
-        case SchedulerType::Unknown: break;
-    }
-    return "manual";
+    return record.adapter.empty() ? "manual" : record.adapter;
 }
 
 nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& record)
@@ -288,7 +285,7 @@ nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& rec
     out["source"] = inventory_source(record);
     out["quarantined"] = record.quarantined;
     out["identity_complete"] = record.identity_complete;
-    out["scheduler_type"] = to_string(record.selector.scheduler_type);
+    out["scheduler_type"] = record.selector.adapter;
     out["cluster_name"] = record.selector.cluster_name;
     out["cluster_tag"] = record.selector.cluster_tag;
     out["native_job_id"] = record.selector.native_job_id;
@@ -350,7 +347,7 @@ std::string optional_string(const nlohmann::json& node, const char* key)
 bool namespace_matches(const CanonicalIdentity& stored, const NativeSelector& selector,
                        const CanonicalIdentity& requested)
 {
-    if (selector.scheduler_type != SchedulerType::Condor)
+    if (selector.adapter != kAdapterCondor)
         return stored.cluster_namespace == requested.cluster_namespace;
     if (!selector.cluster_tag.empty())
         return stored.cluster_namespace == requested.cluster_namespace;
@@ -394,7 +391,7 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
     for (auto& record : registry.inventoryRecords()) {
         if (is_reserved_internal_id(record.internal_id)) continue;
         if (!record.identity_complete) continue;
-        if (record.identity.scheduler_type != identity->scheduler_type) continue;
+        if (record.identity.adapter != identity->adapter) continue;
         if (record.identity.canonical_native != identity->canonical_native) continue;
         if (!namespace_matches(record.identity, selector, *identity)) continue;
         if (!identity->step_id.empty() && record.identity.step_id != identity->step_id) continue;
@@ -532,7 +529,7 @@ std::optional<NativeSelector> legacy_add_selector(const Job& job, const nlohmann
     const auto sub = req.contains("sub_attr") && req["sub_attr"].is_object()
                          ? req["sub_attr"] : nlohmann::json::object();
     if (job.subtype == JobSubType::Condor) {
-        selector.scheduler_type = SchedulerType::Condor;
+        selector.adapter = kAdapterCondor;
         selector.native_job_id = job.NativeJobID;
         if (const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr))
             selector.native_job_id = fmt::format("{}.{}", attr->cluster_id, attr->proc_id);
@@ -542,7 +539,7 @@ std::optional<NativeSelector> legacy_add_selector(const Job& job, const nlohmann
         if (selector.cluster_name.empty())
             selector.cluster_name = Utils::get_condor_collector_host();
     } else if (job.subtype == JobSubType::Slurm) {
-        selector.scheduler_type = SchedulerType::Slurm;
+        selector.adapter = kAdapterSlurm;
         selector.native_job_id = job.NativeJobID;
         selector.cluster_name = sub.value("cluster_name", std::string{});
         if (selector.cluster_name.empty()) selector.cluster_name = SlurmJob::get_cluster_name();
@@ -990,12 +987,17 @@ void registerInventoryRpc(JobRegistry& registry,
             if (params.contains("scheduler_type") && !params["scheduler_type"].is_null()) {
                 if (!params["scheduler_type"].is_string())
                     return error_payload("invalid_request", "scheduler_type must be a string");
-                scheduler_filter = params["scheduler_type"].get<std::string>();
-                if (!scheduler_type_from_string(scheduler_filter))
-                    return error_payload("invalid_request",
-                                         "unknown scheduler_type '" + scheduler_filter + "'");
-                // Normalize to the canonical lowercase wire name below.
-                scheduler_filter = to_string(*scheduler_type_from_string(scheduler_filter));
+                scheduler_filter = normalize_adapter_name(
+                    params["scheduler_type"].get<std::string>());
+                // Open world, validated against the registered adapters: an
+                // unknown name is a caller error, not an empty result.
+                if (!SchedulerAdapterRegistry::instance().known(scheduler_filter))
+                    return error_payload(
+                        "invalid_request",
+                        fmt::format("unknown scheduler_type '{}' (registered: {})",
+                                    scheduler_filter,
+                                    fmt::join(SchedulerAdapterRegistry::instance().names(),
+                                              ", ")));
             }
             std::string native_filter;
             if (params.contains("native_job_id") && !params["native_job_id"].is_null()) {
@@ -1024,7 +1026,7 @@ void registerInventoryRpc(JobRegistry& registry,
             for (auto& record : registry.inventoryRecords()) {
                 if (is_reserved_internal_id(record.internal_id)) continue;
                 if (!scheduler_filter.empty() &&
-                    to_string(record.selector.scheduler_type) != scheduler_filter)
+                    record.selector.adapter != scheduler_filter)
                     continue;
                 if (!native_filter.empty() && record.selector.native_job_id != native_filter)
                     continue;
@@ -1161,8 +1163,8 @@ void registerInventoryRpc(JobRegistry& registry,
             const bool has_instance =
                 selector.contains("instance_id") && !selector["instance_id"].is_null();
             std::vector<std::string> native_fields;
-            for (const char* name : {"scheduler_type", "cluster_name", "cluster_tag",
-                                     "native_job_id", "step_id"}) {
+            for (const char* name : {"scheduler_type", "adapter", "cluster_name",
+                                     "cluster_tag", "native_job_id", "step_id"}) {
                 if (selector.contains(name) && !selector[name].is_null())
                     native_fields.emplace_back(name);
             }
@@ -1183,11 +1185,22 @@ void registerInventoryRpc(JobRegistry& registry,
                     native_selector.step_id = optional_string(selector, "step_id");
                     native_selector.native_job_id = optional_string(selector, "native_job_id");
                     native_selector.cluster_name = optional_string(selector, "cluster_name");
-                    const auto type = optional_string(selector, "scheduler_type");
-                    const auto scheduler_type = scheduler_type_from_string(type);
-                    if (!scheduler_type)
-                        return selector_error("unknown scheduler_type '" + type + "'");
-                    native_selector.scheduler_type = *scheduler_type;
+                    // "adapter" is the preferred key; the legacy
+                    // "scheduler_type" spelling keeps old callers working.
+                    std::string adapter_name;
+                    if (selector.contains("adapter") && !selector["adapter"].is_null())
+                        adapter_name = optional_string(selector, "adapter");
+                    else
+                        adapter_name = optional_string(selector, "scheduler_type");
+                    adapter_name = normalize_adapter_name(adapter_name);
+                    if (!SchedulerAdapterRegistry::instance().known(adapter_name))
+                        return selector_error(
+                            fmt::format("unknown scheduler_type '{}' (registered: {})",
+                                        adapter_name,
+                                        fmt::join(SchedulerAdapterRegistry::instance()
+                                                      .names(),
+                                                  ", ")));
+                    native_selector.adapter = adapter_name;
                 }
             } catch (const std::exception& error) {
                 return selector_error(error.what());
@@ -1298,7 +1311,7 @@ void registerInventoryRpc(JobRegistry& registry,
             out["instance_id"] = target["instance_id"];
             out["internal_job_id"] = target["internal_job_id"];
             out["native_job_id"] = target["native_job_id"];
-            out["scheduler_type"] = to_string(record.selector.scheduler_type);
+            out["scheduler_type"] = record.selector.adapter;
             out["cluster_name"] = record.selector.cluster_name;
             out["cluster_tag"] = record.selector.cluster_tag;
             out["step_id"] = record.selector.step_id;

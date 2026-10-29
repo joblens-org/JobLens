@@ -61,7 +61,7 @@ JobRegistryOptions isolated(const std::string& path)
 NativeSelector condor_selector(const std::string& native)
 {
     NativeSelector selector;
-    selector.scheduler_type = SchedulerType::Condor;
+    selector.adapter = "condor";
     selector.cluster_name = "htcondor01";
     selector.cluster_tag = "schedd-a";
     selector.native_job_id = native;

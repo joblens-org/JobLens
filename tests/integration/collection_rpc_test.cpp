@@ -100,7 +100,7 @@ json rpc(const std::string& method, const json& params = json::object())
 NativeSelector condor_selector(const std::string& native, const std::string& tag)
 {
     NativeSelector selector;
-    selector.scheduler_type = SchedulerType::Condor;
+    selector.adapter = "condor";
     selector.cluster_name = "htcondor01";
     selector.cluster_tag = tag;
     selector.native_job_id = native;
@@ -110,7 +110,7 @@ NativeSelector condor_selector(const std::string& native, const std::string& tag
 NativeSelector slurm_selector(const std::string& native, const std::string& step)
 {
     NativeSelector selector;
-    selector.scheduler_type = SchedulerType::Slurm;
+    selector.adapter = "slurm";
     selector.cluster_name = "slurm-cluster";
     selector.native_job_id = native;
     selector.step_id = step;

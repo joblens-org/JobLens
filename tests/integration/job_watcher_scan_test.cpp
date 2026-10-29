@@ -209,13 +209,18 @@ void make_fixture(Fixture& fixture, const std::string& base)
     fs::create_directories(fixture.slurmd / "not-a-job-directory");
 }
 
-DiscoveryOptions fixture_options(const Fixture& fixture)
+// The explicit per-adapter namespace override. Condor fixtures pass the
+// cluster namespace here; slurm fixtures pass "" so their observations
+// derive the namespace from the fixture environ (or stay incomplete, as the
+// spool-only entries must).
+DiscoveryOptions fixture_options(const Fixture& fixture,
+                                 const std::string& cluster_name = "htcondor-fixture")
 {
     DiscoveryOptions options;
     options.enable_event_source = false;  // unprivileged fixture: no eBPF
     options.discovery.proc_root = fixture.proc.string();
     options.discovery.cgroup_root = fixture.cgroup.string();
-    options.discovery.condor_cluster_name = "htcondor-fixture";
+    options.discovery.cluster_name = cluster_name;
     options.clock = [] { return kFakeNowMs; };
     return options;
 }
@@ -262,8 +267,8 @@ Observation make_condor_observation(const std::string& native, pid_t manager_pid
                                     std::uint64_t manager_ticks)
 {
     Observation observation;
-    observation.scheduler_type = SchedulerType::Condor;
-    observation.selector.scheduler_type = SchedulerType::Condor;
+    observation.adapter = "condor";
+    observation.selector.adapter = "condor";
     observation.selector.cluster_name = "htcondor-fixture";
     observation.selector.native_job_id = native;
     observation.generation.boot_id = "boot-fixture-0001";
@@ -298,7 +303,7 @@ void condor_scan_finds_fixture_job(const Fixture& fixture)
 
     const auto* job = find_complete(result, "76226337.0");
     check(job != nullptr, "the fixture Condor job must be a complete observation");
-    check(job->scheduler_type == SchedulerType::Condor, "scheduler type must be condor");
+    check(job->adapter == "condor", "scheduler type must be condor");
     check(job->canonical_identity.has_value(), "complete observation carries a canonical identity");
     check(job->canonical_identity->key() ==
               "condor|htcondor-fixture@scheduler@schedd07.fixture|76226337.0",
@@ -362,7 +367,7 @@ void condor_incomplete_observations_are_explicit(const Fixture& fixture)
 
 void slurm_scan_finds_fixture_job(const Fixture& fixture)
 {
-    auto options = fixture_options(fixture);
+    auto options = fixture_options(fixture, "");
     options.discovery.slurm_spool_dir = fixture.slurmd.string();
     SlurmJobWatcher watcher(options);
 
@@ -380,7 +385,7 @@ void slurm_scan_finds_fixture_job(const Fixture& fixture)
 
     const auto* job = find_complete(result, "9002");
     check(job != nullptr, "the fixture Slurm job must be a complete observation");
-    check(job->scheduler_type == SchedulerType::Slurm, "scheduler type must be slurm");
+    check(job->adapter == "slurm", "scheduler type must be slurm");
     check(job->selector.step_id == "3", "step id must be the normalized member step");
     check(job->canonical_identity &&
               job->canonical_identity->key() == "slurm|slurm-fixture|9002|3",
@@ -489,7 +494,7 @@ void observe_hint_targets_one_execution(const Fixture& fixture)
     check(!condor.observeForHint(4101).has_value(),
           "a pid whose parent is not a starter must not resolve");
 
-    auto slurm_options = fixture_options(fixture);
+    auto slurm_options = fixture_options(fixture, "");
     slurm_options.discovery.slurm_spool_dir = (fixture.slurmd).string();
     SlurmJobWatcher slurm(slurm_options);
     // 5110's parent is the stepd 5101 of job 9002 step 3.
@@ -504,13 +509,13 @@ void observe_hint_targets_one_execution(const Fixture& fixture)
 void polymorphic_source_interface(const Fixture& fixture)
 {
     CondorJobWatcher condor(fixture_options(fixture));
-    SlurmJobWatcher slurm(fixture_options(fixture));
+    SlurmJobWatcher slurm(fixture_options(fixture, ""));
 
     IDiscoverySource* sources[] = {&condor, &slurm};
     check(sources[0]->name() == "condor", "the condor source must name itself");
-    check(sources[0]->schedulerType() == SchedulerType::Condor, "condor type");
+    check(sources[0]->name() == "condor", "condor type");
     check(sources[1]->name() == "slurm", "the slurm source must name itself");
-    check(sources[1]->schedulerType() == SchedulerType::Slurm, "slurm type");
+    check(sources[1]->name() == "slurm", "slurm type");
 
     for (IDiscoverySource* source : sources) {
         source->requestRescan();
@@ -577,7 +582,7 @@ void lifecycle_is_safe(const Fixture& fixture)
     check(!idle.thread_joinable(), "stop() after a refused start() is safe");
 
     // Same lifecycle for the Slurm adapter.
-    auto slurm_options = fixture_options(fixture);
+    auto slurm_options = fixture_options(fixture, "");
     slurm_options.scan_interval_ms = 20;
     SlurmJobWatcher slurm(slurm_options);
     std::atomic<int> slurm_delivered{0};

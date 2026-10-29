@@ -77,15 +77,88 @@ void append_hex(char* out, uint64_t value)
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Scheduler type
+// Scheduler identity (adapter name) and native-id rules
 // ---------------------------------------------------------------------------
 
-std::optional<SchedulerType> scheduler_type_from_string(const std::string& raw)
+std::string normalize_adapter_name(const std::string& raw)
 {
-    if (raw == "condor" || raw == "Condor" || raw == "CONDOR") return SchedulerType::Condor;
-    if (raw == "slurm" || raw == "Slurm" || raw == "SLURM") return SchedulerType::Slurm;
-    return std::nullopt;
+    std::string normalized;
+    normalized.reserve(raw.size());
+    for (const char c : raw) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;
+        normalized.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c))));
+    }
+    return normalized;
 }
+
+NativeIdRuleRegistry& NativeIdRuleRegistry::instance()
+{
+    static NativeIdRuleRegistry registry;
+    return registry;
+}
+
+void NativeIdRuleRegistry::registerRule(const std::string& adapter, NativeIdRule rule)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    rules_[adapter] = std::move(rule);
+}
+
+const NativeIdRule* NativeIdRuleRegistry::find(const std::string& adapter) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = rules_.find(adapter);
+    return it == rules_.end() ? nullptr : &it->second;
+}
+
+namespace {
+
+// Built-in rule: Condor native ids are "<ClusterId>.<ProcId>" with decimal
+// parts; leading zeros are tolerated and canonicalized ("012.3" == "12.3")
+// so digit concatenation can never merge two different jobs ("12.34" versus
+// "123.4"). No steps. The namespace separates schedds.
+NativeIdRule condor_native_id_rule = [](const NativeSelector& selector)
+    -> std::optional<CanonicalParts> {
+    if (!selector.step_id.empty()) return std::nullopt;  // Condor has no steps
+    auto parsed = parse_condor_native(selector.native_job_id);
+    if (!parsed) return std::nullopt;
+    CanonicalParts parts;
+    parts.cluster_namespace = selector.cluster_name;
+    if (!selector.cluster_tag.empty())
+        parts.cluster_namespace += "@" + selector.cluster_tag;
+    parts.canonical_native = parsed->cluster + "." + parsed->proc;
+    return parts;
+};
+
+// Built-in rule: Slurm native ids are the logical job number without a step;
+// a step refines the identity (normalized, special names preserved).
+NativeIdRule slurm_native_id_rule = [](const NativeSelector& selector)
+    -> std::optional<CanonicalParts> {
+    auto job_number = strip_leading_zeros(selector.native_job_id);
+    if (!job_number) return std::nullopt;
+    CanonicalParts parts;
+    if (!selector.step_id.empty()) {
+        auto step = normalize_slurm_step_id(selector.step_id);
+        if (!step) return std::nullopt;
+        parts.step_id = *step;
+    }
+    parts.cluster_namespace = selector.cluster_name;
+    parts.canonical_native = *job_number;
+    return parts;
+};
+
+// The built-ins are data owned by this TU: identity tests and fixtures get
+// them without linking any adapter. New schedulers register alongside their
+// adapter (REGISTER_NATIVE_ID_RULE) and this layer never learns about them.
+const bool joblens_builtin_native_id_rules = [] {
+    NativeIdRuleRegistry::instance().registerRule(kAdapterCondor,
+                                                  condor_native_id_rule);
+    NativeIdRuleRegistry::instance().registerRule(kAdapterSlurm,
+                                                  slurm_native_id_rule);
+    return true;
+}();
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Internal IDs
@@ -181,8 +254,9 @@ std::optional<uint32_t> slurm_step_value(const std::string& step_id)
 std::string CanonicalIdentity::key() const
 {
     std::string joined;
-    joined.reserve(cluster_namespace.size() + canonical_native.size() + step_id.size() + 8);
-    joined += to_string(scheduler_type);
+    joined.reserve(adapter.size() + cluster_namespace.size() +
+                   canonical_native.size() + step_id.size() + 8);
+    joined += adapter;
     joined += '|';
     joined += cluster_namespace;
     joined += '|';
@@ -196,7 +270,7 @@ std::string CanonicalIdentity::key() const
 
 bool operator==(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs)
 {
-    return lhs.scheduler_type == rhs.scheduler_type &&
+    return lhs.adapter == rhs.adapter &&
            lhs.cluster_namespace == rhs.cluster_namespace &&
            lhs.canonical_native == rhs.canonical_native &&
            lhs.step_id == rhs.step_id;
@@ -214,38 +288,23 @@ bool operator<(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs)
 
 std::optional<CanonicalIdentity> canonicalize(const NativeSelector& selector)
 {
-    if (selector.scheduler_type == SchedulerType::Unknown) return std::nullopt;
+    if (selector.adapter.empty()) return std::nullopt;
     if (selector.cluster_name.empty()) return std::nullopt;
     if (selector.native_job_id.empty()) return std::nullopt;
 
+    // Everything scheduler-specific lives in the adapter's registered rule;
+    // no rule means this layer cannot name the job — explicitly incomplete.
+    const NativeIdRule* rule = NativeIdRuleRegistry::instance().find(selector.adapter);
+    if (rule == nullptr || !*rule) return std::nullopt;
+    const auto parts = (*rule)(selector);
+    if (!parts) return std::nullopt;
+
     CanonicalIdentity identity;
-    identity.scheduler_type = selector.scheduler_type;
+    identity.adapter = selector.adapter;
     identity.native_job_id = selector.native_job_id; // preserved verbatim
-
-    if (selector.scheduler_type == SchedulerType::Condor) {
-        if (!selector.step_id.empty()) return std::nullopt; // Condor has no steps
-        auto parsed = parse_condor_native(selector.native_job_id);
-        if (!parsed) return std::nullopt;
-        identity.cluster_namespace = selector.cluster_name;
-        if (!selector.cluster_tag.empty())
-            identity.cluster_namespace += "@" + selector.cluster_tag;
-        // The namespace separates schedds; the canonical native form removes
-        // leading zeros so one job cannot fork into two identities, while the
-        // original wire string stays preserved in native_job_id.
-        identity.canonical_native = parsed->cluster + "." + parsed->proc;
-        return identity;
-    }
-
-    // Slurm: logical job number without a step; a step refines the identity.
-    auto job_number = strip_leading_zeros(selector.native_job_id);
-    if (!job_number) return std::nullopt;
-    if (!selector.step_id.empty()) {
-        auto step = normalize_slurm_step_id(selector.step_id);
-        if (!step) return std::nullopt;
-        identity.step_id = *step;
-    }
-    identity.cluster_namespace = selector.cluster_name;
-    identity.canonical_native = *job_number;
+    identity.cluster_namespace = parts->cluster_namespace;
+    identity.canonical_native = parts->canonical_native;
+    identity.step_id = parts->step_id;
     return identity;
 }
 
@@ -300,7 +359,10 @@ std::string derive_instance_id(const std::string& db_uuid, uint64_t internal_id)
 void to_json(nlohmann::json& out, const NativeSelector& selector)
 {
     out = nlohmann::json::object();
-    out["scheduler_type"] = to_string(selector.scheduler_type);
+    // Both keys, same lowercase name: new readers prefer "adapter", the
+    // legacy key keeps old binaries and rollback scenarios reading new rows.
+    out["adapter"] = selector.adapter;
+    out["scheduler_type"] = selector.adapter;
     out["cluster_name"] = selector.cluster_name;
     out["cluster_tag"] = selector.cluster_tag;
     out["native_job_id"] = selector.native_job_id;
@@ -309,11 +371,12 @@ void to_json(nlohmann::json& out, const NativeSelector& selector)
 
 void from_json(const nlohmann::json& in, NativeSelector& selector)
 {
-    const auto type = in.at("scheduler_type").get<std::string>();
-    const auto parsed_type = scheduler_type_from_string(type);
-    if (!parsed_type)
-        throw std::runtime_error("unknown scheduler_type '" + type + "'");
-    selector.scheduler_type = *parsed_type;
+    std::string name;
+    if (in.contains("adapter") && in.at("adapter").is_string())
+        name = in.at("adapter").get<std::string>();
+    else
+        name = in.at("scheduler_type").get<std::string>();
+    selector.adapter = normalize_adapter_name(name);
     selector.cluster_name = in.at("cluster_name").get<std::string>();
     selector.cluster_tag = in.value("cluster_tag", "");
     selector.native_job_id = in.at("native_job_id").get<std::string>();
@@ -323,7 +386,8 @@ void from_json(const nlohmann::json& in, NativeSelector& selector)
 void to_json(nlohmann::json& out, const CanonicalIdentity& identity)
 {
     out = nlohmann::json::object();
-    out["scheduler_type"] = to_string(identity.scheduler_type);
+    out["adapter"] = identity.adapter;
+    out["scheduler_type"] = identity.adapter;
     out["cluster_namespace"] = identity.cluster_namespace;
     out["native_job_id"] = identity.native_job_id;
     out["canonical_native"] = identity.canonical_native;
@@ -332,11 +396,12 @@ void to_json(nlohmann::json& out, const CanonicalIdentity& identity)
 
 void from_json(const nlohmann::json& in, CanonicalIdentity& identity)
 {
-    const auto type = in.at("scheduler_type").get<std::string>();
-    const auto parsed_type = scheduler_type_from_string(type);
-    if (!parsed_type)
-        throw std::runtime_error("unknown scheduler_type '" + type + "'");
-    identity.scheduler_type = *parsed_type;
+    std::string name;
+    if (in.contains("adapter") && in.at("adapter").is_string())
+        name = in.at("adapter").get<std::string>();
+    else
+        name = in.at("scheduler_type").get<std::string>();
+    identity.adapter = normalize_adapter_name(name);
     identity.cluster_namespace = in.at("cluster_namespace").get<std::string>();
     identity.native_job_id = in.at("native_job_id").get<std::string>();
     identity.canonical_native = in.at("canonical_native").get<std::string>();

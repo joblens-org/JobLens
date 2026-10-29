@@ -54,7 +54,6 @@ public:
 
     // ---- IDiscoverySource -------------------------------------------------
     const std::string& name() const override { return name_; }
-    SchedulerType schedulerType() const override { return SchedulerType::Condor; }
     bool start(const DiscoverySink& sink) override;
     void stop() override;
     ScanResult scan() override;
@@ -460,11 +459,11 @@ inline Observation CondorJobWatcher::observe_starter(const DiscoveryEnvironment&
 {
     Observation observation;
     std::vector<std::string> reasons;
-    observation.scheduler_type = SchedulerType::Condor;
-    observation.selector.scheduler_type = SchedulerType::Condor;
+    observation.adapter = name_;
+    observation.selector.adapter = name_;
     observation.source_timestamp_ms = scan_clock_now(options_.clock);
 
-    std::string cluster_name = env.condor_cluster_name;
+    std::string cluster_name = env.cluster_name;
     if (cluster_name.empty()) cluster_name = Utils::get_condor_collector_host();
     if (cluster_name.empty())
         reasons.push_back("condor cluster namespace unresolved (COLLECTOR_HOST unavailable)");
