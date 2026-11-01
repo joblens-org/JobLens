@@ -33,7 +33,6 @@
 #include "core/job_discovery.hpp"
 #include "job_watcher/condor_job_watcher.hpp"
 #include "job_watcher/slurm_job_watcher.hpp"
-#include "job_watcher/registration_turn.hpp"
 #include "common/config.hpp"
 
 #include <atomic>
@@ -264,20 +263,6 @@ DiscoverySink scan_sink(ObservationSink on_observation)
     return sink;
 }
 
-Observation make_condor_observation(const std::string& native, pid_t manager_pid,
-                                    std::uint64_t manager_ticks)
-{
-    Observation observation;
-    observation.adapter = "condor";
-    observation.selector.adapter = "condor";
-    observation.selector.cluster_name = "htcondor-fixture";
-    observation.selector.native_job_id = native;
-    observation.generation.boot_id = "boot-fixture-0001";
-    observation.generation.manager_pid = manager_pid;
-    observation.generation.manager_start_ticks = manager_ticks;
-    finalize_observation(observation);
-    return observation;
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -675,160 +660,6 @@ void condor_without_cgroup_still_resolves_members(const Fixture& fixture)
           "members resolved without a cgroup must be reported as partial evidence");
 }
 
-// The poll-turn registration gate replaced the accumulator: one turn batches
-// the Jobs it discovered, registers them before the turn ends, and re-reads
-// incomplete hints on a bounded ladder (plan §6.2/§6.3).
-void registration_turn_batches_and_ladders(const Fixture& /*fixture*/)
-{
-    std::vector<std::size_t> batch_sizes;
-    DiscoverySink sink;
-    sink.to_job = [](const Observation& observation) {
-        Job job;
-        job.NativeJobID = observation.selector.native_job_id;
-        job.cluster_name = observation.selector.cluster_name;
-        job.subtype_name = observation.selector.adapter;
-        JobExecution execution;
-        execution.generation = observation.generation;
-        execution.members = observation.members;
-        execution.members_authoritative = observation.members_complete;
-        job.execution = std::move(execution);
-        return job;
-    };
-    sink.on_jobs = [&](const std::vector<Job>& jobs) {
-        batch_sizes.push_back(jobs.size());
-        std::vector<UpsertResult> results(jobs.size());
-        for (auto& result : results) {
-            result.ok = true;
-            result.disposition = UpsertDisposition::Created;
-            result.internal_id = batch_sizes.size();
-        }
-        return results;
-    };
-
-    Observation observation = make_condor_observation("800.0", 4301, 7101);
-    observation.members.push_back(ProcessIdentity{4310, 7110, "boot-fixture-0001"});
-
-    {
-        // Batch size 1: the event callback returns only after a commit.
-        RegistrationTurn turn;
-        turn.configure(sink, 1);
-        turn.offer(observation);
-        check(batch_sizes.size() == 1 && batch_sizes.front() == 1,
-              "batch size 1 must register inside the event");
-        check(turn.batchesCommitted() == 1, "one event must produce one commit");
-    }
-
-    {
-        // Batch of 4: nothing is committed until the batch is full; the tail is
-        // flushed explicitly before the turn ends.
-        RegistrationTurn turn;
-        batch_sizes.clear();
-        turn.configure(sink, 4);
-        for (int i = 0; i < 3; ++i) turn.offer(observation);
-        check(batch_sizes.empty(), "a partial batch must not commit early");
-        turn.flush();
-        check(batch_sizes.size() == 1 && batch_sizes.front() == 3,
-              "the tail batch must be registered before the turn ends");
-        check(turn.batchesCommitted() == 1, "the batch counter must follow the commits");
-
-    }
-
-    {
-        // Re-read ladder: due at +5 ms, then 25/100/500 ms, then once a second,
-        // and never past the 30 s age limit.
-        RegistrationTurn turn;
-        turn.configure(sink, 1);
-        using Clock = RegistrationTurn::Clock;
-        const auto t0 = Clock::time_point{} + std::chrono::seconds(1);
-        turn.rememberPid(4242, t0);
-        check(turn.pendingCount() == 1, "an incomplete hint must be remembered once");
-        turn.rememberPid(4242, t0 + std::chrono::milliseconds(3));
-        check(turn.pendingCount() == 1, "a repeated event must not add a second entry");
-        check(turn.take_due(t0, 32).empty(), "a hint must not be due before its deadline");
-        check(turn.take_due(t0 + std::chrono::milliseconds(6), 32).size() == 1,
-              "the first re-read must be due after 5 ms");
-        turn.reschedule(4242, t0, 0, t0 + std::chrono::milliseconds(6));
-        check(turn.take_due(t0 + std::chrono::milliseconds(20), 32).empty(),
-              "the second attempt must wait 25 ms");
-        check(turn.take_due(t0 + std::chrono::milliseconds(32), 32).size() == 1,
-              "the second attempt must be due at 25 ms");
-        turn.reschedule(4242, t0, 3, t0 + std::chrono::milliseconds(32));
-        check(turn.take_due(t0 + std::chrono::milliseconds(900), 32).empty(),
-              "after the ladder the interval must be one second");
-        check(turn.take_due(t0 + std::chrono::milliseconds(1100), 32).size() == 1,
-              "the one-second interval must fire");
-        turn.rememberPid(4343, t0);
-        check(turn.take_due(t0 + std::chrono::milliseconds(31000), 32).empty(),
-              "a hint past the 30 s limit must be dropped instead of retried");
-        check(turn.pendingExpired() == 1, "the expiry must stay visible in the counters");
-
-        for (int i = 0; i < static_cast<int>(RegistrationTurn::kMaxPending) + 8; ++i)
-            turn.rememberPid(5000 + i, t0);
-        check(turn.pendingCount() == RegistrationTurn::kMaxPending,
-              "the pending table must stay bounded");
-    }
-
-    {
-        // Production call pattern: take_due() drops the entry and the caller
-        // reschedules with the ORIGINAL deadline. A permanent failure must age
-        // out after 30 s instead of being retried forever with a fresh window.
-        RegistrationTurn turn;
-        turn.configure(sink, 1);
-        const auto first = RegistrationTurn::Clock::time_point{} + std::chrono::seconds(1);
-        turn.rememberPid(7001, first);
-        for (int i = 0; i < 600; ++i) {
-            const auto now = first + std::chrono::milliseconds(100 * (i + 1));
-            for (const auto& entry : turn.take_due(now, 32))
-                turn.reschedule(entry.pid, entry.first, entry.attempt + 1, now);
-        }
-        check(turn.pendingCount() == 0,
-              "a permanently failing re-read must expire instead of staying pending");
-        check(turn.pendingExpired() == 1, "the expiry must stay visible in the counters");
-    }
-
-    {
-        // PID reuse: a hint captured with a complete child identity must not
-        // accept a re-read that belongs to a different process (plan §6.3).
-        Observation captured;
-        captured.generation.boot_id = "boot-fixture-0001";
-        captured.members.push_back(ProcessIdentity{7201, 8001, "boot-fixture-0001"});
-        const auto child = RegistrationTurn::childIdentity(captured, 7201);
-        check(child.complete(), "the captured child identity must be complete");
-        check(RegistrationTurn::sameChild(child, captured, 7201),
-              "the same process must pass the reuse check");
-
-        Observation reused = captured;
-        reused.members.clear();
-        reused.members.push_back(ProcessIdentity{7201, 9002, "boot-fixture-0001"});
-        check(!RegistrationTurn::sameChild(child, reused, 7201),
-              "a reused pid must be rejected instead of registered");
-    }
-
-    {
-        // Turn bound: the 32nd handled sample ends the turn, and the sample
-        // itself is never skipped (the callback handles it before yielding).
-        RegistrationTurn turn;
-        turn.configure(sink, 1);
-        turn.begin_turn();
-        std::size_t handled = 0;
-        bool yielded = false;
-        for (std::size_t i = 0; i < RegistrationTurn::kSamplesPerTurn + 5; ++i) {
-            ++handled;
-            if (turn.should_yield(RegistrationTurn::Clock::time_point{}, false)) {
-                yielded = true;
-                break;
-            }
-        }
-        check(yielded, "a turn must yield once its sample budget is spent");
-        check(handled == RegistrationTurn::kSamplesPerTurn,
-              "exactly 32 samples must be handled per turn, saw " + std::to_string(handled));
-
-        // A stop request ends the turn even when the budget is not spent.
-        turn.begin_turn();
-        check(turn.should_yield(RegistrationTurn::Clock::time_point{}, true),
-              "a stop request must end the turn after the current sample");
-    }
-}
 
 } // namespace
 
@@ -863,7 +694,6 @@ int main(int argc, char** argv)
             {"condor_ad_on_member_process_is_found", condor_ad_on_member_process_is_found},
             {"condor_without_cgroup_still_resolves_members",
              condor_without_cgroup_still_resolves_members},
-            {"registration_turn_batches_and_ladders", registration_turn_batches_and_ladders},
         };
 
         for (const auto& test : tests) {

@@ -18,7 +18,6 @@
 #include "common/ebpf_common.hpp"
 #include "common/utils.hpp"
 #include "core/job_discovery.hpp"
-#include "job_watcher/registration_turn.hpp"
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -85,9 +84,10 @@ private:
     // the due re-reads and the stop check can run (plan §6.2).
     bool stop_requested();
     // One bounded re-read pass over the pids whose deadline expired.
-    void process_due_rewrites();
-    void flush_turn();
-    RegistrationTurn turn_;
+    // Samples handled in the current poll call; the turn ends at
+    // kSamplesPerTurn so the stop/scan checks always get a chance (plan §6.2).
+    static constexpr std::size_t kSamplesPerTurn = 32;
+    std::size_t samples_this_turn_ = 0;
     std::atomic<bool> yield_requested_{false};
     ScanResult finish_scan(ScanResult result);
 
@@ -153,7 +153,6 @@ inline bool CondorJobWatcher::start(const DiscoverySink& sink)
         std::lock_guard<std::mutex> lock(life_mutex_);
         sink_ = sink;
     }
-    turn_.configure(sink, options_.registration_batch_size);
     // Load the event source on first start: an adapter that is never started
     // costs nothing (no privileges used, no kernel objects).
     if (options_.enable_event_source && !event_source_ready_) {
@@ -183,8 +182,8 @@ inline void CondorJobWatcher::stop()
     }
     if (thread && thread->joinable()) thread->join();
 
-    // The turn is only touched by the (now joined) poll thread.
-    turn_.clear();
+    // Only touched by the (now joined) poll thread.
+    samples_this_turn_ = 0;
     yield_requested_ = false;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -347,13 +346,18 @@ inline void CondorJobWatcher::poll_loop()
                                     std::chrono::milliseconds>(
                                         next_scan - now).count()));
         }
-        // A pending re-read must not wait behind a 100 ms stop-check tick.
-        const auto until_due = turn_.msUntilNextDue(RegistrationTurn::Clock::now());
-        if (until_due >= 0) timeout_ms = std::min<int>(timeout_ms, static_cast<int>(until_due));
+        samples_this_turn_ = 0;
+        samples_this_turn_ = 0;
         if (bpf_rb_) {
-            int err = ring_buffer__poll(bpf_rb_, timeout_ms);
-            if (err == -EINTR) continue;   // plain signal wakeup; re-check stop
-            if (err < 0) spdlog::error("CondorJobWatcher: error {}", err);
+            const int err = ring_buffer__poll(bpf_rb_, timeout_ms);
+            if (err == -ECANCELED && yield_requested_.exchange(false)) {
+                // Normal turn end requested by the sample callback; the sample
+                // itself was already handled before the yield.
+            } else if (err == -EINTR) {
+                // Plain signal wakeup; fall through to the stop/scan checks.
+            } else if (err < 0) {
+                spdlog::error("CondorJobWatcher: error {}", err);
+            }
         } else {
             // No event source: wait out the same timeout on the cv so stop()
             // stays immediate and the scan deadline still fires.
@@ -362,10 +366,6 @@ inline void CondorJobWatcher::poll_loop()
                               [this](){ return !polling_running_; });
         }
 
-        // End of turn: the tail batch is registered here (never waits for a
-        // new event), then the due re-reads are serviced by this same thread.
-        flush_turn();
-        process_due_rewrites();
 
         if (options_.scan_interval_ms > 0) {
             const auto now = std::chrono::steady_clock::now();
@@ -406,61 +406,43 @@ inline bool CondorJobWatcher::stop_requested()
 inline void CondorJobWatcher::handle_exec_event(uint32_t pid)
 {
     // Runs on the polling thread. The event is only a hint: the observation is
-    // built from current procfs/ad evidence, and metadata that is not ready yet
-    // is re-read by this same loop instead of being handed to a worker.
-    const auto now = RegistrationTurn::Clock::now();
+    // built from current procfs/ad evidence and registered right here, in
+    // memory. Nothing on this path waits for persistence, so a burst of job
+    // starts cannot block the ring.
+    JobSink sink;
+    {
+        std::lock_guard<std::mutex> lock(life_mutex_);
+        sink = sink_.on_job;
+    }
+    if (!sink) return;
+
     std::optional<Observation> observation;
     try {
         observation = observeForHint(static_cast<pid_t>(pid));
     } catch (const std::exception& error) {
-        spdlog::debug("CondorJobWatcher: exec hint {} could not be resolved: {}", pid,
-                      error.what());
+        spdlog::debug("CondorJobWatcher: exec hint {} could not be resolved: {}", pid, error.what());
     }
     if (!observation) return;   // not a JobLens execution, or it already exited
+
     if (observation->identity_complete) {
-        turn_.offer(*observation);
+        UpsertResult result;
+        try {
+            result = sink(*observation);
+        } catch (const std::exception& error) {
+            spdlog::error("CondorJobWatcher: registration sink failed: {}", error.what());
+            requestRescan();
+            return;
+        }
+        // A facts/metadata failure asks the maintenance pass to look again; a
+        // post-commit failure is repaired from record state.
+        if (!result.ok && result.retry_registration()) requestRescan();
         return;
     }
-    // Incomplete metadata: keep the pid for a bounded re-read. The full scan
-    // still covers whatever outlives the window.
-    turn_.rememberPid(static_cast<pid_t>(pid),
-                      RegistrationTurn::childIdentity(*observation, static_cast<pid_t>(pid)),
-                      now);
+
+    // The scheduler metadata is not written yet (the ad/spool appears a moment
+    // after exec). One coalesced rescan request converges it in tens of ms
+    // without any per-pid state on this thread.
     requestRescan();
-}
-
-inline void CondorJobWatcher::process_due_rewrites()
-{
-    const auto now = RegistrationTurn::Clock::now();
-    const auto due = turn_.take_due(now, 32);
-    for (const auto& entry : due) {
-        const pid_t pid = entry.pid;
-        std::optional<Observation> observation;
-        try {
-            observation = observeForHint(pid);
-        } catch (const std::exception& error) {
-            spdlog::debug("CondorJobWatcher: re-read of hint {} failed: {}", pid, error.what());
-        }
-        if (observation && observation->identity_complete) {
-            // A reused pid or a different process now must not be registered as
-            // the original hint.
-            if (!RegistrationTurn::sameChild(entry.child, *observation, pid)) {
-                spdlog::debug("CondorJobWatcher: dropping hint {} (pid reused or execution ended)", pid);
-                continue;
-            }
-            turn_.offer(*observation);
-            continue;
-        }
-        // Still incomplete: keep the ORIGINAL deadline and advance the
-        // attempt, so the 30 s window is never restarted.
-        turn_.reschedule(pid, entry.first, entry.attempt + 1, RegistrationTurn::Clock::now());
-    }
-    flush_turn();   // a tail batch never waits for the next event
-}
-
-inline void CondorJobWatcher::flush_turn()
-{
-    turn_.flush();
 }
 
 inline ScanResult CondorJobWatcher::finish_scan(ScanResult result)
@@ -687,8 +669,10 @@ inline bool CondorJobWatcher::init_event_source()
         // Handle the CURRENT sample first: libbpf has already advanced the
         // consumer position, so a sample that is not taken now is lost.
         ptr->handle_exec_event(event_ptr->pid);
-        const auto now = RegistrationTurn::Clock::now();
-        if (ptr->turn_.should_yield(now, ptr->stop_requested())) {
+        // Bound the turn: the sample above is already handled, so yielding now
+        // only ends libbpf's consume loop and lets the stop/scan checks run.
+        ++ptr->samples_this_turn_;
+        if (ptr->samples_this_turn_ >= kSamplesPerTurn || ptr->stop_requested()) {
             ptr->yield_requested_ = true;
             return -ECANCELED;
         }
