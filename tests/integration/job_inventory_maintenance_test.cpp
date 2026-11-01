@@ -726,6 +726,10 @@ void run_a10(const std::string& base)
     // read and without any collector involvement.
     probes.set_process(5400, LivenessState::Dead);
     probes.set_cgroup("/cg/slot-4", {}, true);
+    // Consume any rescan request left over from the earlier phases: a pending
+    // request legitimately forces a scan, which would make this assertion about
+    // the targeted retirement path meaningless.
+    registry.runInventoryPass(true);
     const int scans_before = source.scans();
     registry.notifyExit(5400);
     check(wait_until([&]() { return !find_native(registry, "300.0").has_value(); }, 3000),

@@ -601,7 +601,10 @@ void closing_state_is_durable_and_not_resurrected(const std::string& base)
               "a closing instance must leave the active map");
         check(registry.inventoryRecord(internal_id).has_value(),
               "a closing instance stays visible until the archive");
-        registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite);
+        // The shutdown checkpoint is the first durable write deinit performs;
+        // skip it so the injected failure lands on the archive (the failure
+        // under test), exactly like a disk error during archival.
+        registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite, /*skip=*/1);
         check(!registry.deinit(),
               "deinit must report a shutdown that could not archive the drain");
     }
@@ -731,6 +734,80 @@ void registration_errors_are_typed_and_exhaustively_mapped(const std::string& ba
     check(rejected.error == "incomplete_identity",
           "the wire string must stay unchanged, got " + rejected.error);
     check(rejected.retry_registration(), "the typed result must project to a source retry");
+}
+
+// A03 (durability tiering) ---------------------------------------------------
+
+// The registration hot path must not fence: facts and intent are written
+// without a sync and made durable by one checkpoint (or by shutdown).
+void hot_path_registration_does_not_fsync(const std::string& base)
+{
+    const auto path = fresh_dir(base, "sync-tiering");
+    JobRegistry registry(isolated(path));
+
+    const auto before = registry.storeHealth();
+    const auto jobs = std::vector<Job>{condor_observation("801.0"), condor_observation("802.0"),
+                                       condor_observation("803.0")};
+    const auto results = registry.registerDiscoveredJobs(jobs);
+    for (const auto& result : results) check(result.ok, "the batch must register");
+    std::string error;
+    BindingRecord binding;
+    binding.internal_id = results.front().internal_id;
+    binding.revision = 1;
+    binding.mode = CollectionMode::Auto;
+    binding.auto_collectors = {"cpumem_collector"};
+    check(registry.commitBindings({binding}, error), "the binding must commit: " + error);
+
+    const auto after = registry.storeHealth();
+    check(after.sync_commits == before.sync_commits,
+          "registration and intent must not fsync, saw " +
+              std::to_string(after.sync_commits - before.sync_commits) + " sync commit(s)");
+    check(after.durable_commits > before.durable_commits,
+          "the writes must still reach LevelDB (unsynced)");
+    check(after.dirty_records > 0 && after.dirty_bindings > 0,
+          "an unsynced row must stay visible in the dirty set until the checkpoint");
+
+    // The checkpoint (or shutdown) is where the fence happens.
+    const auto synced_before = registry.storeHealth().sync_commits;
+    check(registry.deinit(), "shutdown must succeed");
+    (void)synced_before;
+}
+
+// A03 (shutdown recovery) ----------------------------------------------------
+
+// Everything written during runtime survives a graceful restart even though the
+// hot path never fenced: deinit() flushes the dirty set before closing.
+void shutdown_flush_persists_runtime_changes(const std::string& base)
+{
+    const auto path = fresh_dir(base, "shutdown-flush");
+    std::uint64_t id = 0;
+    {
+        JobRegistry registry(isolated(path));
+        const auto created = registry.upsertObservedJob(condor_observation("810.0"));
+        check(created.ok, "the instance must register");
+        id = created.internal_id;
+
+        std::string error;
+        BindingRecord binding;
+        binding.internal_id = id;
+        binding.revision = 1;
+        binding.mode = CollectionMode::Manual;
+        binding.manual_collectors = {"cpumem_collector"};
+        check(registry.commitBindings({binding}, error), "the binding must commit: " + error);
+        check(registry.deinit(), "shutdown must succeed");
+    }
+    {
+        // Fresh process on the same directory: no re-observation, no rescan —
+        // the state comes back from the shutdown flush only.
+        JobRegistry registry(isolated(path));
+        const auto record = registry.inventoryRecord(id);
+        check(record.has_value(), "the instance must survive the restart");
+        check(record->job.NativeJobID == "810.0", "the facts must survive the restart");
+        const auto binding = registry.bindingRecord(id);
+        check(binding.mode == CollectionMode::Manual &&
+                  binding.manual_collectors == std::vector<std::string>{"cpumem_collector"},
+              "the intent must survive the restart");
+    }
 }
 
 // A26 (allocator order) ------------------------------------------------------
@@ -1361,6 +1438,8 @@ int main(int argc, char** argv)
         archived_instances_leave_no_active_row(base);
         ambiguous_registration_resolves_after_restart(base);
         batch_merges_share_one_facts_transaction(base);
+        hot_path_registration_does_not_fsync(base);
+        shutdown_flush_persists_runtime_changes(base);
         standalone_allocation_cannot_interleave_with_a_batch(base);
         duplicate_input_shares_the_batch_failure(base);
         conflicting_fresh_candidates_are_rejected(base);
