@@ -38,6 +38,7 @@
 
 #include "core/job_identity.hpp"
 #include "core/job_collection_manager.hpp"
+#include "core/reentrancy_gate.hpp"
 #include "core/inventory_config.hpp"
 #include "core/inventory_rpc.hpp"
 #include "core/collector_registry.hpp"
@@ -122,6 +123,7 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
         collection_manager_->setCollectorValidator(
             [known](const std::string& name) { return known.count(name) != 0; });
     }
+
 
     if (options.enable_inventory_maintenance) init_inventory(options);
 
@@ -232,14 +234,28 @@ void JobRegistry::drainHints(std::deque<HeartbeatHint>& out) {
     }
 }
 
-ObservedExecution JobRegistry::toExecution(const Observation& observation) const {
-    ObservedExecution execution;
-    execution.selector = observation.selector;
+Job JobRegistry::toJob(const Observation& observation) const {
+    // The Job is the registration unit (plan §4.1): facts plus one execution
+    // evidence group, no second envelope. The encoder still owns the
+    // scheduler-specific attribute projection.
+    Job job = facts_encoder_(observation);
+    job.subtype_name = observation.selector.adapter;
+    job.cluster_name = observation.selector.cluster_name;
+    job.clusterTag = observation.selector.cluster_tag;
+    job.NativeJobID = observation.selector.native_job_id;
+    JobExecution execution;
     execution.generation = observation.generation;
-    execution.processes = observation.members;
-    execution.members_complete = observation.members_complete;
-    if (facts_encoder_) execution.facts = facts_encoder_(observation);
-    return execution;
+    execution.members = observation.members;
+    execution.members_authoritative = observation.members_complete;
+    if (!observation.selector.step_id.empty())
+        execution.step_id = observation.selector.step_id;
+    execution.read_at_us = observation.source_timestamp_ms > 0
+                               ? observation.source_timestamp_ms * 1000
+                               : 0;
+    execution.read_order = observation.read_order;
+    execution.incomplete_reason = observation.incomplete_reason;
+    job.execution = std::move(execution);
+    return job;
 }
 
 void JobRegistry::processObservation(const Observation& observation,
@@ -261,7 +277,7 @@ void JobRegistry::processObservation(const Observation& observation,
                       observation.selector.native_job_id, observation.incomplete_reason);
     }
 
-    const auto result = upsertObservedJob(toExecution(observation));
+    const auto result = upsertObservedJob(toJob(observation));
     if (result.ok) {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         observed.insert(result.internal_id);
@@ -295,133 +311,27 @@ void JobRegistry::processObservation(const Observation& observation,
                        (result.message.empty() ? "" : ": " + result.message));
 }
 
-JobRegistry::ExecResolution JobRegistry::resolveExecHintOnce(pid_t pid) {
-    for (const auto& [name, source] : hb_sources_) {
-        std::optional<Observation> observation;
-        try {
-            observation = source->observeForHint(pid);
-        } catch (const std::exception& error) {
-            spdlog::debug("JobRegistry: source '{}' could not resolve hint {}: {}",
-                          name, pid, error.what());
+void JobRegistry::repairMissingInitialDecisions() {
+    // Bounded per pass: a large backlog converges over several passes instead
+    // of stalling one.
+    constexpr std::size_t kMaxPerPass = 128;
+    std::size_t repaired = 0;
+    for (const auto& record : store_->records()) {
+        if (repaired >= kMaxPerPass) break;
+        if (!missing_initial_decision(record)) continue;
+        auto policy_targets = std::vector<uint64_t>{record.internal_id};
+        std::vector<AutoSelection> selections;
+        evaluateAutoPolicies(policy_targets, selections);
+        if (selections.empty()) continue;   // no enabled policy for this adapter
+        const auto outcome = collection_manager_->applyAutoPolicy(selections);
+        if (!outcome.ok) {
+            spdlog::warn("JobRegistry: initial decision repair for JobID {} was rejected: {}",
+                         record.internal_id, outcome.message);
             continue;
         }
-        if (!observation) continue;   // not this source's execution
-        std::set<uint64_t> observed;
-        processObservation(*observation, observed);
-        return observation->identity_complete ? ExecResolution::Resolved
-                                              : ExecResolution::Incomplete;
-    }
-    // Unresolvable hints are not errors: the pid may be gone already or belong
-    // to no execution; the authoritative scan covers whatever remains.
-    std::lock_guard<std::mutex> lock(hb_mtx_);
-    ++hb_unresolved_hints_;
-    return ExecResolution::Unresolved;
-}
-
-void JobRegistry::ingestLoop() {
-    {
-        std::lock_guard<std::mutex> lock(ingest_mtx_);
-        ingest_worker_id_ = std::this_thread::get_id();
-    }
-    std::unique_lock<std::mutex> lock(ingest_mtx_);
-    while (!ingest_stopping_) {
-        std::int64_t wait_ms = -1;
-        if (!ingest_retries_.empty()) {
-            std::int64_t next_due = std::numeric_limits<std::int64_t>::max();
-            for (const auto& retry : ingest_retries_)
-                next_due = std::min(next_due, retry.due_ms);
-            const std::int64_t now = now_epoch_ms();
-            wait_ms = next_due > now ? next_due - now : 0;
-            wait_ms = std::min<std::int64_t>(wait_ms, 1000);
-        }
-        ingest_cv_.wait_for(lock, std::chrono::milliseconds(wait_ms), [this]() {
-            return ingest_stopping_ || !ingest_queue_.empty();
-        });
-        if (ingest_stopping_) break;
-
-        // One batch: fresh hints plus retries whose deadline passed. Each
-        // entry carries its attempt so failures ladder without re-counting.
-        std::vector<ExecRetry> batch;
-        for (const pid_t pid : ingest_queue_) batch.push_back(ExecRetry{pid, 0, 0});
-        ingest_queue_.clear();
-        const std::int64_t now = now_epoch_ms();
-        std::vector<ExecRetry> pending;
-        for (auto& retry : ingest_retries_) {
-            if (retry.due_ms <= now) batch.push_back(retry);
-            else pending.push_back(retry);
-        }
-        ingest_retries_.swap(pending);
-        lock.unlock();
-
-        for (const auto& item : batch) {
-            if (ingest_stopping_) break;
-            const auto resolution = resolveExecHintOnce(item.pid);
-            if (resolution != ExecResolution::Incomplete) {
-                std::lock_guard<std::mutex> guard(ingest_mtx_);
-                ingest_inflight_.erase(item.pid);
-                continue;
-            }
-            // Incomplete (scheduler state not yet written): ladder or hand
-            // over to one coalesced authoritative rescan.
-            const std::size_t next = static_cast<std::size_t>(item.attempt);
-            bool laddered = false;
-            {
-                std::lock_guard<std::mutex> guard(ingest_mtx_);
-                if (next < std::size(kExecRetryDelaysMs) &&
-                    ingest_retries_.size() < kIngestRetryCapacity) {
-                    ingest_retries_.push_back(ExecRetry{
-                        item.pid, item.attempt + 1,
-                        now_epoch_ms() + kExecRetryDelaysMs[next]});
-                    laddered = true;
-                } else {
-                    ingest_inflight_.erase(item.pid);
-                }
-            }
-            if (!laddered) requestRescan("exec hint unresolved after retries");
-        }
-        if (ingest_stopping_) break;
-        // Re-acquire before the next wait; the break paths exit with the
-        // unique_lock unlocked, which its destructor handles state-aware.
-        lock.lock();
-    }
-}
-
-void JobRegistry::startExecIngest() {
-    std::lock_guard<std::mutex> lock(ingest_mtx_);
-    if (ingest_stopping_ || (ingest_thread_ && ingest_thread_->joinable())) return;
-    ingest_running_ = true;
-    ingest_thread_ = std::make_unique<std::thread>([this]() { ingestLoop(); });
-}
-
-void JobRegistry::stopExecIngest() {
-    std::unique_ptr<std::thread> thread;
-    {
-        std::lock_guard<std::mutex> lock(ingest_mtx_);
-        ingest_stopping_ = true;
-        if (!ingest_running_ && !(ingest_thread_ && ingest_thread_->joinable()))
-            return;
-        thread = std::move(ingest_thread_);
-        ingest_running_ = false;
-    }
-    ingest_cv_.notify_all();
-    if (thread && thread->joinable()) {
-        const bool on_ingest_thread =
-            ingest_worker_id_ != std::thread::id() &&
-            ingest_worker_id_ == std::this_thread::get_id();
-        if (on_ingest_thread) {
-            // Same rule as the heartbeat worker: a callback from the ingest
-            // thread must never self-join; report incomplete instead.
-            spdlog::error("JobRegistry: exec ingest stop() called from its own "
-                          "worker; shutdown reported incomplete instead of "
-                          "deadlocking");
-            thread.release();
-        } else {
-            thread->join();
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lock(ingest_mtx_);
-        ingest_worker_id_ = std::thread::id();
+        ++repaired;
+        spdlog::info("JobRegistry: repaired the missing initial decision of JobID {}",
+                     record.internal_id);
     }
 }
 
@@ -721,12 +631,19 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
     }
     if (needs_authoritative_pass) requestRescan("process/attribute hint");
 
-    // Exec hints never reach the pass: the ingest worker owns them (the
-    // fast path) and resolves pids through observeForHint directly.
+    // Automatic policy is synchronous with registration; there is no deferred
+    // backlog to drain here (plan §1.1.3).
+
+    // Exec hints never reach this pass: the source resolves them on its own
+    // poll thread and registers the resulting Job synchronously.
 
     // Records no discovery source owns (legacy/manual registrations, or types
     // whose inventory source was removed) are refreshed here; reads never do.
     if (do_scan) refreshLegacyRecords();
+
+    // Missing initial decisions are a record-driven obligation: repair them on
+    // every pass, even when no new observation arrived (plan §5.5).
+    repairMissingInitialDecisions();
 
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
@@ -847,8 +764,20 @@ void JobRegistry::installHeartbeatSink() {
     heartbeat_sink_.on_observation = [this](const Observation& observation) {
         onDiscoveryObservation(observation);
     };
-    heartbeat_sink_.on_exec_hint = [this](pid_t pid) {
-        onDiscoveryExecHint(pid);
+    // The one registration entry every source uses: convert on the source's
+    // own thread and register synchronously. No ingest worker, no queue.
+    heartbeat_sink_.to_job = [this](const Observation& observation) {
+        // One call == one resolved exec event / scan observation the source
+        // handed over, so this is where the "events received" surface counts
+        // now that the source registers on its own thread.
+        {
+            std::lock_guard<std::mutex> lock(hb_mtx_);
+            ++hb_events_received_;
+        }
+        return toJob(observation);
+    };
+    heartbeat_sink_.on_jobs = [this](const std::vector<Job>& jobs) {
+        return registerDiscoveredJobs(jobs);
     };
 }
 
@@ -898,13 +827,6 @@ void JobRegistry::init_inventory(const JobRegistryOptions& options)
         hb_passes_ = 0;
         hb_stop_errors_ = 0;
     }
-    {
-        std::lock_guard<std::mutex> lock(ingest_mtx_);
-        ingest_stopping_ = false;
-        ingest_queue_.clear();
-        ingest_inflight_.clear();
-        ingest_retries_.clear();
-    }
     installHeartbeatSink();
 
     const InventoryWiring wiring = resolve_inventory_components(options);
@@ -918,7 +840,6 @@ void JobRegistry::init_inventory(const JobRegistryOptions& options)
     }
     publishStatusProvider();
     startHeartbeat();
-    startExecIngest();
 
     if (wiring == InventoryWiring::Test)
         spdlog::info("JobRegistry: heartbeat running with {} test source(s)",
@@ -938,6 +859,10 @@ JobRegistry::resolve_inventory_components(const JobRegistryOptions& options)
         process_probe_ = options.test_process_probe;
         cgroup_probe_ = options.test_cgroup_probe;
         facts_encoder_ = options.test_facts_encoder;
+        if (options.test_auto_policy) {
+            auto_policies_.clear();
+            auto_policies_[options.test_auto_policy_adapter] = options.test_auto_policy();
+        }
         reconcile_interval_sec_ = 30;
         return InventoryWiring::Test;
     }
@@ -952,6 +877,8 @@ JobRegistry::resolve_inventory_components(const JobRegistryOptions& options)
         return InventoryWiring::Disabled;
     }
     reconcile_interval_sec_ = config.reconcile_interval_sec;
+    // Configuration wins over the construction default so the budget is a
+    // deployment knob, not a rebuild.
 
     // Exactly one adapter per configured scheduler name, built through the
     // self-registration registry; the heartbeat drives them through
@@ -1057,9 +984,6 @@ void JobRegistry::startDiscoverySources(InventoryWiring wiring)
 }
 
 void JobRegistry::stopInventoryDiscovery() {
-    // The ingest worker produces upserts: stop it before the heartbeat so a
-    // final pass never races a targeted resolution.
-    stopExecIngest();
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         if (!hb_admitted_ && !hb_running_ &&
@@ -1132,11 +1056,20 @@ void JobRegistry::stopInventoryDiscovery() {
 }
 
 
-void JobRegistry::apply_auto_policy(const Job& job, const std::string& adapter)
+std::optional<bool> JobRegistry::apply_auto_policy(const Job& job,
+                                                   const std::string& adapter)
 {
-    const auto policy = auto_policies_.find(adapter);
-    if (policy == auto_policies_.end() || !policy->second.enabled()) return;
+    const auto decision = autoSelectionFor(job, adapter);
+    if (!decision) return std::nullopt;   // no enabled policy: no decision needed
+    const bool committed =
+        applyAutoSelection(job.JobID, decision->collectors, decision->policy_revision);
+    return committed;
+}
 
+std::optional<JobRegistry::AutoDecision> JobRegistry::autoSelectionFor(
+    const Job& job, const std::string& adapter) {
+    const auto policy = auto_policies_.find(adapter);
+    if (policy == auto_policies_.end() || !policy->second.enabled()) return std::nullopt;
     std::string revision;
     std::string error;
     const auto collectors = policy->second.select(job, revision, error);
@@ -1144,9 +1077,12 @@ void JobRegistry::apply_auto_policy(const Job& job, const std::string& adapter)
         spdlog::warn("JobRegistry: automatic selection failed for JobID {}; keeping the "
                      "previous decision: {}",
                      job.JobID, error);
-        return;
+        return std::nullopt;
     }
-    applyAutoSelection(job.JobID, collectors, revision);
+    AutoDecision decision;
+    decision.collectors = collectors;
+    decision.policy_revision = revision;
+    return decision;
 }
 
 bool JobRegistry::applyAutoSelection(uint64_t internal_id,
@@ -1161,7 +1097,15 @@ bool JobRegistry::applyAutoSelection(uint64_t internal_id,
                      internal_id, outcome.message);
         return false;
     }
-    return true;
+    // The decision is durable when the instance reached a stored intent. A
+    // skipped target (unknown instance/collector) or a failed transaction is
+    // not committed even though the batch reported ok.
+    for (const auto& target : outcome.targets) {
+        if (target.internal_id != internal_id) continue;
+        return target.binding.revision > 0 &&
+               target.applied.error.rfind("intent write failed", 0) != 0;
+    }
+    return false;   // no target: the selection was skipped, not committed
 }
 
 bool JobRegistry::deinit()
@@ -1702,9 +1646,33 @@ void JobRegistry::addLifecycleCb(JobLifecycleCb cb) {
 // Inventory store facade
 // ---------------------------------------------------------------------------
 
-UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation) {
+// True when an instance is live and policy-eligible but still has no durable
+// intent: the initial decision never landed (write failure, crash) or the
+// execution generation completed later. Derived from durable state, so it also
+// holds after a restart.
+bool JobRegistry::missing_initial_decision(const JobRecord& record) const
+{
+    if (record.state != kStateActive) return false;
+    if (record.job.execution && !record.job.execution->generation.complete()) return false;
+    if (!record.identity_complete) return false;
+    return store_->binding(record.internal_id).revision == 0;
+}
+
+std::optional<bool> JobRegistry::repair_initial_decision(const JobRecord& record,
+                                                         UpsertResult& result)
+{
+    const auto committed = apply_auto_policy(record.job, record.identity.adapter);
+    if (committed == false) {
+        result.code = RegistrationError::InitialIntentWriteFailed;
+        result.error = to_string(result.code);
+        result.message = "the initial automatic decision could not be committed";
+    }
+    return committed;
+}
+
+UpsertResult JobRegistry::upsertObservedJob(const Job& job) {
     JobRecord record;
-    UpsertResult result = store_->upsert(observation, record);
+    UpsertResult result = store_->upsert(job, record);
     if (!result.ok) return result;
 
     if (result.disposition == UpsertDisposition::Created) {
@@ -1721,8 +1689,15 @@ UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation
         // observation whose execution generation is not verified yet is never
         // auto-collected: the update that completes the generation re-runs
         // the selection instead.
-        if (observation.generation.complete())
-            apply_auto_policy(record.job, record.identity.adapter);
+        if (generation_of(job).complete()) {
+            result.intent_committed =
+                apply_auto_policy(record.job, record.identity.adapter);
+            if (result.intent_committed == false) {
+                result.code = RegistrationError::InitialIntentWriteFailed;
+                result.error = to_string(result.code);
+                result.message = "the initial automatic decision could not be committed";
+            }
+        }
     } else if (result.disposition == UpsertDisposition::Updated) {
         // Fact changes reach already bound consumers (fresh PIDs/attributes)
         // and the collection runtime outside every registry lock. The
@@ -1732,11 +1707,116 @@ UpsertResult JobRegistry::upsertObservedJob(const ObservedExecution& observation
         applyLatestCollectionIntent(record.internal_id);
         // A record registered from an incomplete observation has never seen
         // an automatic selection. The pass that completes its execution
-        // generation is its first complete registration.
-        if (result.generation_became_complete)
-            apply_auto_policy(record.job, record.identity.adapter);
+        // generation is its first complete registration. A record whose
+        // initial decision never became durable is repaired here too, not
+        // only on the Created path (plan §5.5).
+        if (result.generation_became_complete || missing_initial_decision(record))
+            result.intent_committed = repair_initial_decision(record, result);
+    } else if (result.disposition == UpsertDisposition::Unchanged) {
+        // A repeated observation is the record-driven repair path: if the
+        // initial automatic decision is still missing, decide now.
+        if (missing_initial_decision(record))
+            result.intent_committed = repair_initial_decision(record, result);
     }
     return result;
+}
+
+std::vector<UpsertResult> JobRegistry::registerDiscoveredJobs(
+    const std::vector<Job>& jobs) {
+    std::vector<JobRecord> records;
+    auto results = store_->upsertBatch(jobs, records);
+    if (results.empty()) return results;
+
+    // Facts are durable in one batch. What follows is exactly the per-instance
+    // obligation set of the single registration path: kernel attribution and
+    // Added for new instances, intent application for updates.
+    std::vector<uint64_t> policy_targets;
+    for (size_t i = 0; i < results.size(); ++i) {
+        const auto& result = results[i];
+        if (!result.ok) continue;
+        if (result.disposition == UpsertDisposition::Created) {
+            sync_job_to_kernel(records[i].job);
+            broadcast_lifecycle(JobEvent::Added, records[i].job);
+            if (generation_of(jobs[i]).complete())
+                policy_targets.push_back(result.internal_id);
+        } else if (result.disposition == UpsertDisposition::Updated) {
+            applyLatestCollectionIntent(result.internal_id);
+            if (result.generation_became_complete) policy_targets.push_back(result.internal_id);
+        }
+        // The event path is the production entry: an instance whose initial
+        // decision never became durable must be repaired here too, not only on
+        // the single-upsert path (plan §5.5).
+        if (result.disposition != UpsertDisposition::Created) {
+            const auto record = store_->record(result.internal_id);
+            if (record && missing_initial_decision(*record)) {
+                if (std::find(policy_targets.begin(), policy_targets.end(),
+                              result.internal_id) == policy_targets.end())
+                    policy_targets.push_back(result.internal_id);
+            }
+        }
+    }
+
+    // Per-job rule evaluation is not bounded by the commit count, so it is
+    // timed and warned about, but never deferred: the plan keeps the initial
+    // decision synchronous with the registration that triggered it. A slow
+    // rule set costs latency, it does not silently drop the decision.
+    std::vector<AutoSelection> selections;
+    const auto started = std::chrono::steady_clock::now();
+    (void)evaluateAutoPolicies(policy_targets, selections);
+    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - started).count();
+    if (policy_targets.size() >= 16 && elapsed_us > 5000) {
+        spdlog::warn("JobRegistry: automatic policy evaluated {} job(s) in {} us on the "
+                     "discovery thread", policy_targets.size(), elapsed_us);
+    }
+
+    // One durable intent transaction for the whole burst instead of one per
+    // job; the runtime application stays per instance inside the manager. The
+    // per-target results are mapped back onto the registration results, so a
+    // rejected or skipped decision is attributable instead of being reduced to
+    // a batch-wide ok flag (plan §5.1).
+    if (!selections.empty()) {
+        const auto outcome = collection_manager_->applyAutoPolicy(selections);
+        if (!outcome.ok)
+            spdlog::warn("JobRegistry: batch automatic selection was rejected: {}",
+                         outcome.message);
+
+        std::map<uint64_t, const CollectionTargetOutcome*> by_id;
+        for (const auto& target : outcome.targets) by_id[target.internal_id] = &target;
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i].ok) continue;
+            const auto it = by_id.find(results[i].internal_id);
+            if (it == by_id.end()) continue;   // no automatic decision for this item
+            const auto& target = *it->second;
+            const bool intent_durable =
+                target.binding.revision > 0 &&
+                target.applied.error.rfind("intent write failed", 0) != 0;
+            results[i].intent_committed = intent_durable;
+            if (!intent_durable && results[i].code == RegistrationError::None) {
+                results[i].code = outcome.error == CollectionError::StoreUnavailable
+                                      ? RegistrationError::InitialIntentWriteFailed
+                                      : RegistrationError::PolicyEvaluationFailed;
+                results[i].error = to_string(results[i].code);
+                results[i].message = target.applied.error.empty() ? outcome.message
+                                                                  : target.applied.error;
+            }
+        }
+    }
+    return results;
+}
+
+void JobRegistry::evaluateAutoPolicies(const std::vector<uint64_t>& internal_ids,
+                                       std::vector<AutoSelection>& out) {
+    if (internal_ids.empty()) return;
+
+    for (const uint64_t internal_id : internal_ids) {
+        const auto record = store_->record(internal_id);
+        if (!record || record->state != kStateActive) continue;   // retired meanwhile
+        auto decision = autoSelectionFor(record->job, record->identity.adapter);
+        if (!decision) continue;   // no enabled policy for this adapter
+        out.push_back(AutoSelection{internal_id, std::move(decision->collectors),
+                                    std::move(decision->policy_revision)});
+    }
 }
 
 std::optional<JobRecord> JobRegistry::inventoryRecord(uint64_t jobID) const {
@@ -1758,6 +1838,13 @@ BindingRecord JobRegistry::bindingRecord(uint64_t jobID) const {
 
 bool JobRegistry::commitBindings(const std::vector<BindingRecord>& bindings,
                                  std::string& error) {
+    if (joblens::in_mutation_gate()) {
+        // A hook/observer must not commit new intent from inside the gate: the
+        // outer call would then publish a runtime result for an older binding.
+        error = "reentrant_mutation";
+        spdlog::warn("JobRegistry: reentrant commitBindings refused");
+        return false;
+    }
     std::vector<std::pair<JobRecord, bool>> updated;
     if (!store_->commitBindings(bindings, updated, error)) return false;
 
@@ -1794,6 +1881,10 @@ void JobRegistry::injectStoreFaultForTest(StoreFaultMode mode, size_t skip, size
     store_->injectFaultForTest(mode, skip, count);
 }
 
+void JobRegistry::setPreCommitHookForTest(std::function<void()> hook) {
+    store_->setPreCommitHookForTest(std::move(hook));
+}
+
 void JobRegistry::clearStoreFaultsForTest() {
     store_->clearFaultsForTest();
 }
@@ -1807,7 +1898,21 @@ void JobRegistry::setCollectionApplier(CollectionApplier applier) {
     collection_applier_ = std::move(applier);
 }
 
+bool JobRegistry::inApplyGate() const
+{
+    // Shared with the collection manager: a hook that mutates intent while the
+    // apply gate is held is refused at the mutation entry, not after the
+    // commit (plan §7.3).
+    return joblens::in_mutation_gate();
+}
+
 void JobRegistry::applyLatestCollectionIntent(uint64_t internal_id) {
+    if (joblens::in_mutation_gate()) {
+        spdlog::warn("JobRegistry: refusing reentrant collection application for JobID {} "
+                     "(mutation from inside the apply gate)", internal_id);
+        return;
+    }
+    joblens::MutationGateScope gate_scope;
     CollectionApplier applier;
     {
         std::lock_guard<std::mutex> lock(applier_mtx_);
@@ -1829,22 +1934,29 @@ void JobRegistry::applyLatestCollectionIntent(uint64_t internal_id) {
         // error state for an unbound instance would misreport it.
         return;
     }
-    if (previous.applied && previous.revision == binding.revision &&
-        previous.collectors == binding.effectiveCollectors()) {
-        return;   // already converged
-    }
-
     Job job;
+    std::uint64_t facts_revision = 0;
     {
         auto record = store_->record(internal_id);
         if (!record || record->state == kStateClosing) {
             return;   // retired or draining meanwhile: nothing to apply
         }
         job = record->job;
+        facts_revision = record->facts_revision;
+    }
+
+    // Converged means: same binding AND the runtime already saw these facts. A
+    // facts update with an unchanged binding must still refresh the snapshot
+    // (plan §7.2).
+    if (previous.applied && previous.revision == binding.revision &&
+        previous.collectors == binding.effectiveCollectors() &&
+        previous.facts_revision == facts_revision) {
+        return;
     }
 
     AppliedCollection applied;
     applied.revision = binding.revision;
+    applied.facts_revision = facts_revision;
     if (!applier) {
         // No collection runtime on this Agent (inventory-only core, tests).
         // The intent is durable, but nothing was applied: say so.
@@ -1881,15 +1993,10 @@ void JobRegistry::applyLatestCollectionIntent(uint64_t internal_id) {
     }
 
     // recordApplied is a no-op when the instance was retired meanwhile; its
-    // applied state then no longer has an owner.
+    // applied state then no longer has an owner. It also stamps the
+    // Job.collection projection under the same lock, so AppliedCollection and
+    // the Job view can never be observed disagreeing.
     store_->recordApplied(internal_id, applied);
-    // Stamp the runtime-reported holders onto the stored projection (in-memory
-    // only: collection status never survives a restart as true — the replay
-    // re-attaches and the next application re-stamps it).
-    store_->mutateRecord(internal_id, [&applied](JobRecord& record) {
-        record.job.collection.in_pipeline = !applied.collectors.empty();
-        record.job.collection.collectors = applied.collectors;
-    });
 }
 
 void JobRegistry::reconcileCollectionIntent(uint64_t internal_id) {
@@ -1928,14 +2035,11 @@ void JobRegistry::regRPCHandle() {
         });
 }
 
-void JobRegistry::onDiscoveryObservation(const Observation& observation) {
-    HeartbeatHint hint;
-    hint.kind = HeartbeatHint::Kind::Observation;
-    hint.observation = observation;
-    enqueueHint(std::move(hint));
-}
-
 void JobRegistry::onDiscoveryExecHint(pid_t pid) {
+    // Synchronous entry for out-of-band producers and tests. The watchers drive
+    // their own poll-turn registration and no longer come through here, but a
+    // hint still resolves and registers on the CALLER's thread: there is no
+    // ingest worker to hand it to (plan P4).
     if (pid <= 0) return;
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
@@ -1945,27 +2049,35 @@ void JobRegistry::onDiscoveryExecHint(pid_t pid) {
             return;
         }
     }
-    // The ingest worker resolves the pid immediately (the fast path); the
-    // dedup keeps one entry per pid while it is queued or retrying.
-    bool queued = false;
+    std::vector<std::pair<std::string, IDiscoverySource*>> sources;
     {
-        std::lock_guard<std::mutex> lock(ingest_mtx_);
-        if (!ingest_stopping_ && ingest_inflight_.insert(pid).second) {
-            if (ingest_queue_.size() < kIngestQueueCapacity) {
-                ingest_queue_.push_back(pid);
-                queued = true;
-            } else {
-                ingest_inflight_.erase(pid);
-            }
-        }
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        sources = hb_sources_;
     }
-    if (queued) {
-        ingest_cv_.notify_one();
+    std::set<uint64_t> observed;
+    for (const auto& [name, source] : sources) {
+        if (source == nullptr) continue;
+        std::optional<Observation> observation;
+        try {
+            observation = source->observeForHint(pid);
+        } catch (const std::exception& error) {
+            spdlog::debug("JobRegistry: source '{}' could not resolve hint {}: {}",
+                          name, pid, error.what());
+            continue;
+        }
+        if (!observation) continue;   // not this source's execution
+        processObservation(*observation, observed);
         return;
     }
-    // Duplicate or overflowing hint: counted, never blocking the producer.
     std::lock_guard<std::mutex> lock(hb_mtx_);
-    ++hb_events_dropped_;
+    ++hb_unresolved_hints_;
+}
+
+void JobRegistry::onDiscoveryObservation(const Observation& observation) {
+    HeartbeatHint hint;
+    hint.kind = HeartbeatHint::Kind::Observation;
+    hint.observation = observation;
+    enqueueHint(std::move(hint));
 }
 
 nlohmann::json JobRegistry::heartbeatStatusJson() const {
@@ -1987,6 +2099,8 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     std::uint64_t passes = 0;
     std::size_t queue_depth = 0;
     std::size_t exec_ingest_depth = 0;
+    std::size_t policy_pending = 0;
+    std::uint64_t policy_deferred_total = 0;
     std::int64_t last_scan_start_ms = 0;
     std::int64_t last_scan_success_ms = 0;
     bool last_scan_complete = false;
@@ -2015,10 +2129,13 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
         degraded = degraded_;
         last_error = hb_last_error_;
     }
-    {
-        std::lock_guard<std::mutex> lock(ingest_mtx_);
-        exec_ingest_depth = ingest_queue_.size() + ingest_retries_.size();
-    }
+    // Deprecated: the exec ingest worker is gone (plan P4). The field stays for
+    // status compatibility and is always zero; a fake queue is not reported.
+    (void)exec_ingest_depth;
+    // The deferred-policy FIFO was removed with the experimental budget: the
+    // keys stay for status compatibility and always report zero.
+    (void)policy_pending;
+    (void)policy_deferred_total;
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         for (const auto& started : source_started_) {
@@ -2092,6 +2209,11 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     out["events_dropped"] = events_dropped;
     out["queue_depth"] = queue_depth;
     out["exec_ingest_depth"] = exec_ingest_depth;
+    out["policy_pending"] = policy_pending;
+    out["policy_deferred_total"] = policy_deferred_total;
+    // Deprecated: the per-batch policy budget experiment was removed; policy
+    // is evaluated synchronously and only timed for diagnostics.
+    out["auto_policy_budget_us"] = 0;
     out["rescan_requests"] = rescan_requests;
     out["obsolete_hints"] = obsolete_hints;
     out["unresolved_hints"] = hb_unresolved_hints_;

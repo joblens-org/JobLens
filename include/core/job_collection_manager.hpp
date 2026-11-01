@@ -42,6 +42,9 @@ enum class CollectionError {
     NotFound,
     StaleRevision,
     StoreUnavailable,
+    // The caller tried to mutate intent from inside a gated mutation (a
+    // lifecycle hook or collection applier). Nothing was committed.
+    ReentrantMutation,
 };
 
 inline const char* to_string(CollectionError error)
@@ -52,6 +55,7 @@ inline const char* to_string(CollectionError error)
         case CollectionError::UnknownCollector: return "unknown_collector";
         case CollectionError::NotFound:         return "not_found";
         case CollectionError::StaleRevision:    return "stale_revision";
+        case CollectionError::ReentrantMutation: return "reentrant_mutation";
         case CollectionError::StoreUnavailable: return "store_unavailable";
     }
     return "unknown";

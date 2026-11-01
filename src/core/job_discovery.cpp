@@ -11,7 +11,9 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-#include "core/job_observation.hpp"
+#include "core/job_discovery.hpp"
+
+#include <atomic>
 
 #include <algorithm>
 #include <chrono>
@@ -24,6 +26,8 @@
 namespace fs = std::filesystem;
 
 namespace {
+std::atomic<std::uint64_t> g_read_order{0};
+
 
 // Whole-file read. Returns false with a message instead of throwing so a scan
 // pass reports missing/unreadable entries instead of aborting.
@@ -124,42 +128,6 @@ const char* to_string(SourceState state)
 // Observation accumulation
 // ---------------------------------------------------------------------------
 
-void ObservationAccumulator::add(Observation observation)
-{
-    // One accumulated observation per *execution generation* of one canonical
-    // identity. Two managers for the same logical job must never merge: the
-    // member lists of two executions would be combined into one record and the
-    // registry would lose the chance to reject the second generation with
-    // execution_generation_conflict. Observations with an incomplete identity
-    // or an unresolved generation are never merged at all.
-    if (observation.identity_complete && observation.canonical_identity &&
-        observation.generation.complete()) {
-        const auto key = observation.canonical_identity->key() + '#' +
-                         generation_key(observation.generation);
-        const auto found = by_identity_.find(key);
-        if (found != by_identity_.end()) {
-            auto& existing = observations_[found->second];
-            merge_members(existing.members, observation.members);
-            existing.members_complete = existing.members_complete && observation.members_complete;
-            if (existing.cgroup_path.empty()) existing.cgroup_path = observation.cgroup_path;
-            if (existing.generation.cgroup_identity.empty())
-                existing.generation.cgroup_identity = observation.generation.cgroup_identity;
-            for (const auto& note : observation.notes) {
-                if (std::find(existing.notes.begin(), existing.notes.end(), note) == existing.notes.end())
-                    existing.notes.push_back(note);
-            }
-            return;
-        }
-        by_identity_.emplace(key, observations_.size());
-    }
-    observations_.push_back(std::move(observation));
-}
-
-std::vector<Observation> ObservationAccumulator::take()
-{
-    by_identity_.clear();
-    return std::move(observations_);
-}
 
 // ---------------------------------------------------------------------------
 // procfs / cgroup readers
@@ -367,4 +335,9 @@ void finalize_observation(Observation& observation,
 
     observation.identity_complete = reasons.empty();
     observation.incomplete_reason = join_reasons(reasons);
+}
+
+std::uint64_t next_discovery_read_order()
+{
+    return g_read_order.fetch_add(1, std::memory_order_relaxed) + 1;
 }

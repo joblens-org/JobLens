@@ -807,6 +807,7 @@ nlohmann::json store_health_json(const StoreHealth& health){
         {"migration_complete", health.migration_complete},
         {"migration_state", health.migration_state},
         {"degraded", health.degraded},
+        {"durable_commits", health.durable_commits},
         {"write_failures", health.write_failures},
         {"last_write_error", health.last_write_error},
         {"corrupt_records", health.corrupt_records},

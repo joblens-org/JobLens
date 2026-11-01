@@ -19,6 +19,11 @@
 // (CondorJobWatcher, SlurmJobWatcher) and the inventory maintenance
 // controller:
 //
+// Discovery contract (renamed from job_observation when registration became a
+// Job-based synchronous path; plan §5.1). The header owns source, scan, the
+// proc/cgroup readers and the clock — it must never depend on LevelDB, and the
+// registration result type lives in its own contract header.
+//
 //   * scan()      - one synchronous source pass, returns ScanResult
 //   * health()    - SourceHealth of that source (initializing/healthy/degraded)
 //   * observations - typed facts the controller resolves into JobRegistry
@@ -36,7 +41,9 @@
 //      termination evidence.
 #pragma once
 
+#include "core/collector_type.h"
 #include "core/job_identity.hpp"
+#include "core/registration_contract.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -131,6 +138,10 @@ struct Observation {
 
     // Time the source data for this observation was read.
     std::int64_t source_timestamp_ms = 0;
+    // Process-monotonic read order assigned before the source starts reading;
+    // out-of-order commits use it so an older scan never overwrites a newer
+    // event (plan §4.1).
+    std::uint64_t read_order = 0;
     // Per-observation notes, e.g. "cgroup membership unreadable".
     std::vector<std::string> notes;
 };
@@ -220,25 +231,38 @@ struct DiscoveryOptions {
     // Periodic scan tick of the adapter's poll thread; 0 disables it (the
     // maintenance controller owns pacing and runs the authoritative passes).
     std::uint32_t scan_interval_ms = 0;
+    // `job_registry_config.inventory.registration_batch_size` (1..32): how many
+    // discovered jobs one poll turn registers in one commit. 1 means the event
+    // callback returns only after its job's facts/intent attempt completed.
+    std::size_t registration_batch_size = 1;
 
     DiscoveryEnvironment discovery;
     ScanClock clock;
 };
 
-// Receives observations produced by a scan or a targeted probe. Cheap and
-// non-blocking: the plan forbids slow policy/storage work on the producing
-// callback path, so the sink belongs to a queue, not to a repository.
+// Receives observations produced by a scan or a targeted probe.
 using ObservationSink = std::function<void(const Observation&)>;
 
-// Receives discovery output from a source. Both callbacks run on the source's
-// poll thread or the maintenance worker and must stay cheap: no policy
-// evaluation, no storage writes, no slow disk work.
+// Synchronous registration entry (plan §3/§5.1): one call registers a whole
+// turn's worth of jobs and returns one result per job, in input order. It runs
+// on the producing thread (the source's poll thread), never on a worker.
+using JobSink = std::function<std::vector<UpsertResult>(const std::vector<Job>&)>;
+
+// Receives discovery output from a source. Every entry runs on the source's
+// poll thread (or the maintenance worker for a scan), so the source can drive
+// registration itself and observe the result.
 struct DiscoverySink {
-    // Observations produced by a scan (or a periodic scan tick).
+    // Building block of the registration path: turns one parsed observation
+    // into the Job the store consumes (facts projection plus the execution
+    // evidence group). Supplied by the registry so a source never needs the
+    // scheduler-specific facts encoder.
+    std::function<Job(const Observation&)> to_job;
+    // The one registration entry: scan, event and re-read all hand their Jobs
+    // here. Empty when this core has no inventory runtime.
+    JobSink on_jobs;
+    // Retained entry for out-of-band producers and the scan path that the
+    // registry still routes through its hint queue.
     ObservationSink on_observation;
-    // An exec event for a process whose parent is the execution manager. Only
-    // the pid is handed over; building an observation is the consumer's job.
-    std::function<void(pid_t)> on_exec_hint;
 };
 
 // One discovery source for one scheduler type. Implemented by the
@@ -281,15 +305,6 @@ public:
 // path, notes union). Incomplete observations are never merged, and two
 // different managers of one logical job stay separate so the registry can
 // reject the second generation explicitly instead of seeing a blended record.
-class ObservationAccumulator {
-public:
-    void add(Observation observation);
-    std::vector<Observation> take();
-
-private:
-    std::vector<Observation> observations_;
-    std::map<std::string, std::size_t> by_identity_;
-};
 
 // ---------------------------------------------------------------------------
 // procfs / cgroup readers
@@ -316,6 +331,10 @@ bool read_proc_env(const std::string& proc_root, pid_t pid, const std::string& k
 
 std::optional<pid_t> read_proc_ppid(const std::string& proc_root, pid_t pid);
 std::optional<std::uint64_t> read_proc_start_ticks(const std::string& proc_root, pid_t pid);
+
+// Process-monotonic read order, assigned before a builder starts reading. The
+// store uses it so an older scan can never overwrite a newer event (plan §4.1).
+std::uint64_t next_discovery_read_order();
 
 // Boot identity for the host that owns `proc_root`. Empty when unavailable, in
 // which case no ProcessIdentity/ExecutionGeneration is complete.

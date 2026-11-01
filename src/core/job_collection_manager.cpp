@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "core/job_collection_manager.hpp"
+#include "core/reentrancy_gate.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -67,11 +68,29 @@ bool JobCollectionManager::validate_collectors(
     return true;
 }
 
+namespace {
+// Refuses a mutation issued from inside a gated mutation BEFORE any lock or
+// commit: the intent must not move when the caller already owns the ordering.
+CollectionOutcome reentrant_refusal(const char* what)
+{
+    CollectionOutcome outcome;
+    outcome.ok = false;
+    outcome.error = CollectionError::ReentrantMutation;
+    outcome.message = std::string(what) +
+        " was requested from inside a collection mutation; refused without "
+        "committing anything";
+    spdlog::warn("JobCollectionManager: reentrant {} refused", what);
+    return outcome;
+}
+}  // namespace
+
 CollectionOutcome JobCollectionManager::setCollectors(const CollectionRequest& request) {
+    if (joblens::in_mutation_gate()) return reentrant_refusal("setCollectors");
     return mutate(request, /*manual=*/true);
 }
 
 CollectionOutcome JobCollectionManager::resetAuto(const CollectionRequest& request) {
+    if (joblens::in_mutation_gate()) return reentrant_refusal("resetAuto");
     return mutate(request, /*manual=*/false);
 }
 
@@ -212,6 +231,7 @@ CollectionOutcome JobCollectionManager::mutate(const CollectionRequest& request,
 
 CollectionOutcome JobCollectionManager::applyAutoPolicy(
     const std::vector<AutoSelection>& selections) {
+    if (joblens::in_mutation_gate()) return reentrant_refusal("applyAutoPolicy");
     CollectionOutcome outcome;
     std::lock_guard<std::mutex> admission(mtx_);
 
@@ -240,6 +260,17 @@ CollectionOutcome JobCollectionManager::applyAutoPolicy(
             ++outcome.skipped_invalid;
             outcome.message = "no verified inventory instance with internal id " +
                               std::to_string(selection.internal_id);
+            // Attribution: a skipped decision is still a per-item result, not
+            // just a counter. The caller must be able to say which instance
+            // did not get a decision and why.
+            CollectionTargetOutcome skipped;
+            skipped.internal_id = selection.internal_id;
+            skipped.instance_id = registry_.instanceId(selection.internal_id);
+            skipped.binding = registry_.bindingRecord(selection.internal_id);
+            skipped.applied.applied = false;
+            skipped.applied.error = "no verified inventory instance";
+            skipped.changed = false;
+            planned.push_back(std::move(skipped));
             continue;
         }
 
@@ -250,6 +281,14 @@ CollectionOutcome JobCollectionManager::applyAutoPolicy(
             outcome.message = "unknown automatic collector name: " + bad_name;
             spdlog::warn("JobCollectionManager: ignoring invalid automatic selection for "
                          "instance {} (collector '{}')", selection.internal_id, bad_name);
+            CollectionTargetOutcome skipped;
+            skipped.internal_id = selection.internal_id;
+            skipped.instance_id = registry_.instanceId(selection.internal_id);
+            skipped.binding = registry_.bindingRecord(selection.internal_id);
+            skipped.applied.applied = false;
+            skipped.applied.error = "unknown automatic collector name: " + bad_name;
+            skipped.changed = false;
+            planned.push_back(std::move(skipped));
             continue;
         }
 
@@ -303,6 +342,14 @@ CollectionOutcome JobCollectionManager::applyAutoPolicy(
                 outcome.error = CollectionError::StoreUnavailable;
             }
             outcome.message = "automatic policy transaction rejected: " + error;
+            // The transaction failed, but every planned item keeps its
+            // attribution: the caller maps the failure onto the instances that
+            // needed a decision instead of reporting a batch-wide failure.
+            for (auto& target : planned) {
+                target.applied.applied = false;
+                target.applied.error = "intent write failed: " + error;
+            }
+            outcome.targets = std::move(planned);
             return outcome;
         }
     }

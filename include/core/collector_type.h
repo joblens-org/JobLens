@@ -15,12 +15,14 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <optional>
 #include <unordered_map>
 #include <functional>
 #include <any>
 #include <nlohmann/json.hpp>
 #include <variant>
 #include "common/struct2ltable.hpp"
+#include "core/job_identity.hpp"
 #include <spdlog/spdlog.h>
 
 //TODO: 其实更好的方案是设计Job描述方法，但是设计和实现都很痛苦，先开摆
@@ -314,13 +316,28 @@ struct SubAttrMatcher {
     }
 };
 
+// Execution evidence a discovery source actually observed (plan §4.1). It is a
+// value group on the Job, not another transport envelope: the watcher fills it
+// while parsing, the store persists the compatible projection and compares
+// generations by boot/PID/start only.
+struct JobExecution {
+    ExecutionGeneration generation;            // boot_id / manager_pid / manager_start_ticks
+    std::vector<ProcessIdentity> members;
+    bool members_authoritative = false;
+    std::optional<std::string> step_id;        // nullopt != "0"
+    int64_t read_at_us = 0;                    // source read time, for persistence/diagnostics
+    uint64_t read_order = 0;                   // process-monotonic read order, assigned before reading
+    std::string incomplete_reason;             // required source information missing
+    std::vector<std::string> notes;
+};
+
 struct Job {
     uint64_t                              JobID{};
     std::string                           NativeJobID{};   // 调度器原生作业ID字符串，用于查询（Condor: cluster_id.proc_id, Slurm: job_id.step_id）
     std::string                           clusterTag{};    //Job所在集群的标识
     std::string                           cluster_name{};  // 集群名称（公共属性：Condor=COLLECTOR_HOST, Slurm=SLURM_CLUSTER_NAME）
-    JobType                                 jobtype;
-    JobSubType                              subtype;
+    JobType                                 jobtype{JobType::Unknown};
+    JobSubType                              subtype{JobSubType::Unknown};
     // Adapter name for open-world schedulers ("" for the built-ins, whose
     // JobSubType carries the same information). Persisted next to the numeric
     // subtype; readers accept either.
@@ -352,6 +369,11 @@ struct Job {
     // restore/更新路径拿到了组值、等待落库一次（write-once + 至多一次回填重写）。
     bool                                    group_need_persist{false};
 
+    // What the source observed about this execution. Unset for legacy/manual
+    // registrations and for records restored from a schema-2 row that carried
+    // no execution evidence.
+    std::optional<JobExecution>             execution;
+
     static constexpr auto reflection() {
         return std::make_tuple(
             std::make_pair("JobID", &Job::JobID),
@@ -366,6 +388,50 @@ struct Job {
         );
     }
 };
+
+// ---------------------------------------------------------------------------
+// Execution evidence projection (plan §4.2)
+//
+// The Job is the single source of truth; these accessors are the only way the
+// store derives the identity selector, generation and members it persists, so
+// no caller keeps a second copy of the same evidence.
+// ---------------------------------------------------------------------------
+
+inline NativeSelector selector_of(const Job& job) {
+    NativeSelector selector;
+    selector.adapter = job.subtype_name;
+    if (selector.adapter.empty()) {
+        switch (job.subtype) {
+            case JobSubType::Condor: selector.adapter = "condor"; break;
+            case JobSubType::Slurm:  selector.adapter = "slurm";  break;
+            default: break;
+        }
+    }
+    selector.cluster_name = job.cluster_name;
+    selector.cluster_tag = job.clusterTag;
+    selector.native_job_id = job.NativeJobID;
+    if (job.execution && job.execution->step_id) selector.step_id = *job.execution->step_id;
+    return selector;
+}
+
+inline ExecutionGeneration generation_of(const Job& job) {
+    return job.execution ? job.execution->generation : ExecutionGeneration{};
+}
+
+inline const std::vector<ProcessIdentity>& members_of(const Job& job) {
+    static const std::vector<ProcessIdentity> kNoEvidence;
+    return job.execution ? job.execution->members : kNoEvidence;
+}
+
+// True only when the source read the execution scope successfully: an empty
+// member list without this flag is "unknown", not "confirmed empty".
+inline bool members_authoritative_of(const Job& job) {
+    return job.execution && job.execution->members_authoritative;
+}
+
+inline int64_t read_at_us_of(const Job& job) {
+    return job.execution ? job.execution->read_at_us : 0;
+}
 
 // Job 级匹配：开放世界名字（subtype_name）先于字段匹配——新调度器的作业
 // 无需 typed variant 成员即可被 find/del 精确命中。

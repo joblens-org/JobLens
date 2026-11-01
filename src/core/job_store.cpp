@@ -273,6 +273,16 @@ nlohmann::json record_json(const JobRecord& record) {
     return out;
 }
 
+// The durable `j:` row never carries this process's runtime result. `applied`
+// is written as its default projection (not applied) so a restart cannot
+// mistake a hint for live truth; the in-memory record is authoritative while
+// the process runs.
+nlohmann::json record_json_for_active(const JobRecord& record) {
+    JobRecord copy = record;
+    copy.applied = AppliedCollection{};
+    return record_json(copy);
+}
+
 Job decode_legacy_job(const std::string& json_str) {
     auto j = nlohmann::json::parse(json_str);
     Job job;
@@ -356,6 +366,18 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
             if (process.is_object()) record.members.push_back(process_from_json(process));
         }
         record.members = normalized_processes(std::move(record.members));
+    }
+    // Execution evidence is rebuilt from its schema-2 projection instead of a
+    // new JSON group: the durable layout stays compatible (plan §4.3) and the
+    // in-memory Job remains the single source of truth for the store.
+    {
+        JobExecution execution;
+        execution.generation = record.generation;
+        execution.members = record.members;
+        execution.members_authoritative = record.members_authoritative;
+        if (!record.selector.step_id.empty())
+            execution.step_id = record.selector.step_id;
+        record.job.execution = std::move(execution);
     }
     if (j.contains("applied") && j["applied"].is_object()) {
         const auto& applied = j["applied"];
@@ -974,7 +996,7 @@ bool JobStore::migrate_index(std::string& cursor, size_t& batches, size_t batch_
                 batch.Put(key_binding(internal_id), binding_to_json(binding).dump());
             }
 
-            batch.Put(key, record_json(record).dump());
+            batch.Put(key, record_json_for_active(record).dump());
             cursor = key;
             ++processed;
             ++pending;
@@ -1211,6 +1233,7 @@ leveldb::Status JobStore::write_batch_locked(leveldb::WriteBatch& batch,
         return status;
     }
 
+    durable_commits_.fetch_add(1);
     record_store_success();
     return status;
 }
@@ -1225,6 +1248,11 @@ void JobStore::record_store_failure(const std::string& message) {
 void JobStore::record_store_success() {
     store_degraded_.store(false);
     last_store_error_.clear();
+}
+
+void JobStore::setPreCommitHookForTest(std::function<void()> hook) {
+    std::lock_guard<std::mutex> db_lock(db_mtx_);
+    pre_commit_hook_ = std::move(hook);
 }
 
 void JobStore::injectFaultForTest(StoreFaultMode mode, size_t skip, size_t count) {
@@ -1249,11 +1277,18 @@ void JobStore::init_id_counter() {
 
     try {
         uint64_t counter_value = 1;
+        bool counter_malformed = false;
 
         std::string counter_json;
         leveldb::Status s = db_->Get(leveldb::ReadOptions(), key_counter("job_id"), &counter_json);
         if (s.ok()) {
-            counter_value = std::stoull(counter_json);
+            try {
+                counter_value = std::stoull(counter_json);
+            } catch (const std::exception&) {
+                counter_malformed = true;
+                spdlog::error("JobStore: job_id counter is not a number ('{}'); refusing to "
+                              "reset the allocator", counter_json);
+            }
         }
 
         uint64_t max_job_id = 0;
@@ -1298,15 +1333,57 @@ void JobStore::init_id_counter() {
         if (high_water == 0) high_water = 1;
         next_id_ = high_water;
 
+        // The durable exhaustion marker (m:job_id_exhausted) decides whether
+        // MAX is still available. The legacy layout stored only the counter,
+        // where MAX is ambiguous: it may mean "MAX is the next free value" or
+        // "MAX was already handed out". Without a marker the conservative
+        // choice is to stop issuing IDs: reissuing a value that was already
+        // published is worse than burning the last one.
+        std::string marker_json;
+        bool marker_present = false;
+        bool marker_true = false;
+        if (db_->Get(leveldb::ReadOptions(), key_meta("job_id_exhausted"), &marker_json).ok()) {
+            marker_present = true;
+            marker_true = marker_json == "true";
+        }
+
+        bool persist_marker = false;
+        if (counter_malformed) {
+            id_exhausted_ = true;
+            next_id_ = 0;
+            persist_marker = true;
+        } else if (marker_present && marker_true) {
+            id_exhausted_ = true;
+            next_id_ = 0;
+        } else if (marker_present && max_job_id == std::numeric_limits<uint64_t>::max()) {
+            // A false marker cannot override the evidence of an existing MAX
+            // record: the value was issued, so the counter is exhausted.
+            spdlog::error("JobStore: job_id_exhausted=false contradicts an existing "
+                          "maximum JobID; keeping the allocator exhausted");
+            id_exhausted_ = true;
+            next_id_ = 0;
+            persist_marker = true;
+        } else if (!marker_present &&
+                   (counter_value == std::numeric_limits<uint64_t>::max() || id_exhausted_)) {
+            spdlog::warn("JobStore: legacy job_id counter {} carries no exhaustion marker; "
+                         "treating the allocator as exhausted instead of reissuing MAX",
+                         counter_value);
+            id_exhausted_ = true;
+            next_id_ = 0;
+            persist_marker = true;
+        }
+
         // 持久化当前值 (durable high-water reservation)
         leveldb::WriteBatch batch;
         batch.Put(key_counter("job_id"), std::to_string(next_id_));
+        if (persist_marker) batch.Put(key_meta("job_id_exhausted"), "true");
         auto status = write_batch_locked(batch, "init job id counter");
         if (!status.ok()) {
             spdlog::error("JobStore: failed to persist job_id_counter: {}", status.ToString());
         }
 
-        spdlog::info("JobStore: initialized job_id counter, next_id_ = {}", next_id_);
+        spdlog::info("JobStore: initialized job_id counter, next_id_ = {} (exhausted: {})",
+                     next_id_, id_exhausted_);
     } catch (const std::exception& e) {
         spdlog::error("JobStore: failed to init job_id counter: {}", e.what());
         next_id_ = 1;
@@ -1314,6 +1391,11 @@ void JobStore::init_id_counter() {
 }
 
 uint64_t JobStore::allocateId(std::string& error) {
+    // Every allocator consumer shares the same admission order as the inventory
+    // registration path (plan §5.3): a standalone reservation can never land
+    // between a batch's id reservation and that batch's commit, which would let
+    // the batch write an older counter back and reissue a published id.
+    std::lock_guard<std::mutex> admission(upsert_mtx_);
     std::lock_guard<std::mutex> id_lock(id_mtx_);
     if (id_exhausted_ || next_id_ == 0) {
         error = "id_exhausted";
@@ -1322,19 +1404,24 @@ uint64_t JobStore::allocateId(std::string& error) {
     }
 
     const uint64_t id = next_id_;
+    bool exhaust_now = false;
     if (id == std::numeric_limits<uint64_t>::max()) {
         id_exhausted_ = true;
         next_id_ = 0;
+        exhaust_now = true;
     } else {
         next_id_ = id + 1;
     }
 
     // Reserve the id durably before it is handed out. An ambiguous outcome
-    // still advances the in-memory high-water mark: ids are never reused.
+    // still advances the in-memory high-water mark: ids are never reused. The
+    // exhaustion marker rides in the same transaction so a restart cannot
+    // conclude that MAX is still free.
     std::lock_guard<std::mutex> db_lock(db_mtx_);
     leveldb::WriteBatch batch;
     batch.Put(key_counter("job_id"),
               std::to_string(next_id_ == 0 ? id : next_id_));
+    if (exhaust_now) batch.Put(key_meta("job_id_exhausted"), "true");
     auto status = write_batch_locked(batch, "allocate internal id");
     if (!status.ok()) {
         error = "store_write_failed";
@@ -1343,6 +1430,32 @@ uint64_t JobStore::allocateId(std::string& error) {
     }
     return id;
 }
+
+bool JobStore::reserveIdInMemory(uint64_t& id, uint64_t& durable_counter,
+                                 bool& durable_exhausted, std::string& error) {
+    std::lock_guard<std::mutex> id_lock(id_mtx_);
+    if (id_exhausted_ || next_id_ == 0) {
+        error = "id_exhausted";
+        spdlog::error("JobStore: internal id space is exhausted, refusing allocation");
+        return false;
+    }
+    durable_exhausted = false;
+    id = next_id_;
+    if (id == std::numeric_limits<uint64_t>::max()) {
+        id_exhausted_ = true;
+        next_id_ = 0;
+        durable_counter = id;
+        durable_exhausted = true;
+    } else {
+        next_id_ = id + 1;
+        durable_counter = next_id_;
+    }
+    // The reservation becomes durable together with the record that consumes
+    // it (one WriteBatch == one fsync). An ambiguous outcome still advances the
+    // in-memory high-water mark: a burned id is never handed out twice.
+    return true;
+}
+
 
 uint64_t JobStore::nextJobId() {
     if (!store_ready()) {
@@ -1443,7 +1556,7 @@ bool JobStore::insertManual(JobRecord record) {
         }
     }
 
-    batch.Put(key_job(record.internal_id), record_json(record).dump());
+    batch.Put(key_job(record.internal_id), record_json_for_active(record).dump());
     auto status = write_batch_locked(batch, "register job");
     if (!status.ok()) {
         return false;
@@ -1459,29 +1572,162 @@ bool JobStore::insertManual(JobRecord record) {
 // Upsert (the single identity-resolving admission path)
 // ---------------------------------------------------------------------------
 
-UpsertResult JobStore::upsert(const ObservedExecution& observation, JobRecord& out) {
+// One observation against an already-loaded record: pure decision, no durable
+// write and no in-memory publish. The single upsert and the batch path share
+// it, so a merged batch item produces exactly the single-upsert result.
+UpsertResult JobStore::merge_existing(const Job& job, const NativeSelector& selector,
+                                      const CanonicalIdentity& identity,
+                                      uint64_t internal_id, const JobRecord& stored,
+                                      int64_t observed_at, JobRecord& updated_out) {
     UpsertResult result;
+    result.internal_id = internal_id;
+    result.instance_id = instanceId(internal_id);
+    result.facts_revision = stored.facts_revision;
 
-    if (!store_ready()) {
-        result.error = migration_complete_ ? "store_unavailable" : "store_initializing";
-        result.message = "inventory store is not ready";
+    const ExecutionGeneration generation = generation_of(job);
+    const std::vector<ProcessIdentity>& processes = members_of(job);
+    const bool members_complete = members_authoritative_of(job);
+
+    if (stored.quarantined) {
+        result.disposition = UpsertDisposition::Conflict;
+        result.code = RegistrationError::IdentityQuarantined;
+        result.error = "identity_quarantined";
+        result.message = "record is quarantined after an identity conflict";
+        return result;
+    }
+    if (stored.state == kStateClosing) {
+        // A retiring instance must never be resurrected into the active set by
+        // a late observation: the drain owns it until it is archived.
+        result.disposition = UpsertDisposition::Conflict;
+        result.code = RegistrationError::InstanceClosing;
+        result.error = "instance_closing";
+        result.message = "the instance is retiring and no longer accepts observations";
+        return result;
+    }
+    if (stored.identity_complete && stored.identity != identity) {
+        result.disposition = UpsertDisposition::Conflict;
+        result.code = RegistrationError::IdentityIndexMismatch;
+        result.error = "identity_index_mismatch";
+        result.message = "the identity index and the stored record disagree";
+        spdlog::error("JobStore: identity index for JobID {} does not match the stored "
+                      "record; refusing to merge", internal_id);
+        return result;
+    }
+    // Out-of-order commits: an older source read must never overwrite newer
+    // facts. read_order is process-monotonic and assigned before reading, so a
+    // late scan loses to an event that was committed first (plan §4.1, A09).
+    if (stored.job.execution && job.execution &&
+        stored.job.execution->read_order != 0 && job.execution->read_order != 0 &&
+        job.execution->read_order < stored.job.execution->read_order) {
+        result.ok = true;
+        result.disposition = UpsertDisposition::Unchanged;
+        result.message = "older source read order; newer facts kept";
+        updated_out = stored;
         return result;
     }
 
-    const auto identity = canonicalize(observation.selector);
+    if (stored.generation.complete() && generation.complete() &&
+        stored.generation != generation) {
+        result.disposition = UpsertDisposition::Conflict;
+        result.code = RegistrationError::GenerationConflict;
+        result.error = "execution_generation_conflict";
+        result.message = "a different live execution generation owns this identity";
+        spdlog::warn("JobStore: observation for '{}' carries a different live generation "
+                     "than JobID {}; not merged", identity.native_job_id, internal_id);
+        return result;
+    }
+
+    // Merge facts idempotently. The member list is authoritative only when the
+    // source says so: an empty list from a partially-known membership must
+    // never erase stored members.
+    Job observed_job = job;
+    observed_job.JobID = internal_id;
+    observed_job.CollectorNames = stored.job.CollectorNames;
+    apply_identity_via_applier(identity_applier_, observed_job, selector, identity);
+    const bool authoritative_members = members_complete;
+    if (!processes.empty()) {
+        observed_job.JobPIDs.clear();
+        for (const auto& process : processes) observed_job.JobPIDs.push_back(process.pid);
+    } else if (members_complete) {
+        // Read succeeded, no members: an authoritative empty set.
+        observed_job.JobPIDs.clear();
+    }
+
+    Job merged = stored.job;
+    merge_job_facts(merged, observed_job, authoritative_members);
+    merged.JobID = internal_id;
+    merged.CollectorNames = stored.job.CollectorNames;
+
+    JobRecord updated = stored;
+    updated.job = merged;
+    if (job.execution) updated.job.execution = job.execution;
+    updated.selector = selector;
+    updated.last_seen_us = observed_at;
+    const bool generation_became_complete =
+        !stored.generation.complete() && generation.complete();
+    if (generation.complete()) updated.generation = generation;
+    if (!processes.empty()) {
+        updated.members = normalized_processes(processes);
+    } else if (members_complete) {
+        updated.members.clear();
+    } else if (!observed_job.JobPIDs.empty()) {
+        updated.members.clear();
+        for (const auto pid : observed_job.JobPIDs)
+            updated.members.push_back(ProcessIdentity{pid, 0, ""});
+    }
+
+    const bool recovered = stored.state == kStateSuspect;
+    if (recovered) updated.state = kStateActive;
+    const bool changed = recovered ||
+        facts_fingerprint(merged, updated) != facts_fingerprint(stored.job, stored);
+    if (!changed) {
+        updated.facts_revision = stored.facts_revision;
+        result.ok = true;
+        result.disposition = UpsertDisposition::Unchanged;
+        result.facts_revision = stored.facts_revision;
+        updated_out = std::move(updated);
+        return result;
+    }
+
+    updated.facts_revision = stored.facts_revision + 1;
+    result.ok = true;
+    result.disposition = UpsertDisposition::Updated;
+    result.facts_revision = updated.facts_revision;
+    result.generation_became_complete = generation_became_complete;
+    updated_out = std::move(updated);
+    (void)observed_at;
+    return result;
+}
+
+UpsertResult JobStore::upsert(const Job& job, JobRecord& out) {
+    UpsertResult result;
+
+    if (!store_ready()) {
+        result.code = RegistrationError::StoreUnavailable;
+        result.error = to_string(result.code);
+        result.message = migration_complete_ ? "inventory store is not ready"
+                                             : "inventory store is still initializing";
+        return result;
+    }
+
+    const auto selector = selector_of(job);
+    const auto identity = canonicalize(selector);
     if (!identity) {
+        result.code = RegistrationError::IncompleteIdentity;
         result.error = "incomplete_identity";
         result.message = "scheduler type, cluster namespace and native job id are required";
         spdlog::debug("JobStore: rejected incomplete observation (native='{}', cluster='{}')",
-                      observation.selector.native_job_id, observation.selector.cluster_name);
+                      selector.native_job_id, selector.cluster_name);
         return result;
     }
 
     std::unique_lock<std::mutex> admission(upsert_mtx_);
     const std::string index_key = key_identity(identity_index_key(*identity));
 
-    const int64_t observed_at = observation.observed_at_us != 0
-                                    ? observation.observed_at_us : now_us();
+    const ExecutionGeneration generation = generation_of(job);
+    const std::vector<ProcessIdentity>& processes = members_of(job);
+    const bool members_complete = members_authoritative_of(job);
+    const int64_t observed_at = read_at_us_of(job) != 0 ? read_at_us_of(job) : now_us();
 
     uint64_t internal_id = 0;
     bool indexed = false;
@@ -1497,6 +1743,7 @@ UpsertResult JobStore::upsert(const ObservedExecution& observation, JobRecord& o
                 spdlog::warn("JobStore: unreadable identity index: {}", error.what());
             }
         } else if (!s.IsNotFound()) {
+            result.code = RegistrationError::StoreReadFailed;
             result.error = "store_error";
             result.message = s.ToString();
             record_store_failure("LevelDB read failed (identity lookup): " + s.ToString());
@@ -1514,11 +1761,13 @@ UpsertResult JobStore::upsert(const ObservedExecution& observation, JobRecord& o
             if (s.ok()) {
                 try {
                     stored = parse_record(raw, internal_id);
+                    overlay_runtime(stored);
                     have_record = true;
                 } catch (const std::exception& error) {
                     spdlog::warn("JobStore: unreadable record {}: {}", internal_id, error.what());
                 }
             } else if (!s.IsNotFound()) {
+                result.code = RegistrationError::StoreReadFailed;
                 result.error = "store_error";
                 result.message = s.ToString();
                 record_store_failure("LevelDB read failed (record lookup): " + s.ToString());
@@ -1535,6 +1784,7 @@ UpsertResult JobStore::upsert(const ObservedExecution& observation, JobRecord& o
             batch.Delete(index_key);
             auto status = write_batch_locked(batch, "repair stale identity index");
             if (!status.ok()) {
+                result.code = RegistrationError::StoreWriteFailed;
                 result.error = "store_write_failed";
                 result.message = status.ToString();
                 return result;
@@ -1542,157 +1792,60 @@ UpsertResult JobStore::upsert(const ObservedExecution& observation, JobRecord& o
             indexed = false;
             internal_id = 0;
         } else {
-            if (stored.quarantined) {
-                result.disposition = UpsertDisposition::Conflict;
-                result.internal_id = internal_id;
-                result.instance_id = instanceId(internal_id);
-                result.facts_revision = stored.facts_revision;
-                result.error = "identity_quarantined";
-                result.message = "record is quarantined after an identity conflict";
-                return result;
-            }
-            if (stored.state == kStateClosing) {
-                // A retiring instance must never be resurrected into the
-                // active set by a late observation: the drain owns it until it
-                // is archived, and a new execution registers as a new instance.
-                result.disposition = UpsertDisposition::Conflict;
-                result.internal_id = internal_id;
-                result.instance_id = instanceId(internal_id);
-                result.facts_revision = stored.facts_revision;
-                result.error = "instance_closing";
-                result.message = "the instance is retiring and no longer accepts observations";
-                return result;
-            }
-            if (stored.identity_complete && stored.identity != *identity) {
-                result.disposition = UpsertDisposition::Conflict;
-                result.internal_id = internal_id;
-                result.instance_id = instanceId(internal_id);
-                result.facts_revision = stored.facts_revision;
-                result.error = "identity_index_mismatch";
-                result.message = "the identity index and the stored record disagree";
-                spdlog::error("JobStore: identity index for JobID {} does not match the "
-                              "stored record; refusing to merge", internal_id);
-                return result;
-            }
-            if (stored.generation.complete() && observation.generation.complete() &&
-                stored.generation != observation.generation) {
-                result.disposition = UpsertDisposition::Conflict;
-                result.internal_id = internal_id;
-                result.instance_id = instanceId(internal_id);
-                result.facts_revision = stored.facts_revision;
-                result.error = "execution_generation_conflict";
-                result.message = "a different live execution generation owns this identity";
-                spdlog::warn("JobStore: observation for '{}' carries a different live "
-                             "generation than JobID {}; not merged",
-                             identity->native_job_id, internal_id);
-                return result;
-            }
-
-            // Merge facts idempotently. The member list is authoritative only
-            // when the source says so: an empty list from a partially-known
-            // membership must never erase stored members.
-            Job observed_job = observation.facts;
-            observed_job.JobID = internal_id;
-            observed_job.CollectorNames = stored.job.CollectorNames;
-            apply_identity_via_applier(identity_applier_, observed_job, observation.selector, *identity);
-            const bool authoritative_members = observation.members_complete;
-            if (!observation.processes.empty()) {
-                observed_job.JobPIDs.clear();
-                for (const auto& process : observation.processes) {
-                    observed_job.JobPIDs.push_back(process.pid);
-                }
-            } else if (observation.members_complete) {
-                // Read succeeded, no members: an authoritative empty set.
-                observed_job.JobPIDs.clear();
-            }
-
-            Job merged = stored.job;
-            merge_job_facts(merged, observed_job, authoritative_members);
-            merged.JobID = internal_id;
-            merged.CollectorNames = stored.job.CollectorNames;
-
-            JobRecord updated = stored;
-            updated.job = merged;   // the merged facts are the stored projection
-            updated.selector = observation.selector;
-            updated.last_seen_us = observed_at;
-            const bool generation_became_complete =
-                !stored.generation.complete() && observation.generation.complete();
-            if (observation.generation.complete()) updated.generation = observation.generation;
-            if (!observation.processes.empty()) {
-                updated.members = normalized_processes(observation.processes);
-            } else if (observation.members_complete) {
-                // Confirmed empty membership replaces the stored evidence.
-                updated.members.clear();
-            } else if (!observed_job.JobPIDs.empty()) {
-                updated.members.clear();
-                for (const auto pid : observed_job.JobPIDs) {
-                    updated.members.push_back(ProcessIdentity{pid, 0, ""});
-                }
-            }
-
-            const bool recovered = stored.state == kStateSuspect;
-            if (recovered) updated.state = kStateActive;
-            const bool changed = recovered ||
-                facts_fingerprint(merged, updated) != facts_fingerprint(stored.job, stored);
-            if (!changed) {
-                updated.facts_revision = stored.facts_revision;
+            JobRecord updated;
+            result = merge_existing(job, selector, *identity, internal_id, stored, observed_at,
+                                    updated);
+            if (!result.ok) return result;
+            if (result.disposition == UpsertDisposition::Unchanged) {
                 std::unique_lock lg(mtx_);
                 records_[internal_id] = updated;
-                result.ok = true;
-                result.disposition = UpsertDisposition::Unchanged;
-                result.internal_id = internal_id;
-                result.instance_id = instanceId(internal_id);
-                result.facts_revision = stored.facts_revision;
                 out = std::move(updated);
                 return result;
             }
-
-            updated.facts_revision = stored.facts_revision + 1;
-            const std::string record = record_json(updated).dump();
             {
                 std::lock_guard<std::mutex> db_lock(db_mtx_);
                 leveldb::WriteBatch batch;
-                batch.Put(key_job(internal_id), record);
+                batch.Put(key_job(internal_id), record_json_for_active(updated).dump());
                 auto status = write_batch_locked(batch, "update inventory facts");
                 if (!status.ok()) {
+                    result.ok = false;
+                    result.code = RegistrationError::StoreWriteFailed;
                     result.error = "store_write_failed";
                     result.message = status.ToString();
                     return result;
                 }
             }
-
             note_record(updated);
-            result.ok = true;
-            result.disposition = UpsertDisposition::Updated;
-            result.internal_id = internal_id;
-            result.instance_id = instanceId(internal_id);
-            result.facts_revision = updated.facts_revision;
-            result.generation_became_complete = generation_became_complete;
-            spdlog::debug("JobStore: inventory facts updated for JobID {} (revision {})",
-                          internal_id, updated.facts_revision);
             out = std::move(updated);
             return result;
         }
     }
 
     // Create a new inventory record. Nothing is activated and no caller
-    // binding is accepted here.
+    // binding is accepted here. The id reservation rides along in the same
+    // batch as the record and its index entry: one durable commit, not two.
     std::string allocation_error;
-    const uint64_t allocated = allocateId(allocation_error);
-    if (allocated == 0) {
-        result.error = allocation_error.empty() ? "store_write_failed" : allocation_error;
+    uint64_t durable_counter = 0;
+    bool durable_exhausted = false;
+    uint64_t allocated = 0;
+    if (!reserveIdInMemory(allocated, durable_counter, durable_exhausted, allocation_error)) {
+        result.code = allocation_error == "id_exhausted" ? RegistrationError::IdExhausted
+                                                         : RegistrationError::StoreWriteFailed;
+        result.error = result.code == RegistrationError::IdExhausted
+                           ? allocation_error
+                           : to_string(result.code);
         result.message = "durable internal id allocation failed";
         return result;
     }
 
     JobRecord record;
-    record.job = observation.facts;
+    record.job = job;
     record.job.JobID = allocated;
     record.job.CollectorNames.clear();
-    apply_identity_via_applier(identity_applier_, record.job, observation.selector, *identity);
+    apply_identity_via_applier(identity_applier_, record.job, selector, *identity);
     record.job.JobPIDs.clear();
-    if (!observation.processes.empty()) {
-        for (const auto& process : observation.processes) record.job.JobPIDs.push_back(process.pid);
+    if (!processes.empty()) {
+        for (const auto& process : processes) record.job.JobPIDs.push_back(process.pid);
     }
     std::sort(record.job.JobPIDs.begin(), record.job.JobPIDs.end());
     record.job.JobPIDs.erase(std::unique(record.job.JobPIDs.begin(), record.job.JobPIDs.end()),
@@ -1700,18 +1853,18 @@ UpsertResult JobStore::upsert(const ObservedExecution& observation, JobRecord& o
 
     record.internal_id = allocated;
     record.instance_id = instanceId(allocated);
-    record.adapter = observation.selector.adapter;
-    record.selector = observation.selector;
+    record.adapter = selector.adapter;
+    record.selector = selector;
     record.identity = *identity;
     record.identity_complete = true;
-    record.generation = observation.generation;
-    record.members_authoritative = observation.members_complete;
+    record.generation = generation;
+    record.members_authoritative = members_complete;
     record.facts_revision = 1;
     record.state = kStateActive;
     record.first_seen_us = observed_at;
     record.last_seen_us = observed_at;
-    if (!observation.processes.empty()) {
-        record.members = normalized_processes(observation.processes);
+    if (!processes.empty()) {
+        record.members = normalized_processes(processes);
     } else {
         for (const auto pid : record.job.JobPIDs) {
             record.members.push_back(ProcessIdentity{pid, 0, ""});
@@ -1721,7 +1874,11 @@ UpsertResult JobStore::upsert(const ObservedExecution& observation, JobRecord& o
     {
         std::lock_guard<std::mutex> db_lock(db_mtx_);
         leveldb::WriteBatch batch;
-        batch.Put(key_job(allocated), record_json(record).dump());
+        batch.Put(key_counter("job_id"), std::to_string(durable_counter));
+        // MAX is handed out at most once, ever: the marker is committed with
+        // the record that consumes it.
+        if (durable_exhausted) batch.Put(key_meta("job_id_exhausted"), "true");
+        batch.Put(key_job(allocated), record_json_for_active(record).dump());
         batch.Put(index_key, nlohmann::json{
             {"internal_id", allocated},
             {"scheduler_type", identity->adapter},
@@ -1732,6 +1889,7 @@ UpsertResult JobStore::upsert(const ObservedExecution& observation, JobRecord& o
         }.dump());
         auto status = write_batch_locked(batch, "create inventory record");
         if (!status.ok()) {
+            result.code = RegistrationError::StoreWriteFailed;
             result.error = "store_write_failed";
             result.message = status.ToString();
             return result;
@@ -1748,6 +1906,334 @@ UpsertResult JobStore::upsert(const ObservedExecution& observation, JobRecord& o
                  allocated, identity->adapter, identity->native_job_id);
     out = std::move(record);
     return result;
+}
+
+std::vector<UpsertResult> JobStore::upsertBatch(
+    const std::vector<Job>& jobs, std::vector<JobRecord>& out) {
+    std::vector<UpsertResult> results(jobs.size());
+    out.assign(jobs.size(), JobRecord{});
+    if (jobs.empty()) return results;
+
+    if (!store_ready()) {
+        for (auto& result : results) {
+            result.code = RegistrationError::StoreUnavailable;
+            result.error = to_string(result.code);
+            result.message = migration_complete_ ? "inventory store is not ready"
+                                                 : "inventory store is still initializing";
+        }
+        return results;
+    }
+
+    struct Create {
+        size_t index = 0;
+        JobRecord record;
+        CanonicalIdentity identity;
+        std::string index_key;
+        uint64_t durable_counter = 0;
+        bool durable_exhausted = false;
+    };
+    struct Update {
+        size_t index = 0;
+        JobRecord record;
+        bool changed = true;
+    };
+
+    std::vector<Create> creates;
+    // One entry per existing identity: a repeated input in the same batch
+    // merges into this candidate instead of re-reading the pre-batch record,
+    // so the published memory state and the durable row cannot diverge.
+    std::vector<Update> updates;
+    std::map<uint64_t, size_t> update_position;     // internal id -> position in updates
+    std::map<std::string, size_t> created_by_key;   // index key -> position in creates
+    std::vector<std::string> stale_index_keys;
+    std::vector<size_t> durable_items;              // results that depend on the transaction
+
+    std::lock_guard<std::mutex> admission(upsert_mtx_);
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        const auto& job = jobs[i];
+        auto& result = results[i];
+        const auto selector = selector_of(job);
+        const auto identity = canonicalize(selector);
+        if (!identity) {
+            result.fail(RegistrationError::IncompleteIdentity,
+                        "scheduler type, cluster namespace and native job id are required");
+            continue;
+        }
+        const std::string index_key = key_identity(identity_index_key(*identity));
+        const int64_t read_at = read_at_us_of(job);
+        const int64_t observed_at = read_at != 0 ? read_at : now_us();
+
+        // In-batch duplicate of a fresh candidate: merge into the candidate
+        // that will be written, so one identity never lands twice.
+        if (const auto it = created_by_key.find(index_key); it != created_by_key.end()) {
+            auto& candidate = creates[it->second];
+            // Two fresh candidates for one identity in one batch must obey the
+            // same generation rule as a merge: different live manager triples
+            // are a conflict, never a silent overwrite.
+            const auto stored_generation = candidate.record.generation;
+            const auto incoming_generation = generation_of(job);
+            if (stored_generation.complete() && incoming_generation.complete() &&
+                stored_generation != incoming_generation) {
+                result.disposition = UpsertDisposition::Conflict;
+                result.internal_id = candidate.record.internal_id;
+                result.instance_id = candidate.record.instance_id;
+                result.facts_revision = candidate.record.facts_revision;
+                result.code = RegistrationError::GenerationConflict;
+                result.error = "execution_generation_conflict";
+                result.message = "a different live execution generation owns this identity";
+                continue;
+            }
+            const JobRecord before = candidate.record;
+            Job observed_job = job;
+            observed_job.JobID = candidate.record.internal_id;
+            observed_job.CollectorNames = candidate.record.job.CollectorNames;
+            apply_identity_via_applier(identity_applier_, observed_job, selector, *identity);
+            if (!members_of(job).empty()) {
+                observed_job.JobPIDs.clear();
+                for (const auto& process : members_of(job))
+                    observed_job.JobPIDs.push_back(process.pid);
+            }
+            merge_job_facts(candidate.record.job, observed_job,
+                            members_authoritative_of(job));
+            if (job.execution) candidate.record.job.execution = job.execution;
+            if (generation_of(job).complete()) candidate.record.generation = generation_of(job);
+            if (!members_of(job).empty())
+                candidate.record.members = normalized_processes(members_of(job));
+            const bool changed =
+                facts_fingerprint(candidate.record.job, candidate.record) !=
+                facts_fingerprint(before.job, before);
+            if (changed) candidate.record.facts_revision = before.facts_revision + 1;
+
+            result.ok = true;
+            result.disposition = changed ? UpsertDisposition::Updated
+                                         : UpsertDisposition::Unchanged;
+            result.internal_id = candidate.record.internal_id;
+            result.instance_id = candidate.record.instance_id;
+            result.facts_revision = candidate.record.facts_revision;
+            durable_items.push_back(i);   // its durability rides on this batch
+            out[i] = candidate.record;
+            continue;
+        }
+
+        uint64_t internal_id = 0;
+        bool indexed = false;
+        {
+            std::lock_guard<std::mutex> db_lock(db_mtx_);
+            std::string value;
+            const auto s = db_->Get(leveldb::ReadOptions(), index_key, &value);
+            if (s.ok()) {
+                try {
+                    internal_id = nlohmann::json::parse(value).value("internal_id", uint64_t{0});
+                    indexed = internal_id != 0;
+                } catch (const std::exception&) {
+                    indexed = false;
+                }
+            } else if (!s.IsNotFound()) {
+                result.code = RegistrationError::StoreReadFailed;
+                result.error = "store_error";
+                result.message = s.ToString();
+                record_store_failure("LevelDB read failed (batch identity lookup): " +
+                                     s.ToString());
+                continue;
+            }
+        }
+
+        JobRecord stored;
+        bool have_record = false;
+        if (indexed) {
+            std::lock_guard<std::mutex> db_lock(db_mtx_);
+            std::string raw;
+            const auto s = db_->Get(leveldb::ReadOptions(), key_job(internal_id), &raw);
+            if (s.ok()) {
+                try {
+                    stored = parse_record(raw, internal_id);
+                    overlay_runtime(stored);
+                    have_record = true;
+                } catch (const std::exception&) {
+                    have_record = false;
+                }
+            } else if (!s.IsNotFound()) {
+                result.code = RegistrationError::StoreReadFailed;
+                result.error = "store_error";
+                result.message = s.ToString();
+                record_store_failure("LevelDB read failed (batch record lookup): " +
+                                     s.ToString());
+                continue;
+            }
+        }
+
+        if (indexed && have_record) {
+            // A repeated identity in this batch merges into the working-set
+            // candidate, not onto the pre-batch record.
+            const auto position = update_position.find(internal_id);
+            const JobRecord baseline =
+                position != update_position.end() ? updates[position->second].record : stored;
+            JobRecord updated;
+            auto merged = merge_existing(job, selector, *identity, internal_id, baseline,
+                                         observed_at, updated);
+            if (!merged.ok) {
+                // A conflict is reported per item and never blocks the others.
+                results[i] = merged;
+                continue;
+            }
+            merged.internal_id = internal_id;
+            merged.instance_id = instanceId(internal_id);
+            if (position != update_position.end()) {
+                if (merged.disposition != UpsertDisposition::Unchanged)
+                    updates[position->second].record = updated;
+            } else if (merged.disposition == UpsertDisposition::Unchanged) {
+                update_position[internal_id] = updates.size();
+                updates.push_back(Update{i, updated});
+                updates.back().changed = false;
+            } else {
+                update_position[internal_id] = updates.size();
+                updates.push_back(Update{i, updated});
+                updates.back().changed = true;
+            }
+            if (merged.disposition != UpsertDisposition::Unchanged)
+                durable_items.push_back(i);
+            results[i] = merged;
+            out[i] = updated;
+            continue;
+        }
+
+        // Either a fresh identity or a stale index entry (interrupted archive):
+        // both are repaired inside this same facts transaction.
+        if (indexed && !have_record) {
+            spdlog::warn("JobStore: stale identity index for JobID {} in batch; repairing",
+                         internal_id);
+            stale_index_keys.push_back(index_key);
+        }
+
+        std::string allocation_error;
+        uint64_t durable_counter = 0;
+        bool durable_exhausted = false;
+        uint64_t allocated = 0;
+        if (!reserveIdInMemory(allocated, durable_counter, durable_exhausted,
+                               allocation_error)) {
+            result.code = allocation_error == "id_exhausted"
+                              ? RegistrationError::IdExhausted
+                              : RegistrationError::StoreWriteFailed;
+            result.error = result.code == RegistrationError::IdExhausted
+                               ? allocation_error
+                               : to_string(result.code);
+            result.message = "durable internal id allocation failed";
+            continue;
+        }
+
+        Create item;
+        item.index = i;
+        item.identity = *identity;
+        item.index_key = index_key;
+        item.durable_counter = durable_counter;
+        item.durable_exhausted = durable_exhausted;
+        JobRecord& record = item.record;
+        record.job = job;
+        record.job.JobID = allocated;
+        record.job.CollectorNames.clear();
+        apply_identity_via_applier(identity_applier_, record.job, selector, *identity);
+        record.job.JobPIDs.clear();
+        for (const auto& process : members_of(job))
+            record.job.JobPIDs.push_back(process.pid);
+        std::sort(record.job.JobPIDs.begin(), record.job.JobPIDs.end());
+        record.job.JobPIDs.erase(
+            std::unique(record.job.JobPIDs.begin(), record.job.JobPIDs.end()),
+            record.job.JobPIDs.end());
+        record.internal_id = allocated;
+        record.instance_id = instanceId(allocated);
+        record.adapter = selector.adapter;
+        record.selector = selector;
+        record.identity = *identity;
+        record.identity_complete = true;
+        record.generation = generation_of(job);
+        record.members_authoritative = members_authoritative_of(job);
+        record.facts_revision = 1;
+        record.state = kStateActive;
+        record.first_seen_us = observed_at;
+        record.last_seen_us = observed_at;
+        if (!members_of(job).empty()) {
+            record.members = normalized_processes(members_of(job));
+        } else {
+            for (const auto pid : record.job.JobPIDs)
+                record.members.push_back(ProcessIdentity{pid, 0, ""});
+        }
+
+        created_by_key[index_key] = creates.size();
+        creates.push_back(std::move(item));
+        auto& created = creates.back();
+        result.ok = true;
+        result.disposition = UpsertDisposition::Created;
+        result.internal_id = created.record.internal_id;
+        result.instance_id = created.record.instance_id;
+        result.facts_revision = created.record.facts_revision;
+        durable_items.push_back(i);
+        out[i] = created.record;
+    }
+
+    bool has_writes = !creates.empty() || !stale_index_keys.empty();
+    for (const auto& update : updates)
+        if (update.changed) has_writes = true;
+    if (has_writes) {
+        {
+            // Still inside the admission: a standalone allocator must wait for
+            // this batch to finish instead of persisting a counter the batch
+            // would then write back.
+            std::function<void()> hook;
+            {
+                std::lock_guard<std::mutex> db_lock(db_mtx_);
+                hook = pre_commit_hook_;
+            }
+            if (hook) hook();
+        }
+        std::lock_guard<std::mutex> db_lock(db_mtx_);
+        leveldb::WriteBatch batch;
+        if (!creates.empty()) {
+            // The last reservation owns the durable high-water mark.
+            batch.Put(key_counter("job_id"),
+                      std::to_string(creates.back().durable_counter));
+            for (const auto& create : creates) {
+                if (!create.durable_exhausted) continue;
+                batch.Put(key_meta("job_id_exhausted"), "true");
+                break;
+            }
+        }
+        for (const auto& key : stale_index_keys) batch.Delete(key);
+        for (const auto& create : creates) {
+            batch.Put(key_job(create.record.internal_id),
+                      record_json_for_active(create.record).dump());
+            batch.Put(create.index_key, nlohmann::json{
+                {"internal_id", create.record.internal_id},
+                {"scheduler_type", create.identity.adapter},
+                {"cluster_namespace", create.identity.cluster_namespace},
+                {"native_job_id", create.identity.native_job_id},
+                {"canonical_native", create.identity.canonical_native},
+                {"step_id", create.identity.step_id},
+            }.dump());
+        }
+        for (const auto& update : updates) {
+            if (!update.changed) continue;
+            batch.Put(key_job(update.record.internal_id),
+                      record_json_for_active(update.record).dump());
+        }
+
+        const auto status = write_batch_locked(batch, "register inventory batch");
+        if (!status.ok()) {
+            // Every item that depends on this transaction fails; conflicts and
+            // unchanged items keep their own result.
+            for (const size_t index : durable_items) {
+                results[index].ok = false;
+                results[index].code = RegistrationError::StoreWriteFailed;
+                results[index].error = "store_write_failed";
+                results[index].message = status.ToString();
+            }
+            return results;
+        }
+    }
+
+    for (auto& create : creates) note_record(std::move(create.record));
+    // Exactly one publish per identity: the final working-set candidate.
+    for (auto& update : updates) note_record(std::move(update.record));
+    return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -1784,10 +2270,11 @@ bool JobStore::updateRecord(uint64_t id, const std::function<void(JobRecord&)>& 
         record_store_failure(std::string("corrupt job record during ") + operation);
         return false;
     }
+    overlay_runtime(record);
     mutate(record);
 
     leveldb::WriteBatch batch;
-    batch.Put(key_job(id), record_json(record).dump());
+    batch.Put(key_job(id), record_json_for_active(record).dump());
     status = write_batch_locked(batch, operation);
     if (!status.ok()) return false;
 
@@ -1819,11 +2306,12 @@ bool JobStore::persistState(uint64_t id, const std::string& state) {
         record_store_failure("corrupt job record during state persist");
         return false;
     }
+    overlay_runtime(record);
     if (record.state == state) return true;
 
     record.state = state;
     leveldb::WriteBatch batch;
-    batch.Put(key_job(id), record_json(record).dump());
+    batch.Put(key_job(id), record_json_for_active(record).dump());
     status = write_batch_locked(batch, "persist record state");
     if (!status.ok()) return false;
 
@@ -1914,6 +2402,14 @@ bool JobStore::archive(uint64_t id) {
 
     const int64_t now = now_us();
 
+    // The history copy is the last place the applied hint matters. It may have
+    // been coalesced instead of written per application, so the in-memory value
+    // (always current) wins over the possibly older durable one.
+    {
+        std::shared_lock lg(mtx_);
+        const auto it = records_.find(id);
+        if (it != records_.end()) stored.applied = it->second.applied;
+    }
     auto history = record_json(stored);
     history["state"] = kStateClosing;
     history["end_time_us"] = now;
@@ -2044,6 +2540,7 @@ bool JobStore::commitBindings(const std::vector<BindingRecord>& bindings,
                 error = "store_error";
                 return false;
             }
+            overlay_runtime(record);
             if (record.quarantined) {
                 error = "identity_quarantined";
                 return false;
@@ -2051,7 +2548,7 @@ bool JobStore::commitBindings(const std::vector<BindingRecord>& bindings,
             const bool changed = record.job.CollectorNames != binding.effectiveCollectors();
             record.job.CollectorNames = binding.effectiveCollectors();
             batch.Put(key_binding(binding.internal_id), binding_to_json(binding).dump());
-            batch.Put(key_job(binding.internal_id), record_json(record).dump());
+            batch.Put(key_job(binding.internal_id), record_json_for_active(record).dump());
             committed.emplace_back(std::move(record), changed);
         }
 
@@ -2082,10 +2579,36 @@ AppliedCollection JobStore::applied(uint64_t id) const {
     return AppliedCollection{};
 }
 
+bool JobStore::overlay_runtime(JobRecord& record) const {
+    // A record read from disk never contains this process's runtime result, so
+    // the live value is copied over it before the record is published or
+    // written back. Established lock order: db_mtx_ -> mtx_.
+    std::shared_lock lg(mtx_);
+    const auto it = records_.find(record.internal_id);
+    if (it == records_.end()) return false;
+    record.applied = it->second.applied;
+    return true;
+}
+
+void JobStore::apply_runtime_projection_locked(JobRecord& record) const {
+    // Called with mtx_ held: AppliedCollection and the Job.collection
+    // projection change together, so no reader sees them disagree.
+    record.job.collection.in_pipeline = !record.applied.collectors.empty();
+    record.job.collection.collectors = record.applied.collectors;
+}
+
 bool JobStore::recordApplied(uint64_t id, const AppliedCollection& applied) {
-    return updateRecord(id, [&applied](JobRecord& record) {
-        record.applied = applied;
-    }, "record applied state");
+    // The runtime application result describes this process only: a restart
+    // clears the live holders and re-attaches anyway. It is therefore memory
+    // truth, updated atomically with the Job projection and never written back
+    // to the durable row. No dirty set, no background flush: a stale whole-row
+    // rewrite cannot resurrect an archived instance or revert closing state.
+    std::unique_lock lg(mtx_);
+    const auto it = records_.find(id);
+    if (it == records_.end()) return false;
+    it->second.applied = applied;
+    apply_runtime_projection_locked(it->second);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -2193,6 +2716,7 @@ StoreHealth JobStore::health() const {
     store_health.schema_version = schema_version_;
     store_health.db_uuid = db_uuid_;
     store_health.degraded = store_degraded_.load();
+    store_health.durable_commits = durable_commits_.load();
     store_health.write_failures = store_write_failures_.load();
     store_health.corrupt_records = corrupt_records_;
 

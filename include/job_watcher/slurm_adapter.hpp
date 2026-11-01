@@ -40,6 +40,7 @@ public:
         DiscoveryOptions options;
         options.enable_event_source = true;
         options.scan_interval_ms = 0;
+        options.registration_batch_size = settings.registration_batch_size;
         if (!settings.cluster_name.empty())
             options.discovery.cluster_name = settings.cluster_name;
         return options;

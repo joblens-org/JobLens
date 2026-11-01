@@ -49,6 +49,7 @@
 #include "job_watcher/slurm_adapter.hpp"
 
 class JobCollectionManager;
+struct AutoSelection;
 
 // Construction options. Production uses the singleton (all defaults); tests
 // and inventory-only service startup construct an isolated store without
@@ -76,6 +77,11 @@ struct JobRegistryOptions {
     CgroupMembershipProbe test_cgroup_probe;
     // Observation -> typed facts override (empty = the registered adapters).
     std::function<Job(const Observation&)> test_facts_encoder;
+    // Automatic-selection policy for test wiring (production builds it from
+    // job_registry_config.inventory + <type>_job_watcher). The adapter name
+    // below is the key it is armed under.
+    std::function<AutoCollectorPolicy()> test_auto_policy;
+    std::string test_auto_policy_adapter{"condor"};
 };
 
 class JobRegistry : private KernelAttribution::Host {
@@ -123,7 +129,12 @@ public:
     // conflicting live generations are rejected explicitly and never indexed.
     // An upsert never fires lifecycle callbacks or starts collection: runtime
     // application is binding-driven.
-    UpsertResult upsertObservedJob(const ObservedExecution& observation);
+    UpsertResult upsertObservedJob(const Job& job);
+    // Batch registration for a burst of discoveries from one poll iteration:
+    // one durable commit for the facts, one for the automatic intents, then the
+    // runtime application per instance. Same per-job semantics and result as
+    // upsertObservedJob, minus one fsync per job.
+    std::vector<UpsertResult> registerDiscoveredJobs(const std::vector<Job>& jobs);
     std::optional<JobRecord> inventoryRecord(uint64_t jobID) const;
     std::optional<JobRecord> inventoryRecordByIdentity(
         const CanonicalIdentity& identity) const;
@@ -202,6 +213,9 @@ public:
 
     // Test seam only (see StoreFaultMode).
     void injectStoreFaultForTest(StoreFaultMode mode, size_t skip = 0, size_t count = 1);
+    // Test-only seam: runs inside the registration admission, after the id
+    // reservation and before the facts commit.
+    void setPreCommitHookForTest(std::function<void()> hook);
     void clearStoreFaultsForTest();
 
 private:
@@ -218,7 +232,29 @@ private:
     void startDiscoverySources(InventoryWiring wiring);
     // Automatic selection for one newly created instance, evaluated outside
     // every registry lock (plan 6.2: Lua never runs under a lock).
-    void apply_auto_policy(const Job& job, const std::string& adapter);
+    // Returns nullopt when no automatic decision was needed, true when the
+    // decision (including an explicit reject) is durable, false otherwise.
+    std::optional<bool> apply_auto_policy(const Job& job, const std::string& adapter);
+    // Record-driven repair of a missing initial automatic decision (plan §5.5):
+    // the predicate is derived from durable state so a restart repairs too.
+    bool missing_initial_decision(const JobRecord& record) const;
+    std::optional<bool> repair_initial_decision(const JobRecord& record,
+                                                UpsertResult& result);
+    // The policy decision for one newly created instance, or nullopt when the
+    // adapter has no enabled policy. Shared by the single and batch paths.
+    struct AutoDecision {
+        std::vector<std::string> collectors;
+        std::string policy_revision;
+    };
+    std::optional<AutoDecision> autoSelectionFor(const Job& job, const std::string& adapter);
+    // Instances whose automatic selection was skipped because the batch budget
+    // ran out; the heartbeat evaluates them instead of the discovery thread.
+    // Bounded drain of the deferred queue (one intent transaction per pass).
+    // Evaluates the automatic policy for a set of live instances. Synchronous
+    // by design: a slow rule set costs latency and is warned about, it is never
+    // deferred to another thread (plan §1.1.3).
+    void evaluateAutoPolicies(const std::vector<uint64_t>& internal_ids,
+                              std::vector<AutoSelection>& out);
     void regRPCHandle();
     // Guards lifecycle callbacks and the sentinel job.
     mutable std::shared_mutex mtx_;
@@ -262,25 +298,6 @@ private:
     mutable std::mutex hb_mtx_;
     std::condition_variable hb_cv_;
     std::deque<HeartbeatHint> hints_;
-    // --- exec-hint ingest (fast path) ---------------------------------------
-    // Exec hints resolve on this dedicated worker instead of a heartbeat
-    // pass: ring-buffer wakeups reach the store without waiting for a pass
-    // slice, and incomplete observations (scheduler state not yet written at
-    // exec time) retry on a short ladder before falling back to a rescan.
-    struct ExecRetry {
-        pid_t pid = 0;
-        int attempt = 0;          // 0 = first resolution, 1.. = ladder steps
-        std::int64_t due_ms = 0;
-    };
-    mutable std::mutex ingest_mtx_;
-    std::condition_variable ingest_cv_;
-    std::deque<pid_t> ingest_queue_;           // bounded by kIngestQueueCapacity
-    std::set<pid_t> ingest_inflight_;          // queued or retrying (dedup)
-    std::vector<ExecRetry> ingest_retries_;    // bounded by kIngestRetryCapacity
-    std::unique_ptr<std::thread> ingest_thread_;
-    std::thread::id ingest_worker_id_;
-    bool ingest_running_ = false;
-    std::atomic<bool> ingest_stopping_{false};
     std::map<uint64_t, AbsenceEntry> absences_;
     std::set<uint64_t> suspect_ids_;
     std::map<std::string, ExecutionGeneration> ended_generations_;
@@ -337,11 +354,14 @@ private:
     void heartbeatLoop();
     bool runPass(bool do_scan, bool wait);
     void processObservation(const Observation& observation, std::set<uint64_t>& observed);
-    ObservedExecution toExecution(const Observation& observation) const;
+    Job toJob(const Observation& observation) const;
     void enqueueHint(HeartbeatHint hint);
     void requestRescan(const std::string& reason);
     bool rescanRequested() const;
     void refreshLegacyRecords();
+    // Re-evaluates the automatic decision for live instances that never got a
+    // durable one (plan §5.5). Bounded per pass.
+    void repairMissingInitialDecisions();
     void evaluateRetirements(const std::set<uint64_t>& observed_ids,
                              const std::map<std::string, bool>& source_complete);
     bool retireIfConfirmed(const JobRecord& record, const std::string& reason);
@@ -355,13 +375,6 @@ private:
     std::int64_t clockNow() const;
     void drainHints(std::deque<HeartbeatHint>& out);
 
-    // Exec-hint ingest internals (the fast path; see the members above).
-    void startExecIngest();
-    void stopExecIngest();
-    void ingestLoop();
-    enum class ExecResolution { Resolved, Incomplete, Unresolved };
-    ExecResolution resolveExecHintOnce(pid_t pid);
-
     // Lifecycle fan-out copied under the lock and invoked without it, so a
     // callback can never re-enter the registry while it is locked.
     std::vector<JobLifecycleCb> lifecycle_callbacks() const;
@@ -372,6 +385,9 @@ private:
     // apply section and records the verified result into the store. Never
     // called with a registry lock held.
     void applyLatestCollectionIntent(uint64_t internal_id);
+    // True on the thread that currently holds the apply gate (plan §7.3). A
+    // hook that mutates from inside the gate is refused, not deadlocked.
+    bool inApplyGate() const;
     // /proc + scheduler metadata refresh of one job (no persistence).
     void update_job(Job& job);
 
