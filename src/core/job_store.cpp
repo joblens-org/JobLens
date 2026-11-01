@@ -742,6 +742,12 @@ bool JobStore::init_db(const Options& options) {
 }
 
 void JobStore::close_db() {
+    // Last chance: anything written without a fence becomes durable here, or it
+    // is reported instead of silently dropped.
+    if (!flushDirty("shutdown checkpoint")) {
+        spdlog::error("JobStore: the shutdown checkpoint could not be written; the last "
+                      "unsynced registration window is lost");
+    }
     std::lock_guard<std::mutex> db_lock(db_mtx_);
     delete db_;
     db_ = nullptr;
@@ -1200,8 +1206,69 @@ bool JobStore::ready() const {
     return store_ready();
 }
 
+void JobStore::mark_record_dirty(uint64_t internal_id) {
+    std::unique_lock<std::shared_mutex> lock(mtx_);
+    dirty_records_.insert(internal_id);
+}
+
+void JobStore::mark_binding_dirty(uint64_t internal_id) {
+    std::unique_lock<std::shared_mutex> lock(mtx_);
+    dirty_bindings_.insert(internal_id);
+}
+
+bool JobStore::flushDirty(const char* reason) {
+    // One fsynced batch covers both the rows re-written here and every earlier
+    // unsynced write LevelDB already buffered, so the whole state up to this
+    // point becomes durable in a single fdatasync.
+    std::lock_guard<std::mutex> db_lock(db_mtx_);
+    if (!db_) return false;
+
+    std::vector<uint64_t> records;
+    std::vector<uint64_t> bindings;
+    std::vector<JobRecord> snapshots;
+    {
+        std::unique_lock<std::shared_mutex> lock(mtx_);
+        if (dirty_records_.empty() && dirty_bindings_.empty()) return true;
+        records.assign(dirty_records_.begin(), dirty_records_.end());
+        bindings.assign(dirty_bindings_.begin(), dirty_bindings_.end());
+        for (const auto id : records) {
+            const auto it = records_.find(id);
+            if (it != records_.end()) snapshots.push_back(it->second);
+        }
+    }
+
+    leveldb::WriteBatch batch;
+    for (auto& snapshot : snapshots)
+        batch.Put(key_job(snapshot.internal_id), record_json_for_active(snapshot).dump());
+    for (const auto id : bindings) {
+        std::string value;
+        const auto status = db_->Get(leveldb::ReadOptions(), key_binding(id), &value);
+        if (status.IsNotFound()) {
+            batch.Delete(key_binding(id));
+        } else if (status.ok()) {
+            batch.Put(key_binding(id), value);
+        }
+    }
+
+    const auto status = write_batch_locked(batch, reason, /*durable=*/true);
+    {
+        std::unique_lock<std::shared_mutex> lock(mtx_);
+        if (status.ok()) {
+            dirty_records_.clear();
+            dirty_bindings_.clear();
+        } else {
+            dirty_records_.insert(records.begin(), records.end());
+            dirty_bindings_.insert(bindings.begin(), bindings.end());
+        }
+    }
+    if (!status.ok()) return false;
+    spdlog::debug("JobStore: checkpoint flushed {} record(s) and {} binding(s) ({})",
+                  snapshots.size(), bindings.size(), reason);
+    return true;
+}
+
 leveldb::Status JobStore::write_batch_locked(leveldb::WriteBatch& batch,
-                                             const char* operation) {
+                                             const char* operation, bool durable) {
     if (!db_) return leveldb::Status::IOError("job db is not open");
 
     StoreFaultMode injected = StoreFaultMode::None;
@@ -1220,7 +1287,7 @@ leveldb::Status JobStore::write_batch_locked(leveldb::WriteBatch& batch,
     }
 
     leveldb::WriteOptions write_options;
-    write_options.sync = true;
+    write_options.sync = durable;
     auto status = db_->Write(write_options, &batch);
 
     if (injected == StoreFaultMode::FailAfterWrite) {
@@ -1234,6 +1301,7 @@ leveldb::Status JobStore::write_batch_locked(leveldb::WriteBatch& batch,
     }
 
     durable_commits_.fetch_add(1);
+    if (durable) sync_commits_.fetch_add(1);
     record_store_success();
     return status;
 }
@@ -1806,7 +1874,9 @@ UpsertResult JobStore::upsert(const Job& job, JobRecord& out) {
                 std::lock_guard<std::mutex> db_lock(db_mtx_);
                 leveldb::WriteBatch batch;
                 batch.Put(key_job(internal_id), record_json_for_active(updated).dump());
-                auto status = write_batch_locked(batch, "update inventory facts");
+                auto status = write_batch_locked(batch, "update inventory facts",
+                                                 /*durable=*/false);
+                if (status.ok()) mark_record_dirty(internal_id);
                 if (!status.ok()) {
                     result.ok = false;
                     result.code = RegistrationError::StoreWriteFailed;
@@ -1887,7 +1957,9 @@ UpsertResult JobStore::upsert(const Job& job, JobRecord& out) {
             {"canonical_native", identity->canonical_native},
             {"step_id", identity->step_id},
         }.dump());
-        auto status = write_batch_locked(batch, "create inventory record");
+        auto status = write_batch_locked(batch, "create inventory record",
+                                         /*durable=*/false);
+        if (status.ok()) mark_record_dirty(allocated);
         if (!status.ok()) {
             result.code = RegistrationError::StoreWriteFailed;
             result.error = "store_write_failed";
@@ -2216,7 +2288,13 @@ std::vector<UpsertResult> JobStore::upsertBatch(
                       record_json_for_active(update.record).dump());
         }
 
-        const auto status = write_batch_locked(batch, "register inventory batch");
+        const auto status = write_batch_locked(batch, "register inventory batch",
+                                               /*durable=*/false);
+        if (status.ok()) {
+            for (const auto& create : creates) mark_record_dirty(create.record.internal_id);
+            for (const auto& update : updates)
+                if (update.changed) mark_record_dirty(update.record.internal_id);
+        }
         if (!status.ok()) {
             // Every item that depends on this transaction fails; conflicts and
             // unchanged items keep their own result.
@@ -2552,7 +2630,9 @@ bool JobStore::commitBindings(const std::vector<BindingRecord>& bindings,
             committed.emplace_back(std::move(record), changed);
         }
 
-        auto status = write_batch_locked(batch, "commit bindings");
+        // Intent is hot path: written without a fence, checkpointed by the
+        // maintenance pass and flushed on shutdown.
+        auto status = write_batch_locked(batch, "commit bindings", /*durable=*/false);
         if (!status.ok()) {
             error = "store_write_failed";
             return false;
@@ -2565,6 +2645,10 @@ bool JobStore::commitBindings(const std::vector<BindingRecord>& bindings,
                     if (b.internal_id == record.internal_id) record.intent = b;
                 }
                 records_[record.internal_id] = record;
+                // The binding row and the record's CollectorNames projection
+                // both changed and both ride on the next checkpoint.
+                dirty_bindings_.insert(record.internal_id);
+                dirty_records_.insert(record.internal_id);
                 updated.emplace_back(record, changed);
             }
         }
@@ -2717,6 +2801,7 @@ StoreHealth JobStore::health() const {
     store_health.db_uuid = db_uuid_;
     store_health.degraded = store_degraded_.load();
     store_health.durable_commits = durable_commits_.load();
+    store_health.sync_commits = sync_commits_.load();
     store_health.write_failures = store_write_failures_.load();
     store_health.corrupt_records = corrupt_records_;
 
@@ -2728,6 +2813,8 @@ StoreHealth JobStore::health() const {
     {
         std::shared_lock lg(mtx_);
         store_health.active_instances = records_.size();
+        store_health.dirty_records = dirty_records_.size();
+        store_health.dirty_bindings = dirty_bindings_.size();
         for (const auto& entry : records_) {
             if (!entry.second.identity_complete) ++store_health.incomplete_identities;
             if (entry.second.quarantined) ++store_health.quarantined_identities;

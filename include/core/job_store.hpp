@@ -105,9 +105,13 @@ struct StoreHealth {
     uint32_t schema_version = 0;
     std::string db_uuid;
     bool degraded = false;
-    // Durable commits (one LevelDB WriteBatch with sync=true each). Exposed so
-    // the cost of a registration path can be reasoned about, not guessed.
+    // Write batches (any durability) and the subset that actually fsynced.
+    // Exposed so the cost of a registration path can be reasoned about instead
+    // of guessed: the hot path must not move `sync_commits`.
     uint64_t durable_commits = 0;
+    uint64_t sync_commits = 0;
+    uint64_t dirty_records = 0;
+    uint64_t dirty_bindings = 0;
     uint64_t write_failures = 0;
     std::string last_write_error;
     uint64_t incomplete_identities = 0;
@@ -279,6 +283,9 @@ public:
     // field is a fixed "not applied" projection that feeds diagnostics only,
     // and archive copies the final in-memory summary into h:.
     bool recordApplied(uint64_t id, const AppliedCollection& applied);
+    // Flush the rows written without a fence (checkpoint/shutdown). Public: the
+    // registry schedules it from the maintenance pass and from deinit().
+    bool flushDirty(const char* reason);
 
     // --- queries -------------------------------------------------------------
     bool hasActive(uint64_t id) const;
@@ -317,7 +324,14 @@ private:
     bool reserveIdInMemory(uint64_t& id, uint64_t& durable_counter,
                            bool& durable_exhausted, std::string& error);
     bool store_ready() const;
-    leveldb::Status write_batch_locked(leveldb::WriteBatch& batch, const char* operation);
+    // `durable` = true fsyncs the batch (that is, also every earlier unsynced
+    // write in the log). The registration hot path writes with durable=false
+    // and leaves the row in the dirty set for the checkpoint / shutdown flush.
+    leveldb::Status write_batch_locked(leveldb::WriteBatch& batch, const char* operation,
+                                       bool durable = true);
+    // Marks one record / binding as "written but not yet fsynced".
+    void mark_record_dirty(uint64_t internal_id);
+    void mark_binding_dirty(uint64_t internal_id);
     void record_store_failure(const std::string& message);
     void record_store_success();
     void note_record(JobRecord record);
@@ -335,6 +349,9 @@ private:
     // Guards the in-memory record map and the identity index.
     mutable std::shared_mutex mtx_;
     std::unordered_map<uint64_t, JobRecord> records_;
+    // Rows written with durable=false since the last flush (guarded by mtx_).
+    std::set<uint64_t> dirty_records_;
+    std::set<uint64_t> dirty_bindings_;
     std::unordered_map<std::string, uint64_t> identity_index_;
 
     leveldb::DB* db_ = nullptr;
@@ -349,6 +366,7 @@ private:
     std::atomic<bool> store_degraded_{false};
     std::atomic<uint64_t> store_write_failures_{0};
     std::atomic<uint64_t> durable_commits_{0};
+    std::atomic<uint64_t> sync_commits_{0};
     uint64_t corrupt_records_ = 0;
     std::string last_store_error_;   // guarded by db_mtx_
     std::function<void()> pre_commit_hook_;
