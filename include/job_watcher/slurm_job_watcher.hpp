@@ -17,7 +17,8 @@
 #include <fmt/core.h>
 #include "common/ebpf_common.hpp"
 #include "common/utils.hpp"
-#include "core/job_observation.hpp"
+#include "core/job_discovery.hpp"
+#include "job_watcher/registration_turn.hpp"
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -76,7 +77,16 @@ private:
     void emit_observations(const ScanResult& result);
     // Exec events only hand over the pid; building an observation is the
     // consumer's job (worker thread), never the polling thread's.
-    void emit_exec_hint(uint32_t pid);
+    // Handled on the polling thread: resolve, offer to this turn's batch, and
+    // remember the pid when the scheduler metadata is not ready yet.
+    void handle_exec_event(uint32_t pid);
+    // One sample ended the turn: libbpf must stop consuming so the tail batch,
+    // the due re-reads and the stop check can run (plan §6.2).
+    bool stop_requested();
+    void process_due_rewrites();
+    void flush_turn();
+    RegistrationTurn turn_;
+    std::atomic<bool> yield_requested_{false};
     ScanResult finish_scan(ScanResult result);
 
     // Builds the observation for one slurmstepd: manager identity from the
@@ -140,6 +150,7 @@ inline bool SlurmJobWatcher::start(const DiscoverySink& sink)
         std::lock_guard<std::mutex> lock(life_mutex_);
         sink_ = sink;
     }
+    turn_.configure(sink, options_.registration_batch_size);
     if (options_.enable_event_source && !event_source_ready_) {
         if (!init_event_source()) {
             deinit_event_source();
@@ -167,6 +178,7 @@ inline void SlurmJobWatcher::stop()
     }
     if (thread && thread->joinable()) thread->join();
 
+    turn_.clear();
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         health_.polling = false;
@@ -235,13 +247,15 @@ inline ScanResult SlurmJobWatcher::scan()
     }
     result.counts.skipped = unreadable_entries;
 
-    ObservationAccumulator accumulator;
+    // One observation per stepd/spool entry, built directly (the store is the
+    // identity idempotency point, so no second merge model).
     std::set<std::string> live_native_job_ids;
+    result.observations.reserve(stepds.size());
     for (pid_t stepd : stepds) {
         auto observation = observe_stepd(env, boot_id, stepd, children);
         if (!observation.selector.native_job_id.empty())
             live_native_job_ids.insert(observation.selector.native_job_id);
-        accumulator.add(std::move(observation));
+        result.observations.push_back(std::move(observation));
     }
 
     std::size_t spool_candidates = 0;
@@ -275,12 +289,11 @@ inline ScanResult SlurmJobWatcher::scan()
                 continue;
             }
             if (live_native_job_ids.count(observation.selector.native_job_id) > 0) continue;
-            accumulator.add(std::move(observation));
+            result.observations.push_back(std::move(observation));
         }
     }
 
     result.counts.candidates = stepds.size() + spool_candidates;
-    result.observations = accumulator.take();
     return finish_scan(std::move(result));
 }
 
@@ -373,6 +386,8 @@ inline void SlurmJobWatcher::poll_loop()
                                     std::chrono::milliseconds>(
                                         next_scan - now).count()));
         }
+        const auto until_due = turn_.msUntilNextDue(RegistrationTurn::Clock::now());
+        if (until_due >= 0) timeout_ms = std::min<int>(timeout_ms, static_cast<int>(until_due));
         if (bpf_rb_) {
             int err = ring_buffer__poll(bpf_rb_, timeout_ms);
             if (err == -EINTR) continue;   // plain signal wakeup; re-check stop
@@ -384,6 +399,10 @@ inline void SlurmJobWatcher::poll_loop()
             poll_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
                               [this](){ return !polling_running_; });
         }
+
+        // End of turn: register the tail batch, then service the due re-reads.
+        flush_turn();
+        process_due_rewrites();
 
         if (options_.scan_interval_ms > 0) {
             const auto now = std::chrono::steady_clock::now();
@@ -413,19 +432,65 @@ inline void SlurmJobWatcher::emit_observations(const ScanResult& result)
     }
 }
 
-inline void SlurmJobWatcher::emit_exec_hint(uint32_t pid)
+inline bool SlurmJobWatcher::stop_requested()
 {
-    std::function<void(pid_t)> hint;
-    {
-        std::lock_guard<std::mutex> lock(life_mutex_);
-        hint = sink_.on_exec_hint;
-    }
-    if (!hint) return;
+    std::lock_guard<std::mutex> lock(life_mutex_);
+    return !polling_running_;
+}
+
+inline void SlurmJobWatcher::handle_exec_event(uint32_t pid)
+{
+    const auto now = RegistrationTurn::Clock::now();
+    std::optional<Observation> observation;
     try {
-        hint(static_cast<pid_t>(pid));
+        observation = observeForHint(static_cast<pid_t>(pid));
     } catch (const std::exception& error) {
-        spdlog::error("SlurmJobWatcher: exec hint consumer failed: {}", error.what());
+        spdlog::debug("SlurmJobWatcher: exec hint {} could not be resolved: {}", pid,
+                      error.what());
     }
+    if (!observation) return;
+    if (observation->identity_complete) {
+        turn_.offer(*observation);
+        return;
+    }
+    turn_.rememberPid(static_cast<pid_t>(pid),
+                      RegistrationTurn::childIdentity(*observation, static_cast<pid_t>(pid)),
+                      now);
+    requestRescan();
+}
+
+inline void SlurmJobWatcher::process_due_rewrites()
+{
+    const auto now = RegistrationTurn::Clock::now();
+    const auto due = turn_.take_due(now, 32);
+    for (const auto& entry : due) {
+        const pid_t pid = entry.pid;
+        std::optional<Observation> observation;
+        try {
+            observation = observeForHint(pid);
+        } catch (const std::exception& error) {
+            spdlog::debug("SlurmJobWatcher: re-read of hint {} failed: {}", pid, error.what());
+        }
+        if (observation && observation->identity_complete) {
+            // A reused pid or a different process now must not be registered as
+            // the original hint.
+            if (!RegistrationTurn::sameChild(entry.child, *observation, pid)) {
+                spdlog::debug("SlurmJobWatcher: dropping hint {} (pid reused or execution ended)", pid);
+                continue;
+            }
+            turn_.offer(*observation);
+            continue;
+        }
+        // Keep the ORIGINAL deadline and advance the attempt: the 30 s window
+        // is never restarted by a failed re-read.
+        turn_.reschedule(pid, entry.first, entry.attempt + 1, RegistrationTurn::Clock::now());
+    }
+    flush_turn();
+}
+
+inline void SlurmJobWatcher::flush_turn()
+{
+    turn_.flush();
 }
 
 inline ScanResult SlurmJobWatcher::finish_scan(ScanResult result)
@@ -465,6 +530,9 @@ inline Observation SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& en
                                                   const std::map<pid_t, std::vector<pid_t>>& children)
 {
     Observation observation;
+    // Assigned before the first read so the store can reject an older pass
+    // overwriting newer facts (plan §4.1).
+    observation.read_order = next_discovery_read_order();
     std::vector<std::string> reasons;
     observation.adapter = name_;
     observation.selector.adapter = name_;
@@ -617,6 +685,9 @@ inline Observation SlurmJobWatcher::observe_spool_entry(const DiscoveryEnvironme
                                                         const std::string& dir_name)
 {
     Observation observation;
+    // Assigned before the first read so the store can reject an older pass
+    // overwriting newer facts (plan §4.1).
+    observation.read_order = next_discovery_read_order();
     std::vector<std::string> reasons;
     observation.adapter = name_;
     observation.selector.adapter = name_;
@@ -664,7 +735,17 @@ inline bool SlurmJobWatcher::init_event_source()
                       event_ptr->pid, event_ptr->ppid, event_ptr->comm);
         // Cheap by contract: the pid is handed to the sink and nothing else
         // happens on this thread (no /proc reads, no policy, no storage).
-        ptr->emit_exec_hint(event_ptr->pid);
+        // Admission closed: do not start a new sample, end the turn so the
+        // poll thread can finish and join.
+        if (ptr->stop_requested()) return -ECANCELED;
+        // Handle the CURRENT sample first: libbpf has already advanced the
+        // consumer position, so a sample that is not taken now is lost.
+        ptr->handle_exec_event(event_ptr->pid);
+        const auto now = RegistrationTurn::Clock::now();
+        if (ptr->turn_.should_yield(now, ptr->stop_requested())) {
+            ptr->yield_requested_ = true;
+            return -ECANCELED;
+        }
         return 0;
     };
 

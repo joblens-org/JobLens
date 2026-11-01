@@ -123,6 +123,7 @@ nlohmann::json InventoryMaintenanceConfig::to_json() const
     nlohmann::json out;
     out["types"] = std::move(types_json);
     out["reconcile_interval_sec"] = reconcile_interval_sec;
+    out["registration_batch_size"] = registration_batch_size;
     nlohmann::json sources = nlohmann::json::array();
     for (const auto& entry : settings) {
         sources.push_back(nlohmann::json{
@@ -244,6 +245,36 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
             resolved.reconcile_interval_sec = parse_interval_sec(
                 *interval, "job_registry_config.inventory.reconcile_interval_sec");
         }
+        if (const auto* batch = member(*inventory, "registration_batch_size")) {
+            // An illegal batch size is a configuration error, never a reason to
+            // silently disable inventory maintenance.
+            long long value = 0;
+            if (batch->is_number_integer() || batch->is_number_unsigned()) {
+                value = batch->get<long long>();
+            } else if (batch->is_string()) {
+                try {
+                    value = std::stoll(batch->get<std::string>());
+                } catch (const std::exception&) {
+                    throw std::runtime_error(
+                        "job_registry_config.inventory.registration_batch_size must be an "
+                        "integer between 1 and 32");
+                }
+            } else {
+                throw std::runtime_error(
+                    "job_registry_config.inventory.registration_batch_size must be an "
+                    "integer between 1 and 32");
+            }
+            if (value < 1 || value > 32) {
+                throw std::runtime_error(
+                    "job_registry_config.inventory.registration_batch_size must be between "
+                    "1 and 32, got " + std::to_string(value));
+            }
+            resolved.registration_batch_size = static_cast<std::size_t>(value);
+        }
+        if (member(*inventory, "auto_policy_budget_us") != nullptr) {
+            spdlog::warn("inventory: auto_policy_budget_us was removed; the initial policy "
+                         "decision is always evaluated synchronously");
+        }
     }
 
     const std::string legacy_rules_dir =
@@ -326,6 +357,12 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
                      "into inventory discovery with automatic collection; set {}.auto_collect "
                      "explicitly to override",
                      legacy.key, section_of(legacy.adapter));
+    }
+    // One global knob, applied to every adapter's source: the batch size is a
+    // per-source poll-turn bound, not a per-scheduler policy.
+    for (auto& [name, settings] : resolved.settings) {
+        (void)name;
+        settings.registration_batch_size = resolved.registration_batch_size;
     }
     return resolved;
 }
