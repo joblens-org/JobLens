@@ -59,6 +59,13 @@ namespace {
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 
+    // Drops the connection when the peer stopped reading instead of blocking.
+    void send_all_or_drop(int fd, const std::string& data) {
+        if (send_all(fd, data)) return;
+        spdlog::debug("LocalRPC: dropping the connection after a partial response");
+        ::shutdown(fd, SHUT_RDWR);
+    }
+
     std::string recv_all(int fd) {
         std::string data;
         char buffer[4096];
@@ -108,7 +115,6 @@ class RPCServer::Impl {
 public:
     Impl(const std::string& socket_path) 
         : socket_path_(socket_path), 
-          server_fd_(-1), 
           running_(false) {
         
         spdlog::info("LocalRPC: initializing server with socket path: {}", socket_path);
@@ -158,8 +164,9 @@ public:
         
         spdlog::info("LocalRPC: starting server on socket: {}", socket_path_);
         
-        server_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (server_fd_ < 0) {
+        const int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        server_fd_.store(listen_fd);
+        if (listen_fd < 0) {
             spdlog::error("LocalRPC: create socket failed, err: {}", Utils::error_message_from_errno(errno));
             throw RPCError("create socket failed");
         }
@@ -176,21 +183,23 @@ public:
         addr.sun_family = AF_UNIX;
         strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
         
-        ret = bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr));
+        ret = bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr));
         if (ret < 0) {
             spdlog::error("LocalRPC: bind failed for socket: {}, err: {}", socket_path_, Utils::error_message_from_errno(errno));
-            close(server_fd_);
+            close(listen_fd);
+            server_fd_.store(-1);
             throw RPCError("bind failed");
         }
         
-        ret = listen(server_fd_, 5);
+        ret = listen(listen_fd, 5);
         if (ret < 0) {
             spdlog::error("LocalRPC: listen failed, err: {}", Utils::error_message_from_errno(errno));
-            close(server_fd_);
+            close(listen_fd);
+            server_fd_.store(-1);
             throw RPCError("listen failed");
         }
 
-        std::thread(&Impl::handle_loop, this).detach();
+        loop_thread_ = std::thread(&Impl::handle_loop, this);
 
         running_ = true;
         spdlog::info("LocalRPC: server started successfully");
@@ -200,24 +209,60 @@ public:
     void stop() {
         spdlog::info("LocalRPC: stopping server");
         running_ = false;
-        if (server_fd_ >= 0) {
-            close(server_fd_);
-            server_fd_ = -1;
+        // Hand the descriptor over exactly once: the accept loop may be reading
+        // it concurrently (TSan-confirmed race on the plain int), and closing a
+        // reused fd would be far worse than the shutdown hiccup.
+        const int fd = server_fd_.exchange(-1);
+        if (fd >= 0) {
+            close(fd);
             spdlog::debug("LocalRPC: closed server socket");
         }
         unlink(socket_path_.c_str());
         spdlog::debug("LocalRPC: removed socket file: {}", socket_path_);
+        // Unblock a client stuck in recv/send so the join below is bounded.
+        shutdown_clients();
+        // Join the accept loop before the object dies: the detached thread used
+        // to outlive the Impl and read freed memory at process exit. A stop
+        // issued from inside a handler (the loop's own thread) must not
+        // self-join; that path keeps the detached behaviour and reports it.
+        if (loop_thread_.joinable()) {
+            if (std::this_thread::get_id() == loop_thread_id_) {
+                spdlog::warn("LocalRPC: server stopped from its own handler thread; "
+                             "leaving the loop to finish the request");
+                loop_thread_.detach();
+            } else {
+                loop_thread_.join();
+            }
+        }
     }
     
+    // Active client descriptors, so stop() can unblock a read/write instead of
+    // waiting for it (plan §7.3: closing must not depend on a slow client).
+    void track_client(int fd) {
+        std::lock_guard<std::mutex> lock(client_mutex_);
+        clients_.insert(fd);
+    }
+    void untrack_client(int fd) {
+        std::lock_guard<std::mutex> lock(client_mutex_);
+        clients_.erase(fd);
+    }
+    void shutdown_clients() {
+        std::lock_guard<std::mutex> lock(client_mutex_);
+        for (const int fd : clients_) ::shutdown(fd, SHUT_RDWR);
+    }
+
     void handle_loop() {
+        loop_thread_id_ = std::this_thread::get_id();
         spdlog::info("LocalRPC: entering main server loop");
         
         while (running_) {
-            struct pollfd pfd{server_fd_, POLLIN, 0};
+            const int listen_fd = server_fd_.load();
+            if (listen_fd < 0) break;   // stop() closed it
+            struct pollfd pfd{listen_fd, POLLIN, 0};
             int ret = poll(&pfd, 1, 100); // 100ms超时
             
             if (ret > 0 && (pfd.revents & POLLIN)) {
-                int client_fd = accept(server_fd_, nullptr, nullptr);
+                int client_fd = accept(listen_fd, nullptr, nullptr);
                 if (client_fd >= 0) {
                     spdlog::debug("LocalRPC: accepted new client connection");
                     handle_client(client_fd);
@@ -260,6 +305,7 @@ private:
         try {
             spdlog::debug("LocalRPC: handling client request");
             
+            track_client(client_fd);
             std::string request_data = recv_all(client_fd);
             if (request_data.empty()) {
                 spdlog::warn("LocalRPC: received empty request from client");
@@ -282,21 +328,26 @@ private:
             } else {
                 result = {"error", "method not found: " + method};
             }
-            send_all(client_fd, result.dump());
+            send_all_or_drop(client_fd, result.dump());
             spdlog::debug("LocalRPC: sent response ({} bytes)", result.dump().size());
             
         } catch (const std::exception& e) {
             spdlog::error("LocalRPC: error handling client request: {}", e.what());
             json error_response = {"error", e.what()};
-            send_all(client_fd, error_response.dump());
+            send_all_or_drop(client_fd, error_response.dump());
         }
+        untrack_client(client_fd);
         close(client_fd);
         spdlog::debug("LocalRPC: closed client connection");
     }
     
     std::string socket_path_;
-    int server_fd_ = -1;
     std::atomic<bool> running_;
+    std::atomic<int> server_fd_{-1};
+    std::thread loop_thread_;
+    mutable std::mutex client_mutex_;
+    std::set<int> clients_;
+    std::thread::id loop_thread_id_{};
     std::unordered_map<std::string, std::function<json(const json&)>> methods_;
 };
 
