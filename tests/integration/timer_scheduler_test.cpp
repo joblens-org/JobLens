@@ -171,9 +171,14 @@ static void slow_timer_does_not_starve_another_timer()
     check(slow_started.wait_for(2s), "slow timer did not start");
     scheduler.registerRepeatingTimer(5ms, [&] { ++fast; }, "fast");
     eventually([&] { return fast >= 5; }, "slow timer exhausted workers needed by another timer");
+    // A skipped tick is observable, but *when* the overlap is noticed depends on
+    // scheduler jitter; asserting it at one instant made this case fail under
+    // load. Wait for the evidence with a deadline instead of assuming it is
+    // already there.
+    eventually([&] { return task_status(scheduler, "slow").at("skipped_runs").get<size_t>() > 0; },
+               "running timer did not expose skipped ticks");
     const auto slow = task_status(scheduler, "slow");
-    check(slow.at("state") == "running" && slow.at("skipped_runs").get<size_t>() > 0,
-          "running timer did not expose skipped ticks");
+    check(slow.at("state") == "running", "a timer that skipped a tick must stay running");
     check(slow.at("running_elapsed_ms").get<double>() > 0, "running elapsed time missing");
 }
 
