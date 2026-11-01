@@ -27,6 +27,7 @@
  *        decimal-string ids, capabilities field names, truthful status
  */
 #include "core/job_registry.hpp"
+#include "job_fixture.h"
 #include "core/job_collection_manager.hpp"
 #include "core/inventory_status_provider.hpp"
 #include "common/config.hpp"
@@ -41,6 +42,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <fstream>
 #include <iostream>
 #include <optional>
@@ -117,16 +119,17 @@ NativeSelector slurm_selector(const std::string& native, const std::string& step
     return selector;
 }
 
-ObservedExecution condor_observation(const NativeSelector& selector, pid_t manager_pid)
+Job condor_observation(const NativeSelector& selector, pid_t manager_pid)
 {
-    ObservedExecution observation;
-    observation.selector = selector;
-    observation.generation.boot_id = "boot-collection-rpc";
-    observation.generation.manager_pid = manager_pid;
-    observation.generation.manager_start_ticks = 900000 + uint64_t(manager_pid);
-    observation.generation.cgroup_identity = "/sys/fs/cgroup/htcondor/slot1";
-    observation.processes.push_back(
-        ProcessIdentity{manager_pid, 900000 + uint64_t(manager_pid), "boot-collection-rpc"});
+    ExecutionGeneration generation;
+    generation.boot_id = "boot-collection-rpc";
+    generation.manager_pid = manager_pid;
+    generation.manager_start_ticks = 900000 + uint64_t(manager_pid);
+    generation.cgroup_identity = "/sys/fs/cgroup/htcondor/slot1";
+    Job observation = discovered_job(
+        selector, generation,
+        {ProcessIdentity{manager_pid, 900000 + uint64_t(manager_pid), "boot-collection-rpc"}},
+        true);
 
     CondorJobAttr attr{};
     attr.auto_update_child = false;
@@ -137,22 +140,22 @@ ObservedExecution condor_observation(const NativeSelector& selector, pid_t manag
     attr.owner = "alice";
     attr.scheduler_name = selector.cluster_tag;
     attr.collector_host = selector.cluster_name;
-    observation.facts.jobtype = JobType::Job;
-    observation.facts.subtype = JobSubType::Condor;
-    observation.facts.sub_attr = attr;
+    observation.subtype = JobSubType::Condor;
+    observation.sub_attr = attr;
     return observation;
 }
 
-ObservedExecution slurm_observation(const NativeSelector& selector, pid_t manager_pid)
+Job slurm_observation(const NativeSelector& selector, pid_t manager_pid)
 {
-    ObservedExecution observation;
-    observation.selector = selector;
-    observation.generation.boot_id = "boot-collection-rpc";
-    observation.generation.manager_pid = manager_pid;
-    observation.generation.manager_start_ticks = 910000 + uint64_t(manager_pid);
-    observation.generation.cgroup_identity = "/sys/fs/cgroup/slurm/step";
-    observation.processes.push_back(
-        ProcessIdentity{manager_pid, 910000 + uint64_t(manager_pid), "boot-collection-rpc"});
+    ExecutionGeneration generation;
+    generation.boot_id = "boot-collection-rpc";
+    generation.manager_pid = manager_pid;
+    generation.manager_start_ticks = 910000 + uint64_t(manager_pid);
+    generation.cgroup_identity = "/sys/fs/cgroup/slurm/step";
+    Job observation = discovered_job(
+        selector, generation,
+        {ProcessIdentity{manager_pid, 910000 + uint64_t(manager_pid), "boot-collection-rpc"}},
+        true);
 
     SlurmJobAttr attr{};
     attr.auto_update_child = false;
@@ -161,13 +164,12 @@ ObservedExecution slurm_observation(const NativeSelector& selector, pid_t manage
     attr.step_id = *slurm_step_value(selector.step_id);
     attr.cluster_name = selector.cluster_name;
     attr.user = "bob";
-    observation.facts.jobtype = JobType::Job;
-    observation.facts.subtype = JobSubType::Slurm;
-    observation.facts.sub_attr = attr;
+    observation.subtype = JobSubType::Slurm;
+    observation.sub_attr = attr;
     return observation;
 }
 
-uint64_t seed(JobRegistry& registry, const ObservedExecution& observation,
+uint64_t seed(JobRegistry& registry, const Job& observation,
               const std::string& label)
 {
     const auto result = registry.upsertObservedJob(observation);
@@ -842,6 +844,53 @@ void run_closing_case(JobRegistry& registry, const Fixture& ids)
 
 } // namespace
 
+// A24 (shutdown) ------------------------------------------------------------
+
+// stop() joins the accept loop, and the loop may be writing a response. A client
+// that stops reading must not pin shutdown: the response write is bounded and
+// the active client is shut down before the join.
+void slow_client_does_not_block_stop(const std::string& /*base*/)
+{
+    RPCServer::instance().register_method("test/big", [](const nlohmann::json&) {
+        std::string payload(4u << 20, 'x');
+        return nlohmann::json{{"payload", payload}};
+    });
+
+    // The suite's singleton already listens on the shared socket path.
+    const std::string& path = socket_path;
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    check(fd >= 0, "slow client socket");
+    int receive_buffer = 4096;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof(receive_buffer));
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::copy(path.begin(), path.end(), address.sun_path);
+    check(connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
+          "slow client connect");
+
+    const std::string request = R"({"method":"test/big","params":{}})";
+    check(send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
+              static_cast<ssize_t>(request.size()),
+          "slow client send");
+    // The server starts writing a 4 MiB response into a socket nobody reads.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    std::promise<void> finished;
+    auto future = finished.get_future();
+    std::thread stopper([&] {
+        RPCServer::instance().stop();
+        finished.set_value();
+    });
+    const bool bounded = future.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    if (!bounded) ::close(fd);   // unblock the server so the thread can finish
+    stopper.join();
+    ::close(fd);
+
+    check(bounded, "stop() must not block on a client that stopped reading");
+    std::cout << "PASS slow client: shutdown is bounded" << std::endl;
+}
+
 int main(int argc, char** argv)
 {
     try {
@@ -907,6 +956,7 @@ int main(int argc, char** argv)
         run_legacy_cases(registry, ids);
         run_inventory_cases(registry, ids);
         run_closing_case(registry, ids);
+        slow_client_does_not_block_stop(base);
 
         std::cout << "PASS collection rpc: A30 selector forms, snapshot job scope, "
                      "ambiguity and error classes; A31 set/stop/reset_auto, unknown "
