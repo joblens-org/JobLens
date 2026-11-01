@@ -73,7 +73,6 @@ job_registry_config:
   inventory:
     types: [condor, slurm]               # Types with a full local inventory (opt-in, absent = [])
     reconcile_interval_sec: 30           # Reconciliation interval, must be >= 1
-    registration_batch_size: 1           # Jobs registered per poll turn (1..32)
 ```
 
 | Key | Type | Default | Description |
@@ -83,7 +82,6 @@ job_registry_config:
 | `auto_add_slurmjob` | bool | false | **Deprecated.** Same as above for Slurm |
 | `inventory.types` | list | `[]` | Scheduler types that get a complete local inventory, including unselected jobs. `condor` / `slurm`; unknown values are rejected at startup |
 | `inventory.reconcile_interval_sec` | int | 30 | Periodic full reconciliation interval in seconds (minimum 1) |
-| `inventory.registration_batch_size` | int | 1 | How many discovered jobs one source poll turn registers in one durable commit (1..32). `1` completes a job's facts and initial intent inside the event that discovered it; a larger value commits full batches immediately and the tail when the turn ends. Restart to change; an out-of-range value is a startup error. |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` (Condor) or `{JobLensRootDir}/../config/rules/slurm_jobs` (Slurm) | Directory for Lua rule files, used by CondorJobWatcher and SlurmJobWatcher when `use_rules` is enabled. Note: the default varies by watcher context. |
 
 **Inventory and automatic collection** are separate switches, and the legacy
