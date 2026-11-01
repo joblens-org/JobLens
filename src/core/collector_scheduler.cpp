@@ -545,30 +545,49 @@ bool CollectorScheduler::applyJobBinding(const Job& job, std::vector<std::string
         if (!needed.count(name)) to_remove.push_back(name);
     }
 
+    // One System-scope notification per real change, not per application
+    // attempt: the same binding is applied again right after an attach and by
+    // the intent-repair path, and a no-op must not look like new facts.
+    bool changed = false;
+
     // Detach collectors the new selection no longer includes (on_job_removed).
     for (const auto& collector_name : to_remove) {
         auto it = collector_state_dict.find(collector_name);
         if (it == collector_state_dict.end()) continue;
         auto& state = it->second;
         std::lock_guard lg_state(state.m_);
-        detachJobFromCollector(collector_name, state, job, false);
+        if (detachJobFromCollector(collector_name, state, job, false)) changed = true;
     }
 
     // Attach new collectors (on_job_added); refresh snapshots of existing ones so
     // bound consumers see updated facts/PIDs (on_job_updated).
     for (const auto& collector_name : job.CollectorNames) {
-        if (addJob2Collector(job, collector_name)) continue;
+        if (addJob2Collector(job, collector_name)) {
+            changed = true;
+            continue;
+        }
         auto it = collector_state_dict.find(collector_name);
         auto it_info = collector_info_dict.find(collector_name);
         if (it == collector_state_dict.end() || it_info == collector_info_dict.end()) continue;
         {
             std::lock_guard lg_state(it->second.m_);
             if (!it->second.running) continue;
+            // A retained collector is refreshed whenever the facts really
+            // changed, and only then: re-applying an unchanged snapshot (for
+            // example the binding application that runs right after attach)
+            // must not deliver a second notification for the same state.
+            bool facts_changed = true;
             {
                 std::lock_guard snapshot_lock(it->second.snapshot_m_);
+                const auto previous = it->second.job_snapshots.find(job.JobID);
+                if (previous != it->second.job_snapshots.end())
+                    facts_changed = dump_job(previous->second).dump() != dump_job(job).dump();
                 it->second.job_snapshots[job.JobID] = job;
             }
-            notifyJobHook(it_info->second, JobEvent::Updated, job);
+            if (facts_changed) {
+                notifyJobHook(it_info->second, JobEvent::Updated, job);
+                changed = true;
+            }
         }
     }
 
@@ -604,7 +623,7 @@ bool CollectorScheduler::applyJobBinding(const Job& job, std::vector<std::string
         snap->second.collection.collectors = applied;
     }
 
-    notifySystemCollectors(job, JobEvent::Updated);
+    if (changed) notifySystemCollectors(job, JobEvent::Updated);
     return error.empty();
 }
 
