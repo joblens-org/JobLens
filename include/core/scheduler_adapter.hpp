@@ -55,9 +55,6 @@ struct InventoryTypeSettings {
     // Explicit cluster namespace fallback for discovery (wins over the
     // environment-derived value, empty = derive from the source).
     std::string cluster_name;
-    // `job_registry_config.inventory.registration_batch_size` (1..32): the
-    // adapter hands it to its source so one poll turn registers a bounded batch.
-    std::size_t registration_batch_size = 1;
 };
 
 // Capability traits of one adapter. A trait being absent is a normal state,

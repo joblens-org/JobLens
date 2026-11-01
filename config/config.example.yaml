@@ -30,11 +30,6 @@ job_registry_config:
   inventory:
     types: [condor, slurm]
     reconcile_interval_sec: 30
-    # How many discovered jobs one source poll turn registers in one commit
-    # (1..32). 1 means an event's callback returns only after that job's facts
-    # and initial intent were attempted; a larger value commits a full batch
-    # immediately and the tail when the poll turn ends. Restart to change.
-    registration_batch_size: 1
 
 # Scheduler discovery. `auto_collect` is the per-type switch: an explicit value
 # here wins over the legacy job_registry_config.auto_add_condorjob /

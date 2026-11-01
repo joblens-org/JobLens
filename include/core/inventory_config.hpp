@@ -37,10 +37,6 @@ struct InventoryMaintenanceConfig {
     std::vector<std::string> types;
     // Default 30 s; minimum 1 s (validated at startup).
     std::uint32_t reconcile_interval_sec = 30;
-    // How many discovered jobs one poll turn registers in one commit
-    // (1..32). 1 means a source's event callback returns only after that job's
-    // facts and initial intent were attempted.
-    std::size_t registration_batch_size = 1;
     // Keyed by adapter name; contains every registered adapter plus every
     // type the configuration mentions, so the resolved picture is complete.
     std::map<std::string, InventoryTypeSettings> settings;
