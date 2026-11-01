@@ -25,8 +25,16 @@ SchedulerAdapterRegistry& SchedulerAdapterRegistry::instance()
 void SchedulerAdapterRegistry::registerAdapter(const std::string& name, Factory factory)
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto [it, inserted] = factories_.emplace(name, std::move(factory));
-    if (!inserted) it->second = std::move(factory);
+    // Find-then-store, never emplace-then-assign: a failed emplace may already
+    // have moved-from `factory`, and assigning it here would brick a stored
+    // factory with an empty function (every TU including job_registry.hpp runs
+    // the REGISTER_SCHEDULER_ADAPTER registrar once, so duplicates are the
+    // norm). Replacement is intentional: last registration wins.
+    auto it = factories_.find(name);
+    if (it == factories_.end())
+        factories_.emplace_hint(it, name, std::move(factory));
+    else
+        it->second = std::move(factory);
 }
 
 bool SchedulerAdapterRegistry::known(const std::string& name) const
