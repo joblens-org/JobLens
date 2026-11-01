@@ -18,6 +18,7 @@
 #include "core/collector_scheduler.hpp"
 #include "core/job_collection_manager.hpp"
 #include "core/job_registry.hpp"
+#include "job_fixture.h"
 #include "core/writer_manager.hpp"
 #include "writer/base_writer.hpp"
 
@@ -445,24 +446,22 @@ void run(const std::string& base)
     });
 
     const auto upsert = [](const std::string& native) {
-        ObservedExecution execution;
-        execution.selector.adapter = "condor";
-        execution.selector.cluster_name = "htcondor01";
-        execution.selector.native_job_id = native;
-        execution.generation.boot_id = "test-boot";
-        execution.generation.manager_pid = getpid();
-        execution.generation.manager_start_ticks = 1;
-        execution.generation.cgroup_identity = "";
-        execution.processes.push_back(ProcessIdentity{getpid(), 1, "test-boot"});
-        Job facts;
-        facts.jobtype = JobType::Job;
-        facts.subtype = JobSubType::Condor;
+        NativeSelector selector;
+        selector.adapter = "condor";
+        selector.cluster_name = "htcondor01";
+        selector.native_job_id = native;
+        ExecutionGeneration generation;
+        generation.boot_id = "test-boot";
+        generation.manager_pid = getpid();
+        generation.manager_start_ticks = 1;
+        Job job = discovered_job(selector, generation,
+                                 {ProcessIdentity{getpid(), 1, "test-boot"}}, true);
+        job.subtype = JobSubType::Condor;
         CondorJobAttr attr;
         attr.auto_update_child = false;
         attr.starter_pid = getpid();
-        facts.sub_attr = attr;
-        execution.facts = facts;
-        return JobRegistry::instance().upsertObservedJob(execution);
+        job.sub_attr = attr;
+        return JobRegistry::instance().upsertObservedJob(job);
     };
 
     const auto bound = upsert("700.0");

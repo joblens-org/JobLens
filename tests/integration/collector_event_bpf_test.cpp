@@ -38,6 +38,7 @@
 #include "ebpf/ring_buffer_probe.hpp"
 #include "writer/base_writer.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -139,6 +140,39 @@ size_t captured_count(const std::string& collector)
     for (const auto& record : CaptureWriter::store().records)
         if (record->sample->collector_name == collector) ++matched;
     return matched;
+}
+
+// The probe assigns a monotonically increasing sequence number to every
+// sample it commits. A turn-bounded drain is correct only when every delivered
+// sample is observed exactly once: no duplicate (the consumer position did not
+// advance) and no unexplained gap (a sample was dropped somewhere).
+void check_observed_exactly_once(const std::string& collector, size_t at_least,
+                                 uint64_t unexplained_budget, const std::string& label)
+{
+    std::vector<uint64_t> seqs;
+    {
+        std::lock_guard lock(CaptureWriter::store().mutex);
+        for (const auto& record : CaptureWriter::store().records) {
+            if (record->sample->collector_name != collector) continue;
+            const auto text = CaptureWriter::text_of(record);
+            const auto pos = text.find("seq=");
+            if (pos == std::string::npos) continue;
+            seqs.push_back(std::stoull(text.substr(pos + 4)));
+        }
+    }
+    check(seqs.size() >= at_least,
+          label + ": only " + std::to_string(seqs.size()) + " sample(s) observed");
+    std::sort(seqs.begin(), seqs.end());
+    for (size_t i = 1; i < seqs.size(); ++i)
+        check(seqs[i] != seqs[i - 1],
+              label + ": sample " + std::to_string(seqs[i]) +
+                  " was delivered twice (consumer position did not advance)");
+    uint64_t gaps = 0;
+    for (size_t i = 1; i < seqs.size(); ++i) gaps += seqs[i] - seqs[i - 1] - 1;
+    check(gaps <= unexplained_budget,
+          label + ": " + std::to_string(gaps) + " sample(s) missing but only " +
+              std::to_string(unexplained_budget) +
+              " were accounted for by kernel drops and explicit discards");
 }
 
 size_t config_size(const nlohmann::json& config, const char* key, size_t fallback)
@@ -265,19 +299,21 @@ struct BpfEventSource {
         // A7: copy the record; nothing beyond this callback touches ring data.
         cev_sample sample{};
         std::memcpy(&sample, data, std::min(size, sizeof(sample)));
-        // Budget adapter: abort the drain once this turn's bound is reached.
-        if (self->turn_remaining_.load() == 0) {
+        ++self->drained_total;
+        {
+            std::lock_guard lock(self->queue_mutex_);
+            if (self->queue_.size() >= kMaxQueued) ++self->userspace_overflow;
+            else self->queue_.push_back(sample);
+        }
+        // The sample above is already copied out of the ring and libbpf has
+        // advanced the consumer position for it, so the turn bound must never
+        // discard it. Ending the turn *after* keeping this sample makes a turn
+        // deliver exactly `limit` samples: consuming the last one is what
+        // stops the loop.
+        if (self->turn_remaining_.load() == 0 || self->turn_remaining_.fetch_sub(1) == 1) {
             self->budget_exhausted = true;
             return -ENOBUFS;
         }
-        self->turn_remaining_.fetch_sub(1);
-        ++self->drained_total;
-        std::lock_guard lock(self->queue_mutex_);
-        if (self->queue_.size() >= kMaxQueued) {
-            ++self->userspace_overflow;
-            return 0;
-        }
-        self->queue_.push_back(sample);
         return 0;
     }
 
@@ -693,11 +729,17 @@ void run(const std::string& base, const std::string& probe_object)
     check(JobRegistry::instance().addJob(make_job(401, {"bpf_job"})), "add Job 401");
     eventually([] { return BpfJobEvent::init_done.load(); }, "Job BPF source was not initialized");
     eventually([] { return BpfJobEvent::attached.load() >= 1; }, "Job binding was not observed");
+    const auto job_discards_before = BpfJobEvent::unattributed.load();
+    const auto job_drops_before = BpfJobEvent::mirror_dropped.load();
     trigger_getpid(100);
     eventually([] { return captured_count("bpf_job") >= 100; },
                "Job BPF events were not fully delivered");
     check(BpfJobEvent::drain_turns.load() >= 15,
           "100 events over a turn bound of 7 did not require bounded continuation turns");
+    check_observed_exactly_once("bpf_job", 100,
+                                (BpfJobEvent::unattributed.load() - job_discards_before) +
+                                    (BpfJobEvent::mirror_dropped.load() - job_drops_before),
+                                "job bounded drain");
     const auto test_tgid = std::to_string(getpid());
     for (const auto& record : CaptureWriter::wait_for("bpf_job", 100)) {
         check(record->sample->job.JobID == 401, "Job BPF attribution envelope");
@@ -712,13 +754,19 @@ void run(const std::string& base, const std::string& probe_object)
     // unbounded consume aborted from the sample callback at the budget.
     // ------------------------------------------------------------------
     check(JobRegistry::instance().addJob(make_job(402, {"bpf_job_fb"})), "add Job 402");
-    trigger_getpid(20);
-    eventually([] { return captured_count("bpf_job_fb") >= 20; },
+    const auto fb_discards_before = BpfJobEvent::unattributed.load();
+    const auto fb_drops_before = BpfJobEventFallback::mirror_dropped.load();
+    trigger_getpid(40);
+    eventually([] { return captured_count("bpf_job_fb") >= 40; },
                "fallback-adapter events were not delivered");
-    check(BpfJobEventFallback::drain_turns.load() >= 4,
+    check(BpfJobEventFallback::drain_turns.load() >= 8,
           "fallback adapter did not bound its drain turns");
     check(BpfJobEventFallback::mirror_overflow.load() == 0,
           "fallback adapter lost records internally");
+    check_observed_exactly_once("bpf_job_fb", 40,
+                                (BpfJobEvent::unattributed.load() - fb_discards_before) +
+                                    (BpfJobEventFallback::mirror_dropped.load() - fb_drops_before),
+                                "fallback bounded drain");
 
     // ------------------------------------------------------------------
     // A8: mixed readiness and exact kernel-loss telemetry. The one-page ring

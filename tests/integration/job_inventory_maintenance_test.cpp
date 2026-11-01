@@ -1407,18 +1407,30 @@ void run_exec_hint_retry(const std::string& base)
         return observation;
     });
 
+    // The hint entry is synchronous now: the registry resolves on the caller's
+    // thread and registers at once. Retrying an incomplete metadata read is the
+    // SOURCE's job (its poll-turn re-read ladder), so one hint equals one
+    // attempt here, and a second hint from the same source must converge.
+    registry.onDiscoveryExecHint(4242);
+    check(observe_attempts == 1,
+          "exec retry: one hint must cause exactly one targeted observation");
+    check(!find_native(registry, "961.0").has_value(),
+          "exec retry: an incomplete observation must not create a record");
+    check(source.scans() == scans_after_start,
+          "exec retry: resolving a hint must not trigger a full scan");
+
+    // The source re-reads on its own schedule and hands the now-complete
+    // observation over the same entry; only then does the instance exist.
     registry.onDiscoveryExecHint(4242);
     check(wait_until([&]() { return find_native(registry, "961.0").has_value(); }, 5000),
-          "exec retry: the incomplete observation was never retried to completion");
+          "exec retry: the re-read observation was never registered");
     check(observe_attempts >= 2,
           "exec retry: the source was not re-observed after the incomplete pass");
-    check(source.observations_for_hint() >= 2,
-          "exec retry: the re-observation did not go through the hint path");
     check(source.scans() == scans_after_start,
-          "exec retry: the ladder must resolve without a full scan");
+          "exec retry: the re-read must resolve without a full scan");
 
     registry.deinit();
-    pass_case("EXEC2", "incomplete exec observations retry before any rescan");
+    pass_case("EXEC2", "one hint is one synchronous attempt; the source re-read converges");
 }
 
 }  // namespace

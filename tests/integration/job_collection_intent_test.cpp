@@ -24,6 +24,7 @@
  */
 #include "core/job_collection_manager.hpp"
 #include "core/job_registry.hpp"
+#include "job_fixture.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -68,18 +69,18 @@ NativeSelector condor_selector(const std::string& native)
     return selector;
 }
 
-ObservedExecution condor_observation(const std::string& native,
-                                     const std::string& boot_id = "boot-aaa",
-                                     pid_t manager_pid = 4242,
-                                     uint64_t start_ticks = 900000)
+Job condor_observation(const std::string& native,
+                       const std::string& boot_id = "boot-aaa",
+                       pid_t manager_pid = 4242,
+                       uint64_t start_ticks = 900000)
 {
-    ObservedExecution observation;
-    observation.selector = condor_selector(native);
-    observation.generation.boot_id = boot_id;
-    observation.generation.manager_pid = manager_pid;
-    observation.generation.manager_start_ticks = start_ticks;
-    observation.generation.cgroup_identity = "/sys/fs/cgroup/htcondor/slot1";
-    observation.processes.push_back(ProcessIdentity{manager_pid, start_ticks, boot_id});
+    ExecutionGeneration generation;
+    generation.boot_id = boot_id;
+    generation.manager_pid = manager_pid;
+    generation.manager_start_ticks = start_ticks;
+    generation.cgroup_identity = "/sys/fs/cgroup/htcondor/slot1";
+    Job observation = discovered_job(condor_selector(native), generation,
+                                     {ProcessIdentity{manager_pid, start_ticks, boot_id}}, true);
 
     CondorJobAttr attr{};
     attr.auto_update_child = false;
@@ -91,9 +92,8 @@ ObservedExecution condor_observation(const std::string& native,
     attr.slots_cgroup_path = "/sys/fs/cgroup/htcondor/slot1";
     attr.scheduler_host = "htcondor01";
 
-    observation.facts.jobtype = JobType::Job;
-    observation.facts.subtype = JobSubType::Condor;
-    observation.facts.sub_attr = attr;
+    observation.subtype = JobSubType::Condor;
+    observation.sub_attr = attr;
     return observation;
 }
 
@@ -146,7 +146,7 @@ void manual_selection_wins_over_observations_and_policy(const std::string& base)
 
     // An inventory observation update must not rewrite collection intent.
     auto updated_observation = observation;
-    std::get<CondorJobAttr>(updated_observation.facts.sub_attr).owner = "bob";
+    std::get<CondorJobAttr>(updated_observation.sub_attr).owner = "bob";
     const auto updated = registry.upsertObservedJob(updated_observation);
     check(updated.ok && updated.disposition == UpsertDisposition::Updated,
           "observation update must be applied to facts");
@@ -522,6 +522,121 @@ void repeated_requests_converge_a_failed_application(const std::string& base)
 
 } // namespace
 
+// A04 (runtime refresh) -----------------------------------------------------
+
+// A facts update with an unchanged binding must refresh the runtime snapshot:
+// convergence compares the facts revision the runtime actually saw, not only
+// the binding revision and collector set.
+void facts_update_refreshes_a_converged_runtime(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a04-refresh");
+    JobRegistry registry(isolated(path));
+    JobCollectionManager manager(registry);
+    manager.setCollectorValidator([](const std::string& name) {
+        return name == "cpumem_collector";
+    });
+
+    int applies = 0;
+    std::string last_owner;
+    registry.setCollectionApplier([&](const Job& job, std::vector<std::string>& applied,
+                                      std::string& error) {
+        ++applies;
+        last_owner = std::get<CondorJobAttr>(job.sub_attr).owner;
+        applied = job.CollectorNames;
+        error.clear();
+        return true;
+    });
+
+    const auto created = registry.upsertObservedJob(condor_observation("172.0"));
+    check(created.ok, "baseline registration must succeed");
+    const uint64_t id = created.internal_id;
+    check(manager.setCollectors(set_request({id}, {"cpumem_collector"})).ok,
+          "the intent must be accepted");
+    const int applied_after_bind = applies;
+    check(applied_after_bind == 1 && last_owner == "alice",
+          "the first application must carry the stored facts");
+
+    // Same binding, new facts: the runtime must be refreshed with them.
+    auto updated = condor_observation("172.0");
+    std::get<CondorJobAttr>(updated.sub_attr).owner = "after";
+    const auto upsert = registry.upsertObservedJob(updated);
+    check(upsert.ok && upsert.disposition == UpsertDisposition::Updated,
+          "the facts update must land");
+    registry.reconcileCollectionIntent(id);
+    check(applies == applied_after_bind + 1,
+          "a facts change with an unchanged binding must re-apply the snapshot");
+    check(last_owner == "after",
+          "the refreshed snapshot must carry the new facts, got " + last_owner);
+
+    // A no-op reconcile afterwards must not re-apply again.
+    registry.reconcileCollectionIntent(id);
+    check(applies == applied_after_bind + 1,
+          "a converged instance must not be re-applied without a change");
+}
+
+// A21 -----------------------------------------------------------------------
+
+// A collection applier runs inside the apply gate. Mutating intent from there
+// must be refused at the mutation entry, before anything is committed: the
+// outer call would otherwise publish a runtime result for a binding a newer
+// commit already superseded.
+void reentrant_intent_mutation_is_refused(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a21-reentrant");
+    JobRegistry registry(isolated(path));
+    JobCollectionManager manager(registry);
+    manager.setCollectorValidator([](const std::string& name) {
+        return name == "cpumem_collector";
+    });
+
+    const auto created = registry.upsertObservedJob(condor_observation("172.0"));
+    check(created.ok, "baseline registration must succeed");
+    const uint64_t id = created.internal_id;
+
+    const auto bound = manager.setCollectors(set_request({id}, {"cpumem_collector"}));
+    check(bound.ok, "the outer intent must be accepted");
+    const auto outer_binding = registry.bindingRecord(id);
+
+    int nested_ok = 0;
+    int nested_errors = 0;
+    CollectionError nested_error = CollectionError::None;
+    registry.setCollectionApplier([&](const Job& job, std::vector<std::string>& applied,
+                                      std::string& error) {
+        // A hook-style mutation from inside the gate: stop this same instance.
+        CollectionRequest nested;
+        nested.targets = {id};
+        nested.collectors = std::vector<std::string>{};
+        const auto outcome = manager.setCollectors(nested);
+        if (outcome.ok) ++nested_ok;
+        else {
+            ++nested_errors;
+            nested_error = outcome.error;
+        }
+        applied = job.CollectorNames;
+        error.clear();
+        return true;
+    });
+
+    registry.reconcileCollectionIntent(id);
+
+    check(nested_ok == 0, "a nested mutation from inside the gate must not commit");
+    check(nested_errors == 1, "the nested mutation must be refused exactly once");
+    check(nested_error == CollectionError::ReentrantMutation,
+          "the refusal must be typed as reentrant_mutation");
+
+    const auto after = registry.bindingRecord(id);
+    check(after.revision == outer_binding.revision,
+          "the nested attempt must not move the durable binding revision");
+    check(after.mode == outer_binding.mode &&
+              after.manual_collectors == outer_binding.manual_collectors &&
+              !after.manual_collectors.empty(),
+          "the nested manual stop must not survive in the durable binding");
+    const auto applied_now = registry.appliedCollection(id);
+    check(applied_now.applied &&
+              applied_now.collectors == std::vector<std::string>{"cpumem_collector"},
+          "the outer application must record the binding it actually converged on");
+}
+
 int main(int argc, char** argv)
 {
     try {
@@ -532,6 +647,8 @@ int main(int argc, char** argv)
         duplicate_requests_stale_revisions_and_invalid_targets(base);
         durable_intent_survives_restart_and_generation_change(base);
         repeated_requests_converge_a_failed_application(base);
+        facts_update_refreshes_a_converged_runtime(base);
+        reentrant_intent_mutation_is_refused(base);
         std::cout << "PASS collection intent: A05 manual over discovery and "
                      "policy, A06 persistent stop and reset_auto, A07 "
                      "duplicate/stale/invalid request atomicity, A22 durable "

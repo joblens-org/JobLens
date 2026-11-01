@@ -25,6 +25,8 @@
 #include "core/inventory_status_provider.hpp"
 #include "core/job_collection_manager.hpp"
 #include "core/job_registry.hpp"
+#include "job_fixture.h"
+#include "job_fixture.h"
 
 #include <filesystem>
 #include <fstream>
@@ -192,16 +194,17 @@ void run(const std::string& base)
         options.register_rpc = false;
         JobRegistry registry(options);
 
-        ObservedExecution observation;
-        observation.selector.adapter = "condor";
-        observation.selector.cluster_name = "htcondor01";
-        observation.selector.native_job_id = "700.0";
-        observation.generation.boot_id = "boot";
-        observation.generation.manager_pid = 4242;
-        observation.generation.manager_start_ticks = 900000;
-        observation.processes.push_back(ProcessIdentity{4242, 900000, "boot"});
-        observation.facts.jobtype = JobType::Job;
-        observation.facts.subtype = JobSubType::Condor;
+        NativeSelector selector;
+        selector.adapter = "condor";
+        selector.cluster_name = "htcondor01";
+        selector.native_job_id = "700.0";
+        ExecutionGeneration generation;
+        generation.boot_id = "boot";
+        generation.manager_pid = 4242;
+        generation.manager_start_ticks = 900000;
+        Job observation = discovered_job(selector, generation,
+                                         {ProcessIdentity{4242, 900000, "boot"}}, true);
+        observation.subtype = JobSubType::Condor;
 
         const auto created = registry.upsertObservedJob(observation);
         check(created.ok && created.disposition == UpsertDisposition::Created,
@@ -246,16 +249,17 @@ void run(const std::string& base)
         options.register_rpc = false;
         JobRegistry registry(options);
 
-        ObservedExecution observation;
-        observation.selector.adapter = "condor";
-        observation.selector.cluster_name = "htcondor01";
-        observation.selector.native_job_id = "710.0";
-        observation.generation.boot_id = "boot";
-        observation.generation.manager_pid = 4343;
-        observation.generation.manager_start_ticks = 0;  // unknown: not verified
-        observation.processes.push_back(ProcessIdentity{4343, 0, "boot"});
-        observation.facts.jobtype = JobType::Job;
-        observation.facts.subtype = JobSubType::Condor;
+        NativeSelector selector;
+        selector.adapter = "condor";
+        selector.cluster_name = "htcondor01";
+        selector.native_job_id = "710.0";
+        ExecutionGeneration generation;
+        generation.boot_id = "boot";
+        generation.manager_pid = 4343;
+        generation.manager_start_ticks = 0;  // unknown: not verified
+        Job observation = discovered_job(selector, generation,
+                                         {ProcessIdentity{4343, 0, "boot"}}, true);
+        observation.subtype = JobSubType::Condor;
 
         const auto created = registry.upsertObservedJob(observation);
         check(created.ok && created.disposition == UpsertDisposition::Created,
@@ -268,8 +272,8 @@ void run(const std::string& base)
 
         // The observation that completes the generation selects automatically.
         auto completed = observation;
-        completed.generation.manager_start_ticks = 910000;
-        completed.processes.front().start_ticks = 910000;
+        completed.execution->generation.manager_start_ticks = 910000;
+        completed.execution->members.front().start_ticks = 910000;
         const auto updated = registry.upsertObservedJob(completed);
         check(updated.ok && updated.disposition == UpsertDisposition::Updated,
               "incomplete generation: the completing observation must update the record");
@@ -320,6 +324,112 @@ void run(const std::string& base)
             (rules_root / "does-not-exist").string(), "nope_");
         const auto none = broken.select(job, revision, error);
         check(none.empty(), "auto policy: a rules policy with no rules selects nothing");
+    }
+
+    // A14/A32: facts durable but the initial intent write failed. The result
+    // must say the decision is not committed (not "ok = everything worked"),
+    // the instance must stay inventoried with no binding, and a repeated
+    // registration (the record-driven repair) must converge.
+    {
+        JobRegistryOptions options;
+        options.db_path = fresh_dir(base, "lifecycle-intent-failure");
+        options.enable_pid_tracker = false;
+        options.register_rpc = false;
+        JobRegistry registry(options);
+
+        NativeSelector selector;
+        selector.adapter = "condor";
+        selector.cluster_name = "htcondor01";
+        selector.native_job_id = "720.0";
+        ExecutionGeneration generation;
+        generation.boot_id = "boot";
+        generation.manager_pid = 4545;
+        generation.manager_start_ticks = 920000;
+        Job job = discovered_job(selector, generation, {ProcessIdentity{4545, 920000, "boot"}},
+                                 true);
+        job.subtype = JobSubType::Condor;
+
+        // Facts write succeeds, the following intent transaction fails.
+        registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite, /*skip=*/1);
+        const auto failed = registry.upsertObservedJob(job);
+        check(failed.ok, "the facts must stay durable when only the intent write fails");
+        check(failed.intent_committed.has_value() && *failed.intent_committed == false,
+              "a failed initial intent must be reported as not committed");
+        check(failed.code == RegistrationError::InitialIntentWriteFailed,
+              "the typed code must identify the intent failure, got " +
+                  std::string(to_string(failed.code)));
+        check(failed.retry_registration() == false,
+              "an intent failure is repaired by record state, never by re-reading metadata");
+        {
+            const auto binding = registry.bindingRecord(failed.internal_id);
+            check(binding.revision == 0,
+                  "a failed intent must leave the binding revision at zero");
+            check(registry.inventoryRecord(failed.internal_id).has_value(),
+                  "the instance must stay inventoried");
+        }
+
+        registry.clearStoreFaultsForTest();
+        const auto repaired = registry.upsertObservedJob(job);
+        check(repaired.ok, "the repeated registration must succeed");
+        check(repaired.internal_id == failed.internal_id,
+              "the repair must converge on the same instance");
+        check(repaired.intent_committed.has_value() && *repaired.intent_committed,
+              "the repeated registration must commit the initial decision");
+        check(registry.bindingRecord(failed.internal_id).revision > 0,
+              "the repaired binding must be durable");
+        registry.deinit();
+    }
+
+    // A14 (production entry): the event path and a maintenance pass must repair
+    // a missing initial decision, not only the single-upsert entry.
+    {
+        JobRegistryOptions options;
+        options.db_path = fresh_dir(base, "lifecycle-intent-repair");
+        options.enable_pid_tracker = false;
+        options.register_rpc = false;
+        JobRegistry registry(options);
+
+        NativeSelector selector;
+        selector.adapter = "condor";
+        selector.cluster_name = "htcondor01";
+        selector.native_job_id = "730.0";
+        ExecutionGeneration generation;
+        generation.boot_id = "boot";
+        generation.manager_pid = 4646;
+        generation.manager_start_ticks = 930000;
+        Job job = discovered_job(selector, generation, {ProcessIdentity{4646, 930000, "boot"}},
+                                 true);
+        job.subtype = JobSubType::Condor;
+
+        registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite, /*skip=*/1);
+        const auto failed = registry.registerDiscoveredJobs({job});
+        check(failed.size() == 1 && failed[0].ok,
+              "the batch facts must stay durable when only the intent write fails");
+        check(failed[0].intent_committed.has_value() && !*failed[0].intent_committed,
+              "the batch entry must report the missing initial decision");
+        check(failed[0].code == RegistrationError::InitialIntentWriteFailed,
+              "the batch entry must carry the typed intent failure");
+
+        registry.clearStoreFaultsForTest();
+        const auto repaired = registry.registerDiscoveredJobs({job});
+        check(repaired.size() == 1 && repaired[0].ok, "the repeated batch must succeed");
+        check(repaired[0].intent_committed.has_value() && *repaired[0].intent_committed,
+              "a repeated batch registration must repair the initial decision");
+
+        // Same obligation, driven by a maintenance pass with no new observation.
+        Job job2 = discovered_job(selector, generation, {ProcessIdentity{4646, 930000, "boot"}},
+                                  true);
+        job2.NativeJobID = "731.0";
+        registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite, /*skip=*/1);
+        const auto failed2 = registry.registerDiscoveredJobs({job2});
+        check(failed2[0].ok && !*failed2[0].intent_committed,
+              "the second instance must start without a decision");
+        registry.clearStoreFaultsForTest();
+        registry.runInventoryPass(false);
+        const auto repaired2 = registry.bindingRecord(failed2[0].internal_id);
+        check(repaired2.revision > 0,
+              "a maintenance pass must repair the missing initial decision");
+        registry.deinit();
     }
 
     pass_case("LIFECYCLE",
