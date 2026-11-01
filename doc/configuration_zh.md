@@ -72,6 +72,7 @@ job_registry_config:
   inventory:
     types: [condor, slurm]               # 需要完整本地清单的调度器类型（opt-in，缺省为 []）
     reconcile_interval_sec: 30           # 对账周期，最小 1 秒
+    registration_batch_size: 1           # 每个 poll turn 登记的作业数（1..32）
 ```
 
 | 键 | 类型 | 默认值 | 描述 |
@@ -81,6 +82,7 @@ job_registry_config:
 | `auto_add_slurmjob` | bool | false | **已弃用**。同上，作用于 Slurm |
 | `inventory.types` | list | `[]` | 需要完整本地清单的调度器类型（包含未被采集的作业）。取值 `condor` / `slurm`，未知值启动即拒绝 |
 | `inventory.reconcile_interval_sec` | int | 30 | 周期性全量对账间隔，单位秒，最小 1 |
+| `inventory.registration_batch_size` | int | 1 | 每个发现源的 poll turn 一次提交登记多少个作业（1..32）。`1` 表示事件回调返回前该作业的事实与初始 intent 已提交；更大值满批立即提交、poll 结束时提交尾批。重启生效，越界即启动报错。 |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs`（Condor）或 `{JobLensRootDir}/../config/rules/slurm_jobs`（Slurm） | Lua 规则文件目录，CondorJobWatcher 和 SlurmJobWatcher 在 `use_rules` 启用时使用。注意：默认值因 watcher 而异。 |
 
 **清单维护**与**自动采集**是两个独立开关，旧的 `auto_add_*` 旗标折算进它们：
