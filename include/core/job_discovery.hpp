@@ -231,37 +231,27 @@ struct DiscoveryOptions {
     // Periodic scan tick of the adapter's poll thread; 0 disables it (the
     // maintenance controller owns pacing and runs the authoritative passes).
     std::uint32_t scan_interval_ms = 0;
-    // `job_registry_config.inventory.registration_batch_size` (1..32): how many
-    // discovered jobs one poll turn registers in one commit. 1 means the event
-    // callback returns only after its job's facts/intent attempt completed.
-    std::size_t registration_batch_size = 1;
 
     DiscoveryEnvironment discovery;
     ScanClock clock;
 };
 
-// Receives observations produced by a scan or a targeted probe.
+// Receives observations produced by a scan or a targeted probe. Queued and
+// processed by the maintenance thread.
 using ObservationSink = std::function<void(const Observation&)>;
 
-// Synchronous registration entry (plan §3/§5.1): one call registers a whole
-// turn's worth of jobs and returns one result per job, in input order. It runs
-// on the producing thread (the source's poll thread), never on a worker.
-using JobSink = std::function<std::vector<UpsertResult>(const std::vector<Job>&)>;
+// Synchronous single-job registration entry (plan §3/§5.1): resolves the
+// observation, registers it and returns the result. It runs on the caller's
+// thread (the source's poll thread), never on a worker.
+using JobSink = std::function<UpsertResult(const Observation&)>;
 
-// Receives discovery output from a source. Every entry runs on the source's
-// poll thread (or the maintenance worker for a scan), so the source can drive
-// registration itself and observe the result.
+// Receives discovery output from a source.
 struct DiscoverySink {
-    // Building block of the registration path: turns one parsed observation
-    // into the Job the store consumes (facts projection plus the execution
-    // evidence group). Supplied by the registry so a source never needs the
-    // scheduler-specific facts encoder.
-    std::function<Job(const Observation&)> to_job;
-    // The one registration entry: scan, event and re-read all hand their Jobs
-    // here. Empty when this core has no inventory runtime.
-    JobSink on_jobs;
-    // Retained entry for out-of-band producers and the scan path that the
-    // registry still routes through its hint queue.
+    // Event path: register one observation immediately on the poll thread. The
+    // store writes it without a fence, so the callback never waits for
+    // persistence. Empty when this core has no inventory runtime.
+    JobSink on_job;
+    // Scan path: hand the observation to the maintenance thread.
     ObservationSink on_observation;
 };
 

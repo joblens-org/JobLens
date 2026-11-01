@@ -306,6 +306,9 @@ private:
     bool hb_running_ = false;      // worker thread alive
     bool hb_stopping_ = false;
     bool hint_wakeup_ = false;
+    // Set by requestRescan() to cut the maintenance wait short (cooldown still
+    // limits how often a forced scan actually runs).
+    bool hb_wake_ = false;
     bool rescan_flag_ = false;
     bool degraded_ = false;
     bool incomplete_drain_ = false;

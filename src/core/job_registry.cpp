@@ -205,6 +205,12 @@ void JobRegistry::requestRescan(const std::string& reason) {
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         ++hb_rescan_requests_;
+        // Wake the maintenance loop instead of waiting for its next 100 ms
+        // slice: the first request of a burst is serviced at once, while the
+        // forced-scan cooldown keeps a job-start storm from becoming a scan
+        // storm (plan §6.3).
+        hb_wake_ = true;
+        hb_cv_.notify_all();
     }
     for (const auto& [name, source] : hb_sources_) {
         try {
@@ -645,6 +651,14 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
     // every pass, even when no new observation arrived (plan §5.5).
     repairMissingInitialDecisions();
 
+    // Checkpoint: facts and intent are written without a fence on the hot path,
+    // so one fsynced batch per pass bounds what a process crash can lose. The
+    // pass cadence (reconcile_interval_sec) is the checkpoint cadence on
+    // purpose: no extra knob, no extra thread.
+    if (!store_->flushDirty("maintenance checkpoint")) {
+        spdlog::warn("JobRegistry: the maintenance checkpoint could not be written");
+    }
+
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         ++hb_passes_;
@@ -707,20 +721,22 @@ void JobRegistry::heartbeatLoop() {
 
     std::unique_lock<std::mutex> lock(hb_mtx_);
     while (!hb_stopping_) {
-        // A slice-bounded wait keeps stop() bounded; hints are picked up on
-        // the next slice (at most wait_slice_ms) without ever spinning.
-        hb_cv_.wait_for(lock, slice, [this]() { return hb_stopping_; });
+        // A slice-bounded wait keeps stop() bounded; a rescan request wakes it
+        // at once so the first late-metadata job converges in tens of ms, while
+        // the forced-scan cooldown still limits repeats.
+        hb_cv_.wait_for(lock, slice, [this]() { return hb_stopping_ || hb_wake_; });
+        hb_wake_ = false;
         if (hb_stopping_) break;
 
         const bool due = std::chrono::steady_clock::now() >= next_full;
         bool rescan = false;
-        if (!due && !hint_wakeup_) {
+        if (!due) {
             // Discovery events and queue overflows ask for an authoritative
             // pass. Reading source health needs no heartbeat lock.
             lock.unlock();
             rescan = rescanRequested();
             lock.lock();
-            if (!rescan || hb_stopping_) continue;
+            if ((!rescan && !hint_wakeup_) || hb_stopping_) continue;
         }
 
         lock.unlock();
@@ -764,20 +780,15 @@ void JobRegistry::installHeartbeatSink() {
     heartbeat_sink_.on_observation = [this](const Observation& observation) {
         onDiscoveryObservation(observation);
     };
-    // The one registration entry every source uses: convert on the source's
-    // own thread and register synchronously. No ingest worker, no queue.
-    heartbeat_sink_.to_job = [this](const Observation& observation) {
-        // One call == one resolved exec event / scan observation the source
-        // handed over, so this is where the "events received" surface counts
-        // now that the source registers on its own thread.
+    // Event path: the source hands one resolved observation over on its own
+    // poll thread and gets the registration result back. No worker, no queue,
+    // and no fsync on this path.
+    heartbeat_sink_.on_job = [this](const Observation& observation) {
         {
             std::lock_guard<std::mutex> lock(hb_mtx_);
             ++hb_events_received_;
         }
-        return toJob(observation);
-    };
-    heartbeat_sink_.on_jobs = [this](const std::vector<Job>& jobs) {
-        return registerDiscoveredJobs(jobs);
+        return upsertObservedJob(toJob(observation));
     };
 }
 
@@ -813,6 +824,7 @@ void JobRegistry::init_inventory(const JobRegistryOptions& options)
         hb_stopping_ = false;
         hb_running_ = false;
         hint_wakeup_ = false;
+        hb_wake_ = false;
         degraded_ = false;
         incomplete_drain_ = false;
         hb_last_error_.clear();
@@ -1118,6 +1130,13 @@ bool JobRegistry::deinit()
     stopInventoryDiscovery();
 
     bool ok = true;
+    // Everything written without a fence becomes durable before the database
+    // closes; archive runs (synced) after this so a closing record is archived
+    // on top of an up-to-date row.
+    if (!store_->flushDirty("shutdown checkpoint")) {
+        spdlog::warn("JobRegistry: the shutdown checkpoint could not be written");
+        ok = false;
+    }
     // Archive leftover closing records first so a restored closing record is
     // not reported as an incomplete drain even though the archive succeeds.
     if (!cleanupClosingJobs()) ok = false;
