@@ -16,19 +16,27 @@
 //
 // A JobRecord is "a Job plus what JobLens must remember to manage it":
 // execution evidence (identity, generation, members), the durable lifecycle
-// state (active | suspect | closing), the collection intent and the
-// runtime-reported applied state. JobStore is the ONLY writer of that state;
-// every other view (Job snapshots handed to collectors, scheduler lanes,
-// kernel maps) is a projection refreshed through store results and events.
+// state (open | closing), and the desired collection selection. JobStore is the
+// ONLY writer of that state; every other view (Job snapshots handed to
+// collectors, scheduler lanes, kernel maps) is a projection.
 //
-// LevelDB namespaces (schema 2, unchanged layout):
-//   j:  active JobRecords (legacy namespace, additive fields)
-//   h:  archived history (final binding summary)
+// The store holds DESIRED state only. Which collectors are actually attached is
+// owned by the collection runtime and is never mirrored here.
+//
+// LevelDB namespaces (schema 4):
+//   j:  active JobRecords, including the desired selection
+//   h:  archived history (final record + selection summary)
 //   c:  durable allocator high-water mark
-//   m:  schema version, Agent DB UUID, migration state
+//   m:  schema version, Agent DB UUID
 //   i:  canonical identity key -> internal ID
-//   b:  per-instance collection intent (kept as its own key; folding it into
-//       j: is schema-3 work and deliberately not done here)
+//
+// Schema 4 replaces schema 3's separate intent object (its own revision plus a
+// separate facts revision) with one `selection` object ordered by the record's
+// single revision, and drops the persisted runtime `applied` projection. Older
+// schemas are rejected explicitly at open time: this build never migrates or
+// deletes an existing database. The `m:schema_version` marker is a canonical
+// decimal (digits only, no truncation); anything else is rejected read-only
+// before the UUID, id counter or any record is initialized.
 #pragma once
 
 #include <atomic>
@@ -48,6 +56,7 @@
 #include "core/collector_type.h"
 #include "core/registration_contract.hpp"
 #include "core/job_identity.hpp"
+#include "core/liveness.hpp"
 
 class JobStore;
 struct JobRecord;
@@ -68,50 +77,93 @@ inline const char* to_string(CollectionMode mode)
 
 std::optional<CollectionMode> collection_mode_from_string(const std::string& raw);
 
-// Per-instance collection intent. Revisions are monotonically increasing
-// per instance; revision 0 means "no intent recorded yet" (auto, empty).
-struct BindingRecord {
-    uint64_t internal_id = 0;
-    uint64_t revision = 0;
-    CollectionMode mode = CollectionMode::Auto;
-    std::vector<std::string> auto_collectors;
-    std::vector<std::string> manual_collectors;
-    std::string policy_revision;
+// Desired collection selection. It carries no revision and no identity of its
+// own: JobRecord::revision is the ONE monotonic counter that orders every
+// record mutation, including the selection commands guarded by a CAS.
+//
+//   automatic        absent  = no automatic decision was ever recorded
+//                    present = the policy's last decision (may be empty)
+//   automatic_source provenance label of that decision (rule revision), not a
+//                    concurrency token
+//   manual           absent  = no manual override
+//                    present = the operator's selection; present-but-empty is
+//                              a persistent stop and wins over automatic
+struct CollectionSelection {
+    std::optional<std::vector<std::string>> automatic;
+    std::string automatic_source;
+    std::optional<std::vector<std::string>> manual;
 
-    // effective_collectors = manual if mode == manual, else auto. An explicit
-    // empty manual list is a persistent stop and must win over auto.
+    bool hasManual() const { return manual.has_value(); }
+    bool stopped() const { return manual.has_value() && manual->empty(); }
+    // manual wins over automatic, the explicit empty stop included.
     std::vector<std::string> effectiveCollectors() const;
+    CollectionMode mode() const
+    {
+        return manual.has_value() ? CollectionMode::Manual : CollectionMode::Auto;
+    }
 };
 
-// Runtime state of a committed binding. Intent is owned by the store; applied
-// state is reported by the collection runtime and persisted here so a restart
-// can reconcile instead of guessing. `applied=false` with a non-empty
-// `collectors` list is a partial success and stays visible.
-struct AppliedCollection {
-    bool applied = false;
-    uint64_t revision = 0;          // binding revision this result belongs to
-    // Facts revision the runtime actually saw. A facts change with an unchanged
-    // binding must refresh the runtime snapshot, so convergence compares this
-    // too (plan §7.2).
-    uint64_t facts_revision = 0;
+// A control-plane selection command. The store re-reads the record inside the
+// same transaction that writes it, so the transform, the revision guard and
+// the commit are one atomic step; a caller-side read-modify-write window does
+// not exist.
+enum class SelectionOperation {
+    SetManual,   // replace the manual selection; [] is a persistent stop
+    ResetAuto,   // clear the manual override, keep the automatic selection
+    SetAuto,     // record an automatic decision; manual always wins
+};
+
+struct SelectionMutation {
+    uint64_t internal_id = 0;
+    SelectionOperation operation = SelectionOperation::SetManual;
+    // SetManual: manual names. SetAuto: automatic names. ResetAuto: empty.
     std::vector<std::string> collectors;
-    std::string error;
+    std::string automatic_source;                // SetAuto only
+    std::optional<uint64_t> expected_revision;   // CAS guard, checked in-transaction
+};
+
+struct SelectionMutationResult {
+    uint64_t internal_id = 0;
+    // The record revision after the command: the accepted revision a caller may
+    // report. This is an acceptance stamp, not proof the runtime applied it.
+    uint64_t revision = 0;
+    CollectionSelection selection;
+    // The client-visible desired selection changed.
+    bool intent_changed = false;
+    // The effective collector set changed, so the runtime must be reconciled.
+    // An automatic decision under a manual override changes bookkeeping only.
+    bool runtime_changed = false;
+    // A row was written even though the client-visible intent did not move
+    // (automatic bookkeeping under a manual override).
+    bool stored_changed = false;
+    bool skipped_manual_override = false;
 };
 
 struct StoreHealth {
     bool db_running = false;
     bool migration_complete = false;
-    std::string migration_state;         // empty | in_progress:<stage> | complete
+    // empty | complete | unsupported_schema:<n> | malformed_schema_marker
+    std::string migration_state;
     uint32_t schema_version = 0;
     std::string db_uuid;
     bool degraded = false;
+    // A write reported failure without proving whether it landed. Until an
+    // explicit recovery verifies the affected rows (or the store is reopened)
+    // no mutation, runtime application or checkpoint may run: memory and disk
+    // may disagree, and a blind write could publish the older image.
+    bool recovery_required = false;
+    std::string recovery_state;          // last operation that lost certainty
     // Write batches (any durability) and the subset that actually fsynced.
     // Exposed so the cost of a registration path can be reasoned about instead
     // of guessed: the hot path must not move `sync_commits`.
     uint64_t durable_commits = 0;
     uint64_t sync_commits = 0;
     uint64_t dirty_records = 0;
-    uint64_t dirty_bindings = 0;
+    // Entries in the last attempted recovery fence batch. A recovery that
+    // adopts an instance must re-assert it durably; when the adopted instance
+    // was archived, that fence is the only proof the archive landed, so a zero
+    // here after a failed recovery means the obligation is still open.
+    uint64_t recovery_fence_entries = 0;
     uint64_t write_failures = 0;
     std::string last_write_error;
     uint64_t incomplete_identities = 0;
@@ -142,11 +194,12 @@ enum class StoreFaultMode {
 // JobRecord — the one durable representation
 // ---------------------------------------------------------------------------
 
-// Lifecycle state persisted with the record. "closing" is written before the
-// collector drain starts so an interrupted retirement can never resurrect as
-// active; "suspect" is a maintenance verdict (re-admitted by observation).
+// Durable lifecycle state persisted with the record. "closing" is written
+// before the collector drain starts, so an interrupted retirement can never
+// resurrect as active. Unverified liveness is NOT a lifecycle state: a restored
+// record is Open unless it is Closing, and an unreadable process is "unknown",
+// never dead.
 inline constexpr const char* kStateActive = "active";
-inline constexpr const char* kStateSuspect = "suspect";
 inline constexpr const char* kStateClosing = "closing";
 
 struct JobRecord {
@@ -161,16 +214,29 @@ struct JobRecord {
     ExecutionGeneration generation;      // optional; unverified != dead
     std::vector<ProcessIdentity> members;
     bool members_authoritative = false;  // empty list then means "confirmed empty"
+    // Which path owns the execution facts.  A discovery observation EXPECTS a
+    // manager generation, so an incomplete one is an unverified execution, not
+    // a manual registration.  A manual/legacy row owns no generation and its
+    // bound member identities are its only execution evidence.  Set by upsert()
+    // (true) and insertManual() (false); never inferred from a member count.
+    bool execution_observed = false;
     // --- JobLens management state ----------------------------------------
     uint64_t internal_id = 0;
     std::string instance_id;             // opaque handle (db uuid + id)
-    std::string state = kStateActive;    // active | suspect | closing
-    uint64_t facts_revision = 0;
+    std::string state = kStateActive;    // active | closing
+    // The ONE record revision. Every durable mutation of this record advances
+    // it: facts, automatic bookkeeping and manual selection commands alike. A
+    // CAS reads and compares this same value inside the write transaction.
+    uint64_t revision = 0;
+    // Liveness evidence from the last restore/observation. False means the
+    // execution could not be verified (unreadable process, incomplete discovery
+    // identity). It is NOT a lifecycle state: the record stays Open, admission
+    // is refused, and absence never authorizes retirement or PID deletion.
+    bool execution_verified = true;
     int64_t first_seen_us = 0;
     int64_t last_seen_us = 0;
-    // --- collection intent + runtime result ------------------------------
-    BindingRecord intent;
-    AppliedCollection applied;           // durable reconciliation hint (I7)
+    // --- desired selection (the runtime's actual state is not stored) -----
+    CollectionSelection selection;
 };
 
 // ---------------------------------------------------------------------------
@@ -181,7 +247,11 @@ class JobStore {
 public:
     struct Options {
         std::string db_path;                 // empty: job_registry_config.job_db_path
-        size_t migration_batch_limit = 0;    // test seam: stop a migration early
+        // Process-identity verification used by restore().  Empty selects the
+        // production /proc probe.  The registry passes the same probe it uses
+        // for admission, so a row cannot be published as verified here and
+        // refused there.
+        ProcessLivenessProbe identity_probe;
     };
 
     explicit JobStore(const Options& options);
@@ -194,11 +264,15 @@ public:
     StoreHealth health() const;
     bool ready() const;
     bool migrationComplete() const { return migration_complete_; }
+    // True while the last write outcome is unknown. Every durable mutation and
+    // the checkpoint refuse to run in this state.
+    bool recoveryRequired() const { return recovery_required_.load(); }
+    // Explicit, complete recovery: adopts the durable row for every instance
+    // whose last write lost certainty, rewrites the dirty set durably, and
+    // clears the latch only when every step succeeded. Reading one row is not
+    // a recovery, and a successful write elsewhere never clears the latch.
+    bool recoverPending(std::string& error);
     void injectFaultForTest(StoreFaultMode mode, size_t skip = 0, size_t count = 1);
-    // Test-only seam: runs inside the registration admission, after the id
-    // reservation and before the facts commit. Used to prove that a standalone
-    // allocation cannot interleave with a batch reservation (plan §5.3).
-    void setPreCommitHookForTest(std::function<void()> hook);
     void clearFaultsForTest();
 
     // Adapter-owned identity->facts derivation, injected by the registry
@@ -211,11 +285,30 @@ public:
         identity_applier_ = std::move(applier);
     }
     std::string dbUuid() const { return db_uuid_; }
+    // Boot id this process runs under, read once at construction.  An
+    // execution generation stamped with a different boot cannot name a live
+    // process here, so admission must not treat its PID as verified.
+    const std::string& bootId() const { return boot_id_; }
 
     // --- restore (once, right after construction) ------------------------
-    // Validates restored executions: stale generations become suspect with
-    // cleared members, interrupted closings keep their state, dead PIDs are
-    // dropped. Never replays anything into kernel maps.
+    // Validates restored executions with a POSITIVE identity check:
+    //   * a DISCOVERY row (execution_observed) is kept only when its boot
+    //     matches and its manager's current start ticks match.  A stale one
+    //     becomes suspect with cleared members (positive reuse evidence); an
+    //     UNVERIFIABLE one (unreadable /proc, or an incomplete discovery
+    //     generation) becomes suspect while its saved member/PID facts are
+    //     retained -- deleting evidence is not a verdict, and the retained
+    //     facts are what stops a later absence rule from retiring a live child;
+    //   * a MANUAL row (no observed execution) owns no generation; its members
+    //     are re-checked individually;
+    //   * a member is kept only while its saved boot id equals the current boot
+    //     and the process holding that number still matches the saved start
+    //     ticks; a recycled PID or an old-boot identity is dropped;
+    //   * a member without a saved identity (legacy/manual row) is kept as an
+    //     unverified fact, never turned into a fabricated `{pid, 0, ""}` and
+    //     never seeded onto the kernel.
+    // Explicitly interrupted closings keep their state.  Never replays
+    // anything into kernel maps.
     std::vector<JobRecord> restore();
 
     // --- internal id allocation ------------------------------------------
@@ -235,20 +328,11 @@ public:
     // lifecycle callbacks and never starts collection.
     UpsertResult upsert(const Job& job, JobRecord& out);
     // Write-free merge decision for one observation against an already-loaded
-    // record, shared by the single upsert and the batch path.
+    // record, used by the single upsert path.
     UpsertResult merge_existing(const Job& job, const NativeSelector& selector,
                                 const CanonicalIdentity& identity, uint64_t internal_id,
                                 const JobRecord& stored, int64_t observed_at,
                                 JobRecord& updated_out);
-    // Batch form of upsert for a burst of fresh executions: every new record,
-    // its identity index entry and the id counter go into ONE durable commit.
-    // Identities already indexed fall back to the per-record path (they are
-    // merges, not creates) so their result stays exactly the single-upsert one.
-    // `out` is aligned with `jobs`; entries for rejected or merged jobs are
-    // left empty.
-    std::vector<UpsertResult> upsertBatch(const std::vector<Job>& jobs,
-                                          std::vector<JobRecord>& out);
-
     // --- record mutations ---------------------------------------------------
     // Generic in-memory read-modify-write under the store lock. Does not
     // persist; combine with persistRecord for durable mutations.
@@ -267,24 +351,21 @@ public:
     bool refreshFacts(uint64_t id, const std::function<void(Job&)>& refresh);
 
     // --- intent + applied ---------------------------------------------------
-    BindingRecord binding(uint64_t id) const;
-    // One durable transaction for every submitted binding. All targets must
-    // exist and not be closing; on any write failure nothing is committed.
-    // `updated` receives the stored records plus whether the derived
-    // CollectorNames actually changed (the runtime-application trigger).
-    bool commitBindings(const std::vector<BindingRecord>& bindings,
-                        std::vector<std::pair<JobRecord, bool>>& updated,
-                        std::string& error);
-    AppliedCollection applied(uint64_t id) const;
-    // Records the runtime application result. The value is memory truth for
-    // this process only: it is updated together with the Job.collection
-    // projection and never written back to the durable row. A restart clears
-    // the live holders and re-attaches through replay; the durable `applied`
-    // field is a fixed "not applied" projection that feeds diagnostics only,
-    // and archive copies the final in-memory summary into h:.
-    bool recordApplied(uint64_t id, const AppliedCollection& applied);
+    // Desired selection of one instance. The actual attached set is owned by
+    // the collection runtime and is deliberately absent here.
+    CollectionSelection selection(uint64_t id) const;
+    // Atomic selection command batch: for every mutation the stored record is
+    // re-read under the transaction locks, the expected revision is compared
+    // there (never in the caller), and the transform is applied. Every changed
+    // record is written in ONE unsynced batch; a write failure commits and
+    // publishes nothing. `out` is aligned with `mutations`.
+    bool mutateSelections(const std::vector<SelectionMutation>& mutations,
+                          std::vector<SelectionMutationResult>& out,
+                          std::string& error);
     // Flush the rows written without a fence (checkpoint/shutdown). Public: the
-    // registry schedules it from the maintenance pass and from deinit().
+    // registry schedules it from the maintenance pass and from deinit(). Rows
+    // whose last write outcome is unknown are never rewritten; the call then
+    // fails so the caller cannot report a durable state it did not reach.
     bool flushDirty(const char* reason);
 
     // --- queries -------------------------------------------------------------
@@ -308,16 +389,15 @@ private:
     bool init_db(const Options& options);
     void close_db();
     bool load_or_create_db_uuid();
-    bool resume_migration_state(std::string& stage, std::string& cursor);
-    bool migrate_allocator();
-    bool migrate_index(std::string& cursor, size_t& batches, size_t batch_limit);
-    bool migrate_finalize();
-    bool run_migration();
+    // True when the opened database has no user keys yet (a brand-new store).
+    bool db_is_empty() const;
+    // Persists the current schema marker for a brand-new store.
+    bool initialize_schema();
+    // Closes a database this build must not touch and records why it is not
+    // ready. Never deletes data.
+    void reject_unsupported_schema(uint32_t found);
+    void reject_schema(const std::string& state, uint32_t found);
     void init_id_counter();
-    // Copies the live runtime result over a record read from disk (db_mtx_ ->
-    // mtx_ lock order) and keeps the Job.collection projection in sync.
-    bool overlay_runtime(JobRecord& record) const;
-    void apply_runtime_projection_locked(JobRecord& record) const;
     // In-memory reservation for the inventory create path: the caller writes
     // `durable_counter` in the same batch as the record, so a new instance
     // costs one durable commit instead of two.
@@ -327,11 +407,52 @@ private:
     // `durable` = true fsyncs the batch (that is, also every earlier unsynced
     // write in the log). The registration hot path writes with durable=false
     // and leaves the row in the dirty set for the checkpoint / shutdown flush.
+    // `touched` names the instances whose row this batch rewrites; a failed
+    // write of such a batch latches recovery because the disk may have landed
+    // the very image memory did not publish.
     leveldb::Status write_batch_locked(leveldb::WriteBatch& batch, const char* operation,
-                                       bool durable = true);
+                                       bool durable = true,
+                                       const std::vector<uint64_t>* touched = nullptr);
+    // Flush body; callers hold db_mtx_.
+    bool flush_dirty_locked(const char* reason);
+    // Which side is authoritative after an ambiguous write.
+    enum class RecoveryKind {
+        None,
+        // The write may have landed while memory kept the previous image: the
+        // durable row is truth and is adopted for `recovery_ids_`.
+        AdoptDurable,
+        // A checkpoint failed after memory became truth: the snapshot is
+        // rewritten instead of read back.
+        RewriteMemory,
+    };
+    // Callers hold db_mtx_ (write_batch_locked is named for that contract).
+    void latch_recovery_locked(const char* operation, RecoveryKind kind,
+                               const std::vector<uint64_t>& ids);
+    bool recover_pending_locked(std::string& error);
+    // The exact durable image of an archive that landed ambiguously: the
+    // history key (it encodes the archive timestamp), its value verbatim, and
+    // the identity index row the same batch deleted while this instance still
+    // owned it. Recovery re-asserts this image instead of rebuilding one from
+    // memory, which would invent a different timestamp and summary.
+    struct ArchiveFence {
+        uint64_t internal_id = 0;
+        std::string history_key;
+        std::string history_value;
+        std::string identity_key;   // empty when there is nothing to release
+    };
+    // Reads the durable `h:` row for an instance whose `j:` row is gone. Fails
+    // when there is no history row (nothing to prove) or more than one (an
+    // image this process cannot disambiguate).
+    bool read_archive_fence_locked(uint64_t internal_id, ArchiveFence& fence,
+                                   std::string& error);
+    // Reads one durable row and publishes it. `archive` is set when the row was
+    // archived instead of rewritten: memory drops it, and the recovered history
+    // image must be fenced. Returns false only when the outcome is still
+    // unknown (a read error or an image that cannot be proven).
+    bool adopt_durable_locked(uint64_t internal_id, std::optional<ArchiveFence>& archive,
+                              std::string& error);
     // Marks one record / binding as "written but not yet fsynced".
     void mark_record_dirty(uint64_t internal_id);
-    void mark_binding_dirty(uint64_t internal_id);
     void record_store_failure(const std::string& message);
     void record_store_success();
     void note_record(JobRecord record);
@@ -351,25 +472,36 @@ private:
     std::unordered_map<uint64_t, JobRecord> records_;
     // Rows written with durable=false since the last flush (guarded by mtx_).
     std::set<uint64_t> dirty_records_;
-    std::set<uint64_t> dirty_bindings_;
     std::unordered_map<std::string, uint64_t> identity_index_;
 
     leveldb::DB* db_ = nullptr;
     bool db_running_ = false;
     Options options_;
+    // Production /proc probe unless Options::identity_probe overrides it.
+    ProcessLivenessProbe identity_probe_;
+    // Boot id this process runs under: an execution stamped with any other boot
+    // cannot be live here.
+    std::string boot_id_;
 
     std::string db_uuid_;
     uint32_t schema_version_ = 0;
+    // true only when this build owns the on-disk schema. Older/newer layouts
+    // are rejected at open and never migrated or deleted.
     bool migration_complete_ = false;
     std::string migration_state_;
-    size_t migration_batch_limit_ = 0;
     std::atomic<bool> store_degraded_{false};
+    // Guarded by db_mtx_ (the rejected-state fields are set before ready()).
+    RecoveryKind recovery_kind_ = RecoveryKind::None;
+    std::set<uint64_t> recovery_ids_;
+    std::string recovery_operation_;
+    std::atomic<bool> recovery_required_{false};
+    // Entries in the last attempted recovery fence batch (guarded by db_mtx_).
+    uint64_t recovery_fence_entries_ = 0;
     std::atomic<uint64_t> store_write_failures_{0};
     std::atomic<uint64_t> durable_commits_{0};
     std::atomic<uint64_t> sync_commits_{0};
     uint64_t corrupt_records_ = 0;
     std::string last_store_error_;   // guarded by db_mtx_
-    std::function<void()> pre_commit_hook_;
     StoreFaultMode fault_mode_ = StoreFaultMode::None;
     size_t fault_skip_ = 0;
     size_t fault_count_ = 0;

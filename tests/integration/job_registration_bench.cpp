@@ -15,13 +15,13 @@
  * discovery callback" (doc/job_inventory_v2_architecture.md / the synchronous
  * discovery plan).
  *
- * The synchronous chain the plan proposes is exactly:
+ * The registration chain this harness measures is exactly:
  *
  *   observeForHint(pid)              -> Observation   (procfs/ad/cgroup reads)
  *   adapter.encodeFacts(observation) -> typed Job
- *   registry.upsertObservedJob(exec) -> durable fact (LevelDB, sync=true)
- *   registry.applyAutoSelection(...) -> durable intent (LevelDB, sync=true)
- *   registry.reconcileCollectionIntent(...) -> applier (collector attach)
+ *   registry.upsertObservedJob(exec) -> durable facts + optional automatic decision
+ *   (collector attach is owned by the scheduler's asynchronous reconcile pass,
+ *    not by this registration path)
  *
  * This harness runs that chain on real host inputs and reports the per-stage
  * latency distribution, so the cost of doing it on the libbpf poll thread can
@@ -117,21 +117,10 @@ struct Args {
     int burst = 0;
     int batch_probe = 0;
     int enqueue_probe = 0;
-    int batch_burst = 0;
-    int batch_size = 1;
     int lua_rules = 0;      // >0: measure the automatic policy (Lua) per job
     int lua_iterations = 0;
     int register_rules = 0; // >0: arm the real Lua policy inside registration
-    // Workload class for the event stream. `new` registers each identity once,
-    // `duplicate` replays identical facts, `membership-change` replays facts
-    // that force a real merge every time. These are the three classes the plan
-    // requires separately; a single averaged number hid the difference.
-    std::string workload{"new"};
-    int events_per_job = 1;
     bool drain_policies = false;
-    // single = one registration per observed job (callback-per-event)
-    // batch-real = observe every fixture job, commit them in batches
-    std::string mode{"single"};
     bool no_apply = false;
     bool keep_fixture = false;
 };
@@ -160,12 +149,6 @@ Args parse_args(int argc, char** argv)
         else if (key == "--batch-probe") args.batch_probe = std::stoi(next("--batch-probe"));
         else if (key == "--no-apply") args.no_apply = true;
         else if (key == "--enqueue-probe") args.enqueue_probe = std::stoi(next("--enqueue-probe"));
-        else if (key == "--batch-burst") args.batch_burst = std::stoi(next("--batch-burst"));
-        else if (key == "--batch-size") args.batch_size = std::stoi(next("--batch-size"));
-        else if (key == "--mode") args.mode = next("--mode");
-        else if (key == "--workload") args.workload = next("--workload");
-        else if (key == "--events-per-job")
-            args.events_per_job = std::stoi(next("--events-per-job"));
         else if (key == "--lua-rules") args.lua_rules = std::stoi(next("--lua-rules"));
         else if (key == "--lua-iterations")
             args.lua_iterations = std::stoi(next("--lua-iterations"));
@@ -177,9 +160,8 @@ Args parse_args(int argc, char** argv)
             std::cout <<
                 "job_registration_bench --db <leveldb-dir> [--out <dir>] [--jobs N]\n"
                 "  [--burst N] [--repeat K] [--batch-probe N] [--no-apply]\n"
-                "  [--enqueue-probe N] [--batch-burst N] [--batch-size B]\n"
-                "  [--mode single|batch-real] [--workload new|duplicate|membership-change]\n"
-                "  [--events-per-job N] [--lua-rules K] [--lua-iterations N]\n"
+                "  [--enqueue-probe N]\n"
+                "  [--lua-rules K] [--lua-iterations N]\n"
                 "  [--register-rules K] [--drain]\n"
                 "  [--collectors a,b] [--cluster NAME]\n"
                 "  [--fixture-root DIR] [--pid-file FILE] [--keep-fixture]\n";
@@ -402,10 +384,6 @@ struct Samples {
     std::vector<double> total;
     std::vector<double> dup;
     std::vector<double> burst;
-    std::vector<double> batch_burst;   // per registration inside a batch
-    std::vector<double> batch_commit;  // per batch
-    std::size_t batch_applied = 0;     // instances the applier really bound
-    std::size_t batch_duplicate_ids = 0;
 };
 
 struct Stats {
@@ -515,34 +493,6 @@ void run_batch_probe(const fs::path& dir, int records)
     }
 }
 
-// The production batch path applies the automatic policy inside
-// registerDiscoveredJobs (one intent transaction for the batch). The isolated
-// bench registry has no policy wired, so the same two steps are performed here:
-// one durable intent commit for the batch, then the runtime application.
-void applyBenchIntents(JobRegistry& registry, const std::vector<UpsertResult>& results,
-                       const std::vector<std::string>& collectors)
-{
-    std::vector<BindingRecord> bindings;
-    for (const auto& result : results) {
-        if (!result.ok) continue;
-        BindingRecord binding;
-        binding.internal_id = result.internal_id;
-        binding.revision = 1;
-        binding.mode = CollectionMode::Auto;
-        binding.auto_collectors = collectors;
-        binding.policy_revision = "bench";
-        bindings.push_back(std::move(binding));
-    }
-    if (bindings.empty()) return;
-    std::string error;
-    if (!registry.commitBindings(bindings, error)) {
-        std::cerr << "batch intent commit failed: " << error << "\n";
-        return;
-    }
-    for (const auto& result : results)
-        if (result.ok) registry.reconcileCollectionIntent(result.internal_id);
-}
-
 // Realistic deployment rules: each one reads a few nested fields of the job
 // table and returns a decision, like the shipped examples in the API guide.
 void write_probe_rules(const fs::path& dir, int count)
@@ -552,8 +502,7 @@ void write_probe_rules(const fs::path& dir, int count)
     // Every rule passes, so evaluate_all() evaluates all of them: the point is
     // the cost of K per-job evaluations, not short-circuit behaviour.
     for (int i = 0; i < count; ++i) {
-        std::ostringstream lua;
-        lua << "local rule = {}\n"
+        std::ostringstream lua;        lua << "local rule = {}\n"
                "rule.name = \"probe_" << i << "\"\n"
                "rule.description = \"benchmark rule: inspect owner/cluster/pids\"\n"
                "rule.priority = " << (100 - i) << "\n"
@@ -646,18 +595,9 @@ int main(int argc, char** argv)
         return 2;
     }
 
-    // The collector scheduler's applier is bookkeeping under one lock; the
-    // per-collector device work hangs off the sampling lanes, not the attach.
-    std::mutex membership_mutex;
-    std::map<std::string, std::set<uint64_t>> membership;
-    registry.setCollectionApplier(
-        [&](const Job& job, std::vector<std::string>& applied, std::string& error) {
-            std::lock_guard<std::mutex> lock(membership_mutex);
-            for (const auto& name : job.CollectorNames) membership[name].insert(job.JobID);
-            applied = job.CollectorNames;
-            (void)error;
-            return true;
-        });
+    // No collection runtime: this benchmark measures the registration and
+    // desired-state commit path only. Actual attachment belongs to the
+    // scheduler and is not part of this number.
 
     InventoryTypeSettings settings;
     settings.cluster_name = args.cluster;
@@ -674,7 +614,6 @@ int main(int argc, char** argv)
     std::size_t incomplete = 0;
     std::size_t rejected = 0;
 
-    if (args.mode != "batch-real")
     for (const auto& job : jobs) {
         const auto t0 = Clock::now();
         std::optional<Observation> observation;
@@ -705,10 +644,8 @@ int main(int argc, char** argv)
             ++rejected;
             continue;
         }
-        if (!args.no_apply) {
+        if (!args.no_apply)
             registry.applyAutoSelection(result.internal_id, collectors, "bench");
-            registry.reconcileCollectionIntent(result.internal_id);
-        }
         const auto t4 = Clock::now();
 
         samples.observe.push_back(elapsed_us(t0, t1));
@@ -725,96 +662,6 @@ int main(int argc, char** argv)
                 probe_job->JobPIDs.push_back(member.pid);
         }
         executions.push_back(std::move(execution));
-    }
-
-    // ---- batched registration of the real fixture burst --------------------
-    // The plan's alternative: drain the poll iteration, observe every event,
-    // then commit the whole batch durably before returning to the ring buffer.
-    std::vector<double> real_batch_commit;
-    if (args.mode == "batch-real") {
-        const int batch = std::max(1, args.batch_size);
-        std::vector<Job> pending;
-        double observe_us = 0;
-        std::size_t observed_jobs = 0;
-        auto flush = [&]() {
-            if (pending.empty()) return;
-            const auto t0 = Clock::now();
-            const auto results = registry.registerDiscoveredJobs(pending);
-            if (args.register_rules == 0) applyBenchIntents(registry, results, collectors);
-            const auto t1 = Clock::now();
-            const double batch_us = elapsed_us(t0, t1);
-            std::size_t accepted = 0;
-            for (const auto& result : results)
-                if (result.ok) ++accepted;
-            if (accepted > 0) {
-                real_batch_commit.push_back(batch_us);
-                const double share = batch_us / static_cast<double>(accepted);
-                for (std::size_t i = 0; i < accepted; ++i)
-                    samples.total.push_back(share + observe_us / static_cast<double>(observed_jobs));
-            } else {
-                ++rejected;
-            }
-            pending.clear();
-            observe_us = 0;
-            observed_jobs = 0;
-        };
-        // The event stream is explicit: how many events per identity, and
-        // whether a replayed event carries identical facts or a real change.
-        // `--repeat` re-runs the same stream against the same identities, which
-        // is what a repeated observation of a live execution looks like (the
-        // previous implementation only repeated in single mode).
-        const int events = std::max(1, args.events_per_job);
-        const int rounds = std::max(1, args.repeat_rounds);
-        const bool change_members = args.workload == "membership-change";
-        if (args.workload != "new" && args.workload != "duplicate" && !change_members) {
-            std::cerr << "unknown --workload '" << args.workload
-                      << "' (expected new, duplicate or membership-change)\n";
-            std::exit(2);
-        }
-        std::size_t synthetic_member = 0;
-        for (int round = 0; round < rounds; ++round) {
-            for (int event = 0; event < events; ++event) {
-                for (const auto& job : jobs) {
-                    const auto t0 = Clock::now();
-                    std::optional<Observation> observation;
-                    try {
-                        observation = adapter->source().observeForHint(job.child);
-                    } catch (const std::exception& error) {
-                        std::cerr << "observe failed: " << error.what() << "\n";
-                        ++incomplete;
-                        continue;
-                    }
-                    const auto t1 = Clock::now();
-                    if (!observation) {
-                        ++incomplete;
-                        continue;
-                    }
-                    samples.observe.push_back(elapsed_us(t0, t1));
-                    observe_us += elapsed_us(t0, t1);
-                    ++observed_jobs;
-                    Job execution = bench_job(*observation, adapter->encodeFacts(*observation));
-                    if (change_members && (round > 0 || event > 0)) {
-                        // Same execution generation, one extra verified member:
-                        // a merge that must land in the same batch, never a
-                        // second instance.
-                        execution.execution->members_authoritative = true;
-                        execution.execution->members.push_back(ProcessIdentity{
-                            static_cast<pid_t>(900000 + synthetic_member++),
-                            observation->generation.manager_start_ticks,
-                            observation->generation.boot_id});
-                    }
-                    if (!probe_job) {
-                        probe_job = execution;
-                        probe_job->JobPIDs.clear();
-                        for (const auto& member : observation->members)
-                            probe_job->JobPIDs.push_back(member.pid);
-                    }
-                    pending.push_back(std::move(execution));
-                    if (static_cast<int>(pending.size()) >= batch) flush();
-                }
-            }
-        }
-        flush();
     }
 
     // ---- duplicate rounds: same execution seen again ----------------------
@@ -840,60 +687,9 @@ int main(int argc, char** argv)
             const auto result = registry.upsertObservedJob(execution);
             if (result.ok)
                 registry.applyAutoSelection(result.internal_id, collectors, "bench");
-            if (result.ok) registry.reconcileCollectionIntent(result.internal_id);
             const auto t1 = Clock::now();
             if (result.ok) samples.burst.push_back(elapsed_us(t0, t1));
             else ++rejected;
-        }
-    }
-
-    // ---- batched registration: one poll iteration registers a whole batch ---
-    if (args.batch_burst > 0 && !executions.empty()) {
-        const Job& templ = executions.front();
-        const int batch = std::max(1, args.batch_size);
-        std::set<uint64_t> seen_ids;
-        std::vector<Job> pending;
-        for (int i = 0; i < args.batch_burst; ++i) {
-            Job execution = templ;
-            execution.NativeJobID = "7" + std::to_string(200000 + i) + ".0";
-            pending.push_back(std::move(execution));
-            if (static_cast<int>(pending.size()) < batch) continue;
-            const auto t0 = Clock::now();
-            const auto results = registry.registerDiscoveredJobs(pending);
-            if (args.register_rules == 0) applyBenchIntents(registry, results, collectors);
-            const auto t1 = Clock::now();
-            const double per_batch_us = elapsed_us(t0, t1);
-            std::size_t accepted = 0;
-            for (const auto& result : results)
-                if (result.ok) ++accepted;
-            if (accepted > 0) {
-                samples.batch_commit.push_back(per_batch_us);
-                samples.batch_burst.push_back(per_batch_us / static_cast<double>(accepted));
-                for (const auto& result : results) {
-                    if (!result.ok) continue;
-                    if (!seen_ids.insert(result.internal_id).second)
-                        ++samples.batch_duplicate_ids;
-                    if (registry.appliedCollection(result.internal_id).applied)
-                        ++samples.batch_applied;
-                }
-            } else {
-                ++rejected;
-            }
-            pending.clear();
-        }
-        if (!pending.empty()) {
-            const auto t0 = Clock::now();
-            const auto results = registry.registerDiscoveredJobs(pending);
-            if (args.register_rules == 0) applyBenchIntents(registry, results, collectors);
-            const auto t1 = Clock::now();
-            const double per_batch_us = elapsed_us(t0, t1);
-            std::size_t accepted = 0;
-            for (const auto& result : results)
-                if (result.ok) ++accepted;
-            if (accepted > 0) {
-                samples.batch_commit.push_back(per_batch_us);
-                samples.batch_burst.push_back(per_batch_us / static_cast<double>(accepted));
-            }
         }
     }
 
@@ -962,9 +758,6 @@ int main(int argc, char** argv)
     const auto dup = stats_of(samples.dup);
     const auto burst = stats_of(samples.burst);
     const auto enqueued = stats_of(enqueue);
-    const auto batch_reg = stats_of(samples.batch_burst);
-    const auto batch_commit_stats = stats_of(samples.batch_commit);
-    const auto real_batch_stats = stats_of(real_batch_commit);
     const auto lua_stats = stats_of(lua_calls);
     const auto drain_stats = stats_of(drain_passes);
 
@@ -973,17 +766,12 @@ int main(int argc, char** argv)
                 jobs.size(), incomplete, rejected,
                 fixture.cgroup_usable() ? "yes" : "fallback",
                 static_cast<unsigned long long>(commits));
-    // The three workload classes must stay labelable: an averaged number over
-    // new + duplicate + changed facts hid which class a commit count belongs to.
-    std::printf("workload=%s events_per_job=%d rounds=%d mode=%s batch=%d\n",
-                args.workload.c_str(), args.events_per_job, args.repeat_rounds,
-                args.mode.c_str(), args.batch_size);
+    // An averaged number over new + duplicate + changed facts hid which class a
+    // commit count belongs to; keep the repeat count in the report.
+    std::printf("rounds=%d\n", args.repeat_rounds);
     if (!samples.total.empty())
         std::printf("commits per registration: %.2f\n",
                     static_cast<double>(commits) / samples.total.size());
-    if (!real_batch_commit.empty())
-        std::printf("commits per batch iteration: %.2f\n",
-                    static_cast<double>(commits) / real_batch_commit.size());
     print_stats("observeForHint", observe);
     print_stats("encodeFacts", encode);
     print_stats("upsertObservedJob", upsert);
@@ -992,12 +780,6 @@ int main(int argc, char** argv)
     print_stats("upsert duplicate", dup);
     print_stats("burst registration", burst);
     if (enqueued.n > 0) print_stats("enqueue (current path)", enqueued);
-    if (real_batch_stats.n > 0) {
-        print_stats("batched poll iteration", real_batch_stats);
-        std::printf("batched burst: %zu jobs, %zu iterations, total callback %.1fms\n",
-                    total.n, real_batch_stats.n,
-                    (real_batch_stats.sum + observe.sum) / 1000.0);
-    }
     if (lua_stats.n > 0) {
         print_stats("lua policy select", lua_stats);
         std::printf("lua rules=%d decisions: rejected=%zu errors=%zu sample=[%s]\n",
@@ -1011,11 +793,6 @@ int main(int argc, char** argv)
         print_stats("heartbeat pass", drain_stats);
         std::printf("policy is synchronous with registration; no deferred backlog\n");
     }
-    if (batch_reg.n > 0) print_stats("batch registration/job", batch_reg);
-    if (batch_commit_stats.n > 0) print_stats("batch commit", batch_commit_stats);
-    if (batch_reg.n > 0)
-        std::printf("batch instances applied=%zu duplicate_ids=%zu\n", samples.batch_applied,
-                    samples.batch_duplicate_ids);
     if (total.n > 0)
         std::printf("sequential registrations/sec (p50 total): %.1f\n",
                     1e6 / std::max(total.p50, 1.0));
@@ -1038,9 +815,6 @@ int main(int argc, char** argv)
     dump("dup", samples.dup);
     dump("burst", samples.burst);
     dump("enqueue", enqueue);
-    dump("batch_reg", samples.batch_burst);
-    dump("batch_commit", samples.batch_commit);
-    dump("real_batch_commit", real_batch_commit);
     dump("lua_policy", lua_calls);
 
     std::ofstream json(out_dir + "/results.json");
@@ -1064,9 +838,6 @@ int main(int argc, char** argv)
     put("duplicate", dup, false);
     put("burst", burst, false);
     put("enqueue", enqueued, false);
-    put("batch_registration", batch_reg, false);
-    put("batch_commit", batch_commit_stats, false);
-    put("real_batch_commit", real_batch_stats, false);
     put("lua_policy", lua_stats, true);
     json << "}\n";
 

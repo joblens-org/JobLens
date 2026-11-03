@@ -35,7 +35,9 @@ struct UpsertResult {
     UpsertDisposition disposition = UpsertDisposition::Rejected;
     uint64_t internal_id = 0;
     std::string instance_id;
-    uint64_t facts_revision = 0;
+    // The accepted record revision this result committed (0 = nothing durable
+    // was written). It orders the record; it is not runtime proof.
+    uint64_t revision = 0;
     // True when this upsert completed the execution generation of a record
     // that was stored unverified: its first-complete-registration trigger.
     bool generation_became_complete = false;

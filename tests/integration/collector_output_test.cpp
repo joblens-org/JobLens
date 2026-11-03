@@ -207,6 +207,11 @@ void run(const std::string& base) {
     WriterManager::instance().registerWriter<CaptureWriter>("CaptureWriter");
 
     auto& scheduler = CollectorScheduler::instance();
+    // Composition: the scheduler pulls desired state from the registry; the
+    // registry never calls a collector lane synchronously.
+    JobRegistry& job_registry = JobRegistry::instance();
+    scheduler.attach(&job_registry, &job_registry);
+    job_registry.setCollectionRuntime(&scheduler);
     scheduler.start();
 
     // ---- System 作用域：自动启动，合成 Job 0，不走 Job 重载 ----

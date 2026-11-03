@@ -14,7 +14,6 @@
 #include "core/collector_scheduler.hpp"
 
 #include "core/collector_execution_context.hpp"
-#include "core/job_registry.hpp"
 #include "core/output_context.hpp"
 #include "core/writer_manager.hpp"
 
@@ -69,14 +68,24 @@ WorkResult CollectorScheduler::runPeriodicSystemTick(CollectorLaneContext& lane)
 
 void CollectorScheduler::collectJobSample(CollectorLaneContext& lane, size_t jobid,
                                           CollectorRuntime::Operation& callback) {
-    std::optional<Job> job = JobRegistry::instance().findJob(jobid);
-    if (!job.has_value()) return;
+    // The lane's immutable attachment snapshot is the source of truth, not a
+    // reverse read of the registry singleton. A sweep that outlived its
+    // attachment finds no snapshot and produces no sample.
+    auto& state = *lane.state;
+    Job job;
+    {
+        std::lock_guard snapshot_lock(state.snapshot_m_);
+        const auto it = state.job_snapshots.find(jobid);
+        if (it == state.job_snapshots.end()) return;
+        job = it->second;
+    }
+    if (!state.running) return;
 
-    OutputContext output(lane.info.router, makeSample(lane.name, lane.info.type, *job));
+    OutputContext output(lane.info.router, makeSample(lane.name, lane.info.type, job));
     std::unique_ptr<CollectorRuntime::Operation> write_op;
     attachWriteObserver(output, lane.name, jobid, write_op);
 
-    const auto result = invokePeriodicJob(lane.info, *job, output, jobid);
+    const auto result = invokePeriodicJob(lane.info, job, output, jobid);
     applyCollectResult(lane.name, jobid, result, output, callback);
 }
 

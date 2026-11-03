@@ -15,12 +15,7 @@
 // inventory_rpc.cpp; reads state only through the public JobRegistry API.
 #pragma once
 
-#include <memory>
-
 #include "core/job_registry.hpp"
 
-class JobCollectionManager;
-
 // Registers every JobRegistry/* and JobCollection/* RPC method.
-void registerInventoryRpc(JobRegistry& registry,
-                          std::shared_ptr<JobCollectionManager> manager);
+void registerInventoryRpc(JobRegistry& registry);

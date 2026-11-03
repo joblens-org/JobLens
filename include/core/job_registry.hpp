@@ -13,11 +13,12 @@
  * limitations under the License. */
 // job_registry.h — the registry facade
 //
-// JobRegistry owns the JobStore (the single durable JobRecord representation,
-// doc/job_inventory_v2_architecture.md §2.4) and is the ONLY class the
-// CollectorScheduler interacts with: lifecycle callbacks fan job events out to
-// collectors, and the collection applier seam reports the runtime's actual
-// attach/detach results back into the stored records.
+// JobRegistry owns the JobStore: the single durable JobRecord representation
+// and the only writer of facts, desired selection and Open/Closing state. It
+// holds NO runtime mirror. Which collectors are actually attached belongs to
+// the collection runtime, reached through the explicit ICollectionRuntime seam;
+// the runtime converges by reading records through IJobRecordSource and reports
+// a completed stop through IDrainCompletionSink.
 #pragma once
 #include <unordered_map>
 #include <shared_mutex>
@@ -40,6 +41,7 @@
 #include "ebpf/trace_condor_starter.h"
 #include "common/ebpf_common.hpp"
 #include "core/job_store.hpp"
+#include "core/collection_runtime.hpp"
 #include "core/kernel_attribution.hpp"
 #include "core/job_auto_policy.hpp"
 #include "core/liveness.hpp"
@@ -48,8 +50,83 @@
 #include "job_watcher/condor_adapter.hpp"
 #include "job_watcher/slurm_adapter.hpp"
 
-class JobCollectionManager;
-struct AutoSelection;
+// ---------------------------------------------------------------------------
+// Collection selection control (registry-owned)
+// ---------------------------------------------------------------------------
+// These are the control-plane commands the registry executes itself: target
+// validation, manual-stop precedence, revision CAS and the durable transaction
+// live behind one entry point instead of a separate manager object calling
+// back into the registry.
+enum class CollectionError {
+    None = 0,
+    InvalidRequest,
+    UnknownCollector,
+    NotFound,
+    StaleRevision,
+    StoreUnavailable,
+    // The caller tried to mutate intent from inside a gated mutation (a
+    // lifecycle hook or collection applier). Nothing was committed.
+    ReentrantMutation,
+};
+
+inline const char* to_string(CollectionError error)
+{
+    switch (error) {
+        case CollectionError::None:              return "ok";
+        case CollectionError::InvalidRequest:    return "invalid_request";
+        case CollectionError::UnknownCollector:  return "unknown_collector";
+        case CollectionError::NotFound:          return "not_found";
+        case CollectionError::StaleRevision:     return "stale_revision";
+        case CollectionError::ReentrantMutation: return "reentrant_mutation";
+        case CollectionError::StoreUnavailable:  return "store_unavailable";
+    }
+    return "unknown";
+}
+
+struct CollectionRequest {
+    std::vector<uint64_t> targets;
+    // set_collectors: required, explicit [] means persistent stop.
+    // reset_auto: must be absent.
+    std::optional<std::vector<std::string>> collectors;
+    // Optional binding revision guard, single-target requests only. It is
+    // compared inside the store transaction, not in a caller-side lock.
+    std::optional<uint64_t> expected_revision;
+};
+
+struct CollectionTargetOutcome {
+    uint64_t internal_id = 0;
+    std::string instance_id;
+    // The accepted desired state after the command.
+    CollectionSelection selection;
+    // The record revision the command committed. Acceptance only: the runtime
+    // converges asynchronously, so this is not proof the collectors attached.
+    uint64_t revision = 0;
+    // What the runtime actually holds right now, sampled after the commit. It
+    // may still show the previous attachment; that is the honest answer.
+    ActualCollectionState actual;
+    bool changed = false;
+    // The automatic decision was refused before the transaction (unknown
+    // instance or invalid collector). Such a target is never "committed", even
+    // when a previous valid revision exists.
+    bool skipped = false;
+};
+
+struct CollectionOutcome {
+    bool ok = false;
+    CollectionError error = CollectionError::None;
+    std::string message;
+    std::vector<CollectionTargetOutcome> targets;  // exact targets on success
+    size_t unchanged = 0;
+    size_t skipped_manual_override = 0;
+    size_t skipped_invalid = 0;
+};
+
+// Automatic policy result for one instance.
+struct AutoSelection {
+    uint64_t internal_id = 0;
+    std::vector<std::string> collectors;
+    std::string policy_revision;
+};
 
 // Construction options. Production uses the singleton (all defaults); tests
 // and inventory-only service startup construct an isolated store without
@@ -61,9 +138,6 @@ struct JobRegistryOptions {
     bool enable_inventory_maintenance = true;
     bool enable_pid_tracker = true;
     bool register_rpc = true;
-    // Test seam: stop a legacy migration after this many durable batches and
-    // leave it resumable. 0 = unlimited.
-    size_t migration_batch_limit = 0;
     // --- heartbeat test seams (used instead of the config-driven adapters) --
     // Pre-built discovery sources to drive, with the adapter name each
     // observation belongs to. When non-empty, the configuration is not
@@ -84,7 +158,9 @@ struct JobRegistryOptions {
     std::string test_auto_policy_adapter{"condor"};
 };
 
-class JobRegistry : private KernelAttribution::Host {
+class JobRegistry : private KernelAttribution::Host,
+                    public IDrainCompletionSink,
+                    public IJobRecordSource {
 public:
     static JobRegistry& instance();          // 仍保留单例，方便迁移；也可由 main() 构造
     explicit JobRegistry(const JobRegistryOptions& options);
@@ -102,9 +178,6 @@ public:
     bool retireInstance(uint64_t jobID);
     // 通过 sub_attr 匹配删除作业，返回删除的作业数量
     size_t delJob(const SubAttrMatcher& matcher);
-    // Finish the destructive cleanup after scoped collector work has drained.
-    // Returns false when at least one closing record could not be archived.
-    bool acknowledgeJobRemoval(uint64_t jobID);
     size_t closingJobCount() const;
     bool cleanupClosingJobs();
     // Read-only snapshot: no refresh, no PID pruning, no retirement.
@@ -112,9 +185,6 @@ public:
     // 通过 sub_attr 匹配查找作业，返回匹配的作业列表
     std::vector<Job> findJob(const SubAttrMatcher& matcher) const;
     std::vector<Job> snapshot() const;
-
-    // 生命周期回调注册
-    void addLifecycleCb(JobLifecycleCb cb);
 
     // 获取下一个全局唯一递增的JobID（durable 预留；失败返回 0）
     uint64_t getNextJobID();
@@ -130,39 +200,59 @@ public:
     // An upsert never fires lifecycle callbacks or starts collection: runtime
     // application is binding-driven.
     UpsertResult upsertObservedJob(const Job& job);
-    // Batch registration for a burst of discoveries from one poll iteration:
-    // one durable commit for the facts, one for the automatic intents, then the
-    // runtime application per instance. Same per-job semantics and result as
-    // upsertObservedJob, minus one fsync per job.
-    std::vector<UpsertResult> registerDiscoveredJobs(const std::vector<Job>& jobs);
     std::optional<JobRecord> inventoryRecord(uint64_t jobID) const;
     std::optional<JobRecord> inventoryRecordByIdentity(
         const CanonicalIdentity& identity) const;
     std::vector<JobRecord> inventoryRecords() const;
-    BindingRecord bindingRecord(uint64_t jobID) const;
-    // One durable transaction for every submitted binding. All targets must
-    // exist; on any write failure nothing is committed and `error` is set.
-    bool commitBindings(const std::vector<BindingRecord>& bindings, std::string& error);
+    CollectionSelection selectionRecord(uint64_t jobID) const;
+    // Optional collector-name gate. Unset accepts every non-empty name.
+    void setCollectorValidator(std::function<bool(const std::string&)> validator);
+    // operation = set: manual selection replacing any previous intent; []
+    // stops collection. `collectors` must be present.
+    CollectionOutcome setCollectors(const CollectionRequest& request);
+    // operation = reset_auto: clear the manual override and let the recorded
+    // automatic selection apply. `collectors` must be absent.
+    CollectionOutcome resetAuto(const CollectionRequest& request);
+    // Automatic policy decision for a batch of instances. Manual overrides,
+    // including empty ones, are never overwritten.
+    CollectionOutcome applyAutoPolicy(const std::vector<AutoSelection>& selections);
+    // Explicit store recovery: verifies every row whose last write outcome is
+    // unknown and clears the latch only when all of them were read back. The
+    // mutating commands do this automatically; a caller can request it to
+    // report the reason a write is refused.
+    bool recoverStore(std::string& error);
+    // Test seam: replaces the kernel-cleanup step so the retirement ordering
+    // (closing -> cleanup -> archive) can be exercised without BPF. Production
+    // leaves it unset and uses KernelAttribution; it grants no way to write job
+    // state.
+    void setKernelCleanupForTest(
+        std::function<bool(uint64_t, const Job&, std::string&)> cleanup);
     bool hasInstance(uint64_t jobID) const;
     std::string instanceId(uint64_t jobID) const;
     StoreHealth storeHealth() const;
     bool migrationComplete() const { return store_ && store_->migrationComplete(); }
 
     // --- Collection runtime seam ------------------------------------------
-    // The component that actually runs collectors (CollectorScheduler) installs
-    // this sink. It is called outside every registry lock, after the durable
-    // intent transaction, and reports which collectors really took effect.
-    using CollectionApplier = std::function<bool(
-        const Job& job, std::vector<std::string>& applied_collectors, std::string& error)>;
-    void setCollectionApplier(CollectionApplier applier);
-    // Last runtime application result for one instance.
-    AppliedCollection appliedCollection(uint64_t jobID) const;
-    // Converges one instance's runtime to its current durable binding. A call
-    // is a no-op when the applied state already matches (same revision, same
-    // collector set, applied); otherwise the binding is applied again — this is
-    // the retry path for a failed application and the reconciliation path for
-    // state that drifted. Cheap enough to run every heartbeat pass.
-    void reconcileCollectionIntent(uint64_t jobID);
+    // The component that actually runs collectors (CollectorScheduler) is
+    // injected at composition time. The registry never reaches for its
+    // singleton, and it never calls into it on a source or RPC stack: a command
+    // commits desired state, then only wakes the runtime.
+    void setCollectionRuntime(ICollectionRuntime* runtime);
+    ICollectionRuntime* collectionRuntime() const;
+    // Coalesced wake of the installed runtime. Entered under the mutation gate:
+    // a runtime that mutates intent from its wake callback is refused instead
+    // of recursing back into the command path.
+    void wake_runtime();
+    // Actual state as the runtime reports it (untracked when no runtime).
+    ActualCollectionState actualCollection(uint64_t jobID);
+    // IDrainCompletionSink: the runtime proved the instance released every
+    // collector. Runs checked kernel cleanup then the archive; a failure keeps
+    // the Closing record retryable.
+    void onDrained(uint64_t internal_id) override;
+    // IJobRecordSource: the runtime's read surface for desired state.
+    bool runtimeRecords(std::vector<JobRecord>& out) const override;
+    bool runtimeRecord(uint64_t internal_id,
+                       std::optional<JobRecord>& out) const override;
     // Re-read process/attribute facts for one stored job from the host and
     // persist them. Used by the heartbeat for records no discovery source
     // covers (legacy/manual registrations); reads never do this for
@@ -170,6 +260,9 @@ public:
     bool refreshJobFacts(uint64_t jobID);
     // Lifecycle state is a heartbeat decision, not a read side effect.
     void setInstanceState(uint64_t jobID, const std::string& state);
+    // Liveness evidence from the last scan. Not a lifecycle state: an
+    // unverified instance stays Open but must not be admitted to the kernel.
+    void setExecutionVerified(uint64_t jobID, bool verified);
     // Cheap hint sink for kernel exit events. The heartbeat uses it to
     // schedule a coalesced refresh; the callback must not do I/O.
     void setExitObserver(std::function<void(pid_t)> observer);
@@ -213,9 +306,6 @@ public:
 
     // Test seam only (see StoreFaultMode).
     void injectStoreFaultForTest(StoreFaultMode mode, size_t skip = 0, size_t count = 1);
-    // Test-only seam: runs inside the registration admission, after the id
-    // reservation and before the facts commit.
-    void setPreCommitHookForTest(std::function<void()> hook);
     void clearStoreFaultsForTest();
 
 private:
@@ -229,50 +319,50 @@ private:
     // configuration and builds one adapter per configured type.
     InventoryWiring resolve_inventory_components(const JobRegistryOptions& options);
     void init_inventory(const JobRegistryOptions& options);
+    // Admit restored active records to kernel ownership through the single
+    // admission path (a restarted process starts with an empty namespace).
+    void admitRestoredOwners();
     void startDiscoverySources(InventoryWiring wiring);
     // Automatic selection for one newly created instance, evaluated outside
     // every registry lock (plan 6.2: Lua never runs under a lock).
     // Returns nullopt when no automatic decision was needed, true when the
     // decision (including an explicit reject) is durable, false otherwise.
     std::optional<bool> apply_auto_policy(const Job& job, const std::string& adapter);
+    // Shared implementation of set/reset_auto. Validation happens before the
+    // store call; the durable read-transform-write and its revision guard are
+    // one store transaction.
+    CollectionOutcome mutateSelection(const CollectionRequest& request, bool manual);
+    bool validate_collectors(const std::vector<std::string>& collectors,
+                             std::string& bad_name) const;
     // Record-driven repair of a missing initial automatic decision (plan §5.5):
     // the predicate is derived from durable state so a restart repairs too.
     bool missing_initial_decision(const JobRecord& record) const;
     std::optional<bool> repair_initial_decision(const JobRecord& record,
                                                 UpsertResult& result);
     // The policy decision for one newly created instance, or nullopt when the
-    // adapter has no enabled policy. Shared by the single and batch paths.
+    // adapter has no enabled policy.
     struct AutoDecision {
         std::vector<std::string> collectors;
         std::string policy_revision;
     };
     std::optional<AutoDecision> autoSelectionFor(const Job& job, const std::string& adapter);
-    // Instances whose automatic selection was skipped because the batch budget
-    // ran out; the heartbeat evaluates them instead of the discovery thread.
-    // Bounded drain of the deferred queue (one intent transaction per pass).
     // Evaluates the automatic policy for a set of live instances. Synchronous
     // by design: a slow rule set costs latency and is warned about, it is never
     // deferred to another thread (plan §1.1.3).
     void evaluateAutoPolicies(const std::vector<uint64_t>& internal_ids,
                               std::vector<AutoSelection>& out);
     void regRPCHandle();
-    // Guards lifecycle callbacks and the sentinel job.
+    // Guards the sentinel job and the active-reader set.
     mutable std::shared_mutex mtx_;
-    std::vector<JobLifecycleCb> cbs_;
     Job sentinel_job_;   // system JobID 0 (in-memory only, never stored)
 
     // The single durable representation. Everything below reads state through
     // it; the registry never duplicates a JobRecord field.
     std::unique_ptr<JobStore> store_;
 
-    // Guards the installed collection applier. Never held while it runs.
-    mutable std::mutex                     applier_mtx_;
-    CollectionApplier                      collection_applier_;
-    // Serializes collection-runtime applications. Ordering rule: every applier
-    // call reads the current durable binding inside this section, so the last
-    // application always reflects the latest committed intent — an older
-    // caller can never overwrite a newer binding's runtime state.
-    std::mutex                             apply_mtx_;
+    // Injected at composition time. Never held across a call into it.
+    mutable std::mutex                     runtime_mtx_;
+    ICollectionRuntime*                    collection_runtime_ = nullptr;
     // Guards the installed exit hint observer.
     mutable std::mutex                     exit_observer_mtx_;
     std::function<void(pid_t)>             exit_observer_;
@@ -345,7 +435,11 @@ private:
     // populated by resolve_inventory_components().
     std::vector<std::pair<std::string, IDiscoverySource*>> hb_sources_;
     DiscoverySink heartbeat_sink_;
-    std::shared_ptr<JobCollectionManager> collection_manager_;
+    // Control-plane validation. Guarded because tests install it after
+    // construction; the command path copies the callable under the lock and
+    // never calls it while holding a store lock.
+    mutable std::mutex selection_validation_mtx_;
+    std::function<bool(const std::string&)> collector_validator_;
     // Automatic collector selection keyed by adapter name, armed from the
     // resolved inventory configuration. A disabled entry selects nothing.
     std::map<std::string, AutoCollectorPolicy> auto_policies_;
@@ -378,19 +472,20 @@ private:
     std::int64_t clockNow() const;
     void drainHints(std::deque<HeartbeatHint>& out);
 
-    // Lifecycle fan-out copied under the lock and invoked without it, so a
-    // callback can never re-enter the registry while it is locked.
-    std::vector<JobLifecycleCb> lifecycle_callbacks() const;
-    void broadcast_lifecycle(JobEvent event, const Job& job);
-    // Destructive post-drain archive for the no-subscriber removal path.
-    bool finishJobRemoval(const Job& job);
-    // Serialized runtime application: re-reads the durable binding inside the
-    // apply section and records the verified result into the store. Never
-    // called with a registry lock held.
-    void applyLatestCollectionIntent(uint64_t internal_id);
-    // True on the thread that currently holds the apply gate (plan §7.3). A
-    // hook that mutates from inside the gate is refused, not deadlocked.
-    bool inApplyGate() const;
+    // Re-arms a drain for a restored Closing record and retries a cleanup that
+    // failed after the runtime reported completion.
+    void reconcileClosingRemovals();
+    // Destructive post-drain step, in this order only: the record is already
+    // closing (durable), then kernel ownership is removed with owner checks,
+    // then the archive releases the identity index.
+    bool cleanupThenArchive(uint64_t jobID);
+    // Archival entry point for a record that is already closing. `allow_recovery`
+    // is false on the shutdown pass: a single-pass shutdown never retries a
+    // write whose outcome is unknown.
+    bool finalizeClosingRemoval(uint64_t jobID, bool allow_recovery);
+    // Verify every row whose last write lost certainty; false when the store
+    // itself cannot recover.
+    bool recoverStoreIfNeeded(std::string& error);
     // /proc + scheduler metadata refresh of one job (no persistence).
     void update_job(Job& job);
 
@@ -400,8 +495,26 @@ private:
     void stop_pid_tracker();
     std::unique_ptr<KernelAttribution> attribution_;
     // 内核登记入口：KernelAttribution 的生命周期调用薄封装（Added/Removed）。
-    void sync_job_to_kernel(const Job& job);
-    void remove_job_from_kernel(const Job& job);
+    // Serializes activation against retirement so a stale snapshot cannot
+    // revive a closing owner.
+    bool sync_job_to_kernel(const Job& job);
+    // Observation/startup repair: (re)installs the kernel projection of one
+    // instance that is already active. The kernel component owns no queryable
+    // "already installed" state, so this is an idempotent re-seed.
+    void ensure_kernel_owner(const Job& job);
+    std::mutex kernel_owner_mtx_;
+    // Removes kernel ownership. The injected test seam may report a failure;
+    // the production KernelAttribution API cannot, so it always reports clean.
+    void remove_job_from_kernel(const Job& job, bool& ok, std::string& error);
+    std::mutex kernel_cleanup_mtx_;
+    std::function<bool(uint64_t, const Job&, std::string&)> kernel_cleanup_for_test_;
+    // Serializes cleanup+archive so two retry paths cannot clean the same
+    // closing record concurrently; the archive is idempotent under it.
+    std::mutex closing_mtx_;
+    // Instances whose runtime drain completed while cleanup/archive has not yet
+    // succeeded. Retried by the maintenance pass; never re-armed.
+    mutable std::mutex drain_mtx_;
+    std::set<uint64_t> drain_complete_;
     // KernelAttribution::Host — the registry-side projection updates.
     bool attributionJobExists(uint64_t internal_id) override;
     void attributionJobAddPid(uint64_t internal_id, pid_t pid) override;

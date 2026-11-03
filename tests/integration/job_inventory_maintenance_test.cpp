@@ -45,9 +45,11 @@
 #include "core/inventory_config.hpp"
 #include "core/inventory_status_provider.hpp"
 #include "core/job_registry.hpp"
+#include "collection_runtime_fixture.hpp"
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -925,7 +927,7 @@ void run_a14(const std::string& base)
     // closing state instead of archiving immediately.
     std::mutex observer_mutex;
     std::vector<uint64_t> removed;
-    registry.addLifecycleCb([&](JobEvent event, const Job& job) {
+    install_deferred_drain(registry, [&](JobEvent event, const Job& job) {
         if (event != JobEvent::Removed) return;
         std::lock_guard<std::mutex> lock(observer_mutex);
         removed.push_back(job.JobID);
@@ -940,6 +942,9 @@ void run_a14(const std::string& base)
     registry.runInventoryPass(true);
     check(registry.closingJobCount() == 1,
           "A14: retirement did not enter the closing state");
+    // The runtime's own pass is what dispatches the drain/Removed; the
+    // heartbeat only committed the Closing intent.
+    test_runtime(registry).reconcile(old_record->internal_id);
     {
         std::lock_guard<std::mutex> lock(observer_mutex);
         check(removed.size() == 1 && removed.front() == old_record->internal_id,
@@ -962,7 +967,7 @@ void run_a14(const std::string& base)
 
     // The collector drain acknowledges the removal: this is the real
     // production ack path, and it must never touch the new ownership.
-    check(registry.acknowledgeJobRemoval(old_record->internal_id),
+    check(test_runtime(registry).completeDrain(old_record->internal_id),
           "A14: the drain acknowledgement failed");
     check(registry.closingJobCount() == 0, "A14: old closing record was not finalized");
     check(registry.inventoryRecord(new_record->internal_id).has_value(),
@@ -1160,7 +1165,7 @@ void run_a25(const std::string& base)
                 "900.0", 6100, 1919, "htcondor01", "schedd-a", "/cg/slot-14");
             source.set_scan([&]() { return scan_with({job}); });
             JobRegistry registry(heartbeat_options(path, source, probes));
-            registry.addLifecycleCb([&](JobEvent event, const Job& job) {
+            install_deferred_drain(registry, [&](JobEvent event, const Job& job) {
                 if (event != JobEvent::Removed) return;
                 std::lock_guard<std::mutex> lock(observer_mutex);
                 removed.push_back(job.JobID);
@@ -1185,15 +1190,22 @@ void run_a25(const std::string& base)
 
         {
             // Restart: the interrupted retirement is restored as closing and
-            // the cleanup archives it.
+            // the closing cleanup archives it. Maintenance is disabled on this
+            // instance so the restored row can be observed before the same
+            // cleanup the heartbeat would run archives it (otherwise the
+            // background pass races the assertion).
             FakeSource source2("condor");
-            JobRegistry registry(heartbeat_options(path, source2, probes));
+            auto restart_options = heartbeat_options(path, source2, probes);
+            restart_options.enable_inventory_maintenance = false;
+            JobRegistry registry(restart_options);
             const auto record = registry.inventoryRecord(closing_id);
             check(record.has_value() && record->state == "closing",
                   "A25: the interrupted closing was not restored");
-            check(registry.deinit(), "A25: retry after the fault did not finalize");
+            check(registry.cleanupClosingJobs(),
+                  "A25: the restart closing cleanup did not archive the record");
             check(registry.closingJobCount() == 0,
                   "A25: closing record survived the retry");
+            check(registry.deinit(), "A25: retry after the fault did not finalize");
         }
     }
 
@@ -1292,6 +1304,121 @@ void run_legacy(const std::string& base)
     registry.deinit();
 
     pass_case("LEGACY", "manual registrations retire on process evidence without a source");
+}
+
+// ---------------------------------------------------------------------------
+// RESTORE-UNKNOWN (round 3): an unverifiable restored execution keeps its saved
+// evidence.  The suspect verdict blocks admission; deleting the members is not a
+// verdict and would let the later absence rule retire an instance whose child is
+// still alive.
+// ---------------------------------------------------------------------------
+
+void run_restore_unknown_keeps_evidence(const std::string& base)
+{
+    const auto path = fresh_dir(base, "restore-unknown");
+    const std::string boot = read_boot_id();
+    check(!boot.empty(), "RESTORE-UNKNOWN: cannot read the current boot id");
+    const pid_t manager_pid = 8100;
+    const pid_t child_pid = 8200;
+    const std::string cgroup = "/cg/slot-81";
+
+    Observation job;
+    job.adapter = "condor";
+    job.selector.adapter = "condor";
+    job.selector.cluster_name = "htcondor01";
+    job.selector.cluster_tag = "schedd-a";
+    job.selector.native_job_id = "810.0";
+    job.generation.boot_id = boot;
+    job.generation.manager_pid = manager_pid;
+    job.generation.manager_start_ticks = 181818;
+    job.generation.cgroup_identity = cgroup;
+    job.cgroup_path = cgroup;
+    job.owner = "alice";
+    job.scheduler_host = "htcondor01";
+    job.members.push_back(ProcessIdentity{child_pid, 191919, boot});
+    finalize_observation(job);
+
+    {
+        FakeSource source("condor");
+        FakeProbes probes;
+        probes.set_process(manager_pid, LivenessState::Alive, 181818);
+        probes.set_process(child_pid, LivenessState::Alive, 191919);
+        probes.set_cgroup(cgroup, {child_pid}, true);
+        source.set_scan([&]() { return scan_with({job}); });
+        JobRegistry registry(heartbeat_options(path, source, probes));
+        check(find_native(registry, "810.0").has_value(),
+              "RESTORE-UNKNOWN: the baseline observation was not registered");
+        check(registry.deinit(), "RESTORE-UNKNOWN: the baseline shutdown failed");
+    }
+
+    // Restart where the manager cannot be read: the execution is UNKNOWN.  No
+    // maintenance worker here, so the restore verdict is observed directly
+    // (a heartbeat pass may legitimately promote a suspect row with no absence).
+    {
+        FakeProbes probes;
+        probes.set_process(manager_pid, LivenessState::Unknown, 181818);
+        probes.set_process(child_pid, LivenessState::Alive, 191919);
+        probes.set_cgroup(cgroup, {child_pid}, true);
+        JobRegistryOptions options;
+        options.db_path = path;
+        options.enable_pid_tracker = false;
+        options.register_rpc = false;
+        options.enable_inventory_maintenance = false;
+        options.test_process_probe = probes.process_probe();
+        options.test_cgroup_probe = probes.cgroup_probe();
+        options.test_facts_encoder = encode_test_facts;
+        options.test_heartbeat = true;
+        JobRegistry registry(options);
+
+        const auto restored = find_native(registry, "810.0");
+        check(restored.has_value(), "RESTORE-UNKNOWN: the record was not restored");
+        check(restored->state == kStateActive && !restored->execution_verified,
+              "RESTORE-UNKNOWN: an unverifiable execution must stay Open but "
+              "carry the unverified (suspect) evidence, not a lifecycle state");
+        check(std::find(restored->job.JobPIDs.begin(), restored->job.JobPIDs.end(),
+                        child_pid) != restored->job.JobPIDs.end(),
+              "RESTORE-UNKNOWN: restore deleted the saved child PID");
+        check(std::any_of(restored->members.begin(), restored->members.end(),
+                          [&](const ProcessIdentity& member) {
+                              return member.pid == child_pid && member.complete();
+                          }),
+              "RESTORE-UNKNOWN: restore deleted the saved child identity");
+        check(registry.deinit(), "RESTORE-UNKNOWN: the restore-only shutdown failed");
+    }
+
+    // Heartbeat restart: later the manager is positively dead and the cgroup is
+    // unreadable.  Two complete source passes without an observation must still
+    // not retire the instance while the saved child is alive.
+    FakeSource source("condor");
+    FakeProbes probes;
+    probes.set_process(manager_pid, LivenessState::Unknown, 181818);
+    probes.set_process(child_pid, LivenessState::Alive, 191919);
+    probes.set_cgroup(cgroup, {child_pid}, true);
+    source.set_scan([&]() { return scan_with({}); });
+    JobRegistry registry(heartbeat_options(path, source, probes));
+    const auto restored = find_native(registry, "810.0");
+    check(restored.has_value(), "RESTORE-UNKNOWN: the heartbeat restore lost the record");
+    check(std::find(restored->job.JobPIDs.begin(), restored->job.JobPIDs.end(),
+                    child_pid) != restored->job.JobPIDs.end(),
+          "RESTORE-UNKNOWN: the heartbeat restore dropped the child evidence");
+
+    probes.set_process(manager_pid, LivenessState::Dead, 181818);
+    probes.unset_cgroup(cgroup);
+    check(registry.runInventoryPass(true), "RESTORE-UNKNOWN: first pass did not run");
+    check(registry.runInventoryPass(true), "RESTORE-UNKNOWN: second pass did not run");
+
+    const auto after = find_native(registry, "810.0");
+    check(after.has_value(),
+          "RESTORE-UNKNOWN: the instance was retired although its saved child is alive");
+    check(std::find(after->job.JobPIDs.begin(), after->job.JobPIDs.end(), child_pid) !=
+              after->job.JobPIDs.end(),
+          "RESTORE-UNKNOWN: the child evidence was dropped before the verdict");
+    check(registry.findJob(after->internal_id).has_value(),
+          "RESTORE-UNKNOWN: the live instance disappeared from the active set");
+    check(registry.deinit(), "RESTORE-UNKNOWN: shutdown failed");
+
+    pass_case("RESTORE-UNKNOWN",
+              "unverifiable restore is suspect, keeps member evidence and is not retired");
 }
 
 // ---------------------------------------------------------------------------
@@ -1457,6 +1584,7 @@ int main(int argc, char** argv)
         run_a25(base);
         run_a28(base);
         run_legacy(base);
+        run_restore_unknown_keeps_evidence(base);
         run_rescan(base);
         run_exec_hint(base);
         run_exec_hint_retry(base);

@@ -32,7 +32,6 @@
 #include "common/utils.hpp"
 #include "core/collector_registry.hpp"
 #include "core/scheduler_adapter.hpp"
-#include "core/job_collection_manager.hpp"
 #include "core/inventory_config.hpp"
 #include "core/inventory_status_provider.hpp"
 #include "common/local_rpc.hpp"
@@ -268,10 +267,10 @@ uint64_t inventory_snapshot_revision(const std::vector<JobRecord>& records)
     };
     for (const auto* record : ordered) {
         mix(record->internal_id);
-        mix(record->facts_revision);
+        mix(record->revision);
         mix(record->quarantined ? 1u : 0u);
         mix(record->identity_complete ? 2u : 0u);
-        mix(record->state == "closing" ? 3u : (record->state == "suspect" ? 4u : 5u));
+        mix(record->state == "closing" ? 3u : (record->execution_verified ? 5u : 4u));
     }
     // Stay inside the signed 63-bit range so JavaScript consumers keep the
     // exact value; the revision is an opaque token, not a counter.
@@ -290,7 +289,7 @@ nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& rec
     // New APIs carry internal ids as decimal strings (JavaScript uint64 safety).
     out["internal_job_id"] = format_internal_id(record.internal_id);
     out["schema_version"] = kRpcSchemaVersion;
-    out["facts_revision"] = record.facts_revision;
+    out["record_revision"] = record.revision;
     out["state"] = record.state;
     out["source"] = inventory_source(record);
     out["quarantined"] = record.quarantined;
@@ -472,40 +471,42 @@ TargetResolution resolve_instance_handle(JobRegistry& registry, const std::strin
     return result;
 }
 
-// Desired intent is authoritative; applied state comes from the collection
-// runtime that actually owns the collector lanes (plan section 4.2). A core
-// with no runtime reports the intent as accepted-but-not-applied, never as
-// "collecting".
+// The durable record is authoritative for what the operator asked for; the
+// collection runtime is the only source of what is actually attached. The two
+// are reported separately so "accepted" can never be read as "collecting".
 nlohmann::json collection_target_json(JobRegistry& registry, const JobRecord& record,
-                                      const BindingRecord& binding, bool changed)
+                                      const CollectionSelection& selection,
+                                      uint64_t revision, bool changed,
+                                      const ActualCollectionState& actual)
 {
-    const auto desired = binding.effectiveCollectors();
-    const AppliedCollection applied = registry.appliedCollection(record.internal_id);
+    const auto desired = selection.effectiveCollectors();
 
     nlohmann::json out;
     out["instance_id"] = record.instance_id;
     out["internal_job_id"] = format_internal_id(record.internal_id);
     out["native_job_id"] = record.selector.native_job_id;
-    out["binding_revision"] = binding.revision;
-    out["mode"] = to_string(binding.mode);
+    // Accepted: the durable record revision the command committed.
+    out["record_revision"] = revision;
+    out["mode"] = to_string(selection.mode());
     out["desired_collectors"] = desired;
-    out["applied_collectors"] = applied.applied ? applied.collectors
-                                                : std::vector<std::string>{};
-    out["applied_revision"] = applied.applied ? applied.revision : uint64_t{0};
+    // Actual: the runtime's own state, sampled after the commit. It may still
+    // show the previous attachment; that is the honest answer.
+    out["applied_collectors"] = actual.collectors;
+    out["applied_attach_token"] = actual.attach_token;
+    out["draining"] = actual.draining;
     out["errors"] = nlohmann::json::array();
-    if (!applied.applied && !desired.empty()) {
+    if (!actual.error.empty()) {
         out["errors"].push_back(nlohmann::json{
             {"code", "apply_failed"},
-            {"message", applied.error.empty() ? "collection runtime is unavailable"
-                                              : applied.error},
+            {"message", actual.error},
+        });
+    } else if (!desired.empty() && actual.collectors.size() != desired.size()) {
+        out["errors"].push_back(nlohmann::json{
+            {"code", "not_converged"},
+            {"message", "the collection runtime has not applied the desired set yet"},
         });
     }
-    // Generic collection status (v2 G6): the scheduler's actual holders.
-    if (const auto job = registry.findJob(record.internal_id)) {
-        out["in_pipeline"] = job->collection.in_pipeline;
-    } else {
-        out["in_pipeline"] = false;
-    }
+    out["in_pipeline"] = !actual.collectors.empty();
     out["changed"] = changed;
     return out;
 }
@@ -570,7 +571,6 @@ std::optional<NativeSelector> legacy_add_selector(const Job& job, const nlohmann
 // Returns a final response when the legacy add resolved to an inventoried
 // instance, or nullopt when the request must fall back to legacy registration.
 std::optional<nlohmann::json> try_legacy_add_by_identity(JobRegistry& registry,
-                                                         JobCollectionManager& manager,
                                                          const Job& job,
                                                          const nlohmann::json& req)
 {
@@ -592,7 +592,7 @@ std::optional<nlohmann::json> try_legacy_add_by_identity(JobRegistry& registry,
     CollectionRequest request;
     request.targets = {record.internal_id};
     request.collectors = job.CollectorNames;
-    const auto outcome = manager.setCollectors(request);
+    const auto outcome = registry.setCollectors(request);
     if (!outcome.ok) return error_payload(to_string(outcome.error), outcome.message);
 
     const auto& target = outcome.targets.front();
@@ -603,21 +603,19 @@ std::optional<nlohmann::json> try_legacy_add_by_identity(JobRegistry& registry,
     out["JobID"] = target.internal_id;
     out["internal_job_id"] = format_internal_id(target.internal_id);
     out["instance_id"] = target.instance_id;
-    out["binding_revision"] = target.binding.revision;
-    out["mode"] = to_string(target.binding.mode);
-    out["desired_collectors"] = target.binding.effectiveCollectors();
-    // Accepted versus applied stays explicit for legacy callers too: the request
-    // is accepted when the intent is durable, but collection only starts if the
-    // runtime confirmed it.
-    out["applied_collectors"] = target.applied.applied ? target.applied.collectors
-                                                       : std::vector<std::string>{};
-    out["applied_revision"] = target.applied.applied ? target.applied.revision : uint64_t{0};
+    out["record_revision"] = target.revision;
+    out["mode"] = to_string(target.selection.mode());
+    out["desired_collectors"] = target.selection.effectiveCollectors();
+    // Accepted versus actual stays explicit for legacy callers too: the request
+    // is accepted when the record revision is durable, while collection only
+    // starts when the runtime attaches.
+    out["applied_collectors"] = target.actual.collectors;
+    out["applied_attach_token"] = target.actual.attach_token;
     out["errors"] = nlohmann::json::array();
-    if (!target.applied.applied && !out["desired_collectors"].empty()) {
+    if (!target.actual.error.empty()) {
         out["errors"].push_back(nlohmann::json{
             {"code", "apply_failed"},
-            {"message", target.applied.error.empty() ? "collection runtime is unavailable"
-                                                     : target.applied.error},
+            {"message", target.actual.error},
         });
     }
     out["duplicate_observation"] = !target.changed;
@@ -632,9 +630,9 @@ std::optional<nlohmann::json> try_legacy_add_by_identity(JobRegistry& registry,
                      target.internal_id);
     }
     spdlog::info("JobRegistry: legacy add resolved native job '{}' to inventory instance {} "
-                 "(internal {}), binding revision {}",
+                 "(internal {}), record revision {}",
                  record.selector.native_job_id, target.instance_id, target.internal_id,
-                 target.binding.revision);
+                 target.revision);
     return out;
 }
 
@@ -676,8 +674,7 @@ SubAttrMatcher parse_legacy_matcher(const nlohmann::json& matcher_json)
 
 // §9.4 legacy remove: stop collection, keep the inventory fact. Only records
 // outside the inventory (pure legacy registrations) are archived as before.
-nlohmann::json legacy_remove(JobRegistry& registry, JobCollectionManager& manager,
-                             const nlohmann::json& req)
+nlohmann::json legacy_remove(JobRegistry& registry, const nlohmann::json& req)
 {
     std::vector<uint64_t> targets;
     if (req.contains("JobID") && !req["JobID"].is_null()) {
@@ -712,7 +709,7 @@ nlohmann::json legacy_remove(JobRegistry& registry, JobCollectionManager& manage
         CollectionRequest stop;
         stop.targets = {id};
         stop.collectors = std::vector<std::string>{};
-        const auto outcome = manager.setCollectors(stop);
+        const auto outcome = registry.setCollectors(stop);
         if (!outcome.ok) {
             spdlog::error("JobRegistry: legacy remove could not stop collection for JobID {}: {}",
                           id, outcome.message);
@@ -720,13 +717,12 @@ nlohmann::json legacy_remove(JobRegistry& registry, JobCollectionManager& manage
         }
         ++stopped;
         stopped_instances.push_back(outcome.targets.front().instance_id);
-        if (!outcome.targets.front().applied.applied) {
+        const auto& target = outcome.targets.front();
+        if (!target.actual.error.empty()) {
             apply_errors.push_back(nlohmann::json{
-                {"instance_id", outcome.targets.front().instance_id},
+                {"instance_id", target.instance_id},
                 {"code", "apply_failed"},
-                {"message", outcome.targets.front().applied.error.empty()
-                                ? "collection runtime is unavailable"
-                                : outcome.targets.front().applied.error},
+                {"message", target.actual.error},
             });
         }
     }
@@ -787,16 +783,29 @@ nlohmann::json current_inventory_status_provider()
 #endif
 }
 
-// Readiness gate for the inventory/control surface. An unfinished migration or
-// a closed store must not look like "no jobs" or "no such instance".
+// Readiness gate for the inventory/control surface. A rejected schema or a
+// closed store must not look like "no jobs" or "no such instance".
 std::optional<nlohmann::json> store_not_ready_payload(const StoreHealth& health)
 {
     if (health.db_running && health.migration_complete) return std::nullopt;
-    if (!health.db_running)
+    if (!health.db_running) {
+        if (health.migration_state == "malformed_schema_marker") {
+            return error_payload("store_unavailable",
+                                 "inventory store has a schema marker this build did not "
+                                 "write; the database was left untouched (no rewrite, no "
+                                 "deletion)");
+        }
+        if (health.migration_state.rfind("unsupported_schema", 0) == 0) {
+            return error_payload("store_unavailable",
+                                 "inventory store schema is not supported by this build; "
+                                 "it was left untouched (no migration, no deletion): " +
+                                     health.migration_state);
+        }
         return error_payload("store_unavailable",
                              "inventory store is not running on this core");
+    }
     return error_payload("store_unavailable",
-                         "inventory store is initializing (migration " +
+                         "inventory store is not ready (" +
                              (health.migration_state.empty() ? std::string{"unknown"}
                                                              : health.migration_state) + ")");
 }
@@ -807,19 +816,23 @@ nlohmann::json store_health_json(const StoreHealth& health){
         {"migration_complete", health.migration_complete},
         {"migration_state", health.migration_state},
         {"degraded", health.degraded},
+        {"recovery_required", health.recovery_required},
+        {"recovery_state", health.recovery_state},
         {"durable_commits", health.durable_commits},
         // fsynced subset: the registration hot path must not move this
         {"sync_commits", health.sync_commits},
         {"dirty_records", health.dirty_records},
-        {"dirty_bindings", health.dirty_bindings},
         {"write_failures", health.write_failures},
         {"last_write_error", health.last_write_error},
         {"corrupt_records", health.corrupt_records},
         {"db_uuid", health.db_uuid},
         {"persistence", nlohmann::json{
-            {"state", health.degraded ? "degraded"
-                                      : (health.db_running ? "ok" : "unavailable")},
+            {"state", health.recovery_required
+                          ? "recovery_required"
+                          : (health.degraded ? "degraded"
+                                             : (health.db_running ? "ok" : "unavailable"))},
             {"schema_version", health.schema_version},
+            {"last_operation", health.recovery_state},
         }},
     };
 }
@@ -833,7 +846,9 @@ nlohmann::json inventory_status_payload(JobRegistry& registry)
                          ? "disabled"
                          : (!health.migration_complete
                                 ? "initializing"
-                                : (health.degraded ? "degraded" : "healthy"));
+                                : ((health.degraded || health.recovery_required)
+                                       ? "degraded"
+                                       : "healthy"));
     body["inventory_enabled"] = health.db_running;
     body["sources"] = nlohmann::json{{"state", "not_configured"}};
 
@@ -842,7 +857,7 @@ nlohmann::json inventory_status_payload(JobRegistry& registry)
     uint64_t closing = 0;
     for (const auto& record : registry.inventoryRecords()) {
         if (is_reserved_internal_id(record.internal_id)) continue;
-        if (record.state == "suspect") ++suspect;
+        if (!record.execution_verified) ++suspect;
         else if (record.state == "closing") ++closing;
         else ++active;
     }
@@ -869,8 +884,7 @@ nlohmann::json inventory_status_payload(JobRegistry& registry)
 
 }  // namespace
 
-void registerInventoryRpc(JobRegistry& registry,
-                          std::shared_ptr<JobCollectionManager> manager) {
+void registerInventoryRpc(JobRegistry& registry) {
     // 注册 RPC 方法
     // 请求体格式示例：
     // {
@@ -881,12 +895,8 @@ void registerInventoryRpc(JobRegistry& registry,
     //     "Lens": ["cpumem_collector"],
     //      "auto_update_child": true
     // }
-    // `manager` is the registry's control manager, created in the constructor
-    // and shared with the automatic-selection path. Intent mutations are
-    // serialized inside it and committed through JobRegistry::commitBindings.
-
     RPCServer::instance().register_method("JobRegistry/job_opt",
-        [&registry, manager](const nlohmann::json& req) -> nlohmann::json {
+        [&registry](const nlohmann::json& req) -> nlohmann::json {
             nlohmann::json j;
             try {
                 Job job;
@@ -895,7 +905,7 @@ void registerInventoryRpc(JobRegistry& registry,
                     // §9.4: identity resolution first. A legacy JobID is only a
                     // compatibility hint, so it never allocates or overrides the
                     // internal id of an existing inventoried instance.
-                    if (auto resolved = try_legacy_add_by_identity(registry, *manager, job, req)) {
+                    if (auto resolved = try_legacy_add_by_identity(registry, job, req)) {
                         return *resolved;
                     }
                     if (registry.addJob(job)) {
@@ -910,7 +920,7 @@ void registerInventoryRpc(JobRegistry& registry,
                     // §9.4: remove stops collection for resolved live jobs and
                     // keeps the inventory fact instead of forgetting the
                     // execution.
-                    j = legacy_remove(registry, *manager, req);
+                    j = legacy_remove(registry, req);
                 }else {
                     j["status"] = "error";
                     j["code"] = "invalid_request";
@@ -1144,7 +1154,7 @@ void registerInventoryRpc(JobRegistry& registry,
     // §9.1 / §9.2 collection control surface
     // -----------------------------------------------------------------------
     RPCServer::instance().register_method("JobCollection/set",
-        [&registry, manager](const nlohmann::json& req) -> nlohmann::json {
+        [&registry](const nlohmann::json& req) -> nlohmann::json {
             if (!req.is_object())
                 return error_payload("invalid_request", "request body must be a JSON object");
             if (auto not_ready = store_not_ready_payload(registry.storeHealth()))
@@ -1282,8 +1292,8 @@ void registerInventoryRpc(JobRegistry& registry,
             for (const auto& record : resolution.records)
                 request.targets.push_back(record.internal_id);
 
-            const auto outcome = operation == "set" ? manager->setCollectors(request)
-                                                    : manager->resetAuto(request);
+            const auto outcome = operation == "set" ? registry.setCollectors(request)
+                                                    : registry.resetAuto(request);
             if (!outcome.ok) {
                 return error_payload(to_string(outcome.error), outcome.message);
             }
@@ -1292,8 +1302,9 @@ void registerInventoryRpc(JobRegistry& registry,
             for (const auto& target : outcome.targets) {
                 const auto record = registry.inventoryRecord(target.internal_id);
                 if (!record) continue;
-                targets.push_back(
-                    collection_target_json(registry, *record, target.binding, target.changed));
+                targets.push_back(collection_target_json(
+                    registry, *record, target.selection, target.revision, target.changed,
+                    target.actual));
             }
             nlohmann::json out;
             out["status"] = "accepted";
@@ -1324,8 +1335,10 @@ void registerInventoryRpc(JobRegistry& registry,
                 return error_payload(resolution.code, resolution.message);
 
             const auto& record = resolution.records.front();
-            const auto binding = registry.bindingRecord(record.internal_id);
-            auto target = collection_target_json(registry, record, binding, false);
+            const auto selection = registry.selectionRecord(record.internal_id);
+            auto target = collection_target_json(registry, record, selection,
+                                                 record.revision, false,
+                                                 registry.actualCollection(record.internal_id));
 
             nlohmann::json out;
             out["status"] = "ok";
@@ -1339,13 +1352,19 @@ void registerInventoryRpc(JobRegistry& registry,
             out["state"] = record.state;
             out["quarantined"] = record.quarantined;
             out["mode"] = target["mode"];
-            out["binding_revision"] = target["binding_revision"];
+            out["record_revision"] = target["record_revision"];
             out["desired_collectors"] = target["desired_collectors"];
             out["applied_collectors"] = target["applied_collectors"];
-            out["applied_revision"] = target["applied_revision"];
-            out["auto_collectors"] = binding.auto_collectors;
-            out["manual_collectors"] = binding.manual_collectors;
-            out["policy_revision"] = binding.policy_revision;
+            out["applied_attach_token"] = target["applied_attach_token"];
+            out["draining"] = target["draining"];
+            out["in_pipeline"] = target["in_pipeline"];
+            out["automatic_collectors"] = selection.automatic.has_value()
+                                              ? nlohmann::json(*selection.automatic)
+                                              : nlohmann::json(nullptr);
+            out["automatic_source"] = selection.automatic_source;
+            out["manual_collectors"] = selection.manual.has_value()
+                                           ? nlohmann::json(*selection.manual)
+                                           : nlohmann::json(nullptr);
             out["errors"] = nlohmann::json::array();
             return out;
         }

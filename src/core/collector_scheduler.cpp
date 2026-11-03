@@ -13,7 +13,6 @@
  * limitations under the License. */
 #include "core/collector_scheduler.hpp"
 #include "core/collector_registry.hpp"
-#include "core/job_registry.hpp"
 #include "core/output_context.hpp"
 #include "core/output_router.hpp"
 #include "core/collector_execution_context.hpp"
@@ -47,40 +46,6 @@ CollectorScheduler::CollectorScheduler()
     WriterManager::instance().initialize();
 
     registerCollectFuncs();
-
-    JobRegistry::instance().addLifecycleCb(
-        [this](JobEvent e, const Job& job){
-            switch (e) {
-                case JobEvent::Added: {
-                    addJobCollect(job);
-                    spdlog::info("CollectorScheduler: job {} added, {} PIDs", job.JobID, job.JobPIDs.size());
-                    break;
-                }
-                case JobEvent::Removed: {
-                    rmJobCollect(job);
-                    spdlog::info("CollectorScheduler: job {} removed", job.JobID);
-                    break;
-                }
-                case JobEvent::Updated: {
-                    updateJobCollect(job);
-                    spdlog::info("CollectorScheduler: job {} updated", job.JobID);
-                    break;
-                }
-                default: {
-                    spdlog::warn("CollectorScheduler: error job event");
-                }
-            }
-        }
-    );
-
-    // Collection intent reaches the lanes through this sink (call #1 of the
-    // collection-control contract): the registry commits the binding durably and
-    // then asks us to apply it, so `applied_collectors` is real runtime state.
-    JobRegistry::instance().setCollectionApplier(
-        [this](const Job& job, std::vector<std::string>& applied, std::string& error) {
-            return applyJobBinding(job, applied, error);
-        });
-    collection_applier_installed_ = true;
 
     spdlog::info("CollectorScheduler: initialized with {} collector(s) and {} writer(s)",
                 collector_info_dict.size(), WriterManager::instance().names().size());
@@ -192,25 +157,27 @@ bool CollectorScheduler::startPeriodicCollectorLane(const std::string& name,
     return true;
 }
 
-void CollectorScheduler::startCollector(std::string collector_name) {
+bool CollectorScheduler::startCollector(std::string collector_name) {
     // Caller holds m_.
     auto it = collector_info_dict.find(collector_name);
     if (it == collector_info_dict.end()) {
         spdlog::error("CollectorScheduler: start collector error, can not find {}!", collector_name);
-        return;
+        return false;
     }
 
     const collector_info info = it->second;
     if (!info.route_ok()) {
         spdlog::error("CollectorScheduler: collector {} has an invalid output route, refusing to start",
                       collector_name);
-        return;
+        return false;
     }
 
     auto& state = collector_state_dict[collector_name];
     auto lane = createLane(collector_name, info, state);
-    if (!lane) return;
+    if (!lane) return false;
 
+    // A collector that reports running without a successful init would make
+    // actual() claim holders that never existed. Only the started flag counts.
     bool started = false;
     try {
         if (info.trigger == CollectorTrigger::Event)
@@ -221,12 +188,19 @@ void CollectorScheduler::startCollector(std::string collector_name) {
         runtime_->error(collector_name, error.what());
         spdlog::error("CollectorScheduler: start collector {} error: {}",
                       collector_name, error.what());
-        stopCollectorInstance(*lane);
-        return;
+        // A start that failed must not run the stop/accounting protocol: the
+        // caller (addJob2Collector) already holds this lane's state mutex while
+        // startCollector runs, and stopCollectorInstance would re-lock it in
+        // finalizePendingRemovals on the same thread. A lane that never entered
+        // the running state owns no accepted tail, so only the partial init is
+        // released here; the caller rolls membership/snapshot/token back.
+        teardownCollectorLane(*lane, /*release_partial_init=*/true);
+        return false;
     }
 
     if (started)
         spdlog::info("CollectorScheduler: start collector {}", collector_name);
+    return started;
 }
 
 void CollectorScheduler::startPeriodicJobCollector(const std::string& name,
@@ -283,6 +257,15 @@ void CollectorScheduler::stopCollectorInstance(CollectorLaneContext& lane) {
     auto& state = *lane.state;
     if (!state.running && !state.initialized && !state.registrar && !state.lane_valid) return;
 
+    teardownCollectorLane(lane);
+    notifyDrained(finalizePendingRemovals(lane));
+}
+
+void CollectorScheduler::teardownCollectorLane(CollectorLaneContext& lane,
+                                               bool release_partial_init) {
+    // Lock-free by contract: the failed-start path runs this under the caller's
+    // state mutex, so it must not take any lane lock of its own.
+    auto& state = *lane.state;
     state.running = false;
     if (state.task_id != 0) {
         timerScheduler_.cancelTimer(state.task_id);
@@ -294,7 +277,7 @@ void CollectorScheduler::stopCollectorInstance(CollectorLaneContext& lane) {
     }
     // Deinit first: collectors own their source registrations and may destroy
     // them here. The registrar must still be alive for those destructors.
-    if (state.initialized && lane.info.deinit_handle) {
+    if (lane.info.deinit_handle && (state.initialized || release_partial_init)) {
         lane.info.deinit_handle();
         state.initialized = false;
     }
@@ -306,7 +289,6 @@ void CollectorScheduler::stopCollectorInstance(CollectorLaneContext& lane) {
     state.sweep_active = false;
     state.sweep_jobs.clear();
     state.sweep_cursor = 0;
-    finalizePendingRemovals(lane);
 }
 
 void CollectorScheduler::stopAllCollectors() {
@@ -326,53 +308,87 @@ void CollectorScheduler::stopAllCollectors() {
     for (auto& lane : lanes) stopCollectorInstance(lane);
 }
 
-void CollectorScheduler::finalizePendingRemovals(CollectorLaneContext& lane) {
+std::vector<uint64_t> CollectorScheduler::finalizePendingRemovals(CollectorLaneContext& lane) {
     auto& state = *lane.state;
-    std::vector<uint64_t> closes;
+    std::vector<collector_state::PendingClose> closes;
+    std::vector<uint64_t> completed;
     {
         std::lock_guard lock(state.m_);
         closes.swap(state.pending_close);
     }
-    for (auto job_id : closes) {
+    for (const auto& close : closes) {
         Job job;
-        bool found = false;
+        bool have_snapshot = false;
         {
             std::lock_guard lock(state.snapshot_m_);
-            auto it = state.job_snapshots.find(job_id);
-            if (it != state.job_snapshots.end()) {
-                job = it->second;
-                state.job_snapshots.erase(it);
-                state.job_generations.erase(job_id);
-                state.job_generation_counter.erase(job_id);
-                found = true;
+            const auto snapshot_it = state.job_snapshots.find(close.job_id);
+            const auto generation_it = state.job_generations.find(close.job_id);
+            // Validate the attachment epoch BEFORE any hook or snapshot
+            // mutation. A snapshot written by a newer attachment must never be
+            // consumed or erased by this older close; it survives for its own
+            // epoch and the stale acknowledgement below is rejected by token.
+            if (snapshot_it != state.job_snapshots.end() &&
+                generation_it != state.job_generations.end() &&
+                generation_it->second == close.generation) {
+                job = snapshot_it->second;
+                state.job_snapshots.erase(snapshot_it);
+                state.job_generations.erase(generation_it);
+                state.job_generation_counter.erase(close.job_id);
+                have_snapshot = true;
             }
         }
-        if (found) notifyJobHook(lane.info, JobEvent::Removed, job);
-        recordRemovalAck(job_id);
+        if (have_snapshot) notifyJobHook(lane.info, JobEvent::Removed, job);
+        // Every accepted tail has been produced now. Report the completion
+        // outside every lane lock so the registry can archive. A completion
+        // for a superseded attachment is rejected by its token.
+        if (recordRemovalAck(close.job_id, close.token)) completed.push_back(close.job_id);
     }
+    return completed;
 }
 
-void CollectorScheduler::recordRemovalAck(uint64_t jobID) {
-    bool last = false;
-    {
-        std::lock_guard lock(removal_m_);
-        auto it = removal_pending_.find(jobID);
-        if (it == removal_pending_.end()) return;
-        if (--it->second == 0) {
-            removal_pending_.erase(it);
-            last = true;
-        }
+bool CollectorScheduler::recordRemovalAck(uint64_t jobID, uint64_t token) {
+    std::lock_guard lock(removal_m_);
+    auto it = removal_pending_.find(jobID);
+    if (it == removal_pending_.end()) return false;
+    const auto token_it = drain_tokens_.find(jobID);
+    if (token_it == drain_tokens_.end() || token_it->second != token) {
+        // Stale completion: the attachment it belonged to is gone (or has been
+        // replaced). It must never decrement a newer drain's counter.
+        return false;
     }
-    if (last) JobRegistry::instance().acknowledgeJobRemoval(jobID);
+    if (--it->second != 0) return false;
+    removal_pending_.erase(it);
+    drain_tokens_.erase(jobID);
+    draining_.erase(jobID);
+    return true;
 }
 
-bool CollectorScheduler::addJob2Collector(const Job& job, const std::string& collector){
+bool CollectorScheduler::addJob2Collector(const Job& job, const std::string& collector,
+                                          std::string* error){
     auto& state = collector_state_dict[collector];
     std::lock_guard lg(state.m_);
     /* 去重: 避免同一JobID被重复push导致collect(Job) dedup命中返回空快照 */
     if (std::find(state.jobid_list.begin(), state.jobid_list.end(), job.JobID) != state.jobid_list.end()) {
         return false;
     }
+    // The previous attachment's accepted tail is still in flight. That close
+    // owns the snapshot stored under this JobID; attaching now would replace it
+    // and the old close would consume the new attachment's snapshot. Defer the
+    // reattach to a later reconcile pass, after the lane finalized the epoch.
+    for (const auto& close : state.pending_close) {
+        if (close.job_id != job.JobID) continue;
+        if (error != nullptr) *error = "previous attachment is still draining";
+        return false;
+    }
+    // A new attachment generation starts here: any drain of the previous one is
+    // obsolete and must not be completed by its late acknowledgements.
+    {
+        std::lock_guard removal_lock(removal_m_);
+        removal_pending_.erase(job.JobID);
+        drain_tokens_.erase(job.JobID);
+        draining_.erase(job.JobID);
+    }
+    nextAttachToken(job.JobID);
     state.jobid_list.push_back(job.JobID);
     {
         std::lock_guard snapshot_lock(state.snapshot_m_);
@@ -380,12 +396,45 @@ bool CollectorScheduler::addJob2Collector(const Job& job, const std::string& col
         state.job_snapshots[job.JobID] = job;
     }
     runtime_->jobs(collector, state.jobid_list.size());
-    if(!state.running){
-        startCollector(collector);
+    if (!state.running && !startCollector(collector)) {
+        // The collector never entered the running state. Roll the attachment
+        // back: membership, snapshot and token must not outlive a failed init,
+        // and the dedup marker must not block the next reconcile retry.
+        {
+            std::lock_guard snapshot_lock(state.snapshot_m_);
+            state.job_snapshots.erase(job.JobID);
+            state.job_generations.erase(job.JobID);
+            state.job_generation_counter.erase(job.JobID);
+        }
+        auto& list = state.jobid_list;
+        list.erase(std::remove(list.begin(), list.end(), job.JobID), list.end());
+        runtime_->jobs(collector, list.size());
+        // Release the token only when no other collector still holds the job.
+        bool held = false;
+        for (auto& [other_name, other] : collector_state_dict) {
+            if (other_name == collector) continue;
+            std::lock_guard other_lock(other.m_);
+            if (std::find(other.jobid_list.begin(), other.jobid_list.end(), job.JobID) !=
+                other.jobid_list.end()) {
+                held = true;
+                break;
+            }
+        }
+        if (!held) {
+            attach_tokens_.erase(job.JobID);
+            attach_revisions_.erase(job.JobID);
+        }
+        attach_errors_[job.JobID] = "collector '" + collector + "' failed to start";
+        if (error != nullptr) *error = attach_errors_[job.JobID];
+        spdlog::error("CollectorScheduler: {} could not attach JobID {}; retrying on the "
+                      "next reconcile", collector, job.JobID);
+        return false;
     }
     // init 失败时采集器没有进入运行态，不投递 Job 钩子，避免采集器在未初始化状态被回调
     if (state.running) {
         fireJobHook(collector, JobEvent::Added, job);
+    } else {
+        return false;
     }
     return true;
 }
@@ -409,8 +458,20 @@ bool CollectorScheduler::detachJobFromCollector(const std::string& collector_nam
                              info_it->second.trigger == CollectorTrigger::Event;
     if (job_ending && event_scope) {
         // Keep the snapshot and let the event lane consume accepted tail input
-        // before the registry clears kernel attribution.
-        state.pending_close.push_back(id);
+        // before the registry clears kernel attribution. The token identifies
+        // this attachment so a late completion cannot finish a newer one; the
+        // generation pins the exact snapshot epoch this close may release.
+        uint64_t token = 0;
+        const auto token_it = attach_tokens_.find(id);
+        if (token_it != attach_tokens_.end()) token = token_it->second;
+        uint64_t generation = 0;
+        {
+            std::lock_guard snapshot_lock(state.snapshot_m_);
+            const auto generation_it = state.job_generations.find(id);
+            if (generation_it != state.job_generations.end())
+                generation = generation_it->second;
+        }
+        state.pending_close.push_back(collector_state::PendingClose{id, token, generation});
         if (state.lane_valid)
             taskExecutor_.request(state.lane, RequestPolicy::Remember);
         return true;
@@ -485,28 +546,81 @@ void CollectorScheduler::addJobCollect(const Job& job){
 }
 
 void CollectorScheduler::rmJobCollect(const Job& job){
-    std::lock_guard lg(m_);
+    std::vector<uint64_t> completed;
+    {
+        std::lock_guard lg(m_);
+        completed = rmJobCollectLocked(job);
+    }
+    notifyDrained(completed);
+}
 
-    // Membership is authoritative here, not job.CollectorNames: intent can
-    // change after the collectors were attached (manual stop), and the Job
-    // snapshot handed to a removal already carries the *new* selection. Reading
-    // the list would then leave the collectors that actually hold the job
-    // attached to a dead instance forever.
+std::vector<uint64_t> CollectorScheduler::rmJobCollectLocked(const Job& job){
+    // Caller holds m_.
+    std::vector<uint64_t> completed;
+
+    // An accepted drain keeps ownership of the stopping boundary: it may not
+    // be restarted just because the collector membership is already detached.
+    // The deferred tail (event lane) would otherwise be reported as clean.
+    {
+        std::lock_guard removal_lock(removal_m_);
+        if (draining_.count(job.JobID) != 0) return completed;
+    }
+
+    // Membership alone is not the whole boundary: a lane that was stopped while
+    // the record was still Open already holds a deferred close (its tail is
+    // still owed) and has no membership any more. Hold every Job-scope lane
+    // while the boundary is computed, so the completion count and the adopted
+    // tokens are fixed before any acknowledgement can be applied.
+    std::vector<std::unique_lock<std::mutex>> lane_locks;
+    lane_locks.reserve(collector_state_dict.size());
+    std::vector<collector_state*> job_lanes;
     std::vector<std::string> bound_job_collectors;
+    size_t adopted_closes = 0;
     for (auto& [name, state] : collector_state_dict) {
         auto info_it = collector_info_dict.find(name);
         if (info_it == collector_info_dict.end()) continue;
         if (info_it->second.scope != CollectorScope::Job) continue;
-        std::lock_guard lg_state(state.m_);
+        lane_locks.emplace_back(state.m_);
+        job_lanes.push_back(&state);
         if (std::find(state.jobid_list.begin(), state.jobid_list.end(), job.JobID) !=
             state.jobid_list.end())
             bound_job_collectors.push_back(name);
+        for (const auto& close : state.pending_close)
+            if (close.job_id == job.JobID) ++adopted_closes;
     }
 
-    if (!bound_job_collectors.empty()) {
+    uint64_t drain_token = 0;
+    bool immediate = false;
+    {
         std::lock_guard removal_lock(removal_m_);
-        removal_pending_[job.JobID] = bound_job_collectors.size();
+        if (draining_.count(job.JobID) != 0) return completed;
+        if (bound_job_collectors.empty() && adopted_closes == 0) {
+            // Nothing holds the instance: the stopping boundary is already
+            // proven, so the completion is immediate.
+            removal_pending_.erase(job.JobID);
+            drain_tokens_.erase(job.JobID);
+            draining_.erase(job.JobID);
+            completed.push_back(job.JobID);
+            immediate = true;
+        } else {
+            // A fresh token identifies THIS boundary: a tail that finalized
+            // before it carries an older token and must not count here.
+            drain_token = nextAttachToken(job.JobID);
+            // Attached holders and prior-stop deferred closes are one fixed
+            // completion count.
+            removal_pending_[job.JobID] = bound_job_collectors.size() + adopted_closes;
+            drain_tokens_[job.JobID] = drain_token;
+            draining_.insert(job.JobID);
+            // Adoption rewrites the completion obligation only. The captured
+            // generation still names the tail lifetime this close releases.
+            for (auto* state : job_lanes) {
+                for (auto& close : state->pending_close)
+                    if (close.job_id == job.JobID) close.token = drain_token;
+            }
+        }
     }
+    lane_locks.clear();
+    if (immediate) return completed;
 
     for (const auto& collector_name : bound_job_collectors) {
         auto it = collector_state_dict.find(collector_name);
@@ -514,19 +628,23 @@ void CollectorScheduler::rmJobCollect(const Job& job){
         auto& state = it->second;
         std::lock_guard lg_state(state.m_);
         const bool deferred = detachJobFromCollector(collector_name, state, job, true);
-        if (!deferred) recordRemovalAck(job.JobID);
+        if (!deferred && recordRemovalAck(job.JobID, drain_token)) completed.push_back(job.JobID);
     }
 
-    if (bound_job_collectors.empty())
-        JobRegistry::instance().acknowledgeJobRemoval(job.JobID);
-
-    notifySystemCollectors(job, JobEvent::Removed);
+    // The System-scope view is a whole-inventory projection diffed once per
+    // reconcile pass (see reconcileOnce). Broadcasting Removed here as well
+    // would deliver two removals for one retirement.
+    return completed;
 }
 
 bool CollectorScheduler::applyJobBinding(const Job& job, std::vector<std::string>& applied,
                                          std::string& error){
     std::lock_guard lg(m_);
+    return applyJobBindingLocked(job, applied, error);
+}
 
+bool CollectorScheduler::applyJobBindingLocked(const Job& job, std::vector<std::string>& applied,
+                                               std::string& error){
     const std::set<std::string> needed{job.CollectorNames.begin(), job.CollectorNames.end()};
 
     // An unknown collector name must fail the application instead of being
@@ -572,6 +690,13 @@ bool CollectorScheduler::applyJobBinding(const Job& job, std::vector<std::string
         {
             std::lock_guard lg_state(it->second.m_);
             if (!it->second.running) continue;
+            // Only a collector that really holds the job may refresh its
+            // snapshot. An attachment still draining its previous epoch is not
+            // a holder; writing here would create a newer snapshot under the
+            // JobID that the deferred close must never see.
+            if (std::find(it->second.jobid_list.begin(), it->second.jobid_list.end(), job.JobID) ==
+                it->second.jobid_list.end())
+                continue;
             // A retained collector is refreshed whenever the facts really
             // changed, and only then: re-applying an unchanged snapshot (for
             // example the binding application that runs right after attach)
@@ -623,7 +748,6 @@ bool CollectorScheduler::applyJobBinding(const Job& job, std::vector<std::string
         snap->second.collection.collectors = applied;
     }
 
-    if (changed) notifySystemCollectors(job, JobEvent::Updated);
     return error.empty();
 }
 
@@ -634,6 +758,7 @@ void CollectorScheduler::updateJobCollect(const Job& job){
     if (!error.empty())
         spdlog::warn("CollectorScheduler: applying binding for JobID {} reported: {}",
                      job.JobID, error);
+    notifySystemCollectors(job, JobEvent::Updated);
 }
 
 void CollectorScheduler::buildOutputRoute(collector_info& info) {
@@ -801,21 +926,334 @@ void CollectorScheduler::addSystemEventCollectFunc(std::string name, std::string
 }
 
 
+void CollectorScheduler::attach(IJobRecordSource* source, IDrainCompletionSink* sink) {
+    // Composition order: the desired-state source and the drain-completion sink
+    // are fixed before the worker starts. They are never replaced afterwards.
+    std::lock_guard lock(reconcile_m_);
+    record_source_ = source;
+    drain_sink_ = sink;
+}
+
+void CollectorScheduler::wake() {
+    {
+        std::lock_guard lock(reconcile_m_);
+        reconcile_requested_ = true;
+    }
+    reconcile_cv_.notify_one();
+}
+
+void CollectorScheduler::notifyDrained(const std::vector<uint64_t>& internal_ids) {
+    if (internal_ids.empty()) return;
+    IDrainCompletionSink* sink = nullptr;
+    {
+        std::lock_guard lock(reconcile_m_);
+        // No callback after shutdown began: nothing may depend on one arriving.
+        if (reconcile_stopping_) return;
+        sink = drain_sink_;
+    }
+    if (sink == nullptr) return;
+    for (const auto id : internal_ids) sink->onDrained(id);
+}
+
+uint64_t CollectorScheduler::nextAttachToken(uint64_t internal_id) {
+    // Caller holds m_. A reattach of the same instance gets a strictly greater
+    // token; tokens are never reused, so a late completion for an older
+    // attachment can be rejected instead of merged.
+    const uint64_t token = ++attach_token_seq_;
+    attach_tokens_[internal_id] = token;
+    return token;
+}
+
+bool CollectorScheduler::beginDrain(uint64_t internal_id) {
+    IJobRecordSource* source = nullptr;
+    {
+        std::lock_guard lock(reconcile_m_);
+        source = record_source_;
+    }
+    if (source == nullptr) {
+        // No desired-state source: this runtime cannot prove any boundary.
+        return false;
+    }
+    std::optional<JobRecord> record;
+    if (!source->runtimeRecord(internal_id, record)) {
+        // The store cannot be read: an unknown desired state is not proof that
+        // nothing is attached, so the caller must keep the Closing record.
+        return false;
+    }
+    if (!record) {
+        // Not tracked by the registry: nothing this runtime could hold.
+        return true;
+    }
+    std::vector<uint64_t> completed;
+    {
+        std::lock_guard lg(m_);
+        if (record->state != kStateClosing) {
+            // The durable state is authoritative: a drain for a record that is
+            // not Closing is refused rather than guessed.
+            return false;
+        }
+        completed = rmJobCollectLocked(record->job);
+    }
+    notifyDrained(completed);
+    return true;
+}
+
+ActualCollectionState CollectorScheduler::actual(uint64_t internal_id) {
+    ActualCollectionState state;
+    {
+        std::lock_guard lg(m_);
+        const auto token_it = attach_tokens_.find(internal_id);
+        if (token_it != attach_tokens_.end()) {
+            state.tracked = true;
+            state.attach_token = token_it->second;
+        }
+        const auto revision_it = attach_revisions_.find(internal_id);
+        if (revision_it != attach_revisions_.end())
+            state.last_revision = revision_it->second;
+        const auto error_it = attach_errors_.find(internal_id);
+        if (error_it != attach_errors_.end()) state.error = error_it->second;
+        for (const auto& [name, collector] : collector_state_dict) {
+            auto info_it = collector_info_dict.find(name);
+            if (info_it == collector_info_dict.end()) continue;
+            if (info_it->second.scope != CollectorScope::Job) continue;
+            // Only a collector that really entered the running state holds the
+            // job. A membership left behind by a failed init is not an
+            // attachment and must never be reported as one.
+            if (!collector.running.load()) continue;
+            std::lock_guard lg_state(collector.m_);
+            if (std::find(collector.jobid_list.begin(), collector.jobid_list.end(),
+                          internal_id) != collector.jobid_list.end()) {
+                state.collectors.push_back(name);
+                state.tracked = true;
+            }
+        }
+    }
+    {
+        std::lock_guard lock(removal_m_);
+        state.draining = draining_.count(internal_id) != 0;
+    }
+    return state;
+}
+
+void CollectorScheduler::reconcileLoop() {
+    for (;;) {
+        {
+            std::unique_lock lock(reconcile_m_);
+            reconcile_cv_.wait_for(lock, reconcile_interval_, [this] {
+                return reconcile_requested_ || reconcile_stopping_;
+            });
+            if (reconcile_stopping_) return;
+            reconcile_requested_ = false;
+        }
+        try {
+            reconcileOnce();
+        } catch (const std::exception& error) {
+            spdlog::error("CollectorScheduler: reconcile failed: {}", error.what());
+        } catch (...) {
+            spdlog::error("CollectorScheduler: reconcile failed: unknown exception");
+        }
+    }
+}
+
+void CollectorScheduler::reconcileOnce() {
+    // This worker is the only place desired state becomes actual state. It
+    // reads records from the registry (never a mirror) and reconciles:
+    //   1. detach every collector binding a job the record no longer selects,
+    //   2. attach/refresh what the record selects,
+    //   3. drain Closing records.
+    IJobRecordSource* source = nullptr;
+    {
+        std::lock_guard lock(reconcile_m_);
+        source = record_source_;
+    }
+    if (source == nullptr) return;
+    std::vector<JobRecord> records;
+    if (!source->runtimeRecords(records)) {
+        // The desired state cannot be read right now. That is NOT an empty
+        // inventory: keep every current attachment instead of detaching all of
+        // them, which would turn a store outage into a collection outage.
+        return;
+    }
+
+    std::vector<uint64_t> completed;
+    {
+        std::lock_guard lg(m_);
+
+        std::map<uint64_t, Job> open_jobs;
+        std::vector<Job> closing_jobs;
+        std::set<uint64_t> closing_ids;
+        for (const auto& record : records) {
+            if (record.internal_id == 0) continue;
+            if (record.state == kStateClosing) {
+                closing_ids.insert(record.internal_id);
+                closing_jobs.push_back(record.job);
+                continue;
+            }
+            Job desired = record.job;
+            desired.CollectorNames = record.selection.effectiveCollectors();
+            open_jobs.emplace(record.internal_id, std::move(desired));
+        }
+
+        // Closing records are removed through the single accounting path
+        // FIRST: it reserves the drain token and the pending count before any
+        // membership disappears, so the deferred event tail owns a real
+        // acknowledgement instead of being completed from an unaccounted
+        // detach and archived early.
+        for (const auto& job : closing_jobs) {
+            auto local = rmJobCollectLocked(job);
+            completed.insert(completed.end(), local.begin(), local.end());
+        }
+
+        // Detach collectors that still hold a job the record no longer wants
+        // (or that is gone). A job ending keeps its accepted tail alive in the
+        // event lane before the snapshot is released. Closing records are
+        // excluded: the drain above owns their membership and completion.
+        for (auto& [name, state] : collector_state_dict) {
+            auto info_it = collector_info_dict.find(name);
+            if (info_it == collector_info_dict.end()) continue;
+            if (info_it->second.scope != CollectorScope::Job) continue;
+
+            std::vector<uint64_t> bound;
+            {
+                std::lock_guard lg_state(state.m_);
+                bound = state.jobid_list;
+            }
+            for (const auto job_id : bound) {
+                if (job_id == 0) continue;   // the system sentinel
+                if (closing_ids.count(job_id) != 0) continue;
+                bool wanted = false;
+                const auto open_it = open_jobs.find(job_id);
+                if (open_it != open_jobs.end()) {
+                    const auto& names = open_it->second.CollectorNames;
+                    wanted = std::find(names.begin(), names.end(), name) != names.end();
+                }
+                if (wanted) continue;
+                Job snapshot;
+                bool have_snapshot = false;
+                {
+                    std::lock_guard lg_snap(state.snapshot_m_);
+                    const auto it = state.job_snapshots.find(job_id);
+                    if (it != state.job_snapshots.end()) {
+                        snapshot = it->second;
+                        have_snapshot = true;
+                    }
+                }
+                if (!have_snapshot) {
+                    // No snapshot means no accepted tail to honour: drop the
+                    // membership; the release loop below drops its token.
+                    std::lock_guard lg_state(state.m_);
+                    auto& list = state.jobid_list;
+                    list.erase(std::remove(list.begin(), list.end(), job_id), list.end());
+                    runtime_->jobs(name, list.size());
+                    continue;
+                }
+                std::lock_guard lg_state(state.m_);
+                detachJobFromCollector(name, state, snapshot, /*job_ending=*/true);
+            }
+        }
+
+        // System-scope collectors see the whole inventory, including records
+        // that select no job collector. This diff is notification bookkeeping
+        // only: the records remain the sole authority.
+        {
+            std::map<uint64_t, std::pair<Job, std::string>> next;
+            for (const auto& record : records) {
+                if (record.internal_id == 0) continue;
+                if (record.state == kStateClosing) continue;
+                Job projection = record.job;
+                projection.CollectorNames = record.selection.effectiveCollectors();
+                const auto key = dump_job(projection).dump();
+                const auto previous = system_projection_.find(record.internal_id);
+                if (previous == system_projection_.end())
+                    notifySystemCollectors(projection, JobEvent::Added);
+                else if (previous->second.second != key)
+                    notifySystemCollectors(projection, JobEvent::Updated);
+                next.emplace(record.internal_id, std::make_pair(std::move(projection), key));
+            }
+            for (const auto& [id, previous] : system_projection_) {
+                if (next.count(id) == 0)
+                    notifySystemCollectors(previous.first, JobEvent::Removed);
+            }
+            system_projection_ = std::move(next);
+        }
+
+        // Attach / refresh what the records select. A refused application is
+        // reported by the runtime status (actual()); it is never invented as
+        // applied.
+        for (const auto& [job_id, desired] : open_jobs) {
+            if (desired.CollectorNames.empty()) continue;
+            std::vector<std::string> applied;
+            std::string error;
+            applyJobBindingLocked(desired, applied, error);
+            if (error.empty())
+                attach_errors_.erase(job_id);
+            else
+                attach_errors_[job_id] = error;
+        }
+
+        // The runtime reports the revision it really converged to.
+        for (const auto& record : records) {
+            if (record.state == kStateClosing) continue;
+            if (attach_errors_.count(record.internal_id) != 0) continue;
+            if (attach_tokens_.count(record.internal_id) == 0) continue;
+            attach_revisions_[record.internal_id] = record.revision;
+        }
+
+        // Release the token of an instance the runtime no longer holds. Facts
+        // refreshes and automatic bookkeeping do not detach anything, so they
+        // keep the token; a real detach releases it and a later reattach gets
+        // a strictly greater one.
+        std::set<uint64_t> held;
+        for (const auto& [name, state] : collector_state_dict) {
+            auto info_it = collector_info_dict.find(name);
+            if (info_it == collector_info_dict.end()) continue;
+            if (info_it->second.scope != CollectorScope::Job) continue;
+            std::lock_guard lg_state(state.m_);
+            for (const auto job_id : state.jobid_list)
+                if (job_id != 0) held.insert(job_id);
+        }
+        for (auto it = attach_tokens_.begin(); it != attach_tokens_.end();) {
+            if (held.count(it->first) == 0) {
+                attach_revisions_.erase(it->first);
+                attach_errors_.erase(it->first);
+                it = attach_tokens_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    std::sort(completed.begin(), completed.end());
+    completed.erase(std::unique(completed.begin(), completed.end()), completed.end());
+    notifyDrained(completed);
+}
+
 void CollectorScheduler::start() {
-    std::lock_guard lg(m_);
-    if (running_) return;
-    running_ = true;
+    {
+        std::lock_guard lg(m_);
+        if (running_) return;
+        running_ = true;
+    }
+    {
+        std::lock_guard lock(reconcile_m_);
+        reconcile_stopping_ = false;
+        reconcile_requested_ = true;
+    }
+    if (record_source_ != nullptr && !reconcile_thread_.joinable())
+        reconcile_thread_ = std::thread([this] { reconcileLoop(); });
+    reconcile_cv_.notify_one();
     runtime_->lifecycle("running");
 }
 
 void CollectorScheduler::shutdown() {
     std::lock_guard shutdown_lock(shutdown_mutex_);
-    if (collection_applier_installed_) {
-        // Stop receiving intent the moment shutdown begins: a collector lane
-        // must not be attached while it is being torn down.
-        JobRegistry::instance().setCollectionApplier({});
-        collection_applier_installed_ = false;
+    {
+        // No completion callback after shutdown began.
+        std::lock_guard lock(reconcile_m_);
+        reconcile_stopping_ = true;
     }
+    reconcile_cv_.notify_all();
+    if (reconcile_thread_.joinable()) reconcile_thread_.join();
     runtime_->lifecycle("stopping");
     {
         std::lock_guard lg(m_);

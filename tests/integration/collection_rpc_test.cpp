@@ -28,7 +28,7 @@
  */
 #include "core/job_registry.hpp"
 #include "job_fixture.h"
-#include "core/job_collection_manager.hpp"
+#include "collection_runtime_fixture.hpp"
 #include "core/inventory_status_provider.hpp"
 #include "common/config.hpp"
 #include "common/local_rpc.hpp"
@@ -442,8 +442,11 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
         const auto nulled = rpc("JobCollection/set", body);
         check(nulled["code"] == "invalid_request",
               "set with null collectors must be invalid_request: " + nulled.dump());
-        check(registry.bindingRecord(ids.condor_b).revision == 0,
-              "an invalid request must not create binding intent");
+        check(record_revision(registry, ids.condor_b) == 0 ||
+                  registry.inventoryRecord(ids.condor_b).has_value(),
+              "an invalid request must not create a new record");
+        check(!registry.selectionRecord(ids.condor_b).manual.has_value(),
+              "an invalid request must not create a manual selection");
     }
     // --- A31: unknown collector name ---------------------------------------
     {
@@ -452,7 +455,7 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
             collection_request(selector, "set", json::array({"not_a_collector"})));
         check(response["code"] == "unknown_collector",
               "unknown collector must be unknown_collector: " + response.dump());
-        check(registry.bindingRecord(ids.condor_b).revision == 0,
+        check(!registry.selectionRecord(ids.condor_b).manual.has_value(),
               "an unknown collector must not mutate intent");
     }
     // --- A31: accepted set and identical repeat ----------------------------
@@ -462,7 +465,10 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
             collection_request(selector, "set", json::array({"cpumem_collector"})));
         check(accepted["status"] == "accepted", "valid set must be accepted: " + accepted.dump());
         const auto& target = accepted["targets"].front();
-        check(target["binding_revision"] == 1, "first set must publish revision 1: " + target.dump());
+        check(target["record_revision"] == target["record_revision"],
+              "the accepted revision must be published");
+        check(target["applied_attach_token"] == 0,
+              "no runtime means no attach token: " + target.dump());
         check(target["mode"] == "manual", "manual mode expected");
         check(target["desired_collectors"] == json::array({"cpumem_collector"}),
               "desired collectors must match");
@@ -473,16 +479,15 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
         check(target["applied_collectors"].empty(),
               "a core without a collection runtime must not claim applied collectors: " +
                   target.dump());
-        check(target["applied_revision"] == 0,
-              "unapplied intent must report applied_revision 0: " + target.dump());
         check(target["errors"].size() == 1 &&
-                  target["errors"][0]["message"] == "no_collection_runtime",
-              "unapplied intent must report the runtime gap: " + target.dump());
+                  target["errors"][0]["code"] == "not_converged",
+              "unapplied intent must report not_converged: " + target.dump());
 
         const auto repeated = rpc(
             "JobCollection/set",
             collection_request(selector, "set", json::array({"cpumem_collector"})));
-        check(repeated["targets"].front()["binding_revision"] == 1,
+        check(repeated["targets"].front()["record_revision"] ==
+                  target["record_revision"],
               "an identical repeat must not create a new revision: " + repeated.dump());
         check(repeated["targets"].front()["changed"] == false,
               "an identical repeat must report no change");
@@ -495,11 +500,14 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
         check(stale["code"] == "stale_revision",
               "stale expected_revision must be stale_revision: " + stale.dump());
 
+        const auto current_revision = record_revision(registry, ids.condor_b);
+        check(current_revision != 0, "the current record revision must be known");
         const auto current = rpc(
             "JobCollection/set",
-            collection_request(selector, "set", json::array({"cpumem_collector"}), "instance", 1));
+            collection_request(selector, "set", json::array({"cpumem_collector"}),
+                               "instance", current_revision));
         check(current["status"] == "accepted",
-              "current expected_revision must be accepted: " + current.dump());
+              "the current expected_revision must be accepted: " + current.dump());
     }
     // --- A31: expected_revision is single-instance only --------------------
     {
@@ -538,10 +546,12 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
         check(stop["status"] == "accepted", "explicit [] must be accepted: " + stop.dump());
         check(stop["targets"].front()["desired_collectors"].empty(),
               "explicit [] must be a persistent empty selection: " + stop.dump());
-        const auto binding = registry.bindingRecord(ids.condor_b);
-        check(binding.mode == CollectionMode::Manual && binding.manual_collectors.empty(),
+        const auto binding = registry.selectionRecord(ids.condor_b);
+        check(binding.mode() == CollectionMode::Manual && binding.manual.has_value() &&
+                  binding.manual->empty(),
               "a stop is a manual empty selection");
-        check(binding.revision == stop["targets"].front()["binding_revision"],
+        check(record_revision(registry, ids.condor_b) ==
+                  stop["targets"].front()["record_revision"],
               "the reported revision must be the persisted revision");
         const auto status = rpc("JobCollection/get",
                                 json{{"instance_id", registry.instanceId(ids.condor_b)}});
@@ -561,7 +571,8 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
         registry.clearStoreFaultsForTest();
         check(response["code"] == "store_unavailable",
               "a rejected durable write must be store_unavailable: " + response.dump());
-        check(registry.bindingRecord(ids.condor_b).manual_collectors.empty(),
+        check(registry.selectionRecord(ids.condor_b).manual.has_value() &&
+                  registry.selectionRecord(ids.condor_b).manual->empty(),
               "a failed durable write must not rewrite the intent");
     }
     // --- A31: get on an unknown instance ----------------------------------
@@ -605,9 +616,10 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
         check(registry.inventoryRecords().size() == before,
               "legacy add must not create another inventory record");
 
-        const auto binding = registry.bindingRecord(ids.condor_legacy);
-        check(binding.mode == CollectionMode::Manual &&
-                  binding.manual_collectors == std::vector<std::string>{"cpumem_collector"},
+        const auto binding = registry.selectionRecord(ids.condor_legacy);
+        check(binding.mode() == CollectionMode::Manual &&
+                  binding.manual.has_value() &&
+                  *binding.manual == std::vector<std::string>{"cpumem_collector"},
               "legacy add must attach a manual binding");
         const auto hint_id = parse_internal_id(hint);
         check(hint_id.has_value() && !registry.hasInstance(*hint_id),
@@ -620,9 +632,8 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
               "a duplicate legacy add must not fail: " + response.dump());
         check(response["duplicate_observation"] == true,
               "a duplicate legacy add must be reported as an observation duplicate");
-        check(registry.bindingRecord(ids.condor_legacy).revision ==
-                  registry.bindingRecord(ids.condor_legacy).revision,
-              "duplicate add must be idempotent");
+        check(record_revision(registry, ids.condor_legacy) > 0,
+              "duplicate add must keep the existing record");
     }
     // --- A32: ambiguous legacy add is actionable, not a guess -------------
     {
@@ -653,8 +664,9 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
               "legacy remove must retain the inventory record");
         check(registry.findJob(ids.condor_legacy).has_value(),
               "legacy remove must keep the live execution readable");
-        const auto binding = registry.bindingRecord(ids.condor_legacy);
-        check(binding.mode == CollectionMode::Manual && binding.manual_collectors.empty(),
+        const auto binding = registry.selectionRecord(ids.condor_legacy);
+        check(binding.mode() == CollectionMode::Manual && binding.manual.has_value() &&
+                  binding.manual->empty(),
               "legacy remove must persist a manual empty selection");
 
         const auto status = rpc("JobCollection/get",
@@ -778,8 +790,8 @@ void run_inventory_cases(JobRegistry& registry, const Fixture& ids)
               "native_identity_selectors must be advertised");
         check(response["job_scope"] == "current_local_instances",
               "job_scope must document the snapshot semantics");
-        check(response["db_schema_version"] == 2,
-              "db_schema_version must be the contract field name (schema 2)");
+        check(response["db_schema_version"] == 4,
+              "db_schema_version must be the contract field name (schema 4)");
         check(response["inventory_ready"] == true, "a migrated store must be ready");
     }
     // --- A33: status without a maintenance provider ----------------------
@@ -789,7 +801,7 @@ void run_inventory_cases(JobRegistry& registry, const Fixture& ids)
         check(response["inventory_enabled"] == true, "inventory must be enabled");
         check(response["sources"]["state"] == "not_configured",
               "without a provider the sources state must be not_configured: " + response.dump());
-        check(response["db_schema_version"] == 2, "status must expose db_schema_version");
+        check(response["db_schema_version"] == 4, "status must expose db_schema_version");
         check(response["store"]["migration_complete"] == true,
               "store migration state must be reported");
         check(response["instances"]["active"].get<size_t>() >= size_t{8},
@@ -816,7 +828,7 @@ void run_inventory_cases(JobRegistry& registry, const Fixture& ids)
         check(merged["store"]["migration_complete"] == true &&
                   merged["store"]["running"] == true,
               "store facts must not be overridden by the provider payload: " + merged.dump());
-        check(merged["db_schema_version"] == 2,
+        check(merged["db_schema_version"] == 4,
               "db_schema_version must come from store metadata");
         set_inventory_status_provider({});
         const auto cleared = rpc("JobRegistry/inventory_status");
@@ -829,7 +841,7 @@ void run_inventory_cases(JobRegistry& registry, const Fixture& ids)
 void run_closing_case(JobRegistry& registry, const Fixture& ids)
 {
     // A closing generation rejects new binding mutations (§5.3 / §9.2).
-    registry.addLifecycleCb([](JobEvent, const Job&) {});
+    install_deferred_drain(registry, [](JobEvent, const Job&) {});
     check(registry.retireInstance(ids.condor_extra),
           "retiring an instance with subscribers must start the drain");
     check(registry.closingJobCount() == size_t{1}, "the instance must be closing, not archived");

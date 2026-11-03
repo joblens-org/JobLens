@@ -36,20 +36,15 @@
  *
  * Each scenario uses its own temporary LevelDB directory.
  */
-#include "core/job_collection_manager.hpp"
 #include "core/registration_error.hpp"
 #include "core/job_registry.hpp"
 #include "job_fixture.h"
+#include "collection_runtime_fixture.hpp"
 
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
 
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstdint>
-#include <mutex>
-#include <thread>
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
@@ -74,14 +69,13 @@ std::string fresh_dir(const std::string& base, const std::string& name)
     return path.string();
 }
 
-JobRegistryOptions isolated(const std::string& path, size_t migration_batch_limit = 0)
+JobRegistryOptions isolated(const std::string& path)
 {
     JobRegistryOptions options;
     options.db_path = path;
     options.enable_inventory_maintenance = false;
     options.enable_pid_tracker = false;
     options.register_rpc = false;
-    options.migration_batch_limit = migration_batch_limit;
     return options;
 }
 
@@ -220,7 +214,7 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
     check(created.internal_id > 0, "created inventory must carry an internal id");
     check(created.instance_id.rfind("ji1-", 0) == 0,
           "created inventory must carry an opaque instance handle");
-    check(created.facts_revision == 1, "first revision must be 1");
+    check(created.revision == 1, "first revision must be 1");
 
     {
         const auto record = registry.inventoryRecord(created.internal_id);
@@ -240,8 +234,17 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
         check(job->JobPIDs.size() == 1 && job->JobPIDs.front() == 4242,
               "observed processes must become facts");
     }
-    check(registry.bindingRecord(created.internal_id).revision == 0,
-          "no binding intent may be created by an observation");
+    {
+        // ONE record revision: the observation created revision 1, but it must
+        // not decide collection. No automatic and no manual decision exist.
+        const auto record = registry.inventoryRecord(created.internal_id);
+        check(record.has_value() && record->revision == created.revision,
+              "the observation commits the record revision it reports");
+        check(!record->selection.automatic.has_value() &&
+                  !record->selection.manual.has_value() &&
+                  record->selection.effectiveCollectors().empty(),
+              "an observation must not create a collection decision");
+    }
     check(registry.inventoryRecords().size() == 1, "exactly one inventory entry");
 
     const auto repeat = registry.upsertObservedJob(observation);
@@ -249,7 +252,7 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
           "repeat observation must be unchanged");
     check(repeat.internal_id == created.internal_id, "repeat must keep the internal id");
     check(repeat.instance_id == created.instance_id, "repeat must keep the instance handle");
-    check(repeat.facts_revision == created.facts_revision,
+    check(repeat.revision == created.revision,
           "unchanged facts must not advance the revision");
     check(registry.inventoryRecords().size() == 1, "repeat must not duplicate the entry");
 
@@ -265,7 +268,7 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
           "fact updates must not change the internal id");
     check(updated.instance_id == created.instance_id,
           "fact updates must not change the instance handle");
-    check(updated.facts_revision == created.facts_revision + 1,
+    check(updated.revision == created.revision + 1,
           "changed facts must advance the revision exactly once");
 
     {
@@ -296,7 +299,10 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
 
 // A19 -----------------------------------------------------------------------
 
-void legacy_restore_migrates_inventory_and_selection(const std::string& base)
+// Schema 3 is a hard boundary. A store with data but no schema marker is an
+// old-schema store: this build rejects it and leaves every row untouched. It
+// never migrates or deletes in place.
+void legacy_schema_is_rejected_without_migration(const std::string& base)
 {
     const auto path = fresh_dir(base, "a19");
     const uint64_t active_id = 41;
@@ -311,48 +317,41 @@ void legacy_restore_migrates_inventory_and_selection(const std::string& base)
         {"c:job_id", "41"},
     });
 
-    JobRegistry registry(isolated(path));
-    check(registry.migrationComplete(), "legacy db must migrate to schema 2");
+    {
+        JobRegistry registry(isolated(path));
+        const auto health = registry.storeHealth();
+        check(!health.db_running, "an old-schema store must be rejected, not opened");
+        check(!health.migration_complete,
+              "a rejected store must not advertise readiness");
+        check(health.migration_state.rfind("unsupported_schema", 0) == 0,
+              "rejection must name the unsupported schema, got " + health.migration_state);
+        check(registry.inventoryRecords().empty(),
+              "a rejected store must not publish partial inventory");
+        check(record_revision(registry, active_id) == 0,
+              "a rejected store must not synthesize a record");
+        check(registry.getNextJobID() == 0,
+              "a rejected store must not hand out ids");
+    }
 
-    const auto health = registry.storeHealth();
-    check(health.schema_version == 2, "migrated schema version must be 2");
-    check(health.migration_state == "complete", "migration state must be complete");
-    check(!health.db_uuid.empty(), "migration must persist an Agent DB UUID");
-    check(health.active_instances == 1, "migration must restore the active record");
+    // The rows are still there: rejection did not migrate or delete anything.
+    check(raw_keys_with_prefix(path, "j:").size() == 1,
+          "rejection must not delete active records");
+    check(raw_keys_with_prefix(path, "h:").size() == 1,
+          "rejection must not delete history");
 
-    // Inventory appears independently of any lifecycle-callback subscriber.
-    const auto job = registry.findJob(active_id);
-    check(job.has_value(), "restored inventory must be readable without a subscriber");
-
-    const auto identity = canonicalize(condor_selector("172.0"));
-    check(identity.has_value(), "fixture selector must canonicalize");
-    const auto by_identity = registry.inventoryRecordByIdentity(*identity);
-    check(by_identity.has_value(), "migration must build the identity index");
-    check(by_identity->internal_id == active_id,
-          "migration must preserve the existing internal id");
-    check(by_identity->instance_id.rfind("ji1-", 0) == 0,
-          "restored records must expose an instance handle");
-
-    const auto binding = registry.bindingRecord(active_id);
-    check(binding.mode == CollectionMode::Manual,
-          "legacy non-empty CollectorNames must migrate to a manual binding");
-    check(binding.manual_collectors == std::vector<std::string>{"cpumem_collector"},
-          "migrated manual selection must preserve the legacy names");
-    check(binding.revision == 1, "migrated binding starts at revision 1");
-    check(binding.policy_revision == "legacy",
-          "legacy origin must not be reported as an automatic policy");
-
-    // The allocator high-water mark covers active, history and counter values.
-    const auto next = registry.getNextJobID();
-    check(next > active_id, "allocator must stay above restored active ids");
-    check(next > history_id, "allocator must stay above restored history ids");
+    {
+        JobRegistry again(isolated(path));
+        check(!again.storeHealth().db_running,
+              "an old-schema store must stay rejected on every open");
+    }
 }
 
 // A20 -----------------------------------------------------------------------
 
-void interrupted_migration_resumes_idempotently(const std::string& base)
+// Rejection is all-or-nothing and idempotent, even for a populated store.
+void unsupported_schema_is_rejected_idempotently(const std::string& base)
 {
-    const auto path = fresh_dir(base, "a20-resume");
+    const auto path = fresh_dir(base, "a20-reject");
     std::vector<uint64_t> ids;
     for (uint64_t index = 0; index < 70; ++index) ids.push_back(100 + index);
 
@@ -367,81 +366,55 @@ void interrupted_migration_resumes_idempotently(const std::string& base)
     write_raw_db(path, entries);
 
     {
-        JobRegistry interrupted(isolated(path, /*migration_batch_limit=*/1));
-        check(!interrupted.migrationComplete(),
-              "batch-limited migration must stop before advertising readiness");
-        check(interrupted.storeHealth().migration_state.rfind("in_progress", 0) == 0,
-              "interrupted migration must persist in-progress state");
-        check(interrupted.inventoryRecords().empty(),
-              "inventory must not be published before migration completes");
+        JobRegistry rejected(isolated(path));
+        check(!rejected.storeHealth().db_running,
+              "a populated old-schema store must be rejected");
+        check(rejected.inventoryRecords().empty(),
+              "rejection must not publish a partial inventory");
     }
-
-    {
-        JobRegistry resumed(isolated(path));
-        check(resumed.migrationComplete(), "migration must resume and complete");
-        check(resumed.inventoryRecords().size() == ids.size(),
-              "resume must preserve every record exactly once");
-        for (const auto id : ids) {
-            const auto record = resumed.inventoryRecord(id);
-            check(record.has_value(), "resume must preserve internal id " + std::to_string(id));
-            check(record->identity_complete, "resume must build complete identities");
-            check(record->facts_revision == 1, "migration must not fork revisions");
-        }
-    }
+    check(raw_keys_with_prefix(path, "j:").size() == ids.size(),
+          "rejection must preserve every record");
 
     {
         JobRegistry reopened(isolated(path));
-        check(reopened.migrationComplete(), "migrated db must stay migrated");
-        check(reopened.inventoryRecords().size() == ids.size(),
-              "reopening a migrated db must not duplicate records");
-        check(reopened.storeHealth().quarantined_identities == 0,
-              "clean migration must not quarantine anything");
+        check(!reopened.storeHealth().db_running,
+              "reopening must not switch rejection into migration");
+        check(reopened.inventoryRecords().empty(),
+              "a rejected store publishes no inventory on retry");
     }
+    check(raw_keys_with_prefix(path, "j:").size() == ids.size(),
+          "repeated rejection must not delete rows");
 }
 
-void conflicting_live_identities_are_quarantined(const std::string& base)
+void conflicting_live_execution_is_not_merged(const std::string& base)
 {
     const auto path = fresh_dir(base, "a20-conflict");
-    const uint64_t first_id = 61;
-    const uint64_t second_id = 62;
-
-    write_raw_db(path, {
-        {"j:" + hex64(first_id),
-         legacy_condor_record("172.0", "htcondor01", "schedd-a", {}, 6100).dump()},
-        {"j:" + hex64(second_id),
-         legacy_condor_record("172.0", "htcondor01", "schedd-a", {}, 6200).dump()},
-        {"c:job_id", "62"},
-    });
-
     JobRegistry registry(isolated(path));
-    check(registry.migrationComplete(), "conflicting db must still migrate");
 
-    const auto records = registry.inventoryRecords();
-    check(records.size() == 2, "conflicting identities must not be merged");
-    check(registry.findJob(first_id).has_value() && registry.findJob(second_id).has_value(),
-          "both conflicting internal ids must be preserved");
+    const auto first = registry.upsertObservedJob(condor_observation("172.0"));
+    check(first.ok, "the first live execution must register");
 
+    // A different live generation for the same identity is a conflict, not a
+    // merge: the second execution must not receive a second internal id.
+    auto conflicting = condor_observation("172.0");
+    ExecutionGeneration generation;
+    generation.boot_id = "boot-bbb";
+    generation.manager_pid = 5252;
+    generation.manager_start_ticks = 990000;
+    conflicting.execution->generation = generation;
+    conflicting.execution->members = {ProcessIdentity{5252, 990000, "boot-bbb"}};
+    const auto conflict = registry.upsertObservedJob(conflicting);
+    check(!conflict.ok && conflict.error == "execution_generation_conflict",
+          "a different live generation must not merge into the old record");
+
+    check(registry.inventoryRecords().size() == 1,
+          "a conflicting live execution must not create a second instance");
     const auto identity = canonicalize(condor_selector("172.0"));
     const auto indexed = registry.inventoryRecordByIdentity(*identity);
-    check(indexed.has_value(), "one conflict survivor must own the identity index");
-    check(indexed->internal_id == first_id,
-          "the earliest internal id must win the identity index deterministically");
-
-    size_t quarantined = 0;
-    for (const auto& record : records) quarantined += record.quarantined ? 1 : 0;
-    check(quarantined == 1, "exactly one conflicting record must be quarantined");
-    check(registry.storeHealth().quarantined_identities == 1,
-          "health must expose the quarantined identity count");
-
-    // A quarantined record is not eligible for identity resolution.
-    const auto conflict = registry.upsertObservedJob(condor_observation("172.0"));
-    check(conflict.ok, "upsert must resolve to the indexed survivor");
-    check(conflict.internal_id == first_id,
-          "upsert must never merge into the quarantined record");
-    check(conflict.disposition != UpsertDisposition::Created,
-          "an observation must not create a third record for a known identity");
-    check(registry.inventoryRecords().size() == 2,
-          "upsert must not duplicate the quarantined record");
+    check(indexed.has_value() && indexed->internal_id == first.internal_id,
+          "the original live execution keeps the identity index");
+    check(registry.storeHealth().quarantined_identities == 0,
+          "a live conflict is rejected, not quarantined");
 }
 
 // Restore validation (supports A03/A20) --------------------------------------
@@ -467,8 +440,10 @@ void stale_generation_is_not_replayed(const std::string& base)
         JobRegistry registry(isolated(path));
         const auto record = registry.inventoryRecord(internal_id);
         check(record.has_value(), "the record must still be restored");
-        check(record->state == "suspect",
-              "a stale execution generation must be marked suspect on restore");
+        check(record->state == "active",
+              "a stale generation is not a lifecycle state: the record stays Open");
+        check(!record->execution_verified,
+              "a stale execution generation must be restored as unverified");
         const auto job = registry.findJob(internal_id);
         check(job.has_value() && job->JobPIDs.empty(),
               "stale PIDs must not be replayed into the registry");
@@ -537,25 +512,28 @@ void write_failures_reject_mutations_without_id_reuse(const std::string& base)
           "ambiguous allocation must not reuse a lower internal id");
 
     // (3) Binding transaction failure must leave the previous intent intact.
-    JobCollectionManager manager(registry);
+    // No Config here: accept every name, the focus is the write failure.
+    registry.setCollectorValidator(nullptr);
     CollectionRequest set;
     set.targets = {first.internal_id};
     set.collectors = std::vector<std::string>{"cpumem_collector"};
-    const auto accepted = manager.setCollectors(set);
+    const auto accepted = registry.setCollectors(set);
     check(accepted.ok, "baseline binding must be accepted: " + accepted.message);
 
     registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite);
     set.collectors = std::vector<std::string>{"disk_collector"};
-    const auto rejected = manager.setCollectors(set);
+    const auto rejected = registry.setCollectors(set);
     check(!rejected.ok, "a failed binding write must not report success");
     check(rejected.error == CollectionError::StoreUnavailable,
           "binding store failure must be distinguishable");
     {
-        const auto binding = registry.bindingRecord(first.internal_id);
-        check(binding.revision == accepted.targets.front().binding.revision,
-              "a failed binding write must not advance the revision");
-        check(binding.manual_collectors == std::vector<std::string>{"cpumem_collector"},
-              "a failed binding write must not rewrite the intent");
+        const auto selection = registry.selectionRecord(first.internal_id);
+        const auto selection_revision = record_revision(registry, first.internal_id);
+        check(selection_revision == accepted.targets.front().revision,
+              "a failed selection write must not advance the revision");
+        check(selection.manual.has_value() &&
+                  *selection.manual == std::vector<std::string>{"cpumem_collector"},
+              "a failed selection write must not rewrite the intent");
     }
 
     // (4) Archive transaction failure must keep the instance active.
@@ -571,8 +549,8 @@ void write_failures_reject_mutations_without_id_reuse(const std::string& base)
           "retirement must succeed once the store recovers");
     check(!registry.findJob(retried.internal_id).has_value(),
           "successful retirement removes the active record");
-    check(!registry.bindingRecord(retried.internal_id).revision,
-          "successful retirement removes the binding record");
+    check(record_revision(registry, retried.internal_id) == 0,
+          "successful retirement removes the record, not just its selection");
 
     registry.clearStoreFaultsForTest();
 }
@@ -594,7 +572,7 @@ void closing_state_is_durable_and_not_resurrected(const std::string& base)
         // the process as closing, not as an active instance. The injected
         // fault models the archive failing (or the process dying) before the
         // drain completes — exactly the restart scenario being tested.
-        registry.addLifecycleCb([](JobEvent, const Job&) {});
+        install_deferred_drain(registry, [](JobEvent, const Job&) {});
         check(registry.retireInstance(internal_id),
               "retirement with a subscriber must be accepted");
         check(!registry.hasInstance(internal_id),
@@ -659,16 +637,20 @@ void restored_suspect_instances_are_not_replayed(const std::string& base)
 
     {
         JobRegistry registry(isolated(path));
-        check(registry.inventoryRecord(internal_id).has_value() &&
-                  registry.inventoryRecord(internal_id)->state == "suspect",
-              "the stale generation must be restored as suspect");
+        const auto restored = registry.inventoryRecord(internal_id);
+        check(restored.has_value() && restored->state == "active" &&
+                  !restored->execution_verified,
+              "the stale generation must be restored Open and unverified");
 
         size_t added = 0;
-        registry.addLifecycleCb([&added, internal_id](JobEvent event, const Job& job) {
+        install_deferred_drain(registry, [&added, internal_id](JobEvent event, const Job& job) {
             if (event == JobEvent::Added && job.JobID == internal_id) ++added;
         });
+        test_runtime(registry).reconcile(internal_id);
         check(added == 0,
-              "a suspect execution must not be replayed to collectors after a restart");
+              "an unverified execution must not be replayed to collectors after a restart");
+        check(registry.actualCollection(internal_id).collectors.empty(),
+              "a facts-only restored record selects no collector");
     }
 }
 
@@ -746,17 +728,27 @@ void hot_path_registration_does_not_fsync(const std::string& base)
     JobRegistry registry(isolated(path));
 
     const auto before = registry.storeHealth();
-    const auto jobs = std::vector<Job>{condor_observation("801.0"), condor_observation("802.0"),
-                                       condor_observation("803.0")};
-    const auto results = registry.registerDiscoveredJobs(jobs);
-    for (const auto& result : results) check(result.ok, "the batch must register");
-    std::string error;
-    BindingRecord binding;
-    binding.internal_id = results.front().internal_id;
-    binding.revision = 1;
-    binding.mode = CollectionMode::Auto;
-    binding.auto_collectors = {"cpumem_collector"};
-    check(registry.commitBindings({binding}, error), "the binding must commit: " + error);
+    const auto first = registry.upsertObservedJob(condor_observation("801.0"));
+    const auto second = registry.upsertObservedJob(condor_observation("802.0"));
+    const auto third = registry.upsertObservedJob(condor_observation("803.0"));
+    check(first.ok && second.ok && third.ok, "the registrations must succeed");
+    registry.setCollectorValidator(nullptr);
+    const auto committed = registry.applyAutoPolicy(
+        {{first.internal_id, {"cpumem_collector"}, "sync-tiering"}});
+    check(committed.ok, "the binding must commit: " + committed.message);
+
+    // A registry-owned selection command is also intent-hot: it must not turn
+    // the unsynced control path into a per-request fence.
+    CollectionRequest selection;
+    selection.targets = {first.internal_id};
+    selection.collectors = std::vector<std::string>{"disk_collector"};
+    const auto selected = registry.setCollectors(selection);
+    check(selected.ok, "the selection command must commit: " + selected.message);
+    check(selected.targets.front().revision == committed.targets.front().revision + 1,
+          "the selection command must advance the stored revision exactly once");
+    check(record_revision(registry, first.internal_id) ==
+              selected.targets.front().revision,
+          "the accepted revision must be the committed record revision");
 
     const auto after = registry.storeHealth();
     check(after.sync_commits == before.sync_commits,
@@ -764,8 +756,6 @@ void hot_path_registration_does_not_fsync(const std::string& base)
               std::to_string(after.sync_commits - before.sync_commits) + " sync commit(s)");
     check(after.durable_commits > before.durable_commits,
           "the writes must still reach LevelDB (unsynced)");
-    check(after.dirty_records > 0 && after.dirty_bindings > 0,
-          "an unsynced row must stay visible in the dirty set until the checkpoint");
 
     // The checkpoint (or shutdown) is where the fence happens.
     const auto synced_before = registry.storeHealth().sync_commits;
@@ -783,17 +773,17 @@ void shutdown_flush_persists_runtime_changes(const std::string& base)
     std::uint64_t id = 0;
     {
         JobRegistry registry(isolated(path));
+        registry.setCollectorValidator(nullptr);
         const auto created = registry.upsertObservedJob(condor_observation("810.0"));
         check(created.ok, "the instance must register");
         id = created.internal_id;
 
         std::string error;
-        BindingRecord binding;
-        binding.internal_id = id;
-        binding.revision = 1;
-        binding.mode = CollectionMode::Manual;
-        binding.manual_collectors = {"cpumem_collector"};
-        check(registry.commitBindings({binding}, error), "the binding must commit: " + error);
+        CollectionRequest selection;
+        selection.targets = {id};
+        selection.collectors = std::vector<std::string>{"cpumem_collector"};
+        const auto committed = registry.setCollectors(selection);
+        check(committed.ok, "the binding must commit: " + committed.message);
         check(registry.deinit(), "shutdown must succeed");
     }
     {
@@ -803,118 +793,17 @@ void shutdown_flush_persists_runtime_changes(const std::string& base)
         const auto record = registry.inventoryRecord(id);
         check(record.has_value(), "the instance must survive the restart");
         check(record->job.NativeJobID == "810.0", "the facts must survive the restart");
-        const auto binding = registry.bindingRecord(id);
-        check(binding.mode == CollectionMode::Manual &&
-                  binding.manual_collectors == std::vector<std::string>{"cpumem_collector"},
+        const auto binding = registry.selectionRecord(id);
+        check(binding.mode() == CollectionMode::Manual &&
+                  binding.manual.value_or(std::vector<std::string>{}) == std::vector<std::string>{"cpumem_collector"},
               "the intent must survive the restart");
     }
 }
 
-// A26 (allocator order) ------------------------------------------------------
-
-// A standalone allocation and an inventory batch share one admission: the
-// standalone call must wait for the batch whose id reservation is already in
-// flight, otherwise the batch would write an older counter back and reissue a
-// published id after a restart (plan §5.3).
-void standalone_allocation_cannot_interleave_with_a_batch(const std::string& base)
-{
-    const auto path = fresh_dir(base, "alloc-order");
-    std::uint64_t batch_id = 0;
-    {
-        JobRegistry registry(isolated(path));
-        std::mutex mutex;
-        std::condition_variable cv;
-        bool reserved = false;
-        bool release = false;
-        registry.setPreCommitHookForTest([&] {
-            std::unique_lock<std::mutex> lock(mutex);
-            reserved = true;
-            cv.notify_all();
-            cv.wait(lock, [&] { return release; });
-        });
-
-        std::vector<UpsertResult> results;
-        std::thread batch_thread([&] {
-            results = registry.registerDiscoveredJobs({condor_observation("901.0")});
-        });
-        {
-            std::unique_lock<std::mutex> lock(mutex);
-            cv.wait_for(lock, std::chrono::seconds(10), [&] { return reserved; });
-        }
-
-        std::atomic<bool> allocated{false};
-        std::atomic<std::uint64_t> standalone{0};
-        std::thread allocator([&] {
-            standalone = registry.getNextJobID();
-            allocated = true;
-        });
-
-        // The batch is between its id reservation and its commit; a standalone
-        // allocation must wait for that admission instead of persisting a
-        // counter the batch would then write back.
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        const bool blocked_while_in_flight = !allocated.load();
-
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            release = true;
-        }
-        cv.notify_all();
-        batch_thread.join();
-        allocator.join();
-        registry.setPreCommitHookForTest({});
-
-        check(reserved, "the batch must reach its pre-commit point");
-        check(results.size() == 1 && results[0].ok, "the batch registration must succeed");
-        batch_id = results[0].internal_id;
-        check(blocked_while_in_flight,
-              "a standalone allocation must wait for the batch admission");
-        check(allocated.load(), "the standalone allocation must complete after the batch");
-        check(standalone.load() > batch_id,
-              "the standalone id must follow the batch id, got " +
-                  std::to_string(standalone.load()) + " after " + std::to_string(batch_id));
-        check(registry.deinit(), "shutdown must succeed");
-    }
-    {
-        JobRegistry registry(isolated(path));
-        const auto next = registry.getNextJobID();
-        check(next > batch_id, "the durable counter must not go backwards after a restart");
-    }
-}
-
-// A03 (failure attribution) -------------------------------------------------
-
-// A batch that contains one identity twice must fail *both* results when the
-// shared facts transaction fails: the duplicate rode on the same commit and no
-// instance may be published for it.
-void duplicate_input_shares_the_batch_failure(const std::string& base)
-{
-    const auto path = fresh_dir(base, "dup-failure");
-    JobRegistry registry(isolated(path));
-
-    const auto job = condor_observation("902.0");
-    registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite, /*skip=*/0);
-    const auto results = registry.registerDiscoveredJobs({job, job});
-    check(results.size() == 2, "both inputs must be answered");
-    check(!results[0].ok, "the first copy must fail with the transaction");
-    check(!results[1].ok, "the duplicate copy must fail with the same transaction");
-    check(results[1].code == RegistrationError::StoreWriteFailed,
-          "the duplicate must carry the store failure code");
-    check(registry.inventoryRecords().empty(),
-          "a failed batch must not publish any instance");
-
-    registry.clearStoreFaultsForTest();
-    const auto retried = registry.registerDiscoveredJobs({job, job});
-    check(retried[0].ok && retried[1].ok, "the retry must succeed");
-    check(retried[0].internal_id == retried[1].internal_id,
-          "the duplicate must resolve to the same instance");
-    check(registry.inventoryRecords().size() == 1, "exactly one instance may exist");
-}
-
 // A05 (fresh candidates) ----------------------------------------------------
 
-// Two *fresh* candidates for one identity with different live manager triples
-// conflict exactly like a merge would: the second never overwrites the first.
+// A second observation for one identity with a different live manager triple
+// conflicts exactly like a merge would: it never overwrites the first.
 void conflicting_fresh_candidates_are_rejected(const std::string& base)
 {
     const auto path = fresh_dir(base, "fresh-conflict");
@@ -925,12 +814,13 @@ void conflicting_fresh_candidates_are_rejected(const std::string& base)
     second.execution->generation =
         ExecutionGeneration{"boot-aaa", 8888, 777777, "/sys/fs/cgroup/htcondor/slot8"};
 
-    const auto results = registry.registerDiscoveredJobs({first, second});
-    check(results[0].ok && results[0].disposition == UpsertDisposition::Created,
+    const auto created = registry.upsertObservedJob(first);
+    check(created.ok && created.disposition == UpsertDisposition::Created,
           "the first candidate must be created");
-    check(!results[1].ok && results[1].code == RegistrationError::GenerationConflict,
-          "a different manager triple for the same fresh identity must conflict");
-    const auto stored = registry.inventoryRecord(results[0].internal_id);
+    const auto conflict = registry.upsertObservedJob(second);
+    check(!conflict.ok && conflict.code == RegistrationError::GenerationConflict,
+          "a different manager triple for the same identity must conflict");
+    const auto stored = registry.inventoryRecord(created.internal_id);
     check(stored.has_value(), "the first candidate must stay readable");
     check(stored->generation.manager_pid == 4242,
           "the conflicting candidate must not overwrite the stored generation");
@@ -939,9 +829,9 @@ void conflicting_fresh_candidates_are_rejected(const std::string& base)
 
 // A04 (working set) ---------------------------------------------------------
 
-// Repeated inputs for one existing identity merge into a single candidate, and
+// Repeated observations for one existing identity publish the last state, and
 // the published memory state equals what a restart reads back.
-void batch_working_set_keeps_memory_and_disk_in_sync(const std::string& base)
+void repeated_observations_keep_memory_and_disk_in_sync(const std::string& base)
 {
     const auto path = fresh_dir(base, "working-set");
     std::uint64_t id = 0;
@@ -958,15 +848,16 @@ void batch_working_set_keeps_memory_and_disk_in_sync(const std::string& base)
         Job before = condor_observation("904.0");
         std::get<CondorJobAttr>(before.sub_attr).owner = "before";
 
-        const auto results = registry.registerDiscoveredJobs({after, before});
-        check(results[0].ok && results[1].ok, "both repeated inputs must be accepted");
+        const auto first = registry.upsertObservedJob(after);
+        const auto second = registry.upsertObservedJob(before);
+        check(first.ok && second.ok, "both repeated observations must be accepted");
 
         const auto live = registry.inventoryRecord(id);
         check(live.has_value(), "the instance must stay readable");
         published_owner = std::get<CondorJobAttr>(live->job.sub_attr).owner;
-        published_revision = live->facts_revision;
-        check(published_revision == results[1].facts_revision,
-              "the published revision must be the final candidate's");
+        published_revision = live->revision;
+        check(published_revision == second.revision,
+              "the published revision must be the final observation's");
         check(published_owner == "before",
               "the working set must publish the last input, got " + published_owner);
         check(registry.deinit(), "shutdown must succeed");
@@ -981,7 +872,7 @@ void batch_working_set_keeps_memory_and_disk_in_sync(const std::string& base)
         check(owner == published_owner,
               "the restarted record must agree with the published owner ('" + owner +
                   "' vs '" + published_owner + "')");
-        check(reopened->facts_revision == published_revision,
+        check(reopened->revision == published_revision,
               "the restarted revision must match the published revision");
     }
 }
@@ -1029,62 +920,61 @@ void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string
 
 // A29 -----------------------------------------------------------------------
 
-void batch_registration_keeps_single_upsert_semantics(const std::string& base)
+void registration_keeps_single_upsert_semantics(const std::string& base)
 {
     const auto path = fresh_dir(base, "a29");
     JobRegistry registry(isolated(path));
+    // No Config in this test: the name gate is not what is under test here.
+    registry.setCollectorValidator(nullptr);
 
     auto first = condor_observation("501.0");
     auto second = condor_observation("502.0");
     auto incomplete = condor_observation("503.0");
     incomplete.cluster_name.clear();   // no namespace -> no identity
 
-    // A burst of fresh executions: all created, all in one durable batch.
-    const auto batch = registry.registerDiscoveredJobs({first, second, incomplete});
-    check(batch.size() == 3, "batch results must stay aligned with the input");
-    check(batch[0].ok && batch[1].ok, "fresh executions must be created");
-    check(batch[0].disposition == UpsertDisposition::Created,
-          "batch create must report created");
-    check(batch[0].internal_id != batch[1].internal_id,
+    // Fresh executions: each is created with its own internal id.
+    const auto first_result = registry.upsertObservedJob(first);
+    const auto second_result = registry.upsertObservedJob(second);
+    const auto incomplete_result = registry.upsertObservedJob(incomplete);
+    check(first_result.ok && second_result.ok, "fresh executions must be created");
+    check(first_result.disposition == UpsertDisposition::Created,
+          "a fresh registration must report created");
+    check(first_result.internal_id != second_result.internal_id,
           "each instance gets its own internal id");
-    check(!batch[2].ok && batch[2].error == "incomplete_identity",
-          "an incomplete identity stays rejected in the batch path");
+    check(!incomplete_result.ok && incomplete_result.error == "incomplete_identity",
+          "an incomplete identity stays rejected");
     check(registry.inventoryRecords().size() == 2, "only the complete identities persist");
 
-    // The same batch again is a merge, not a duplicate: the ids are unchanged.
-    const auto repeat = registry.registerDiscoveredJobs({first, second});
-    check(repeat[0].ok && repeat[1].ok, "replaying the batch must succeed");
-    check(repeat[0].disposition != UpsertDisposition::Created,
-          "a replayed batch must not create a second instance");
-    check(repeat[0].internal_id == batch[0].internal_id &&
-              repeat[1].internal_id == batch[1].internal_id,
-          "a replayed batch must resolve to the same instances");
+    // The same input again is a merge, not a duplicate: the ids are unchanged.
+    const auto repeat_first = registry.upsertObservedJob(first);
+    const auto repeat_second = registry.upsertObservedJob(second);
+    check(repeat_first.ok && repeat_second.ok, "replaying the input must succeed");
+    check(repeat_first.disposition != UpsertDisposition::Created,
+          "a replayed input must not create a second instance");
+    check(repeat_first.internal_id == first_result.internal_id &&
+              repeat_second.internal_id == second_result.internal_id,
+          "a replayed input must resolve to the same instances");
 
-    // The automatic intent is still one transaction for the batch: the applier
-    // result is visible per instance.
-    std::vector<BindingRecord> bindings;
-    for (const auto& result : batch) {
+    // The automatic intent is one transaction for the batch of selections: the
+    // applier result is visible per instance.
+    std::vector<AutoSelection> selections;
+    for (const auto& result : {first_result, second_result}) {
         if (!result.ok) continue;
-        BindingRecord binding;
-        binding.internal_id = result.internal_id;
-        binding.revision = 1;
-        binding.mode = CollectionMode::Auto;
-        binding.auto_collectors = {"cpumem_collector"};
-        binding.policy_revision = "test";
-        bindings.push_back(std::move(binding));
+        selections.push_back(AutoSelection{result.internal_id, {"cpumem_collector"}, "test"});
     }
-    std::string error;
-    check(registry.commitBindings(bindings, error),
-          "one batch intent transaction must accept every binding: " + error);
-    for (const auto& binding : bindings) {
-        check(registry.bindingRecord(binding.internal_id).auto_collectors ==
-                  std::vector<std::string>{"cpumem_collector"},
-              "the batch intent must be readable per instance");
-        registry.reconcileCollectionIntent(binding.internal_id);
-        check(!registry.appliedCollection(binding.internal_id).applied,
-              "an isolated registry has no runtime, so applied stays false");
-        check(registry.appliedCollection(binding.internal_id).error == "no_collection_runtime",
-              "the missing runtime must be reported honestly");
+    const auto committed = registry.applyAutoPolicy(selections);
+    check(committed.ok,
+          "one intent transaction must accept every binding: " + committed.message);
+    for (const auto& selection : selections) {
+        const auto stored = registry.selectionRecord(selection.internal_id);
+        check(stored.automatic.has_value() &&
+                  *stored.automatic == std::vector<std::string>{"cpumem_collector"},
+              "the automatic decision must be readable per instance");
+        // No runtime was installed on this isolated registry: the actual state
+        // is untracked, never inferred from the desired selection.
+        const auto actual = registry.actualCollection(selection.internal_id);
+        check(!actual.tracked && actual.collectors.empty() && actual.attach_token == 0,
+              "without a runtime the actual state must stay untracked");
     }
 }
 
@@ -1103,7 +993,8 @@ void max_internal_id_is_never_reissued(const std::string& base)
     // already-issued MAX may not be handed out again.
     {
         const auto path = fresh_dir(base, "a26a");
-        write_raw_db(path, {{"c:job_id", std::to_string(kMax - 1)}});
+        write_raw_db(path, {{"m:schema_version", "4"},
+                            {"c:job_id", std::to_string(kMax - 1)}});
         {
             JobRegistry registry(isolated(path));
             check(registry.getNextJobID() == kMax - 1,
@@ -1123,7 +1014,8 @@ void max_internal_id_is_never_reissued(const std::string& base)
     // exhausted rather than reissued.
     {
         const auto path = fresh_dir(base, "a26b");
-        write_raw_db(path, {{"c:job_id", std::to_string(kMax)}});
+        write_raw_db(path, {{"m:schema_version", "4"},
+                            {"c:job_id", std::to_string(kMax)}});
         JobRegistry registry(isolated(path));
         check(registry.getNextJobID() == 0,
               "a marker-less MAX counter must be treated as exhausted");
@@ -1134,7 +1026,8 @@ void max_internal_id_is_never_reissued(const std::string& base)
     // transaction; the exhaustion then survives the restart.
     {
         const auto path = fresh_dir(base, "a26c");
-        write_raw_db(path, {{"c:job_id", std::to_string(kMax)},
+        write_raw_db(path, {{"m:schema_version", "4"},
+                            {"c:job_id", std::to_string(kMax)},
                             {"m:job_id_exhausted", "false"}});
         {
             JobRegistry registry(isolated(path));
@@ -1154,7 +1047,8 @@ void max_internal_id_is_never_reissued(const std::string& base)
     // still holds MAX.
     {
         const auto path = fresh_dir(base, "a26d");
-        write_raw_db(path, {{"c:job_id", std::to_string(kMax)},
+        write_raw_db(path, {{"m:schema_version", "4"},
+                            {"c:job_id", std::to_string(kMax)},
                             {"m:job_id_exhausted", "true"}});
         JobRegistry registry(isolated(path));
         check(registry.getNextJobID() == 0, "marker=true must refuse every allocation");
@@ -1165,6 +1059,7 @@ void max_internal_id_is_never_reissued(const std::string& base)
     {
         const auto path = fresh_dir(base, "a26e");
         write_raw_db(path, {
+            {"m:schema_version", "4"},
             {"j:" + hex64(kMax),
              legacy_condor_record("172.0", "htcondor01", "schedd-a", {}, 4100).dump()},
             {"c:job_id", std::to_string(kMax - 1)},
@@ -1183,7 +1078,8 @@ void runtime_state_survives_later_durable_writes(const std::string& base)
 {
     const auto path = fresh_dir(base, "a11-runtime");
     JobRegistry registry(isolated(path));
-    registry.setCollectionApplier([](const Job& job, std::vector<std::string>& applied,
+    registry.setCollectorValidator(nullptr);
+    install_collection_runtime(registry, [](const Job& job, std::vector<std::string>& applied,
                                      std::string& error) {
         applied = job.CollectorNames;
         error.clear();
@@ -1195,20 +1091,18 @@ void runtime_state_survives_later_durable_writes(const std::string& base)
     const uint64_t id = created.internal_id;
 
     std::string error;
-    BindingRecord binding;
-    binding.internal_id = id;
-    binding.revision = 1;
-    binding.mode = CollectionMode::Auto;
-    binding.auto_collectors = {"cpumem_collector"};
-    binding.policy_revision = "a11";
-    check(registry.commitBindings({binding}, error), "binding must commit: " + error);
-    registry.reconcileCollectionIntent(id);
+    const auto initial = registry.applyAutoPolicy(
+        {{id, {"cpumem_collector"}, "a11"}});
+    check(initial.ok, "binding must commit: " + initial.message);
+    test_runtime(registry).reconcile(id);
+    const uint64_t applied_revision = record_revision(registry, id);
     {
-        const auto applied = registry.appliedCollection(id);
+        const auto applied = test_runtime(registry).applied(id);
         check(applied.applied &&
                   applied.collectors == std::vector<std::string>{"cpumem_collector"},
               "the runtime result must be visible after apply");
-        check(applied.revision == 1, "the applied revision must track the binding");
+        check(applied.revision == applied_revision,
+              "the actual revision must be the record revision the runtime read");
     }
 
     // (1) Unchanged discovery pass: neither facts nor runtime state may move.
@@ -1216,11 +1110,11 @@ void runtime_state_survives_later_durable_writes(const std::string& base)
     check(unchanged.ok && unchanged.disposition == UpsertDisposition::Unchanged,
           "a repeated observation must stay unchanged");
     {
-        const auto applied = registry.appliedCollection(id);
+        const auto applied = test_runtime(registry).applied(id);
         check(applied.applied &&
                   applied.collectors == std::vector<std::string>{"cpumem_collector"},
               "an unchanged upsert must not clear the runtime holders");
-        check(applied.revision == 1,
+        check(applied.revision == applied_revision,
               "an unchanged upsert must not move the applied revision");
     }
 
@@ -1232,7 +1126,7 @@ void runtime_state_survives_later_durable_writes(const std::string& base)
     check(updated.ok && updated.disposition == UpsertDisposition::Updated,
           "a changed observation must be an update");
     {
-        const auto applied = registry.appliedCollection(id);
+        const auto applied = test_runtime(registry).applied(id);
         check(applied.applied &&
                   applied.collectors == std::vector<std::string>{"cpumem_collector"},
               "a facts update must not erase the current runtime result");
@@ -1240,40 +1134,55 @@ void runtime_state_survives_later_durable_writes(const std::string& base)
 
     // (3) An intent the runtime only partially honoured must not be reported
     // as applied, and the holders it really reports must stay visible.
-    registry.setCollectionApplier([](const Job&, std::vector<std::string>& applied,
+    install_collection_runtime(registry, [](const Job&, std::vector<std::string>& applied,
                                      std::string& error) {
         applied = {"cpumem_collector"};   // the old lane is still attached
         error = "collector_failed";
         return false;
     });
-    BindingRecord second = binding;
-    second.revision = 2;
-    second.auto_collectors = {"cpumem_collector", "disk_collector"};
-    check(registry.commitBindings({second}, error), "second binding must commit: " + error);
+    const uint64_t before_second = record_revision(registry, id);
+    const auto actual_before_second = test_runtime(registry).applied(id);
+    const auto second = registry.applyAutoPolicy(
+        {{id, {"cpumem_collector", "disk_collector"}, "a11"}});
+    check(second.ok, "second binding must commit: " + second.message);
+    check(second.targets.front().revision == before_second + 1,
+          "the second binding must advance the record revision exactly once");
     {
-        const auto applied = registry.appliedCollection(id);
+        // Acceptance is not application: until the runtime's own pass runs, the
+        // actual state still names the previous attachment and revision.
+        const auto before = registry.actualCollection(id);
+        check(before.tracked &&
+                  before.collectors == std::vector<std::string>{"cpumem_collector"},
+              "the accepted intent must not be reported as attached");
+        check(before.last_revision == actual_before_second.revision,
+              "the actual state must still name the revision it converged to");
+    }
+    test_runtime(registry).reconcile(id);
+    {
+        const auto applied = test_runtime(registry).applied(id);
         check(!applied.applied, "a rejected apply must not report the intent as applied");
         check(applied.collectors == std::vector<std::string>{"cpumem_collector"},
               "the holders the runtime still reports must stay visible");
-        check(applied.revision == 2,
-              "the applied record must point at the binding revision it tried");
+        check(applied.revision == second.targets.front().revision,
+              "the applied record must point at the revision it tried");
         check(applied.error == "collector_failed",
               "the runtime error must be visible, got '" + applied.error + "'");
     }
 
     // The retry path converges once the runtime accepts the intent again.
-    registry.setCollectionApplier([](const Job& job, std::vector<std::string>& applied,
+    install_collection_runtime(registry, [](const Job& job, std::vector<std::string>& applied,
                                      std::string& error) {
         applied = job.CollectorNames;
         error.clear();
         return true;
     });
-    registry.reconcileCollectionIntent(id);
+    test_runtime(registry).reconcile(id);
     {
-        const auto converged = registry.appliedCollection(id);
+        const auto converged = test_runtime(registry).applied(id);
         check(converged.applied && converged.collectors.size() == 2,
               "the retry must converge to the new intent");
-        check(converged.revision == 2, "the applied revision must converge to revision 2");
+        check(converged.revision == record_revision(registry, id),
+              "the applied revision must converge to the current record revision");
     }
 }
 
@@ -1290,7 +1199,8 @@ void archived_instances_leave_no_active_row(const std::string& base)
     uint64_t id = 0;
     {
         JobRegistry registry(isolated(path));
-        registry.setCollectionApplier([](const Job& job, std::vector<std::string>& applied,
+        registry.setCollectorValidator(nullptr);
+        install_collection_runtime(registry, [](const Job& job, std::vector<std::string>& applied,
                                          std::string& error) {
             applied = job.CollectorNames;
             error.clear();
@@ -1300,17 +1210,18 @@ void archived_instances_leave_no_active_row(const std::string& base)
         check(created.ok, "baseline registration must succeed");
         id = created.internal_id;
 
-        std::string error;
-        BindingRecord binding;
-        binding.internal_id = id;
-        binding.revision = 1;
-        binding.mode = CollectionMode::Auto;
-        binding.auto_collectors = {"cpumem_collector"};
-        check(registry.commitBindings({binding}, error), "binding must commit: " + error);
-        registry.reconcileCollectionIntent(id);
+        const auto committed = registry.applyAutoPolicy(
+            {{id, {"cpumem_collector"}, "a12"}});
+        check(committed.ok, "binding must commit: " + committed.message);
+        test_runtime(registry).reconcile(id);
 
-        // The runtime result is still a pending coalesced hint here.
-        check(registry.retireInstance(id), "retirement must archive the instance");
+        // Retirement is accepted as a durable Closing revision; the runtime's
+        // own pass proves the boundary and the archive releases the identity.
+        check(registry.retireInstance(id), "retirement must be accepted");
+        check(registry.inventoryRecord(id).has_value() &&
+                  registry.inventoryRecord(id)->state == "closing",
+              "the accepted retirement must stay Closing until the runtime drains");
+        test_runtime(registry).reconcile(id);
         check(!registry.inventoryRecord(id).has_value(),
               "the archived instance must leave the active map");
         check(registry.deinit(), "shutdown must not fail after a clean archive");
@@ -1365,19 +1276,17 @@ void ambiguous_registration_resolves_after_restart(const std::string& base)
 
 // A03/A04/A05 ---------------------------------------------------------------
 
-// One batch that both creates and merges costs exactly one facts transaction:
-// the merge, the new record and its identity index land in the same commit, a
-// conflicting item is reported per item without blocking the others, and an
-// in-batch duplicate resolves to the candidate being written.
-void batch_merges_share_one_facts_transaction(const std::string& base)
+// A create, a fact merge, a conflicting generation and a repeat of the newly
+// created identity each resolve to the single-upsert semantics; the conflict is
+// reported per call without blocking the others.
+void sequential_merges_keep_single_upsert_semantics(const std::string& base)
 {
-    const auto path = fresh_dir(base, "a03-batch-merge");
+    const auto path = fresh_dir(base, "a03-merge");
     JobRegistry registry(isolated(path));
 
     const auto seed_a = registry.upsertObservedJob(condor_observation("601.0"));
     const auto seed_b = registry.upsertObservedJob(condor_observation("602.0"));
     check(seed_a.ok && seed_b.ok, "the seed instances must register");
-    const uint64_t before = registry.storeHealth().durable_commits;
 
     Job fresh = condor_observation("603.0");
     Job changed = condor_observation("601.0");
@@ -1388,33 +1297,683 @@ void batch_merges_share_one_facts_transaction(const std::string& base)
     Job duplicate = condor_observation("603.0");
     duplicate.execution->members.push_back(ProcessIdentity{5252, 424242, "boot-aaa"});
 
-    const auto results =
-        registry.registerDiscoveredJobs({fresh, changed, conflict, duplicate});
-    check(results.size() == 4, "batch results must stay aligned with the input");
+    const auto created = registry.upsertObservedJob(fresh);
+    const auto merged = registry.upsertObservedJob(changed);
+    const auto conflicted = registry.upsertObservedJob(conflict);
+    const auto repeated = registry.upsertObservedJob(duplicate);
 
-    check(results[0].ok && results[0].disposition == UpsertDisposition::Created,
+    check(created.ok && created.disposition == UpsertDisposition::Created,
           "the fresh identity must be created");
-    check(results[1].ok && results[1].disposition == UpsertDisposition::Updated,
-          "the changed identity must merge in the same batch");
-    check(results[1].internal_id == seed_a.internal_id,
+    check(merged.ok && merged.disposition == UpsertDisposition::Updated,
+          "the changed identity must merge");
+    check(merged.internal_id == seed_a.internal_id,
           "the merge must resolve to the stored instance");
-    check(!results[2].ok && results[2].code == RegistrationError::GenerationConflict,
+    check(!conflicted.ok && conflicted.code == RegistrationError::GenerationConflict,
           "a different live generation must be reported as a conflict");
-    check(results[2].internal_id == seed_b.internal_id,
+    check(conflicted.internal_id == seed_b.internal_id,
           "the conflict must name the instance it belongs to");
-    check(results[3].ok && results[3].internal_id == results[0].internal_id,
-          "an in-batch duplicate must resolve to the candidate being written");
+    check(repeated.ok && repeated.internal_id == created.internal_id,
+          "a repeated observation must resolve to the stored instance");
 
-    const uint64_t commits = registry.storeHealth().durable_commits - before;
-    check(commits == 1,
-          "create + merge + index repair must share one facts transaction, saw " +
-              std::to_string(commits));
-
-    const auto stored = registry.inventoryRecord(results[0].internal_id);
-    check(stored.has_value() && stored->facts_revision == 2,
-          "the in-batch duplicate must have merged into the created record");
+    const auto stored = registry.inventoryRecord(created.internal_id);
+    check(stored.has_value() && stored->revision == 2,
+          "the repeated observation must have merged into the created record");
     check(registry.inventoryRecords().size() == 3,
           "exactly three instances may exist");
+}
+
+// Schema 3: desired selection is one field of the record that owns it. There
+// is no second `b:` row to keep consistent, and a restart reads the intent
+// from the same row as the facts.
+void selection_intent_lives_in_the_record_row(const std::string& base)
+{
+    const auto path = fresh_dir(base, "schema3-intent");
+    uint64_t id = 0;
+    {
+        JobRegistry registry(isolated(path));
+        registry.setCollectorValidator(nullptr);
+        const auto created = registry.upsertObservedJob(condor_observation("172.0"));
+        check(created.ok, "baseline registration must succeed");
+        id = created.internal_id;
+
+        CollectionRequest request;
+        request.targets = {id};
+        request.collectors = std::vector<std::string>{"cpumem_collector"};
+        const auto selected = registry.setCollectors(request);
+        check(selected.ok, "the manual selection must commit: " + selected.message);
+        check(selected.targets.front().revision == created.revision + 1,
+              "the manual selection must advance the one record revision");
+        check(registry.deinit(), "shutdown must succeed");
+    }
+
+    check(raw_keys_with_prefix(path, "b:").empty(),
+          "schema 4 must not write a separate binding row");
+    const auto rows = read_raw_db(path);
+    bool found_intent = false;
+    for (const auto& [key, value] : rows) {
+        if (key != "j:" + hex64(id)) continue;
+        const auto record = nlohmann::json::parse(value);
+        check(record.contains("selection"), "the record row must carry the selection");
+        check(record["selection"].contains("manual") && !record["selection"]["manual"].is_null(),
+              "the stored selection must be the manual one");
+        check(record.value("revision", uint64_t{0}) == 2,
+              "the stored revision must be the one the selection committed");
+        found_intent = true;
+    }
+    check(found_intent, "the instance row must still exist");
+
+    {
+        JobRegistry registry(isolated(path));
+        const auto binding = registry.selectionRecord(id);
+        const auto binding_revision = record_revision(registry, id);
+        check(binding.mode() == CollectionMode::Manual &&
+                  binding.manual.value_or(std::vector<std::string>{}) == std::vector<std::string>{"cpumem_collector"},
+              "a restart must restore the intent from the record row");
+        check(binding_revision == 2,
+              "the restored revision must be the one the selection committed");
+    }
+}
+
+// A failed closing write must not start any destructive path: the record stays
+// active, no Removed event is delivered and the drain is never entered.
+void closing_write_failure_keeps_the_instance(const std::string& base)
+{
+    const auto path = fresh_dir(base, "closing-sync-failure");
+    JobRegistry registry(isolated(path));
+    const auto created = registry.upsertObservedJob(condor_observation("172.0"));
+    check(created.ok, "baseline registration must succeed");
+
+    size_t removed_events = 0;
+    install_deferred_drain(registry, [&removed_events](JobEvent event, const Job&) {
+        if (event == JobEvent::Removed) ++removed_events;
+    });
+
+    registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite);
+    check(!registry.retireInstance(created.internal_id),
+          "a failed closing sync must refuse retirement");
+    registry.clearStoreFaultsForTest();
+
+    check(removed_events == 0,
+          "a failed closing sync must not deliver Removed");
+    const auto record = registry.inventoryRecord(created.internal_id);
+    check(record.has_value() && record->state == kStateActive,
+          "a failed closing sync must leave the instance active");
+    check(registry.findJob(created.internal_id).has_value(),
+          "the instance must remain readable after the refused retirement");
+}
+
+// A19 (canonical marker) ----------------------------------------------------
+
+// The schema marker this build writes is a canonical decimal. Anything else -
+// a prefix parse like "3garbage", a value that only fits after truncation, an
+// older/newer schema, or non-digit bytes - is not this build's layout: it is
+// rejected before any UUID, id counter or record is initialized, and every
+// original key/value stays exactly as it was.
+void schema_marker_must_be_canonical(const std::string& base)
+{
+    const std::vector<std::string> markers = {
+        "3garbage", "4294967299", "2", "5", " 3", "3 ", "03", "-3", "", "0x3",
+    };
+    for (size_t index = 0; index < markers.size(); ++index) {
+        const auto marker = markers[index];
+        const auto path = fresh_dir(base, "a19b-" + std::to_string(index));
+        write_raw_db(path, {
+            {"m:schema_version", marker},
+            {"m:db_uuid", "uuid-keep"},
+            {"m:custom_metadata", "keep-me"},
+            {"j:" + hex64(41),
+             legacy_condor_record("172.0", "htcondor01", "schedd-a",
+                                  {"cpumem_collector"}, 4100).dump()},
+            {"c:job_id", "41"},
+        });
+        const auto before = read_raw_db(path);
+        {
+            JobRegistry registry(isolated(path));
+            const auto health = registry.storeHealth();
+            check(!health.db_running,
+                  "marker '" + marker + "' must be rejected, not opened");
+            check(!health.migration_complete,
+                  "marker '" + marker + "' must not advertise readiness");
+            check(!health.recovery_required,
+                  "a rejected schema is a read-only rejection, not a pending recovery");
+            check(registry.inventoryRecords().empty(),
+                  "marker '" + marker + "' must not publish inventory");
+            check(record_revision(registry, 41) == 0,
+                  "marker '" + marker + "' must not synthesize intent");
+            check(registry.getNextJobID() == 0,
+                  "marker '" + marker + "' must not hand out ids");
+        }
+        const auto after = read_raw_db(path);
+        check(after == before,
+              "rejecting marker '" + marker + "' must preserve every key and value");
+    }
+}
+
+// A24 (ambiguous closing) ---------------------------------------------------
+
+// A closing write whose outcome is unknown may have landed. The process must
+// keep the pre-failure view, refuse the shutdown checkpoint for that row, and
+// report a failed deinit; the next open reads the durable closing state.
+void ambiguous_closing_state_is_not_reverted(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a24b-ambiguous-closing");
+    uint64_t id = 0;
+    {
+        JobRegistry registry(isolated(path));
+        install_deferred_drain(registry, [](JobEvent, const Job&) {});
+        const auto created = registry.upsertObservedJob(condor_observation("172.0"));
+        check(created.ok, "baseline registration must succeed");
+        id = created.internal_id;
+
+        registry.injectStoreFaultForTest(StoreFaultMode::FailAfterWrite, /*skip=*/0,
+                                         /*count=*/1);
+        check(!registry.retireInstance(id),
+              "an ambiguous closing write must not report success");
+        check(registry.storeHealth().recovery_required,
+              "the ambiguous closing write must latch recovery");
+        const auto record = registry.inventoryRecord(id);
+        check(record.has_value() && record->state == kStateActive,
+              "memory keeps the pre-failure state until recovery");
+        check(!registry.deinit(),
+              "a shutdown with an unrecovered store must report failure");
+    }
+    {
+        JobRegistry reopened(isolated(path));
+        const auto record = reopened.inventoryRecord(id);
+        check(record.has_value() && record->state == "closing",
+              "the closing fact that landed must survive; the shutdown checkpoint "
+              "must not rewrite the stale active row");
+        check(!reopened.hasInstance(id), "a closing instance is never active");
+        const auto late = reopened.upsertObservedJob(condor_observation("172.0"));
+        check(!late.ok && late.error == "instance_closing",
+              "the restored closing reservation must reject a late observation");
+        check(reopened.cleanupClosingJobs(),
+              "the closing cleanup must finish the interrupted retirement");
+        check(!reopened.inventoryRecord(id).has_value(),
+              "the archive removes the closing record");
+        const auto replacement = reopened.upsertObservedJob(condor_observation("172.0"));
+        check(replacement.ok && replacement.internal_id != id,
+              "after the archive the identity can be registered as a new instance");
+    }
+}
+
+// A24 (cleanup ordering) ----------------------------------------------------
+
+// The archive releases the identity index, so it must come last: a failed
+// owner-sensitive kernel cleanup keeps the durable closing reservation, blocks
+// a replacement from taking the identity, and stays retryable.
+void cleanup_failure_keeps_the_closing_reservation(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a24c-cleanup-retry");
+    JobRegistry registry(isolated(path));
+    size_t cleanup_calls = 0;
+    bool record_visible_during_cleanup = false;
+    registry.setKernelCleanupForTest(
+        [&](uint64_t job_id, const Job&, std::string& error) {
+            ++cleanup_calls;
+            // The archive releases the identity index, so at cleanup time the
+            // record must still be there; if it were already archived this
+            // would be false.
+            record_visible_during_cleanup = registry.inventoryRecord(job_id).has_value();
+            if (cleanup_calls == 1) {
+                error = "injected cleanup failure";
+                return false;
+            }
+            error.clear();
+            return true;
+        });
+
+    const auto created = registry.upsertObservedJob(condor_observation("172.0"));
+    check(created.ok, "baseline registration must succeed");
+    const uint64_t id = created.internal_id;
+
+    // The runtime owns the drain: install it before the command so retirement
+    // is accepted as Closing and the cleanup runs only after the runtime
+    // proves the boundary.
+    install_deferred_drain(registry);
+    check(registry.retireInstance(id), "the retirement must be accepted");
+    const auto closing = registry.inventoryRecord(id);
+    check(closing.has_value() && closing->state == "closing",
+          "the accepted retirement is durable Closing before any cleanup");
+    check(test_runtime(registry).reconcile(id),
+          "the runtime must accept the Closing record");
+    check(!test_runtime(registry).completeDrain(id),
+          "a failed kernel cleanup must not report a completed retirement");
+    check(cleanup_calls == 1, "the cleanup must be attempted");
+    check(record_visible_during_cleanup,
+          "the cleanup must run while the durable record still exists");
+    check(registry.inventoryRecord(id).has_value() &&
+              registry.inventoryRecord(id)->state == "closing",
+          "a failed cleanup keeps the durable closing reservation");
+    check(!registry.hasInstance(id), "a closing reservation is not an active instance");
+
+    // The closing reservation still owns the identity: no replacement may take
+    // it, which is exactly what makes the retry safe.
+    const auto late = registry.upsertObservedJob(condor_observation("172.0"));
+    check(!late.ok && late.error == "instance_closing",
+          "the closing reservation must reject a replacement observation");
+    const auto identity = canonicalize(condor_selector("172.0"));
+    check(identity.has_value(), "the fixture identity must canonicalize");
+    const auto by_identity = registry.inventoryRecordByIdentity(*identity);
+    check(by_identity.has_value() && by_identity->internal_id == id,
+          "the identity must still resolve to the closing instance");
+
+    check(test_runtime(registry).completeDrain(id),
+          "the retry must finish the retirement once cleanup succeeds");
+    check(cleanup_calls == 2, "the retry must run the cleanup again");
+    check(!registry.inventoryRecord(id).has_value(),
+          "the successful retry archives the record");
+    const auto replacement = registry.upsertObservedJob(condor_observation("172.0"));
+    check(replacement.ok && replacement.disposition == UpsertDisposition::Created &&
+              replacement.internal_id != id,
+          "only after the archive may the identity be registered again");
+}
+
+// A24 (ambiguous closing retry) ---------------------------------------------
+
+// A closing write whose outcome is unknown may have landed. Memory keeps the
+// active view until recovery, so the first retire reports failure without a
+// Removed. The retry adopts the durable closing row and must dispatch the
+// missing drain exactly once instead of returning "closing and subscribed"
+// forever; after the subscriber acks, the record is archived and the identity
+// is released.
+void ambiguous_closing_retry_restores_the_drain(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a24d-closing-retry");
+    JobRegistry registry(isolated(path));
+    size_t removed_events = 0;
+    bool ack_ok = false;
+    uint64_t id = 0;
+    install_deferred_drain(registry, [&](JobEvent event, const Job& job) {
+        if (event != JobEvent::Removed || job.JobID != id) return;
+        ++removed_events;
+        ack_ok = test_runtime(registry).completeDrain(job.JobID);
+    });
+
+    const auto created = registry.upsertObservedJob(condor_observation("172.0"));
+    check(created.ok, "baseline registration must succeed");
+    id = created.internal_id;
+
+    registry.injectStoreFaultForTest(StoreFaultMode::FailAfterWrite, /*skip=*/0,
+                                     /*count=*/1);
+    check(!registry.retireInstance(id),
+          "an ambiguous closing write must not report success");
+    check(registry.storeHealth().recovery_required,
+          "the ambiguous closing write must latch recovery");
+    check(removed_events == 0, "a failed closing sync must not deliver Removed");
+    const auto active = registry.inventoryRecord(id);
+    check(active.has_value() && active->state == kStateActive,
+          "memory keeps the active view until recovery");
+
+    registry.clearStoreFaultsForTest();
+    check(registry.retireInstance(id),
+          "the retry must accept the recovered closing record");
+    check(test_runtime(registry).reconcile(id),
+          "the runtime must resume the drain for the recovered record");
+    check(removed_events == 1,
+          "exactly one Removed may be dispatched for the recovered closing record");
+    check(ack_ok, "the recovered drain ack must archive the record");
+    check(!registry.inventoryRecord(id).has_value(),
+          "the ack archives the recovered closing record");
+    check(!registry.hasInstance(id), "an archived instance is no longer active");
+
+    const auto replacement = registry.upsertObservedJob(condor_observation("172.0"));
+    check(replacement.ok && replacement.disposition == UpsertDisposition::Created &&
+              replacement.internal_id != id,
+          "after the archive the identity can be registered as a new instance");
+}
+
+// A24 (cleanup after ack) ---------------------------------------------------
+
+// The cleanup happens after the last collection ack, so a failed cleanup is
+// not a lost drain: the closing reservation stays and the same ack path can be
+// retried to completion.
+void cleanup_failure_after_ack_is_retryable(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a24e-ack-retry");
+    JobRegistry registry(isolated(path));
+    size_t cleanup_calls = 0;
+    size_t removed_events = 0;
+    bool first_ack = true;
+    registry.setKernelCleanupForTest(
+        [&](uint64_t, const Job&, std::string& error) {
+            ++cleanup_calls;
+            if (cleanup_calls == 1) {
+                error = "injected cleanup failure after the ack";
+                return false;
+            }
+            error.clear();
+            return true;
+        });
+    uint64_t id = 0;
+    install_deferred_drain(registry, [&](JobEvent event, const Job& job) {
+        if (event != JobEvent::Removed || job.JobID != id) return;
+        ++removed_events;
+        first_ack = test_runtime(registry).completeDrain(job.JobID);
+    });
+
+    const auto created = registry.upsertObservedJob(condor_observation("172.0"));
+    check(created.ok, "baseline registration must succeed");
+    id = created.internal_id;
+
+    check(registry.retireInstance(id), "retirement must be accepted");
+    check(removed_events == 0, "acceptance alone does not dispatch a drain");
+    check(test_runtime(registry).reconcile(id), "the runtime must start the drain");
+    check(removed_events == 1, "one Removed starts the drain");
+    check(!first_ack, "the ack must report the failed cleanup");
+    const auto closing = registry.inventoryRecord(id);
+    check(closing.has_value() && closing->state == kStateClosing,
+          "a cleanup failure after the ack keeps the closing reservation");
+    check(!registry.hasInstance(id), "a closing reservation is not an active instance");
+    check(registry.retireInstance(id),
+          "a second retire is an idempotent acceptance of the same Closing record");
+    check(removed_events == 1,
+          "the second retire must not emit a second Removed");
+
+    check(test_runtime(registry).completeDrain(id),
+          "the ack retry must finish the cleanup and archive");
+    check(cleanup_calls == 2, "the retry must run the cleanup again");
+    check(!registry.inventoryRecord(id).has_value(),
+          "the successful retry archives the record");
+    check(removed_events == 1, "the retry must not emit a second Removed");
+}
+
+// A05/A23 (runtime projection) ----------------------------------------------
+
+// The runtime result and the Job.collection projection are one piece of
+// in-memory truth. A whole-record publication (an ordinary unchanged
+// observation followed by a changed one) must rebuild the projection from the
+// live result, and an unchanged observation must not re-invoke the runtime.
+void runtime_projection_survives_repeated_observation(const std::string& base)
+{
+    const auto path = fresh_dir(base, "runtime-projection");
+    JobRegistry registry(isolated(path));
+    registry.setCollectorValidator(nullptr);
+    size_t applies = 0;
+    install_collection_runtime(registry,
+        [&](const Job&, std::vector<std::string>& applied, std::string& error) {
+            ++applies;
+            applied = {"cpumem_collector"};
+            error.clear();
+            return true;
+        });
+
+    const auto created = registry.upsertObservedJob(condor_observation("905.0"));
+    check(created.ok, "the instance must register");
+    const auto committed = registry.applyAutoPolicy(
+        {{created.internal_id, {"cpumem_collector"}, "projection-test"}});
+    check(committed.ok, "the binding must commit: " + committed.message);
+    check(applies == 0, "a command must not run the runtime on its own stack");
+    test_runtime(registry).reconcile(created.internal_id);
+    check(applies == 1, "the runtime pass must attach the selection once");
+
+    {
+        const auto actual = registry.actualCollection(created.internal_id);
+        check(actual.tracked &&
+                  actual.collectors == std::vector<std::string>{"cpumem_collector"},
+              "the runtime holders must be reported as actual");
+        const auto projected = registry.inventoryRecord(created.internal_id);
+        check(projected.has_value() &&
+                  actual.last_revision == projected->revision,
+              "the actual state must name the record revision it converged to");
+    }
+
+    // An ordinary unchanged observation republishes the record but must not
+    // detach or refresh the attachment.
+    const auto unchanged = registry.upsertObservedJob(condor_observation("905.0"));
+    check(unchanged.ok && unchanged.disposition == UpsertDisposition::Unchanged,
+          "the repeat observation must be unchanged");
+    {
+        const auto actual = registry.actualCollection(created.internal_id);
+        check(actual.collectors == std::vector<std::string>{"cpumem_collector"},
+              "an unchanged observation must not erase the runtime holders");
+    }
+    check(applies == 1, "an unchanged observation must not re-run the runtime");
+
+    // A real facts change reaches the same attachment without a detach.
+    Job changed = condor_observation("905.0");
+    std::get<CondorJobAttr>(changed.sub_attr).owner = "changed";
+    const auto updated = registry.upsertObservedJob(changed);
+    check(updated.ok && updated.disposition == UpsertDisposition::Updated,
+          "the fact change must be applied");
+    const auto actual = registry.actualCollection(created.internal_id);
+    check(actual.collectors == std::vector<std::string>{"cpumem_collector"},
+          "a fact change must not erase the runtime holders");
+}
+
+// A21 (recovery fence) ------------------------------------------------------
+
+// An ambiguous unsynced selection may have landed. Recovery adopts the durable
+// row, but adoption alone is not durable: the recovered row (and any remaining
+// dirty row) must be rewritten in one fenced batch before the latch is
+// released. A failed fence keeps both the latch and the dirty obligation.
+void recovery_fences_the_adopted_selection(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a21-recovery-fence");
+    JobRegistry registry(isolated(path));
+    registry.setCollectorValidator(nullptr);
+
+    const auto created = registry.upsertObservedJob(condor_observation("906.0"));
+    check(created.ok, "the instance must register");
+    const uint64_t id = created.internal_id;
+
+    CollectionRequest first;
+    first.targets = {id};
+    first.collectors = std::vector<std::string>{"cpumem_collector"};
+    check(registry.setCollectors(first).ok, "the first selection must commit");
+    const uint64_t revision_before_ambiguous = record_revision(registry, id);
+    const auto before = registry.storeHealth();
+    check(before.dirty_records > 0,
+          "an unsynced selection must leave a dirty obligation");
+
+    registry.injectStoreFaultForTest(StoreFaultMode::FailAfterWrite, /*skip=*/0,
+                                     /*count=*/1);
+    CollectionRequest second;
+    second.targets = {id};
+    second.collectors = std::vector<std::string>{"disk_collector"};
+    const auto ambiguous = registry.setCollectors(second);
+    check(!ambiguous.ok && ambiguous.error == CollectionError::StoreUnavailable,
+          "an ambiguous selection write must be reported as store-unavailable");
+    check(registry.storeHealth().recovery_required,
+          "the ambiguous selection must latch recovery");
+    check(registry.storeHealth().sync_commits == before.sync_commits,
+          "the failed selection must not count as a fence");
+
+    // A failing recovery fence must not clear the latch or the dirty row.
+    registry.clearStoreFaultsForTest();
+    registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite, /*skip=*/0,
+                                     /*count=*/1);
+    std::string error;
+    check(!registry.recoverStore(error),
+          "a failed recovery fence must report failure");
+    check(registry.storeHealth().recovery_required,
+          "a failed recovery fence must keep the latch");
+    check(registry.storeHealth().dirty_records > 0,
+          "a failed recovery fence must keep the dirty obligation");
+    check(registry.storeHealth().sync_commits == before.sync_commits,
+          "a failed recovery fence must not count as a durable commit");
+
+    // The retry fences the adopted row before reporting recovery complete.
+    registry.clearStoreFaultsForTest();
+    error.clear();
+    check(registry.recoverStore(error), "the recovery retry must succeed: " + error);
+    const auto after = registry.storeHealth();
+    check(!after.recovery_required, "a completed recovery must release the latch");
+    check(after.sync_commits > before.sync_commits,
+          "recovery must fence the adopted selection row");
+    check(after.dirty_records == 0,
+          "recovery must clear the dirty obligation it fenced");
+
+    const auto binding = registry.selectionRecord(id);
+
+    const auto binding_revision = record_revision(registry, id);
+    check(binding.mode() == CollectionMode::Manual &&
+              binding.manual.value_or(std::vector<std::string>{}) == std::vector<std::string>{"disk_collector"},
+          "recovery must publish the durable selection that landed");
+    check(binding_revision == revision_before_ambiguous + 1,
+          "recovery must publish the ONE revision of the landed write");
+}
+
+// A24/A21 (ambiguous archive image) -----------------------------------------
+
+// An archive write that landed but reported failure leaves no active row to
+// rewrite and no dirty snapshot to fence. Recovery must read the durable `h:`
+// row back and re-assert that exact key/value (plus the matching active and
+// identity deletions) in one fenced batch; adopting the archive and clearing
+// the latch without any write would claim a durability nobody proved, and
+// rebuilding the history row from memory would write a second, different one.
+void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a24f-archive-recovery");
+    const auto identity = canonicalize(condor_selector("907.0"));
+    check(identity.has_value(), "the fixture identity must canonicalize");
+
+    uint64_t id = 0;
+    int64_t archived_first_seen = 0;
+    uint64_t archived_revision = 0;
+    uint64_t fence_entries = 0;
+    {
+        JobRegistry registry(isolated(path));
+        const auto created = registry.upsertObservedJob(condor_observation("907.0"));
+        check(created.ok, "baseline registration must succeed");
+        id = created.internal_id;
+
+        const auto before_archive = registry.inventoryRecord(id);
+        check(before_archive.has_value(), "the instance must be readable before retirement");
+        archived_first_seen = before_archive->first_seen_us;
+
+        // This retirement makes two durable writes: the closing state and then
+        // the archive. `skip=1` lands the injected failure on the archive.
+        registry.injectStoreFaultForTest(StoreFaultMode::FailAfterWrite, /*skip=*/1,
+                                         /*count=*/1);
+        check(!registry.retireInstance(id),
+              "an ambiguous archive must not report a completed retirement");
+        registry.clearStoreFaultsForTest();
+
+        // The closing transition is itself a record mutation, so the durable
+        // image the archive write copies carries the revision after that bump.
+        const auto closing_row = registry.inventoryRecord(id);
+        check(closing_row.has_value() && closing_row->state == kStateClosing,
+              "the closing reservation must be durable before the archive");
+        archived_revision = closing_row->revision;
+        check(archived_revision == before_archive->revision + 1,
+              "the closing transition must advance the ONE record revision (" +
+                  std::to_string(before_archive->revision) + " -> " +
+                  std::to_string(archived_revision) + ")");
+
+        const auto latched = registry.storeHealth();
+        check(latched.recovery_required, "the ambiguous archive must latch recovery");
+        check(latched.active_instances == 1, "memory keeps the instance until recovery");
+        check(registry.inventoryRecord(id).has_value(),
+              "the instance stays readable until recovery adopts the archive");
+
+        // A failing fence must keep the latch and the obligation. The instance
+        // has no active row left to rewrite, so a zero entry count here would
+        // mean recovery attempted no durable write at all.
+        registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite, /*skip=*/0,
+                                         /*count=*/1);
+        std::string error;
+        check(!registry.recoverStore(error),
+              "a failed archive fence must report failure");
+        const auto failed = registry.storeHealth();
+        check(failed.recovery_required, "a failed archive fence must keep the latch");
+        check(failed.recovery_fence_entries >= 2,
+              "the archive fence must re-assert the history row and the active "
+              "deletion, got " + std::to_string(failed.recovery_fence_entries) + " entry(s)");
+        check(failed.sync_commits == latched.sync_commits,
+              "a failed archive fence must not count as a durable commit");
+        check(failed.active_instances == 0,
+              "the adopted archive leaves no pending active row");
+        check(!registry.hasInstance(id), "an archived instance is never active");
+        check(!registry.inventoryRecordByIdentity(*identity).has_value(),
+              "the adopted archive releases the identity to the store");
+        fence_entries = failed.recovery_fence_entries;
+
+        // Only a successful fence may complete the recovery.
+        registry.clearStoreFaultsForTest();
+        error.clear();
+        check(registry.recoverStore(error),
+              "the archive recovery retry must succeed: " + error);
+        const auto recovered = registry.storeHealth();
+        check(!recovered.recovery_required,
+              "a completed archive recovery must release the latch");
+        check(recovered.sync_commits > latched.sync_commits,
+              "recovery must fence the reconstructed archive durably");
+        check(recovered.recovery_fence_entries == fence_entries,
+              "the retry must fence the same non-empty image");
+        check(recovered.active_instances == 0,
+              "a recovered archive leaves no active instance behind");
+        check(registry.deinit(), "shutdown must succeed after the archive recovery");
+    }
+
+    // The durable image, read with the store closed.
+    const auto rows = read_raw_db(path);
+    size_t history_rows = 0;
+    std::string history_key;
+    std::string history_value;
+    bool archived_active_row_present = false;
+    bool archived_id_in_index = false;
+    for (const auto& [key, value] : rows) {
+        if (key == "j:" + hex64(id)) archived_active_row_present = true;
+        if (key.rfind("h:" + hex64(id) + ":", 0) == 0) {
+            ++history_rows;
+            history_key = key;
+            history_value = value;
+        }
+        if (key.rfind("i:", 0) == 0 &&
+            nlohmann::json::parse(value).value("internal_id", uint64_t{0}) == id) {
+            archived_id_in_index = true;
+        }
+    }
+    check(!archived_active_row_present,
+          "the recovered archive must leave no active row for the archived instance");
+    check(history_rows == 1,
+          "the recovery must preserve exactly one history row, found " +
+              std::to_string(history_rows));
+    check(!archived_id_in_index,
+          "the archive must release the identity index owner it held");
+    check(raw_keys_with_prefix(path, "j:").empty(),
+          "the recovery must leave no active row at all");
+
+    // The history key encodes the archive timestamp and the value carries the
+    // summary of the same archive. A regenerated row would land under a new
+    // key (a second history row) and with a different end_time_us.
+    const auto stamp = std::stoull(history_key.substr(history_key.size() - 16), nullptr, 16);
+    const auto history = nlohmann::json::parse(history_value);
+    check(history.value("end_time_us", int64_t{0}) == static_cast<int64_t>(stamp),
+          "the fenced history value must belong to its own key");
+    check(history.value("first_seen_us", int64_t{-1}) == archived_first_seen,
+          "the fenced history row must keep the observed facts, not a guess");
+    check(history.value("revision", uint64_t{0}) == archived_revision,
+          "the fenced history row must keep the archived record revision");
+    check(history.value("state", std::string{}) == kStateClosing,
+          "the fenced history row must keep the closing state");
+    check(history.contains("selection"),
+          "the fenced history row must keep the audit selection");
+    const auto stored_selection = history.value("selection", nlohmann::json::object());
+    check(stored_selection.is_object(),
+          "the archived selection must be an object, not a dropped field");
+    const auto stored_identity = history.value("identity", nlohmann::json::object());
+    check(stored_identity.is_object() &&
+              stored_identity.value("native_job_id", std::string{}) == "907.0",
+          "the fenced history row must keep the archived identity");
+
+    {
+        JobRegistry reopened(isolated(path));
+        check(!reopened.inventoryRecord(id).has_value(),
+              "the recovered archive must not be resurrected by a restart");
+        check(!reopened.inventoryRecordByIdentity(*identity).has_value(),
+              "the archived identity must not resolve to the archived instance");
+        const auto replacement = reopened.upsertObservedJob(condor_observation("907.0"));
+        check(replacement.ok && replacement.disposition == UpsertDisposition::Created &&
+                  replacement.internal_id != id,
+              "after the archive the identity must register as a new instance");
+        const auto binding = reopened.selectionRecord(replacement.internal_id);
+        const auto binding_revision = record_revision(reopened, replacement.internal_id);
+        check(binding_revision == 1 && !binding.manual.has_value(),
+              "the replacement must not inherit the archived intent");
+        check(reopened.deinit(), "shutdown must succeed after the replacement");
+    }
 }
 
 int main(int argc, char** argv)
@@ -1423,36 +1982,51 @@ int main(int argc, char** argv)
         const std::string base = argc > 1 ? argv[1] : "/tmp/joblens-inventory-store-test";
         std::filesystem::create_directories(base);
         upsert_is_idempotent_and_activates_nothing(base);
-        legacy_restore_migrates_inventory_and_selection(base);
-        interrupted_migration_resumes_idempotently(base);
-        conflicting_live_identities_are_quarantined(base);
+        legacy_schema_is_rejected_without_migration(base);
+        unsupported_schema_is_rejected_idempotently(base);
+        conflicting_live_execution_is_not_merged(base);
         stale_generation_is_not_replayed(base);
         write_failures_reject_mutations_without_id_reuse(base);
         closing_state_is_durable_and_not_resurrected(base);
         restored_suspect_instances_are_not_replayed(base);
         member_semantics_distinguish_unknown_from_confirmed_empty(base);
-        batch_registration_keeps_single_upsert_semantics(base);
+        registration_keeps_single_upsert_semantics(base);
         registration_errors_are_typed_and_exhaustively_mapped(base);
         max_internal_id_is_never_reissued(base);
         runtime_state_survives_later_durable_writes(base);
         archived_instances_leave_no_active_row(base);
         ambiguous_registration_resolves_after_restart(base);
-        batch_merges_share_one_facts_transaction(base);
+        sequential_merges_keep_single_upsert_semantics(base);
         hot_path_registration_does_not_fsync(base);
         shutdown_flush_persists_runtime_changes(base);
-        standalone_allocation_cannot_interleave_with_a_batch(base);
-        duplicate_input_shares_the_batch_failure(base);
         conflicting_fresh_candidates_are_rejected(base);
-        batch_working_set_keeps_memory_and_disk_in_sync(base);
+        repeated_observations_keep_memory_and_disk_in_sync(base);
+        selection_intent_lives_in_the_record_row(base);
+        closing_write_failure_keeps_the_instance(base);
+        schema_marker_must_be_canonical(base);
+        ambiguous_closing_state_is_not_reverted(base);
+        ambiguous_closing_retry_restores_the_drain(base);
+        cleanup_failure_keeps_the_closing_reservation(base);
+        cleanup_failure_after_ack_is_retryable(base);
+        runtime_projection_survives_repeated_observation(base);
+        recovery_fences_the_adopted_selection(base);
+        ambiguous_archive_is_fenced_from_the_durable_image(base);
         std::cout << "PASS inventory store: A04 empty-binding upsert idempotency, "
-                     "A19 legacy restore and manual migration, A20 resumable "
-                     "migration, quarantine and stale-generation rejection, A21 "
+                     "A19 old-schema rejection without migration or deletion, "
+                     "A19 canonical schema marker, A20 idempotent rejection and "
+                     "live-generation conflict, A21 "
                      "durable-write failure handling and no ID reuse, A24 "
-                     "durable closing state, A25 suspect replay filter, A26 "
-                     "member semantics (unknown vs confirmed empty), A29 batch "
+                     "durable closing state, A24 ambiguous closing write and "
+                     "missing-drain recovery, A24 cleanup ordering and retry "
+                     "after the ack, A25 suspect replay filter, A26 "
+                     "member semantics (unknown vs confirmed empty), A29 "
                      "registration parity, A26 max-ID exhaustion across restart, "
                      "A11 runtime state across later durable writes, A12 archive "
-                     "leaves no active row\n";
+                     "leaves no active row, A05 runtime projection across "
+                     "republication, A21 recovery fences the adopted selection, "
+                     "A24 ambiguous archive recovery fences the durable history "
+                     "image, "
+                     "schema-3 single-row intent and closing-sync failure safety\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

@@ -19,6 +19,7 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,36 @@ struct CgroupMembership {
 using ProcessLivenessProbe = std::function<LivenessResult(const ProcessIdentity&)>;
 using CgroupMembershipProbe = std::function<CgroupMembership(const std::string&)>;
 
-// Production probes over a (possibly fake) procfs/cgroup tree.
-ProcessLivenessProbe make_proc_liveness_probe(const std::string& proc_root = "/proc");
+// Field 22 of <proc_root>/<pid>/stat (start time in clock ticks), or nullopt
+// when it cannot be read.  Used to bind a numeric PID to the process that holds
+// it now (manual registration, kernel FORK event): a bare number is not an
+// execution identity.
+std::optional<std::uint64_t> read_process_start_ticks(pid_t pid,
+                                                      const std::string& proc_root = "/proc");
+
+// The boot id this host runs under, or empty when it cannot be read.  One
+// implementation for the store, the probes and the admission boundary: a saved
+// identity is only replayable when its boot id equals this one.
+std::string read_boot_id();
+
+// Production probes over a (possibly fake) procfs/cgroup tree.  The process
+// probe also rejects a COMPLETE saved identity whose boot id differs from
+// `boot_id` (read once, at factory time, when the argument is empty); a
+// bootless identity stays an existence probe, because "pid exists" is not the
+// same claim as "this saved execution is live".
+ProcessLivenessProbe make_proc_liveness_probe(const std::string& proc_root = "/proc",
+                                              std::string boot_id = {});
 CgroupMembershipProbe make_cgroup_membership_probe();
+
+// Positive verification of a SAVED ProcessIdentity against this host.  This is
+// the only rule an admission/seeding decision may use:
+//   * Alive   -- the probe finds the same live process AND both boot ids are
+//                known and equal;
+//   * Dead    -- the probe finds it gone/reused, or the saved boot id names a
+//                different boot (positive proof this is another execution);
+//   * Unknown -- the probe could not read the process, or the boot identity of
+//                one side is unavailable.  Unknown is never "verified" and
+//                never death evidence.
+LivenessResult verify_process_identity(const ProcessIdentity& identity,
+                                       const std::string& current_boot_id,
+                                       const ProcessLivenessProbe& probe);

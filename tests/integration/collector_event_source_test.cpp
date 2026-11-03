@@ -847,6 +847,11 @@ void run(const std::string& base)
     WriterManager::instance().registerWriter<CaptureWriter>("CaptureWriter");
 
     auto& scheduler = CollectorScheduler::instance();
+    // Composition (the same wiring the service root performs): the scheduler is
+    // the sole actual, the registry its desired-state source and drain sink.
+    JobRegistry& registry = JobRegistry::instance();
+    scheduler.attach(&registry, &registry);
+    registry.setCollectionRuntime(&scheduler);
     scheduler.start();
 
     // ------------------------------------------------------------------

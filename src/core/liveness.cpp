@@ -19,6 +19,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
 #include <sstream>
 #include <unistd.h>
 
@@ -90,9 +91,27 @@ const char* to_string(LivenessState state)
     return "unknown";
 }
 
-ProcessLivenessProbe make_proc_liveness_probe(const std::string& proc_root)
+std::optional<std::uint64_t> read_process_start_ticks(pid_t pid, const std::string& proc_root)
 {
-    return [proc_root](const ProcessIdentity& identity) -> LivenessResult {
+    if (pid <= 0) return std::nullopt;
+    std::uint64_t ticks = 0;
+    if (read_start_ticks_raw(proc_root, pid, ticks) != StatRead::Ok) return std::nullopt;
+    return ticks;
+}
+
+std::string read_boot_id()
+{
+    std::ifstream input("/proc/sys/kernel/random/boot_id");
+    std::string value;
+    if (input && std::getline(input, value)) return value;
+    return {};
+}
+
+ProcessLivenessProbe make_proc_liveness_probe(const std::string& proc_root,
+                                              std::string boot_id)
+{
+    if (boot_id.empty()) boot_id = read_boot_id();
+    return [proc_root, boot_id](const ProcessIdentity& identity) -> LivenessResult {
         if (identity.pid <= 0) {
             return LivenessResult{LivenessState::Dead, "no pid"};
         }
@@ -116,8 +135,34 @@ ProcessLivenessProbe make_proc_liveness_probe(const std::string& proc_root)
             // execution is gone even though the number is alive.
             return LivenessResult{LivenessState::Dead, "pid reused (start ticks differ)"};
         }
+        if (!identity.boot_id.empty() && !boot_id.empty() && identity.boot_id != boot_id) {
+            // Same number and ticks, different boot: positive proof that the
+            // saved identity names another execution.
+            return LivenessResult{LivenessState::Dead, "identity belongs to another boot"};
+        }
         return LivenessResult{LivenessState::Alive, "pid live"};
     };
+}
+
+LivenessResult verify_process_identity(const ProcessIdentity& identity,
+                                       const std::string& current_boot_id,
+                                       const ProcessLivenessProbe& probe)
+{
+    if (identity.pid <= 0) return LivenessResult{LivenessState::Dead, "no pid"};
+    if (!identity.boot_id.empty() && !current_boot_id.empty() &&
+        identity.boot_id != current_boot_id) {
+        return LivenessResult{LivenessState::Dead, "identity belongs to another boot"};
+    }
+    const LivenessResult probed = probe ? probe(identity) : LivenessResult{};
+    if (probed.state != LivenessState::Alive) return probed;
+    if (identity.boot_id.empty() || current_boot_id.empty()) {
+        // The probe (possibly an injected test double) can only prove "this pid
+        // is live", not "this saved execution is live": a boot identity is
+        // missing on one side. Verified Alive requires positive boot equality.
+        return LivenessResult{LivenessState::Unknown,
+                              "boot identity unavailable; cannot positively verify"};
+    }
+    return probed;
 }
 
 CgroupMembershipProbe make_cgroup_membership_probe()

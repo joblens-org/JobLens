@@ -23,10 +23,11 @@
  */
 #include "common/config.hpp"
 #include "core/inventory_status_provider.hpp"
-#include "core/job_collection_manager.hpp"
 #include "core/job_registry.hpp"
 #include "job_fixture.h"
+#include "collection_runtime_fixture.hpp"
 #include "job_fixture.h"
+#include "collection_runtime_fixture.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -209,32 +210,32 @@ void run(const std::string& base)
         const auto created = registry.upsertObservedJob(observation);
         check(created.ok && created.disposition == UpsertDisposition::Created,
               "auto policy: the instance must be created");
-        const auto binding = registry.bindingRecord(created.internal_id);
-        check(binding.mode == CollectionMode::Auto,
+        const auto binding = registry.selectionRecord(created.internal_id);
+        check(binding.mode() == CollectionMode::Auto,
               "auto policy: the selection must be automatic");
-        check(binding.auto_collectors.size() == 2 &&
-                  binding.auto_collectors[0] == "cpumem_collector",
+        check(binding.automatic.has_value() && binding.automatic->size() == 2 &&
+                  binding.automatic->front() == "cpumem_collector",
               "auto policy: defaults mode must add every configured collector");
-        check(binding.effectiveCollectors() == binding.auto_collectors,
+        check(binding.effectiveCollectors() == *binding.automatic,
               "auto policy: without a manual override the defaults are effective");
-        check(binding.policy_revision == "defaults",
+        check(binding.automatic_source == "defaults",
               "auto policy: the revision must identify the defaults source");
         check(registry.findJob(created.internal_id)->CollectorNames.size() == 2,
               "auto policy: the derived snapshot must follow the selection");
 
         // A manual override keeps winning over the automatic decision.
-        JobCollectionManager manager(registry);
-        manager.setCollectorValidator([](const std::string& name) {
+                registry.setCollectorValidator([](const std::string& name) {
             return name == "cpumem_collector" || name == "io_collector";
         });
         CollectionRequest stop;
         stop.targets = {created.internal_id};
         stop.collectors = std::vector<std::string>{};
-        check(manager.setCollectors(stop).ok, "auto policy: manual stop must be accepted");
+        check(registry.setCollectors(stop).ok, "auto policy: manual stop must be accepted");
         const auto second = registry.upsertObservedJob(observation);
         check(second.ok, "auto policy: a repeated observation must succeed");
-        const auto after = registry.bindingRecord(created.internal_id);
-        check(after.mode == CollectionMode::Manual && after.manual_collectors.empty(),
+        const auto after = registry.selectionRecord(created.internal_id);
+        check(after.mode() == CollectionMode::Manual && after.manual.has_value() &&
+                  after.manual->empty(),
               "auto policy: the manual override must survive re-registration");
         check(registry.deinit(), "auto policy: deinit after defaults");
     }
@@ -264,8 +265,8 @@ void run(const std::string& base)
         const auto created = registry.upsertObservedJob(observation);
         check(created.ok && created.disposition == UpsertDisposition::Created,
               "incomplete generation: the instance must still be inventoried");
-        check(registry.bindingRecord(created.internal_id).revision == 0 &&
-                  registry.bindingRecord(created.internal_id).effectiveCollectors().empty(),
+        check(!registry.selectionRecord(created.internal_id).automatic.has_value() &&
+                  registry.selectionRecord(created.internal_id).effectiveCollectors().empty(),
               "incomplete generation: an unverified execution must not be auto-collected");
         check(registry.findJob(created.internal_id)->CollectorNames.empty(),
               "incomplete generation: no collector may reach the derived snapshot");
@@ -277,8 +278,8 @@ void run(const std::string& base)
         const auto updated = registry.upsertObservedJob(completed);
         check(updated.ok && updated.disposition == UpsertDisposition::Updated,
               "incomplete generation: the completing observation must update the record");
-        const auto binding = registry.bindingRecord(created.internal_id);
-        check(binding.revision == 1 && binding.effectiveCollectors().size() == 2,
+        const auto binding = registry.selectionRecord(created.internal_id);
+        check(binding.automatic.has_value() && binding.effectiveCollectors().size() == 2,
               "incomplete generation: the completed generation must trigger the "
               "automatic selection");
         check(registry.findJob(created.internal_id)->CollectorNames.size() == 2,
@@ -361,9 +362,9 @@ void run(const std::string& base)
         check(failed.retry_registration() == false,
               "an intent failure is repaired by record state, never by re-reading metadata");
         {
-            const auto binding = registry.bindingRecord(failed.internal_id);
-            check(binding.revision == 0,
-                  "a failed intent must leave the binding revision at zero");
+            const auto binding = registry.selectionRecord(failed.internal_id);
+            check(!binding.automatic.has_value(),
+                  "a failed intent must leave the automatic decision unrecorded");
             check(registry.inventoryRecord(failed.internal_id).has_value(),
                   "the instance must stay inventoried");
         }
@@ -375,8 +376,8 @@ void run(const std::string& base)
               "the repair must converge on the same instance");
         check(repaired.intent_committed.has_value() && *repaired.intent_committed,
               "the repeated registration must commit the initial decision");
-        check(registry.bindingRecord(failed.internal_id).revision > 0,
-              "the repaired binding must be durable");
+        check(registry.selectionRecord(failed.internal_id).automatic.has_value(),
+              "the repaired automatic decision must be durable");
         registry.deinit();
     }
 
@@ -402,32 +403,32 @@ void run(const std::string& base)
         job.subtype = JobSubType::Condor;
 
         registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite, /*skip=*/1);
-        const auto failed = registry.registerDiscoveredJobs({job});
-        check(failed.size() == 1 && failed[0].ok,
-              "the batch facts must stay durable when only the intent write fails");
-        check(failed[0].intent_committed.has_value() && !*failed[0].intent_committed,
-              "the batch entry must report the missing initial decision");
-        check(failed[0].code == RegistrationError::InitialIntentWriteFailed,
-              "the batch entry must carry the typed intent failure");
+        const auto failed = registry.upsertObservedJob(job);
+        check(failed.ok,
+              "the facts must stay durable when only the intent write fails");
+        check(failed.intent_committed.has_value() && !*failed.intent_committed,
+              "the registration must report the missing initial decision");
+        check(failed.code == RegistrationError::InitialIntentWriteFailed,
+              "the registration must carry the typed intent failure");
 
         registry.clearStoreFaultsForTest();
-        const auto repaired = registry.registerDiscoveredJobs({job});
-        check(repaired.size() == 1 && repaired[0].ok, "the repeated batch must succeed");
-        check(repaired[0].intent_committed.has_value() && *repaired[0].intent_committed,
-              "a repeated batch registration must repair the initial decision");
+        const auto repaired = registry.upsertObservedJob(job);
+        check(repaired.ok, "the repeated registration must succeed");
+        check(repaired.intent_committed.has_value() && *repaired.intent_committed,
+              "a repeated registration must repair the initial decision");
 
         // Same obligation, driven by a maintenance pass with no new observation.
         Job job2 = discovered_job(selector, generation, {ProcessIdentity{4646, 930000, "boot"}},
                                   true);
         job2.NativeJobID = "731.0";
         registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite, /*skip=*/1);
-        const auto failed2 = registry.registerDiscoveredJobs({job2});
-        check(failed2[0].ok && !*failed2[0].intent_committed,
+        const auto failed2 = registry.upsertObservedJob(job2);
+        check(failed2.ok && !*failed2.intent_committed,
               "the second instance must start without a decision");
         registry.clearStoreFaultsForTest();
         registry.runInventoryPass(false);
-        const auto repaired2 = registry.bindingRecord(failed2[0].internal_id);
-        check(repaired2.revision > 0,
+        const auto repaired2 = registry.selectionRecord(failed2.internal_id);
+        check(repaired2.automatic.has_value(),
               "a maintenance pass must repair the missing initial decision");
         registry.deinit();
     }

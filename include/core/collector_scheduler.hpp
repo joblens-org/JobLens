@@ -24,6 +24,9 @@
 #include <string>
 #include <unordered_map>
 #include <optional>
+#include <set>
+#include <map>
+#include <condition_variable>
 #include <fmt/core.h>
 #include <fmt/chrono.h>
 #include <date/date.h>
@@ -39,8 +42,13 @@
 
 #include "job_lifecycle_event.h"
 #include "core/collector_runtime.hpp"
+#include "core/collection_runtime.hpp"
 
-class CollectorScheduler {
+// The collection runtime: the SOLE owner of the actual attach state. It pulls
+// desired state from the registry through IJobRecordSource and reports a
+// completed stop through IDrainCompletionSink; the registry never mirrors what
+// is attached and never calls into a collector lane.
+class CollectorScheduler : public ICollectionRuntime {
 public:
     ~CollectorScheduler();
 
@@ -51,10 +59,22 @@ public:
     CollectorScheduler& operator=(CollectorScheduler&&)      = default;
 
 
+    // Composition: the desired-state source and the drain-completion sink are
+    // injected once, before start(). No singleton reverse read is used after
+    // this call.
+    void attach(IJobRecordSource* source, IDrainCompletionSink* sink);
     void start();
     void shutdown();
-    
+
     nlohmann::json snapshot();
+
+    // ICollectionRuntime -----------------------------------------------------
+    // Coalesced reconcile request. Never blocks and never runs a collector.
+    void wake() override;
+    // Release every collector for one instance and prove the accepted tail is
+    // produced. True = the runtime owns the drain and will call onDrained().
+    bool beginDrain(uint64_t internal_id) override;
+    ActualCollectionState actual(uint64_t internal_id) override;
 
     static CollectorScheduler& instance();
 
@@ -68,7 +88,7 @@ private:
 
     struct collector_state{
         std::vector<size_t> jobid_list;
-        std::mutex              m_;
+        mutable std::mutex      m_;
         size_t task_id = 0;
         std::atomic<bool>        running{false};
         bool initialized = false;
@@ -90,8 +110,18 @@ private:
         std::unordered_map<uint64_t, uint64_t> job_generations;
         std::unordered_map<uint64_t, uint64_t> job_generation_counter;
 
-        // Protected by m_.
-        std::vector<uint64_t> pending_close;
+        // One deferred removal. It names the attachment whose accepted tail is
+        // still being produced: the attach token rejects a completion from an
+        // older attachment, and the snapshot generation proves the snapshot
+        // being released is still the one this close captured. A newer
+        // attachment never inherits the old close. Guarded by the collector
+        // state mutex, like every other membership field.
+        struct PendingClose {
+            uint64_t job_id = 0;
+            uint64_t token = 0;
+            uint64_t generation = 0;
+        };
+        std::vector<PendingClose> pending_close;
         std::vector<size_t> sweep_jobs;
         size_t sweep_cursor = 0;
         bool sweep_active = false;
@@ -145,6 +175,9 @@ private:
     void registerCollectFuncs();
     void addJobCollect(const Job& job);
     void rmJobCollect(const Job& job);
+    // Caller holds m_. Returns the instances whose drain completed and whose
+    // completion must be delivered after m_ is released.
+    std::vector<uint64_t> rmJobCollectLocked(const Job& job);
     void updateJobCollect(const Job& job);
     // Reconciles the scheduler's job -> collector membership with the registry's
     // intent and reports which collectors really hold the job. Installed as the
@@ -154,7 +187,11 @@ private:
     bool applyJobBinding(const Job& job, std::vector<std::string>& applied,
                          std::string& error);
     // Caller holds m_.
-    void startCollector(std::string collector);
+    bool applyJobBindingLocked(const Job& job, std::vector<std::string>& applied,
+                               std::string& error);
+    // Caller holds m_. Returns false when the collector could not be
+    // initialized/started, so the caller must not claim an attachment.
+    bool startCollector(std::string collector);
     std::shared_ptr<CollectorLaneContext> createLane(const std::string& name,
                                               const collector_info& info,
                                               collector_state& state);
@@ -199,11 +236,33 @@ private:
                             const CollectInvocation& result, const OutputContext& output,
                             CollectorRuntime::Operation& callback);
     void stopCollectorInstance(CollectorLaneContext& lane);
-    void finalizePendingRemovals(CollectorLaneContext& lane);
-    void recordRemovalAck(uint64_t jobID);
+    // Releases one lane's timer, executor slot, collector instance and staged
+    // registrar. Takes no lock: a failed start runs it while its caller still
+    // holds the lane state mutex, so it must never enter the stop/accounting
+    // protocol (finalizePendingRemovals locks that same mutex).
+    // release_partial_init: a start that threw may have allocated in its init
+    // before failing, so deinit must run even though `initialized` is false —
+    // the same contract the initializeCollector()==false paths follow.
+    void teardownCollectorLane(CollectorLaneContext& lane,
+                               bool release_partial_init = false);
+    std::vector<uint64_t> finalizePendingRemovals(CollectorLaneContext& lane);
+    // Returns true when this acknowledgement completed the drain for that
+    // attachment. A token that no longer names the pending drain is stale and
+    // changes nothing.
+    bool recordRemovalAck(uint64_t jobID, uint64_t token);
+    // Reconcile worker: converge to the records the registry publishes.
+    void reconcileLoop();
+    void reconcileOnce();
+    void notifyDrained(const std::vector<uint64_t>& internal_ids);
+    // Attach bookkeeping: a reattach of the same instance gets a strictly
+    // greater token. Caller holds m_.
+    uint64_t nextAttachToken(uint64_t internal_id);
     void stopAllCollectors();
-    /// 挂载 Job 到采集器；返回 true 表示这是一次新的挂载（已触发 on_job_added）
-    bool addJob2Collector(const Job& job, const std::string& collector);
+    /// 挂载 Job 到采集器；返回 true 表示这是一次新的、已成功运行的挂载。
+    /// A failed start rolls the membership back so the next reconcile retries
+    /// init instead of deduplicating against a dead attachment.
+    bool addJob2Collector(const Job& job, const std::string& collector,
+                          std::string* error = nullptr);
     /// 从采集器摘除 Job；返回 true 表示 Removed 钩子被延后到 event lane。
     /// 调用方需持有 state.m_ 以及 m_。
     bool detachJobFromCollector(const std::string& collector_name, collector_state& state,
@@ -226,11 +285,35 @@ private:
     std::mutex              m_;
     std::mutex shutdown_mutex_;
     std::mutex removal_m_;
+    // An accepted drain: how many bound collectors still owe an acknowledgement.
     std::unordered_map<uint64_t, size_t> removal_pending_;
+    // The attach token the pending drain belongs to. A completion carrying any
+    // other token is stale and must not complete a newer attachment.
+    std::unordered_map<uint64_t, uint64_t> drain_tokens_;
+    // Instances whose drain was accepted and whose completion is pending.
+    std::set<uint64_t> draining_;
+    // Monotonic attach tokens (never reused) and the live token per instance.
+    uint64_t attach_token_seq_ = 0;
+    std::unordered_map<uint64_t, uint64_t> attach_tokens_;
+    // Last record revision each attachment converged to (actual-state report).
+    std::unordered_map<uint64_t, uint64_t> attach_revisions_;
+    // The last application failure per instance, cleared on convergence.
+    std::unordered_map<uint64_t, std::string> attach_errors_;
+    // Last System-scope notification projection per record (job + its
+    // serialized form). Notification bookkeeping only: never an authoritative
+    // state, never an attachment.
+    std::map<uint64_t, std::pair<Job, std::string>> system_projection_;
     std::unordered_map<std::string, collector_info> collector_info_dict;
     std::unordered_map<std::string, collector_state> collector_state_dict;
+    // Injected composition seam. Set once before start(); read afterwards.
+    IJobRecordSource* record_source_ = nullptr;
+    IDrainCompletionSink* drain_sink_ = nullptr;
+    std::thread reconcile_thread_;
+    std::mutex reconcile_m_;
+    std::condition_variable reconcile_cv_;
+    bool reconcile_requested_ = false;
+    bool reconcile_stopping_ = false;
+    std::chrono::milliseconds reconcile_interval_{1000};
     double default_freq;
     bool                    running_ = false;
-    // Cleared on shutdown so the registry never calls a destroyed scheduler.
-    bool                    collection_applier_installed_ = false;
 };

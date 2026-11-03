@@ -133,11 +133,17 @@ bool already_running() {
 
 void onBecomeService() {
     spdlog::info("Main: app start as service mode.");
-    // The registry constructor is the single assembly point (plan 5.1): it
-    // opens the store, starts inventory discovery and maintenance (initial
-    // scan included) before any collector can subscribe.
-    JobRegistry::instance();
-    CollectorScheduler::instance().start();
+    // The registry constructor is the single assembly point for durable state:
+    // it opens the store, creates the kernel namespace and starts inventory
+    // discovery and maintenance (initial scan included).
+    JobRegistry& registry = JobRegistry::instance();
+    // Explicit ownership seam: the scheduler pulls desired state from the
+    // registry and reports a completed drain back to it. Neither side reaches
+    // for the other's singleton after this wiring.
+    CollectorScheduler& scheduler = CollectorScheduler::instance();
+    scheduler.attach(&registry, &registry);
+    registry.setCollectionRuntime(&scheduler);
+    scheduler.start();
 }
 
 int version() {

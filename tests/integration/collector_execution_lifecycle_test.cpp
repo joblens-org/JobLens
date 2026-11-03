@@ -16,9 +16,9 @@
 #include "core/collector_execution_context.hpp"
 #include "core/collector_registry.hpp"
 #include "core/collector_scheduler.hpp"
-#include "core/job_collection_manager.hpp"
 #include "core/job_registry.hpp"
 #include "job_fixture.h"
+#include "collection_runtime_fixture.hpp"
 #include "core/writer_manager.hpp"
 #include "writer/base_writer.hpp"
 
@@ -357,9 +357,19 @@ void run(const std::string& base)
     auto& server = RPCServer::instance(socket_path);
     (void)server;
     Config::instance(base + ".yaml");
+    // This suite exercises collector execution, not kernel ownership, and the
+    // test environment has no BPF privileges. Use the documented test seam so
+    // an unavailable kernel attribution does not block retirement/archive.
+    JobRegistry::instance().setKernelCleanupForTest(
+        [](uint64_t, const Job&, std::string&) { return true; });
     WriterManager::instance().registerWriter<CaptureWriter>("CaptureWriter");
 
     auto& scheduler = CollectorScheduler::instance();
+    // Composition: the runtime pulls desired state from the registry and
+    // reports drain completion back to it. There is no implicit registration.
+    JobRegistry& registry = JobRegistry::instance();
+    scheduler.attach(&registry, &registry);
+    registry.setCollectionRuntime(&scheduler);
     scheduler.start();
 
     // System periodic runs with zero Jobs and System event uses Job 0.
@@ -440,8 +450,7 @@ void run(const std::string& base)
     // committed binding must attach the lane and report itself as applied; a
     // persistent stop must detach it; retirement must still acknowledge.
     // ---------------------------------------------------------------------
-    JobCollectionManager collection(JobRegistry::instance());
-    collection.setCollectorValidator([](const std::string& name) {
+    JobRegistry::instance().setCollectorValidator([](const std::string& name) {
         return name == "job_event" || name == "job_periodic";
     });
 
@@ -474,20 +483,24 @@ void run(const std::string& base)
     CollectionRequest bind;
     bind.targets = {bound.internal_id};
     bind.collectors = std::vector<std::string>{"job_event"};
-    const auto bound_outcome = collection.setCollectors(bind);
+    const auto bound_outcome = JobRegistry::instance().setCollectors(bind);
     check(bound_outcome.ok, "set must be accepted: " + bound_outcome.message);
     const auto& target = bound_outcome.targets.front();
-    check(target.binding.revision == 1, "first binding is revision 1");
-    check(target.applied.applied,
-          "binding must be applied by the runtime, got: " + target.applied.error);
-    check(target.applied.collectors == std::vector<std::string>{"job_event"},
-          "applied collectors must name the attached lane");
-    check(target.applied.revision == target.binding.revision,
-          "applied revision must match the committed revision");
-    check(FakeJobEvent::added.load() > added_before_bind,
-          "on_job_added must run when intent attaches a lane");
-    check(collector_status(scheduler, "job_event").at("job_count").get<size_t>() == 1,
-          "the lane must hold exactly the bound instance");
+    check(target.revision > 0, "the accepted revision must be committed");
+    check(!target.actual.tracked,
+          "a command must not claim an attachment before the runtime converges");
+    eventually([&] {
+        return FakeJobEvent::added.load() > added_before_bind &&
+               collector_status(scheduler, "job_event").at("job_count").get<size_t>() == 1;
+    }, "on_job_added must run when the runtime attaches the lane");
+    const auto attached = JobRegistry::instance().actualCollection(bound.internal_id);
+    check(attached.tracked &&
+              attached.collectors == std::vector<std::string>{"job_event"},
+          "actual collectors must name the attached lane");
+    const auto attached_record = JobRegistry::instance().inventoryRecord(bound.internal_id);
+    check(attached_record.has_value() &&
+              attached.last_revision == attached_record->revision,
+          "the actual state must name the record revision it converged to");
 
     // The bound instance produces events through the existing source.
     FakeJobEvent::extra_job_id.store(bound.internal_id);
@@ -501,15 +514,14 @@ void run(const std::string& base)
     CollectionRequest stop;
     stop.targets = {bound.internal_id};
     stop.collectors = std::vector<std::string>{};
-    const auto stopped = collection.setCollectors(stop);
+    const auto stopped = JobRegistry::instance().setCollectors(stop);
     check(stopped.ok, "stop must be accepted: " + stopped.message);
-    check(stopped.targets.front().applied.applied, "stop must be applied");
-    check(stopped.targets.front().applied.collectors.empty(),
+    eventually([&] {
+        return FakeJobEvent::removed.load() > removed_before_stop &&
+               collector_status(scheduler, "job_event").at("job_count").get<size_t>() == 0;
+    }, "on_job_removed must run when a stop detaches the lane");
+    check(JobRegistry::instance().actualCollection(bound.internal_id).collectors.empty(),
           "nothing may remain applied after a persistent stop");
-    check(FakeJobEvent::removed.load() > removed_before_stop,
-          "on_job_removed must run when a stop detaches the lane");
-    check(collector_status(scheduler, "job_event").at("job_count").get<size_t>() == 0,
-          "the stopped instance must leave the lane");
     check(JobRegistry::instance().findJob(bound.internal_id).has_value(),
           "stopping collection must keep the inventory record");
 
@@ -525,7 +537,7 @@ void run(const std::string& base)
     CollectionRequest bind_two;
     bind_two.targets = {bound_two.internal_id};
     bind_two.collectors = std::vector<std::string>{"job_event"};
-    check(collection.setCollectors(bind_two).ok, "second bind");
+    check(JobRegistry::instance().setCollectors(bind_two).ok, "second bind");
     const int removed_before_retire = FakeJobEvent::removed.load();
     check(JobRegistry::instance().retireInstance(bound_two.internal_id),
           "retire the bound instance");
