@@ -75,7 +75,9 @@ public:
 private:
     bool start_polling();
     void poll_loop();
-    void emit_observations(const ScanResult& result);
+    // The source's own periodic scan registers its Jobs synchronously through
+    // the on_job sink, exactly like exec events (no queue, no worker).
+    void register_scan_jobs(const ScanResult& result);
     // An exec event is handled on the polling thread: resolve the pid, offer
     // the built Job to this turn's batch, and remember the pid when the
     // scheduler metadata is not ready yet (bounded re-read, plan §6.3).
@@ -373,7 +375,7 @@ inline void CondorJobWatcher::poll_loop()
         if (options_.scan_interval_ms > 0) {
             const auto now = std::chrono::steady_clock::now();
             if (now >= next_scan) {
-                emit_observations(scan());
+                register_scan_jobs(scan());
                 next_scan = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(options_.scan_interval_ms);
             }
@@ -381,21 +383,29 @@ inline void CondorJobWatcher::poll_loop()
     }
 }
 
-inline void CondorJobWatcher::emit_observations(const ScanResult& result)
+inline void CondorJobWatcher::register_scan_jobs(const ScanResult& result)
 {
-    ObservationSink sink;
+    JobSink sink;
     {
         std::lock_guard<std::mutex> lock(life_mutex_);
-        sink = sink_.on_observation;
+        sink = sink_.on_job;
     }
     if (!sink) return;
     for (const auto& job : result.jobs) {
         // The sink is caller-owned code on the polling thread: a throwing
         // consumer must not take the discovery adapter down with it.
         try {
-            sink(job);
+            const UpsertResult registered = sink(job);
+            // A facts/metadata failure asks the maintenance pass to look
+            // again; a post-commit failure is repaired from record state.
+            if (!registered.ok && registered.retry_registration()) {
+                requestRescan();
+                return;
+            }
         } catch (const std::exception& error) {
-            spdlog::error("CondorJobWatcher: discovery sink failed: {}", error.what());
+            spdlog::error("CondorJobWatcher: registration sink failed: {}", error.what());
+            requestRescan();
+            return;
         }
     }
 }

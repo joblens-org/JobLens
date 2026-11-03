@@ -386,7 +386,6 @@ constexpr std::size_t kIngestRetryCapacity = 256;
 // written yet at exec time. Sub-second retries cover the race; the ladder's
 // exhaustion hands the pid to one coalesced authoritative rescan.
 constexpr int kExecRetryDelaysMs[] = {5, 25, 100, 500};
-constexpr std::size_t kHintQueueCapacity = 512;
 constexpr std::uint32_t kWaitSliceMs = 100;
 }  // namespace
 
@@ -400,40 +399,16 @@ void JobRegistry::noteHeartbeatError(const std::string& error) {
     hb_last_error_ = error;
 }
 
-void JobRegistry::enqueueHint(HeartbeatHint hint) {
-    bool overflow = false;
+void JobRegistry::notifyExit(pid_t pid) {
+    // Exit evidence is coalesced into one authoritative pass request: the
+    // cheap-and-bounded rule the queued hint used to provide, without a
+    // queue. The heartbeat cooldown still limits forced scans.
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         ++hb_events_received_;
-        if (!hb_admitted_ || hb_stopping_) {
-            ++hb_events_dropped_;
-            return;
-        }
-        if (hints_.size() >= kHintQueueCapacity) {
-            ++hb_events_dropped_;
-            overflow = true;
-        } else {
-            hints_.push_back(std::move(hint));
-            hint_wakeup_ = true;
-        }
     }
-    if (overflow) {
-        // Bounded queue: the producer is never blocked; the drop is counted,
-        // the heartbeat degrades and an authoritative rescan repairs whatever
-        // the dropped hint would have refreshed.
-        noteHeartbeatError("invariant hint queue overflow; awaiting authoritative rescan");
-        spdlog::warn("JobRegistry: hint queue full, dropping event; requesting a rescan");
-        requestRescan("hint queue overflow");
-        return;
-    }
-    hb_cv_.notify_one();
-}
-
-void JobRegistry::notifyExit(pid_t pid) {
-    HeartbeatHint hint;
-    hint.kind = HeartbeatHint::Kind::Exit;
-    hint.pid = pid;
-    enqueueHint(std::move(hint));
+    (void)pid;
+    requestRescan("exit hint");
 }
 
 void JobRegistry::requestRescan(const std::string& reason) {
@@ -465,14 +440,6 @@ bool JobRegistry::rescanRequested() const {
         }
     }
     return false;
-}
-
-void JobRegistry::drainHints(std::deque<HeartbeatHint>& out) {
-    std::lock_guard<std::mutex> lock(hb_mtx_);
-    while (!hints_.empty()) {
-        out.push_back(std::move(hints_.front()));
-        hints_.pop_front();
-    }
 }
 
 void JobRegistry::processObservation(const Job& job, std::set<uint64_t>& observed) {
@@ -832,26 +799,11 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
         }
     }
 
-    std::deque<HeartbeatHint> hints;
-    drainHints(hints);
-    bool needs_authoritative_pass = false;
-    for (auto& hint : hints) {
-        if (hint.kind == HeartbeatHint::Kind::Observation) {
-            processObservation(hint.job, observed);
-        } else {
-            // Exit/refresh hints are cheap by design: they ask for one
-            // coalesced authoritative pass instead of doing discovery I/O on
-            // the producing callback.
-            needs_authoritative_pass = true;
-        }
-    }
-    if (needs_authoritative_pass) requestRescan("process/attribute hint");
-
     // Automatic policy is synchronous with registration; there is no deferred
     // backlog to drain here (plan §1.1.3).
 
-    // Exec hints never reach this pass: the source resolves them on its own
-    // poll thread and registers the resulting Job synchronously.
+    // Exec events and the sources' own scans never reach this pass: they
+    // register synchronously on their producing threads through on_job.
 
     // Records no discovery source owns (legacy/manual registrations, or types
     // whose inventory source was removed) are refreshed here; reads never do.
@@ -896,12 +848,6 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
     // a drain still awaiting its ack is left to the collector runtime.
     reconcileClosingRemovals();
 
-    {
-        std::lock_guard<std::mutex> lock(hb_mtx_);
-        // Only clear the wake-up when this pass consumed everything; a hint
-        // that arrived after the drain must wake the next slice.
-        if (hints_.empty()) hint_wakeup_ = false;
-    }
     return true;
 }
 
@@ -946,7 +892,7 @@ void JobRegistry::heartbeatLoop() {
             lock.unlock();
             rescan = rescanRequested();
             lock.lock();
-            if ((!rescan && !hint_wakeup_) || hb_stopping_) continue;
+            if (!rescan || hb_stopping_) continue;
         }
 
         lock.unlock();
@@ -972,8 +918,8 @@ void JobRegistry::heartbeatLoop() {
         }
         lock.lock();
         // A pass already in flight (an explicit reconcile, for example) owns
-        // the queued hints; retry on the next slice.
-        if (!executed) hint_wakeup_ = true;
+        // the discovery reads; retry on the next slice (the wait is
+        // slice-bounded, so no wake flag is needed).
     }
 }
 
@@ -985,14 +931,10 @@ void JobRegistry::startHeartbeat() {
 }
 
 void JobRegistry::installHeartbeatSink() {
-    // The sink entries are the same bounded producers tests and out-of-band
-    // callers use; adapters go through them too.
-    heartbeat_sink_.on_observation = [this](const Job& job) {
-        onDiscoveryObservation(job);
-    };
-    // Event path: the source hands one discovered Job over on its own
-    // poll thread and gets the registration result back. No worker, no queue,
-    // and no fsync on this path.
+    // The single registration entry every discovery path uses: exec events
+    // and the sources' own scans hand one discovered Job over on the source's
+    // poll thread and get the result back. No worker, no queue, no fsync on
+    // this path.
     heartbeat_sink_.on_job = [this](const Job& job) {
         {
             std::lock_guard<std::mutex> lock(hb_mtx_);
@@ -1033,12 +975,10 @@ void JobRegistry::init_inventory(const JobRegistryOptions& options)
         hb_admitted_ = true;
         hb_stopping_ = false;
         hb_running_ = false;
-        hint_wakeup_ = false;
         hb_wake_ = false;
         degraded_ = false;
         incomplete_drain_ = false;
         hb_last_error_.clear();
-        hints_.clear();
         absences_.clear();
         suspect_ids_.clear();
         ended_generations_.clear();
@@ -1248,21 +1188,10 @@ void JobRegistry::stopInventoryDiscovery() {
         }
     }
 
-    // "Finish queued bounded maintenance": accepted discoveries are committed
-    // while the store is still open, never silently discarded.
-    std::deque<HeartbeatHint> hints;
-    drainHints(hints);
-    std::set<uint64_t> observed;
-    for (auto& hint : hints) {
-        if (hint.kind == HeartbeatHint::Kind::Observation)
-            processObservation(hint.job, observed);
-    }
-    if (!hints.empty()) {
-        spdlog::info("JobRegistry: discovery stopped, {} buffered hint(s) completed",
-                     hints.size());
-    } else {
-        spdlog::info("JobRegistry: discovery stopped");
-    }
+    // Discovery registration is synchronous on the producing threads, so
+    // stopping the sources means no accepted work is left behind: there is no
+    // queue to drain and nothing buffered to finish.
+    spdlog::info("JobRegistry: discovery stopped");
 }
 
 
@@ -3456,13 +3385,6 @@ void JobRegistry::regRPCHandle() {
         });
 }
 
-void JobRegistry::onDiscoveryObservation(const Job& job) {
-    HeartbeatHint hint;
-    hint.kind = HeartbeatHint::Kind::Observation;
-    hint.job = job;
-    enqueueHint(std::move(hint));
-}
-
 nlohmann::json JobRegistry::heartbeatStatusJson() const {
     // Registry/store queries happen without holding the heartbeat mutex; they
     // take their own locks briefly and never re-enter here.
@@ -3473,14 +3395,12 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     std::vector<std::pair<uint64_t, ExecutionGeneration>> closing_ids;
     std::set<uint64_t> suspect_ids;
     std::uint64_t events_received = 0;
-    std::uint64_t events_dropped = 0;
     std::uint64_t rescan_requests = 0;
     std::uint64_t obsolete_hints = 0;
     std::uint64_t incomplete_observations = 0;
     std::uint64_t upsert_conflicts = 0;
     std::uint64_t retirements = 0;
     std::uint64_t passes = 0;
-    std::size_t queue_depth = 0;
     std::size_t exec_ingest_depth = 0;
     std::size_t policy_pending = 0;
     std::uint64_t policy_deferred_total = 0;
@@ -3497,14 +3417,12 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
         closing_ids = closing_generations_;
         suspect_ids = suspect_ids_;
         events_received = hb_events_received_;
-        events_dropped = hb_events_dropped_;
         rescan_requests = hb_rescan_requests_;
         obsolete_hints = hb_obsolete_hints_;
         incomplete_observations = hb_incomplete_observations_;
         upsert_conflicts = hb_upsert_conflicts_;
         retirements = hb_retirements_;
         passes = hb_passes_;
-        queue_depth = hints_.size();
         last_scan_start_ms = last_scan_start_ms_;        last_scan_success_ms = last_scan_success_ms_;
         last_scan_complete = last_scan_complete_;
         incomplete_drain = incomplete_drain_;
@@ -3512,8 +3430,9 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
         degraded = degraded_;
         last_error = hb_last_error_;
     }
-    // Deprecated: the exec ingest worker is gone (plan P4). The field stays for
-    // status compatibility and is always zero; a fake queue is not reported.
+    // Deprecated: the exec ingest worker and the observation hint queue are
+    // gone (plan P4). The keys stay for status compatibility and are always
+    // zero; a fake queue is not reported.
     (void)exec_ingest_depth;
     // The deferred-policy FIFO was removed with the experimental budget: the
     // keys stay for status compatibility and always report zero.
@@ -3589,8 +3508,8 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     out["incomplete_count"] = incomplete_count;
     out["quarantined_count"] = quarantined_count;
     out["events_received"] = events_received;
-    out["events_dropped"] = events_dropped;
-    out["queue_depth"] = queue_depth;
+    out["events_dropped"] = 0;   // no queue since P4: nothing is dropped
+    out["queue_depth"] = 0;   // no queue since P4
     out["exec_ingest_depth"] = exec_ingest_depth;
     out["policy_pending"] = policy_pending;
     out["policy_deferred_total"] = policy_deferred_total;

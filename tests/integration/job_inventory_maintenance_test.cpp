@@ -165,16 +165,16 @@ public:
         health_.state = SourceState::Degraded;
         health_.last_error = error;
     }
-    // Delivers one discovered Job through the installed sink (the producing
-    // thread; the callback only enqueues).
-    void inject(const Job& job)
+    // Registers one discovered Job through the installed sink, exactly like
+    // an exec event on the source's poll thread (synchronous, no queue).
+    UpsertResult inject(const Job& job)
     {
-        ObservationSink sink;
+        JobSink sink;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            sink = sink_.on_observation;
+            sink = sink_.on_job;
         }
-        if (sink) sink(job);
+        return sink ? sink(job) : UpsertResult{};
     }
 
     int starts() const { std::lock_guard<std::mutex> lock(mutex_); return starts_; }
@@ -718,13 +718,17 @@ void run_a11(const std::string& base)
     const Job job =
         make_condor_job("400.0", 5500, 888, "htcondor01", "schedd-a", "/cg/slot-5");
 
+    // Scan-driven injection: `scan_jobs` is what the next pass observes. The
+    // out-of-band producer entry is gone with the hint queue; the scan path
+    // is the honest equivalent (same admission, same bookkeeping).
+    std::vector<Job> scan_jobs;
     bool first = true;
     source.set_scan([&]() {
         if (first) {
             first = false;
             return scan_with({job});
         }
-        return scan_with({});
+        return scan_with(scan_jobs);
     });
 
     // EPERM on the manager probe: unknown, not death, even after two complete
@@ -741,7 +745,7 @@ void run_a11(const std::string& base)
     // is retried once the namespace resolves.
     const Job unresolved = make_unresolved_job("401.0", 5501);
     check(!discovery_job_ready(unresolved), "A11: fixture should be incomplete");
-    registry.onDiscoveryObservation(unresolved);
+    scan_jobs = {unresolved};
     registry.reconcileInventoryNow();
     check(!find_native(registry, "401.0").has_value(),
           "A11: an unresolved identity was indexed");
@@ -754,14 +758,14 @@ void run_a11(const std::string& base)
     // The manager is live; the empty scans must not retire it (absence is not
     // the subject of this case).
     probes.set_process(5501, LivenessState::Alive, 999);
-    registry.onDiscoveryObservation(resolved);
+    scan_jobs = {resolved};
     registry.reconcileInventoryNow();
     check(find_native(registry, "401.0").has_value(),
           "A11: a retried complete identity was not indexed");
     check(count_records(registry) == 2, "A11: retry duplicated or merged records");
 
-    // A namespace-less observation must never merge into another namespace.
-    registry.onDiscoveryObservation(make_unresolved_job("400.0", 5502));
+    // A namespace-less discovery must never merge into another namespace.
+    scan_jobs = {make_unresolved_job("400.0", 5502)};
     registry.reconcileInventoryNow();
     check(count_records(registry) == 2, "A11: an unresolved identity merged into a record");
 
@@ -769,7 +773,7 @@ void run_a11(const std::string& base)
     const Job other_cluster =
         make_condor_job("400.0", 5600, 1111, "htcondor02", "schedd-b", "/cg/slot-7");
     probes.set_process(5600, LivenessState::Alive, 1111);
-    registry.onDiscoveryObservation(other_cluster);
+    scan_jobs = {other_cluster};
     registry.reconcileInventoryNow();
     check(count_records(registry) == 3, "A11: namespaces merged");
     check(find_native(registry, "400.0", "htcondor02", "schedd-b").has_value(),
@@ -782,7 +786,8 @@ void run_a11(const std::string& base)
 }
 
 // ---------------------------------------------------------------------------
-// A12 - bounded queue overflow, degradation, rescan, repair
+// A12 - producer registration proceeds while a pass is in flight; nothing
+//       is queued, so nothing can be dropped
 // ---------------------------------------------------------------------------
 
 void run_a12(const std::string& base)
@@ -796,8 +801,10 @@ void run_a12(const std::string& base)
     const Job beta =
         make_condor_job("501.0", 5701, 1313, "htcondor01", "schedd-a", "/cg/slot-9");
 
-    // Block a pass inside the source scan, then overflow the queue from the
-    // producer side.
+    // Block a pass inside the source scan, then register from the producer
+    // side (the sink the poll thread would call). The old bounded queue with
+    // its drop accounting is gone; registration is synchronous and must
+    // neither block on the in-flight pass nor lose the discoveries.
     std::promise<void> scan_entered;
     std::promise<void> release_scan;
     auto gate = release_scan.get_future().share();
@@ -810,28 +817,30 @@ void run_a12(const std::string& base)
     std::thread reconciler([&]() { registry.reconcileInventoryNow(); });
     scan_entered.get_future().wait();
 
-    const int rescans_before = heartbeat_status()["rescan_requests"].get<std::uint64_t>();
-    for (int index = 0; index < 600; ++index) registry.onDiscoveryObservation(alpha);
+    const UpsertResult alpha_result = source.inject(alpha);
+    const UpsertResult beta_result = source.inject(beta);
+    check(alpha_result.ok && beta_result.ok,
+          "A12: producer-side registration failed while a pass was in flight");
+    check(count_records(registry) == 2,
+          "A12: synchronous registration did not land while the pass was blocked");
 
-    const auto degraded = heartbeat_status();
-    check(degraded["events_dropped"].get<std::uint64_t>() >= 1,
-          "A12: queue overflow did not count drops");
-    check(degraded["queue_depth"].get<std::size_t>() <= 512,
-          "A12: the hint queue was not bounded");
-    check(degraded["state"] == "degraded", "A12: overflow did not degrade the source state");
-    check(degraded["rescan_requests"].get<std::uint64_t>() >= static_cast<std::uint64_t>(rescans_before) + 1,
-          "A12: overflow did not request a rescan");
+    const auto status = heartbeat_status();
+    check(status["events_dropped"].get<std::uint64_t>() == 0,
+          "A12: an event was dropped even though no queue exists");
+    check(status["queue_depth"].get<std::size_t>() == 0,
+          "A12: the deprecated queue-depth key must report zero");
 
     release_scan.set_value();
     reconciler.join();
 
-    // The authoritative rescan repairs whatever the dropped hints carried.
+    // The next authoritative pass re-observes both: idempotent, no repair
+    // needed, nothing duplicated.
     source.set_scan([&]() { return scan_with({alpha, beta}); });
-    check(wait_until([&]() { return count_records(registry) == 2; }, 5000),
-          "A12: the rescan did not repair the dropped hints");
+    registry.reconcileInventoryNow();
+    check(count_records(registry) == 2, "A12: the rescan duplicated live instances");
 
     registry.deinit();
-    pass_case("A12", "bounded queue drops, degradation, rescan request and scan repair");
+    pass_case("A12", "synchronous producer registration under an in-flight pass loses nothing");
 }
 
 // ---------------------------------------------------------------------------
@@ -941,13 +950,13 @@ void run_a14(const std::string& base)
     check(still_new->generation.manager_start_ticks == 1616,
           "A14: new generation was replaced by stale state");
 
-    // A stale hint for the retired generation still cannot resurrect it.
-    registry.onDiscoveryObservation(old_job);
+    // A stale discovery for the retired generation still cannot resurrect it.
+    source.set_scan([&]() { return scan_with({old_job}); });
     registry.reconcileInventoryNow();
     check(!find_native(registry, "700.0").has_value(),
-          "A14: a stale hint resurrected the retired generation");
+          "A14: a stale discovery resurrected the retired generation");
     check(find_native(registry, "700.1").has_value(),
-          "A14: stale hint disturbed the new instance");
+          "A14: a stale discovery disturbed the new instance");
 
     registry.deinit();
     pass_case("A14", "late cleanup of an old generation cannot remove new ownership");

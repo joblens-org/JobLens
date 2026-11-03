@@ -209,24 +209,18 @@ struct DiscoveryOptions {
     ScanClock clock;
 };
 
-// Receives the discovered Jobs a source's own periodic scan produced,
-// delivered on that source's polling thread.
-using ObservationSink = std::function<void(const Job&)>;
-
 // Synchronous single-job registration entry (plan §3/§5.1): registers one
 // discovered Job and returns the result. It runs on the caller's
-// thread (the source's poll thread), never on a worker.
+// thread (the source's poll thread), never on a worker. Both discovery
+// paths — exec events and the source's own periodic scan — use it.
 using JobSink = std::function<UpsertResult(const Job&)>;
 
 // Receives discovery output from a source.
 struct DiscoverySink {
-    // Event path: register one discovered Job immediately on the poll thread. The
-    // store writes it without a fence, so the callback never waits for
-    // persistence. Empty when this core has no inventory runtime.
+    // Register one discovered Job immediately on the poll thread. The store
+    // writes it without a fence, so the callback never waits for persistence.
+    // Empty when this core has no inventory runtime.
     JobSink on_job;
-    // Scan path: hand the source's own periodic scan results to the discovery
-    // sink, still on the polling thread.
-    ObservationSink on_observation;
 };
 
 // One discovery source for one scheduler type. Implemented by the

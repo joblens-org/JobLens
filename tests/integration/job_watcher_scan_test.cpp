@@ -255,12 +255,12 @@ bool has_source_note(const ScanResult& result)
     return false;
 }
 
-// A DiscoverySink carrying only a scan callback (the fixture has no
-// eBPF, so no exec hints can arrive).
-DiscoverySink scan_sink(ObservationSink on_observation)
+// A DiscoverySink carrying only the registration callback (the fixture has
+// no eBPF, so no exec hints can arrive).
+DiscoverySink scan_sink(JobSink on_job)
 {
     DiscoverySink sink;
-    sink.on_observation = std::move(on_observation);
+    sink.on_job = std::move(on_job);
     return sink;
 }
 
@@ -548,7 +548,7 @@ void lifecycle_is_safe(const Fixture& fixture)
     check(delivered.load() == 0,
           "no callback may run before start(): the sink is a start() argument");
 
-    check(watcher.start(scan_sink([&delivered](const Job&) { delivered.fetch_add(1); })),
+    check(watcher.start(scan_sink([&delivered](const Job&) { delivered.fetch_add(1); return UpsertResult{}; })),
           "start() must run with a scan interval even without eBPF");
     check(watcher.polling(), "start() must report polling");
     check(watcher.thread_joinable(), "start() must own a joinable poll thread");
@@ -566,7 +566,7 @@ void lifecycle_is_safe(const Fixture& fixture)
     watcher.stop();  // idempotent
     check(!watcher.thread_joinable(), "a second stop() must stay a no-op");
 
-    check(watcher.start(scan_sink([&delivered](const Job&) { delivered.fetch_add(1); })),
+    check(watcher.start(scan_sink([&delivered](const Job&) { delivered.fetch_add(1); return UpsertResult{}; })),
           "start() after stop() must work");
     check(watcher.polling(), "restart must poll again");
     watcher.stop();
@@ -578,7 +578,7 @@ void lifecycle_is_safe(const Fixture& fixture)
 
     // Nothing to poll: no event source and no interval.
     CondorJobWatcher idle(fixture_options(fixture));
-    check(!idle.start(scan_sink([](const Job&) {})),
+    check(!idle.start(scan_sink([](const Job&) { return UpsertResult{}; })),
           "start() must refuse to spin a thread with no event source and no interval");
     check(!idle.polling(), "a refused start() must not report polling");
     idle.stop();
@@ -589,7 +589,7 @@ void lifecycle_is_safe(const Fixture& fixture)
     slurm_options.scan_interval_ms = 20;
     SlurmJobWatcher slurm(slurm_options);
     std::atomic<int> slurm_delivered{0};
-    check(slurm.start(scan_sink([&slurm_delivered](const Job&) { slurm_delivered.fetch_add(1); })),
+    check(slurm.start(scan_sink([&slurm_delivered](const Job&) { slurm_delivered.fetch_add(1); return UpsertResult{}; })),
           "the Slurm adapter must start its scan thread");
     check(slurm.polling() && slurm.thread_joinable(), "the Slurm adapter owns a joined thread");
     const auto slurm_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);

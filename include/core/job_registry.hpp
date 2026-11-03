@@ -271,9 +271,6 @@ public:
     // exactly what the periodic worker runs. Returns false when the heartbeat
     // is not running.
     bool reconcileInventoryNow();
-    // Discovery event entries (the sink the adapters get, exposed for tests
-    // and out-of-band producers). Cheap and bounded: they only enqueue.
-    void onDiscoveryObservation(const Job& job);
     // Kernel exit hint entry (cheap; schedules a coalesced refresh).
     void notifyExit(pid_t pid);
 
@@ -419,12 +416,8 @@ private:
     std::vector<std::unique_ptr<ISchedulerAdapter>> adapters_;
 
     // --- inventory heartbeat state (guarded by hb_mtx_ unless noted) --------
-    struct HeartbeatHint {
-        enum class Kind { Observation = 0, Exit, Refresh };
-        Kind kind = Kind::Observation;
-        Job job;
-        pid_t pid = 0;
-    };
+    // Discovery registration is synchronous on the producing threads (plan
+    // P4): there is no observation queue and no drain step.
     struct AbsenceEntry {
         ExecutionGeneration generation;
         int complete_absences = 0;
@@ -432,7 +425,6 @@ private:
     };
     mutable std::mutex hb_mtx_;
     std::condition_variable hb_cv_;
-    std::deque<HeartbeatHint> hints_;
     std::map<uint64_t, AbsenceEntry> absences_;
     std::set<uint64_t> suspect_ids_;
     std::map<std::string, ExecutionGeneration> ended_generations_;
@@ -440,7 +432,6 @@ private:
     bool hb_admitted_ = false;     // false after stopInventoryDiscovery()
     bool hb_running_ = false;      // worker thread alive
     bool hb_stopping_ = false;
-    bool hint_wakeup_ = false;
     // Set by requestRescan() to cut the maintenance wait short (cooldown still
     // limits how often a forced scan actually runs).
     bool hb_wake_ = false;
@@ -456,7 +447,6 @@ private:
     std::thread::id hb_worker_id_;
     std::uint32_t reconcile_interval_sec_ = 30;
     std::uint64_t hb_events_received_ = 0;
-    std::uint64_t hb_events_dropped_ = 0;
     std::uint64_t hb_rescan_requests_ = 0;
     std::uint64_t hb_obsolete_hints_ = 0;
     std::uint64_t hb_incomplete_observations_ = 0;
@@ -494,7 +484,6 @@ private:
     void heartbeatLoop();
     bool runPass(bool do_scan, bool wait);
     void processObservation(const Job& job, std::set<uint64_t>& observed);
-    void enqueueHint(HeartbeatHint hint);
     void requestRescan(const std::string& reason);
     bool rescanRequested() const;
     void refreshLegacyRecords();
@@ -512,7 +501,6 @@ private:
     nlohmann::json heartbeatStatusJson() const;
     void installHeartbeatSink();
     std::int64_t clockNow() const;
-    void drainHints(std::deque<HeartbeatHint>& out);
 
     // Re-arms a drain for a restored Closing record and retries a cleanup that
     // failed after the runtime reported completion.

@@ -73,7 +73,9 @@ public:
 private:
     bool start_polling();
     void poll_loop();
-    void emit_observations(const ScanResult& result);
+    // The source's own periodic scan registers its Jobs synchronously through
+    // the on_job sink, exactly like exec events (no queue, no worker).
+    void register_scan_jobs(const ScanResult& result);
     // Exec events only hand over the pid; building the discovered Job is the
     // consumer's job (worker thread), never the polling thread's.
     // Handled on the polling thread: resolve, offer to this turn's batch, and
@@ -408,7 +410,7 @@ inline void SlurmJobWatcher::poll_loop()
         if (options_.scan_interval_ms > 0) {
             const auto now = std::chrono::steady_clock::now();
             if (now >= next_scan) {
-                emit_observations(scan());
+                register_scan_jobs(scan());
                 next_scan = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(options_.scan_interval_ms);
             }
@@ -416,19 +418,27 @@ inline void SlurmJobWatcher::poll_loop()
     }
 }
 
-inline void SlurmJobWatcher::emit_observations(const ScanResult& result)
+inline void SlurmJobWatcher::register_scan_jobs(const ScanResult& result)
 {
-    ObservationSink sink;
+    JobSink sink;
     {
         std::lock_guard<std::mutex> lock(life_mutex_);
-        sink = sink_.on_observation;
+        sink = sink_.on_job;
     }
     if (!sink) return;
     for (const auto& job : result.jobs) {
         try {
-            sink(job);
+            const UpsertResult registered = sink(job);
+            // A facts/metadata failure asks the maintenance pass to look
+            // again; a post-commit failure is repaired from record state.
+            if (!registered.ok && registered.retry_registration()) {
+                requestRescan();
+                return;
+            }
         } catch (const std::exception& error) {
-            spdlog::error("SlurmJobWatcher: discovery sink failed: {}", error.what());
+            spdlog::error("SlurmJobWatcher: registration sink failed: {}", error.what());
+            requestRescan();
+            return;
         }
     }
 }
