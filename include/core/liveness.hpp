@@ -81,6 +81,21 @@ CgroupMembershipProbe make_cgroup_membership_probe();
 //   * Unknown -- the probe could not read the process, or the boot identity of
 //                one side is unavailable.  Unknown is never "verified" and
 //                never death evidence.
+
+// Verdict for a restored execution generation: only positive evidence counts.
+// Stale means the generation names an execution this boot cannot host; Unknown
+// means unreadable evidence (neither death nor liveness); Verified means the
+// manager process positively matches. Unverified is NOT a lifecycle state.
+enum class ExecutionVerdict {
+    Verified,
+    Stale,
+    Unknown,
+};
+
+ExecutionVerdict verify_execution(const ExecutionGeneration& generation,
+                                  bool execution_observed, const std::string& boot_id,
+                                  const ProcessLivenessProbe& probe);
+
 LivenessResult verify_process_identity(const ProcessIdentity& identity,
                                        const std::string& current_boot_id,
                                        const ProcessLivenessProbe& probe);

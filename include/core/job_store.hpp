@@ -58,6 +58,10 @@
 #include "core/job_identity.hpp"
 #include "core/liveness.hpp"
 
+// Canonical key of the durable identity index entry (`i:` layout). Shared by
+// the store (row maintenance) and the registry (its in-memory index mirror).
+std::string identity_index_key(const CanonicalIdentity& identity);
+
 class JobStore;
 struct JobRecord;
 
@@ -247,12 +251,18 @@ class JobStore {
 public:
     struct Options {
         std::string db_path;                 // empty: job_registry_config.job_db_path
-        // Process-identity verification used by restore().  Empty selects the
-        // production /proc probe.  The registry passes the same probe it uses
-        // for admission, so a row cannot be published as verified here and
-        // refused there.
-        ProcessLivenessProbe identity_probe;
+        // NOTE: process-identity verification no longer lives here. The registry
+        // owns the probe (admission and restore validation share it) and the
+        // record map; this class only executes persistence.
     };
+
+    // Read-only access to the current in-memory image of one record. The
+    // registry owns the records; the store needs their content to fence
+    // unsynced rows during flushDirty() and recovery. The provider MUST NOT be
+    // called with any store lock held (the store calls it in snapshot phases
+    // outside db_mtx_), and it must not fail spuriously: a missing row is
+    // reported as nullopt.
+    using RowProvider = std::function<std::optional<JobRecord>(uint64_t)>;
 
     explicit JobStore(const Options& options);
     ~JobStore();
@@ -268,11 +278,17 @@ public:
     bool recoveryRequired() const { return recovery_required_.load(); }
     // Explicit, complete recovery: adopts the durable row for every instance
     // whose last write lost certainty, rewrites the dirty set durably, and
-    // clears the latch only when every step succeeded. Reading one row is not
-    // a recovery, and a successful write elsewhere never clears the latch.
-    bool recoverPending(std::string& error);
+    // clears the latch only when every step succeeded. `adopted` returns the
+    // durable rows that are now authoritative and `removed` the instances the
+    // durable state proves gone (archived or delete-confirmed); the registry
+    // applies both to its record map. Reading one row is not a recovery, and a
+    // successful write elsewhere never clears the latch.
+    bool recoverPending(std::vector<JobRecord>& adopted, std::vector<uint64_t>& removed,
+                        std::string& error);
     void injectFaultForTest(StoreFaultMode mode, size_t skip = 0, size_t count = 1);
     void clearFaultsForTest();
+    // See RowProvider; inject before the first flush/recovery use.
+    void setRowProvider(RowProvider provider) { row_provider_ = std::move(provider); }
 
     // Adapter-owned identity->facts derivation, injected by the registry
     // (dispatches through the scheduler adapters by identity.adapter). The
@@ -283,6 +299,13 @@ public:
     {
         identity_applier_ = std::move(applier);
     }
+
+    // --- restore (once, right after construction) ------------------------
+    // Raw rows only: parse every `j:` row and return it with its instance_id
+    // derived. NO validation, NO suspect marking, NO index building — the
+    // registry owns the records and decides what a restored execution is
+    // worth. Corrupt rows are counted and skipped.
+    std::vector<JobRecord> loadAll();
 
     // --- internal id allocation ------------------------------------------
     uint64_t nextJobId();   // ready-checked; 0 when the store is not ready
@@ -295,14 +318,15 @@ public:
     // --- inventory upsert --------------------------------------------------
     // Identity-resolving idempotent upsert; rejects incomplete identities,
     // closing instances and conflicting live generations. Never fires
-    // lifecycle callbacks and never starts collection.
+    // lifecycle callbacks and never starts collection. `out` carries the
+    // authoritative record (the caller owns the record map and must publish
+    // it).
     UpsertResult upsert(const Job& job, JobRecord& out);
     // --- record mutations ---------------------------------------------------
-    // Generic in-memory read-modify-write under the store lock. Does not
-    // persist; combine with updateRecord for durable mutations.
-    bool mutateRecord(uint64_t id, const std::function<void(JobRecord&)>& mutate);
-    // Durable lifecycle-state write (the closing transition).
-    bool persistState(uint64_t id, const std::string& state);
+    // Durable lifecycle-state write (the closing transition). `out` receives
+    // the authoritative record after the revision bump.
+    bool persistState(uint64_t id, const std::string& state,
+                      std::optional<JobRecord>& out);
     // Durable archive (active/closing -> history, identity index and intent
     // removed) for an instance that WAS collected: the history row keeps the
     // final record, the fact snapshot of what the runtime really had attached
@@ -319,42 +343,37 @@ public:
     bool discard(uint64_t id);
     // Re-read process/attribute facts for one stored job (legacy/manual
     // registrations): /proc + scheduler metadata I/O happen in `refresh`
-    // OUTSIDE every store lock; only the result write happens here.
-    bool refreshFacts(uint64_t id, const std::function<void(Job&)>& refresh);
+    // OUTSIDE every store lock; only the result write happens here. `out`
+    // receives the authoritative record after the revision bump.
+    bool refreshFacts(uint64_t id, const std::function<void(Job&)>& refresh,
+                      std::optional<JobRecord>& out);
 
     // --- intent + applied ---------------------------------------------------
-    // Desired selection of one instance. The actual attached set is owned by
-    // the collection runtime and is deliberately absent here.
-    CollectionSelection selection(uint64_t id) const;
     // Atomic selection command batch: for every mutation the stored record is
     // re-read under the transaction locks, the expected revision is compared
     // there (never in the caller), and the transform is applied. Every changed
     // record is written in ONE unsynced batch; a write failure commits and
-    // publishes nothing. `out` is aligned with `mutations`.
+    // publishes nothing. `out` is aligned with `mutations` and carries the
+    // authoritative revision/selection the caller must publish.
     bool mutateSelections(const std::vector<SelectionMutation>& mutations,
                           std::vector<SelectionMutationResult>& out,
                           std::string& error);
     // Flush the rows written without a fence (checkpoint/shutdown). Public: the
     // registry schedules it from the maintenance pass and from deinit(). Rows
-    // whose last write outcome is unknown are never rewritten; the call then
+    // whose last write outcome are unknown are never rewritten; the call then
     // fails so the caller cannot report a durable state it did not reach.
+    // Row content comes from the RowProvider.
     bool flushDirty(const char* reason);
 
-    // --- queries -------------------------------------------------------------
-    bool hasActive(uint64_t id) const;
-    size_t closingCount() const;
-    std::optional<JobRecord> record(uint64_t id) const;
-    std::optional<JobRecord> recordByIdentity(const CanonicalIdentity& identity) const;
-    std::vector<JobRecord> records() const;
-    // Active (non-closing) records whose job satisfies `pred`.
-    std::vector<JobRecord> findActive(
-        const std::function<bool(const Job&)>& pred) const;
+    // Pure derivation from the db uuid: no record access.
     std::string instanceId(uint64_t id) const;
 
 private:
     // Injected by the registry; see setIdentityApplier.
     std::function<void(Job&, const NativeSelector&, const CanonicalIdentity&)>
         identity_applier_;
+    // Injected by the registry; see setRowProvider.
+    RowProvider row_provider_;
 
     bool init_db(const Options& options);
     void close_db();
@@ -376,14 +395,6 @@ private:
     bool store_ready() const;
 
     // --- internal implementation entry points (no external callers) -------
-    // Restore (once, right after construction): validates restored executions
-    // with a POSITIVE identity check.  A DISCOVERY row is kept only when its
-    // boot matches and its manager's start ticks match; a MANUAL row's members
-    // are re-checked individually; a member is kept only while its saved boot
-    // id equals the current boot and the process still matches the saved start
-    // ticks.  Interrupted closings keep their state.  Never replays anything
-    // into kernel maps.
-    std::vector<JobRecord> restore();
     // Durable allocation on its own (manual registration): reserves the id
     // with its own commit before it is handed out.
     uint64_t allocateId(std::string& error);
@@ -393,9 +404,10 @@ private:
                                 const CanonicalIdentity& identity, uint64_t internal_id,
                                 const JobRecord& stored, int64_t observed_at,
                                 JobRecord& updated_out);
-    // Generic durable read-modify-write of one record.
+    // Generic durable read-modify-write of one record. `out` receives the
+    // authoritative record after the revision bump.
     bool updateRecord(uint64_t id, const std::function<void(JobRecord&)>& mutate,
-                      const char* operation);
+                      const char* operation, std::optional<JobRecord>& out);
     // `durable` = true fsyncs the batch (that is, also every earlier unsynced
     // write in the log). The registration hot path writes with durable=false
     // and leaves the row in the dirty set for the checkpoint / shutdown flush.
@@ -408,8 +420,6 @@ private:
                                        bool durable = true,
                                        const std::vector<uint64_t>* touched = nullptr,
                                        bool delete_only = false);
-    // Flush body; callers hold db_mtx_.
-    bool flush_dirty_locked(const char* reason);
     // Which side is authoritative after an ambiguous write.
     enum class RecoveryKind {
         None,
@@ -427,7 +437,8 @@ private:
     void latch_recovery_locked(const char* operation, RecoveryKind kind,
                                const std::vector<uint64_t>& ids,
                                bool delete_only = false);
-    bool recover_pending_locked(std::string& error);
+    bool recover_pending_locked(std::vector<JobRecord>& adopted,
+                                std::vector<uint64_t>& removed, std::string& error);
     // The exact durable image of an archive that landed ambiguously: the
     // history key (it encodes the archive timestamp), its value verbatim, and
     // the identity index row the same batch deleted while this instance still
@@ -444,44 +455,39 @@ private:
     // image this process cannot disambiguate).
     bool read_archive_fence_locked(uint64_t internal_id, ArchiveFence& fence,
                                    std::string& error);
-    // Reads one durable row and publishes it. `archive` is set when the row was
-    // archived instead of rewritten: memory drops it, and the recovered history
-    // image must be fenced. `delete_confirmed` is set when the row is missing
-    // and the latched batch was delete-only: the deletion landed and the fence
-    // re-asserts it by deleting the row again. Returns false only when the
-    // outcome is still unknown (a read error or an image that cannot be proven).
+    // Reads one durable row and hands it back for adoption. `archive` is set
+    // when the row was archived: the recovered history image must be fenced.
+    // `delete_confirmed` is set when the row is missing and the latched batch
+    // was delete-only: the deletion landed and the fence re-asserts it by
+    // deleting the row again. Returns false only when the outcome is still
+    // unknown (a read error or an image that cannot be proven).
     bool adopt_durable_locked(uint64_t internal_id, std::optional<ArchiveFence>& archive,
-                              bool& delete_confirmed, std::string& error);
+                              bool& delete_confirmed, JobRecord& adopted_record,
+                              std::string& error);
+    // Phase-1 helper of recover_pending_locked (callers hold db_mtx_).
+    bool adopt_locked_pass1(uint64_t id, std::vector<ArchiveFence>& archives,
+                            std::vector<JobRecord>& adopted,
+                            std::vector<uint64_t>& removed, std::string& error);
     // Marks one record / binding as "written but not yet fsynced".
     void mark_record_dirty(uint64_t internal_id);
     void record_store_failure(const std::string& message);
     void record_store_success();
-    void note_record(JobRecord record);
-    bool update_job_info(uint64_t id, const Job& job);
+    bool update_job_info(uint64_t id, const Job& job,
+                         std::optional<JobRecord>& out);
     std::string identity_key(const CanonicalIdentity& identity) const;
-    // In-memory identity index, guarded by mtx_. Callers hold mtx_.
-    std::unordered_map<std::string, uint64_t>& identity_index() { return identity_index_; }
-    const std::unordered_map<std::string, uint64_t>& identityIndex() const {
-        return identity_index_;
-    }
-    // Serializes inventory admission (identity lookup -> allocate -> commit).
-    std::mutex upsert_mtx_;
     // Serializes job_db transactions.
     mutable std::mutex db_mtx_;
-    // Guards the in-memory record map and the identity index.
-    mutable std::shared_mutex mtx_;
-    std::unordered_map<uint64_t, JobRecord> records_;
-    // Rows written with durable=false since the last flush (guarded by mtx_).
+    // Rows written with durable=false since the last flush (guarded by db_mtx_).
+    // Record content lives in the registry (see RowProvider); this set is the
+    // persistence-side obligation to fence them.
     std::set<uint64_t> dirty_records_;
-    std::unordered_map<std::string, uint64_t> identity_index_;
 
     leveldb::DB* db_ = nullptr;
     bool db_running_ = false;
     Options options_;
-    // Production /proc probe unless Options::identity_probe overrides it.
-    ProcessLivenessProbe identity_probe_;
     // Boot id this process runs under: an execution stamped with any other boot
-    // cannot be live here.
+    // cannot be live here. Read once at construction for restore validation,
+    // which the registry performs with its own probe.
     std::string boot_id_;
 
     std::string db_uuid_;

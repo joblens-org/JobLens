@@ -346,6 +346,36 @@ private:
     // it; the registry never duplicates a JobRecord field.
     std::unique_ptr<JobStore> store_;
 
+    // The single source of truth for inventoried records (moved from the
+    // store): every other view (scheduler lanes, kernel maps, RPC payloads) is
+    // a projection or a snapshot copy. Mutations hold records_mtx_ uniquely
+    // through their whole read-decide-transform-commit sequence; reads take it
+    // shared.
+    mutable std::shared_mutex records_mtx_;
+    std::unordered_map<uint64_t, JobRecord> records_;
+    // In-memory mirror of the durable `i:` identity index (same key layout).
+    std::unordered_map<std::string, uint64_t> identity_index_;
+
+    // Registry-side record-map accessors and publish points. Query helpers
+    // return snapshot copies with instance_id derived.
+    std::optional<JobRecord> ownRecord(uint64_t id) const;
+    std::vector<JobRecord> ownRecords() const;
+    std::vector<JobRecord> ownFindActive(
+        const std::function<bool(const Job&)>& pred) const;
+    bool ownHasActive(uint64_t id) const;
+    size_t ownClosingCount() const;
+    std::optional<JobRecord> ownRecordByIdentity(const CanonicalIdentity& identity) const;
+    CollectionSelection ownSelection(uint64_t id) const;
+    void publishRecord(JobRecord record);
+    void eraseRecord(uint64_t id);
+    void applyRecovered(const std::vector<JobRecord>& adopted,
+                        const std::vector<uint64_t>& removed);
+    void applySelectionResults(const std::vector<SelectionMutationResult>& results);
+    // Restore validation (moved from the store): positive identity checks with
+    // the admission probe; adjustments are memory-only, the next durable write
+    // of a row persists whatever is current.
+    void validateRestoredExecutions(std::vector<JobRecord>& rows);
+
     // Injected at composition time. Never held across a call into it.
     mutable std::mutex                     runtime_mtx_;
     ICollectionRuntime*                    collection_runtime_ = nullptr;
