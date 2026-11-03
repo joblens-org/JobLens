@@ -78,12 +78,6 @@ public:
     // Per-type discovery options derived from the resolved settings.
     virtual DiscoveryOptions discoveryOptions(const InventoryTypeSettings& settings) const = 0;
 
-    // Typed facts for one observation, identity fields included: subtype,
-    // typed attributes, NativeJobID and cluster namespaces derived from the
-    // canonical identity (the store never guesses them). JobID, JobPIDs and
-    // CollectorNames are store/intent owned and must stay empty.
-    virtual Job encodeFacts(const Observation& observation) const = 0;
-
     // Legacy (schema < 2) decode: typed facts from a stored JSON row.
     virtual Job decodeFacts(const nlohmann::json& row) const = 0;
     // Best-effort selector reconstruction for a legacy row (no scheduler
@@ -92,8 +86,8 @@ public:
 
     // Applies a resolved identity to the typed facts (derives the typed attr
     // fields the schema defines from the canonical form). The store calls it
-    // through the registry-injected applier on upsert; encoders that already
-    // applied the identity (encodeFacts normally does) are idempotent here.
+    // through the registry-injected applier on upsert; it is idempotent for
+    // facts a watcher already filled from its parsed sources.
     // Default: nothing to derive — open-world (JSON) facts are kept verbatim.
     virtual void applyIdentityToFacts(Job& facts, const NativeSelector& selector,
                                       const CanonicalIdentity& identity) const

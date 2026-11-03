@@ -45,34 +45,9 @@ public:
         return options;
     }
 
-    Job encodeFacts(const Observation& observation) const override
-    {
-        Job facts;
-        facts.jobtype = JobType::Job;
-        facts.subtype = JobSubType::Slurm;
-
-        SlurmJobAttr attributes{};
-        attributes.auto_update_child = false;
-        attributes.stepd_pid = observation.generation.manager_pid;
-        attributes.cluster_name = observation.selector.cluster_name;
-        attributes.cgroup_path = observation.cgroup_path;
-        attributes.user = observation.owner;
-        attributes.job_name = observation.job_name;
-        attributes.partition = observation.partition;
-        attributes.step_id = slurm_step_value(observation.selector.step_id).value_or(0);
-        try {
-            attributes.job_id = std::stoull(observation.selector.native_job_id);
-        } catch (const std::exception&) {
-            // Canonicalization already rejected non-numeric Slurm ids; leaving
-            // the field at 0 keeps the missing fact visible.
-        }
-        facts.sub_attr = attributes;
-
-        if (const auto identity = canonicalize(observation.selector)) {
-            apply_identity(facts, observation.selector, *identity);
-        }
-        return facts;
-    }
+    // Typed facts for a discovered Job are filled by the watcher itself where
+    // it parses its sources (no encodeFacts detour through neutral fields).
+    // This adapter only decodes legacy rows and derives identity fields.
 
     Job decodeFacts(const nlohmann::json& row) const override
     {
@@ -113,8 +88,8 @@ public:
         return selector;
     }
 
-    // Delegates to the same derivation encodeFacts uses (moved from the
-    // store's apply_identity_to_facts; idempotent for encoded facts).
+    // Delegates to the shared identity derivation (moved from the store's
+    // apply_identity_to_facts; idempotent for watcher-filled facts).
     void applyIdentityToFacts(Job& job, const NativeSelector& selector,
                               const CanonicalIdentity& identity) const override
     {

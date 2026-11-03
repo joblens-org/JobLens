@@ -45,29 +45,9 @@ public:
         return options;
     }
 
-    // Typed facts for one observation, identity fields included. JobID,
-    // JobPIDs and CollectorNames stay empty: they are store/intent owned.
-    Job encodeFacts(const Observation& observation) const override
-    {
-        Job facts;
-        facts.jobtype = JobType::Job;
-        facts.subtype = JobSubType::Condor;
-
-        CondorJobAttr attributes{};
-        attributes.auto_update_child = false;
-        attributes.starter_pid = observation.generation.manager_pid;
-        attributes.scheduler_host = observation.scheduler_host;
-        attributes.scheduler_name = observation.selector.cluster_tag;
-        attributes.slots_cgroup_path = observation.cgroup_path;
-        attributes.owner = observation.owner;
-        attributes.collector_host = observation.selector.cluster_name;
-        facts.sub_attr = attributes;
-
-        if (const auto identity = canonicalize(observation.selector)) {
-            apply_identity(facts, observation.selector, *identity);
-        }
-        return facts;
-    }
+    // Typed facts for a discovered Job are filled by the watcher itself where
+    // it parses its sources (no encodeFacts detour through neutral fields).
+    // This adapter only decodes legacy rows and derives identity fields.
 
     Job decodeFacts(const nlohmann::json& row) const override
     {
@@ -135,34 +115,6 @@ public:
     }
 
 private:
-    // The native string and namespace are authoritative; scheduler numeric
-    // fields derive from the canonical form so they can never disagree with
-    // the identity index.
-    static void apply_identity(Job& job, const NativeSelector& selector,
-                               const CanonicalIdentity& identity)
-    {
-        job.NativeJobID = identity.native_job_id;
-        if (!selector.cluster_name.empty()) job.cluster_name = selector.cluster_name;
-        if (!selector.cluster_tag.empty()) job.clusterTag = selector.cluster_tag;
-        if (job.jobtype != JobType::Job && job.jobtype != JobType::Sys) {
-            job.jobtype = JobType::Job;
-        }
-        job.subtype = JobSubType::Condor;
-        if (!std::holds_alternative<CondorJobAttr>(job.sub_attr)) {
-            job.sub_attr = CondorJobAttr{};
-        }
-        auto& attr = std::get<CondorJobAttr>(job.sub_attr);
-        const auto dot = identity.canonical_native.find('.');
-        if (dot != std::string::npos) {
-            try {
-                attr.cluster_id = std::stoull(identity.canonical_native.substr(0, dot));
-                attr.proc_id = std::stoull(identity.canonical_native.substr(dot + 1));
-            } catch (const std::exception&) {
-                // Canonical validation already guaranteed decimal parts.
-            }
-        }
-    }
-
     std::string name_{"condor"};
     CondorJobWatcher watcher_;
 };

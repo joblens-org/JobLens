@@ -17,9 +17,8 @@
  *
  * The registration chain this harness measures is exactly:
  *
- *   observeForHint(pid)              -> Observation   (procfs/ad/cgroup reads)
- *   adapter.encodeFacts(observation) -> typed Job
- *   registry.upsertObservedJob(exec) -> durable facts + optional automatic decision
+ *   observeForHint(pid)              -> Job (procfs/ad/cgroup reads + typed facts)
+ *   registry.upsertObservedJob(job)  -> durable facts + optional automatic decision
  *   (collector attach is owned by the scheduler's asynchronous reconcile pass,
  *    not by this registration path)
  *
@@ -30,7 +29,7 @@
  * Inputs are real: it spawns one fake `condor_starter` parent per job, with a
  * real job child process carrying a real _CONDOR_JOB_AD file, moved into a
  * per-job cgroup v2 directory (the layout the Condor startd produces). The
- * observation itself is produced by the production CondorJobWatcher against
+ * discovered Job itself is produced by the production CondorJobWatcher against
  * /proc, therefore the read path is the shipped one; only the cluster (no
  * working collector/schedd on the test host) is simulated.
  *
@@ -84,26 +83,6 @@ double elapsed_us(const Clock::time_point& a, const Clock::time_point& b)
     return std::chrono::duration<double, std::micro>(b - a).count();
 }
 
-
-// One discovery result as the Job the source hands to registration (plan §4.1):
-// encoded facts plus ONE execution evidence group.
-Job bench_job(const Observation& observation, Job facts)
-{
-    facts.subtype_name = observation.selector.adapter;
-    facts.NativeJobID = observation.selector.native_job_id;
-    facts.cluster_name = observation.selector.cluster_name;
-    facts.clusterTag = observation.selector.cluster_tag;
-    JobExecution execution;
-    execution.generation = observation.generation;
-    execution.members = observation.members;
-    execution.members_authoritative = observation.members_complete;
-    if (!observation.selector.step_id.empty()) execution.step_id = observation.selector.step_id;
-    execution.read_at_us =
-        observation.source_timestamp_ms > 0 ? observation.source_timestamp_ms * 1000 : 0;
-    execution.read_order = observation.read_order;
-    facts.execution = std::move(execution);
-    return facts;
-}
 
 struct Args {
     std::string db;
@@ -373,7 +352,6 @@ private:
 
 struct Samples {
     std::vector<double> observe;
-    std::vector<double> encode;
     std::vector<double> upsert;
     std::vector<double> apply;
     std::vector<double> total;
@@ -611,24 +589,24 @@ int main(int argc, char** argv)
 
     for (const auto& job : jobs) {
         const auto t0 = Clock::now();
-        std::optional<Observation> observation;
+        std::optional<Job> discovered;
         try {
-            observation = adapter->source().observeForHint(job.child);
+            discovered = adapter->source().observeForHint(job.child);
         } catch (const std::exception& error) {
             std::cerr << "observe failed for pid " << job.child << ": " << error.what() << "\n";
             ++incomplete;
             continue;
         }
         const auto t1 = Clock::now();
-        if (!observation) {
+        if (!discovered) {
             ++incomplete;
             continue;
         }
         Job execution;
         try {
-            execution = bench_job(*observation, adapter->encodeFacts(*observation));
+            execution = *discovered;
         } catch (const std::exception& error) {
-            std::cerr << "encode failed: " << error.what() << "\n";
+            std::cerr << "prepare failed: " << error.what() << "\n";
             ++incomplete;
             continue;
         }
@@ -644,17 +622,17 @@ int main(int argc, char** argv)
         const auto t4 = Clock::now();
 
         samples.observe.push_back(elapsed_us(t0, t1));
-        samples.encode.push_back(elapsed_us(t1, t2));
         samples.upsert.push_back(elapsed_us(t2, t3));
         samples.apply.push_back(elapsed_us(t3, t4));
         samples.total.push_back(elapsed_us(t0, t4));
         if (!probe_job) {
             probe_job = execution;
             // The policy sees the stored projection, whose PIDs come from the
-            // store (encodeFacts leaves them empty).
+            // store (discovery leaves them empty).
             probe_job->JobPIDs.clear();
-            for (const auto& member : observation->members)
-                probe_job->JobPIDs.push_back(member.pid);
+            if (execution.execution)
+                for (const auto& member : execution.execution->members)
+                    probe_job->JobPIDs.push_back(member.pid);
         }
         executions.push_back(std::move(execution));
     }
@@ -715,7 +693,6 @@ int main(int argc, char** argv)
     // ---- report ------------------------------------------------------------
     const auto commits = registry.storeHealth().durable_commits - commits_before;
     const auto observe = stats_of(samples.observe);
-    const auto encode = stats_of(samples.encode);
     const auto upsert = stats_of(samples.upsert);
     const auto apply = stats_of(samples.apply);
     const auto total = stats_of(samples.total);
@@ -735,7 +712,6 @@ int main(int argc, char** argv)
         std::printf("commits per registration: %.2f\n",
                     static_cast<double>(commits) / samples.total.size());
     print_stats("observeForHint", observe);
-    print_stats("encodeFacts", encode);
     print_stats("upsertObservedJob", upsert);
     print_stats("auto intent + attach", apply);
     print_stats("TOTAL callback", total);
@@ -765,7 +741,6 @@ int main(int argc, char** argv)
             csv << stage << "," << i << "," << values[i] << "\n";
     };
     dump("observe", samples.observe);
-    dump("encode", samples.encode);
     dump("upsert", samples.upsert);
     dump("apply", samples.apply);
     dump("total", samples.total);
@@ -787,7 +762,6 @@ int main(int argc, char** argv)
              << ", \"sum_us\": " << s.sum << "}" << (last ? "\n" : ",\n");
     };
     put("observe", observe, false);
-    put("encode", encode, false);
     put("upsert", upsert, false);
     put("apply", apply, false);
     put("total", total, false);

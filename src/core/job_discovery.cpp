@@ -312,29 +312,31 @@ ProcessIdentity read_process_identity(const std::string& proc_root,
 }
 
 // ---------------------------------------------------------------------------
-// Observation finalization
+// Discovered Job finalization
 // ---------------------------------------------------------------------------
 
-void finalize_observation(Observation& observation,
-                          std::vector<std::string> source_reasons)
+bool discovery_job_ready(const Job& job)
+{
+    if (!job.execution || !job.execution->generation.complete()) return false;
+    return canonicalize(selector_of(job)).has_value();
+}
+
+void finalize_discovery_job(Job& job, std::vector<std::string> source_reasons)
 {
     std::vector<std::string> reasons = std::move(source_reasons);
 
-    const auto canonical = canonicalize(observation.selector);
-    if (!canonical) {
+    if (!canonicalize(selector_of(job))) {
         reasons.push_back(
             "logical identity unresolved: scheduler type, cluster namespace or native job id missing");
-    } else {
-        observation.canonical_identity = canonical;
     }
 
-    if (!observation.generation.complete()) {
+    if (!job.execution || !job.execution->generation.complete()) {
         reasons.push_back(
             "execution generation unresolved: manager pid, manager start ticks or boot id missing");
     }
 
-    observation.identity_complete = reasons.empty();
-    observation.incomplete_reason = join_reasons(reasons);
+    if (!job.execution) job.execution.emplace();
+    job.execution->incomplete_reason = join_reasons(reasons);
 }
 
 std::uint64_t next_discovery_read_order()

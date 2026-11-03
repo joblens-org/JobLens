@@ -59,7 +59,7 @@ public:
     ScanResult scan() override;
     SourceHealth health() const override;
     void requestRescan() override;
-    std::optional<Observation> observeForHint(pid_t hint_pid) override;
+    std::optional<Job> observeForHint(pid_t hint_pid) override;
 
     // ---- Owner/test observability ------------------------------------------
     bool polling() const;
@@ -91,18 +91,21 @@ private:
     std::atomic<bool> yield_requested_{false};
     ScanResult finish_scan(ScanResult result);
 
-    // Builds one observation from a condor_starter candidate using the same
+    // Builds one discovered Job from a condor_starter candidate using the same
     // sources the scan path reads (starter environ, _CONDOR_JOB_AD file, slot
     // cgroup), through the injectable discovery roots. `preferred_member_pid`
     // (exec-hint path) is probed for the job ad before the other members.
-    Observation observe_starter(const DiscoveryEnvironment& env, const std::string& boot_id,
-                                pid_t starter_pid, pid_t preferred_member_pid = 0);
+    Job observe_starter(const DiscoveryEnvironment& env, const std::string& boot_id,
+                        pid_t starter_pid, pid_t preferred_member_pid = 0);
 
     // Member pids of one starter: cgroup members when the cgroup is readable,
     // otherwise the starter's live children in /proc (the classic layout where
     // the job ad is exported to the job process instead of the starter).
+    // `cgroup_path` may be cleared (cgroup shared with the daemon tree); notes
+    // explain whichever fallback was taken.
     std::vector<pid_t> collect_member_pids(const DiscoveryEnvironment& env,
-                                           Observation& observation,
+                                           std::string& cgroup_path,
+                                           std::vector<std::string>& notes,
                                            pid_t starter_pid, bool& membership_known);
 
     bool init_event_source();
@@ -250,11 +253,11 @@ inline ScanResult CondorJobWatcher::scan()
             "they cannot be attributed to condor", unreadable_entries));
     }
 
-    // One observation per manager, built directly: the store is the identity
+    // One discovered Job per manager, built directly: the store is the identity
     // idempotency point, so the accumulator (a second merge model) is gone.
-    result.observations.reserve(starters.size());
+    result.jobs.reserve(starters.size());
     for (pid_t starter : starters) {
-        result.observations.push_back(observe_starter(env, boot_id, starter));
+        result.jobs.push_back(observe_starter(env, boot_id, starter));
     }
     return finish_scan(std::move(result));
 }
@@ -283,14 +286,14 @@ inline DiscoveryEnvironment CondorJobWatcher::discovery_environment() const
     return options_.discovery;
 }
 
-inline std::optional<Observation> CondorJobWatcher::observeForHint(pid_t hint_pid)
+inline std::optional<Job> CondorJobWatcher::observeForHint(pid_t hint_pid)
 {
     if (hint_pid <= 0) return std::nullopt;
     const auto env = discovery_environment();
     const auto ppid = read_proc_ppid(env.proc_root, hint_pid);
     if (!ppid || *ppid <= 0) return std::nullopt;
     // The BPF filter guarantees the parent is a starter for real events; the
-    // cmdline check keeps a recycled pid from fabricating an observation.
+    // cmdline check keeps a recycled pid from fabricating a discovery.
     std::string cmdline;
     std::string error;
     if (!read_proc_cmdline(env.proc_root, *ppid, cmdline, error) ||
@@ -386,13 +389,13 @@ inline void CondorJobWatcher::emit_observations(const ScanResult& result)
         sink = sink_.on_observation;
     }
     if (!sink) return;
-    for (const auto& observation : result.observations) {
+    for (const auto& job : result.jobs) {
         // The sink is caller-owned code on the polling thread: a throwing
         // consumer must not take the discovery adapter down with it.
         try {
-            sink(observation);
+            sink(job);
         } catch (const std::exception& error) {
-            spdlog::error("CondorJobWatcher: observation sink failed: {}", error.what());
+            spdlog::error("CondorJobWatcher: discovery sink failed: {}", error.what());
         }
     }
 }
@@ -405,8 +408,8 @@ inline bool CondorJobWatcher::stop_requested()
 
 inline void CondorJobWatcher::handle_exec_event(uint32_t pid)
 {
-    // Runs on the polling thread. The event is only a hint: the observation is
-    // built from current procfs/ad evidence and registered right here, in
+    // Runs on the polling thread. The event is only a hint: the discovered Job
+    // is built from current procfs/ad evidence and registered right here, in
     // memory. Nothing on this path waits for persistence, so a burst of job
     // starts cannot block the ring.
     JobSink sink;
@@ -416,18 +419,18 @@ inline void CondorJobWatcher::handle_exec_event(uint32_t pid)
     }
     if (!sink) return;
 
-    std::optional<Observation> observation;
+    std::optional<Job> discovered;
     try {
-        observation = observeForHint(static_cast<pid_t>(pid));
+        discovered = observeForHint(static_cast<pid_t>(pid));
     } catch (const std::exception& error) {
         spdlog::debug("CondorJobWatcher: exec hint {} could not be resolved: {}", pid, error.what());
     }
-    if (!observation) return;   // not a JobLens execution, or it already exited
+    if (!discovered) return;   // not a JobLens execution, or it already exited
 
-    if (observation->identity_complete) {
+    if (discovery_job_ready(*discovered)) {
         UpsertResult result;
         try {
-            result = sink(*observation);
+            result = sink(*discovered);
         } catch (const std::exception& error) {
             spdlog::error("CondorJobWatcher: registration sink failed: {}", error.what());
             requestRescan();
@@ -451,8 +454,8 @@ inline ScanResult CondorJobWatcher::finish_scan(ScanResult result)
     result.complete = result.error.empty();
     result.counts.complete = 0;
     result.counts.incomplete = 0;
-    for (const auto& observation : result.observations) {
-        if (observation.identity_complete) ++result.counts.complete;
+    for (const auto& job : result.jobs) {
+        if (discovery_job_ready(job)) ++result.counts.complete;
         else ++result.counts.incomplete;
     }
 
@@ -477,14 +480,13 @@ inline ScanResult CondorJobWatcher::finish_scan(ScanResult result)
 }
 
 inline std::vector<pid_t> CondorJobWatcher::collect_member_pids(
-    const DiscoveryEnvironment& env, Observation& observation, pid_t starter_pid,
-    bool& membership_known)
+    const DiscoveryEnvironment& env, std::string& cgroup_path,
+    std::vector<std::string>& notes, pid_t starter_pid, bool& membership_known)
 {
     membership_known = false;
     std::vector<pid_t> members;
     std::string members_error;
-    if (!observation.cgroup_path.empty() &&
-        read_cgroup_members(observation.cgroup_path, members, members_error)) {
+    if (!cgroup_path.empty() && read_cgroup_members(cgroup_path, members, members_error)) {
         // A job-scoped cgroup contains the starter and its job processes, never
         // the daemon that spawned the starter. Nodes without per-slot cgroups
         // put the starter in the shared service cgroup, where all Condor
@@ -498,12 +500,11 @@ inline std::vector<pid_t> CondorJobWatcher::collect_member_pids(
             membership_known = true;  // the read succeeded, an empty list included
             return members;
         }
-        observation.notes.push_back(fmt::format(
+        notes.push_back(fmt::format(
             "cgroup {} is shared with the daemon tree (contains starter parent {}); "
             "members resolved from the starter's children",
-            observation.cgroup_path, *starter_parent));
-        observation.cgroup_path.clear();
-        observation.generation.cgroup_identity.clear();
+            cgroup_path, *starter_parent));
+        cgroup_path.clear();
         members.clear();
     }
 
@@ -511,8 +512,8 @@ inline std::vector<pid_t> CondorJobWatcher::collect_member_pids(
     // PIDs (and the job ad that usually lives on them) survive without cgroup
     // v2. The enumeration cannot prove completeness, so consumers must treat
     // the member list as partial (members_complete == false).
-    if (!observation.cgroup_path.empty())
-        observation.notes.push_back("cgroup membership unreadable: " + members_error);
+    if (!cgroup_path.empty())
+        notes.push_back("cgroup membership unreadable: " + members_error);
     for (pid_t pid : list_proc_pids(env.proc_root)) {
         if (pid == starter_pid) continue;
         const auto ppid = read_proc_ppid(env.proc_root, pid);
@@ -520,61 +521,77 @@ inline std::vector<pid_t> CondorJobWatcher::collect_member_pids(
     }
     std::sort(members.begin(), members.end());
     if (!members.empty())
-        observation.notes.push_back(fmt::format(
+        notes.push_back(fmt::format(
             "cgroup unavailable; {} member pid(s) resolved from the starter's children",
             members.size()));
     return members;
 }
 
-inline Observation CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,
-                                                     const std::string& boot_id,
-                                                     pid_t starter_pid,
-                                                     pid_t preferred_member_pid)
+inline Job CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,
+                                             const std::string& boot_id,
+                                             pid_t starter_pid,
+                                             pid_t preferred_member_pid)
 {
-    Observation observation;
+    // The Job is the registration unit: typed facts (filled here, where the
+    // sources are parsed) plus the execution evidence group. No second
+    // envelope — the registry derives selector/identity on admission.
+    Job job;
+    JobExecution& execution = job.execution.emplace();
     // Assigned before the first read so the store can reject an older pass
     // overwriting newer facts (plan §4.1).
-    observation.read_order = next_discovery_read_order();
+    execution.read_order = next_discovery_read_order();
     std::vector<std::string> reasons;
-    observation.adapter = name_;
-    observation.selector.adapter = name_;
-    observation.source_timestamp_ms = scan_clock_now(options_.clock);
+    job.subtype_name = name_;
+    job.jobtype = JobType::Job;
+    job.subtype = JobSubType::Condor;
+    execution.read_at_us = scan_clock_now(options_.clock) * 1000;
 
     std::string cluster_name = env.cluster_name;
     if (cluster_name.empty()) cluster_name = Utils::get_condor_collector_host();
     if (cluster_name.empty())
         reasons.push_back("condor cluster namespace unresolved (COLLECTOR_HOST unavailable)");
-    observation.selector.cluster_name = cluster_name;
+    job.cluster_name = cluster_name;
 
     const auto manager = read_process_identity(env.proc_root, boot_id, starter_pid);
-    observation.generation.boot_id = manager.boot_id;
-    observation.generation.manager_pid = starter_pid;
-    observation.generation.manager_start_ticks = manager.start_ticks;
+    execution.generation.boot_id = manager.boot_id;
+    execution.generation.manager_pid = starter_pid;
+    execution.generation.manager_start_ticks = manager.start_ticks;
 
-    observation.cgroup_path =
+    std::string cgroup_path =
         read_proc_cgroup_path(env.proc_root, starter_pid, env.cgroup_root);
-    observation.generation.cgroup_identity = observation.cgroup_path;
-    if (observation.cgroup_path.empty()) {
-        observation.notes.push_back(fmt::format(
+    if (cgroup_path.empty()) {
+        execution.notes.push_back(fmt::format(
             "cgroup path unavailable for starter pid {}", starter_pid));
     }
+
+    // Typed attrs the scan itself owns; the ad fields join once parsed below.
+    CondorJobAttr attributes{};
+    attributes.auto_update_child = false;
+    attributes.starter_pid = starter_pid;
+    attributes.collector_host = cluster_name;
 
     // Members first: the job ad usually lives on a member process, so the
     // membership must be known before the ad resolution can fall back to it.
     bool membership_known = false;
     const auto member_pids =
-        collect_member_pids(env, observation, starter_pid, membership_known);
-    observation.members_complete = membership_known;
+        collect_member_pids(env, cgroup_path, execution.notes, starter_pid,
+                            membership_known);
+    // The cgroup may have been discarded as daemon-shared while collecting
+    // members; the typed attribute and the generation evidence must agree with
+    // whatever survived.
+    execution.generation.cgroup_identity = cgroup_path;
+    attributes.slots_cgroup_path = cgroup_path;
+    execution.members_authoritative = membership_known;
     for (pid_t member_pid : member_pids) {
         if (member_pid == starter_pid) continue;
         const auto member =
             read_process_identity(env.proc_root, boot_id, member_pid);
-        if (!member.complete()) observation.members_complete = false;
-        observation.members.push_back(member);
+        if (!member.complete()) execution.members_authoritative = false;
+        execution.members.push_back(member);
     }
     if (member_pids.empty() && membership_known)
-        observation.notes.push_back("cgroup " + observation.cgroup_path +
-                                    " has no member processes");
+        execution.notes.push_back("cgroup " + cgroup_path +
+                                  " has no member processes");
 
     // Job ad resolution: the starter's own _CONDOR_JOB_AD first, then the job
     // child processes. HTCondor exports the ad to the job environment, and the
@@ -598,7 +615,7 @@ inline Observation CondorJobWatcher::observe_starter(const DiscoveryEnvironment&
             if (read_proc_env(env.proc_root, candidate, "_CONDOR_JOB_AD", ad_path,
                               candidate_error) &&
                 !ad_path.empty()) {
-                observation.notes.push_back(fmt::format(
+                execution.notes.push_back(fmt::format(
                     "_CONDOR_JOB_AD read from job process {} (starter has none)", candidate));
                 break;
             }
@@ -628,16 +645,18 @@ inline Observation CondorJobWatcher::observe_starter(const DiscoveryEnvironment&
             if (!ad) {
                 reasons.push_back("condor job ad unparsable: " + parse_error);
             } else {
-                observation.selector.native_job_id = ad->native_job_id;
-                observation.selector.cluster_tag = ad->scheduler_name;
-                observation.owner = ad->owner;
-                observation.scheduler_host = ad->scheduler_host;
+                job.NativeJobID = ad->native_job_id;
+                job.clusterTag = ad->scheduler_name;
+                attributes.owner = ad->owner;
+                attributes.scheduler_host = ad->scheduler_host;
+                attributes.scheduler_name = ad->scheduler_name;
             }
         }
     }
 
-    finalize_observation(observation, std::move(reasons));
-    return observation;
+    job.sub_attr = attributes;
+    finalize_discovery_job(job, std::move(reasons));
+    return job;
 }
 
 inline bool CondorJobWatcher::init_event_source()

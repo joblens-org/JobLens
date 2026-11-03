@@ -26,15 +26,17 @@
 //
 //   * scan()      - one synchronous source pass, returns ScanResult
 //   * health()    - SourceHealth of that source (initializing/healthy/degraded)
-//   * observations - typed facts the controller resolves into JobRegistry
-//                    upserts; never a JobRegistry dependency of its own
+//   * jobs        - discovered Jobs (typed facts + execution evidence group)
+//                   the controller admits through JobRegistry upserts; never a
+//                   JobRegistry dependency of its own
 //
 // Two rules are structural rather than conventional:
 //
-//   1. An Observation either carries a canonical identity plus a complete
-//      execution generation, or it is explicitly incomplete with a reason.
-//      There is no "best effort" middle state, and an incomplete observation
-//      is not eligible for automatic collection or for retirement decisions.
+//   1. A discovered Job either is ready (resolvable identity plus a complete
+//      execution generation) or is explicitly incomplete with a reason on the
+//      execution group. There is no "best effort" middle state, and an
+//      incomplete discovery is not eligible for automatic collection or for
+//      retirement decisions.
 //   2. A failed or incomplete scan is never interpreted as "everything else
 //      ended". ScanResult::complete says whether the pass covered the
 //      configured sources; a consumer must check it before treating absence as
@@ -94,57 +96,25 @@ struct DiscoveryEnvironment {
 };
 
 // ---------------------------------------------------------------------------
-// Observation
+// Discovered Job readiness
 // ---------------------------------------------------------------------------
 
-// One candidate local execution seen by a source pass.
+// One discovered job IS the registration unit: typed facts on the Job itself
+// plus one `Job::execution` evidence group. There is no second envelope — the
+// watcher fills the Job where it parses its sources, and the registry derives
+// the selector/identity from the Job on admission (selector_of/canonicalize).
 //
-// `selector` is always filled with whatever native fields the source really
-// provided (never synthesized). `canonical_identity` is present only when the
-// scheduler namespace and native id both resolved. `identity_complete` also
-// requires a complete execution generation (boot id + manager pid + manager
-// start ticks); the two-level split lets a consumer show enrichment progress
-// without ever indexing a partial identity.
-struct Observation {
-    // Adapter registry name of the source that produced this observation
-    // ("" must never happen: the watcher fills its own name).
-    std::string adapter;
+// Readiness is the old two-level rule: the logical identity resolves AND the
+// execution generation is complete (boot id + manager pid + manager start
+// ticks). An unresolvable identity stays out of the identity index and is
+// retried on the next observation; an incomplete generation is an unverified
+// execution, never a guess.
+bool discovery_job_ready(const Job& job);
 
-    NativeSelector selector;
-    std::optional<CanonicalIdentity> canonical_identity;
-    bool identity_complete = false;
-    // Human-readable list of what is missing, joined with "; ". Empty exactly
-    // when identity_complete is true.
-    std::string incomplete_reason;
-
-    // Manager process of the execution (Condor: condor_starter, Slurm:
-    // slurmstepd) plus the execution cgroup as corroborating evidence.
-    // cgroup_identity is empty when the cgroup is unavailable.
-    ExecutionGeneration generation;
-    // Absolute cgroup directory discovered for the execution ("" = unknown).
-    std::string cgroup_path;
-
-    // Member processes of the execution, manager excluded. A member whose
-    // start ticks could not be read is kept with start_ticks == 0 so the
-    // missing evidence stays visible; members_complete is false in that case.
-    std::vector<ProcessIdentity> members;
-    bool members_complete = true;
-
-    // Scheduler metadata for the registry record.
-    std::string owner;
-    std::string job_name;
-    std::string partition;
-    std::string scheduler_host;
-
-    // Time the source data for this observation was read.
-    std::int64_t source_timestamp_ms = 0;
-    // Process-monotonic read order assigned before the source starts reading;
-    // out-of-order commits use it so an older scan never overwrites a newer
-    // event (plan §4.1).
-    std::uint64_t read_order = 0;
-    // Per-observation notes, e.g. "cgroup membership unreadable".
-    std::vector<std::string> notes;
-};
+// Fills `job.execution->incomplete_reason` from the identity/generation checks
+// plus adapter-level source reasons (unreadable ad, missing env var). Ensures
+// the execution group exists so the reasons survive with the evidence.
+void finalize_discovery_job(Job& job, std::vector<std::string> source_reasons = {});
 
 // ---------------------------------------------------------------------------
 // Scan result
@@ -167,9 +137,12 @@ struct ScanCounts {
 };
 
 struct ScanResult {
-    std::vector<Observation> observations;
+    // The discovered Jobs: typed facts plus the execution evidence group,
+    // built where the source parsed its inputs. JobID, JobPIDs and
+    // CollectorNames stay empty: they are store/intent owned.
+    std::vector<Job> jobs;
     // True when the pass covered every configured source without an I/O or
-    // configuration error. Incomplete *observations* (missing ad, unresolved
+    // configuration error. Incomplete *discoveries* (missing ad, unresolved
     // namespace) do not make a pass incomplete: they were still observed.
     // Consumers must never read absent jobs out of a pass with complete=false.
     bool complete = false;
@@ -236,22 +209,23 @@ struct DiscoveryOptions {
     ScanClock clock;
 };
 
-// Receives observations produced by a scan or a targeted probe. Queued and
-// processed by the maintenance thread.
-using ObservationSink = std::function<void(const Observation&)>;
+// Receives the discovered Jobs a source's own periodic scan produced,
+// delivered on that source's polling thread.
+using ObservationSink = std::function<void(const Job&)>;
 
-// Synchronous single-job registration entry (plan §3/§5.1): resolves the
-// observation, registers it and returns the result. It runs on the caller's
+// Synchronous single-job registration entry (plan §3/§5.1): registers one
+// discovered Job and returns the result. It runs on the caller's
 // thread (the source's poll thread), never on a worker.
-using JobSink = std::function<UpsertResult(const Observation&)>;
+using JobSink = std::function<UpsertResult(const Job&)>;
 
 // Receives discovery output from a source.
 struct DiscoverySink {
-    // Event path: register one observation immediately on the poll thread. The
+    // Event path: register one discovered Job immediately on the poll thread. The
     // store writes it without a fence, so the callback never waits for
     // persistence. Empty when this core has no inventory runtime.
     JobSink on_job;
-    // Scan path: hand the observation to the maintenance thread.
+    // Scan path: hand the source's own periodic scan results to the discovery
+    // sink, still on the polling thread.
     ObservationSink on_observation;
 };
 
@@ -282,19 +256,8 @@ public:
     // this execution's files are read (O(job), not O(node)). Returns nullopt
     // when the hint cannot be resolved (process gone, parent is not the
     // expected manager); the caller then falls back to a full scan.
-    virtual std::optional<Observation> observeForHint(pid_t hint_pid) = 0;
+    virtual std::optional<Job> observeForHint(pid_t hint_pid) = 0;
 };
-
-// ---------------------------------------------------------------------------
-// Observation accumulation
-// ---------------------------------------------------------------------------
-
-// Merges per-candidate observations into one observation per execution
-// generation of a canonical identity. Complete observations with the same
-// identity AND the same manager identity are merged (member processes, cgroup
-// path, notes union). Incomplete observations are never merged, and two
-// different managers of one logical job stay separate so the registry can
-// reject the second generation explicitly instead of seeing a blended record.
 
 // ---------------------------------------------------------------------------
 // procfs / cgroup readers
@@ -349,10 +312,3 @@ bool read_cgroup_members(const std::string& cgroup_dir, std::vector<pid_t>& memb
 // sufficient, and no caller may upgrade a partial identity.
 ProcessIdentity read_process_identity(const std::string& proc_root,
                                       const std::string& boot_id, pid_t pid);
-
-// Fills canonical_identity / identity_complete / incomplete_reason from the
-// selector and generation an adapter has already filled in. `source_reasons`
-// are adapter-level facts (unreadable ad, missing env var) that make the
-// observation incomplete on top of unresolved identity/generation.
-void finalize_observation(Observation& observation,
-                          std::vector<std::string> source_reasons = {});

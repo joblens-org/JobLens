@@ -140,7 +140,7 @@ struct JobRegistryOptions {
     bool register_rpc = true;
     // --- heartbeat test seams (used instead of the config-driven adapters) --
     // Pre-built discovery sources to drive, with the adapter name each
-    // observation belongs to. When non-empty, the configuration is not
+    // discovered Job belongs to. When non-empty, the configuration is not
     // consulted and automatic selection stays disabled.
     std::vector<std::pair<std::string, IDiscoverySource*>> test_sources;
     // With this flag the heartbeat runs without reading Config (test wiring;
@@ -149,8 +149,6 @@ struct JobRegistryOptions {
     // Liveness probe overrides (empty = production /proc/cgroup probes).
     ProcessLivenessProbe test_process_probe;
     CgroupMembershipProbe test_cgroup_probe;
-    // Observation -> typed facts override (empty = the registered adapters).
-    std::function<Job(const Observation&)> test_facts_encoder;
     // Automatic-selection policy for test wiring (production builds it from
     // job_registry_config.inventory + <type>_job_watcher). The adapter name
     // below is the key it is armed under.
@@ -275,7 +273,7 @@ public:
     bool reconcileInventoryNow();
     // Discovery event entries (the sink the adapters get, exposed for tests
     // and out-of-band producers). Cheap and bounded: they only enqueue.
-    void onDiscoveryObservation(const Observation& observation);
+    void onDiscoveryObservation(const Job& job);
     // Kernel exit hint entry (cheap; schedules a coalesced refresh).
     void notifyExit(pid_t pid);
 
@@ -379,7 +377,7 @@ private:
     void eraseRecord(uint64_t id);
     void applyRecovered(const std::vector<JobRecord>& adopted,
                         const std::vector<uint64_t>& removed);
-    // Merge decision for one observation against the current record image
+    // Merge decision for one discovered Job against the current record image
     // (moved from the store): pure, no durable write and no publish. The
     // register/merge semantics of a repeated identity live here so every
     // caller gets the same result.
@@ -424,7 +422,7 @@ private:
     struct HeartbeatHint {
         enum class Kind { Observation = 0, Exit, Refresh };
         Kind kind = Kind::Observation;
-        Observation observation;
+        Job job;
         pid_t pid = 0;
     };
     struct AbsenceEntry {
@@ -472,11 +470,10 @@ private:
     // taking hb_mtx_.
     std::mutex pass_mtx_;
     std::unique_ptr<std::thread> heartbeat_thread_;
-    // Liveness probes (production or test-injected) and the observation ->
-    // typed-facts encoder. Set once during init, read during passes.
+    // Liveness probes (production or test-injected). Set once during init,
+    // read during passes.
     ProcessLivenessProbe process_probe_;
     CgroupMembershipProbe cgroup_probe_;
-    std::function<Job(const Observation&)> facts_encoder_;
     // Every discovery source the heartbeat drives (adapters or test sources),
     // populated by resolve_inventory_components().
     std::vector<std::pair<std::string, IDiscoverySource*>> hb_sources_;
@@ -496,8 +493,7 @@ private:
     void startHeartbeat();
     void heartbeatLoop();
     bool runPass(bool do_scan, bool wait);
-    void processObservation(const Observation& observation, std::set<uint64_t>& observed);
-    Job toJob(const Observation& observation) const;
+    void processObservation(const Job& job, std::set<uint64_t>& observed);
     void enqueueHint(HeartbeatHint hint);
     void requestRescan(const std::string& reason);
     bool rescanRequested() const;

@@ -135,7 +135,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         health_.rescan_requested = true;
     }
-    std::optional<Observation> observeForHint(pid_t hint) override
+    std::optional<Job> observeForHint(pid_t hint) override
     {
         // No remaining test drives the targeted hint path; the registry's
         // hint entry was removed with the watchers' self-registration loop.
@@ -165,16 +165,16 @@ public:
         health_.state = SourceState::Degraded;
         health_.last_error = error;
     }
-    // Delivers one observation through the installed sink (the producing
+    // Delivers one discovered Job through the installed sink (the producing
     // thread; the callback only enqueues).
-    void inject(const Observation& observation)
+    void inject(const Job& job)
     {
         ObservationSink sink;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             sink = sink_.on_observation;
         }
-        if (sink) sink(observation);
+        if (sink) sink(job);
     }
 
     int starts() const { std::lock_guard<std::mutex> lock(mutex_); return starts_; }
@@ -268,47 +268,53 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Observation helpers
-// ---------------------------------------------------------------------------
-
-Observation make_condor_observation(const std::string& native,
-                                    pid_t manager_pid,
-                                    std::uint64_t manager_ticks,
-                                    const std::string& cluster = "htcondor01",
-                                    const std::string& tag = "schedd-a",
-                                    const std::string& cgroup = "",
-                                    const std::vector<pid_t>& members = {})
+// Discovery fixtures: discovered Jobs carry typed facts plus the execution
+// evidence group, exactly like the watchers build them.
+Job make_condor_job(const std::string& native,
+                    pid_t manager_pid,
+                    std::uint64_t manager_ticks,
+                    const std::string& cluster = "htcondor01",
+                    const std::string& tag = "schedd-a",
+                    const std::string& cgroup = "",
+                    const std::vector<pid_t>& members = {})
 {
-    Observation observation;
-    observation.adapter = "condor";
-    observation.selector.adapter = "condor";
-    observation.selector.cluster_name = cluster;
-    observation.selector.cluster_tag = tag;
-    observation.selector.native_job_id = native;
-    observation.generation.boot_id = "boot-aaa";
-    observation.generation.manager_pid = manager_pid;
-    observation.generation.manager_start_ticks = manager_ticks;
-    observation.generation.cgroup_identity = cgroup;
-    observation.cgroup_path = cgroup;
-    observation.owner = "alice";
-    observation.scheduler_host = "htcondor01";
+    Job job;
+    job.subtype_name = "condor";
+    job.jobtype = JobType::Job;
+    job.subtype = JobSubType::Condor;
+    job.cluster_name = cluster;
+    job.clusterTag = tag;
+    job.NativeJobID = native;
+    CondorJobAttr attributes{};
+    attributes.auto_update_child = false;
+    attributes.starter_pid = manager_pid;
+    attributes.scheduler_host = "htcondor01";
+    attributes.scheduler_name = tag;
+    attributes.slots_cgroup_path = cgroup;
+    attributes.owner = "alice";
+    attributes.collector_host = cluster;
+    job.sub_attr = attributes;
+    JobExecution& execution = job.execution.emplace();
+    execution.generation.boot_id = "boot-aaa";
+    execution.generation.manager_pid = manager_pid;
+    execution.generation.manager_start_ticks = manager_ticks;
+    execution.generation.cgroup_identity = cgroup;
     for (const pid_t member : members) {
-        observation.members.push_back(ProcessIdentity{member, manager_ticks, "boot-aaa"});
+        execution.members.push_back(ProcessIdentity{member, manager_ticks, "boot-aaa"});
     }
-    finalize_observation(observation);
-    return observation;
+    finalize_discovery_job(job);
+    return job;
 }
 
-Observation make_unresolved_observation(const std::string& native, pid_t manager_pid)
+Job make_unresolved_job(const std::string& native, pid_t manager_pid)
 {
-    Observation observation = make_condor_observation(native, manager_pid, 900000);
-    observation.selector.cluster_name.clear();
-    observation.incomplete_reason.clear();
-    finalize_observation(observation);
-    return observation;
+    Job job = make_condor_job(native, manager_pid, 900000);
+    job.cluster_name.clear();
+    finalize_discovery_job(job);
+    return job;
 }
 
-ScanResult scan_with(std::vector<Observation> observations, bool complete = true,
+ScanResult scan_with(std::vector<Job> jobs, bool complete = true,
                      const std::string& error = "")
 {
     ScanResult result;
@@ -316,43 +322,13 @@ ScanResult scan_with(std::vector<Observation> observations, bool complete = true
     result.error = error;
     result.started_at_ms = 10;
     result.finished_at_ms = 11;
-    result.observations = std::move(observations);
-    for (const auto& observation : result.observations) {
-        if (observation.identity_complete) ++result.counts.complete;
+    result.jobs = std::move(jobs);
+    for (const auto& job : result.jobs) {
+        if (discovery_job_ready(job)) ++result.counts.complete;
         else ++result.counts.incomplete;
     }
-    result.counts.candidates = result.observations.size();
+    result.counts.candidates = result.jobs.size();
     return result;
-}
-
-// The observation -> facts encoding the adapters normally provide. The store
-// normalizes identity fields, so the shape matches the v1 fallback encoder.
-Job encode_test_facts(const Observation& observation)
-{
-    Job facts;
-    facts.jobtype = JobType::Job;
-    if (observation.adapter == "condor") {
-        facts.subtype = JobSubType::Condor;
-        CondorJobAttr attributes{};
-        attributes.auto_update_child = false;
-        attributes.starter_pid = observation.generation.manager_pid;
-        attributes.scheduler_host = observation.scheduler_host;
-        attributes.scheduler_name = observation.selector.cluster_tag;
-        attributes.slots_cgroup_path = observation.cgroup_path;
-        attributes.owner = observation.owner;
-        attributes.collector_host = observation.selector.cluster_name;
-        facts.sub_attr = attributes;
-    } else if (observation.adapter == "slurm") {
-        facts.subtype = JobSubType::Slurm;
-        SlurmJobAttr attributes{};
-        attributes.auto_update_child = false;
-        attributes.stepd_pid = observation.generation.manager_pid;
-        attributes.cluster_name = observation.selector.cluster_name;
-        attributes.cgroup_path = observation.cgroup_path;
-        attributes.user = observation.owner;
-        facts.sub_attr = attributes;
-    }
-    return facts;
 }
 
 JobRegistryOptions heartbeat_options(const std::string& path, FakeSource& source,
@@ -366,7 +342,6 @@ JobRegistryOptions heartbeat_options(const std::string& path, FakeSource& source
     options.test_sources = {{"condor", &source}};
     options.test_process_probe = probes.process_probe();
     options.test_cgroup_probe = probes.cgroup_probe();
-    options.test_facts_encoder = encode_test_facts;
     options.test_heartbeat = true;
     return options;
 }
@@ -381,7 +356,6 @@ JobRegistryOptions legacy_heartbeat_options(const std::string& path, FakeProbes&
     options.enable_inventory_maintenance = true;
     options.test_process_probe = probes.process_probe();
     options.test_cgroup_probe = probes.cgroup_probe();
-    options.test_facts_encoder = encode_test_facts;
     options.test_heartbeat = true;
     return options;
 }
@@ -531,8 +505,8 @@ void run_a08(const std::string& base)
 {
     FakeSource source("condor");
     FakeProbes probes;
-    const Observation scanned =
-        make_condor_observation("100.0", 5100, 554, "htcondor01", "schedd-a", "/cg/slot-2");
+    const Job scanned =
+        make_condor_job("100.0", 5100, 554, "htcondor01", "schedd-a", "/cg/slot-2");
     probes.set_process(5100, LivenessState::Alive, 554);
     source.set_scan([&]() { return scan_with({scanned}); });
     JobRegistry registry(heartbeat_options(fresh_dir(base, "a08"), source, probes));
@@ -544,8 +518,8 @@ void run_a08(const std::string& base)
 
     // An event buffered during the initial pass is committed by the pass that
     // drains it, through the same upsert path.
-    const Observation injected =
-        make_condor_observation("101.0", 5101, 555, "htcondor01", "schedd-a", "/cg/slot-2");
+    const Job injected =
+        make_condor_job("101.0", 5101, 555, "htcondor01", "schedd-a", "/cg/slot-2");
     source.inject(injected);
     check(wait_until([&]() { return find_native(registry, "101.0").has_value(); }, 5000),
           "A08: buffered event during the scan was not merged");
@@ -578,8 +552,8 @@ void run_a08(const std::string& base)
           "A08: obsolete hint resurrected an ended generation");
 
     // A new generation for the same identity registers as a new instance.
-    const Observation revived =
-        make_condor_observation("101.0", 5102, 556, "htcondor01", "schedd-a", "/cg/slot-2");
+    const Job revived =
+        make_condor_job("101.0", 5102, 556, "htcondor01", "schedd-a", "/cg/slot-2");
     probes.set_process(5102, LivenessState::Alive, 556);
     source.set_scan([&]() { return scan_with({revived}); });
     check(registry.reconcileInventoryNow(), "A08: the revival pass did not run");
@@ -602,8 +576,8 @@ void run_a09(const std::string& base)
     {
         FakeSource source("condor");
         FakeProbes probes;
-        const Observation job =
-            make_condor_observation("200.0", 5200, 666, "htcondor01", "schedd-a", "/cg/slot-1");
+        const Job job =
+            make_condor_job("200.0", 5200, 666, "htcondor01", "schedd-a", "/cg/slot-1");
         int pass = 0;
         source.set_scan([&]() {
             ++pass;
@@ -627,8 +601,8 @@ void run_a09(const std::string& base)
     {
         FakeSource source("condor");
         FakeProbes probes;
-        const Observation job =
-            make_condor_observation("210.0", 5301, 777, "htcondor01", "schedd-a", "/cg/slot-2");
+        const Job job =
+            make_condor_job("210.0", 5301, 777, "htcondor01", "schedd-a", "/cg/slot-2");
         int pass = 0;
         source.set_scan([&]() {
             ++pass;
@@ -652,8 +626,8 @@ void run_a09(const std::string& base)
     {
         FakeSource source("condor");
         FakeProbes probes;
-        const Observation job =
-            make_condor_observation("220.0", 5300, 666, "htcondor01", "schedd-a", "/cg/slot-3");
+        const Job job =
+            make_condor_job("220.0", 5300, 666, "htcondor01", "schedd-a", "/cg/slot-3");
         int pass = 0;
         source.set_scan([&]() {
             ++pass;
@@ -690,8 +664,8 @@ void run_a10(const std::string& base)
 {
     FakeSource source("condor");
     FakeProbes probes;
-    const Observation job =
-        make_condor_observation("300.0", 5400, 777, "htcondor01", "schedd-a", "/cg/slot-4");
+    const Job job =
+        make_condor_job("300.0", 5400, 777, "htcondor01", "schedd-a", "/cg/slot-4");
     source.set_scan([&]() { return scan_with({job}); });
     JobRegistry registry(heartbeat_options(fresh_dir(base, "a10"), source, probes));
 
@@ -741,8 +715,8 @@ void run_a11(const std::string& base)
     FakeSource source("condor");
     FakeProbes probes;
     JobRegistry registry(heartbeat_options(fresh_dir(base, "a11"), source, probes));
-    const Observation job =
-        make_condor_observation("400.0", 5500, 888, "htcondor01", "schedd-a", "/cg/slot-5");
+    const Job job =
+        make_condor_job("400.0", 5500, 888, "htcondor01", "schedd-a", "/cg/slot-5");
 
     bool first = true;
     source.set_scan([&]() {
@@ -765,8 +739,8 @@ void run_a11(const std::string& base)
 
     // An unresolved namespace cannot be indexed, is counted as incomplete and
     // is retried once the namespace resolves.
-    const Observation unresolved = make_unresolved_observation("401.0", 5501);
-    check(!unresolved.identity_complete, "A11: fixture should be incomplete");
+    const Job unresolved = make_unresolved_job("401.0", 5501);
+    check(!discovery_job_ready(unresolved), "A11: fixture should be incomplete");
     registry.onDiscoveryObservation(unresolved);
     registry.reconcileInventoryNow();
     check(!find_native(registry, "401.0").has_value(),
@@ -775,8 +749,8 @@ void run_a11(const std::string& base)
           "A11: incomplete observation was not reported");
     check(count_records(registry) == 1, "A11: an incomplete identity created a record");
 
-    const Observation resolved =
-        make_condor_observation("401.0", 5501, 999, "htcondor01", "schedd-a", "/cg/slot-6");
+    const Job resolved =
+        make_condor_job("401.0", 5501, 999, "htcondor01", "schedd-a", "/cg/slot-6");
     // The manager is live; the empty scans must not retire it (absence is not
     // the subject of this case).
     probes.set_process(5501, LivenessState::Alive, 999);
@@ -787,13 +761,13 @@ void run_a11(const std::string& base)
     check(count_records(registry) == 2, "A11: retry duplicated or merged records");
 
     // A namespace-less observation must never merge into another namespace.
-    registry.onDiscoveryObservation(make_unresolved_observation("400.0", 5502));
+    registry.onDiscoveryObservation(make_unresolved_job("400.0", 5502));
     registry.reconcileInventoryNow();
     check(count_records(registry) == 2, "A11: an unresolved identity merged into a record");
 
     // A second cluster namespace with the same native id stays distinct.
-    const Observation other_cluster =
-        make_condor_observation("400.0", 5600, 1111, "htcondor02", "schedd-b", "/cg/slot-7");
+    const Job other_cluster =
+        make_condor_job("400.0", 5600, 1111, "htcondor02", "schedd-b", "/cg/slot-7");
     probes.set_process(5600, LivenessState::Alive, 1111);
     registry.onDiscoveryObservation(other_cluster);
     registry.reconcileInventoryNow();
@@ -817,10 +791,10 @@ void run_a12(const std::string& base)
     FakeProbes probes;
     JobRegistry registry(heartbeat_options(fresh_dir(base, "a12"), source, probes));
 
-    const Observation alpha =
-        make_condor_observation("500.0", 5700, 1212, "htcondor01", "schedd-a", "/cg/slot-8");
-    const Observation beta =
-        make_condor_observation("501.0", 5701, 1313, "htcondor01", "schedd-a", "/cg/slot-9");
+    const Job alpha =
+        make_condor_job("500.0", 5700, 1212, "htcondor01", "schedd-a", "/cg/slot-8");
+    const Job beta =
+        make_condor_job("501.0", 5701, 1313, "htcondor01", "schedd-a", "/cg/slot-9");
 
     // Block a pass inside the source scan, then overflow the queue from the
     // producer side.
@@ -877,8 +851,8 @@ void run_a13(const std::string& base)
           "A13: a scan-only source was not reported");
     check(status["state"] != "stopped", "A13: the heartbeat did not run");
 
-    const Observation job =
-        make_condor_observation("600.0", 5800, 1414, "htcondor01", "schedd-a", "/cg/slot-10");
+    const Job job =
+        make_condor_job("600.0", 5800, 1414, "htcondor01", "schedd-a", "/cg/slot-10");
     bool first = true;
     source.set_scan([&]() {
         if (first) {
@@ -907,8 +881,8 @@ void run_a14(const std::string& base)
 {
     FakeSource source("condor");
     FakeProbes probes;
-    const Observation old_job =
-        make_condor_observation("700.0", 5900, 1515, "htcondor01", "schedd-a", "/cg/slot-11");
+    const Job old_job =
+        make_condor_job("700.0", 5900, 1515, "htcondor01", "schedd-a", "/cg/slot-11");
     source.set_scan([&]() { return scan_with({old_job}); });
     JobRegistry registry(heartbeat_options(fresh_dir(base, "a14"), source, probes));
 
@@ -944,8 +918,8 @@ void run_a14(const std::string& base)
 
     // A new job reuses the same PID and cgroup path while the old record is
     // still closing.
-    const Observation new_job =
-        make_condor_observation("700.1", 5900, 1616, "htcondor01", "schedd-a", "/cg/slot-11");
+    const Job new_job =
+        make_condor_job("700.1", 5900, 1616, "htcondor01", "schedd-a", "/cg/slot-11");
     source.set_scan([&]() { return scan_with({new_job}); });
     registry.reconcileInventoryNow();
 
@@ -989,10 +963,10 @@ void run_a23(const std::string& base)
     FakeProbes probes;
     JobRegistry registry(heartbeat_options(fresh_dir(base, "a23"), source, probes));
 
-    const Observation first =
-        make_condor_observation("800.0", 6000, 1717, "htcondor01", "schedd-a", "/cg/slot-12");
-    const Observation second =
-        make_condor_observation("801.0", 6001, 1818, "htcondor01", "schedd-a", "/cg/slot-13");
+    const Job first =
+        make_condor_job("800.0", 6000, 1717, "htcondor01", "schedd-a", "/cg/slot-12");
+    const Job second =
+        make_condor_job("801.0", 6001, 1818, "htcondor01", "schedd-a", "/cg/slot-13");
     std::atomic<int> mutate{0};
     source.set_scan([&]() {
         if (mutate.load() % 2 == 0) return scan_with({first, second});
@@ -1150,7 +1124,7 @@ void run_a25(const std::string& base)
         std::vector<uint64_t> removed;
         uint64_t closing_id = 0;
         {
-            const Observation job = make_condor_observation(
+            const Job job = make_condor_job(
                 "900.0", 6100, 1919, "htcondor01", "schedd-a", "/cg/slot-14");
             source.set_scan([&]() { return scan_with({job}); });
             JobRegistry registry(heartbeat_options(path, source, probes));
@@ -1211,8 +1185,8 @@ void run_a28(const std::string& base)
     FakeSource source("condor");
     FakeProbes probes;
     JobRegistry registry(heartbeat_options(fresh_dir(base, "a28"), source, probes));
-    const Observation job =
-        make_condor_observation("600.0", 5800, 1414, "htcondor01", "schedd-a", "/cg/slot-10");
+    const Job job =
+        make_condor_job("600.0", 5800, 1414, "htcondor01", "schedd-a", "/cg/slot-10");
 
     bool first = true;
     source.set_scan([&]() {
@@ -1311,21 +1285,15 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
     const pid_t child_pid = 8200;
     const std::string cgroup = "/cg/slot-81";
 
-    Observation job;
-    job.adapter = "condor";
-    job.selector.adapter = "condor";
-    job.selector.cluster_name = "htcondor01";
-    job.selector.cluster_tag = "schedd-a";
-    job.selector.native_job_id = "810.0";
-    job.generation.boot_id = boot;
-    job.generation.manager_pid = manager_pid;
-    job.generation.manager_start_ticks = 181818;
-    job.generation.cgroup_identity = cgroup;
-    job.cgroup_path = cgroup;
-    job.owner = "alice";
-    job.scheduler_host = "htcondor01";
-    job.members.push_back(ProcessIdentity{child_pid, 191919, boot});
-    finalize_observation(job);
+    Job job = make_condor_job("810.0", manager_pid, 181818,
+                              "htcondor01", "schedd-a", cgroup);
+    // The restore path validates against the CURRENT boot, so the fixture
+    // must carry the real one; the member models a live child under an alive
+    // manager with its own start time.
+    job.execution->generation.boot_id = boot;
+    job.execution->members.clear();
+    job.execution->members.push_back(ProcessIdentity{child_pid, 191919, boot});
+    finalize_discovery_job(job);
 
     {
         FakeSource source("condor");
@@ -1355,7 +1323,6 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
         options.enable_inventory_maintenance = false;
         options.test_process_probe = probes.process_probe();
         options.test_cgroup_probe = probes.cgroup_probe();
-        options.test_facts_encoder = encode_test_facts;
         options.test_heartbeat = true;
         JobRegistry registry(options);
 
@@ -1418,8 +1385,8 @@ void run_rescan(const std::string& base)
 {
     FakeSource source("condor");
     FakeProbes probes;
-    const Observation job =
-        make_condor_observation("950.0", 9100, 191919, "htcondor01", "schedd-a", "/cg/slot-95");
+    const Job job =
+        make_condor_job("950.0", 9100, 191919, "htcondor01", "schedd-a", "/cg/slot-95");
     source.set_scan([&]() { return scan_with({job}); });
     JobRegistry registry(heartbeat_options(fresh_dir(base, "rescan"), source, probes));
     check(find_native(registry, "950.0").has_value(), "rescan: initial scan missing");

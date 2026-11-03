@@ -225,19 +225,20 @@ DiscoveryOptions fixture_options(const Fixture& fixture,
     return options;
 }
 
-const Observation* find_complete(const ScanResult& result, const std::string& native_job_id)
+const Job* find_complete(const ScanResult& result, const std::string& native_job_id)
 {
-    for (const auto& observation : result.observations) {
-        if (observation.identity_complete && observation.selector.native_job_id == native_job_id)
-            return &observation;
+    for (const auto& job : result.jobs) {
+        if (discovery_job_ready(job) && job.NativeJobID == native_job_id)
+            return &job;
     }
     return nullptr;
 }
 
-std::vector<pid_t> member_pids(const Observation& observation)
+std::vector<pid_t> member_pids(const Job& job)
 {
     std::vector<pid_t> pids;
-    for (const auto& member : observation.members) pids.push_back(member.pid);
+    if (job.execution)
+        for (const auto& member : job.execution->members) pids.push_back(member.pid);
     return pids;
 }
 
@@ -254,7 +255,7 @@ bool has_source_note(const ScanResult& result)
     return false;
 }
 
-// A DiscoverySink carrying only an observation callback (the fixture has no
+// A DiscoverySink carrying only a scan callback (the fixture has no
 // eBPF, so no exec hints can arrive).
 DiscoverySink scan_sink(ObservationSink on_observation)
 {
@@ -286,37 +287,43 @@ void condor_scan_finds_fixture_job(const Fixture& fixture)
               std::to_string(result.counts.incomplete));
     check(has_source_note(result),
           "an unavailable/disabled eBPF event source must be reported as an explicit note");
-    // Every observation carries a process-monotonic read order, assigned before
-    // the builder reads, so the store can reject an older pass (plan §4.1).
-    for (const auto& observation : result.observations)
-        check(observation.read_order > 0,
-              "a discovery observation must carry a read order");
+    // Every discovered Job carries a process-monotonic read order, assigned
+    // before the builder reads, so the store can reject an older pass
+    // (plan §4.1).
+    for (const auto& discovered : result.jobs)
+        check(discovered.execution && discovered.execution->read_order > 0,
+              "a discovered Job must carry a read order");
 
     const auto* job = find_complete(result, "76226337.0");
-    check(job != nullptr, "the fixture Condor job must be a complete observation");
-    check(job->adapter == "condor", "scheduler type must be condor");
-    check(job->canonical_identity.has_value(), "complete observation carries a canonical identity");
-    check(job->canonical_identity->key() ==
-              "condor|htcondor-fixture@scheduler@schedd07.fixture|76226337.0",
+    check(job != nullptr, "the fixture Condor job must be a complete discovery");
+    check(job->subtype_name == "condor", "scheduler type must be condor");
+    const auto identity = canonicalize(selector_of(*job));
+    check(identity.has_value(), "a ready discovery resolves a canonical identity");
+    check(identity->key() == "condor|htcondor-fixture@scheduler@schedd07.fixture|76226337.0",
           "canonical key must keep cluster namespace, schedd tag and native id, got " +
-              job->canonical_identity->key());
-    check(job->selector.cluster_tag == "scheduler@schedd07.fixture",
+              identity->key());
+    check(job->clusterTag == "scheduler@schedd07.fixture",
           "the schedd namespace must come from the job ad");
-    check(job->incomplete_reason.empty(), "a complete observation has no incomplete reason");
-    check(job->generation.manager_pid == 4101 && job->generation.manager_start_ticks == 7001,
+    check(job->execution->incomplete_reason.empty(),
+          "a complete discovery has no incomplete reason");
+    check(job->execution->generation.manager_pid == 4101 &&
+              job->execution->generation.manager_start_ticks == 7001,
           "manager pid/start ticks must identify the executing condor_starter");
-    check(job->generation.boot_id == "boot-fixture-0001", "generation must carry the boot id");
-    check(job->generation.complete(), "generation evidence must be complete");
-    check(job->cgroup_path == (fixture.cgroup / "htcondor" / "slot1").string(),
-          "the slot cgroup path must be discovered, got " + job->cgroup_path);
-    check(job->members_complete, "member process identities must be complete");
+    check(job->execution->generation.boot_id == "boot-fixture-0001",
+          "generation must carry the boot id");
+    check(job->execution->generation.complete(), "generation evidence must be complete");
+    const auto& condor_attr = std::get<CondorJobAttr>(job->sub_attr);
+    check(condor_attr.slots_cgroup_path == (fixture.cgroup / "htcondor" / "slot1").string(),
+          "the slot cgroup path must be discovered, got " + condor_attr.slots_cgroup_path);
+    check(job->execution->members_authoritative, "member process identities must be complete");
     const auto members = member_pids(*job);
     check(members.size() == 2 && members[0] == 4110 && members[1] == 4111,
           "members are the slot cgroup processes without the starter");
-    check(job->owner == "alice", "owner must come from the job ad");
-    check(job->scheduler_host == "schedd07.fixture", "schedd host must come from the job ad");
-    check(job->source_timestamp_ms == kFakeNowMs,
-          "the injected clock must stamp the observation");
+    check(condor_attr.owner == "alice", "owner must come from the job ad");
+    check(condor_attr.scheduler_host == "schedd07.fixture",
+          "schedd host must come from the job ad");
+    check(job->execution->read_at_us == kFakeNowMs * 1000,
+          "the injected clock must stamp the discovery");
 
     const auto health = watcher.health();
     check(health.state == SourceState::Healthy, "a successful scan makes the source healthy");
@@ -333,22 +340,20 @@ void condor_incomplete_observations_are_explicit(const Fixture& fixture)
 
     bool saw_unreadable_ad = false;
     bool saw_missing_global_job_id = false;
-    for (const auto& observation : result.observations) {
-        if (observation.identity_complete) continue;
-        check(!observation.incomplete_reason.empty(),
-              "an incomplete observation must always explain why");
-        check(observation.selector.native_job_id.empty(),
+    for (const auto& discovered : result.jobs) {
+        if (discovery_job_ready(discovered)) continue;
+        check(!discovered.execution->incomplete_reason.empty(),
+              "an incomplete discovery must always explain why");
+        check(discovered.NativeJobID.empty(),
               "no native job id may be synthesized for an unreadable ad");
-        check(!observation.canonical_identity ||
-                  !observation.canonical_identity->native_job_id.empty(),
-              "an incomplete observation must never carry a guessed identity");
-        check(!observation.identity_complete || observation.generation.complete(),
-              "identity completeness implies a complete generation");
-        if (contains(observation.incomplete_reason, "unreadable") &&
-            contains(observation.incomplete_reason, "missing.ad")) {
+        const auto ident = canonicalize(selector_of(discovered));
+        check(!ident || !ident->native_job_id.empty(),
+              "an incomplete discovery must never carry a guessed identity");
+        if (contains(discovered.execution->incomplete_reason, "unreadable") &&
+            contains(discovered.execution->incomplete_reason, "missing.ad")) {
             saw_unreadable_ad = true;
         }
-        if (contains(observation.incomplete_reason, "no GlobalJobId")) {
+        if (contains(discovered.execution->incomplete_reason, "no GlobalJobId")) {
             saw_missing_global_job_id = true;
         }
     }
@@ -375,41 +380,46 @@ void slurm_scan_finds_fixture_job(const Fixture& fixture)
     check(result.counts.skipped >= 1, "a non job<id> spool entry must be counted as skipped");
 
     const auto* job = find_complete(result, "9002");
-    check(job != nullptr, "the fixture Slurm job must be a complete observation");
-    check(job->adapter == "slurm", "scheduler type must be slurm");
-    check(job->selector.step_id == "3", "step id must be the normalized member step");
-    check(job->canonical_identity &&
-              job->canonical_identity->key() == "slurm|slurm-fixture|9002|3",
+    check(job != nullptr, "the fixture Slurm job must be a complete discovery");
+    check(job->subtype_name == "slurm", "scheduler type must be slurm");
+    check(job->execution->step_id && *job->execution->step_id == "3",
+          "step id must be the normalized member step");
+    const auto slurm_identity = canonicalize(selector_of(*job));
+    check(slurm_identity && slurm_identity->key() == "slurm|slurm-fixture|9002|3",
           "canonical key must keep cluster, job id and step");
-    check(job->generation.manager_pid == 5101 && job->generation.manager_start_ticks == 8001,
+    check(job->execution->generation.manager_pid == 5101 &&
+              job->execution->generation.manager_start_ticks == 8001,
           "manager pid/start ticks must identify the executing slurmstepd");
-    check(job->cgroup_path == (fixture.cgroup / "slurm" / "job_9002" / "step_3").string(),
-          "the step cgroup path must be discovered, got " + job->cgroup_path);
+    const auto& slurm_attr = std::get<SlurmJobAttr>(job->sub_attr);
+    check(slurm_attr.cgroup_path ==
+              (fixture.cgroup / "slurm" / "job_9002" / "step_3").string(),
+          "the step cgroup path must be discovered, got " + slurm_attr.cgroup_path);
     const auto members = member_pids(*job);
     check(members.size() == 2 && members[0] == 5110 && members[1] == 5111,
           "members are the step processes without slurmstepd");
-    check(job->owner == "alice" && job->job_name == "demo" && job->partition == "debug",
+    check(slurm_attr.user == "alice" && slurm_attr.job_name == "demo" &&
+              slurm_attr.partition == "debug",
           "scheduler metadata must come from the members' environment");
 
     bool saw_unattributable_stepd = false;
     bool saw_spool_entry = false;
-    for (const auto& observation : result.observations) {
-        if (observation.identity_complete) continue;
-        check(!observation.incomplete_reason.empty(),
-              "an incomplete slurm observation must explain itself");
-        if (contains(observation.incomplete_reason, "no attributable job members"))
+    for (const auto& discovered : result.jobs) {
+        if (discovery_job_ready(discovered)) continue;
+        check(!discovered.execution->incomplete_reason.empty(),
+              "an incomplete slurm discovery must explain itself");
+        if (contains(discovered.execution->incomplete_reason, "no attributable job members"))
             saw_unattributable_stepd = true;
-        if (observation.selector.native_job_id == "9001") {
-            check(contains(observation.incomplete_reason, "no live slurmstepd"),
+        if (discovered.NativeJobID == "9001") {
+            check(contains(discovered.execution->incomplete_reason, "no live slurmstepd"),
                   "a spool entry without a live stepd must say so, got " +
-                      observation.incomplete_reason);
-            check(!observation.canonical_identity,
+                      discovered.execution->incomplete_reason);
+            check(!canonicalize(selector_of(discovered)),
                   "a spool entry must not claim a canonical identity");
             saw_spool_entry = true;
         }
     }
     check(saw_unattributable_stepd,
-          "a slurmstepd without attributable members must be an incomplete observation");
+          "a slurmstepd without attributable members must be an incomplete discovery");
     check(saw_spool_entry, "a spool directory without a live stepd must be observed as incomplete");
 }
 
@@ -423,7 +433,7 @@ void health_degrades_and_recovers(const Fixture& fixture)
     const auto failed = watcher.scan();
     check(!failed.ok(), "scan against a missing proc root must fail");
     check(!failed.complete, "a failed scan is never complete");
-    check(failed.observations.empty(), "a failed scan must not invent observations");
+    check(failed.jobs.empty(), "a failed scan must not invent discoveries");
     check(contains(failed.error, "missing-proc"), "the scan error must name the missing root");
 
     auto health = watcher.health();
@@ -470,15 +480,15 @@ void observe_hint_targets_one_execution(const Fixture& fixture)
 {
     CondorJobWatcher condor(fixture_options(fixture));
     // 4110 is a member process whose parent is the starter 4101.
-    const auto observation = condor.observeForHint(4110);
-    check(observation.has_value(), "a hint under a starter must resolve");
-    check(observation->identity_complete, "the targeted observation must be complete");
-    check(observation->selector.native_job_id == "76226337.0",
-          "the targeted observation must name the fixture job");
-    check(observation->generation.manager_pid == 4101,
+    const auto targeted = condor.observeForHint(4110);
+    check(targeted.has_value(), "a hint under a starter must resolve");
+    check(discovery_job_ready(*targeted), "the targeted discovery must be ready");
+    check(targeted->NativeJobID == "76226337.0",
+          "the targeted discovery must name the fixture job");
+    check(targeted->execution->generation.manager_pid == 4101,
           "the manager is the hint's parent (the starter)");
-    check(member_pids(*observation).size() == 2,
-          "the targeted observation keeps the cgroup member list");
+    check(member_pids(*targeted).size() == 2,
+          "the targeted discovery keeps the cgroup member list");
 
     // Unresolvable hints fall back to the caller (full scan).
     check(!condor.observeForHint(9999).has_value(), "a dead pid must not resolve");
@@ -491,10 +501,12 @@ void observe_hint_targets_one_execution(const Fixture& fixture)
     // 5110's parent is the stepd 5101 of job 9002 step 3.
     const auto step = slurm.observeForHint(5110);
     check(step.has_value(), "a hint under a stepd must resolve");
-    check(step->identity_complete, "the targeted slurm observation must be complete");
-    check(step->selector.native_job_id == "9002" && step->selector.step_id == "3",
-          "the targeted slurm observation must name job and step");
-    check(step->generation.manager_pid == 5101, "the manager is the hint's parent (the stepd)");
+    check(discovery_job_ready(*step), "the targeted slurm discovery must be ready");
+    check(step->NativeJobID == "9002" && step->execution->step_id &&
+              *step->execution->step_id == "3",
+          "the targeted slurm discovery must name job and step");
+    check(step->execution->generation.manager_pid == 5101,
+          "the manager is the hint's parent (the stepd)");
 }
 
 void polymorphic_source_interface(const Fixture& fixture)
@@ -536,7 +548,7 @@ void lifecycle_is_safe(const Fixture& fixture)
     check(delivered.load() == 0,
           "no callback may run before start(): the sink is a start() argument");
 
-    check(watcher.start(scan_sink([&delivered](const Observation&) { delivered.fetch_add(1); })),
+    check(watcher.start(scan_sink([&delivered](const Job&) { delivered.fetch_add(1); })),
           "start() must run with a scan interval even without eBPF");
     check(watcher.polling(), "start() must report polling");
     check(watcher.thread_joinable(), "start() must own a joinable poll thread");
@@ -554,7 +566,7 @@ void lifecycle_is_safe(const Fixture& fixture)
     watcher.stop();  // idempotent
     check(!watcher.thread_joinable(), "a second stop() must stay a no-op");
 
-    check(watcher.start(scan_sink([&delivered](const Observation&) { delivered.fetch_add(1); })),
+    check(watcher.start(scan_sink([&delivered](const Job&) { delivered.fetch_add(1); })),
           "start() after stop() must work");
     check(watcher.polling(), "restart must poll again");
     watcher.stop();
@@ -566,7 +578,7 @@ void lifecycle_is_safe(const Fixture& fixture)
 
     // Nothing to poll: no event source and no interval.
     CondorJobWatcher idle(fixture_options(fixture));
-    check(!idle.start(scan_sink([](const Observation&) {})),
+    check(!idle.start(scan_sink([](const Job&) {})),
           "start() must refuse to spin a thread with no event source and no interval");
     check(!idle.polling(), "a refused start() must not report polling");
     idle.stop();
@@ -577,7 +589,7 @@ void lifecycle_is_safe(const Fixture& fixture)
     slurm_options.scan_interval_ms = 20;
     SlurmJobWatcher slurm(slurm_options);
     std::atomic<int> slurm_delivered{0};
-    check(slurm.start(scan_sink([&slurm_delivered](const Observation&) { slurm_delivered.fetch_add(1); })),
+    check(slurm.start(scan_sink([&slurm_delivered](const Job&) { slurm_delivered.fetch_add(1); })),
           "the Slurm adapter must start its scan thread");
     check(slurm.polling() && slurm.thread_joinable(), "the Slurm adapter owns a joined thread");
     const auto slurm_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -616,17 +628,20 @@ void condor_ad_on_member_process_is_found(const Fixture& fixture)
     const auto* job = find_complete(result, "76226340.0");
     check(job != nullptr,
           "an ad that lives on the job process must be discovered by the scan");
-    check(job->owner == "carol", "the ad metadata must come from the member's ad");
+    check(std::get<CondorJobAttr>(job->sub_attr).owner == "carol",
+          "the ad metadata must come from the member's ad");
 
     // The exec-hint path must prefer the hinted pid's own environment.
     CondorJobWatcher hints(fixture_options(fixture));
     const auto targeted = hints.observeForHint(4410);
     check(targeted.has_value(), "a hint for the job process must resolve");
-    check(targeted->identity_complete && targeted->selector.native_job_id == "76226340.0",
-          "the targeted observation must resolve the ad from the hinted pid");
+    check(discovery_job_ready(*targeted) && targeted->NativeJobID == "76226340.0",
+          "the targeted discovery must resolve the ad from the hinted pid");
     bool ad_note = false;
-    for (const auto& note : targeted->notes) {
-        if (contains(note, "_CONDOR_JOB_AD read from job process")) ad_note = true;
+    if (targeted->execution) {
+        for (const auto& note : targeted->execution->notes) {
+            if (contains(note, "_CONDOR_JOB_AD read from job process")) ad_note = true;
+        }
     }
     check(ad_note, "reading the ad from a member must stay visible in the notes");
 }
@@ -656,7 +671,7 @@ void condor_without_cgroup_still_resolves_members(const Fixture& fixture)
     check(members.size() == 2,
           "the starter's children must be discovered as members without a cgroup, got " +
               std::to_string(members.size()));
-    check(!job->members_complete,
+    check(!job->execution->members_authoritative,
           "members resolved without a cgroup must be reported as partial evidence");
 }
 

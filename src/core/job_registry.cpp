@@ -475,35 +475,10 @@ void JobRegistry::drainHints(std::deque<HeartbeatHint>& out) {
     }
 }
 
-Job JobRegistry::toJob(const Observation& observation) const {
-    // The Job is the registration unit (plan §4.1): facts plus one execution
-    // evidence group, no second envelope. The encoder still owns the
-    // scheduler-specific attribute projection.
-    Job job = facts_encoder_(observation);
-    job.subtype_name = observation.selector.adapter;
-    job.cluster_name = observation.selector.cluster_name;
-    job.clusterTag = observation.selector.cluster_tag;
-    job.NativeJobID = observation.selector.native_job_id;
-    JobExecution execution;
-    execution.generation = observation.generation;
-    execution.members = observation.members;
-    execution.members_authoritative = observation.members_complete;
-    if (!observation.selector.step_id.empty())
-        execution.step_id = observation.selector.step_id;
-    execution.read_at_us = observation.source_timestamp_ms > 0
-                               ? observation.source_timestamp_ms * 1000
-                               : 0;
-    execution.read_order = observation.read_order;
-    execution.incomplete_reason = observation.incomplete_reason;
-    job.execution = std::move(execution);
-    return job;
-}
-
-void JobRegistry::processObservation(const Observation& observation,
-                                     std::set<uint64_t>& observed) {
-    const auto identity = canonicalize(observation.selector);
-    if (identity && observation.generation.complete() &&
-        isObsolete(*identity, observation.generation)) {
+void JobRegistry::processObservation(const Job& job, std::set<uint64_t>& observed) {
+    const auto identity = canonicalize(selector_of(job));
+    const ExecutionGeneration generation = generation_of(job);
+    if (identity && generation.complete() && isObsolete(*identity, generation)) {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         ++hb_obsolete_hints_;
         spdlog::debug("JobRegistry: discarded hint for the ended execution of '{}'",
@@ -511,19 +486,23 @@ void JobRegistry::processObservation(const Observation& observation,
         return;
     }
 
-    if (!observation.identity_complete) {
+    // The old two-level readiness rule: resolvable identity AND complete
+    // execution generation.
+    const bool ready = identity && generation.complete();
+    if (!ready) {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         ++hb_incomplete_observations_;
-        spdlog::debug("JobRegistry: incomplete observation '{}': {}",
-                      observation.selector.native_job_id, observation.incomplete_reason);
+        spdlog::debug("JobRegistry: incomplete discovery '{}': {}",
+                      job.NativeJobID,
+                      job.execution ? job.execution->incomplete_reason : std::string{});
     }
 
-    const auto result = upsertObservedJob(toJob(observation));
+    const auto result = upsertObservedJob(job);
     if (result.ok) {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         observed.insert(result.internal_id);
         auto& entry = absences_[result.internal_id];
-        entry.generation = observation.generation;
+        entry.generation = generation;
         entry.complete_absences = 0;
         entry.last_seen_ms = clockNow();
         suspect_ids_.erase(result.internal_id);
@@ -543,8 +522,8 @@ void JobRegistry::processObservation(const Observation& observation,
         std::lock_guard<std::mutex> lock(hb_mtx_);
         ++hb_upsert_conflicts_;
         hb_last_error_ = result.error + (result.message.empty() ? "" : ": " + result.message);
-        spdlog::warn("JobRegistry: observation for '{}' rejected: {}",
-                     observation.selector.native_job_id, result.error);
+        spdlog::warn("JobRegistry: discovery for '{}' rejected: {}",
+                     job.NativeJobID, result.error);
         return;
     }
 
@@ -848,8 +827,8 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
 
     std::set<uint64_t> observed;
     for (const auto& entry : results) {
-        for (const auto& observation : entry.second.observations) {
-            processObservation(observation, observed);
+        for (const auto& job : entry.second.jobs) {
+            processObservation(job, observed);
         }
     }
 
@@ -858,7 +837,7 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
     bool needs_authoritative_pass = false;
     for (auto& hint : hints) {
         if (hint.kind == HeartbeatHint::Kind::Observation) {
-            processObservation(hint.observation, observed);
+            processObservation(hint.job, observed);
         } else {
             // Exit/refresh hints are cheap by design: they ask for one
             // coalesced authoritative pass instead of doing discovery I/O on
@@ -1008,18 +987,18 @@ void JobRegistry::startHeartbeat() {
 void JobRegistry::installHeartbeatSink() {
     // The sink entries are the same bounded producers tests and out-of-band
     // callers use; adapters go through them too.
-    heartbeat_sink_.on_observation = [this](const Observation& observation) {
-        onDiscoveryObservation(observation);
+    heartbeat_sink_.on_observation = [this](const Job& job) {
+        onDiscoveryObservation(job);
     };
-    // Event path: the source hands one resolved observation over on its own
+    // Event path: the source hands one discovered Job over on its own
     // poll thread and gets the registration result back. No worker, no queue,
     // and no fsync on this path.
-    heartbeat_sink_.on_job = [this](const Observation& observation) {
+    heartbeat_sink_.on_job = [this](const Job& job) {
         {
             std::lock_guard<std::mutex> lock(hb_mtx_);
             ++hb_events_received_;
         }
-        return upsertObservedJob(toJob(observation));
+        return upsertObservedJob(job);
     };
 }
 
@@ -1095,13 +1074,12 @@ void JobRegistry::init_inventory(const JobRegistryOptions& options)
 JobRegistry::InventoryWiring
 JobRegistry::resolve_inventory_components(const JobRegistryOptions& options)
 {
-    // Test wiring: pre-built sources, injected probes and encoder, no
-    // configuration and no automatic selection.
+    // Test wiring: pre-built sources and injected probes, no configuration
+    // and no automatic selection.
     if (!options.test_sources.empty() || options.test_heartbeat) {
         hb_sources_ = options.test_sources;
         process_probe_ = options.test_process_probe;
         cgroup_probe_ = options.test_cgroup_probe;
-        facts_encoder_ = options.test_facts_encoder;
         if (options.test_auto_policy) {
             auto_policies_.clear();
             auto_policies_[options.test_auto_policy_adapter] = options.test_auto_policy();
@@ -1168,16 +1146,10 @@ JobRegistry::resolve_inventory_components(const JobRegistryOptions& options)
     // registry dispatches through adapters_ itself while building record
     // images (see applyIdentityToFacts).
 
-    // Liveness probes and the adapter facts encoder.
+    // Liveness probes only: discovered Jobs arrive fully typed from the
+    // watchers, so there is no observation->facts encoder to wire.
     process_probe_ = make_proc_liveness_probe();
     cgroup_probe_ = make_cgroup_membership_probe();
-    facts_encoder_ = [this](const Observation& observation) -> Job {
-        for (const auto& adapter : adapters_) {
-            if (adapter->name() == observation.adapter)
-                return adapter->encodeFacts(observation);
-        }
-        return Job{};   // no adapter: facts stay empty, the store normalizes
-    };
 
     // Kernel attribution capability gate: only adapters with the trait
     // register into pid2job/cgroup2job; legacy/manual rows (unknown adapter)
@@ -1276,14 +1248,14 @@ void JobRegistry::stopInventoryDiscovery() {
         }
     }
 
-    // "Finish queued bounded maintenance": accepted observations are committed
+    // "Finish queued bounded maintenance": accepted discoveries are committed
     // while the store is still open, never silently discarded.
     std::deque<HeartbeatHint> hints;
     drainHints(hints);
     std::set<uint64_t> observed;
     for (auto& hint : hints) {
         if (hint.kind == HeartbeatHint::Kind::Observation)
-            processObservation(hint.observation, observed);
+            processObservation(hint.job, observed);
     }
     if (!hints.empty()) {
         spdlog::info("JobRegistry: discovery stopped, {} buffered hint(s) completed",
@@ -3484,10 +3456,10 @@ void JobRegistry::regRPCHandle() {
         });
 }
 
-void JobRegistry::onDiscoveryObservation(const Observation& observation) {
+void JobRegistry::onDiscoveryObservation(const Job& job) {
     HeartbeatHint hint;
     hint.kind = HeartbeatHint::Kind::Observation;
-    hint.observation = observation;
+    hint.job = job;
     enqueueHint(std::move(hint));
 }
 
