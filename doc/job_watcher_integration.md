@@ -57,14 +57,17 @@ What you get for free:
    attribute schema, identity format and capabilities.
 3. **Runtime:** the heartbeat drives the adapter's `IDiscoverySource`:
    periodic authoritative `scan()` passes, plus O(job) `observeForHint(pid)`
-   targeted passes fed by exec-event hints from the eBPF ring buffer.
-   Observations flow into the store; facts are encoded by the adapter.
+   targeted passes fed by exec-event hints from the eBPF ring buffer. Every
+   discovered **Job** carries its typed facts and one execution evidence
+   group, built by the watcher where it parses its sources; the registry
+   derives selector/identity on admission. There is no second envelope.
 
 Two structural rules govern the whole line:
 
-- An **Observation** either carries a canonical identity plus a complete
-  execution generation, or it is *explicitly incomplete* with reasons. There
-  is no best-effort middle state.
+- A discovered **Job** either is ready (resolvable canonical identity plus a
+  complete execution generation — `discovery_job_ready`) or is *explicitly
+  incomplete* with reasons on `job.execution->incomplete_reason`. There is no
+  best-effort middle state.
 - A **failed or partial scan is never "everything else ended"**:
   `ScanResult::complete` says whether the pass covered its sources; consumers
   must check it before treating absence as termination evidence.
@@ -76,18 +79,17 @@ Latency-critical discovery never waits for a heartbeat pass:
 1. The watcher's poll thread wakes the moment the kernel delivers the exec
    event (`ring_buffer__poll` blocks inside libbpf's epoll; no polling slice
    in between).
-2. `sink.on_exec_hint(pid)` lands in a bounded queue owned by the registry's
-   **ingest worker** — a dedicated thread, started with the heartbeat, that
-   resolves pids immediately: `observeForHint` → `processObservation` → store
-   upsert → lifecycle/attach. The heartbeat keeps scans, retirement and
-   reconciliation only.
+2. The poll thread resolves the pid itself (`observeForHint`) and registers
+   the discovered Job **synchronously on the same thread** through
+   `sink.on_job(job)`: store upsert → lifecycle/attach. No queue, no worker;
+   the heartbeat keeps scans, retirement and reconciliation only.
 3. Scheduler state may not be written yet at exec time (job ad, spool dir):
-   an **incomplete observation never creates a record**, but the ingest worker
-   retries it on a short ladder — **5 / 25 / 100 / 500 ms** — and only after
-   exhaustion requests one coalesced authoritative rescan. Before the ladder
-   this race fell back to the full reconcile interval (~30 s default).
-4. `JobRegistry/inventory_status` reports the pending fast-path work as
-   `exec_ingest_depth` (queue + retries).
+   an **incomplete discovery never creates a record**; the watcher requests
+   one coalesced authoritative rescan and the next pass converges it in tens
+   of milliseconds.
+4. `JobRegistry/inventory_status` keeps `exec_ingest_depth`,
+   `queue_depth` and `events_dropped` as deprecated constant-zero keys:
+   the ingest worker and the observation queue no longer exist.
 
 Deliberately **not** solved here (layer 2, needs its own design): events
 between the process's first instruction and the user-space `pid2job` seeding
@@ -112,40 +114,48 @@ changes the collector lifecycle contract.
 
 ### 3.2 Threading and the sink
 
-- The poll thread's only job is to drain the ring buffer and hand the **pid**
-  to `sink.on_exec_hint`. No `/proc` reads, no policy, no storage on the
-  polling thread — the plan forbids slow work on the producing path.
+- The poll thread drains the ring buffer, resolves each pid into a Job
+  (`observeForHint`) and registers it through `sink.on_job`. Registration
+  writes without a fence, so the callback never waits for persistence — but
+  it does the discovery I/O and the upsert inline, on purpose.
 - Sink callbacks are caller-owned code running on *your* thread: wrap them in
   try/catch so a throwing consumer cannot take the watcher down.
-- Expensive work (building observations, /proc I/O) belongs to the caller's
-  thread (`scan()`, `observeForHint()`), i.e. the registry heartbeat worker.
+- Discovery I/O (`/proc`, ad/spool reads) happens where the Job is built:
+  `scan()` on the heartbeat worker, `observeForHint()` on the poll thread.
 
-### 3.3 Building an `Observation`
+### 3.3 Building a discovered `Job`
 
-- `selector`: whatever native fields the source really provided, verbatim.
-  Never synthesize values.
+The Job is the registration unit: typed facts plus one `execution` evidence
+group, filled where the source parses its inputs. `JobID`, `JobPIDs` and
+`CollectorNames` stay empty — they are store/intent owned.
+
+- Identity fields (`subtype_name`, `cluster_name`, `clusterTag`,
+  `NativeJobID`, `execution->step_id`): whatever the source really provided,
+  verbatim. Never synthesize values.
 - Cluster namespace (e.g. `COLLECTOR_HOST`, `SLURM_CLUSTER_NAME`): explicit
   config override wins; otherwise derive from the source environment. **Never
   guessed from a native job number.** Unresolved namespace ⇒ incomplete
-  observation with a reason.
-- `generation`: manager pid + manager start ticks + boot id. All three or the
-  generation is incomplete.
-- `members`: prefer the execution cgroup's `cgroup.procs` — a *successful read
-  including an empty list is authoritative* (`members_complete = true`). Fall
-  back to manager children only when the cgroup is unreadable, and mark the
-  list partial (`members_complete = false`). A member whose start ticks cannot
-  be read stays in the list with `start_ticks == 0` so the missing evidence
-  remains visible.
-- Every caveat goes into `notes`; every missing piece into
-  `incomplete_reason` (empty exactly when `identity_complete`).
+  discovery with a reason.
+- `execution->generation`: manager pid + manager start ticks + boot id. All
+  three or the generation is incomplete.
+- `execution->members`: prefer the execution cgroup's `cgroup.procs` — a
+  *successful read including an empty list is authoritative*
+  (`members_authoritative = true`). Fall back to manager children only when
+  the cgroup is unreadable, and mark the list partial
+  (`members_authoritative = false`). A member whose start ticks cannot be read
+  stays in the list with `start_ticks == 0` so the missing evidence remains
+  visible.
+- Finish with `finalize_discovery_job(job, reasons)`: it computes readiness
+  (`discovery_job_ready`) from the identity/generation checks and records
+  every missing piece in `execution->incomplete_reason` (empty exactly when
+  ready). Caveats go into `execution->notes`.
 
 ### 3.4 Adapter duties (`ISchedulerAdapter`)
 
 - `discoveryOptions(settings)`: map `InventoryTypeSettings` onto your
   `DiscoveryOptions` (event source on/off, scan interval, cluster namespace).
-- `encodeFacts(Observation)`: fill the typed `sub_attr`, `subtype`, and the
-  identity fields derived from the canonical identity. **`JobID`, `JobPIDs`
-  and `CollectorNames` must stay empty** — they are store/intent owned.
+- (Discovery facts are filled by the watcher itself; there is no
+  `encodeFacts` detour through neutral fields.)
 - `decodeFacts(row)` / `legacySelector(job)`: best-effort reconstruction for
   schema<2 rows. Incomplete is fine; a guess is not.
 - `traits()`: be honest.
@@ -182,18 +192,17 @@ public:
     ~SshJobWatcher() override { stop(); }
 
     const std::string& name() const override { return name_; }
-    SchedulerType schedulerType() const override { return SchedulerType::Ssh; }
 
     bool start(const DiscoverySink& sink) override;     // sink first, then poll
     void stop() override;                               // idempotent, bounded
     ScanResult scan() override;                         // authoritative pass
     SourceHealth health() const override;
     void requestRescan() override;
-    std::optional<Observation> observeForHint(pid_t hint_pid) override;
+    std::optional<Job> observeForHint(pid_t hint_pid) override;
 
 private:
     void poll_loop();                                   // event-blocked (epoll)
-    Observation observe_session(...);                   // your observe_starter
+    Job observe_session(...);                           // your observe_starter
     bool init_event_source();                           // optional eBPF
     ...
 };
@@ -213,13 +222,13 @@ watcher — copy the patterns, not just the shape):
   pacing and the interval is 0.
 - `scan()`: check `proc_root` readability first (failure ⇒ `complete=false`);
   read `boot_id`; enumerate candidate managers from the process table;
-  `skipped` entries are counted and noted, never fabricated into
-  observations; run candidates through an `ObservationAccumulator`; finish
-  through the same health-update path (`finish_scan` pattern).
+  `skipped` entries are counted and noted, never fabricated into Jobs; build
+  one Job per manager (the store is the identity idempotency point — no merge
+  model); finish through the same health-update path (`finish_scan` pattern).
 - `observeForHint(pid)`: read the parent, **verify the parent's cmdline is
   the expected manager** (the eBPF filter guarantees it for real events, but a
-  recycled pid must not fabricate an observation), then build one observation
-  with the hinted pid preferred during fact resolution.
+  recycled pid must not fabricate a discovery), then build one Job with the
+  hinted pid preferred during fact resolution.
 
 ### Step 3 — write the adapter
 
@@ -234,7 +243,6 @@ public:
     std::string configSection() const override { return "ssh_job_watcher"; }
     IDiscoverySource& source() override { return watcher_; }
     DiscoveryOptions discoveryOptions(const InventoryTypeSettings&) const override;
-    Job encodeFacts(const Observation&) const override;
     Job decodeFacts(const nlohmann::json& row) const override;
     NativeSelector legacySelector(const Job&) const override;
     AdapterTraits traits() const override;   // ssh: both traits false
@@ -350,18 +358,18 @@ alternative), matching and cgroup derivation are all adapter-driven.
 
 - [ ] Constructor: options only — no Config, no eBPF, no threads.
 - [ ] `start()` installs the sink before any possible callback.
-- [ ] Poll thread hands over pids only; all discovery I/O lives in
-      `scan()` / `observeForHint()` on the caller's thread (exec hints are
-      resolved immediately by the registry's ingest worker, with the
-      5/25/100/500 ms retry ladder).
+- [ ] Poll thread registers exec hints synchronously through `on_job`;
+      periodic self-scans (if `scan_interval_ms > 0`) use the same entry.
 - [ ] `stop()` is idempotent and bounded; safe from the destructor.
 - [ ] `scan()` reports `complete=false` only for pass-level failures;
       skipped sources are counted and noted, never treated as absence.
-- [ ] Observations are complete or explicitly incomplete; the cluster
-      namespace is never guessed from a native id.
+- [ ] Discovered Jobs are ready or explicitly incomplete
+      (`execution->incomplete_reason`); the cluster namespace is never guessed
+      from a native id.
 - [ ] Cgroup membership: successful read (including empty) is authoritative;
-      fallback paths mark `members_complete=false`.
-- [ ] `encodeFacts` leaves `JobID`/`JobPIDs`/`CollectorNames` empty.
+      fallback paths mark `members_authoritative=false`.
+- [ ] The builder leaves `JobID`/`JobPIDs`/`CollectorNames` empty (store and
+      intent own them).
 - [ ] `traits()` is truthful; missing capabilities are normal states.
 - [ ] eBPF failures degrade to scan-only with an explicit note.
 - [ ] Both test tiers pass unprivileged; new invariants covered in the

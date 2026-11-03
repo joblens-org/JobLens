@@ -196,7 +196,7 @@ enum class StoreFaultMode {
     FailAfterWrite,
 };
 
-// One scheduler observation. `facts` carries the typed scheduler attributes;
+// One scheduler discovery. `facts` carries the typed scheduler attributes;
 // its JobID and CollectorNames are deliberately ignored: inventory upserts
 // never allocate a caller-chosen ID and never activate collection.
 //

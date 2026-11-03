@@ -378,7 +378,7 @@ private:
     // (moved from the store): pure, no durable write and no publish. The
     // register/merge semantics of a repeated identity live here so every
     // caller gets the same result.
-    UpsertResult mergeObservation(const JobRecord& stored, const Job& job,
+    UpsertResult mergeDiscoveredJob(const JobRecord& stored, const Job& job,
                                   const NativeSelector& selector,
                                   const CanonicalIdentity& identity,
                                   uint64_t internal_id, int64_t observed_at,
@@ -528,7 +528,7 @@ private:
     // Serializes activation against retirement so a stale snapshot cannot
     // revive a closing owner.
     bool sync_job_to_kernel(const Job& job);
-    // Observation/startup repair: (re)installs the kernel projection of one
+    // Discovery/startup repair: (re)installs the kernel projection of one
     // instance that is already active. The kernel component owns no queryable
     // "already installed" state, so this is an idempotent re-seed.
     void ensure_kernel_owner(const Job& job);

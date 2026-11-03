@@ -50,14 +50,16 @@ src/ebpf/trace_ssh_session.bpf.c          # 可选：exec-hint 事件源
    adapter 是**唯一**知道该调度器属性 schema、身份格式和能力的东西。
 3. **运行：** 心跳驱动 adapter 的 `IDiscoverySource`：周期性权威
    `scan()`，加上由 eBPF ringbuf exec 事件喂给的 O(job)
-   `observeForHint(pid)` 定向观测。Observation 流入 store，facts 由
-   adapter 编码。
+   `observeForHint(pid)` 定向观测。发现的 **Job** 自带 typed facts 和一
+   组 execution 证据，由 watcher 在解析源的地方就地填好；registry 在
+   准入时从 Job 派生 selector/identity。没有第二个信封。
 
 两条贯穿始终的结构性规则：
 
-- 一条 **Observation** 要么带 canonical identity + 完整 execution
-  generation，要么**显式 incomplete 并说明原因**。不存在"尽力而为"的
-  中间态。
+- 一个发现的 **Job** 要么 ready（canonical identity 可解析 + 完整
+  execution generation，见 `discovery_job_ready`），要么**显式
+  incomplete 并把原因写在 `job.execution->incomplete_reason`**。不存在
+  "尽力而为"的中间态。
 - **失败或不完整的扫描永远不代表"其余的都结束了"**：`ScanResult::complete`
   只说明这次 pass 是否覆盖了配置的源；消费方必须先检查它才能把"缺席"
   当作终止证据。
@@ -69,16 +71,15 @@ src/ebpf/trace_ssh_session.bpf.c          # 可选：exec-hint 事件源
 1. 内核送达 exec 事件的瞬间，watcher 轮询线程即被唤醒
    （`ring_buffer__poll` 阻塞在 libbpf 自己的 epoll 里；中间没有任何
    轮询切片）。
-2. `sink.on_exec_hint(pid)` 落进 registry **ingest worker** 的有界队列——
-   一个与心跳同时启动的专用线程，立即解析 pid：`observeForHint` →
-   `processObservation` → store upsert → 生命周期/attach。心跳只保留扫描、
-   退休与对账。
-3. exec 时刻调度器状态可能还没写好（job ad、spool 目录）：**不完整的观测
-   永远不建记录**，但 ingest worker 会走一条短重试梯子——**5 / 25 / 100 /
-   500 ms**——梯子走尽才请求一次合并的权威重扫。在重试梯子之前，这个竞争
-   的兜底是整个 reconcile 间隔（默认 ~30s）。
-4. `JobRegistry/inventory_status` 用 `exec_ingest_depth`（队列 + 重试）
-   报告快速通道的积压。
+2. 轮询线程自己解析 pid（`observeForHint`），并**同线程同步**通过
+   `sink.on_job(job)` 登记发现的 Job：store upsert → 生命周期/attach。
+   没有队列、没有 worker；心跳只保留扫描、退休与对账。
+3. exec 时刻调度器状态可能还没写好（job ad、spool 目录）：**不完整的发现
+   永远不建记录**；watcher 请求一次合并的权威重扫，下一遍 pass 在数十
+   毫秒内收敛。
+4. `JobRegistry/inventory_status` 保留 `exec_ingest_depth`、`queue_depth`
+   与 `events_dropped` 作为废弃的恒零键：ingest worker 与 observation
+   队列已不存在。
 
 这里**刻意**不解决（层 2，需要单独设计）：进程第一条指令到用户态
 `pid2job` 播种之间的事件，对 syscall-tracepoint 采集器仍然不可见。由
@@ -101,37 +102,43 @@ exec tracer 自己写入 provisional `pid2job` 条目可以关掉这个窗口—
 
 ### 3.2 线程模型与 sink
 
-- 轮询线程的唯一职责：抽干 ring buffer，把 **pid** 递给
-  `sink.on_exec_hint`。轮询线程上没有 `/proc` 读取、没有策略、没有存储——
-  plan 明令禁止生产路径上的慢操作。
+- 轮询线程抽干 ring buffer，把每个 pid 解析成 Job（`observeForHint`），
+  再通过 `sink.on_job` 登记。登记写盘不带 fence，回调不等持久化——但发现
+  I/O 与 upsert 就是内联做的，这是刻意为之。
 - sink 回调是跑在**你的**线程上的调用方代码：用 try/catch 包住，消费方
   抛异常不能带塌 watcher。
-- 昂贵的工作（构造 Observation、/proc I/O）属于调用方线程
-  （`scan()`、`observeForHint()`），也就是 registry 心跳 worker。
+- 发现 I/O（`/proc`、ad/spool 读取）发生在构造 Job 的地方：`scan()` 在
+  心跳 worker 上，`observeForHint()` 在轮询线程上。
 
-### 3.3 构造 Observation
+### 3.3 构造发现的 Job
 
-- `selector`：源真正提供的原生字段，逐字保留。绝不合成数值。
+Job 就是登记单元：typed facts 加一组 `execution` 证据，在源解析输入的
+地方就地填好。`JobID`、`JobPIDs`、`CollectorNames` 保持为空——它们归
+store/intent 所有。
+
+- 身份字段（`subtype_name`、`cluster_name`、`clusterTag`、`NativeJobID`、
+  `execution->step_id`）：源真正提供的原生字段，逐字保留。绝不合成数值。
 - 集群命名空间（如 `COLLECTOR_HOST`、`SLURM_CLUSTER_NAME`）：显式配置
   优先；否则从源环境推导。**绝不从原生作业编号瞎猜。** 推不出来 ⇒
-  incomplete observation 并写明原因。
-- `generation`：manager pid + manager start ticks + boot id，三者齐备才算
-  完整。
-- `members`：优先读执行 cgroup 的 `cgroup.procs`——**读成功（包括空列表）
-  即为权威**（`members_complete = true`）。cgroup 不可读才退化为枚举
-  manager 的子进程，且标记列表为部分（`members_complete = false`）。
-  start ticks 读不出来的成员保留在列表里、`start_ticks == 0`，让缺失的
-  证据保持可见。
-- 每个注意事项进 `notes`；每个缺失环节进 `incomplete_reason`
-  （当且仅当 `identity_complete` 时为空）。
+  incomplete 发现并写明原因。
+- `execution->generation`：manager pid + manager start ticks + boot id，
+  三者齐备才算完整。
+- `execution->members`：优先读执行 cgroup 的 `cgroup.procs`——**读成功
+  （包括空列表）即为权威**（`members_authoritative = true`）。cgroup 不可
+  读才退化为枚举 manager 的子进程，且标记列表为部分
+  （`members_authoritative = false`）。start ticks 读不出来的成员保留在
+  列表里、`start_ticks == 0`，让缺失的证据保持可见。
+- 收尾调 `finalize_discovery_job(job, reasons)`：它按身份/代次检查算出
+  ready 与否（`discovery_job_ready`），把每个缺失环节写进
+  `execution->incomplete_reason`（当且仅当 ready 时为空）。注意事项进
+  `execution->notes`。
 
 ### 3.4 Adapter 的职责（`ISchedulerAdapter`）
 
 - `discoveryOptions(settings)`：把 `InventoryTypeSettings` 映射到你的
   `DiscoveryOptions`（事件源开关、扫描间隔、集群命名空间）。
-- `encodeFacts(Observation)`：填 typed `sub_attr`、`subtype`，以及从
-  canonical identity 推导的身份字段。**`JobID`、`JobPIDs`、
-  `CollectorNames` 必须留空**——它们归 store/intent 所有。
+- （发现期 facts 由 watcher 自己填写；没有经过中立字段的
+  `encodeFacts` 中转。）
 - `decodeFacts(row)` / `legacySelector(job)`：为 schema<2 的行做尽力而为
   的重建。可以不完整；不可以瞎猜。
 - `traits()`：如实声明。
@@ -171,11 +178,11 @@ public:
     ScanResult scan() override;                         // 权威 pass
     SourceHealth health() const override;
     void requestRescan() override;
-    std::optional<Observation> observeForHint(pid_t hint_pid) override;
+    std::optional<Job> observeForHint(pid_t hint_pid) override;
 
 private:
     void poll_loop();                                   // 事件阻塞（epoll）
-    Observation observe_session(...);                   // 你的 observe_starter
+    Job observe_session(...);                           // 你的 observe_starter
     bool init_event_source();                           // 可选 eBPF
     ...
 };
@@ -193,11 +200,11 @@ private:
   心跳管，间隔是 0。
 - `scan()`：先检查 `proc_root` 可读（失败 ⇒ `complete=false`）；读
   `boot_id`；从进程表枚举候选 manager；`skipped` 只计数加 note，**绝不
-  伪造观测**；候选过一遍 `ObservationAccumulator`；用同一个健康更新路径
-  收尾（`finish_scan` 模式）。
+  伪造 Job**；每个 manager 直接构一个 Job（store 是身份幂等点——没有
+  第二个合并模型）；用同一个健康更新路径收尾（`finish_scan` 模式）。
 - `observeForHint(pid)`：读 parent，**校验 parent 的 cmdline 确实是预期
-  manager**（eBPF 过滤对真实事件有保证，但被复用的 pid 不能伪造观测），
-  然后以 hint pid 优先构出一条观测。
+  manager**（eBPF 过滤对真实事件有保证，但被复用的 pid 不能伪造发现），
+  然后以 hint pid 优先构出一个 Job。
 
 ### 第 3 步 — 写 adapter
 
@@ -212,7 +219,6 @@ public:
     std::string configSection() const override { return "ssh_job_watcher"; }
     IDiscoverySource& source() override { return watcher_; }
     DiscoveryOptions discoveryOptions(const InventoryTypeSettings&) const override;
-    Job encodeFacts(const Observation&) const override;
     Job decodeFacts(const nlohmann::json& row) const override;
     NativeSelector legacySelector(const Job&) const override;
     AdapterTraits traits() const override;   // ssh：两项都是 false
@@ -323,17 +329,18 @@ ssh_job_watcher:
 
 - [ ] 构造函数：只存 options——不读 Config、不加载 eBPF、不开线程。
 - [ ] `start()` 在任何可能的回调之前装好 sink。
-- [ ] 轮询线程只递 pid；所有发现 I/O 都在调用方线程的
-      `scan()` / `observeForHint()` 里（exec hint 由 registry 的 ingest
-      worker 即时解析，含 5/25/100/500ms 重试梯子）。
+- [ ] 轮询线程把 exec hint 经 `on_job` 同步登记；周期性自扫
+      （`scan_interval_ms > 0` 时）走同一个入口。
 - [ ] `stop()` 幂等、有界；从析构函数调用安全。
 - [ ] `scan()` 只在 pass 级失败时报 `complete=false`；跳过的源只计数加
       note，绝不当缺席。
-- [ ] Observation 要么完整要么显式不完整；集群命名空间绝不从原生 id
+- [ ] 发现的 Job 要么 ready 要么显式不完整
+      （`execution->incomplete_reason`）；集群命名空间绝不从原生 id
       瞎猜。
 - [ ] cgroup 成员：读成功（含空列表）即权威；退化路径标记
-      `members_complete=false`。
-- [ ] `encodeFacts` 让 `JobID`/`JobPIDs`/`CollectorNames` 保持为空。
+      `members_authoritative=false`。
+- [ ] 构造方让 `JobID`/`JobPIDs`/`CollectorNames` 保持为空（store 与
+      intent 所有）。
 - [ ] `traits()` 如实；缺失的能力是正常状态。
 - [ ] eBPF 失败降级为 scan-only 并有显式 note。
 - [ ] 两个测试层级都在无特权环境通过；新不变量在 registry 层覆盖。

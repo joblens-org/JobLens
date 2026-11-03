@@ -15,7 +15,7 @@
 // an inventory citizen (doc/job_inventory_v2_architecture.md §2.2).
 //
 // Everything scheduler-specific lives behind this interface: discovery
-// (through IDiscoverySource), observation -> typed facts encoding, legacy-row
+// (through IDiscoverySource), legacy-row
 // decoding, identity validation and capability traits. Nothing in the store,
 // the registry or the RPC surface names a scheduler.
 //

@@ -2229,7 +2229,7 @@ void JobRegistry::applyIdentityToFacts(Job& job, const NativeSelector& selector,
 // durable write and no publish (moved verbatim from the store). The
 // register/merge semantics of a repeated identity live here, so every caller
 // gets the same result.
-UpsertResult JobRegistry::mergeObservation(const JobRecord& stored, const Job& job,
+UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job& job,
                                            const NativeSelector& selector,
                                            const CanonicalIdentity& identity,
                                            uint64_t internal_id, int64_t observed_at,
@@ -2695,7 +2695,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job) {
 
     if (have_stored) {
         JobRecord updated;
-        result = mergeObservation(stored, job, selector, *identity, internal_id,
+        result = mergeDiscoveredJob(stored, job, selector, *identity, internal_id,
                                   observed_at, updated);
         if (!result.ok) return result;
         if (result.disposition == UpsertDisposition::Unchanged) {

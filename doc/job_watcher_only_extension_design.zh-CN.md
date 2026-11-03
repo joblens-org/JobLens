@@ -45,10 +45,12 @@ JSON facts）仍为可选的后续项。
 - `canonicalize(selector)` 保留通用部分（命名空间拼接、key 组装），**native-id 校验/规范化规则外置**：新增自注册规则表
   `REGISTER_NATIVE_ID_RULE("condor", fn)`（与 `REGISTER_SCHEDULER_ADAPTER` 同一 TU 作用域约定）。condor 注册 `"d.d"` 严格十进制规则，slurm 注册数字去前导零规则；`canonicalize` 按名字查表，查不到 → 不完整（显式，不猜测）。
 
-### B. Observation / 发现源（job_observation）
+### B. 发现源（job_discovery）
 
-- `Observation.scheduler_type` → `adapter`（名字，watcher 构造观测时填自己的名字）。
-- `finalize_observation` 逻辑不变（内部走 A 的 canonicalize）。
+- Observation 中间态已删除（2026-11-04）：watcher 直接构造带 `execution`
+  证据组的 Job，typed facts 在解析源的地方就地填写；readness 由
+  `discovery_job_ready` 判定，缺失原因记在
+  `job.execution->incomplete_reason`（`finalize_discovery_job` 收尾）。
 - `IDiscoverySource::schedulerType()` 退役；`DiscoveryEnvironment` 中 per-scheduler 命名空间字段（`condor_cluster_name`/`slurm_cluster_name`）合并为通用 `cluster_name`（各自 adapter 只读自己的键——通过 `InventoryTypeSettings.cluster_name` 已有通路）。
 
 ### C. 配置解析（inventory_config）
@@ -60,19 +62,18 @@ JSON facts）仍为可选的后续项。
 ### D. Registry 运行时（job_registry）
 
 - `auto_policies_: std::map<std::string, AutoCollectorPolicy>`，武装时直接用 settings 的名字键（删除 job_registry.cpp:984 的 InventoryType→SchedulerType else）。
-- `facts_encoder_` 分派：按 `observation.adapter` 匹配 `hb_sources_` 的名字。
 - `source_complete: std::map<std::string, bool>` 按源名字键控；`evaluateRetirements` 用 `record.adapter` 查询——**修复新类型永不缺席退休的静默缺陷**。
 - `apply_auto_policy(job, SchedulerType)` → 名字参数；`update_job`/refreshJobFacts 的 subtype 分派（1585-1591）改经 adapter（按 record.adapter 查注册表调 facts 刷新钩子；无 adapter 的手工记录走 CommonJobAttr 通用路径）。
 
 ### E. Store（job_store）
 
-- **删除 `apply_identity_to_facts` 的类型分派**：discovery upsert 的 facts 由 registry 的 `facts_encoder_`（adapter `encodeFacts`）在进 store 前编码完毕——condor adapter 的 `encodeFacts::apply_identity` 已做同样推导，store 里这份是 S4 残留。若 store 内部身份解析晚于编码的场景仍需补推，注入 `IdentityApplier` 回调（registry 装、按名字查 adapter），store 保持零分支。
+- **删除 `apply_identity_to_facts` 的类型分派**：discovery upsert 的 facts 由 watcher 在解析源时直接填完（Observation/encodeFacts 中转已删除）；身份推导经 registry 按 `record.adapter` 查 adapter 的 `applyIdentityToFacts` 完成，store 保持零分支。
 - legacy 行解码（`decode_legacy_job`/`selector_from_legacy_job`）：遍历注册 adapter 的 `decodeFacts`/`legacySelector`（对外来类型已返回"不认识"），认领者处理；无人认领 → CommonJobAttr 通用行。
 - `record_json` 对 facts 的序列化随 F 区方案走。
 
 ### F. facts schema（collector_type.h）——两案
 
-- **方案一（推荐，阶段一）**：`SubAttr = std::variant<CondorJobAttr, CommonJobAttr, SlurmJobAttr, nlohmann::json>`。内置两类型保持强类型（存量 collector、SubAttrMatcher 强类型匹配零改动）；**新调度器的 typed facts 以 JSON 进 variant**（adapter 的 `encodeFacts` 自由构造、`factsSchema()` 可选声明）。`Job` 增加 `subtype_name: std::string`（wire 新旧并存：旧数字 subtype 照读，新行只写名字）。匹配器对 JSON 成员做字段级匹配。
+- **方案一（推荐，阶段一）**：`SubAttr = std::variant<CondorJobAttr, CommonJobAttr, SlurmJobAttr, nlohmann::json>`。内置两类型保持强类型（存量 collector、SubAttrMatcher 强类型匹配零改动）；**新调度器的 typed facts 以 JSON 进 variant**（watcher 构造 Job 时自由填写、`factsSchema()` 可选声明）。`Job` 增加 `subtype_name: std::string`（wire 新旧并存：旧数字 subtype 照读，新行只写名字）。匹配器对 JSON 成员做字段级匹配。
 - **方案二（阶段二，可选）**：`sub_attr` 彻底 JSON 化。收益是完全开放；代价是所有读强类型 attr 的 collector 全改。本设计不阻塞、不要求。
 
 ### G. KernelAttribution
@@ -108,7 +109,7 @@ public:
     ScanResult scan() override;          // 枚举 /proc 中带 JOBLENS_SSH_JOB 标记环境变量的会话进程
     SourceHealth health() const override;
     void requestRescan() override;
-    std::optional<Observation> observeForHint(pid_t) override { return std::nullopt; }  // 无 exec 事件源
+    std::optional<Job> observeForHint(pid_t) override { return std::nullopt; }  // 无 exec 事件源
 private:
     std::string name_{"ssh"};
     DiscoveryOptions options_;
@@ -126,15 +127,8 @@ public:
     IDiscoverySource& source() override { return watcher_; }
     DiscoveryOptions discoveryOptions(const InventoryTypeSettings&) const override;
 
-    Job encodeFacts(const Observation& obs) const override {
-        Job facts;
-        facts.subtype_name = name_;              // 字符串，不再是枚举
-        facts.NativeJobID  = obs.selector.native_job_id;
-        facts.owner        = obs.owner;
-        facts.sub_attr     = nlohmann::json{     // F 方案一：JSON facts，schema 自定
-            {"session_user", obs.owner}, {"local", true}};
-        return facts;                            // JobID/JobPIDs/CollectorNames 留空
-    }
+    // 发现期 facts 由 watcher 自己构造（不再有 encodeFacts 中转）；此处只保留
+    // 存量行解码与身份推导。
     Job decodeFacts(const nlohmann::json&) const override;   // ssh 无存量行，返回通用 Job
     NativeSelector legacySelector(const Job&) const override { return {}; }
     AdapterTraits traits() const override { return {}; }     // 无 cgroup 证据、无内核归因
