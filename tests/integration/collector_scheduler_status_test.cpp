@@ -220,6 +220,14 @@ struct CollectorSchedulerTestAccess {
 void check(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
+
+// JobRegistry::hasInstance() was removed as a production-dead API; active-only
+// is derived from the record state so the assertion semantics stay unchanged.
+static bool has_active(const JobRegistry& registry, uint64_t internal_id)
+{
+    const auto record = registry.inventoryRecord(internal_id);
+    return record.has_value() && record->state != std::string(kStateClosing);
+}
 std::string hex_id(uint64_t id) {
     std::ostringstream out;
     out << std::hex << std::setw(16) << std::setfill('0') << id;
@@ -1022,7 +1030,7 @@ void run(const std::string& base) {
               "an acknowledgement must not deliver another lane's Removed");
 
         CollectorSchedulerTestAccess::drainLane(scheduler, "ri_ev_a");
-        check(!archive.inventoryRecord(8101).has_value() && !archive.hasInstance(8101),
+        check(!archive.inventoryRecord(8101).has_value() && !has_active(archive, 8101),
               "the last ack must archive the record and release the instance");
         history_rows = raw_keys_from_store_copy(live_db, base + "-archive-copy-4",
                                                 "h:" + hex_id(8101) + ":");
@@ -1116,7 +1124,7 @@ void run(const std::string& base) {
     check(injected_actual.tracked &&
               injected_actual.collectors == std::vector<std::string>{"idle"},
           "the scheduler must converge to the injected record source");
-    check(!registry.hasInstance(777),
+    check(!has_active(registry, 777),
           "the global registry must not know the injected instance");
 
     scheduler.shutdown();

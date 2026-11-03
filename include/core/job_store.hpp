@@ -263,7 +263,6 @@ public:
     // --- health / test faults -------------------------------------------
     StoreHealth health() const;
     bool ready() const;
-    bool migrationComplete() const { return migration_complete_; }
     // True while the last write outcome is unknown. Every durable mutation and
     // the checkpoint refuse to run in this state.
     bool recoveryRequired() const { return recovery_required_.load(); }
@@ -284,11 +283,6 @@ public:
     {
         identity_applier_ = std::move(applier);
     }
-    std::string dbUuid() const { return db_uuid_; }
-    // Boot id this process runs under, read once at construction.  An
-    // execution generation stamped with a different boot cannot name a live
-    // process here, so admission must not treat its PID as verified.
-    const std::string& bootId() const { return boot_id_; }
 
     // --- restore (once, right after construction) ------------------------
     // Validates restored executions with a POSITIVE identity check:

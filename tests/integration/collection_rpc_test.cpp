@@ -59,6 +59,14 @@ void check(bool condition, const std::string& message)
     if (!condition) throw std::runtime_error(message);
 }
 
+// JobRegistry::hasInstance() was removed as a production-dead API; active-only
+// is derived from the record state so the assertion semantics stay unchanged.
+bool has_active(const JobRegistry& registry, uint64_t internal_id)
+{
+    const auto record = registry.inventoryRecord(internal_id);
+    return record.has_value() && record->state != std::string(kStateClosing);
+}
+
 using json = nlohmann::json;
 
 std::string socket_path;
@@ -622,7 +630,7 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
                   *binding.manual == std::vector<std::string>{"cpumem_collector"},
               "legacy add must attach a manual binding");
         const auto hint_id = parse_internal_id(hint);
-        check(hint_id.has_value() && !registry.hasInstance(*hint_id),
+        check(hint_id.has_value() && !has_active(registry, *hint_id),
               "the JobID hint must never become an internal id");
     }
     // --- A32: duplicate observation is not a failure ----------------------

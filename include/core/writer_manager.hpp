@@ -45,11 +45,6 @@ public:
 
     nlohmann::json output_status() const;
 
-    std::string getWriterType(const std::string& name){
-        const BaseWriter* writer = find(name);
-        return writer ? writer->get_type() : std::string{};
-    }
-
     template <typename T>
     void registerWriter(std::string name) {
         factories_.emplace(std::move(name), [](std::string name, std::string type, std::string config_name) -> std::unique_ptr<BaseWriter> {

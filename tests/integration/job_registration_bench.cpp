@@ -119,7 +119,6 @@ struct Args {
     int lua_rules = 0;      // >0: measure the automatic policy (Lua) per job
     int lua_iterations = 0;
     int register_rules = 0; // >0: arm the real Lua policy inside registration
-    bool drain_policies = false;
     bool no_apply = false;
     bool keep_fixture = false;
 };
@@ -152,14 +151,13 @@ Args parse_args(int argc, char** argv)
             args.lua_iterations = std::stoi(next("--lua-iterations"));
         else if (key == "--register-rules")
             args.register_rules = std::stoi(next("--register-rules"));
-        else if (key == "--drain") args.drain_policies = true;
         else if (key == "--keep-fixture") args.keep_fixture = true;
         else if (key == "--help" || key == "-h") {
             std::cout <<
                 "job_registration_bench --db <leveldb-dir> [--out <dir>] [--jobs N]\n"
                 "  [--burst N] [--repeat K] [--batch-probe N] [--no-apply]\n"
                 "  [--lua-rules K] [--lua-iterations N]\n"
-                "  [--register-rules K] [--drain]\n"
+                "  [--register-rules K]\n"
                 "  [--collectors a,b] [--cluster NAME]\n"
                 "  [--fixture-root DIR] [--pid-file FILE] [--keep-fixture]\n";
             std::exit(0);
@@ -690,15 +688,6 @@ int main(int argc, char** argv)
         }
     }
 
-    // ---- heartbeat pass timing (the deferred policy FIFO was removed) ------
-    std::vector<double> drain_passes;
-    if (args.drain_policies) {
-        const auto t0 = Clock::now();
-        registry.runInventoryPass(false);
-        const auto t1 = Clock::now();
-        drain_passes.push_back(elapsed_us(t0, t1));
-    }
-
     std::vector<double> lua_calls;
     std::size_t lua_rejected = 0;
     std::size_t lua_errors = 0;
@@ -733,7 +722,6 @@ int main(int argc, char** argv)
     const auto dup = stats_of(samples.dup);
     const auto burst = stats_of(samples.burst);
     const auto lua_stats = stats_of(lua_calls);
-    const auto drain_stats = stats_of(drain_passes);
 
     std::printf("\n== registration chain (real procfs/ad/cgroup, sync LevelDB) ==\n");
     std::printf("jobs=%zu incomplete=%zu rejected=%zu cgroup=%s durable_commits=%llu\n",
@@ -762,10 +750,6 @@ int main(int argc, char** argv)
     if (args.register_rules > 0)
         std::printf("inline policy: rules=%d (evaluated synchronously, no budget)\n",
                     args.register_rules);
-    if (drain_stats.n > 0) {
-        print_stats("heartbeat pass", drain_stats);
-        std::printf("policy is synchronous with registration; no deferred backlog\n");
-    }
     if (total.n > 0)
         std::printf("sequential registrations/sec (p50 total): %.1f\n",
                     1e6 / std::max(total.p50, 1.0));

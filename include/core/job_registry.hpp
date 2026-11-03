@@ -216,21 +216,14 @@ public:
     // Automatic policy decision for a batch of instances. Manual overrides,
     // including empty ones, are never overwritten.
     CollectionOutcome applyAutoPolicy(const std::vector<AutoSelection>& selections);
-    // Explicit store recovery: verifies every row whose last write outcome is
-    // unknown and clears the latch only when all of them were read back. The
-    // mutating commands do this automatically; a caller can request it to
-    // report the reason a write is refused.
-    bool recoverStore(std::string& error);
     // Test seam: replaces the kernel-cleanup step so the retirement ordering
     // (closing -> cleanup -> archive) can be exercised without BPF. Production
     // leaves it unset and uses KernelAttribution; it grants no way to write job
     // state.
     void setKernelCleanupForTest(
         std::function<bool(uint64_t, const Job&, std::string&)> cleanup);
-    bool hasInstance(uint64_t jobID) const;
     std::string instanceId(uint64_t jobID) const;
     StoreHealth storeHealth() const;
-    bool migrationComplete() const { return store_ && store_->migrationComplete(); }
 
     // --- Collection runtime seam ------------------------------------------
     // The component that actually runs collectors (CollectorScheduler) is
@@ -263,9 +256,6 @@ public:
     // Liveness evidence from the last scan. Not a lifecycle state: an
     // unverified instance stays Open but must not be admitted to the kernel.
     void setExecutionVerified(uint64_t jobID, bool verified);
-    // Cheap hint sink for kernel exit events. The heartbeat uses it to
-    // schedule a coalesced refresh; the callback must not do I/O.
-    void setExitObserver(std::function<void(pid_t)> observer);
 
     // --- Lifecycle -----------------------------------------------------------
     // Stop discovery admission and polling. Must run before the collector
@@ -278,13 +268,10 @@ public:
     bool deinit();
 
     // --- Inventory heartbeat (v2 §2.3) ---------------------------------------
-    // One maintenance tick: scan -> upsert -> hint merge -> retirement ->
-    // desired/applied reconciliation. Public so tests and the on-demand
-    // refresh path run exactly what the periodic worker runs. Returns true
-    // when a pass ran.
-    bool runInventoryPass(bool do_scan = true);
     // One on-demand authoritative pass (the `ensure_registered` refresh
-    // provider). Returns false when the heartbeat is not running.
+    // provider): scan -> upsert -> hint merge -> retirement -> reconciliation,
+    // exactly what the periodic worker runs. Returns false when the heartbeat
+    // is not running.
     bool reconcileInventoryNow();
     // Discovery event entries (the sink the adapters get, exposed for tests
     // and out-of-band producers). Cheap and bounded: they only enqueue.

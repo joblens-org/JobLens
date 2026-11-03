@@ -426,7 +426,7 @@ void run(const std::string& base)
         check(failed2.ok && !*failed2.intent_committed,
               "the second instance must start without a decision");
         registry.clearStoreFaultsForTest();
-        registry.runInventoryPass(false);
+        registry.reconcileInventoryNow();
         const auto repaired2 = registry.selectionRecord(failed2.internal_id);
         check(repaired2.automatic.has_value(),
               "a maintenance pass must repair the missing initial decision");

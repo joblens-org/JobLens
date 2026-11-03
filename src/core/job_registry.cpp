@@ -708,11 +708,6 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
     return true;
 }
 
-bool JobRegistry::runInventoryPass(bool do_scan) {
-    const bool result = runPass(do_scan, /*wait=*/true);
-    return result;
-}
-
 bool JobRegistry::reconcileInventoryNow() {
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
@@ -2195,10 +2190,6 @@ CollectionOutcome JobRegistry::applyAutoPolicy(
     return outcome;
 }
 
-bool JobRegistry::recoverStore(std::string& error) {
-    return recoverStoreIfNeeded(error);
-}
-
 bool JobRegistry::recoverStoreIfNeeded(std::string& error) {
     error.clear();
     if (!store_) {
@@ -2211,10 +2202,6 @@ bool JobRegistry::recoverStoreIfNeeded(std::string& error) {
         return false;
     }
     return true;
-}
-
-bool JobRegistry::hasInstance(uint64_t jobID) const {
-    return store_->hasActive(jobID);
 }
 
 std::string JobRegistry::instanceId(uint64_t jobID) const {
@@ -2301,11 +2288,6 @@ void JobRegistry::setExecutionVerified(uint64_t jobID, bool verified) {
     store_->mutateRecord(jobID, [verified](JobRecord& record) {
         record.execution_verified = verified;
     });
-}
-
-void JobRegistry::setExitObserver(std::function<void(pid_t)> observer) {
-    std::lock_guard<std::mutex> lock(exit_observer_mtx_);
-    exit_observer_ = std::move(observer);
 }
 
 bool JobRegistry::refreshJobFacts(uint64_t jobID) {

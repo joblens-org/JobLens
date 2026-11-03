@@ -45,6 +45,14 @@ void check(bool condition, const std::string& message)
     if (!condition) throw std::runtime_error(message);
 }
 
+// JobRegistry::hasInstance() was removed as a production-dead API; active-only
+// is derived from the record state so the assertion semantics stay unchanged.
+bool has_active(const JobRegistry& registry, uint64_t internal_id)
+{
+    const auto record = registry.inventoryRecord(internal_id);
+    return record.has_value() && record->state != std::string(kStateClosing);
+}
+
 std::string fresh_dir(const std::string& base, const std::string& name)
 {
     const auto path = std::filesystem::path(base) / name;
@@ -57,8 +65,7 @@ JobRegistryOptions isolated(const std::string& path)
 {
     JobRegistryOptions options;
     options.db_path = path;
-    options.enable_inventory_maintenance = false;
-    options.enable_pid_tracker = false;
+    options.enable_inventory_maintenance = false;    options.enable_pid_tracker = false;
     options.register_rpc = false;
     return options;
 }
@@ -418,7 +425,7 @@ void durable_intent_survives_restart_and_generation_change(const std::string& ba
     {
         // Fresh JobRegistry instance on the same DB: durable intent reapply.
         JobRegistry registry(isolated(path));
-        check(registry.migrationComplete(), "restart must reopen an initialized db");
+        check(registry.storeHealth().migration_complete, "restart must reopen an initialized db");
 
         const auto record = registry.inventoryRecord(internal_id);
         check(record.has_value(), "restart must restore the inventory record");
@@ -1095,7 +1102,7 @@ void closing_keeps_the_runtime_holders_until_the_archive(const std::string& base
     install_deferred_drain(registry, [](JobEvent, const Job&) {});
     check(registry.retireInstance(id),
           "retirement must be accepted and handed to the runtime");
-    check(!registry.hasInstance(id), "a closing instance leaves the active map");
+    check(!has_active(registry, id), "a closing instance leaves the active map");
 
     const auto closing = registry.inventoryRecord(id);
     check(closing.has_value() && closing->state == "closing",

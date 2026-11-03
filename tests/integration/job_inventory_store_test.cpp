@@ -79,6 +79,25 @@ JobRegistryOptions isolated(const std::string& path)
     return options;
 }
 
+// hasInstance()/inventoryRecordByIdentity() were removed as production-dead
+// registry APIs; the assertions derive the same facts from the public record
+// snapshot so their semantics stay unchanged.
+bool has_active(const JobRegistry& registry, uint64_t internal_id)
+{
+    const auto record = registry.inventoryRecord(internal_id);
+    return record.has_value() && record->state != std::string(kStateClosing);
+}
+
+std::optional<JobRecord> record_by_identity(const JobRegistry& registry,
+                                            const CanonicalIdentity& identity)
+{
+    const std::string key = identity.key();
+    for (const auto& record : registry.inventoryRecords()) {
+        if (record.identity_complete && record.identity.key() == key) return record;
+    }
+    return std::nullopt;
+}
+
 std::string hex64(uint64_t value)
 {
     char buffer[17];
@@ -410,7 +429,7 @@ void conflicting_live_execution_is_not_merged(const std::string& base)
     check(registry.inventoryRecords().size() == 1,
           "a conflicting live execution must not create a second instance");
     const auto identity = canonicalize(condor_selector("172.0"));
-    const auto indexed = registry.inventoryRecordByIdentity(*identity);
+    const auto indexed = record_by_identity(registry, *identity);
     check(indexed.has_value() && indexed->internal_id == first.internal_id,
           "the original live execution keeps the identity index");
     check(registry.storeHealth().quarantined_identities == 0,
@@ -481,7 +500,7 @@ void write_failures_reject_mutations_without_id_reuse(const std::string& base)
     check(!failed.ok, "a failed durable write must not report success");
     check(failed.error == "store_write_failed",
           "write failure must report a stable code, got " + failed.error);
-    check(!registry.inventoryRecordByIdentity(*canonicalize(condor_selector("200.0")))
+    check(!record_by_identity(registry, *canonicalize(condor_selector("200.0")))
                .has_value(),
           "a failed registration must not leave a durable record");
 
@@ -575,7 +594,7 @@ void closing_state_is_durable_and_not_resurrected(const std::string& base)
         install_deferred_drain(registry, [](JobEvent, const Job&) {});
         check(registry.retireInstance(internal_id),
               "retirement with a subscriber must be accepted");
-        check(!registry.hasInstance(internal_id),
+        check(!has_active(registry, internal_id),
               "a closing instance must leave the active map");
         check(registry.inventoryRecord(internal_id).has_value(),
               "a closing instance stays visible until the archive");
@@ -597,7 +616,7 @@ void closing_state_is_durable_and_not_resurrected(const std::string& base)
         check(record->state == "closing",
               "the restored record must carry the durable closing state, got " +
                   record->state);
-        check(!registry.hasInstance(internal_id),
+        check(!has_active(registry, internal_id),
               "a restored closing instance must not be an active job");
         check(!registry.findJob(internal_id).has_value(),
               "a restored closing instance must not be findable as active");
@@ -1257,7 +1276,7 @@ void ambiguous_registration_resolves_after_restart(const std::string& base)
         JobRegistry registry(isolated(path));
         const auto identity = canonicalize(condor_selector("200.0"));
         check(identity.has_value(), "the fixture selector must canonicalize");
-        const auto restored = registry.inventoryRecordByIdentity(*identity);
+        const auto restored = record_by_identity(registry, *identity);
         check(restored.has_value(),
               "the record that landed ambiguously must be restored by identity");
         check(restored->internal_id > first_id,
@@ -1483,7 +1502,7 @@ void ambiguous_closing_state_is_not_reverted(const std::string& base)
         check(record.has_value() && record->state == "closing",
               "the closing fact that landed must survive; the shutdown checkpoint "
               "must not rewrite the stale active row");
-        check(!reopened.hasInstance(id), "a closing instance is never active");
+        check(!has_active(reopened, id), "a closing instance is never active");
         const auto late = reopened.upsertObservedJob(condor_observation("172.0"));
         check(!late.ok && late.error == "instance_closing",
               "the restored closing reservation must reject a late observation");
@@ -1545,7 +1564,7 @@ void cleanup_failure_keeps_the_closing_reservation(const std::string& base)
     check(registry.inventoryRecord(id).has_value() &&
               registry.inventoryRecord(id)->state == "closing",
           "a failed cleanup keeps the durable closing reservation");
-    check(!registry.hasInstance(id), "a closing reservation is not an active instance");
+    check(!has_active(registry, id), "a closing reservation is not an active instance");
 
     // The closing reservation still owns the identity: no replacement may take
     // it, which is exactly what makes the retry safe.
@@ -1554,7 +1573,7 @@ void cleanup_failure_keeps_the_closing_reservation(const std::string& base)
           "the closing reservation must reject a replacement observation");
     const auto identity = canonicalize(condor_selector("172.0"));
     check(identity.has_value(), "the fixture identity must canonicalize");
-    const auto by_identity = registry.inventoryRecordByIdentity(*identity);
+    const auto by_identity = record_by_identity(registry, *identity);
     check(by_identity.has_value() && by_identity->internal_id == id,
           "the identity must still resolve to the closing instance");
 
@@ -1615,7 +1634,7 @@ void ambiguous_closing_retry_restores_the_drain(const std::string& base)
     check(ack_ok, "the recovered drain ack must archive the record");
     check(!registry.inventoryRecord(id).has_value(),
           "the ack archives the recovered closing record");
-    check(!registry.hasInstance(id), "an archived instance is no longer active");
+    check(!has_active(registry, id), "an archived instance is no longer active");
 
     const auto replacement = registry.upsertObservedJob(condor_observation("172.0"));
     check(replacement.ok && replacement.disposition == UpsertDisposition::Created &&
@@ -1664,7 +1683,7 @@ void cleanup_failure_after_ack_is_retryable(const std::string& base)
     const auto closing = registry.inventoryRecord(id);
     check(closing.has_value() && closing->state == kStateClosing,
           "a cleanup failure after the ack keeps the closing reservation");
-    check(!registry.hasInstance(id), "a closing reservation is not an active instance");
+    check(!has_active(registry, id), "a closing reservation is not an active instance");
     check(registry.retireInstance(id),
           "a second retire is an idempotent acceptance of the same Closing record");
     check(removed_events == 1,
@@ -1779,12 +1798,14 @@ void recovery_fences_the_adopted_selection(const std::string& base)
     check(registry.storeHealth().sync_commits == before.sync_commits,
           "the failed selection must not count as a fence");
 
-    // A failing recovery fence must not clear the latch or the dirty row.
+    // A failing recovery fence must not clear the latch or the dirty row. The
+    // selection command is the recovery retry point: it verifies the uncertain
+    // rows before anything else and reports the refused recovery.
     registry.clearStoreFaultsForTest();
     registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite, /*skip=*/0,
                                      /*count=*/1);
-    std::string error;
-    check(!registry.recoverStore(error),
+    const auto refused_retry = registry.setCollectors(second);
+    check(!refused_retry.ok && refused_retry.error == CollectionError::StoreUnavailable,
           "a failed recovery fence must report failure");
     check(registry.storeHealth().recovery_required,
           "a failed recovery fence must keep the latch");
@@ -1793,10 +1814,12 @@ void recovery_fences_the_adopted_selection(const std::string& base)
     check(registry.storeHealth().sync_commits == before.sync_commits,
           "a failed recovery fence must not count as a durable commit");
 
-    // The retry fences the adopted row before reporting recovery complete.
+    // The retry fences the adopted row before reporting recovery complete; the
+    // identical selection writes nothing, so only the fence moves the counters.
     registry.clearStoreFaultsForTest();
-    error.clear();
-    check(registry.recoverStore(error), "the recovery retry must succeed: " + error);
+    const auto recovered_retry = registry.setCollectors(second);
+    check(recovered_retry.ok,
+          "the recovery retry must succeed through the selection command");
     const auto after = registry.storeHealth();
     check(!after.recovery_required, "a completed recovery must release the latch");
     check(after.sync_commits > before.sync_commits,
@@ -1872,8 +1895,12 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
         // mean recovery attempted no durable write at all.
         registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite, /*skip=*/0,
                                          /*count=*/1);
-        std::string error;
-        check(!registry.recoverStore(error),
+        registry.setCollectorValidator(nullptr);
+        CollectionRequest fence_probe;
+        fence_probe.targets = {id};
+        fence_probe.collectors = std::vector<std::string>{"disk_collector"};
+        const auto refused_retry = registry.setCollectors(fence_probe);
+        check(!refused_retry.ok && refused_retry.error == CollectionError::StoreUnavailable,
               "a failed archive fence must report failure");
         const auto failed = registry.storeHealth();
         check(failed.recovery_required, "a failed archive fence must keep the latch");
@@ -1884,16 +1911,17 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
               "a failed archive fence must not count as a durable commit");
         check(failed.active_instances == 0,
               "the adopted archive leaves no pending active row");
-        check(!registry.hasInstance(id), "an archived instance is never active");
-        check(!registry.inventoryRecordByIdentity(*identity).has_value(),
+        check(!has_active(registry, id), "an archived instance is never active");
+        check(!record_by_identity(registry, *identity).has_value(),
               "the adopted archive releases the identity to the store");
         fence_entries = failed.recovery_fence_entries;
 
         // Only a successful fence may complete the recovery.
         registry.clearStoreFaultsForTest();
-        error.clear();
-        check(registry.recoverStore(error),
-              "the archive recovery retry must succeed: " + error);
+        const auto recovered_retry = registry.setCollectors(fence_probe);
+        check(recovered_retry.error == CollectionError::NotFound,
+              "the archive recovery retry must succeed: the refusal must come "
+              "from the missing instance, not the latch (" + recovered_retry.message + ")");
         const auto recovered = registry.storeHealth();
         check(!recovered.recovery_required,
               "a completed archive recovery must release the latch");
@@ -1962,7 +1990,7 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
         JobRegistry reopened(isolated(path));
         check(!reopened.inventoryRecord(id).has_value(),
               "the recovered archive must not be resurrected by a restart");
-        check(!reopened.inventoryRecordByIdentity(*identity).has_value(),
+        check(!record_by_identity(reopened, *identity).has_value(),
               "the archived identity must not resolve to the archived instance");
         const auto replacement = reopened.upsertObservedJob(condor_observation("907.0"));
         check(replacement.ok && replacement.disposition == UpsertDisposition::Created &&
