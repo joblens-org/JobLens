@@ -116,7 +116,6 @@ struct Args {
     int repeat_rounds = 1;
     int burst = 0;
     int batch_probe = 0;
-    int enqueue_probe = 0;
     int lua_rules = 0;      // >0: measure the automatic policy (Lua) per job
     int lua_iterations = 0;
     int register_rules = 0; // >0: arm the real Lua policy inside registration
@@ -148,7 +147,6 @@ Args parse_args(int argc, char** argv)
         else if (key == "--burst") args.burst = std::stoi(next("--burst"));
         else if (key == "--batch-probe") args.batch_probe = std::stoi(next("--batch-probe"));
         else if (key == "--no-apply") args.no_apply = true;
-        else if (key == "--enqueue-probe") args.enqueue_probe = std::stoi(next("--enqueue-probe"));
         else if (key == "--lua-rules") args.lua_rules = std::stoi(next("--lua-rules"));
         else if (key == "--lua-iterations")
             args.lua_iterations = std::stoi(next("--lua-iterations"));
@@ -160,7 +158,6 @@ Args parse_args(int argc, char** argv)
             std::cout <<
                 "job_registration_bench --db <leveldb-dir> [--out <dir>] [--jobs N]\n"
                 "  [--burst N] [--repeat K] [--batch-probe N] [--no-apply]\n"
-                "  [--enqueue-probe N]\n"
                 "  [--lua-rules K] [--lua-iterations N]\n"
                 "  [--register-rules K] [--drain]\n"
                 "  [--collectors a,b] [--cluster NAME]\n"
@@ -702,28 +699,6 @@ int main(int argc, char** argv)
         drain_passes.push_back(elapsed_us(t0, t1));
     }
 
-    // ---- what the callback costs today: hand the pid to the ingest worker ---
-    // Same fixtures, same registry code, production wiring of the async fast
-    // path: the producer only enqueues, the worker owns the durable work.
-    std::vector<double> enqueue;
-    if (args.enqueue_probe > 0 && !jobs.empty()) {
-        JobRegistryOptions async_options;
-        async_options.db_path = args.db + "-enqueue";
-        async_options.test_heartbeat = true;
-        async_options.enable_pid_tracker = false;
-        async_options.register_rpc = false;
-        JobRegistry async_registry(async_options);
-        for (int i = 0; i < args.enqueue_probe; ++i) {
-            const auto& job = jobs[static_cast<std::size_t>(i) % jobs.size()];
-            const auto t0 = Clock::now();
-            async_registry.onDiscoveryExecHint(job.child);
-            const auto t1 = Clock::now();
-            enqueue.push_back(elapsed_us(t0, t1));
-        }
-        async_registry.deinit();
-    }
-
-    // ---- Lua policy cost: the automatic selection the plan runs per job ------
     std::vector<double> lua_calls;
     std::size_t lua_rejected = 0;
     std::size_t lua_errors = 0;
@@ -757,7 +732,6 @@ int main(int argc, char** argv)
     const auto total = stats_of(samples.total);
     const auto dup = stats_of(samples.dup);
     const auto burst = stats_of(samples.burst);
-    const auto enqueued = stats_of(enqueue);
     const auto lua_stats = stats_of(lua_calls);
     const auto drain_stats = stats_of(drain_passes);
 
@@ -779,7 +753,6 @@ int main(int argc, char** argv)
     print_stats("TOTAL callback", total);
     print_stats("upsert duplicate", dup);
     print_stats("burst registration", burst);
-    if (enqueued.n > 0) print_stats("enqueue (current path)", enqueued);
     if (lua_stats.n > 0) {
         print_stats("lua policy select", lua_stats);
         std::printf("lua rules=%d decisions: rejected=%zu errors=%zu sample=[%s]\n",
@@ -814,7 +787,6 @@ int main(int argc, char** argv)
     dump("total", samples.total);
     dump("dup", samples.dup);
     dump("burst", samples.burst);
-    dump("enqueue", enqueue);
     dump("lua_policy", lua_calls);
 
     std::ofstream json(out_dir + "/results.json");
@@ -837,7 +809,6 @@ int main(int argc, char** argv)
     put("total", total, false);
     put("duplicate", dup, false);
     put("burst", burst, false);
-    put("enqueue", enqueued, false);
     put("lua_policy", lua_stats, true);
     json << "}\n";
 

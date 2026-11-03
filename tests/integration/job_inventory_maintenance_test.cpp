@@ -1460,110 +1460,6 @@ void run_rescan(const std::string& base)
     pass_case("RESCAN", "event-driven and on-demand passes run the same reconcile path");
 }
 
-// ---------------------------------------------------------------------------
-// EXEC - exec hints: targeted observation without a full scan
-// ---------------------------------------------------------------------------
-
-void run_exec_hint(const std::string& base)
-{
-    FakeSource source("condor");
-    FakeProbes probes;
-    JobRegistry registry(heartbeat_options(fresh_dir(base, "exec-hint"), source, probes));
-
-    // The authoritative pass would find nothing: only the targeted path can
-    // create the instance here.
-    source.set_scan([&]() { return scan_with({}); });
-
-    const Observation job =
-        make_condor_observation("960.0", 9700, 292929, "htcondor01", "schedd-a", "/cg/slot-96");
-    source.set_observe([&](pid_t pid) -> std::optional<Observation> {
-        if (pid != 4242) return std::nullopt;
-        return job;
-    });
-
-    const int scans_after_start = source.scans();
-
-    registry.onDiscoveryExecHint(4242);
-    check(wait_until([&]() { return find_native(registry, "960.0").has_value(); }, 5000),
-          "exec hint: the targeted observation did not create the instance");
-    check(source.observations_for_hint() >= 1,
-          "exec hint: the source was never asked for a targeted observation");
-    check(source.scans() == scans_after_start,
-          "exec hint: resolving one pid must not trigger a full scan");
-
-    // An unresolvable hint is counted, never turned into a record.
-    const auto unresolved_before =
-        heartbeat_status()["unresolved_hints"].get<std::uint64_t>();
-    registry.onDiscoveryExecHint(9999);
-    check(wait_until([&]() {
-              return heartbeat_status()["unresolved_hints"].get<std::uint64_t>() >
-                     unresolved_before;
-          }, 5000),
-          "exec hint: an unresolvable pid was not counted");
-    check(registry.inventoryRecords().size() == 1,
-          "exec hint: an unresolvable pid must not create a record");
-
-    registry.deinit();
-    pass_case("EXEC", "exec hints resolve to targeted observations without a full scan");
-}
-
-// EXEC2 - the exec-hint fast path retries incomplete observations (scheduler
-// state not yet written at exec time) on a short ladder before any rescan.
-void run_exec_hint_retry(const std::string& base)
-{
-    FakeSource source("condor");
-    FakeProbes probes;
-    JobRegistry registry(heartbeat_options(fresh_dir(base, "exec-retry"), source, probes));
-
-    // The authoritative pass would find nothing: only the retry ladder can
-    // create the instance here.
-    source.set_scan([&]() { return scan_with({}); });
-    const int scans_after_start = source.scans();
-
-    int observe_attempts = 0;
-    source.set_observe([&](pid_t pid) -> std::optional<Observation> {
-        if (pid != 4242) return std::nullopt;
-        ++observe_attempts;
-        Observation observation = make_condor_observation("961.0", 9701, 292930,
-                                                          "htcondor01", "schedd-a", "/cg/slot-97");
-        if (observe_attempts == 1) {
-            // The job ad is not written yet at exec time: the native id is
-            // unknown, so the observation is explicitly incomplete and must
-            // not create a record.
-            observation.identity_complete = false;
-            observation.canonical_identity.reset();
-            observation.selector.native_job_id.clear();
-            observation.incomplete_reason = "condor job ad unavailable";
-        }
-        return observation;
-    });
-
-    // The hint entry is synchronous now: the registry resolves on the caller's
-    // thread and registers at once. Retrying an incomplete metadata read is the
-    // SOURCE's job (its poll-turn re-read ladder), so one hint equals one
-    // attempt here, and a second hint from the same source must converge.
-    registry.onDiscoveryExecHint(4242);
-    check(observe_attempts == 1,
-          "exec retry: one hint must cause exactly one targeted observation");
-    check(!find_native(registry, "961.0").has_value(),
-          "exec retry: an incomplete observation must not create a record");
-    check(source.scans() == scans_after_start,
-          "exec retry: resolving a hint must not trigger a full scan");
-
-    // The source re-reads on its own schedule and hands the now-complete
-    // observation over the same entry; only then does the instance exist.
-    registry.onDiscoveryExecHint(4242);
-    check(wait_until([&]() { return find_native(registry, "961.0").has_value(); }, 5000),
-          "exec retry: the re-read observation was never registered");
-    check(observe_attempts >= 2,
-          "exec retry: the source was not re-observed after the incomplete pass");
-    check(source.scans() == scans_after_start,
-          "exec retry: the re-read must resolve without a full scan");
-
-    registry.deinit();
-    pass_case("EXEC2", "one hint is one synchronous attempt; the source re-read converges");
-}
-
 }  // namespace
 
 int main(int argc, char** argv)
@@ -1586,8 +1482,6 @@ int main(int argc, char** argv)
         run_legacy(base);
         run_restore_unknown_keeps_evidence(base);
         run_rescan(base);
-        run_exec_hint(base);
-        run_exec_hint_retry(base);
         std::cout << "ALL PASS\n";
         return 0;
     } catch (const std::exception& error) {

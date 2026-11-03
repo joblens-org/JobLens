@@ -2324,44 +2324,6 @@ void JobRegistry::regRPCHandle() {
         });
 }
 
-void JobRegistry::onDiscoveryExecHint(pid_t pid) {
-    // Synchronous entry for out-of-band producers and tests. The watchers drive
-    // their own poll-turn registration and no longer come through here, but a
-    // hint still resolves and registers on the CALLER's thread: there is no
-    // ingest worker to hand it to (plan P4).
-    if (pid <= 0) return;
-    {
-        std::lock_guard<std::mutex> lock(hb_mtx_);
-        ++hb_events_received_;
-        if (!hb_admitted_ || hb_stopping_) {
-            ++hb_events_dropped_;
-            return;
-        }
-    }
-    std::vector<std::pair<std::string, IDiscoverySource*>> sources;
-    {
-        std::lock_guard<std::mutex> lock(hb_mtx_);
-        sources = hb_sources_;
-    }
-    std::set<uint64_t> observed;
-    for (const auto& [name, source] : sources) {
-        if (source == nullptr) continue;
-        std::optional<Observation> observation;
-        try {
-            observation = source->observeForHint(pid);
-        } catch (const std::exception& error) {
-            spdlog::debug("JobRegistry: source '{}' could not resolve hint {}: {}",
-                          name, pid, error.what());
-            continue;
-        }
-        if (!observation) continue;   // not this source's execution
-        processObservation(*observation, observed);
-        return;
-    }
-    std::lock_guard<std::mutex> lock(hb_mtx_);
-    ++hb_unresolved_hints_;
-}
-
 void JobRegistry::onDiscoveryObservation(const Observation& observation) {
     HeartbeatHint hint;
     hint.kind = HeartbeatHint::Kind::Observation;
@@ -2505,7 +2467,6 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     out["auto_policy_budget_us"] = 0;
     out["rescan_requests"] = rescan_requests;
     out["obsolete_hints"] = obsolete_hints;
-    out["unresolved_hints"] = hb_unresolved_hints_;
     out["incomplete_observations"] = incomplete_observations;
     out["upsert_conflicts"] = upsert_conflicts;
     out["retirements"] = retirements;

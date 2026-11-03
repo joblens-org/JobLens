@@ -289,7 +289,6 @@ public:
     // Discovery event entries (the sink the adapters get, exposed for tests
     // and out-of-band producers). Cheap and bounded: they only enqueue.
     void onDiscoveryObservation(const Observation& observation);
-    void onDiscoveryExecHint(pid_t pid);
     // Kernel exit hint entry (cheap; schedules a coalesced refresh).
     void notifyExit(pid_t pid);
 
@@ -414,7 +413,6 @@ private:
     std::uint64_t hb_events_dropped_ = 0;
     std::uint64_t hb_rescan_requests_ = 0;
     std::uint64_t hb_obsolete_hints_ = 0;
-    std::uint64_t hb_unresolved_hints_ = 0;
     std::uint64_t hb_incomplete_observations_ = 0;
     std::uint64_t hb_upsert_conflicts_ = 0;
     std::uint64_t hb_retirements_ = 0;
