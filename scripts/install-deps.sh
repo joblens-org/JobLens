@@ -117,6 +117,73 @@ install_sol2() {
     fi
 }
 
+install_lua54() {
+    # sol2 v3.5.0 supports Lua <= 5.4 only (upstream Lua 5.5 support is still an
+    # unmerged PR). Fedora 45+/rawhide ship Lua 5.5 as the default `lua` /
+    # `lua-devel` (only a runtime lua5.4-libs compat package, no headers), so
+    # building against /usr/include/lua.h fails in sol2's version check.
+    # Build a static Lua 5.4 into INSTALL_PREFIX (default /usr/local):
+    # CMake's FindLua searches <prefix>/include before /usr/include, so
+    # find_package(Lua 5.4) then resolves headers and liblua.a from there.
+    local LUA_VERSION="${LUA_VERSION:-5.4.8}"
+    local INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
+
+    # Skip when the system Lua is already <= 5.4 (sol2 compatible)
+    if [ -f /usr/include/lua.h ]; then
+        local system_major system_minor
+        system_major=$(grep -m1 '#define[[:space:]]LUA_VERSION_MAJOR' /usr/include/lua.h | grep -o '[0-9]\+' | head -1)
+        system_minor=$(grep -m1 '#define[[:space:]]LUA_VERSION_MINOR' /usr/include/lua.h | grep -o '[0-9]\+' | head -1)
+        if [ -n "${system_major}" ] && { [ "${system_major}" -lt 5 ] || \
+            { [ "${system_major}" -eq 5 ] && [ -n "${system_minor}" ] && [ "${system_minor}" -lt 5 ]; }; }; then
+            echo "    system Lua ${system_major}.${system_minor} <= 5.4, no compat build needed"
+            return 0
+        fi
+    fi
+
+    # Idempotency: already installed as 5.4
+    if [ -f "${INSTALL_PREFIX}/include/lua.h" ] && [ -f "${INSTALL_PREFIX}/lib/liblua.a" ]; then
+        echo "    Lua 5.4 already installed at ${INSTALL_PREFIX}"
+        return 0
+    fi
+
+    echo "==> Building Lua ${LUA_VERSION} (static liblua.a) from source..."
+    local LUA_TMP_DIR
+    LUA_TMP_DIR=$(mktemp -d)
+    trap "rm -rf ${LUA_TMP_DIR}" RETURN
+
+    curl -fsSL --retry 3 --retry-delay 5 --retry-max-time 60 \
+        "https://www.lua.org/ftp/lua-${LUA_VERSION}.tar.gz" \
+        -o "${LUA_TMP_DIR}/lua.tar.gz" || {
+        echo "ERROR: Failed to download Lua"
+        return 1
+    }
+
+    tar -xzf "${LUA_TMP_DIR}/lua.tar.gz" -C "${LUA_TMP_DIR}"
+
+    # Target `a` builds only liblua.a (no interpreter => no readline dependency).
+    # LUA_USE_LINUX matches distro builds; -fPIC is required to link the static
+    # archive into a PIE executable.
+    make -C "${LUA_TMP_DIR}/lua-${LUA_VERSION}/src" a \
+        SYSCFLAGS="-DLUA_USE_LINUX" MYCFLAGS="-O2 -fPIC" || return 1
+
+    sudo install -d "${INSTALL_PREFIX}/include" "${INSTALL_PREFIX}/lib"
+    sudo install -m 0644 "${LUA_TMP_DIR}/lua-${LUA_VERSION}/src/liblua.a" "${INSTALL_PREFIX}/lib/"
+    sudo install -m 0644 \
+        "${LUA_TMP_DIR}/lua-${LUA_VERSION}/src/lua.h" \
+        "${LUA_TMP_DIR}/lua-${LUA_VERSION}/src/luaconf.h" \
+        "${LUA_TMP_DIR}/lua-${LUA_VERSION}/src/lualib.h" \
+        "${LUA_TMP_DIR}/lua-${LUA_VERSION}/src/lauxlib.h" \
+        "${LUA_TMP_DIR}/lua-${LUA_VERSION}/src/lua.hpp" \
+        "${INSTALL_PREFIX}/include/"
+
+    if [ -f "${INSTALL_PREFIX}/include/lua.h" ] && [ -f "${INSTALL_PREFIX}/lib/liblua.a" ]; then
+        echo "✅ Lua ${LUA_VERSION} installed successfully"
+    else
+        echo "❌ Lua installation failed"
+        return 1
+    fi
+}
+
 install_bpftool_deb() {
     local BPFTOOL_VERSION="${BPFTOOL_VERSION:-v7.7.0}"
     local BPFTOOL_ARCH
@@ -241,6 +308,7 @@ install_rpm() {
     echo "==> Building Howard Hinnant date from source..."
     install_date
     install_sol2
+    install_lua54
     echo "Done."
 }
 
@@ -272,6 +340,7 @@ install_arch() {
         nlohmann-json \
         bpftool
     install_sol2
+    install_lua54
     echo "Done."
 }
 
