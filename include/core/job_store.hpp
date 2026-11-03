@@ -12,7 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 // JobStore — the single durable representation of inventoried jobs
-// (doc/job_inventory_v2_architecture.md §2.1/§2.4).
+// (doc/jobstore_persistence_service.md).
 //
 // A JobRecord is "a Job plus what JobLens must remember to manage it":
 // execution evidence (identity, generation, members), the durable lifecycle
