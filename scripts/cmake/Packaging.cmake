@@ -36,8 +36,11 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/joblens.service
 
 get_filename_component(SYSTEMD_PRESET_DIR
     "${SYSTEMD_UNIT_DIR}/../system-preset" ABSOLUTE)
+# 两个 unit 都必须显式 enable：preset 规则按文件名顺序取第一条匹配，而系统级的
+# 99-default-disable.preset 是 `disable *`。未在此列出的 unit 会命中那条兜底规则，
+# 安装后停在 disabled，既不会开机自启，升级后也不会被拉起。
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/90-joblens.preset
-    "enable joblens.service\n")
+    "enable joblens.service\nenable joblens-trigger.service\n")
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/90-joblens.preset
         DESTINATION ${SYSTEMD_PRESET_DIR})
 

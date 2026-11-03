@@ -340,14 +340,13 @@ rm -rf %{buildroot}%{_libdir}/cmake/date 2>/dev/null || :
 # 防止 RPM 因数据库记录"未修改"而覆盖用户配置。
 # %%post 脚本会将备份恢复（如内容不同则保留旧版）。
 
+# 停止旧 trigger 实例：避免旧进程继续持有即将被替换的 venv 文件并占用 7592 端口。
+# 这里只 stop，不 disable —— disable 会删掉 multi-user.target.wants 下的链接，而 RPM
+# 升级路径（$1=2）不会再执行 preset，结果是升级后服务既不运行也不会开机自启
+# （0.3.7 及更早版本升级后 trigger 起不来即由此产生）。恢复运行由 %%post 负责。
 if [ -x /usr/bin/systemctl ]; then
-    if /usr/bin/systemctl list-unit-files joblens-trigger.service >/dev/null 2>&1 || \
-       /usr/bin/systemctl status joblens-trigger.service >/dev/null 2>&1; then
-        /usr/bin/systemctl stop joblens-trigger.service >/dev/null 2>&1 || :
-        /usr/bin/systemctl disable joblens-trigger.service >/dev/null 2>&1 || :
-        /usr/bin/systemctl reset-failed joblens-trigger.service >/dev/null 2>&1 || :
-        /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || :
-    fi
+    /usr/bin/systemctl stop joblens-trigger.service >/dev/null 2>&1 || :
+    /usr/bin/systemctl reset-failed joblens-trigger.service >/dev/null 2>&1 || :
 fi
 
 if [ "$1" -eq 2 ]; then
@@ -414,8 +413,18 @@ elif [ "$1" -eq 2 ] && [ -x /usr/bin/systemctl ]; then
     /usr/bin/systemctl restart joblens.service >/dev/null 2>&1 || :
 fi
 
-# trigger 服务的 systemd post 逻辑（首次安装 enable，升级不操作）
+# trigger 服务的 systemd post 逻辑：首次安装按 preset 结果 enable（见
+# 90-joblens.preset），升级路径该宏不执行任何操作，恢复运行见下。
 %systemd_post joblens-trigger.service
+
+# trigger 服务在升级后的恢复
+#   %%pre 已停掉旧实例，此处按与 core 一致的方式拉起新版本：
+#   enable 保证下次开机仍自启，start 保证升级后立即可用。
+#   mask 过的单元启动会被 systemd 拒绝，错误在此忽略，不覆盖显式 mask。
+if [ "$1" -eq 2 ] && [ -x /usr/bin/systemctl ]; then
+    /usr/bin/systemctl enable joblens-trigger.service >/dev/null 2>&1 || :
+    /usr/bin/systemctl start joblens-trigger.service >/dev/null 2>&1 || :
+fi
 
 exit 0
 
@@ -453,11 +462,10 @@ if [ "$1" -eq 0 ] && [ -x /usr/bin/systemctl ]; then
     /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || :
 fi
 
-# core 服务升级时的重启已在 %post 中完成, 此处不再 mark-restart,
+# 两个服务升级时的启停都已在 %post 中完成, 此处不再 mark-restart,
 # 否则 systemd transfiletrigger 的 reload-or-restart --marked 会对
 # 标记单元再执行一次 restart, 与 %post 冲突导致服务被 stop。
-# trigger 服务的 postun 逻辑（%post 未 restart trigger, 此处仍需 mark-restart）
-%systemd_postun_with_restart joblens-trigger.service
+# 完全卸载时的 daemon-reload 由上面的 $1 -eq 0 分支完成。
 
 exit 0
 

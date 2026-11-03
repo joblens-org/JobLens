@@ -140,7 +140,7 @@ fail_check() {
 check_1_binary() {
     local files
     files=$(get_filelist "$RPM_FILE")
-    if echo "$files" | grep -qE '^/usr/bin/JobLens$'; then
+    if grep -qE '^/usr/bin/JobLens$' <<< "$files"; then
         pass_check "1/10" "/usr/bin/JobLens 二进制存在"
     else
         fail_check "1/10" "/usr/bin/JobLens 二进制存在" \
@@ -154,7 +154,7 @@ $(echo "$files" | grep '/usr/bin/' || echo '  (无匹配)')"
 check_2_gunicorn() {
     local files
     files=$(get_filelist "$RPM_FILE")
-    if echo "$files" | grep -q '/usr/lib/joblens/trigger-venv/bin/gunicorn$'; then
+    if grep -q '/usr/lib/joblens/trigger-venv/bin/gunicorn$' <<< "$files"; then
         pass_check "2/10" "trigger-venv/bin/gunicorn 入口存在"
     else
         fail_check "2/10" "trigger-venv/bin/gunicorn 入口存在" \
@@ -168,7 +168,7 @@ $(echo "$files" | grep 'trigger-venv/bin/' || echo '  (无匹配)')"
 check_3_core_service() {
     local files
     files=$(get_filelist "$RPM_FILE")
-    if echo "$files" | grep -q '/usr/lib/systemd/system/joblens\.service$'; then
+    if grep -q '/usr/lib/systemd/system/joblens\.service$' <<< "$files"; then
         pass_check "3/10" "joblens.service systemd unit 存在"
     else
         fail_check "3/10" "joblens.service systemd unit 存在" \
@@ -182,7 +182,7 @@ $(echo "$files" | grep 'systemd/system/' || echo '  (无匹配)')"
 check_4_trigger_service() {
     local files
     files=$(get_filelist "$RPM_FILE")
-    if echo "$files" | grep -q '/usr/lib/systemd/system/joblens-trigger\.service$'; then
+    if grep -q '/usr/lib/systemd/system/joblens-trigger\.service$' <<< "$files"; then
         pass_check "4/10" "joblens-trigger.service systemd unit 存在"
     else
         fail_check "4/10" "joblens-trigger.service systemd unit 存在" \
@@ -196,13 +196,14 @@ $(echo "$files" | grep 'systemd/system/' || echo '  (无匹配)')"
 check_5_bpf_objects() {
     local files
     files=$(get_filelist "$RPM_FILE")
-    if echo "$files" | grep -qE '/usr/lib/joblens/bpf_obj/[^/]+\.bpf\.o$'; then
+    # _libdir 在 64 位系统为 /usr/lib64，不能用 /usr/lib 写死
+    if grep -qE '/usr/lib(64)?/joblens/bpf_obj/[^/]+\.bpf\.o$' <<< "$files"; then
         local count
-        count=$(echo "$files" | grep -cE '/usr/lib/joblens/bpf_obj/[^/]+\.bpf\.o$' || true)
+        count=$(echo "$files" | grep -cE '/usr/lib(64)?/joblens/bpf_obj/[^/]+\.bpf\.o$' || true)
         pass_check "5/10" "eBPF *.bpf.o 对象文件存在 (${count} 个)"
     else
         fail_check "5/10" "eBPF *.bpf.o 对象文件存在" \
-            "预期: /usr/lib/joblens/bpf_obj/*.bpf.o
+            "预期: /usr/lib64/joblens/bpf_obj/*.bpf.o（64 位系统为 lib64，32 位为 lib）
 实际 bpf_obj/ 文件:
 $(echo "$files" | grep 'bpf_obj/' || echo '  (无匹配)')"
     fi
@@ -215,13 +216,13 @@ check_6_configs() {
     local ok=true
     local missing=""
 
-    if ! echo "$files" | grep -q '/etc/JobLens/config\.yaml$'; then
+    if ! grep -q '/etc/JobLens/config\.yaml$' <<< "$files"; then
         ok=false
         missing="$missing  - /etc/JobLens/config.yaml
 "
     fi
 
-    if ! echo "$files" | grep -q '/etc/JobLens/trigger/config\.yaml$'; then
+    if ! grep -q '/etc/JobLens/trigger/config\.yaml$' <<< "$files"; then
         ok=false
         missing="$missing  - /etc/JobLens/trigger/config.yaml
 "
@@ -229,7 +230,7 @@ check_6_configs() {
 
     # 额外检查：gunicorn.conf.py 也应在
     local gunicorn_ok=true
-    if ! echo "$files" | grep -q '/etc/JobLens/trigger/gunicorn\.conf\.py$'; then
+    if ! grep -q '/etc/JobLens/trigger/gunicorn\.conf\.py$' <<< "$files"; then
         gunicorn_ok=false
     fi
 
@@ -299,6 +300,15 @@ check_9_scriptlets() {
         && ! echo "$scripts" | grep -q 'systemctl.*daemon-reload\|systemd_post\|preset.*joblens'; then
         ok=false
         missing="$missing  - %post (systemd daemon-reload / preset / systemd_post)
+"
+    fi
+
+    # 检查 %post 是否包含升级后拉起 trigger 的逻辑
+    # 回归防护：0.3.7 及更早版本升级时只 stop/disable trigger 且 %post 不重启，
+    # 导致升级后 joblens-trigger 既不运行也不开机自启。
+    if ! echo "$scripts" | grep -qE 'systemctl (start|restart) joblens-trigger'; then
+        ok=false
+        missing="$missing  - %post 缺少升级后启动 joblens-trigger 的逻辑
 "
     fi
 
