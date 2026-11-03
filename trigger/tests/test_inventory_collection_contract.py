@@ -85,11 +85,14 @@ def _target(**overrides: Any) -> dict:
         "instance_id": "inst-condor-01",
         "internal_job_id": "42",
         "native_job_id": "172.0",
-        "binding_revision": 3,
+        # Accepted durable revision (the ONE record revision).
+        "record_revision": 3,
         "mode": "manual",
         "desired_collectors": ["cpumem_collector"],
         "applied_collectors": [],
-        "applied_revision": 2,
+        # Actual runtime state, sampled: not proof the intent is attached.
+        "applied_attach_token": 0,
+        "draining": False,
         "errors": [],
     }
     target.update(overrides)
@@ -177,8 +180,8 @@ def test_a30_slurm_job_scope_reports_each_observed_step(install_core) -> None:
             instance_id="inst-step-1",
             native_job_id="9001",
             internal_job_id="43",
-            binding_revision=1,
-            applied_revision=1,
+            record_revision=1,
+            applied_attach_token=1,
         ),
     ]
     fake = install_core(response={"status": "accepted", "targets": targets})
@@ -387,8 +390,8 @@ def test_a31_set_distinguishes_accepted_from_applied(install_core) -> None:
     target = body["targets"][0]
     assert target["desired_collectors"] == ["cpumem_collector"]
     assert target["applied_collectors"] == []
-    assert target["binding_revision"] == 3
-    assert target["applied_revision"] == 2
+    assert target["record_revision"] == 3
+    assert target["applied_attach_token"] == 0
     assert target["mode"] == "manual"
     assert target["errors"] == []
 
@@ -562,8 +565,8 @@ def test_a31_get_forwards_instance_id_and_passes_selection_through(install_core)
         "status": "ok",
         "instance_id": "inst-condor-01",
         "mode": "manual",
-        "binding_revision": 3,
-        "applied_revision": 2,
+        "record_revision": 3,
+        "applied_attach_token": 0,
         "desired_collectors": ["cpumem_collector"],
         "applied_collectors": [],
         "errors": [{"code": "collector_init_failed", "collector": "cpumem_collector"}],

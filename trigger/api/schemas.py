@@ -332,11 +332,12 @@ class CollectionTarget(BaseModel):
     instance_id: str = Field(..., description="不透明实例句柄")
     internal_job_id: str = Field(..., pattern=r"^[0-9]+$", description="内部作业 ID，十进制字符串")
     native_job_id: Optional[str] = Field(None, description="调度器原生作业 ID 字符串")
-    binding_revision: int = Field(..., description="期望（desired）绑定修订号")
+    record_revision: int = Field(..., description="已受理（accepted）的记录修订号")
     mode: str = Field(..., description="绑定模式，如 manual/auto")
     desired_collectors: List[str] = Field(..., description="已持久化的期望采集器")
     applied_collectors: List[str] = Field(..., description="调度器已实际生效的采集器")
-    applied_revision: int = Field(..., description="已生效的绑定修订号")
+    applied_attach_token: int = Field(0, description="实际生效的调度器附着令牌")
+    draining: bool = Field(False, description="该实例的停止是否仍在排空")
     errors: List[Any] = Field(default_factory=list, description="单实例应用错误")
     model_config = {"extra": "allow"}
 
