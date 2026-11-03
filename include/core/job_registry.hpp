@@ -500,6 +500,13 @@ private:
     // succeeded. Retried by the maintenance pass; never re-armed.
     mutable std::mutex drain_mtx_;
     std::set<uint64_t> drain_complete_;
+    // Fact snapshot of what the collection runtime really had attached when a
+    // retirement was accepted, taken at the closing transition while the
+    // runtime still holds the instance. Runtime state only: never persisted,
+    // lost on restart (a restored closing falls back to the durable selection
+    // at archive time). Decides archive-versus-discard.
+    mutable std::mutex retire_applied_mtx_;
+    std::unordered_map<uint64_t, std::vector<std::string>> retire_applied_;
     // KernelAttribution::Host — the registry-side projection updates.
     bool attributionJobExists(uint64_t internal_id) override;
     void attributionJobAddPid(uint64_t internal_id, pid_t pid) override;

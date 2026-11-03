@@ -1084,7 +1084,8 @@ bool JobStore::flush_dirty_locked(const char* reason) {
 
 leveldb::Status JobStore::write_batch_locked(leveldb::WriteBatch& batch,
                                              const char* operation, bool durable,
-                                             const std::vector<uint64_t>* touched) {
+                                             const std::vector<uint64_t>* touched,
+                                             bool delete_only) {
     if (!db_) return leveldb::Status::IOError("job db is not open");
 
     StoreFaultMode injected = StoreFaultMode::None;
@@ -1098,7 +1099,8 @@ leveldb::Status JobStore::write_batch_locked(leveldb::WriteBatch& batch,
                 record_store_failure(fmt::format("injected write failure before commit ({})",
                                                  operation));
                 if (touched && !touched->empty())
-                    latch_recovery_locked(operation, RecoveryKind::AdoptDurable, *touched);
+                    latch_recovery_locked(operation, RecoveryKind::AdoptDurable, *touched,
+                                          delete_only);
                 return leveldb::Status::IOError("injected write failure before commit");
             }
         }
@@ -1111,14 +1113,14 @@ leveldb::Status JobStore::write_batch_locked(leveldb::WriteBatch& batch,
     if (injected == StoreFaultMode::FailAfterWrite) {
         record_store_failure(fmt::format("injected write failure after commit ({})", operation));
         if (touched && !touched->empty())
-            latch_recovery_locked(operation, RecoveryKind::AdoptDurable, *touched);
+            latch_recovery_locked(operation, RecoveryKind::AdoptDurable, *touched, delete_only);
         return leveldb::Status::IOError("injected write failure after commit");
     }
     if (!status.ok()) {
         record_store_failure(fmt::format("LevelDB write failed ({}): {}",
                                          operation, status.ToString()));
         if (touched && !touched->empty())
-            latch_recovery_locked(operation, RecoveryKind::AdoptDurable, *touched);
+            latch_recovery_locked(operation, RecoveryKind::AdoptDurable, *touched, delete_only);
         return status;
     }
 
@@ -1129,11 +1131,18 @@ leveldb::Status JobStore::write_batch_locked(leveldb::WriteBatch& batch,
 }
 
 void JobStore::latch_recovery_locked(const char* operation, RecoveryKind kind,
-                                     const std::vector<uint64_t>& ids)
+                                     const std::vector<uint64_t>& ids, bool delete_only)
 {
     // A durable-row uncertainty is never downgraded to a checkpoint retry:
     // adopting disk is the safe direction and it covers every nameable row.
     if (recovery_kind_ != RecoveryKind::AdoptDurable) recovery_kind_ = kind;
+    // A rewrite latch (the checkpoint failure path) names no ids and must not
+    // weaken a delete-only proof already latched for earlier ids.
+    if (kind == RecoveryKind::AdoptDurable) {
+        const bool first = recovery_ids_.empty();
+        recovery_delete_only_ = first ? delete_only
+                                      : (recovery_delete_only_ && delete_only);
+    }
     recovery_ids_.insert(ids.begin(), ids.end());
     recovery_operation_ = operation ? operation : "unknown write";
     recovery_required_.store(true);
@@ -1161,10 +1170,13 @@ bool JobStore::recover_pending_locked(std::string& error) {
     // still report failure; memory then has no row to rewrite, so the durable
     // history row is the only authoritative image and it has to be fenced.
     std::vector<ArchiveFence> archives;
+    // Deletions confirmed by the row's own absence (delete-only batches).
+    std::vector<uint64_t> confirmed_deletes;
     for (const auto id : ids) {
         std::optional<ArchiveFence> archive;
+        bool delete_confirmed = false;
         std::string failure;
-        if (!adopt_durable_locked(id, archive, failure)) {
+        if (!adopt_durable_locked(id, archive, delete_confirmed, failure)) {
             // Adoption is partial: keep the fenced-write obligation visible for
             // every recovered row that this process already holds, so a retry
             // cannot forget a row that is still only in an unsynced write.
@@ -1181,6 +1193,7 @@ bool JobStore::recover_pending_locked(std::string& error) {
             return false;
         }
         if (archive) archives.push_back(std::move(*archive));
+        if (delete_confirmed) confirmed_deletes.push_back(id);
     }
 
     // The recovered rows are once again authoritative memory state, but the
@@ -1206,7 +1219,7 @@ bool JobStore::recover_pending_locked(std::string& error) {
         }
     }
 
-    if (snapshots.empty() && archives.empty()) {
+    if (snapshots.empty() && archives.empty() && confirmed_deletes.empty()) {
         // Nothing authoritative to re-assert: the latch names rows this process
         // can neither adopt nor rewrite. Reporting completion here would claim a
         // durable state nobody proved.
@@ -1221,6 +1234,13 @@ bool JobStore::recover_pending_locked(std::string& error) {
         uint64_t fence_entries = 0;
         for (const auto& snapshot : snapshots) {
             batch.Put(key_job(snapshot.internal_id), record_json(snapshot).dump());
+            ++fence_entries;
+        }
+        // A delete-only batch is atomic, so a missing `j:` row proves the whole
+        // batch landed: the identity index cannot have survived it. Re-deleting
+        // the row is the idempotent durable proof of that image.
+        for (const auto id : confirmed_deletes) {
+            batch.Delete(key_job(id));
             ++fence_entries;
         }
         for (const auto& archive : archives) {
@@ -1255,12 +1275,13 @@ bool JobStore::recover_pending_locked(std::string& error) {
 
     recovery_ids_.clear();
     recovery_kind_ = RecoveryKind::None;
+    recovery_delete_only_ = false;
     recovery_operation_.clear();
     recovery_required_.store(false);
     record_store_success();
     spdlog::info("JobStore: recovery complete; {} instance(s) adopted, {} row(s) fenced "
                  "from the durable state and {} archive image(s) re-asserted",
-                 ids.size(), snapshots.size(), archives.size());
+                 ids.size(), snapshots.size(), archives.size(), confirmed_deletes.size());
     return true;
 }
 
@@ -1334,8 +1355,9 @@ bool JobStore::read_archive_fence_locked(uint64_t internal_id, ArchiveFence& fen
 }
 
 bool JobStore::adopt_durable_locked(uint64_t internal_id, std::optional<ArchiveFence>& archive,
-                                    std::string& error) {
+                                    bool& delete_confirmed, std::string& error) {
     archive.reset();
+    delete_confirmed = false;
     std::string raw;
     const auto status = db_->Get(leveldb::ReadOptions(), key_job(internal_id), &raw);
 
@@ -1353,6 +1375,23 @@ bool JobStore::adopt_durable_locked(uint64_t internal_id, std::optional<ArchiveF
     }
 
     if (status.IsNotFound()) {
+        if (recovery_delete_only_) {
+            // The latched batch only deleted rows and the `j:` row is gone: a
+            // delete batch is atomic, so the index entry cannot have survived
+            // it either. The deletion is confirmed; the fence re-asserts it by
+            // deleting the row again.
+            std::unique_lock lg(mtx_);
+            records_.erase(internal_id);
+            dirty_records_.erase(internal_id);
+            if (had_identity) {
+                const auto key = identity_index_key(previous_identity);
+                const auto it = identity_index_.find(key);
+                if (it != identity_index_.end() && it->second == internal_id)
+                    identity_index_.erase(it);
+            }
+            delete_confirmed = true;
+            return true;
+        }
         // The write that lost certainty deleted the active row. Only the
         // archive deletes `j:`; the image it left in `h:` is read back before
         // memory is touched, so an unprovable archive keeps the latch instead
@@ -2280,7 +2319,8 @@ bool JobStore::update_job_info(uint64_t id, const Job& job) {
     }, "update job facts");
 }
 
-bool JobStore::archive(uint64_t id) {
+bool JobStore::archive(uint64_t id, const std::vector<std::string>& applied_collectors,
+                       const std::string& applied_provenance) {
     if (!db_running_ || db_ == nullptr) return true;   // nothing durable to clean
     if (recovery_required_.load()) {
         spdlog::error("JobStore: refusing to archive JobID {} while recovery is required",
@@ -2321,6 +2361,12 @@ bool JobStore::archive(uint64_t id) {
     auto history = record_json(stored);
     history["state"] = kStateClosing;
     history["end_time_us"] = now;
+    // The fact snapshot of what the collection runtime really had attached when
+    // the registry accepted the retirement, and how it was established
+    // ("applied": observed on the live runtime; anything else is the registry's
+    // documented fallback). Desired selection alone never decides this row.
+    history["applied_collectors"] = applied_collectors;
+    history["applied_provenance"] = applied_provenance;
 
     leveldb::WriteBatch batch;
     batch.Delete(key);
@@ -2365,6 +2411,89 @@ bool JobStore::archive(uint64_t id) {
     }
 
     spdlog::info("JobStore: archived job {} to history", id);
+    return true;
+}
+
+bool JobStore::discard(uint64_t id) {
+    if (!db_running_ || db_ == nullptr) return true;   // nothing durable to clean
+    if (recovery_required_.load()) {
+        spdlog::error("JobStore: refusing to discard JobID {} while recovery is required",
+                      id);
+        return false;
+    }
+
+    // Same admission as the archive: a discard must not race an upsert of the
+    // instance, or the record could be recreated right after the atomic delete.
+    std::lock_guard<std::mutex> admission(upsert_mtx_);
+    std::lock_guard<std::mutex> db_lock(db_mtx_);
+
+    std::string key = key_job(id);
+    std::string json;
+    leveldb::Status s = db_->Get(leveldb::ReadOptions(), key, &json);
+    if (s.IsNotFound()) {
+        spdlog::warn("JobStore: job {} not found in db when discarding", id);
+        std::unique_lock lg(mtx_);
+        records_.erase(id);
+        return true;
+    }
+    if (!s.ok()) {
+        record_store_failure("LevelDB read failed (discard job): " + s.ToString());
+        return false;
+    }
+
+    JobRecord stored;
+    try {
+        stored = parse_record(json, id);
+    } catch (const std::exception& error) {
+        spdlog::error("JobStore: cannot parse job {} for discard: {}", id, error.what());
+        record_store_failure("corrupt job record during discard");
+        return false;
+    }
+
+    leveldb::WriteBatch batch;
+    batch.Delete(key);
+
+    // Never let stale cleanup remove a newer execution's identity index.
+    bool owned_identity = false;
+    std::string index_key;
+    if (stored.identity_complete) {
+        index_key = key_identity(identity_index_key(stored.identity));
+        std::string value;
+        const auto index_status = db_->Get(leveldb::ReadOptions(), index_key, &value);
+        if (index_status.ok()) {
+            uint64_t owner = 0;
+            try {
+                owner = nlohmann::json::parse(value).value("internal_id", uint64_t{0});
+            } catch (const std::exception&) {
+                owner = 0;
+            }
+            if (owner == id) {
+                batch.Delete(index_key);
+                owned_identity = true;
+            }
+        } else if (!index_status.IsNotFound()) {
+            record_store_failure("LevelDB read failed (identity index discard): " +
+                                 index_status.ToString());
+            return false;
+        }
+    }
+
+    const std::vector<uint64_t> touched{id};
+    const auto status = write_batch_locked(batch, "discard job", /*durable=*/true, &touched,
+                                           /*delete_only=*/true);
+    if (!status.ok()) {
+        return false;
+    }
+
+    {
+        std::unique_lock lg(mtx_);
+        records_.erase(id);
+        if (owned_identity) {
+            identity_index_.erase(identity_index_key(stored.identity));
+        }
+    }
+
+    spdlog::info("JobStore: discarded job {} (never collected)", id);
     return true;
 }
 

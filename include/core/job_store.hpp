@@ -304,8 +304,19 @@ public:
     // Durable lifecycle-state write (the closing transition).
     bool persistState(uint64_t id, const std::string& state);
     // Durable archive (active/closing -> history, identity index and intent
-    // removed). Returns false on a store failure.
-    bool archive(uint64_t id);
+    // removed) for an instance that WAS collected: the history row keeps the
+    // final record, the fact snapshot of what the runtime really had attached
+    // (`applied_collectors`, captured by the registry at the retire decision
+    // point) and how that snapshot was established (`applied_provenance`).
+    // Returns false on a store failure.
+    bool archive(uint64_t id, const std::vector<std::string>& applied_collectors,
+                 const std::string& applied_provenance);
+    // Durable removal WITHOUT a history row, for an instance that was never
+    // collected. Same admission, durability and recovery fencing as archive,
+    // except an ambiguous batch is confirmed by the absence of the `j:` row
+    // itself (a delete-only batch is atomic, so the identity index cannot
+    // outlive the row it pointed at).
+    bool discard(uint64_t id);
     // Re-read process/attribute facts for one stored job (legacy/manual
     // registrations): /proc + scheduler metadata I/O happen in `refresh`
     // OUTSIDE every store lock; only the result write happens here.
@@ -390,10 +401,13 @@ private:
     // and leaves the row in the dirty set for the checkpoint / shutdown flush.
     // `touched` names the instances whose row this batch rewrites; a failed
     // write of such a batch latches recovery because the disk may have landed
-    // the very image memory did not publish.
+    // the very image memory did not publish. `delete_only` marks a batch whose
+    // only row effect is deleting `j:`/`i:` entries: an ambiguous outcome is
+    // then confirmed by the row's absence instead of an archive fence.
     leveldb::Status write_batch_locked(leveldb::WriteBatch& batch, const char* operation,
                                        bool durable = true,
-                                       const std::vector<uint64_t>* touched = nullptr);
+                                       const std::vector<uint64_t>* touched = nullptr,
+                                       bool delete_only = false);
     // Flush body; callers hold db_mtx_.
     bool flush_dirty_locked(const char* reason);
     // Which side is authoritative after an ambiguous write.
@@ -407,8 +421,12 @@ private:
         RewriteMemory,
     };
     // Callers hold db_mtx_ (write_batch_locked is named for that contract).
+    // `delete_only` records that the latched batch only deleted rows, so a
+    // recovery that finds the `j:` row missing treats that as a confirmed
+    // deletion instead of demanding an archive fence.
     void latch_recovery_locked(const char* operation, RecoveryKind kind,
-                               const std::vector<uint64_t>& ids);
+                               const std::vector<uint64_t>& ids,
+                               bool delete_only = false);
     bool recover_pending_locked(std::string& error);
     // The exact durable image of an archive that landed ambiguously: the
     // history key (it encodes the archive timestamp), its value verbatim, and
@@ -428,10 +446,12 @@ private:
                                    std::string& error);
     // Reads one durable row and publishes it. `archive` is set when the row was
     // archived instead of rewritten: memory drops it, and the recovered history
-    // image must be fenced. Returns false only when the outcome is still
-    // unknown (a read error or an image that cannot be proven).
+    // image must be fenced. `delete_confirmed` is set when the row is missing
+    // and the latched batch was delete-only: the deletion landed and the fence
+    // re-asserts it by deleting the row again. Returns false only when the
+    // outcome is still unknown (a read error or an image that cannot be proven).
     bool adopt_durable_locked(uint64_t internal_id, std::optional<ArchiveFence>& archive,
-                              std::string& error);
+                              bool& delete_confirmed, std::string& error);
     // Marks one record / binding as "written but not yet fsynced".
     void mark_record_dirty(uint64_t internal_id);
     void record_store_failure(const std::string& message);
@@ -473,6 +493,8 @@ private:
     std::atomic<bool> store_degraded_{false};
     // Guarded by db_mtx_ (the rejected-state fields are set before ready()).
     RecoveryKind recovery_kind_ = RecoveryKind::None;
+    // True while every latched batch was delete-only (see write_batch_locked).
+    bool recovery_delete_only_ = false;
     std::set<uint64_t> recovery_ids_;
     std::string recovery_operation_;
     std::atomic<bool> recovery_required_{false};

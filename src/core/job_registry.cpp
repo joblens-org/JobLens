@@ -1465,6 +1465,14 @@ bool JobRegistry::retireInstance(uint64_t jobID) {
     // The closing fact must be durable before anything destructive starts: a
     // failed write leaves the instance active and accepted, with no drain.
     if (record->state != kStateClosing) {
+        // Capture the runtime's actual attachment BEFORE the drain begins (and
+        // before any fault can interrupt the sequence): after the drain, or
+        // after a restart, the fact of "was this ever collected" is gone. This
+        // snapshot decides archive-versus-discard later, at cleanup time.
+        {
+            std::lock_guard<std::mutex> applied_lock(retire_applied_mtx_);
+            retire_applied_[jobID] = actualCollection(jobID).collectors;
+        }
         if (!store_->persistState(jobID, kStateClosing)) {
             spdlog::error("JobRegistry: could not persist the closing state for JobID {}; "
                           "retirement refused (the record stays active)", jobID);
@@ -1527,6 +1535,26 @@ bool JobRegistry::cleanupThenArchive(uint64_t jobID) {
     if (current->state != kStateClosing) return false;
     const Job& closing_job = current->job;
 
+    // Archive-versus-discard is a fact decision made here, not in the store:
+    // the runtime snapshot captured when the retirement was accepted
+    // ("applied"), or — for a closing restored from disk, whose capture died
+    // with the previous process — the durable effective selection as the
+    // documented fallback. An empty resolved set means the instance was never
+    // collected and leaves no history row.
+    std::vector<std::string> applied;
+    const char* provenance = "effective";
+    {
+        std::lock_guard<std::mutex> applied_lock(retire_applied_mtx_);
+        const auto captured = retire_applied_.find(jobID);
+        if (captured != retire_applied_.end()) {
+            applied = captured->second;
+            provenance = "applied";
+        }
+    }
+    if (applied.empty() && provenance != std::string("applied")) {
+        applied = current->selection.effectiveCollectors();
+    }
+
     // Ordering invariant (never reversed): durable closing reservation ->
     // checked owner-sensitive kernel cleanup -> archive. The archive is the
     // only step that releases the identity index, so a failed cleanup leaves a
@@ -1540,10 +1568,17 @@ bool JobRegistry::cleanupThenArchive(uint64_t jobID) {
                       cleanup_error.empty() ? "unknown error" : cleanup_error);
         return false;
     }
-    if (!store_->archive(jobID)) {
-        spdlog::error("JobRegistry: durable archive failed for closing JobID {}, keeping "
-                      "it pending (kernel ownership already released)", jobID);
+    const bool removed = applied.empty() ? store_->discard(jobID)
+                                         : store_->archive(jobID, applied, provenance);
+    if (!removed) {
+        spdlog::error("JobRegistry: durable {} failed for closing JobID {}, keeping "
+                      "it pending (kernel ownership already released)",
+                      applied.empty() ? "discard" : "archive", jobID);
         return false;
+    }
+    {
+        std::lock_guard<std::mutex> applied_lock(retire_applied_mtx_);
+        retire_applied_.erase(jobID);
     }
     return true;
 }

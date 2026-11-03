@@ -1857,9 +1857,27 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
     uint64_t fence_entries = 0;
     {
         JobRegistry registry(isolated(path));
+        // The archive path only fires for an instance that WAS collected: the
+        // registry captures the runtime's actual attachment at the retire
+        // decision point. Attach a collector first so this stays the archive
+        // (history-row) scenario; a never-collected instance is the discard
+        // scenario covered by its own case below.
+        registry.setCollectorValidator(nullptr);
+        install_collection_runtime(registry,
+                                   [](const Job& job, std::vector<std::string>& applied,
+                                      std::string& error) {
+                                       applied = job.CollectorNames;
+                                       error.clear();
+                                       return true;
+                                   });
         const auto created = registry.upsertObservedJob(condor_observation("907.0"));
         check(created.ok, "baseline registration must succeed");
         id = created.internal_id;
+
+        const auto committed = registry.applyAutoPolicy(
+            {{id, {"disk_collector"}, "a24f"}});
+        check(committed.ok, "binding must commit: " + committed.message);
+        test_runtime(registry).reconcile(id);
 
         const auto before_archive = registry.inventoryRecord(id);
         check(before_archive.has_value(), "the instance must be readable before retirement");
@@ -1869,8 +1887,12 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
         // the archive. `skip=1` lands the injected failure on the archive.
         registry.injectStoreFaultForTest(StoreFaultMode::FailAfterWrite, /*skip=*/1,
                                          /*count=*/1);
-        check(!registry.retireInstance(id),
-              "an ambiguous archive must not report a completed retirement");
+        // With a runtime holding the instance the retirement is accepted
+        // immediately; the runtime's own pass drives the drain and the archive,
+        // and it is that archive write whose outcome becomes ambiguous.
+        check(registry.retireInstance(id),
+              "retirement with a subscriber must be accepted");
+        test_runtime(registry).reconcile(id);
         registry.clearStoreFaultsForTest();
 
         // The closing transition is itself a record mutation, so the durable
@@ -1985,6 +2007,13 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
     check(stored_identity.is_object() &&
               stored_identity.value("native_job_id", std::string{}) == "907.0",
           "the fenced history row must keep the archived identity");
+    const auto stored_applied = history.value("applied_collectors", nlohmann::json::array());
+    check(stored_applied.is_array() && stored_applied.size() == 1 &&
+              stored_applied[0] == "disk_collector",
+          "the fenced history row must keep the applied fact snapshot of what the "
+          "runtime really had attached");
+    check(history.value("applied_provenance", std::string{}) == "applied",
+          "the fact snapshot must record that it was observed on the live runtime");
 
     {
         JobRegistry reopened(isolated(path));
@@ -2002,6 +2031,135 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
               "the replacement must not inherit the archived intent");
         check(reopened.deinit(), "shutdown must succeed after the replacement");
     }
+}
+
+// Archive split, fact criterion: an instance that was NEVER collected leaves
+// no history row at all — its removal is a durable delete.
+void never_collected_instances_are_discarded(const std::string& base)
+{
+    const auto path = fresh_dir(base, "discard-never-collected");
+    uint64_t id = 0;
+    {
+        JobRegistry registry(isolated(path));
+        // No runtime is installed: nothing can ever have collected the job, and
+        // the retirement finalizes synchronously.
+        const auto created = registry.upsertObservedJob(condor_observation("172.0"));
+        check(created.ok, "baseline registration must succeed");
+        id = created.internal_id;
+        check(registry.retireInstance(id), "retirement must be accepted");
+        check(!registry.inventoryRecord(id).has_value(),
+              "the discarded instance must leave the active map");
+        check(registry.deinit(), "shutdown must not fail after a clean discard");
+    }
+
+    check(raw_keys_with_prefix(path, "j:").empty(),
+          "no active row may survive a discard");
+    check(raw_keys_with_prefix(path, "h:").empty(),
+          "a never-collected instance must leave no history row");
+}
+
+// An ambiguous discard (the delete batch landed but the write reported
+// failure) is confirmed by the row's own absence; recovery must clear the
+// latch and durably re-assert the deletion, and never write a history row.
+void ambiguous_discard_is_confirmed_by_the_missing_row(const std::string& base)
+{
+    const auto path = fresh_dir(base, "discard-ambiguous");
+    uint64_t id = 0;
+    {
+        JobRegistry registry(isolated(path));
+        const auto created = registry.upsertObservedJob(condor_observation("172.0"));
+        check(created.ok, "baseline registration must succeed");
+        id = created.internal_id;
+
+        // Two durable writes: the closing state (skipped), then the discard
+        // (lands, reports failure).
+        registry.injectStoreFaultForTest(StoreFaultMode::FailAfterWrite, /*skip=*/1,
+                                         /*count=*/1);
+        check(!registry.retireInstance(id),
+              "an ambiguous discard must not report a completed retirement");
+        registry.clearStoreFaultsForTest();
+
+        const auto latched = registry.storeHealth();
+        check(latched.recovery_required, "the ambiguous discard must latch recovery");
+
+        // A probe mutation drives the recovery, exactly like production paths.
+        registry.setCollectorValidator(nullptr);
+        CollectionRequest probe;
+        probe.targets = {id};
+        probe.collectors = std::vector<std::string>{"disk_collector"};
+        const auto probe_outcome = registry.setCollectors(probe);
+        check(probe_outcome.error == CollectionError::NotFound,
+              "the discard recovery must succeed; the refusal must come from the "
+              "missing instance (" + probe_outcome.message + ")");
+        const auto recovered = registry.storeHealth();
+        check(!recovered.recovery_required,
+              "the confirmed deletion must release the latch");
+        check(recovered.recovery_fence_entries >= 1,
+              "the discard fence must durably re-assert the deletion");
+        check(registry.deinit(), "shutdown must succeed after the discard recovery");
+    }
+
+    check(raw_keys_with_prefix(path, "j:").empty(),
+          "no active row may survive a recovered discard");
+    check(raw_keys_with_prefix(path, "h:").empty(),
+          "a discard must never write a history row");
+    check(raw_keys_with_prefix(path, "i:").empty(),
+          "the delete batch is atomic: the identity index cannot survive the row");
+}
+
+// A closing restored from disk carries no captured runtime fact (the capture
+// is runtime state and dies with the process). The archive decision then
+// falls back to the durable effective selection and records that provenance.
+void restored_closing_archives_with_effective_fallback(const std::string& base)
+{
+    const auto path = fresh_dir(base, "restored-closing-fallback");
+    uint64_t id = 0;
+    {
+        JobRegistry registry(isolated(path));
+        registry.setCollectorValidator(nullptr);
+        install_deferred_drain(registry, [](JobEvent, const Job&) {});
+        const auto created = registry.upsertObservedJob(condor_observation("172.0"));
+        check(created.ok, "baseline registration must succeed");
+        id = created.internal_id;
+        // A durable non-empty selection is what the fallback will read.
+        const auto committed = registry.applyAutoPolicy(
+            {{id, {"disk_collector"}, "fallback"}});
+        check(committed.ok, "binding must commit: " + committed.message);
+        check(registry.retireInstance(id),
+              "retirement with a subscriber must be accepted");
+        // The shutdown checkpoint is skipped so the injected failure lands on
+        // the archive write: the closing row survives as if the process died
+        // between the closing transition and the archive.
+        registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite, /*skip=*/1);
+        check(!registry.deinit(),
+              "deinit must fail to archive the drain (the crash model)");
+    }
+
+    {
+        JobRegistry registry(isolated(path));
+        const auto record = registry.inventoryRecord(id);
+        check(record.has_value() && record->state == "closing",
+              "the closing record must be restored");
+        check(registry.cleanupClosingJobs(),
+              "the closing cleanup must finalize the restored closing");
+        check(!registry.inventoryRecord(id).has_value(),
+              "the restored closing must be archived by the cleanup");
+        check(registry.deinit(), "shutdown must succeed after the fallback archive");
+    }
+
+    const auto history_keys = raw_keys_with_prefix(path, "h:");
+    check(history_keys.size() == 1,
+          "the fallback must keep exactly one history row for a selected instance");
+    for (const auto& [key, value] : read_raw_db(path)) {
+        if (key.rfind("h:" + hex64(id) + ":", 0) != 0) continue;
+        const auto history = nlohmann::json::parse(value);
+        check(history.value("applied_provenance", std::string{}) == "effective",
+              "a restored closing must record the effective-selection fallback");
+        const auto applied = history.value("applied_collectors", nlohmann::json::array());
+        check(applied.size() == 1 && applied[0] == "disk_collector",
+              "the fallback snapshot must carry the durable effective selection");
+    }
+    check(raw_keys_with_prefix(path, "j:").empty(), "no active row may survive");
 }
 
 int main(int argc, char** argv)
@@ -2039,6 +2197,9 @@ int main(int argc, char** argv)
         runtime_projection_survives_repeated_observation(base);
         recovery_fences_the_adopted_selection(base);
         ambiguous_archive_is_fenced_from_the_durable_image(base);
+        never_collected_instances_are_discarded(base);
+        ambiguous_discard_is_confirmed_by_the_missing_row(base);
+        restored_closing_archives_with_effective_fallback(base);
         std::cout << "PASS inventory store: A04 empty-binding upsert idempotency, "
                      "A19 old-schema rejection without migration or deletion, "
                      "A19 canonical schema marker, A20 idempotent rejection and "
@@ -2053,7 +2214,9 @@ int main(int argc, char** argv)
                      "leaves no active row, A05 runtime projection across "
                      "republication, A21 recovery fences the adopted selection, "
                      "A24 ambiguous archive recovery fences the durable history "
-                     "image, "
+                     "image, archive split by the fact criterion (never-collected "
+                      "discard, ambiguous discard recovery, restored-closing "
+                      "effective fallback), "
                      "schema-3 single-row intent and closing-sync failure safety\n";
         return 0;
     } catch (const std::exception& error) {
