@@ -2575,26 +2575,11 @@ bool JobStore::hasActive(uint64_t id) const {
     return it != records_.end() && it->second.state != kStateClosing;
 }
 
-bool JobStore::isClosing(uint64_t id) const {
-    std::shared_lock lg(mtx_);
-    const auto it = records_.find(id);
-    return it != records_.end() && it->second.state == kStateClosing;
-}
-
 size_t JobStore::closingCount() const {
     std::shared_lock lg(mtx_);
     size_t count = 0;
     for (const auto& entry : records_) {
         if (entry.second.state == kStateClosing) ++count;
-    }
-    return count;
-}
-
-size_t JobStore::activeCount() const {
-    std::shared_lock lg(mtx_);
-    size_t count = 0;
-    for (const auto& entry : records_) {
-        if (entry.second.state != kStateClosing) ++count;
     }
     return count;
 }

@@ -284,31 +284,7 @@ public:
         identity_applier_ = std::move(applier);
     }
 
-    // --- restore (once, right after construction) ------------------------
-    // Validates restored executions with a POSITIVE identity check:
-    //   * a DISCOVERY row (execution_observed) is kept only when its boot
-    //     matches and its manager's current start ticks match.  A stale one
-    //     becomes suspect with cleared members (positive reuse evidence); an
-    //     UNVERIFIABLE one (unreadable /proc, or an incomplete discovery
-    //     generation) becomes suspect while its saved member/PID facts are
-    //     retained -- deleting evidence is not a verdict, and the retained
-    //     facts are what stops a later absence rule from retiring a live child;
-    //   * a MANUAL row (no observed execution) owns no generation; its members
-    //     are re-checked individually;
-    //   * a member is kept only while its saved boot id equals the current boot
-    //     and the process holding that number still matches the saved start
-    //     ticks; a recycled PID or an old-boot identity is dropped;
-    //   * a member without a saved identity (legacy/manual row) is kept as an
-    //     unverified fact, never turned into a fabricated `{pid, 0, ""}` and
-    //     never seeded onto the kernel.
-    // Explicitly interrupted closings keep their state.  Never replays
-    // anything into kernel maps.
-    std::vector<JobRecord> restore();
-
     // --- internal id allocation ------------------------------------------
-    // Durable allocation on its own (manual registration): reserves the id with
-    // its own commit before it is handed out.
-    uint64_t allocateId(std::string& error);
     uint64_t nextJobId();   // ready-checked; 0 when the store is not ready
 
     // --- manual (legacy) registration -------------------------------------
@@ -321,19 +297,10 @@ public:
     // closing instances and conflicting live generations. Never fires
     // lifecycle callbacks and never starts collection.
     UpsertResult upsert(const Job& job, JobRecord& out);
-    // Write-free merge decision for one observation against an already-loaded
-    // record, used by the single upsert path.
-    UpsertResult merge_existing(const Job& job, const NativeSelector& selector,
-                                const CanonicalIdentity& identity, uint64_t internal_id,
-                                const JobRecord& stored, int64_t observed_at,
-                                JobRecord& updated_out);
     // --- record mutations ---------------------------------------------------
     // Generic in-memory read-modify-write under the store lock. Does not
-    // persist; combine with persistRecord for durable mutations.
+    // persist; combine with updateRecord for durable mutations.
     bool mutateRecord(uint64_t id, const std::function<void(JobRecord&)>& mutate);
-    // Generic durable read-modify-write of one record.
-    bool updateRecord(uint64_t id, const std::function<void(JobRecord&)>& mutate,
-                      const char* operation);
     // Durable lifecycle-state write (the closing transition).
     bool persistState(uint64_t id, const std::string& state);
     // Durable archive (active/closing -> history, identity index and intent
@@ -364,9 +331,7 @@ public:
 
     // --- queries -------------------------------------------------------------
     bool hasActive(uint64_t id) const;
-    bool isClosing(uint64_t id) const;
     size_t closingCount() const;
-    size_t activeCount() const;
     std::optional<JobRecord> record(uint64_t id) const;
     std::optional<JobRecord> recordByIdentity(const CanonicalIdentity& identity) const;
     std::vector<JobRecord> records() const;
@@ -398,6 +363,28 @@ private:
     bool reserveIdInMemory(uint64_t& id, uint64_t& durable_counter,
                            bool& durable_exhausted, std::string& error);
     bool store_ready() const;
+
+    // --- internal implementation entry points (no external callers) -------
+    // Restore (once, right after construction): validates restored executions
+    // with a POSITIVE identity check.  A DISCOVERY row is kept only when its
+    // boot matches and its manager's start ticks match; a MANUAL row's members
+    // are re-checked individually; a member is kept only while its saved boot
+    // id equals the current boot and the process still matches the saved start
+    // ticks.  Interrupted closings keep their state.  Never replays anything
+    // into kernel maps.
+    std::vector<JobRecord> restore();
+    // Durable allocation on its own (manual registration): reserves the id
+    // with its own commit before it is handed out.
+    uint64_t allocateId(std::string& error);
+    // Write-free merge decision for one observation against an already-loaded
+    // record, used by the single upsert path.
+    UpsertResult merge_existing(const Job& job, const NativeSelector& selector,
+                                const CanonicalIdentity& identity, uint64_t internal_id,
+                                const JobRecord& stored, int64_t observed_at,
+                                JobRecord& updated_out);
+    // Generic durable read-modify-write of one record.
+    bool updateRecord(uint64_t id, const std::function<void(JobRecord&)>& mutate,
+                      const char* operation);
     // `durable` = true fsyncs the batch (that is, also every earlier unsynced
     // write in the log). The registration hot path writes with durable=false
     // and leaves the row in the dirty set for the checkpoint / shutdown flush.
