@@ -220,7 +220,7 @@ struct JobRecord {
     // --- the Job as collectors see it (projection source) ---------------
     Job job;
     // --- execution evidence ---------------------------------------------
-    std::string adapter;                 // adapter name, e.g. "condor"
+    // (The adapter name lives on job.subtype_name — one copy on the Job.)
     NativeSelector selector;             // original wire identity (verbatim)
     CanonicalIdentity identity;          // valid only when identity_complete
     bool identity_complete = false;

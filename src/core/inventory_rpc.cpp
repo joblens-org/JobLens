@@ -279,7 +279,7 @@ uint64_t inventory_snapshot_revision(const std::vector<JobRecord>& records)
 
 std::string inventory_source(const JobRecord& record)
 {
-    return record.adapter.empty() ? "manual" : record.adapter;
+    return record.job.subtype_name.empty() ? "manual" : record.job.subtype_name;
 }
 
 nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& record)

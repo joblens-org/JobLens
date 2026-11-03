@@ -216,7 +216,7 @@ nlohmann::json record_json(const JobRecord& record) {
     out["last_seen_us"]   = record.last_seen_us;
     out["members_authoritative"] = record.members_authoritative;
     out["execution_observed"] = record.execution_observed;
-    if (!record.adapter.empty()) out["adapter"] = record.adapter;
+    if (!record.job.subtype_name.empty()) out["adapter"] = record.job.subtype_name;
     if (record.selector.adapter.empty()) {
         out["selector"] = nullptr;
     } else {
@@ -283,7 +283,11 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
     record.first_seen_us  = j.value("first_seen_us", int64_t{0});
     record.last_seen_us   = j.value("last_seen_us", int64_t{0});
     record.members_authoritative = j.value("members_authoritative", false);
-    record.adapter        = j.value("adapter", std::string{});
+    // Legacy fold: rows written before the adapter name moved onto the Job
+    // carry it only under "adapter" — hydrate subtype_name so every reader
+    // sees one copy.
+    if (record.job.subtype_name.empty())
+        record.job.subtype_name = j.value("adapter", std::string{});
     if (record.revision == 0) record.revision = 1;
 
     // Schema 4 stores the desired selection in the same row, ordered by the

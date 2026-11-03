@@ -607,7 +607,7 @@ void JobRegistry::evaluateRetirements(
                 suspect_ids_.erase(record.internal_id);
                 continue;
             }
-            const auto coverage = source_complete.find(record.adapter);
+            const auto coverage = source_complete.find(record.job.subtype_name);
             const bool absence_allowed =
                 coverage != source_complete.end() && coverage->second;
             if (absence_allowed && entry.complete_absences < kAbsencesBeforeRetirement) {
@@ -1100,7 +1100,7 @@ JobRegistry::resolve_inventory_components(const JobRegistryOptions& options)
             auto record = ownRecord(internal_id);
             if (!record) return false;
             for (const auto& adapter : adapters_) {
-                if (adapter->name() == record->adapter)
+                if (adapter->name() == record->job.subtype_name)
                     return adapter->traits().kernel_attribution;
             }
             return true;
@@ -1422,7 +1422,7 @@ std::string JobRegistry::attributionCgroupPath(uint64_t internal_id) {
     const auto record = ownRecord(internal_id);
     if (!record) return {};
     for (const auto& adapter : adapters_)
-        if (adapter->name() == record->adapter)
+        if (adapter->name() == record->job.subtype_name)
             return adapter->cgroupPathOf(record->job);
     return {};
 }
@@ -1564,7 +1564,8 @@ bool JobRegistry::addJob(const Job& job) {
         // Legacy registrations carry their identity only inside the typed
         // facts; reconstruct the selector, never a guess.
         record.selector = selector_from_legacy_job(record.job);
-        record.adapter = record.selector.adapter;
+        // One copy of the adapter name: on the Job itself.
+        record.job.subtype_name = record.selector.adapter;
         if (const auto identity = canonicalize(record.selector)) {
             record.identity = *identity;
             record.identity_complete = true;
@@ -2759,7 +2760,6 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job) {
 
         created.internal_id = allocated;
         created.instance_id = store_->instanceId(allocated);
-        created.adapter = selector.adapter;
         created.selector = selector;
         created.identity = *identity;
         created.identity_complete = true;
