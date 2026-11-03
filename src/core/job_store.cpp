@@ -13,9 +13,10 @@
  * limitations under the License. */
 // JobStore implementation — see include/core/job_store.hpp.
 //
-// Scheduler-specific fact decoding (Condor/Slurm attribute variants) is still
-// parked here in decode_facts/selector_from_legacy_job/apply_identity_to_facts
-// and moves into the scheduler adapters in v2 stage S4.
+// This file is the persistence executor only: LevelDB layout, row codec,
+// batch atomicity, tiered durability, recovery fences and the ID high-water.
+// Every business decision (merge, restore validation, selection strategy,
+// archive-versus-discard) lives in job_registry.cpp.
 
 #include "core/job_store.hpp"
 
@@ -182,20 +183,6 @@ ProcessIdentity process_from_json(const nlohmann::json& in) {
     process.start_ticks = in.value("start_ticks", uint64_t{0});
     process.boot_id = in.value("boot_id", std::string{});
     return process;
-}
-
-std::vector<ProcessIdentity> normalized_processes(std::vector<ProcessIdentity> processes) {
-    std::sort(processes.begin(), processes.end(),
-              [](const ProcessIdentity& lhs, const ProcessIdentity& rhs) {
-                  if (lhs.pid != rhs.pid) return lhs.pid < rhs.pid;
-                  return lhs.start_ticks < rhs.start_ticks;
-              });
-    processes.erase(std::unique(processes.begin(), processes.end(),
-                                [](const ProcessIdentity& lhs, const ProcessIdentity& rhs) {
-                                    return lhs == rhs;
-                                }),
-                    processes.end());
-    return processes;
 }
 
 void write_job_fields(nlohmann::json& out, const Job& job) {
@@ -387,218 +374,30 @@ CollectionSelection selection_from_json(const nlohmann::json& in) {
     return selection;
 }
 
-
-// ---------------------------------------------------------------------------
-// Fact merging
-// ---------------------------------------------------------------------------
-
-bool merge_text(std::string& target, const std::string& source) {
-    if (source.empty() || target == source) return false;
-    target = source;
-    return true;
-}
-
-template <typename T>
-bool merge_scalar(T& target, T source) {
-    if (source == T{} || target == source) return false;
-    target = source;
-    return true;
-}
-
-bool merge_flag(bool& target, bool source) {
-    if (!source || target) return false;
-    target = true;
-    return true;
-}
-
-bool merge_condor_attr(CondorJobAttr& target, const CondorJobAttr& source) {
-    bool changed = false;
-    changed |= merge_scalar(target.starter_pid, source.starter_pid);
-    changed |= merge_scalar(target.cluster_id, source.cluster_id);
-    changed |= merge_scalar(target.proc_id, source.proc_id);
-    changed |= merge_text(target.scheduler_host, source.scheduler_host);
-    changed |= merge_text(target.scheduler_name, source.scheduler_name);
-    changed |= merge_text(target.slots_cgroup_path, source.slots_cgroup_path);
-    changed |= merge_text(target.owner, source.owner);
-    changed |= merge_text(target.job_ad_path, source.job_ad_path);
-    changed |= merge_text(target.collector_host, source.collector_host);
-    changed |= merge_flag(target.auto_update_child, source.auto_update_child);
-    return changed;
-}
-
-bool merge_slurm_attr(SlurmJobAttr& target, const SlurmJobAttr& source) {
-    bool changed = false;
-    changed |= merge_scalar(target.stepd_pid, source.stepd_pid);
-    changed |= merge_scalar(target.job_id, source.job_id);
-    changed |= merge_scalar(target.step_id, source.step_id);
-    changed |= merge_text(target.cluster_name, source.cluster_name);
-    changed |= merge_text(target.cgroup_path, source.cgroup_path);
-    changed |= merge_text(target.user, source.user);
-    changed |= merge_text(target.job_name, source.job_name);
-    changed |= merge_text(target.partition, source.partition);
-    changed |= merge_flag(target.auto_update_child, source.auto_update_child);
-    return changed;
-}
-
-bool merge_common_attr(CommonJobAttr& target, const CommonJobAttr& source) {
-    return merge_flag(target.auto_update_child, source.auto_update_child);
-}
-
-// Merge observation facts into the stored facts. Empty/default observation
-// fields never erase known facts; CollectorNames is never taken from an
-// observation because selection is intent, not a discovery fact.
-//
-// `replace_members` upgrades the PID list to an authoritative replacement: an
-// empty list then means "the source read the membership and found none", which
-// must clear stale PIDs instead of silently keeping them. Without the flag
-// (membership only partially known) an empty list is ignored.
-bool merge_job_facts(Job& target, const Job& observed, bool replace_members) {
-    bool changed = false;
-
-    if (observed.subtype != JobSubType::Unknown && target.subtype != observed.subtype) {
-        target.subtype = observed.subtype;
-        changed = true;
-    }
-    if (observed.jobtype != JobType::Unknown && target.jobtype != observed.jobtype) {
-        target.jobtype = observed.jobtype;
-        changed = true;
-    }
-    changed |= merge_text(target.NativeJobID, observed.NativeJobID);
-    changed |= merge_text(target.cluster_name, observed.cluster_name);
-    changed |= merge_text(target.clusterTag, observed.clusterTag);
-
-    std::vector<pid_t> observed_pids = observed.JobPIDs;
-    std::sort(observed_pids.begin(), observed_pids.end());
-    observed_pids.erase(std::unique(observed_pids.begin(), observed_pids.end()),
-                        observed_pids.end());
-    // Authoritative replacement (possibly empty), or a non-empty merge list;
-    // a partial member set never erases stored members.
-    if (replace_members || !observed_pids.empty()) {
-        if (observed_pids != target.JobPIDs) {
-            target.JobPIDs = std::move(observed_pids);
-            changed = true;
-        }
-    }
-
-    std::visit([&changed, &target](const auto& source) {
-        using T = std::decay_t<decltype(source)>;
-        if constexpr (std::is_same_v<T, CondorJobAttr>) {
-            if (auto* current = std::get_if<CondorJobAttr>(&target.sub_attr)) {
-                changed |= merge_condor_attr(*current, source);
-            } else {
-                target.sub_attr = source;
-                changed = true;
-            }
-        } else if constexpr (std::is_same_v<T, SlurmJobAttr>) {
-            if (auto* current = std::get_if<SlurmJobAttr>(&target.sub_attr)) {
-                changed |= merge_slurm_attr(*current, source);
-            } else {
-                target.sub_attr = source;
-                changed = true;
-            }
-        } else {
-            if (auto* current = std::get_if<CommonJobAttr>(&target.sub_attr)) {
-                changed |= merge_common_attr(*current, source);
-            } else {
-                target.sub_attr = source;
-                changed = true;
-            }
-        }
-    }, observed.sub_attr);
-
-    return changed;
-}
-
-nlohmann::json facts_fingerprint(const Job& job, const JobRecord& record) {
-    nlohmann::json out;
-    out["jobtype"] = static_cast<int>(job.jobtype);
-    out["subtype"] = static_cast<int>(job.subtype);
-    out["native_job_id"] = job.NativeJobID;
-    out["cluster_name"] = job.cluster_name;
-    out["clusterTag"] = job.clusterTag;
-
-    auto pids = job.JobPIDs;
-    std::sort(pids.begin(), pids.end());
-    pids.erase(std::unique(pids.begin(), pids.end()), pids.end());
-    out["pids"] = pids;
-
-    nlohmann::json members = nlohmann::json::array();
-    for (const auto& member : normalized_processes(record.members)) {
-        members.push_back(process_to_json(member));
-    }
-    out["members"] = std::move(members);
-
-    std::visit([&out](const auto& attr) {
-        out["sub_attr"] = nlohmann::json(attr);
-    }, job.sub_attr);
-    out["generation"] = generation_to_json(record.generation);
-    return out;
-}
-
-// ---------------------------------------------------------------------------
-// Scheduler-specific fact helpers (move into adapters in S4)
-// ---------------------------------------------------------------------------
-
-// Best-effort selector reconstruction for legacy (schema < 2) records. A
-// missing namespace or native id yields an incomplete selector, never a guess.
-NativeSelector selector_from_legacy_job(const Job& job) {
-    NativeSelector selector;
-    if (job.subtype == JobSubType::Condor) {
-        selector.adapter = kAdapterCondor;
-        selector.cluster_name = job.cluster_name;
-        selector.cluster_tag = job.clusterTag;
-        selector.native_job_id = job.NativeJobID;
-        if (selector.native_job_id.empty()) {
-            if (const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr)) {
-                selector.native_job_id = fmt::format("{}.{}", attr->cluster_id, attr->proc_id);
-            }
-        }
-    } else if (job.subtype == JobSubType::Slurm) {
-        selector.adapter = kAdapterSlurm;
-        selector.cluster_name = job.cluster_name;
-        selector.native_job_id = job.NativeJobID;
-        if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr)) {
-            if (selector.cluster_name.empty()) selector.cluster_name = attr->cluster_name;
-            if (selector.native_job_id.empty()) {
-                selector.native_job_id = std::to_string(attr->job_id);
-            }
-            if (attr->step_id != 0) {
-                if (const auto name = slurm_step_name(attr->step_id)) {
-                    selector.step_id = *name;
-                } else {
-                    selector.step_id = std::to_string(attr->step_id);
-                }
-            }
-        }
-    }
-    return selector;
-}
-
-// Apply a resolved logical identity to typed facts through the registry's
-// injected applier (adapter-owned derivation). The generic parts — the
-// authoritative native string and namespace — apply here; the scheduler
-// typed-attr derivation lives in the adapters. Without an applier (store-only
-// tests) the observed facts are stored verbatim: no branch, no misfiling of
-// an open-world scheduler into a built-in schema.
-void apply_identity_via_applier(
-    const std::function<void(Job&, const NativeSelector&, const CanonicalIdentity&)>& applier,
-    Job& job, const NativeSelector& selector, const CanonicalIdentity& identity) {
-    job.NativeJobID = identity.native_job_id;
-    if (!selector.cluster_name.empty()) job.cluster_name = selector.cluster_name;
-    if (!selector.cluster_tag.empty()) job.clusterTag = selector.cluster_tag;
-    if (job.jobtype != JobType::Job && job.jobtype != JobType::Sys) {
-        job.jobtype = JobType::Job;
-    }
-    if (applier) applier(job, selector, identity);
-}
-
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Row member canonicalization (shared with the registry's merge path)
+// ---------------------------------------------------------------------------
+
+std::vector<ProcessIdentity> normalized_processes(std::vector<ProcessIdentity> processes) {
+    std::sort(processes.begin(), processes.end(),
+              [](const ProcessIdentity& lhs, const ProcessIdentity& rhs) {
+                  if (lhs.pid != rhs.pid) return lhs.pid < rhs.pid;
+                  return lhs.start_ticks < rhs.start_ticks;
+              });
+    processes.erase(std::unique(processes.begin(), processes.end(),
+                                [](const ProcessIdentity& lhs, const ProcessIdentity& rhs) {
+                                    return lhs == rhs;
+                                }),
+                    processes.end());
+    return processes;
+}
 
 // Unambiguous identity index key. Canonical components are validated
 // (scheduler name, digits/dot native id, normalized step), so the only
 // free-form part is the cluster namespace and it is length-prefixed.
-std::string identity_index_key(const CanonicalIdentity& identity) {
-    std::string key;
+std::string identity_index_key(const CanonicalIdentity& identity) {    std::string key;
     key.reserve(identity.cluster_namespace.size() + identity.canonical_native.size() + 32);
     key += identity.adapter;
     key += '|';
@@ -635,8 +434,7 @@ std::optional<CollectionMode> collection_mode_from_string(const std::string& raw
 // ---------------------------------------------------------------------------
 
 JobStore::JobStore(const Options& options)
-    : options_(options),
-      boot_id_(read_boot_id()) {
+    : options_(options) {
     if (!init_db(options)) {
         db_running_ = false;
         spdlog::warn("JobStore: job db not running");
@@ -1476,8 +1274,8 @@ uint64_t JobStore::allocateId(std::string& error) {
     return id;
 }
 
-bool JobStore::reserveIdInMemory(uint64_t& id, uint64_t& durable_counter,
-                                 bool& durable_exhausted, std::string& error) {
+bool JobStore::reserveId(uint64_t& id, uint64_t& durable_counter,
+                         bool& durable_exhausted, std::string& error) {
     std::lock_guard<std::mutex> id_lock(id_mtx_);
     if (id_exhausted_ || next_id_ == 0) {
         error = "id_exhausted";
@@ -1517,919 +1315,228 @@ uint64_t JobStore::nextJobId() {
 }
 
 // ---------------------------------------------------------------------------
-// Manual registration (legacy addJob persistence)
+// Durable identity resolution (the ambiguous-create repair read)
 // ---------------------------------------------------------------------------
 
-bool JobStore::insertManual(JobRecord record) {
-    if (!store_ready()) return false;
-    if (recovery_required_.load()) {
-        spdlog::error("JobStore: refusing a manual registration while recovery is required");
+std::optional<JobRecord> JobStore::readRowByIdentity(const CanonicalIdentity& identity) {
+    if (!store_ready()) return std::nullopt;
+    std::lock_guard<std::mutex> db_lock(db_mtx_);
+    if (!db_) return std::nullopt;
+
+    std::string value;
+    const auto index_key = key_identity(identity_index_key(identity));
+    auto status = db_->Get(leveldb::ReadOptions(), index_key, &value);
+    if (status.IsNotFound()) return std::nullopt;
+    if (!status.ok()) {
+        record_store_failure("LevelDB read failed (identity lookup): " + status.ToString());
+        return std::nullopt;
+    }
+    uint64_t internal_id = 0;
+    try {
+        internal_id = nlohmann::json::parse(value).value("internal_id", uint64_t{0});
+    } catch (const std::exception& error) {
+        spdlog::warn("JobStore: unreadable identity index: {}", error.what());
+        return std::nullopt;
+    }
+    if (internal_id == 0) return std::nullopt;
+
+    std::string raw;
+    status = db_->Get(leveldb::ReadOptions(), key_job(internal_id), &raw);
+    if (status.IsNotFound()) {
+        // A stale entry: its row is gone (batches delete row and index
+        // atomically), so the next create's PutIdentity overwrites it.
+        spdlog::warn("JobStore: identity index names JobID {} but its row is gone",
+                     internal_id);
+        return std::nullopt;
+    }
+    if (!status.ok()) {
+        record_store_failure("LevelDB read failed (record lookup): " + status.ToString());
+        return std::nullopt;
+    }
+    try {
+        auto record = parse_record(raw, internal_id);
+        record.instance_id = derive_instance_id(db_uuid_, internal_id);
+        return record;
+    } catch (const std::exception& error) {
+        spdlog::warn("JobStore: unreadable record {}: {}", internal_id, error.what());
+        return std::nullopt;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The write primitive
+// ---------------------------------------------------------------------------
+
+bool JobStore::identity_owner_locked(const CanonicalIdentity& identity, uint64_t& owner,
+                                     std::string& error) {
+    // Callers hold db_mtx_.
+    owner = 0;
+    std::string value;
+    const auto status = db_->Get(leveldb::ReadOptions(),
+                                 key_identity(identity_index_key(identity)), &value);
+    if (status.IsNotFound()) return true;
+    if (!status.ok()) {
+        error = "store_error";
+        record_store_failure("LevelDB read failed (identity index): " + status.ToString());
         return false;
     }
-
-    record.revision = std::max<uint64_t>(record.revision, 1);
-    // A manual registration owns no discovery execution: its bound members are
-    // the evidence, and an empty generation is expected here.
-    record.execution_observed = false;
-    if (record.state.empty()) record.state = kStateActive;
-    if (record.first_seen_us == 0) record.first_seen_us = now_us();
-    if (record.last_seen_us == 0) record.last_seen_us = record.first_seen_us;
-    record.instance_id = derive_instance_id(db_uuid_, record.internal_id);
-    if (record.selector.adapter.empty()) {
-        // Legacy registrations carry their identity only inside the typed
-        // facts; reconstruct the selector, never a guess.
-        record.selector = selector_from_legacy_job(record.job);
-        record.adapter = record.selector.adapter;
-        if (const auto identity = canonicalize(record.selector)) {
-            record.identity = *identity;
-            record.identity_complete = true;
-        }
+    try {
+        owner = nlohmann::json::parse(value).value("internal_id", uint64_t{0});
+    } catch (const std::exception&) {
+        owner = 0;   // unparsable entry: treat as absent, writes overwrite it
     }
-    // Bind each numeric PID to the process that holds it NOW.  A manual
-    // registration has no scheduler-side identity to copy, and a bare number is
-    // not an execution identity: recording the current start ticks makes the
-    // kernel path verify the same process later instead of trusting a number
-    // that may be recycled.  An unreadable stat leaves the identity incomplete,
-    // which is reported as incomplete ownership rather than guessed.
-    record.members.clear();
-    for (const auto pid : record.job.JobPIDs) {
-        const auto ticks = read_process_start_ticks(pid);
-        record.members.push_back(ProcessIdentity{
-            pid, ticks.value_or(0), ticks.has_value() ? boot_id_ : std::string{}});
-    }
+    return true;
+}
 
-    std::lock_guard<std::mutex> db_lock(db_mtx_);
-    leveldb::WriteBatch batch;
-
-    // A legacy register is a manual selection: the caller explicitly asked
-    // for these collectors, so it cannot be reported as an automatic origin.
-    if (!record.job.CollectorNames.empty()) {
-        record.selection.manual = record.job.CollectorNames;
-    }
-
-    if (record.identity_complete) {
-        const std::string index_key = key_identity(identity_index_key(record.identity));
-        std::string existing;
-        auto s = db_->Get(leveldb::ReadOptions(), index_key, &existing);
-        if (!s.ok() && !s.IsNotFound()) {
-            record_store_failure("LevelDB read failed (identity index): " + s.ToString());
-            return false;
-        }
-        if (s.IsNotFound()) {
-            batch.Put(index_key, nlohmann::json{
-                {"internal_id", record.internal_id},
-                {"scheduler_type", record.identity.adapter},
-                {"cluster_namespace", record.identity.cluster_namespace},
-                {"native_job_id", record.identity.native_job_id},
-                {"canonical_native", record.identity.canonical_native},
-                {"step_id", record.identity.step_id},
-            }.dump());
-        } else {
-            uint64_t owner = 0;
-            try {
-                owner = nlohmann::json::parse(existing).value("internal_id", uint64_t{0});
-            } catch (const std::exception&) {
-                owner = 0;
-            }
-            if (owner != 0 && owner != record.internal_id) {
-                spdlog::error("JobStore: identity for JobID {} is already registered as "
-                              "JobID {}, refusing a duplicate inventory record",
-                              record.internal_id, owner);
+bool JobStore::apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& batch,
+                                     bool& put_seen, std::string& error) {
+    // Callers hold db_mtx_.
+    switch (op.kind) {
+        case WriteOp::PutRecord: {
+            if (!op.record || op.internal_id == 0) {
+                error = "invalid_op";
                 return false;
             }
-            batch.Put(index_key, nlohmann::json{
-                {"internal_id", record.internal_id},
-                {"scheduler_type", record.identity.adapter},
-                {"cluster_namespace", record.identity.cluster_namespace},
-                {"native_job_id", record.identity.native_job_id},
-                {"canonical_native", record.identity.canonical_native},
-                {"step_id", record.identity.step_id},
+            batch.Put(key_job(op.internal_id), record_json(*op.record).dump());
+            put_seen = true;
+            return true;
+        }
+        case WriteOp::DeleteRecord: {
+            batch.Delete(key_job(op.internal_id));
+            return true;
+        }
+        case WriteOp::PutIdentity: {
+            if (!op.identity) {
+                error = "invalid_op";
+                return false;
+            }
+            // Refuse a duplicate LIVE identity only: a different owner whose
+            // row still exists. An entry whose row is gone (interrupted
+            // archive, unparsable value) is stale and overwritten here.
+            uint64_t owner = 0;
+            if (!identity_owner_locked(*op.identity, owner, error)) return false;
+            if (owner != 0 && owner != op.internal_id) {
+                std::string raw;
+                const auto row = db_->Get(leveldb::ReadOptions(), key_job(owner), &raw);
+                if (!row.ok() && !row.IsNotFound()) {
+                    error = "store_error";
+                    record_store_failure("LevelDB read failed (identity owner row): " +
+                                         row.ToString());
+                    return false;
+                }
+                if (row.ok()) {
+                    spdlog::error("JobStore: identity for JobID {} is already registered "
+                                  "as JobID {}; refusing the write",
+                                  op.internal_id, owner);
+                    error = "identity_conflict";
+                    return false;
+                }
+                spdlog::warn("JobStore: overwriting a stale identity index entry that "
+                             "named JobID {}", owner);
+            }
+            const CanonicalIdentity& identity = *op.identity;
+            batch.Put(key_identity(identity_index_key(identity)), nlohmann::json{
+                {"internal_id", op.internal_id},
+                {"scheduler_type", identity.adapter},
+                {"cluster_namespace", identity.cluster_namespace},
+                {"native_job_id", identity.native_job_id},
+                {"canonical_native", identity.canonical_native},
+                {"step_id", identity.step_id},
             }.dump());
+            put_seen = true;
+            return true;
         }
-    }
-
-    batch.Put(key_job(record.internal_id), record_json(record).dump());
-    auto status = write_batch_locked(batch, "register job");
-    if (!status.ok()) {
-        return false;
-    }
-
-    const uint64_t registered_id = record.internal_id;
-    spdlog::info("JobStore: persisted manual registration of JobID {}", registered_id);
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Upsert (the single identity-resolving admission path)
-// ---------------------------------------------------------------------------
-
-// One observation against an already-loaded record: pure decision, no durable
-// write and no in-memory publish. The register/merge semantics of a repeated
-// identity live here, so every caller gets the same result.
-UpsertResult JobStore::merge_existing(const Job& job, const NativeSelector& selector,
-                                      const CanonicalIdentity& identity,
-                                      uint64_t internal_id, const JobRecord& stored,
-                                      int64_t observed_at, JobRecord& updated_out) {
-    UpsertResult result;
-    result.internal_id = internal_id;
-    result.instance_id = instanceId(internal_id);
-    result.revision = stored.revision;
-
-    const ExecutionGeneration generation = generation_of(job);
-    const std::vector<ProcessIdentity>& processes = members_of(job);
-    const bool members_complete = members_authoritative_of(job);
-
-    if (stored.quarantined) {
-        result.disposition = UpsertDisposition::Conflict;
-        result.code = RegistrationError::IdentityQuarantined;
-        result.error = "identity_quarantined";
-        result.message = "record is quarantined after an identity conflict";
-        return result;
-    }
-    if (stored.state == kStateClosing) {
-        // A retiring instance must never be resurrected into the active set by
-        // a late observation: the drain owns it until it is archived.
-        result.disposition = UpsertDisposition::Conflict;
-        result.code = RegistrationError::InstanceClosing;
-        result.error = "instance_closing";
-        result.message = "the instance is retiring and no longer accepts observations";
-        return result;
-    }
-    if (stored.identity_complete && stored.identity != identity) {
-        result.disposition = UpsertDisposition::Conflict;
-        result.code = RegistrationError::IdentityIndexMismatch;
-        result.error = "identity_index_mismatch";
-        result.message = "the identity index and the stored record disagree";
-        spdlog::error("JobStore: identity index for JobID {} does not match the stored "
-                      "record; refusing to merge", internal_id);
-        return result;
-    }
-    // Out-of-order commits: an older source read must never overwrite newer
-    // facts. read_order is process-monotonic and assigned before reading, so a
-    // late scan loses to an event that was committed first (plan §4.1, A09).
-    if (stored.job.execution && job.execution &&
-        stored.job.execution->read_order != 0 && job.execution->read_order != 0 &&
-        job.execution->read_order < stored.job.execution->read_order) {
-        result.ok = true;
-        result.disposition = UpsertDisposition::Unchanged;
-        result.message = "older source read order; newer facts kept";
-        updated_out = stored;
-        return result;
-    }
-
-    if (stored.generation.complete() && generation.complete() &&
-        stored.generation != generation) {
-        result.disposition = UpsertDisposition::Conflict;
-        result.code = RegistrationError::GenerationConflict;
-        result.error = "execution_generation_conflict";
-        result.message = "a different live execution generation owns this identity";
-        spdlog::warn("JobStore: observation for '{}' carries a different live generation "
-                     "than JobID {}; not merged", identity.native_job_id, internal_id);
-        return result;
-    }
-
-    // Merge facts idempotently. The member list is authoritative only when the
-    // source says so: an empty list from a partially-known membership must
-    // never erase stored members.
-    Job observed_job = job;
-    observed_job.JobID = internal_id;
-    observed_job.CollectorNames = stored.job.CollectorNames;
-    apply_identity_via_applier(identity_applier_, observed_job, selector, identity);
-    const bool authoritative_members = members_complete;
-    if (!processes.empty()) {
-        observed_job.JobPIDs.clear();
-        for (const auto& process : processes) observed_job.JobPIDs.push_back(process.pid);
-    } else if (members_complete) {
-        // Read succeeded, no members: an authoritative empty set.
-        observed_job.JobPIDs.clear();
-    }
-
-    Job merged = stored.job;
-    merge_job_facts(merged, observed_job, authoritative_members);
-    merged.JobID = internal_id;
-    merged.CollectorNames = stored.job.CollectorNames;
-
-    JobRecord updated = stored;
-    // This record now carries a discovery observation, so its execution facts
-    // are owned by the source: an incomplete generation is an unverified
-    // execution from here on, never a manual row that merely lacks one.
-    updated.execution_observed = true;
-    updated.job = merged;
-    if (job.execution) updated.job.execution = job.execution;
-    updated.selector = selector;
-    updated.last_seen_us = observed_at;
-    const bool generation_became_complete =
-        !stored.generation.complete() && generation.complete();
-    if (generation.complete()) updated.generation = generation;
-    if (!processes.empty()) {
-        updated.members = normalized_processes(processes);
-    } else if (members_complete) {
-        updated.members.clear();
-    } else if (!observed_job.JobPIDs.empty()) {
-        updated.members.clear();
-        for (const auto pid : observed_job.JobPIDs)
-            updated.members.push_back(ProcessIdentity{pid, 0, ""});
-    }
-
-    // A record whose liveness could not be verified is re-admitted by positive
-    // observation evidence. Unverified is not a lifecycle state.
-    const bool recovered = !stored.execution_verified;
-    if (recovered) updated.execution_verified = true;
-    // Provenance is a durable fact of its own: a manual row that first meets a
-    // discovery observation stays "manual" on disk when every other fact is
-    // identical, and a restart would replay its incomplete generation as
-    // Verified.  The delta rides the same write and revision as any fact change.
-    const bool provenance_changed =
-        updated.execution_observed != stored.execution_observed;
-    const bool changed = recovered || provenance_changed ||
-        facts_fingerprint(merged, updated) != facts_fingerprint(stored.job, stored);
-    if (!changed) {
-        updated.revision = stored.revision;
-        result.ok = true;
-        result.disposition = UpsertDisposition::Unchanged;
-        result.revision = stored.revision;
-        updated_out = std::move(updated);
-        return result;
-    }
-
-    updated.revision = stored.revision + 1;
-    result.ok = true;
-    result.disposition = UpsertDisposition::Updated;
-    result.revision = updated.revision;
-    result.generation_became_complete = generation_became_complete;
-    updated_out = std::move(updated);
-    (void)observed_at;
-    return result;
-}
-
-UpsertResult JobStore::upsert(const Job& job, JobRecord& out) {
-    UpsertResult result;
-
-    if (!store_ready()) {
-        result.code = RegistrationError::StoreUnavailable;
-        result.error = to_string(result.code);
-        result.message = migration_complete_ ? "inventory store is not ready"
-                                             : "inventory store is still initializing";
-        return result;
-    }
-    if (recovery_required_.load()) {
-        result.code = RegistrationError::StoreUnavailable;
-        result.error = "recovery_required";
-        result.message = "the last durable write outcome is unknown; recovery is required";
-        return result;
-    }
-
-    const auto selector = selector_of(job);
-    const auto identity = canonicalize(selector);
-    if (!identity) {
-        result.code = RegistrationError::IncompleteIdentity;
-        result.error = "incomplete_identity";
-        result.message = "scheduler type, cluster namespace and native job id are required";
-        spdlog::debug("JobStore: rejected incomplete observation (native='{}', cluster='{}')",
-                      selector.native_job_id, selector.cluster_name);
-        return result;
-    }
-
-    const std::string index_key = key_identity(identity_index_key(*identity));
-
-    const ExecutionGeneration generation = generation_of(job);
-    const std::vector<ProcessIdentity>& processes = members_of(job);
-    const bool members_complete = members_authoritative_of(job);
-    const int64_t observed_at = read_at_us_of(job) != 0 ? read_at_us_of(job) : now_us();
-
-    uint64_t internal_id = 0;
-    bool indexed = false;
-    {
-        std::lock_guard<std::mutex> db_lock(db_mtx_);
-        std::string value;
-        auto s = db_->Get(leveldb::ReadOptions(), index_key, &value);
-        if (s.ok()) {
-            try {
-                internal_id = nlohmann::json::parse(value).value("internal_id", uint64_t{0});
-                indexed = internal_id != 0;
-            } catch (const std::exception& error) {
-                spdlog::warn("JobStore: unreadable identity index: {}", error.what());
+        case WriteOp::DeleteIdentity: {
+            if (!op.identity) {
+                error = "invalid_op";
+                return false;
             }
-        } else if (!s.IsNotFound()) {
-            result.code = RegistrationError::StoreReadFailed;
-            result.error = "store_error";
-            result.message = s.ToString();
-            record_store_failure("LevelDB read failed (identity lookup): " + s.ToString());
-            return result;
-        }
-    }
-
-    if (indexed) {
-        JobRecord stored;
-        bool have_record = false;
-        {
-            std::lock_guard<std::mutex> db_lock(db_mtx_);
-            std::string raw;
-            auto s = db_->Get(leveldb::ReadOptions(), key_job(internal_id), &raw);
-            if (s.ok()) {
-                try {
-                    stored = parse_record(raw, internal_id);
-                    have_record = true;
-                } catch (const std::exception& error) {
-                    spdlog::warn("JobStore: unreadable record {}: {}", internal_id, error.what());
-                }
-            } else if (!s.IsNotFound()) {
-                result.code = RegistrationError::StoreReadFailed;
-                result.error = "store_error";
-                result.message = s.ToString();
-                record_store_failure("LevelDB read failed (record lookup): " + s.ToString());
-                return result;
-            }
-        }
-
-        if (!have_record) {
-            // Interrupted archive left a stale index entry: drop it and create
-            // a fresh record instead of resolving to a missing instance.
-            spdlog::warn("JobStore: stale identity index for JobID {}, repairing", internal_id);
-            std::lock_guard<std::mutex> db_lock(db_mtx_);
-            leveldb::WriteBatch batch;
-            batch.Delete(index_key);
-            auto status = write_batch_locked(batch, "repair stale identity index");
-            if (!status.ok()) {
-                result.code = RegistrationError::StoreWriteFailed;
-                result.error = "store_write_failed";
-                result.message = status.ToString();
-                return result;
-            }
-            indexed = false;
-            internal_id = 0;
-        } else {
-            JobRecord updated;
-            result = merge_existing(job, selector, *identity, internal_id, stored, observed_at,
-                                    updated);
-            if (!result.ok) return result;
-            if (result.disposition == UpsertDisposition::Unchanged) {
-                out = std::move(updated);
-                return result;
-            }
-            {
-                std::lock_guard<std::mutex> db_lock(db_mtx_);
-                leveldb::WriteBatch batch;
-                batch.Put(key_job(internal_id), record_json(updated).dump());
-                const std::vector<uint64_t> touched{internal_id};
-                auto status = write_batch_locked(batch, "update inventory facts",
-                                                 /*durable=*/false, &touched);
-                if (status.ok()) mark_record_dirty(internal_id);
-                if (!status.ok()) {
-                    result.ok = false;
-                    result.code = RegistrationError::StoreWriteFailed;
-                    result.error = "store_write_failed";
-                    result.message = status.ToString();
-                    return result;
-                }
-            }
-            out = std::move(updated);
-            return result;
-        }
-    }
-
-    // Create a new inventory record. Nothing is activated and no caller
-    // binding is accepted here. The id reservation rides along in the same
-    // batch as the record and its index entry: one durable commit, not two.
-    std::string allocation_error;
-    uint64_t durable_counter = 0;
-    bool durable_exhausted = false;
-    uint64_t allocated = 0;
-    if (!reserveIdInMemory(allocated, durable_counter, durable_exhausted, allocation_error)) {
-        result.code = allocation_error == "id_exhausted" ? RegistrationError::IdExhausted
-                                                         : RegistrationError::StoreWriteFailed;
-        result.error = result.code == RegistrationError::IdExhausted
-                           ? allocation_error
-                           : to_string(result.code);
-        result.message = "durable internal id allocation failed";
-        return result;
-    }
-
-    JobRecord record;
-    record.job = job;
-    record.job.JobID = allocated;
-    record.job.CollectorNames.clear();
-    apply_identity_via_applier(identity_applier_, record.job, selector, *identity);
-    record.job.JobPIDs.clear();
-    if (!processes.empty()) {
-        for (const auto& process : processes) record.job.JobPIDs.push_back(process.pid);
-    }
-    std::sort(record.job.JobPIDs.begin(), record.job.JobPIDs.end());
-    record.job.JobPIDs.erase(std::unique(record.job.JobPIDs.begin(), record.job.JobPIDs.end()),
-                             record.job.JobPIDs.end());
-
-    record.internal_id = allocated;
-    record.instance_id = instanceId(allocated);
-    record.adapter = selector.adapter;
-    record.selector = selector;
-    record.identity = *identity;
-    record.identity_complete = true;
-    record.execution_observed = true;   // created by a discovery observation
-    record.generation = generation;
-    record.members_authoritative = members_complete;
-    record.revision = 1;
-    record.state = kStateActive;
-    record.first_seen_us = observed_at;
-    record.last_seen_us = observed_at;
-    if (!processes.empty()) {
-        record.members = normalized_processes(processes);
-    } else {
-        for (const auto pid : record.job.JobPIDs) {
-            record.members.push_back(ProcessIdentity{pid, 0, ""});
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> db_lock(db_mtx_);
-        leveldb::WriteBatch batch;
-        batch.Put(key_counter("job_id"), std::to_string(durable_counter));
-        // MAX is handed out at most once, ever: the marker is committed with
-        // the record that consumes it.
-        if (durable_exhausted) batch.Put(key_meta("job_id_exhausted"), "true");
-        batch.Put(key_job(allocated), record_json(record).dump());
-        batch.Put(index_key, nlohmann::json{
-            {"internal_id", allocated},
-            {"scheduler_type", identity->adapter},
-            {"cluster_namespace", identity->cluster_namespace},
-            {"native_job_id", identity->native_job_id},
-            {"canonical_native", identity->canonical_native},
-            {"step_id", identity->step_id},
-        }.dump());
-        // A create has no published memory image to revert: identity lookup
-        // repairs an ambiguous create, so it does not latch recovery.
-        auto status = write_batch_locked(batch, "create inventory record",
-                                         /*durable=*/false);
-        if (status.ok()) mark_record_dirty(allocated);
-        if (!status.ok()) {
-            result.code = RegistrationError::StoreWriteFailed;
-            result.error = "store_write_failed";
-            result.message = status.ToString();
-            return result;
-        }
-    }
-
-    result.ok = true;
-    result.disposition = UpsertDisposition::Created;
-    result.internal_id = allocated;
-    result.instance_id = record.instance_id;
-    result.revision = record.revision;
-    spdlog::info("JobStore: created inventory instance {} for {} '{}'",
-                 allocated, identity->adapter, identity->native_job_id);
-    out = std::move(record);
-    return result;
-}
-
-// ---------------------------------------------------------------------------
-// Record mutations
-// ---------------------------------------------------------------------------
-
-bool JobStore::updateRecord(uint64_t id, const std::function<void(JobRecord&)>& mutate,
-                            const char* operation, std::optional<JobRecord>& out) {
-    if (!store_ready()) return false;
-    if (recovery_required_.load()) {
-        spdlog::error("JobStore: refusing '{}' while recovery is required", operation);
-        return false;
-    }
-    std::lock_guard<std::mutex> db_lock(db_mtx_);
-
-    std::string raw;
-    auto status = db_->Get(leveldb::ReadOptions(), key_job(id), &raw);
-    if (status.IsNotFound()) return false;
-    if (!status.ok()) {
-        record_store_failure(std::string("LevelDB read failed (") + operation + "): " +
-                             status.ToString());
-        return false;
-    }
-
-    JobRecord record;
-    try {
-        record = parse_record(raw, id);
-    } catch (const std::exception& error) {
-        record_store_failure(std::string("corrupt job record during ") + operation);
-        return false;
-    }
-    mutate(record);
-    // A durable record mutation advances the one record revision. This is the
-    // same counter the selection CAS compares.
-    ++record.revision;
-
-    leveldb::WriteBatch batch;
-    batch.Put(key_job(id), record_json(record).dump());
-    const std::vector<uint64_t> touched{id};
-    status = write_batch_locked(batch, operation, /*durable=*/true, &touched);
-    if (!status.ok()) return false;
-
-    out = record;
-    return true;
-}
-
-bool JobStore::persistState(uint64_t id, const std::string& state,
-                            std::optional<JobRecord>& out) {
-    if (!db_running_ || db_ == nullptr) return false;
-    if (recovery_required_.load()) {
-        spdlog::error("JobStore: refusing a state write for JobID {} while recovery is "
-                      "required", id);
-        return false;
-    }
-
-    // Serialize with observation upserts: the record read-modify-write must
-    // not lose a concurrent fact update's fields.
-    std::lock_guard<std::mutex> db_lock(db_mtx_);
-
-    std::string raw;
-    auto status = db_->Get(leveldb::ReadOptions(), key_job(id), &raw);
-    if (status.IsNotFound()) return true;   // nothing durable left to mark
-    if (!status.ok()) {
-        record_store_failure("LevelDB read failed (record state): " + status.ToString());
-        return false;
-    }
-
-    JobRecord record;
-    try {
-        record = parse_record(raw, id);
-    } catch (const std::exception&) {
-        record_store_failure("corrupt job record during state persist");
-        return false;
-    }
-    if (record.state == state) {
-        out = record;
-        return true;
-    }
-
-    record.state = state;
-    ++record.revision;
-    leveldb::WriteBatch batch;
-    batch.Put(key_job(id), record_json(record).dump());
-    const std::vector<uint64_t> touched{id};
-    status = write_batch_locked(batch, "persist record state", /*durable=*/true, &touched);
-    if (!status.ok()) return false;
-
-    // The ONE revision orders memory and disk alike: the caller publishes the
-    // whole record, never a field patch, so its image cannot name an older
-    // revision than the durable row the same commit wrote.
-    out = record;
-    return true;
-}
-
-bool JobStore::refreshFacts(uint64_t id, const std::function<void(Job&)>& refresh,
-                            std::optional<JobRecord>& out) {
-    if (!row_provider_) return false;
-    auto row = row_provider_(id);
-    if (!row) return false;
-    Job job = std::move(row->job);
-
-    // /proc and scheduler metadata I/O strictly outside every store lock.
-    refresh(job);
-    return update_job_info(id, job, out);
-}
-
-bool JobStore::update_job_info(uint64_t id, const Job& job,
-                               std::optional<JobRecord>& out) {
-    if (!db_running_) return false;
-    return updateRecord(id, [&job, id](JobRecord& record) {
-        record.job = job;
-        record.job.JobID = id;   // CollectorNames stay intent-owned, untouched
-        record.last_seen_us = now_us();
-        // Records without a validated execution generation keep their member
-        // list as the only liveness evidence. Only replace it while the
-        // refresh still sees processes: an empty result is itself the
-        // termination evidence the retirement pass has to evaluate.
-        if (!record.generation.complete() && !job.JobPIDs.empty()) {
-            record.members.clear();
-            for (const auto pid : job.JobPIDs)
-                record.members.push_back(ProcessIdentity{pid, 0, ""});
-        }
-        if (record.revision == 0) {
-            record.revision = 1;
-            record.first_seen_us = now_us();
-            record.selector = selector_from_legacy_job(record.job);
-            if (const auto identity = canonicalize(record.selector)) {
-                record.identity = *identity;
-                record.identity_complete = true;
-            }
-        }
-    }, "update job facts", out);
-}
-
-bool JobStore::archive(uint64_t id, const std::vector<std::string>& applied_collectors,
-                       const std::string& applied_provenance) {
-    if (!db_running_ || db_ == nullptr) return true;   // nothing durable to clean
-    if (recovery_required_.load()) {
-        spdlog::error("JobStore: refusing to archive JobID {} while recovery is required",
-                      id);
-        return false;
-    }
-
-    // Archive must not race an upsert of the same instance, otherwise the
-    // record could be recreated right after the atomic delete.
-    std::lock_guard<std::mutex> db_lock(db_mtx_);
-
-    std::string key = key_job(id);
-    std::string json;
-    leveldb::Status s = db_->Get(leveldb::ReadOptions(), key, &json);
-    if (s.IsNotFound()) {
-        spdlog::warn("JobStore: job {} not found in db when ending", id);
-        return true;
-    }
-    if (!s.ok()) {
-        record_store_failure("LevelDB read failed (archive job): " + s.ToString());
-        return false;
-    }
-
-    JobRecord stored;
-    try {
-        stored = parse_record(json, id);
-    } catch (const std::exception& error) {
-        spdlog::error("JobStore: cannot parse job {} for archival: {}", id, error.what());
-        record_store_failure("corrupt job record during archive");
-        return false;
-    }
-
-    const int64_t now = now_us();
-
-    auto history = record_json(stored);
-    history["state"] = kStateClosing;
-    history["end_time_us"] = now;
-    // The fact snapshot of what the collection runtime really had attached when
-    // the registry accepted the retirement, and how it was established
-    // ("applied": observed on the live runtime; anything else is the registry's
-    // documented fallback). Desired selection alone never decides this row.
-    history["applied_collectors"] = applied_collectors;
-    history["applied_provenance"] = applied_provenance;
-
-    leveldb::WriteBatch batch;
-    batch.Delete(key);
-
-    // The archived record already carries the final selection; `selection` is
-    // kept as an explicit audit field for readers of the history row.
-
-    // Never let stale cleanup remove a newer execution's identity index.
-    if (stored.identity_complete) {
-        const std::string index_key = key_identity(identity_index_key(stored.identity));
-        std::string value;
-        auto index_status = db_->Get(leveldb::ReadOptions(), index_key, &value);
-        if (index_status.ok()) {
+            // Release only an entry this instance still owns on disk: a newer
+            // execution may have claimed the identity by now.
             uint64_t owner = 0;
-            try {
-                owner = nlohmann::json::parse(value).value("internal_id", uint64_t{0});
-            } catch (const std::exception&) {
-                owner = 0;
+            if (!identity_owner_locked(*op.identity, owner, error)) return false;
+            if (owner == op.internal_id) {
+                batch.Delete(key_identity(identity_index_key(*op.identity)));
             }
-            if (owner == id) batch.Delete(index_key);
-        } else if (!index_status.IsNotFound()) {
-            record_store_failure("LevelDB read failed (identity index archive): " +
-                                 index_status.ToString());
-            return false;
+            return true;
+        }
+        case WriteOp::PutHistory: {
+            if (!op.record || op.internal_id == 0) {
+                error = "invalid_op";
+                return false;
+            }
+            int64_t end_time = now_us();
+            if (!op.history_key_suffix.empty()) {
+                end_time = static_cast<int64_t>(unhex64(op.history_key_suffix));
+            }
+            auto history = record_json(*op.record);
+            history["state"] = kStateClosing;
+            history["end_time_us"] = end_time;
+            // The fact snapshot of what the collection runtime really had
+            // attached when the registry accepted the retirement, and how it
+            // was established. The desired selection alone never decides this
+            // row.
+            history["applied_collectors"] = op.applied_collectors;
+            history["applied_provenance"] = op.history_provenance;
+            batch.Put(key_history(op.internal_id, static_cast<uint64_t>(end_time)),
+                      history.dump());
+            put_seen = true;
+            return true;
+        }
+        case WriteOp::ReserveCounter: {
+            batch.Put(key_counter("job_id"), std::to_string(op.durable_counter));
+            // MAX is handed out at most once, ever: the marker is committed
+            // with the batch that consumes it.
+            if (op.counter_exhausted) batch.Put(key_meta("job_id_exhausted"), "true");
+            put_seen = true;
+            return true;
         }
     }
-
-    batch.Put(key_history(id, now), history.dump());
-
-    const std::vector<uint64_t> touched{id};
-    s = write_batch_locked(batch, "archive job", /*durable=*/true, &touched);
-    if (!s.ok()) {
-        return false;
-    }
-
-    spdlog::info("JobStore: archived job {} to history", id);
-    return true;
+    error = "invalid_op";
+    return false;
 }
 
-bool JobStore::discard(uint64_t id) {
-    if (!db_running_ || db_ == nullptr) return true;   // nothing durable to clean
-    if (recovery_required_.load()) {
-        spdlog::error("JobStore: refusing to discard JobID {} while recovery is required",
-                      id);
-        return false;
-    }
-
-    // Same admission as the archive: a discard must not race an upsert of the
-    // instance, or the record could be recreated right after the atomic delete.
-    std::lock_guard<std::mutex> db_lock(db_mtx_);
-
-    std::string key = key_job(id);
-    std::string json;
-    leveldb::Status s = db_->Get(leveldb::ReadOptions(), key, &json);
-    if (s.IsNotFound()) {
-        spdlog::warn("JobStore: job {} not found in db when discarding", id);
-        return true;
-    }
-    if (!s.ok()) {
-        record_store_failure("LevelDB read failed (discard job): " + s.ToString());
-        return false;
-    }
-
-    JobRecord stored;
-    try {
-        stored = parse_record(json, id);
-    } catch (const std::exception& error) {
-        spdlog::error("JobStore: cannot parse job {} for discard: {}", id, error.what());
-        record_store_failure("corrupt job record during discard");
-        return false;
-    }
-
-    leveldb::WriteBatch batch;
-    batch.Delete(key);
-
-    // Never let stale cleanup remove a newer execution's identity index.
-    bool owned_identity = false;
-    std::string index_key;
-    if (stored.identity_complete) {
-        index_key = key_identity(identity_index_key(stored.identity));
-        std::string value;
-        const auto index_status = db_->Get(leveldb::ReadOptions(), index_key, &value);
-        if (index_status.ok()) {
-            uint64_t owner = 0;
-            try {
-                owner = nlohmann::json::parse(value).value("internal_id", uint64_t{0});
-            } catch (const std::exception&) {
-                owner = 0;
-            }
-            if (owner == id) {
-                batch.Delete(index_key);
-                owned_identity = true;
-            }
-        } else if (!index_status.IsNotFound()) {
-            record_store_failure("LevelDB read failed (identity index discard): " +
-                                 index_status.ToString());
-            return false;
-        }
-    }
-
-    const std::vector<uint64_t> touched{id};
-    const auto status = write_batch_locked(batch, "discard job", /*durable=*/true, &touched,
-                                           /*delete_only=*/true);
-    if (!status.ok()) {
-        return false;
-    }
-
-    spdlog::info("JobStore: discarded job {} (never collected)", id);
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Desired selection
-// ---------------------------------------------------------------------------
-
-bool JobStore::mutateSelections(const std::vector<SelectionMutation>& mutations,
-                                std::vector<SelectionMutationResult>& out,
-                                std::string& error) {
-    out.clear();
+bool JobStore::commit(std::vector<WriteOp> ops, bool durable,
+                      std::vector<uint64_t>& touched, const char* reason,
+                      std::string& error) {
     error.clear();
+    if (ops.empty()) return true;   // nothing to make atomic
     if (!store_ready()) {
         error = "store_unavailable";
         return false;
     }
     if (recovery_required_.load()) {
-        // The stored row may already carry a write memory did not publish.
-        // Refusing is the only answer that cannot diverge further.
+        spdlog::error("JobStore: refusing '{}' while recovery is required", reason);
         error = "recovery_required";
         return false;
     }
-    if (mutations.empty()) {
-        error = "no_targets";
-        return false;
-    }
 
-    // Serialize with observation upserts and hold the db transaction lock for
-    // the whole read-transform-write: the revision guard below is evaluated
-    // against the same image that is written, so no caller can pass a stale
-    // revision between a check and a commit.
     std::lock_guard<std::mutex> db_lock(db_mtx_);
 
-    struct PendingWrite {
-        JobRecord record;
-    };
-    std::vector<SelectionMutationResult> planned;
-    std::vector<PendingWrite> writes;
-    std::set<uint64_t> seen;
-    planned.reserve(mutations.size());
-
-    for (const auto& mutation : mutations) {
-        if (!seen.insert(mutation.internal_id).second) {
-            error = "duplicate_target";
-            return false;
-        }
-
-        std::string raw;
-        const auto status = db_->Get(leveldb::ReadOptions(),
-                                     key_job(mutation.internal_id), &raw);
-        if (!status.ok()) {
-            error = status.IsNotFound() ? "not_found" : "store_error";
-            return false;
-        }
-        JobRecord record;
-        try {
-            record = parse_record(raw, mutation.internal_id);
-        } catch (const std::exception&) {
-            error = "store_error";
-            return false;
-        }
-        if (record.quarantined) {
-            error = "identity_quarantined";
-            return false;
-        }
-        if (record.state == kStateClosing) {
-            error = "instance_closing";
-            return false;
-        }
-        if (mutation.expected_revision.has_value() &&
-            record.revision != *mutation.expected_revision) {
-            error = "stale_revision";
-            return false;
-        }
-
-        const CollectionSelection current = record.selection;
-        const auto before = current.effectiveCollectors();
-        CollectionSelection next = current;
-        bool intent_changed = false;
-        bool stored_changed = false;
-        bool skipped_manual_override = false;
-
-        switch (mutation.operation) {
-            case SelectionOperation::SetManual:
-                if (!current.manual.has_value() ||
-                    *current.manual != mutation.collectors) {
-                    next.manual = mutation.collectors;
-                    intent_changed = true;
-                    stored_changed = true;
-                }
-                break;
-            case SelectionOperation::ResetAuto:
-                if (current.manual.has_value()) {
-                    next.manual.reset();
-                    intent_changed = true;
-                    stored_changed = true;
-                }
-                break;
-            case SelectionOperation::SetAuto:
-                if (current.automatic != mutation.collectors ||
-                    current.automatic_source != mutation.automatic_source) {
-                    next.automatic = mutation.collectors;
-                    next.automatic_source = mutation.automatic_source;
-                    stored_changed = true;
-                    if (current.manual.has_value()) {
-                        // Manual precedence, including an empty manual stop:
-                        // record the decision for a later reset_auto without
-                        // moving the client-visible intent or the runtime.
-                        skipped_manual_override = true;
-                    } else {
-                        intent_changed = true;
-                    }
-                }
-                break;
-        }
-
-        SelectionMutationResult result;
-        result.internal_id = mutation.internal_id;
-        result.intent_changed = intent_changed;
-        result.stored_changed = stored_changed;
-        result.skipped_manual_override = skipped_manual_override;
-        result.runtime_changed = before != next.effectiveCollectors();
-        // ONE revision orders every record mutation, bookkeeping included: an
-        // automatic decision recorded under a manual override still advances
-        // the record. It does not detach anything (runtime_changed stays false).
-        result.revision = stored_changed ? record.revision + 1 : record.revision;
-        if (stored_changed) {
-            record.selection = next;
-            record.revision = result.revision;
-            record.job.CollectorNames = next.effectiveCollectors();
-            writes.push_back(PendingWrite{std::move(record)});
-            result.selection = std::move(next);
-        } else {
-            result.selection = current;
-        }
-        planned.push_back(std::move(result));
+    leveldb::WriteBatch batch;
+    bool put_seen = false;
+    std::vector<uint64_t> record_puts;
+    for (const auto& op : ops) {
+        if (!apply_write_op_locked(op, batch, put_seen, error)) return false;
+        if (op.kind == WriteOp::PutRecord) record_puts.push_back(op.internal_id);
     }
+    // A batch of only deletes proves its own ambiguous outcome by the row's
+    // absence; anything that writes a row needs the regular recovery fence.
+    const bool delete_only = !put_seen;
 
-    if (!writes.empty()) {
-        leveldb::WriteBatch batch;
-        std::vector<uint64_t> touched;
-        touched.reserve(writes.size());
-        for (const auto& write : writes) {
-            batch.Put(key_job(write.record.internal_id),
-                      record_json(write.record).dump());
-            touched.push_back(write.record.internal_id);
-        }
-        // Intent is hot path: unsynced, checkpointed by maintenance/shutdown.
-        const auto status = write_batch_locked(batch, "mutate selection",
-                                               /*durable=*/false, &touched);
-        if (!status.ok()) {
-            // A reported failure publishes nothing: the in-memory records and
-            // the caller-visible outcome stay at their previous values.
-            error = "store_write_failed";
-            return false;
-        }
+    const auto status = write_batch_locked(batch, reason, durable,
+                                           touched.empty() ? nullptr : &touched,
+                                           delete_only);
+    if (!status.ok()) {
+        error = "store_write_failed";
+        return false;
     }
-
-    // The results carry the authoritative revision and selection: the caller
-    // owns the record map and publishes them there. The function-top db lock
-    // is still held, so the dirty marking rides under it.
-    if (!writes.empty()) {
-        for (const auto& write : writes) mark_record_dirty(write.record.internal_id);
+    if (!durable) {
+        // The row image lives in the registry: the dirty set records the
+        // persistence-side obligation to fence it (mark_record_dirty runs
+        // under the db_mtx_ this function still holds).
+        for (const auto id : record_puts) mark_record_dirty(id);
     }
-
-    out = std::move(planned);
     return true;
 }
 

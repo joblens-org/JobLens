@@ -348,13 +348,22 @@ private:
 
     // The single source of truth for inventoried records (moved from the
     // store): every other view (scheduler lanes, kernel maps, RPC payloads) is
-    // a projection or a snapshot copy. Mutations hold records_mtx_ uniquely
-    // through their whole read-decide-transform-commit sequence; reads take it
-    // shared.
+    // a projection or a snapshot copy. Mutations publish under it briefly
+    // after their durable commit; reads take it shared.
     mutable std::shared_mutex records_mtx_;
     std::unordered_map<uint64_t, JobRecord> records_;
     // In-memory mirror of the durable `i:` identity index (same key layout).
     std::unordered_map<std::string, uint64_t> identity_index_;
+    // Serializes business mutations (the record transaction lock, the role the
+    // store's upsert mutex/db transaction used to play). Every write path
+    // holds it across read -> decide -> commit -> publish, so a decided
+    // revision cannot move before its commit lands. It is NOT held over
+    // reader-facing records_mtx_ sections during the durable commit itself:
+    // the collection runtime keeps reading the previous image while the store
+    // writes, exactly as it did when publication happened after the store
+    // call — the runtime converges in that window (bind -> attach before a
+    // retire's drain).
+    mutable std::mutex mutation_mtx_;
 
     // Registry-side record-map accessors and publish points. Query helpers
     // return snapshot copies with instance_id derived.
@@ -370,7 +379,29 @@ private:
     void eraseRecord(uint64_t id);
     void applyRecovered(const std::vector<JobRecord>& adopted,
                         const std::vector<uint64_t>& removed);
-    void applySelectionResults(const std::vector<SelectionMutationResult>& results);
+    // Merge decision for one observation against the current record image
+    // (moved from the store): pure, no durable write and no publish. The
+    // register/merge semantics of a repeated identity live here so every
+    // caller gets the same result.
+    UpsertResult mergeObservation(const JobRecord& stored, const Job& job,
+                                  const NativeSelector& selector,
+                                  const CanonicalIdentity& identity,
+                                  uint64_t internal_id, int64_t observed_at,
+                                  JobRecord& updated_out);
+    // Adapter-owned identity->facts derivation (was the store's injected
+    // applier): the generic parts apply here, the scheduler typed-attr
+    // derivation dispatches through adapters_ by identity.adapter. Without
+    // adapters the observed facts are stored verbatim.
+    void applyIdentityToFacts(Job& facts, const NativeSelector& selector,
+                              const CanonicalIdentity& identity) const;
+    // Atomic selection command batch (moved from the store): reads the
+    // records under records_mtx_, checks the revision CAS there, transforms
+    // into pending images and writes every changed row in ONE unsynced
+    // batch; a write failure commits and publishes nothing. `out` is aligned
+    // with `mutations` and carries the authoritative revision/selection.
+    bool executeSelectionMutations(const std::vector<SelectionMutation>& mutations,
+                                   std::vector<SelectionMutationResult>& out,
+                                   std::string& error);
     // Restore validation (moved from the store): positive identity checks with
     // the admission probe; adjustments are memory-only, the next durable write
     // of a row persists whatever is current.

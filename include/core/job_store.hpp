@@ -11,23 +11,28 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// JobStore — the single durable representation of inventoried jobs
+// JobStore — the pure persistence service behind JobRegistry
 // (doc/jobstore_persistence_service.md).
+//
+// The store owns the LevelDB layout and nothing else: key namespaces, row
+// encode/decode, batch atomicity, tiered durability, recovery fences and the
+// internal-ID high-water mark. Every business decision — inventory merging,
+// restore validation, selection strategy, archive-versus-discard — lives in
+// JobRegistry, the single source of truth for JobRecords. The registry runs its
+// whole read-decide-transform sequence under its record lock and then calls
+// commit() with the resulting rows; the store never interprets them.
 //
 // A JobRecord is "a Job plus what JobLens must remember to manage it":
 // execution evidence (identity, generation, members), the durable lifecycle
-// state (open | closing), and the desired collection selection. JobStore is the
-// ONLY writer of that state; every other view (Job snapshots handed to
-// collectors, scheduler lanes, kernel maps) is a projection.
-//
-// The store holds DESIRED state only. Which collectors are actually attached is
-// owned by the collection runtime and is never mirrored here.
+// state (active | closing), and the desired collection selection. Which
+// collectors are actually attached is owned by the collection runtime and is
+// never persisted here.
 //
 // LevelDB namespaces (schema 4):
 //   j:  active JobRecords, including the desired selection
-//   h:  archived history (final record + selection summary)
+//   h:  archived history (final record + applied-collector snapshot)
 //   c:  durable allocator high-water mark
-//   m:  schema version, Agent DB UUID
+//   m:  schema version, Agent DB UUID, id-exhaustion marker
 //   i:  canonical identity key -> internal ID
 //
 // Schema 4 replaces schema 3's separate intent object (its own revision plus a
@@ -107,10 +112,15 @@ struct CollectionSelection {
     }
 };
 
-// A control-plane selection command. The store re-reads the record inside the
-// same transaction that writes it, so the transform, the revision guard and
-// the commit are one atomic step; a caller-side read-modify-write window does
-// not exist.
+// Canonical member-list form of a durable row: sorted by (pid, start_ticks)
+// and deduplicated. Shared by the row codec (parse_record) and the registry's
+// merge path so both write the same j: image.
+std::vector<ProcessIdentity> normalized_processes(std::vector<ProcessIdentity> processes);
+
+// A control-plane selection command. The registry re-reads the record inside
+// the same record lock that serializes the commit, so the transform, the
+// revision guard and the write are one atomic step; a caller-side
+// read-modify-write window does not exist.
 enum class SelectionOperation {
     SetManual,   // replace the manual selection; [] is a persistent stop
     ResetAuto,   // clear the manual override, keep the automatic selection
@@ -221,8 +231,9 @@ struct JobRecord {
     // Which path owns the execution facts.  A discovery observation EXPECTS a
     // manager generation, so an incomplete one is an unverified execution, not
     // a manual registration.  A manual/legacy row owns no generation and its
-    // bound member identities are its only execution evidence.  Set by upsert()
-    // (true) and insertManual() (false); never inferred from a member count.
+    // bound member identities are its only execution evidence.  Set by the
+    // registry's upsert create/merge paths (true) and manual registration
+    // (false); never inferred from a member count.
     bool execution_observed = false;
     // --- JobLens management state ----------------------------------------
     uint64_t internal_id = 0;
@@ -290,15 +301,9 @@ public:
     // See RowProvider; inject before the first flush/recovery use.
     void setRowProvider(RowProvider provider) { row_provider_ = std::move(provider); }
 
-    // Adapter-owned identity->facts derivation, injected by the registry
-    // (dispatches through the scheduler adapters by identity.adapter). The
-    // store itself never branches on a scheduler; without an applier the
-    // observed facts are stored verbatim.
-    void setIdentityApplier(
-        std::function<void(Job&, const NativeSelector&, const CanonicalIdentity&)> applier)
-    {
-        identity_applier_ = std::move(applier);
-    }
+    // Adapter-owned identity->facts derivation is registry business: the
+    // registry dispatches through its scheduler adapters while building the
+    // record image, before commit() ever sees a row.
 
     // --- restore (once, right after construction) ------------------------
     // Raw rows only: parse every `j:` row and return it with its instance_id
@@ -306,58 +311,72 @@ public:
     // registry owns the records and decides what a restored execution is
     // worth. Corrupt rows are counted and skipped.
     std::vector<JobRecord> loadAll();
+    // Durable identity resolution for the registry's upsert: reports the `j:`
+    // row the `i:` index names. The registry consults this when its in-memory
+    // mirror misses — an earlier create may have landed ambiguously without
+    // publishing anything, and the durable index is the documented repair
+    // source. nullopt when no entry exists or the row it names is gone (a
+    // stale entry the next create's PutIdentity overwrites).
+    std::optional<JobRecord> readRowByIdentity(const CanonicalIdentity& identity);
 
     // --- internal id allocation ------------------------------------------
     uint64_t nextJobId();   // ready-checked; 0 when the store is not ready
+    // In-memory half of a single-batch create: reserves the next internal id
+    // (burned even when the paired commit() later fails — ids are never
+    // reused) and reports the durable counter value the ReserveCounter op
+    // must carry, so a new instance costs one batch instead of two commits.
+    // Pair with commit() inside one registry record lock.
+    bool reserveId(uint64_t& id, uint64_t& durable_counter,
+                   bool& durable_exhausted, std::string& error);
 
-    // --- manual (legacy) registration -------------------------------------
-    // Durable insert of a caller-built record plus the identity index.
-    // Rejects a duplicate live identity. Returns false on any failure.
-    bool insertManual(JobRecord record);
+    // --- the write primitive ----------------------------------------------
+    // Every durable mutation is one atomic batch of ops, built and ordered by
+    // the registry (the only writer):
+    //   PutRecord / DeleteRecord       j: rows (the image is registry truth)
+    //   PutIdentity / DeleteIdentity   i: index maintenance
+    //   PutHistory                     h: archive row (final record + applied
+    //                                  collector snapshot + end time)
+    //   ReserveCounter                 c: allocator high-water riding a create
+    // PutIdentity refuses a duplicate LIVE identity (an entry owned by a
+    // different instance whose j: row still exists); stale entries are
+    // overwritten. DeleteIdentity releases an entry only while the named
+    // instance still owns it on disk.
+    //
+    // `durable` = true fsyncs the batch (and every earlier unsynced write in
+    // the log); false leaves each PutRecord row in the dirty set for the
+    // checkpoint / shutdown flush — the registration hot path stays there.
+    // `touched` (input) names the instances whose rows this batch rewrites
+    // while the registry still holds a previous image: a write whose outcome
+    // becomes unknown latches recovery for exactly these ids. A create that
+    // published nothing passes an empty list — identity lookup repairs it.
+    // A batch of only deletes proves its own ambiguous outcome by the row's
+    // absence (delete-only recovery confirmation).
+    struct WriteOp {
+        enum Kind {
+            PutRecord,
+            DeleteRecord,
+            PutIdentity,
+            DeleteIdentity,
+            PutHistory,
+            ReserveCounter,
+        } kind = PutRecord;
+        uint64_t internal_id = 0;
+        std::optional<JobRecord> record;              // PutRecord / PutHistory
+        std::optional<CanonicalIdentity> identity;    // i: operations
+        // PutHistory: hex end-time suffix of the h: key; empty = stamped by
+        // the store at commit time (the value's end_time_us always matches).
+        std::string history_key_suffix;
+        std::vector<std::string> applied_collectors;  // PutHistory: fact snapshot
+        std::string history_provenance;               // PutHistory: how established
+        uint64_t durable_counter = 0;                 // ReserveCounter
+        // ReserveCounter: the m: exhaustion marker rides the same op so a
+        // restart cannot conclude MAX is still free.
+        bool counter_exhausted = false;
+    };
+    bool commit(std::vector<WriteOp> ops, bool durable,
+                std::vector<uint64_t>& touched, const char* reason,
+                std::string& error);
 
-    // --- inventory upsert --------------------------------------------------
-    // Identity-resolving idempotent upsert; rejects incomplete identities,
-    // closing instances and conflicting live generations. Never fires
-    // lifecycle callbacks and never starts collection. `out` carries the
-    // authoritative record (the caller owns the record map and must publish
-    // it).
-    UpsertResult upsert(const Job& job, JobRecord& out);
-    // --- record mutations ---------------------------------------------------
-    // Durable lifecycle-state write (the closing transition). `out` receives
-    // the authoritative record after the revision bump.
-    bool persistState(uint64_t id, const std::string& state,
-                      std::optional<JobRecord>& out);
-    // Durable archive (active/closing -> history, identity index and intent
-    // removed) for an instance that WAS collected: the history row keeps the
-    // final record, the fact snapshot of what the runtime really had attached
-    // (`applied_collectors`, captured by the registry at the retire decision
-    // point) and how that snapshot was established (`applied_provenance`).
-    // Returns false on a store failure.
-    bool archive(uint64_t id, const std::vector<std::string>& applied_collectors,
-                 const std::string& applied_provenance);
-    // Durable removal WITHOUT a history row, for an instance that was never
-    // collected. Same admission, durability and recovery fencing as archive,
-    // except an ambiguous batch is confirmed by the absence of the `j:` row
-    // itself (a delete-only batch is atomic, so the identity index cannot
-    // outlive the row it pointed at).
-    bool discard(uint64_t id);
-    // Re-read process/attribute facts for one stored job (legacy/manual
-    // registrations): /proc + scheduler metadata I/O happen in `refresh`
-    // OUTSIDE every store lock; only the result write happens here. `out`
-    // receives the authoritative record after the revision bump.
-    bool refreshFacts(uint64_t id, const std::function<void(Job&)>& refresh,
-                      std::optional<JobRecord>& out);
-
-    // --- intent + applied ---------------------------------------------------
-    // Atomic selection command batch: for every mutation the stored record is
-    // re-read under the transaction locks, the expected revision is compared
-    // there (never in the caller), and the transform is applied. Every changed
-    // record is written in ONE unsynced batch; a write failure commits and
-    // publishes nothing. `out` is aligned with `mutations` and carries the
-    // authoritative revision/selection the caller must publish.
-    bool mutateSelections(const std::vector<SelectionMutation>& mutations,
-                          std::vector<SelectionMutationResult>& out,
-                          std::string& error);
     // Flush the rows written without a fence (checkpoint/shutdown). Public: the
     // registry schedules it from the maintenance pass and from deinit(). Rows
     // whose last write outcome are unknown are never rewritten; the call then
@@ -369,9 +388,6 @@ public:
     std::string instanceId(uint64_t id) const;
 
 private:
-    // Injected by the registry; see setIdentityApplier.
-    std::function<void(Job&, const NativeSelector&, const CanonicalIdentity&)>
-        identity_applier_;
     // Injected by the registry; see setRowProvider.
     RowProvider row_provider_;
 
@@ -387,27 +403,19 @@ private:
     void reject_unsupported_schema(uint32_t found);
     void reject_schema(const std::string& state, uint32_t found);
     void init_id_counter();
-    // In-memory reservation for the inventory create path: the caller writes
-    // `durable_counter` in the same batch as the record, so a new instance
-    // costs one durable commit instead of two.
-    bool reserveIdInMemory(uint64_t& id, uint64_t& durable_counter,
-                           bool& durable_exhausted, std::string& error);
     bool store_ready() const;
 
     // --- internal implementation entry points (no external callers) -------
     // Durable allocation on its own (manual registration): reserves the id
     // with its own commit before it is handed out.
     uint64_t allocateId(std::string& error);
-    // Write-free merge decision for one observation against an already-loaded
-    // record, used by the single upsert path.
-    UpsertResult merge_existing(const Job& job, const NativeSelector& selector,
-                                const CanonicalIdentity& identity, uint64_t internal_id,
-                                const JobRecord& stored, int64_t observed_at,
-                                JobRecord& updated_out);
-    // Generic durable read-modify-write of one record. `out` receives the
-    // authoritative record after the revision bump.
-    bool updateRecord(uint64_t id, const std::function<void(JobRecord&)>& mutate,
-                      const char* operation, std::optional<JobRecord>& out);
+    // Applies one WriteOp to `batch` (the i: ownership reads ride the same
+    // db_mtx_ section as the write). Returns false + error on an invalid op
+    // or a refused identity operation. `put_seen` records that the batch
+    // writes at least one row (a delete-only batch proves its own ambiguous
+    // outcome by the row's absence).
+    bool apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& batch,
+                               bool& put_seen, std::string& error);
     // `durable` = true fsyncs the batch (that is, also every earlier unsynced
     // write in the log). The registration hot path writes with durable=false
     // and leaves the row in the dirty set for the checkpoint / shutdown flush.
@@ -472,9 +480,10 @@ private:
     void mark_record_dirty(uint64_t internal_id);
     void record_store_failure(const std::string& message);
     void record_store_success();
-    bool update_job_info(uint64_t id, const Job& job,
-                         std::optional<JobRecord>& out);
-    std::string identity_key(const CanonicalIdentity& identity) const;
+    // Reads the durable `i:` owner of one identity. Returns false on a read
+    // error; owner == 0 means "no parsable owner" (a stale entry).
+    bool identity_owner_locked(const CanonicalIdentity& identity, uint64_t& owner,
+                               std::string& error);
     // Serializes job_db transactions.
     mutable std::mutex db_mtx_;
     // Rows written with durable=false since the last flush (guarded by db_mtx_).
