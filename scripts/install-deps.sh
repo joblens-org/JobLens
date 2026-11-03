@@ -63,36 +63,20 @@ install_sol2() {
     local SOL2_VERSION="${SOL2_VERSION:-v3.5.0}"
     local INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
 
-    # 检查是否已安装（系统路径或自定义路径）
-    for prefix in "${INSTALL_PREFIX}" "/usr"; do
-        if [ -f "${prefix}/include/sol/sol.hpp" ] && \
-           [ -f "${prefix}/include/sol/config.hpp" ]; then
-            echo "    sol2 already installed at ${prefix}/include/sol/"
-            return 0
-        fi
-    done
+    # Idempotency: installed copy already carries the Lua 5.5 compat patch
+    if [ -f "${INSTALL_PREFIX}/include/sol/sol.hpp" ] && \
+       grep -q 'LUA_VERSION_NUM > 505' "${INSTALL_PREFIX}/include/sol/compatibility/compat-5.3.h" 2>/dev/null; then
+        echo "    sol2 already installed (Lua 5.5 compatible) at ${INSTALL_PREFIX}/include/sol/"
+        return 0
+    fi
 
-    echo "==> Installing sol2 (${SOL2_VERSION})..."
+    echo "==> Installing sol2 (${SOL2_VERSION}, patched for Lua 5.5)..."
 
-    # 优先尝试系统包管理器（非交互，失败静默 fallback）
-    case "$ID" in
-        fedora)
-            if sudo dnf install -y sol2-devel 2>/dev/null; then
-                echo "✅ sol2 installed via dnf (sol2-devel)"
-                return 0
-            fi
-            echo "    dnf sol2-devel not available, falling back to tarball"
-            ;;
-        ubuntu|debian)
-            if sudo apt-get install -y sol2-dev 2>/dev/null; then
-                echo "✅ sol2 installed via apt (sol2-dev)"
-                return 0
-            fi
-            echo "    apt sol2-dev not available, falling back to tarball"
-            ;;
-    esac
-
-    # Fallback: 从 GitHub release tarball 安装完整 include/sol
+    # Always install from the upstream tarball into INSTALL_PREFIX:
+    #   - distro packages (dnf sol2-devel / apt sol2-dev) cannot carry the Lua
+    #     5.5 compat patch and may be older (e.g. Debian ships 3.3.0);
+    #   - ${INSTALL_PREFIX}/include precedes /usr/include, shadowing any
+    #     system copy (e.g. Fedora sol2-devel).
     local SOL2_URL="https://github.com/ThePhD/sol2/archive/refs/tags/${SOL2_VERSION}.tar.gz"
     local SOL2_TMP_DIR
     SOL2_TMP_DIR=$(mktemp -d)
@@ -105,81 +89,37 @@ install_sol2() {
     }
 
     tar -xzf "${SOL2_TMP_DIR}/sol2.tar.gz" -C "${SOL2_TMP_DIR}"
+
+    # Lua 5.5 compat patch (upstream sol2 support is still an unmerged PR;
+    # version-gated so Lua <= 5.4 behavior is unchanged):
+    #   1) compat-5.3.h: version gate accepts LUA_VERSION_NUM 5.5
+    #   2) compat-5.4.h: LUA_ERRGCMM fallback define applies to >= 5.4
+    #   3) state.hpp:    lua_newstate gained a seed parameter in 5.5
+    local SOL2_SRC="${SOL2_TMP_DIR}/sol2-${SOL2_VERSION#v}/include/sol"
+    sed -i 's/LUA_VERSION_NUM < 501 || LUA_VERSION_NUM > 504/LUA_VERSION_NUM < 501 || LUA_VERSION_NUM > 505/' \
+        "${SOL2_SRC}/compatibility/compat-5.3.h"
+    sed -i 's/LUA_VERSION_NUM == 504/LUA_VERSION_NUM >= 504/' \
+        "${SOL2_SRC}/compatibility/compat-5.4.h"
+    sed -i '/^namespace sol {/i\#if LUA_VERSION_NUM >= 505\n#define SOL_LUA_NEWSTATE(f, ud) lua_newstate(f, ud, 0)\n#else\n#define SOL_LUA_NEWSTATE(f, ud) lua_newstate(f, ud)\n#endif\n' \
+        "${SOL2_SRC}/state.hpp"
+    sed -i 's/unique_base(lua_newstate(alfunc, alpointer))/unique_base(SOL_LUA_NEWSTATE(alfunc, alpointer))/' \
+        "${SOL2_SRC}/state.hpp"
+
+    if ! grep -q 'LUA_VERSION_NUM > 505' "${SOL2_SRC}/compatibility/compat-5.3.h" || \
+       ! grep -q 'SOL_LUA_NEWSTATE' "${SOL2_SRC}/state.hpp"; then
+        echo "ERROR: sol2 Lua 5.5 compat patch did not apply (unexpected sol2 layout?)"
+        return 1
+    fi
+
     sudo mkdir -p "${INSTALL_PREFIX}/include"
-    sudo cp -r "${SOL2_TMP_DIR}/sol2-${SOL2_VERSION#v}/include/sol" "${INSTALL_PREFIX}/include/"
+    sudo rm -rf "${INSTALL_PREFIX}/include/sol"
+    sudo cp -r "${SOL2_SRC}" "${INSTALL_PREFIX}/include/sol"
 
     if [ -f "${INSTALL_PREFIX}/include/sol/sol.hpp" ] && \
-       [ -f "${INSTALL_PREFIX}/include/sol/config.hpp" ]; then
-        echo "✅ sol2 installed successfully"
+       grep -q 'LUA_VERSION_NUM > 505' "${INSTALL_PREFIX}/include/sol/compatibility/compat-5.3.h"; then
+        echo "✅ sol2 installed successfully (Lua 5.4/5.5 compatible)"
     else
         echo "❌ Installation failed"
-        return 1
-    fi
-}
-
-install_lua54() {
-    # sol2 v3.5.0 supports Lua <= 5.4 only (upstream Lua 5.5 support is still an
-    # unmerged PR). Fedora 45+/rawhide ship Lua 5.5 as the default `lua` /
-    # `lua-devel` (only a runtime lua5.4-libs compat package, no headers), so
-    # building against /usr/include/lua.h fails in sol2's version check.
-    # Build a static Lua 5.4 into INSTALL_PREFIX (default /usr/local):
-    # CMake's FindLua searches <prefix>/include before /usr/include, so
-    # find_package(Lua 5.4) then resolves headers and liblua.a from there.
-    local LUA_VERSION="${LUA_VERSION:-5.4.8}"
-    local INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
-
-    # Skip when the system Lua is already <= 5.4 (sol2 compatible)
-    if [ -f /usr/include/lua.h ]; then
-        local system_major system_minor
-        system_major=$(grep -m1 '#define[[:space:]]LUA_VERSION_MAJOR' /usr/include/lua.h | grep -o '[0-9]\+' | head -1)
-        system_minor=$(grep -m1 '#define[[:space:]]LUA_VERSION_MINOR' /usr/include/lua.h | grep -o '[0-9]\+' | head -1)
-        if [ -n "${system_major}" ] && { [ "${system_major}" -lt 5 ] || \
-            { [ "${system_major}" -eq 5 ] && [ -n "${system_minor}" ] && [ "${system_minor}" -lt 5 ]; }; }; then
-            echo "    system Lua ${system_major}.${system_minor} <= 5.4, no compat build needed"
-            return 0
-        fi
-    fi
-
-    # Idempotency: already installed as 5.4
-    if [ -f "${INSTALL_PREFIX}/include/lua.h" ] && [ -f "${INSTALL_PREFIX}/lib/liblua.a" ]; then
-        echo "    Lua 5.4 already installed at ${INSTALL_PREFIX}"
-        return 0
-    fi
-
-    echo "==> Building Lua ${LUA_VERSION} (static liblua.a) from source..."
-    local LUA_TMP_DIR
-    LUA_TMP_DIR=$(mktemp -d)
-    trap "rm -rf ${LUA_TMP_DIR}" RETURN
-
-    curl -fsSL --retry 3 --retry-delay 5 --retry-max-time 60 \
-        "https://www.lua.org/ftp/lua-${LUA_VERSION}.tar.gz" \
-        -o "${LUA_TMP_DIR}/lua.tar.gz" || {
-        echo "ERROR: Failed to download Lua"
-        return 1
-    }
-
-    tar -xzf "${LUA_TMP_DIR}/lua.tar.gz" -C "${LUA_TMP_DIR}"
-
-    # Target `a` builds only liblua.a (no interpreter => no readline dependency).
-    # LUA_USE_LINUX matches distro builds; -fPIC is required to link the static
-    # archive into a PIE executable.
-    make -C "${LUA_TMP_DIR}/lua-${LUA_VERSION}/src" a \
-        SYSCFLAGS="-DLUA_USE_LINUX" MYCFLAGS="-O2 -fPIC" || return 1
-
-    sudo install -d "${INSTALL_PREFIX}/include" "${INSTALL_PREFIX}/lib"
-    sudo install -m 0644 "${LUA_TMP_DIR}/lua-${LUA_VERSION}/src/liblua.a" "${INSTALL_PREFIX}/lib/"
-    sudo install -m 0644 \
-        "${LUA_TMP_DIR}/lua-${LUA_VERSION}/src/lua.h" \
-        "${LUA_TMP_DIR}/lua-${LUA_VERSION}/src/luaconf.h" \
-        "${LUA_TMP_DIR}/lua-${LUA_VERSION}/src/lualib.h" \
-        "${LUA_TMP_DIR}/lua-${LUA_VERSION}/src/lauxlib.h" \
-        "${LUA_TMP_DIR}/lua-${LUA_VERSION}/src/lua.hpp" \
-        "${INSTALL_PREFIX}/include/"
-
-    if [ -f "${INSTALL_PREFIX}/include/lua.h" ] && [ -f "${INSTALL_PREFIX}/lib/liblua.a" ]; then
-        echo "✅ Lua ${LUA_VERSION} installed successfully"
-    else
-        echo "❌ Lua installation failed"
         return 1
     fi
 }
@@ -308,7 +248,6 @@ install_rpm() {
     echo "==> Building Howard Hinnant date from source..."
     install_date
     install_sol2
-    install_lua54
     echo "Done."
 }
 
@@ -340,7 +279,6 @@ install_arch() {
         nlohmann-json \
         bpftool
     install_sol2
-    install_lua54
     echo "Done."
 }
 
