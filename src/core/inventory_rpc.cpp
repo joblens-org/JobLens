@@ -301,9 +301,9 @@ nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& rec
     out["step_id"] = record.selector.step_id;
     out["first_seen_us"] = record.first_seen_us;
     out["last_seen_us"] = record.last_seen_us;
-    out["generation"] = generation_to_json(record.generation);
+    out["generation"] = generation_to_json(generation_of(record.job));
     out["processes"] = nlohmann::json::array();
-    for (const auto& process : record.members) {
+    for (const auto& process : members_of(record.job)) {
         out["processes"].push_back(process_to_json(process));
     }
     if (const auto job = registry.findJob(record.internal_id)) {

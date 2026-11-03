@@ -214,7 +214,7 @@ nlohmann::json record_json(const JobRecord& record) {
     out["quarantined"]    = record.quarantined;
     out["first_seen_us"]  = record.first_seen_us;
     out["last_seen_us"]   = record.last_seen_us;
-    out["members_authoritative"] = record.members_authoritative;
+    out["members_authoritative"] = members_authoritative_of(record.job);
     out["execution_observed"] = record.execution_observed;
     if (!record.job.subtype_name.empty()) out["adapter"] = record.job.subtype_name;
     if (record.selector.adapter.empty()) {
@@ -224,9 +224,9 @@ nlohmann::json record_json(const JobRecord& record) {
     }
     if (record.identity_complete) out["identity"] = record.identity;
     else                          out["identity"] = nullptr;
-    out["generation"]     = generation_to_json(record.generation);
+    out["generation"]     = generation_to_json(generation_of(record.job));
     out["members"]        = nlohmann::json::array();
-    for (const auto& member : record.members) {
+    for (const auto& member : members_of(record.job)) {
         out["members"].push_back(process_to_json(member));
     }
     return out;
@@ -275,6 +275,9 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
     record.job = decode_legacy_job(raw);
     record.job.JobID = internal_id;
     record.internal_id = internal_id;
+    // The execution group is the one copy of the evidence; the row's
+    // generation/members/members_authoritative keys hydrate it below.
+    JobExecution& execution = ensure_execution(record.job);
 
     const auto j = nlohmann::json::parse(raw);
     record.revision       = j.value("revision", uint64_t{1});
@@ -282,7 +285,7 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
     record.quarantined    = j.value("quarantined", false);
     record.first_seen_us  = j.value("first_seen_us", int64_t{0});
     record.last_seen_us   = j.value("last_seen_us", int64_t{0});
-    record.members_authoritative = j.value("members_authoritative", false);
+    execution.members_authoritative = j.value("members_authoritative", false);
     // Legacy fold: rows written before the adapter name moved onto the Job
     // carry it only under "adapter" — hydrate subtype_name so every reader
     // sees one copy.
@@ -320,7 +323,7 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
         }
     }
     if (j.contains("generation") && j["generation"].is_object()) {
-        record.generation = generation_from_json(j["generation"]);
+        execution.generation = generation_from_json(j["generation"]);
     }
     // Provenance is stored explicitly.  A row written before the field existed
     // is classified from its own evidence: any generation field means a
@@ -329,28 +332,23 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
     const bool has_execution_flag = j.contains("execution_observed");
     record.execution_observed = has_execution_flag
                                     ? j.value("execution_observed", false)
-                                    : !(record.generation.boot_id.empty() &&
-                                        record.generation.manager_pid == 0 &&
-                                        record.generation.manager_start_ticks == 0);
+                                    : !(execution.generation.boot_id.empty() &&
+                                        execution.generation.manager_pid == 0 &&
+                                        execution.generation.manager_start_ticks == 0);
     const auto members_it = j.contains("members") ? j.find("members") : j.find("processes");
     if (members_it != j.end() && members_it->is_array()) {
         for (const auto& process : *members_it) {
-            if (process.is_object()) record.members.push_back(process_from_json(process));
+            if (process.is_object()) execution.members.push_back(process_from_json(process));
         }
-        record.members = normalized_processes(std::move(record.members));
+        execution.members = normalized_processes(std::move(execution.members));
     }
-    // Execution evidence is rebuilt from its stored projection instead of a
-    // new JSON group: the durable layout stays compatible (plan §4.3) and the
-    // in-memory Job remains the single source of truth for the store.
-    {
-        JobExecution execution;
-        execution.generation = record.generation;
-        execution.members = record.members;
-        execution.members_authoritative = record.members_authoritative;
-        if (!record.selector.step_id.empty())
-            execution.step_id = record.selector.step_id;
-        record.job.execution = std::move(execution);
-    }
+    // Step presence rides the selector's verbatim copy (plan §4.3: the row
+    // layout is unchanged and the Job stays the single source of truth).
+    if (!record.selector.step_id.empty())
+        execution.step_id = record.selector.step_id;
+    fmt::print(stderr, "DBG parse_record id={} has_gen={} has_members={} gen_pid={} members={}\n",
+               internal_id, j.contains("generation"), j.contains("members"),
+               execution.generation.manager_pid, execution.members.size());
     return record;
 }
 

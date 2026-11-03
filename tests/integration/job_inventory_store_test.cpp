@@ -841,7 +841,7 @@ void conflicting_fresh_candidates_are_rejected(const std::string& base)
           "a different manager triple for the same identity must conflict");
     const auto stored = registry.inventoryRecord(created.internal_id);
     check(stored.has_value(), "the first candidate must stay readable");
-    check(stored->generation.manager_pid == 4242,
+    check(stored->job.execution->generation.manager_pid == 4242,
           "the conflicting candidate must not overwrite the stored generation");
     check(registry.inventoryRecords().size() == 1, "only one instance may exist");
 }
@@ -931,7 +931,7 @@ void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string
     check(registry.findJob(created.internal_id)->JobPIDs.empty(),
           "a confirmed empty membership must clear stale member pids");
     const auto record = registry.inventoryRecord(created.internal_id);
-    check(record.has_value() && record->members.empty(),
+    check(record.has_value() && record->job.execution->members.empty(),
           "the stored process evidence must follow the confirmed empty set");
 }
 

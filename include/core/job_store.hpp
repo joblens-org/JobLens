@@ -218,16 +218,15 @@ inline constexpr const char* kStateClosing = "closing";
 
 struct JobRecord {
     // --- the Job as collectors see it (projection source) ---------------
+    // job.execution carries the one copy of the execution evidence
+    // (generation / members / members_authoritative) every record owns;
+    // manual registrations emplace the group when they bind their PIDs.
     Job job;
     // --- execution evidence ---------------------------------------------
-    // (The adapter name lives on job.subtype_name — one copy on the Job.)
     NativeSelector selector;             // original wire identity (verbatim)
     CanonicalIdentity identity;          // valid only when identity_complete
     bool identity_complete = false;
     bool quarantined = false;
-    ExecutionGeneration generation;      // optional; unverified != dead
-    std::vector<ProcessIdentity> members;
-    bool members_authoritative = false;  // empty list then means "confirmed empty"
     // Which path owns the execution facts.  A discovery observation EXPECTS a
     // manager generation, so an incomplete one is an unverified execution, not
     // a manual registration.  A manual/legacy row owns no generation and its

@@ -227,7 +227,7 @@ nlohmann::json facts_fingerprint(const Job& job, const JobRecord& record) {
     out["pids"] = pids;
 
     nlohmann::json members = nlohmann::json::array();
-    for (const auto& member : normalized_processes(record.members)) {
+    for (const auto& member : members_of(record.job)) {
         nlohmann::json entry;
         entry["pid"] = member.pid;
         entry["start_ticks"] = member.start_ticks;
@@ -239,12 +239,13 @@ nlohmann::json facts_fingerprint(const Job& job, const JobRecord& record) {
     std::visit([&out](const auto& attr) {
         out["sub_attr"] = nlohmann::json(attr);
     }, job.sub_attr);
-    nlohmann::json generation;
-    generation["boot_id"] = record.generation.boot_id;
-    generation["manager_pid"] = record.generation.manager_pid;
-    generation["manager_start_ticks"] = record.generation.manager_start_ticks;
-    generation["cgroup_identity"] = record.generation.cgroup_identity;
-    out["generation"] = std::move(generation);
+    const ExecutionGeneration& generation = generation_of(record.job);
+    nlohmann::json generation_json;
+    generation_json["boot_id"] = generation.boot_id;
+    generation_json["manager_pid"] = generation.manager_pid;
+    generation_json["manager_start_ticks"] = generation.manager_start_ticks;
+    generation_json["cgroup_identity"] = generation.cgroup_identity;
+    out["generation"] = std::move(generation_json);
     return out;
 }
 
@@ -332,6 +333,11 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
     });
     {
         auto rows = store_->loadAll();
+        for (const auto& row : rows)
+            fmt::print(stderr, "DBG ctor-restore id={} exec={} gen_pid={} members={}\n",
+                       row.internal_id, row.job.execution.has_value(),
+                       row.job.execution ? row.job.execution->generation.manager_pid : 0,
+                       row.job.execution ? row.job.execution->members.size() : 0);
         validateRestoredExecutions(rows);
         for (auto& row : rows) publishRecord(std::move(row));
     }
@@ -531,8 +537,8 @@ void JobRegistry::refreshLegacyRecords() {
         // legacy refresh replaces the saved member identities with bare PIDs,
         // which would erase the only evidence the record has.
         if (record.execution_observed) continue;
-        if (record.generation.complete()) continue;    // nothing to refresh
-        if (record.members.empty()) continue;          // no liveness evidence yet
+        if (generation_of(record.job).complete()) continue;    // nothing to refresh
+        if (members_of(record.job).empty()) continue;          // no liveness evidence yet
         refreshJobFacts(record.internal_id);
     }
 }
@@ -542,7 +548,7 @@ bool JobRegistry::retireIfConfirmed(const JobRecord& record, const std::string& 
     // decision for an older execution must never remove newer ownership.
     const auto current = ownRecord(record.internal_id);
     if (!current) return false;
-    if (!(current->generation == record.generation)) {
+    if (!(generation_of(current->job) == generation_of(record.job))) {
         spdlog::info("JobRegistry: JobID {} changed execution generation before "
                      "retirement; keeping current ownership", record.internal_id);
         return false;
@@ -558,7 +564,8 @@ bool JobRegistry::retireIfConfirmed(const JobRecord& record, const std::string& 
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         ++hb_retirements_;
-        closing_generations_.emplace_back(record.internal_id, record.generation);
+        closing_generations_.emplace_back(record.internal_id,
+                                           generation_of(record.job));
         absences_.erase(record.internal_id);
         suspect_ids_.erase(record.internal_id);
     }
@@ -570,7 +577,7 @@ void JobRegistry::rememberEnded(const JobRecord& record) {
     const auto identity = canonicalize(record.selector);
     if (!identity) return;
     std::lock_guard<std::mutex> lock(hb_mtx_);
-    ended_generations_[identity->key()] = record.generation;
+    ended_generations_[identity->key()] = generation_of(record.job);
     while (ended_generations_.size() > kEndedGenerationCapacity) {
         ended_generations_.erase(ended_generations_.begin());
     }
@@ -597,8 +604,9 @@ void JobRegistry::evaluateRetirements(
         {
             std::lock_guard<std::mutex> lock(hb_mtx_);
             auto& entry = absences_[record.internal_id];
-            if (!(entry.generation == record.generation)) {
-                entry.generation = record.generation;
+            const ExecutionGeneration generation = generation_of(record.job);
+            if (!(entry.generation == generation)) {
+                entry.generation = generation;
                 entry.complete_absences = 0;
             }
             if (observed_ids.count(record.internal_id) != 0) {
@@ -629,8 +637,9 @@ void JobRegistry::evaluateRetirements(
         // registrations, unresolved observations) have no manager to probe.
         // The refreshed member list is their only evidence: live or unreadable
         // pids keep the record, an all-dead list retires it.
-        if (!record.generation.complete()) {
-            std::vector<ProcessIdentity> pids = record.members;
+        const ExecutionGeneration generation = generation_of(record.job);
+        if (!generation.complete()) {
+            std::vector<ProcessIdentity> pids = members_of(record.job);
             if (pids.empty()) {
                 if (const auto job = findJob(record.internal_id)) {
                     for (const auto pid : job->JobPIDs)
@@ -654,9 +663,9 @@ void JobRegistry::evaluateRetirements(
             continue;
         }
 
-        const ProcessIdentity manager{record.generation.manager_pid,
-                                      record.generation.manager_start_ticks,
-                                      record.generation.boot_id};
+        const ProcessIdentity manager{generation.manager_pid,
+                                      generation.manager_start_ticks,
+                                      generation.boot_id};
         const LivenessResult manager_liveness = process_probe_
                                                     ? process_probe_(manager)
                                                     : LivenessResult{};
@@ -667,9 +676,9 @@ void JobRegistry::evaluateRetirements(
         bool cgroup_empty_confirmed = false;
         bool cgroup_live = false;
         bool cgroup_inconclusive = false;
-        if (!record.generation.cgroup_identity.empty() && cgroup_probe_) {
+        if (!generation.cgroup_identity.empty() && cgroup_probe_) {
             const CgroupMembership membership =
-                cgroup_probe_(record.generation.cgroup_identity);
+                cgroup_probe_(generation.cgroup_identity);
             if (membership.readable) {
                 if (membership.members.empty()) {
                     // The read succeeded and found nothing: positive "cgroup
@@ -708,7 +717,7 @@ void JobRegistry::evaluateRetirements(
 
         bool live_member = false;
         bool member_inconclusive = false;
-        for (const auto& member : record.members) {
+        for (const auto& member : members_of(record.job)) {
             const LivenessResult liveness = process_probe_ ? process_probe_(member)
                                                            : LivenessResult{};
             if (liveness.state == LivenessState::Alive) {
@@ -1278,7 +1287,7 @@ bool JobRegistry::deinit()
         }
         for (const auto& [internal_id, generation] : closing) {
             const auto record = ownRecord(internal_id);
-            if (record && !(record->generation == generation)) {
+            if (record && !(generation_of(record->job) == generation)) {
                 spdlog::info("JobRegistry: JobID {} no longer carries the retired "
                              "generation; acknowledgement discarded", internal_id);
                 continue;
@@ -1379,12 +1388,14 @@ void JobRegistry::attributionJobRemovePid(uint64_t internal_id, pid_t pid) {
     auto& pids = it->second.job.JobPIDs;
     const auto before = pids.size();
     pids.erase(std::remove(pids.begin(), pids.end(), pid), pids.end());
-    auto& members = it->second.members;
-    members.erase(std::remove_if(members.begin(), members.end(),
-                                  [pid](const ProcessIdentity& member) {
-                                      return member.pid == pid;
-                                  }),
-                   members.end());
+    if (it->second.job.execution) {
+        auto& members = it->second.job.execution->members;
+        members.erase(std::remove_if(members.begin(), members.end(),
+                                      [pid](const ProcessIdentity& member) {
+                                          return member.pid == pid;
+                                      }),
+                       members.end());
+    }
     if (pids.size() != before) {
         spdlog::trace("JobRegistry: kernel EXIT removed pid={} from job_id={} (now {} pids)",
                       pid, internal_id, pids.size());
@@ -1580,10 +1591,11 @@ bool JobRegistry::addJob(const Job& job) {
         // leaves the identity incomplete, which is reported as incomplete
         // ownership rather than guessed.
         const std::string boot_id = read_boot_id();
-        record.members.clear();
+        JobExecution& execution = ensure_execution(record.job);
+        execution.members.clear();
         for (const auto pid : record.job.JobPIDs) {
             const auto ticks = read_process_start_ticks(pid);
-            record.members.push_back(ProcessIdentity{
+            execution.members.push_back(ProcessIdentity{
                 pid, ticks.value_or(0), ticks.has_value() ? boot_id : std::string{}});
         }
     }
@@ -2282,8 +2294,9 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
         return result;
     }
 
-    if (stored.generation.complete() && generation.complete() &&
-        stored.generation != generation) {
+    const ExecutionGeneration stored_generation = generation_of(stored.job);
+    if (stored_generation.complete() && generation.complete() &&
+        stored_generation != generation) {
         result.disposition = UpsertDisposition::Conflict;
         result.code = RegistrationError::GenerationConflict;
         result.error = "execution_generation_conflict";
@@ -2320,20 +2333,27 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     // execution from here on, never a manual row that merely lacks one.
     updated.execution_observed = true;
     updated.job = merged;
-    if (job.execution) updated.job.execution = job.execution;
+    // The record's evidence copy is NOT taken wholesale from the incoming
+    // Job: a partially-known member list must never erase stored members
+    // (that is what the branches below decide). merged still carries the
+    // stored execution group; the runtime metadata of the observation
+    // (read_at/read_order/reasons) is diagnostic and stays with the producer.
     updated.selector = selector;
     updated.last_seen_us = observed_at;
     const bool generation_became_complete =
-        !stored.generation.complete() && generation.complete();
-    if (generation.complete()) updated.generation = generation;
+        !generation_of(stored.job).complete() && generation.complete();
+    // The record's one evidence copy rides the Job: the discovery execution
+    // group (normalized) replaces the stored one under the same rules.
+    JobExecution& updated_execution = ensure_execution(updated.job);
+    if (generation.complete()) updated_execution.generation = generation;
     if (!processes.empty()) {
-        updated.members = normalized_processes(processes);
+        updated_execution.members = normalized_processes(processes);
     } else if (members_complete) {
-        updated.members.clear();
+        updated_execution.members.clear();
     } else if (!observed_job.JobPIDs.empty()) {
-        updated.members.clear();
+        updated_execution.members.clear();
         for (const auto pid : observed_job.JobPIDs)
-            updated.members.push_back(ProcessIdentity{pid, 0, ""});
+            updated_execution.members.push_back(ProcessIdentity{pid, 0, ""});
     }
 
     // A record whose liveness could not be verified is re-admitted by positive
@@ -2535,12 +2555,18 @@ void JobRegistry::validateRestoredExecutions(std::vector<JobRecord>& rows) {
     const std::string boot_id = read_boot_id();
     for (auto& record : rows) {
         if (record.state == kStateClosing) continue;   // the drain owns it
-        switch (verify_execution(record.generation, record.execution_observed,
+        JobExecution& execution = ensure_execution(record.job);
+        fmt::print(stderr,
+                   "DBG validate id={} gen_pid={} gen_boot={} members={} cur_boot={} observed={}\n",
+                   record.internal_id, execution.generation.manager_pid,
+                   execution.generation.boot_id, execution.members.size(), boot_id,
+                   record.execution_observed);
+        switch (verify_execution(execution.generation, record.execution_observed,
                                  boot_id, process_probe_)) {
             case ExecutionVerdict::Stale:
                 record.execution_verified = false;
                 record.job.JobPIDs.clear();
-                record.members.clear();
+                execution.members.clear();
                 spdlog::warn("JobRegistry: restored JobID {} has a stale execution "
                              "generation; liveness unknown", record.internal_id);
                 break;
@@ -2551,13 +2577,13 @@ void JobRegistry::validateRestoredExecutions(std::vector<JobRecord>& rows) {
                              "process or incomplete discovery identity); liveness "
                              "unknown, {} member(s) kept as evidence and never "
                              "replayed",
-                             record.internal_id, record.members.size());
+                             record.internal_id, execution.members.size());
                 break;
             case ExecutionVerdict::Verified: {
                 std::vector<ProcessIdentity> kept;
-                kept.reserve(record.members.size());
+                kept.reserve(execution.members.size());
                 size_t dropped = 0;
-                for (const auto& member : record.members) {
+                for (const auto& member : execution.members) {
                     if (!member.complete()) {
                         kept.push_back(member);
                         continue;
@@ -2571,17 +2597,17 @@ void JobRegistry::validateRestoredExecutions(std::vector<JobRecord>& rows) {
                     kept.push_back(member);
                 }
                 if (dropped != 0) {
-                    record.members = std::move(kept);
+                    execution.members = std::move(kept);
                     spdlog::warn("JobRegistry: restored JobID {} dropped {} "
                                  "reused/gone member process identity(ies)",
                                  record.internal_id, dropped);
                 }
-                if (!record.members.empty()) {
+                if (!execution.members.empty()) {
                     record.job.JobPIDs.clear();
-                    for (const auto& member : record.members)
+                    for (const auto& member : execution.members)
                         record.job.JobPIDs.push_back(member.pid);
                 }
-                if (record.members.empty() && dropped != 0)
+                if (execution.members.empty() && dropped != 0)
                     record.execution_verified = false;
                 break;
             }
@@ -2764,17 +2790,26 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job) {
         created.identity = *identity;
         created.identity_complete = true;
         created.execution_observed = true;   // created by a discovery observation
-        created.generation = generation;
-        created.members_authoritative = members_complete;
+        // ensure_execution keeps the discovered group intact (emplace would
+    // destroy it); the assignments below normalize the record's own fields.
+    JobExecution& created_execution = ensure_execution(created.job);
+        created_execution.generation = generation;
+        created_execution.members_authoritative = members_complete;
+        created_execution.read_at_us = read_at_us_of(job);
+        created_execution.read_order = job.execution ? job.execution->read_order : 0;
+        created_execution.incomplete_reason =
+            job.execution ? job.execution->incomplete_reason : std::string{};
+        created_execution.notes = job.execution ? job.execution->notes
+                                                 : std::vector<std::string>{};
         created.revision = 1;
         created.state = kStateActive;
         created.first_seen_us = observed_at;
         created.last_seen_us = observed_at;
         if (!processes.empty()) {
-            created.members = normalized_processes(processes);
+            created_execution.members = normalized_processes(processes);
         } else {
             for (const auto pid : created.job.JobPIDs) {
-                created.members.push_back(ProcessIdentity{pid, 0, ""});
+                created_execution.members.push_back(ProcessIdentity{pid, 0, ""});
             }
         }
 
@@ -3345,10 +3380,11 @@ bool JobRegistry::refreshJobFacts(uint64_t jobID) {
     // as the only liveness evidence. Only replace it while the refresh still
     // sees processes: an empty result is itself the termination evidence the
     // retirement pass has to evaluate.
-    if (!record.generation.complete() && !job.JobPIDs.empty()) {
-        record.members.clear();
+    if (!generation_of(record.job).complete() && !job.JobPIDs.empty()) {
+        JobExecution& execution = ensure_execution(record.job);
+        execution.members.clear();
         for (const auto pid : job.JobPIDs)
-            record.members.push_back(ProcessIdentity{pid, 0, ""});
+            execution.members.push_back(ProcessIdentity{pid, 0, ""});
     }
     if (record.revision == 0) {
         record.revision = 1;

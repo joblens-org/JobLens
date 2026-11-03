@@ -335,8 +335,7 @@ void finalize_discovery_job(Job& job, std::vector<std::string> source_reasons)
             "execution generation unresolved: manager pid, manager start ticks or boot id missing");
     }
 
-    if (!job.execution) job.execution.emplace();
-    job.execution->incomplete_reason = join_reasons(reasons);
+    ensure_execution(job).incomplete_reason = join_reasons(reasons);
 }
 
 std::uint64_t next_discovery_read_order()

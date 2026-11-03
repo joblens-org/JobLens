@@ -558,7 +558,8 @@ void run_a08(const std::string& base)
     source.set_scan([&]() { return scan_with({revived}); });
     check(registry.reconcileInventoryNow(), "A08: the revival pass did not run");
     const auto revived_record = find_native(registry, "101.0");
-    check(revived_record.has_value() && revived_record->generation.manager_pid == 5102,
+    check(revived_record.has_value() &&
+              revived_record->job.execution->generation.manager_pid == 5102,
           "A08: a new generation was rejected after retirement");
     check(count_records(registry) == 2, "A08: duplicate entry for one generation");
 
@@ -677,7 +678,8 @@ void run_a10(const std::string& base)
     probes.set_cgroup("/cg/slot-4", {6001}, true);
     const auto record = find_native(registry, "300.0");
     check(record.has_value(), "A10: record missing");
-    check(record->members.empty(), "A10: fixture should have an empty PID list");
+    check(record->job.execution->members.empty(),
+          "A10: fixture should have an empty PID list");
 
     source.set_scan([&]() { return scan_with({}); });
     registry.reconcileInventoryNow();
@@ -778,7 +780,7 @@ void run_a11(const std::string& base)
     check(count_records(registry) == 3, "A11: namespaces merged");
     check(find_native(registry, "400.0", "htcondor02", "schedd-b").has_value(),
           "A11: second namespace record missing");
-    check(find_native(registry, "400.0")->generation.manager_pid == 5500,
+    check(find_native(registry, "400.0")->job.execution->generation.manager_pid == 5500,
           "A11: wrong record was updated");
 
     registry.deinit();
@@ -947,7 +949,7 @@ void run_a14(const std::string& base)
     const auto still_new = find_native(registry, "700.1");
     check(still_new.has_value() && still_new->internal_id == new_record->internal_id,
           "A14: old acknowledgement removed the new identity index");
-    check(still_new->generation.manager_start_ticks == 1616,
+    check(still_new->job.execution->generation.manager_start_ticks == 1616,
           "A14: new generation was replaced by stale state");
 
     // A stale discovery for the retired generation still cannot resurrect it.
@@ -1254,7 +1256,7 @@ void run_legacy(const std::string& base)
     const auto records = registry.inventoryRecords();
     check(records.size() == 1, "legacy: the registration created no inventory record");
     const uint64_t id = records.front().internal_id;
-    check(!records.front().generation.complete(),
+    check(!records.front().job.execution->generation.complete(),
           "legacy: a manual registration must not invent an execution generation");
 
     check(heartbeat_status()["configured_types"].empty(),
@@ -1343,7 +1345,8 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
         check(std::find(restored->job.JobPIDs.begin(), restored->job.JobPIDs.end(),
                         child_pid) != restored->job.JobPIDs.end(),
               "RESTORE-UNKNOWN: restore deleted the saved child PID");
-        check(std::any_of(restored->members.begin(), restored->members.end(),
+        check(std::any_of(restored->job.execution->members.begin(),
+                          restored->job.execution->members.end(),
                           [&](const ProcessIdentity& member) {
                               return member.pid == child_pid && member.complete();
                           }),

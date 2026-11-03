@@ -397,6 +397,15 @@ struct Job {
 // no caller keeps a second copy of the same evidence.
 // ---------------------------------------------------------------------------
 
+// Engages the execution group without destroying an existing one (unlike
+// optional::emplace, which always reconstructs). Discovery, manual
+// registration and restore all funnel through this.
+inline JobExecution& ensure_execution(Job& job)
+{
+    if (!job.execution) job.execution.emplace();
+    return *job.execution;
+}
+
 inline NativeSelector selector_of(const Job& job) {
     NativeSelector selector;
     selector.adapter = job.subtype_name;
