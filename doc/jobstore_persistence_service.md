@@ -1,7 +1,7 @@
 # JobStore 持久化服务边界重构方案
 
-状态:方案已评审定稿(2026-11-03),待实施。
-分支:`feature/collector-output-refactor`(在途 collector 改动由维护者自理后开工)。
+状态:已实施完成(2026-11-03)。五个提交:95b5e9d(docs 方案)→ cb1255a(零行为清理)→ 9a0585b(归档分流)→ 5a0db23(事实来源迁移)→ 09906d2(commit 写原语收敛,含 merge 判定上移与 setIdentityApplier 拆除)。实施中的既定偏差:`verify_execution`/`ExecutionVerdict` 落位 liveness、`identity_index_key` 成为共享自由函数、store 保留 `instanceId()` 纯派生、registry 新增 `mutation_mtx_` 串行化业务变更(records_mtx_ 只护读与发布)。遗留:lifecycle 套件存在与本重构无关的既有低概率竞态(约 1/20,事件早于 lane 快照挂载),建议另开测试加固专项。
+分支:`feature/collector-output-refactor`。
 
 ## 1. 背景与诊断
 
