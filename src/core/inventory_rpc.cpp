@@ -481,6 +481,33 @@ TargetResolution resolve_instance_handle(JobRegistry& registry, const std::strin
     return result;
 }
 
+// Instance addressing by internal_job_id: the durable id resolves in O(1)
+// through the registry's record map instead of a scan comparing derived
+// handles. Addressability matches the opaque-handle path exactly: an active
+// record only (findJob), a closing instance rejects with generation_closing,
+// and the reserved system sentinel is never addressable.
+TargetResolution resolve_instance_handle_by_id(JobRegistry& registry, uint64_t internal_id)
+{
+    TargetResolution result;
+    auto record = is_reserved_internal_id(internal_id)
+                      ? std::nullopt
+                      : registry.inventoryRecord(internal_id);
+    if (!record) {
+        result.code = "not_found";
+        result.message = "no verified current instance with internal_job_id '" +
+                         format_internal_id(internal_id) + "'";
+        return result;
+    }
+    if (!registry.findJob(record->internal_id).has_value()) {
+        result.code = "generation_closing";
+        result.message = "instance " + record->instance_id +
+                         " is closing and rejects new binding mutations";
+        return result;
+    }
+    result.records.push_back(std::move(*record));
+    return result;
+}
+
 // The durable record is authoritative for what the operator asked for; the
 // collection runtime is the only source of what is actually attached. The two
 // are reported separately so "accepted" can never be read as "collecting".
@@ -1203,25 +1230,47 @@ void registerInventoryRpc(JobRegistry& registry) {
 
             const bool has_instance =
                 selector.contains("instance_id") && !selector["instance_id"].is_null();
+            // Preferred instance form: the durable internal id as a decimal
+            // string. instance_id stays accepted through the transition.
+            const bool has_internal_id =
+                selector.contains("internal_job_id") &&
+                !selector["internal_job_id"].is_null();
+            const bool has_handle = has_instance || has_internal_id;
             std::vector<std::string> native_fields;
             for (const char* name : {"scheduler_type", "adapter", "cluster_name",
                                      "cluster_tag", "native_job_id", "step_id"}) {
                 if (selector.contains(name) && !selector[name].is_null())
                     native_fields.emplace_back(name);
             }
-            if (has_instance && !native_fields.empty())
-                return selector_error("selector must use exactly one form: instance_id or "
-                                      "native identity fields, not both");
-            if (!has_instance && native_fields.empty())
-                return selector_error("selector is required: instance_id or native identity fields");
-            if (has_instance && scope != "instance")
-                return selector_error("instance_id selector only supports scope=instance");
+            if (has_instance && has_internal_id)
+                return selector_error("selector must use exactly one instance form: "
+                                      "internal_job_id or instance_id, not both");
+            if (has_handle && !native_fields.empty())
+                return selector_error("selector must use exactly one form: an instance "
+                                      "handle (internal_job_id, instance_id) or native "
+                                      "identity fields, not both");
+            if (!has_handle && native_fields.empty())
+                return selector_error("selector is required: an instance handle "
+                                      "(internal_job_id, instance_id) or native identity "
+                                      "fields");
+            if (has_handle && scope != "instance")
+                return selector_error("instance handle selectors only support "
+                                      "scope=instance");
 
             NativeSelector native_selector;
             std::string instance_handle;
+            std::optional<uint64_t> internal_handle;
             try {
                 instance_handle = has_instance ? optional_string(selector, "instance_id") : "";
-                if (!has_instance) {
+                if (has_internal_id) {
+                    const auto raw = optional_string(selector, "internal_job_id");
+                    internal_handle = parse_internal_id(raw);
+                    if (!internal_handle)
+                        return selector_error(
+                            "internal_job_id must be a decimal internal id string (got '" +
+                            raw + "')");
+                }
+                if (!has_handle) {
                     native_selector.cluster_tag = optional_string(selector, "cluster_tag");
                     native_selector.step_id = optional_string(selector, "step_id");
                     native_selector.native_job_id = optional_string(selector, "native_job_id");
@@ -1286,9 +1335,12 @@ void registerInventoryRpc(JobRegistry& registry) {
             }
 
             const auto resolution =
-                has_instance ? resolve_instance_handle(registry, instance_handle)
-                             : resolve_native_target(registry, native_selector, scope,
-                                                     ensure_registered);
+                has_internal_id
+                    ? resolve_instance_handle_by_id(registry, *internal_handle)
+                    : has_instance
+                          ? resolve_instance_handle(registry, instance_handle)
+                          : resolve_native_target(registry, native_selector, scope,
+                                                  ensure_registered);
             if (!resolution.ok()) {
                 if (resolution.code == "ambiguous_selector")
                     return error_payload(resolution.code, resolution.message,

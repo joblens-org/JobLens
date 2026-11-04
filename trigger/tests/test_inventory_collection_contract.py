@@ -173,6 +173,56 @@ def test_a30_instance_handle_selector_forwards_instance_id_only(install_core) ->
     assert response.get_json()["targets"][0]["instance_id"] == "opaque-handle-9"
 
 
+def test_a30_internal_job_id_selector_forwards_verbatim(install_core) -> None:
+    """internal_job_id 实例句柄（推荐形式）：原样转发，不注入 instance_id/内部推导。"""
+    fake = install_core(
+        response={
+            "status": "accepted",
+            "targets": [_target(instance_id="opaque-handle-9", native_job_id=None)],
+        }
+    )
+
+    response = _post_collection(
+        _app().test_client(),
+        {"selector": {"internal_job_id": "42"}, "operation": "set", "collectors": []},
+    )
+
+    assert response.status_code == 200
+    forwarded = fake.calls[0][1]
+    assert forwarded["selector"] == {"internal_job_id": "42"}
+    assert forwarded["scope"] == "instance"
+    # 透传边界：Trigger 不把一种句柄形式翻译成另一种
+    assert "instance_id" not in forwarded["selector"]
+
+
+def test_a30_internal_job_id_rejects_non_decimal_and_dual_forms(install_core) -> None:
+    """非十进制 internal_job_id 与两种句柄并用在边界即拒绝，不打扰 Core。"""
+    fake = install_core()
+    client = _app().test_client()
+
+    response = _post_collection(
+        client,
+        {"selector": {"internal_job_id": "4x2"}, "operation": "set", "collectors": []},
+    )
+    assert response.status_code == 400
+
+    response = _post_collection(
+        client,
+        {
+            "selector": {"internal_job_id": "42", "instance_id": "opaque-handle-9"},
+            "operation": "set",
+            "collectors": [],
+        },
+    )
+    assert response.status_code == 400
+    assert "exactly one instance form" in response.get_json()["message"]
+    # 边界拒绝：Core 从未被调用
+    assert fake.calls == []
+
+
+# ==================== A30: job scope reports each observed step ====================
+
+
 def test_a30_slurm_job_scope_reports_each_observed_step(install_core) -> None:
     targets = [
         _target(instance_id="inst-step-batch", native_job_id="9001", mode="auto"),
