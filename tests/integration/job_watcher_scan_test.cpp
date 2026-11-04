@@ -31,6 +31,7 @@
  */
 #include "core/job_identity.hpp"
 #include "core/job_discovery.hpp"
+#include "common/procfs.hpp"
 #include "job_watcher/condor_job_watcher.hpp"
 #include "job_watcher/slurm_job_watcher.hpp"
 #include "common/config.hpp"

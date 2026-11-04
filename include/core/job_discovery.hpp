@@ -20,9 +20,10 @@
 // controller:
 //
 // Discovery contract (renamed from job_observation when registration became a
-// Job-based synchronous path; plan §5.1). The header owns source, scan, the
-// proc/cgroup readers and the clock — it must never depend on LevelDB, and the
-// registration result type lives in its own contract header.
+// Job-based synchronous path; plan §5.1). The header owns source and scan —
+// the root-explicit proc/cgroup readers live in common/procfs.hpp — and it
+// must never depend on LevelDB; the registration result type lives in its own
+// contract header.
 //
 //   * scan()      - one synchronous source pass, returns ScanResult
 //   * health()    - SourceHealth of that source (initializing/healthy/degraded)
@@ -253,64 +254,9 @@ public:
     virtual std::optional<Job> observeForHint(pid_t hint_pid) = 0;
 };
 
-// ---------------------------------------------------------------------------
-// procfs / cgroup readers
-// ---------------------------------------------------------------------------
-//
-// Same layout and semantics as the /proc-based helpers in common/utils.hpp,
-// but every root is explicit so fixtures can be unprivileged. Production
-// callers pass DiscoveryEnvironment defaults ("/proc", "/sys/fs/cgroup").
-
-// Numeric pid directories of `proc_root`, ascending. Unreadable roots yield an
-// empty vector; callers that need the error call ensure_readable_directory().
-std::vector<pid_t> list_proc_pids(const std::string& proc_root);
-
-// Returns false with a message when `path` is missing or not a directory.
-bool ensure_readable_directory(const std::string& path, std::string& error);
-
-// NUL-separated cmdline turned into a space-separated string.
-bool read_proc_cmdline(const std::string& proc_root, pid_t pid, std::string& out,
-                       std::string& error);
-
-// Reads one environment variable of a process. false = environ unreadable.
-bool read_proc_env(const std::string& proc_root, pid_t pid, const std::string& key,
-                   std::string& out, std::string& error);
-
-// Reads <pid>/environ ONCE and extracts every requested key in a single pass
-// (the discovery hot path asks for several variables of the same process).
-// Absent keys are simply missing from the map; false = environ unreadable.
-bool read_proc_env_values(const std::string& proc_root, pid_t pid,
-                          const std::vector<std::string>& keys,
-                          std::map<std::string, std::string>& out,
-                          std::string& error);
-
-std::optional<pid_t> read_proc_ppid(const std::string& proc_root, pid_t pid);
-std::optional<std::uint64_t> read_proc_start_ticks(const std::string& proc_root, pid_t pid);
-
 // Process-monotonic read order, assigned before a builder starts reading. The
 // store uses it so an older scan can never overwrite a newer event (plan §4.1).
 std::uint64_t next_discovery_read_order();
 
-// Boot identity for the host that owns `proc_root`. Empty when unavailable, in
-// which case no ProcessIdentity/ExecutionGeneration is complete.
-std::string read_boot_id(const std::string& proc_root);
+// Process identity from the fake or real procfs (see common/procfs.hpp).
 
-// Absolute cgroup v2 directory of a process. Empty for the root cgroup (not
-// execution-scoped evidence) or when the file is missing.
-std::string read_proc_cgroup_path(const std::string& proc_root, pid_t pid,
-                                  const std::string& cgroup_root);
-
-// PIDs listed in <cgroup_dir>/cgroup.procs. Empty when unreadable.
-std::vector<pid_t> read_cgroup_members(const std::string& cgroup_dir);
-
-// Error-reporting variant: false means the membership is unknown ("not empty"
-// can never be concluded from it); true means the list is authoritative, an
-// empty list included.
-bool read_cgroup_members(const std::string& cgroup_dir, std::vector<pid_t>& members,
-                         std::string& error);
-
-// Process identity from the fake or real procfs. Fields that cannot be read
-// stay zero; ProcessIdentity::complete() reports whether the evidence is
-// sufficient, and no caller may upgrade a partial identity.
-ProcessIdentity read_process_identity(const std::string& proc_root,
-                                      const std::string& boot_id, pid_t pid);

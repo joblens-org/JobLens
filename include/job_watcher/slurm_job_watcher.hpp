@@ -16,6 +16,7 @@
 #include <spdlog/spdlog.h>
 #include <fmt/core.h>
 #include "common/ebpf_common.hpp"
+#include "common/procfs.hpp"
 #include "common/utils.hpp"
 #include "core/job_discovery.hpp"
 #include <algorithm>

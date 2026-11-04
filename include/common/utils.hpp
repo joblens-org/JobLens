@@ -33,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include "common/procfs.hpp"
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -130,28 +131,13 @@ namespace Utils
      * @return cgroup绝对路径，失败返回空串
      */
     inline std::string v2_cgroup_absolute_path(pid_t pid = 0){
-        const fs::path proc = (pid == 0) ? "/proc/self/cgroup"
-                                         : "/proc/" + std::to_string(pid) + "/cgroup";
-
-        std::ifstream fin(proc);
-        if (!fin)
-            return {};                 // 进程不存在或权限不足
-
-        std::string line;
-        while (std::getline(fin, line)){
-            // v2 统一层级格式：0::/relative/path
-            if (line.compare(0,3,"0::") == 0){
-                std::string rel = line.substr(3);          // "/system.slice/xxx"
-                // 拼到挂载点即可。v2 统一层级挂载点 99% 是 /sys/fs/cgroup
-                fs::path mount = "/sys/fs/cgroup";
-                fs::path rel_path = fs::path(rel).lexically_normal();
-                if (rel_path.is_absolute()) {
-                    rel_path = rel_path.relative_path();
-                }
-                return (mount / rel_path).lexically_normal().string();
-            }
-        }
-        return {};   // 不是 v2 或没找到
+        // 薄 wrapper：实现统一在 common/procfs.hpp（root-explicit 读器）。
+        // pid 0 表示当前进程；root-explicit 读器需要一个真实 pid。
+        const pid_t target = (pid == 0) ? ::getpid() : pid;
+        // 与旧实现唯一的行为差异：进程位于根 cgroup（"0::/"）时返回空串
+        // 而非 "/sys/fs/cgroup"——把根 cgroup 的全部进程归给一个作业从来
+        // 不是正确归属；调用方按"空 = 无 cgroup 证据"处理。
+        return read_proc_cgroup_path("/proc", target, "/sys/fs/cgroup");
     }
 
     /**
@@ -160,16 +146,8 @@ namespace Utils
      * @return PID列表
      */
     inline std::vector<pid_t> get_pids_in_cgroup(const std::string& cgroup_dir){
-        std::vector<pid_t> pids;
-        fs::path procs = fs::path(cgroup_dir) / "cgroup.procs";
-        std::ifstream fin(procs);
-        if (!fin)
-            return pids;   // 文件不存在或权限不足
-
-        pid_t pid;
-        while (fin >> pid)          // 每行一个 PID
-            pids.push_back(pid);
-        return pids;
+        // 薄 wrapper：实现统一在 common/procfs.hpp（root-explicit 读器）。
+        return read_cgroup_members(cgroup_dir);
     }
     inline std::string executableDir() {
         char buf[PATH_MAX + 1] = {};
