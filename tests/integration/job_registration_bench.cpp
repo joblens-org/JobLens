@@ -591,7 +591,9 @@ int main(int argc, char** argv)
         const auto t0 = Clock::now();
         std::optional<Job> discovered;
         try {
-            discovered = adapter->source().observeForHint(job.child);
+            // The fixture knows the starter pid: hand it over like a real
+            // exec event does, so the observation skips the ppid stat read.
+            discovered = adapter->source().observeForHint(job.child, job.starter);
         } catch (const std::exception& error) {
             std::cerr << "observe failed for pid " << job.child << ": " << error.what() << "\n";
             ++incomplete;

@@ -60,7 +60,7 @@ public:
     ScanResult scan() override;
     SourceHealth health() const override;
     void requestRescan() override;
-    std::optional<Job> observeForHint(pid_t hint_pid) override;
+    std::optional<Job> observeForHint(pid_t hint_pid, pid_t hint_ppid = 0) override;
 
     // ---- Owner/test observability ------------------------------------------
     bool polling() const;
@@ -82,7 +82,9 @@ private:
     // An exec event is handled on the polling thread: resolve the pid, offer
     // the built Job to this turn's batch, and remember the pid when the
     // scheduler metadata is not ready yet (bounded re-read, plan §6.3).
-    void handle_exec_event(uint32_t pid);
+    // `ppid` comes from the event itself; the observation skips the ppid
+    // read when it is positive.
+    void handle_exec_event(uint32_t pid, uint32_t ppid);
     // One sample ended the turn: libbpf must stop consuming so the tail batch,
     // the due re-reads and the stop check can run (plan §6.2).
     bool stop_requested();
@@ -289,23 +291,29 @@ inline DiscoveryEnvironment CondorJobWatcher::discovery_environment() const
     return options_.discovery;
 }
 
-inline std::optional<Job> CondorJobWatcher::observeForHint(pid_t hint_pid)
+inline std::optional<Job> CondorJobWatcher::observeForHint(pid_t hint_pid, pid_t hint_ppid)
 {
     if (hint_pid <= 0) return std::nullopt;
     const auto env = discovery_environment();
-    const auto ppid = read_proc_ppid(env.proc_root, hint_pid);
-    if (!ppid || *ppid <= 0) return std::nullopt;
+    // The event carries its own ppid (the starter): use it directly. Events
+    // from old BPF objects carry 0 and fall back to reading the hint's stat.
+    pid_t ppid = hint_ppid;
+    if (ppid <= 0) {
+        const auto read = read_proc_ppid(env.proc_root, hint_pid);
+        if (!read || *read <= 0) return std::nullopt;
+        ppid = *read;
+    }
     // The BPF filter guarantees the parent is a starter for real events; the
     // cmdline check keeps a recycled pid from fabricating a discovery.
     std::string cmdline;
     std::string error;
-    if (!read_proc_cmdline(env.proc_root, *ppid, cmdline, error) ||
+    if (!read_proc_cmdline(env.proc_root, ppid, cmdline, error) ||
         cmdline.find("condor_starter") == std::string::npos)
         return std::nullopt;
     const std::string boot_id = read_boot_id(env.proc_root);
     // The hinted pid is the exec'd job process: probe it for the job ad first,
     // mirroring the old exec-event watcher that read _CONDOR_JOB_AD there.
-    return observe_starter(env, boot_id, *ppid, hint_pid);
+    return observe_starter(env, boot_id, ppid, hint_pid);
 }
 
 // ---------------------------------------------------------------------------
@@ -417,7 +425,7 @@ inline bool CondorJobWatcher::stop_requested()
     return !polling_running_;
 }
 
-inline void CondorJobWatcher::handle_exec_event(uint32_t pid)
+inline void CondorJobWatcher::handle_exec_event(uint32_t pid, uint32_t ppid)
 {
     // Runs on the polling thread. The event is only a hint: the discovered Job
     // is built from current procfs/ad evidence and registered right here, in
@@ -432,7 +440,7 @@ inline void CondorJobWatcher::handle_exec_event(uint32_t pid)
 
     std::optional<Job> discovered;
     try {
-        discovered = observeForHint(static_cast<pid_t>(pid));
+        discovered = observeForHint(static_cast<pid_t>(pid), static_cast<pid_t>(ppid));
     } catch (const std::exception& error) {
         spdlog::debug("CondorJobWatcher: exec hint {} could not be resolved: {}", pid, error.what());
     }
@@ -698,7 +706,10 @@ inline bool CondorJobWatcher::init_event_source()
         if (ptr->stop_requested()) return -ECANCELED;
         // Handle the CURRENT sample first: libbpf has already advanced the
         // consumer position, so a sample that is not taken now is lost.
-        ptr->handle_exec_event(event_ptr->pid);
+        // The event carries its ppid: no /proc stat read is needed on this
+        // path (old event objects without the field hand 0 and the
+        // observation falls back to reading it).
+        ptr->handle_exec_event(event_ptr->pid, event_ptr->ppid);
         // Bound the turn: the sample above is already handled, so yielding now
         // only ends libbpf's consume loop and lets the stop/scan checks run.
         ++ptr->samples_this_turn_;

@@ -248,10 +248,13 @@ public:
     virtual void requestRescan() = 0;
     // Targeted observation for one exec-event pid. The BPF filter guarantees
     // the parent is the execution manager, so the manager is the ppid; only
-    // this execution's files are read (O(job), not O(node)). Returns nullopt
-    // when the hint cannot be resolved (process gone, parent is not the
-    // expected manager); the caller then falls back to a full scan.
-    virtual std::optional<Job> observeForHint(pid_t hint_pid) = 0;
+    // this execution's files are read (O(job), not O(node)). `hint_ppid` is
+    // the exec event's own ppid: when positive (event objects that carry the
+    // field) the /proc ppid read is skipped; when zero (old BPF objects) the
+    // hint's stat is read instead. Returns nullopt when the hint cannot be
+    // resolved (process gone, parent is not the expected manager); the caller
+    // then falls back to a full scan.
+    virtual std::optional<Job> observeForHint(pid_t hint_pid, pid_t hint_ppid = 0) = 0;
 };
 
 // Process-monotonic read order, assigned before a builder starts reading. The

@@ -135,7 +135,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         health_.rescan_requested = true;
     }
-    std::optional<Job> observeForHint(pid_t hint) override
+    std::optional<Job> observeForHint(pid_t hint, pid_t /*hint_ppid*/) override
     {
         // No remaining test drives the targeted hint path; the registry's
         // hint entry was removed with the watchers' self-registration loop.

@@ -58,7 +58,7 @@ public:
     ScanResult scan() override;
     SourceHealth health() const override;
     void requestRescan() override;
-    std::optional<Job> observeForHint(pid_t hint_pid) override;
+    std::optional<Job> observeForHint(pid_t hint_pid, pid_t hint_ppid = 0) override;
 
     // ---- Owner/test observability ------------------------------------------
     bool polling() const;
@@ -81,7 +81,9 @@ private:
     // consumer's job (worker thread), never the polling thread's.
     // Handled on the polling thread: resolve, offer to this turn's batch, and
     // remember the pid when the scheduler metadata is not ready yet.
-    void handle_exec_event(uint32_t pid);
+    // `ppid` comes from the event itself; the observation skips the ppid
+    // read when it is positive.
+    void handle_exec_event(uint32_t pid, uint32_t ppid);
     // One sample ended the turn: libbpf must stop consuming so the tail batch,
     // the due re-reads and the stop check can run (plan §6.2).
     bool stop_requested();
@@ -324,25 +326,31 @@ inline DiscoveryEnvironment SlurmJobWatcher::discovery_environment() const
     return options_.discovery;
 }
 
-inline std::optional<Job> SlurmJobWatcher::observeForHint(pid_t hint_pid)
+inline std::optional<Job> SlurmJobWatcher::observeForHint(pid_t hint_pid, pid_t hint_ppid)
 {
     if (hint_pid <= 0) return std::nullopt;
     const auto env = discovery_environment();
-    const auto ppid = read_proc_ppid(env.proc_root, hint_pid);
-    if (!ppid || *ppid <= 0) return std::nullopt;
+    // The event carries its own ppid (the stepd): use it directly. Events
+    // from old BPF objects carry 0 and fall back to reading the hint's stat.
+    pid_t ppid = hint_ppid;
+    if (ppid <= 0) {
+        const auto read = read_proc_ppid(env.proc_root, hint_pid);
+        if (!read || *read <= 0) return std::nullopt;
+        ppid = *read;
+    }
     // Real events guarantee the parent is a slurmstepd; the cmdline check
     // keeps a recycled pid from fabricating a discovery.
     std::string cmdline;
     std::string error;
-    if (!read_proc_cmdline(env.proc_root, *ppid, cmdline, error) ||
+    if (!read_proc_cmdline(env.proc_root, ppid, cmdline, error) ||
         cmdline.find("slurmstepd") == std::string::npos)
         return std::nullopt;
     const std::string boot_id = read_boot_id(env.proc_root);
     // The exec'd task seeds the identity derivation; the step cgroup members
     // (merged by observe_stepd) complete the process list.
     std::map<pid_t, std::vector<pid_t>> children;
-    children[*ppid] = {hint_pid};
-    return observe_stepd(env, boot_id, *ppid, children);
+    children[ppid] = {hint_pid};
+    return observe_stepd(env, boot_id, ppid, children);
 }
 
 // ---------------------------------------------------------------------------
@@ -450,7 +458,7 @@ inline bool SlurmJobWatcher::stop_requested()
     return !polling_running_;
 }
 
-inline void SlurmJobWatcher::handle_exec_event(uint32_t pid)
+inline void SlurmJobWatcher::handle_exec_event(uint32_t pid, uint32_t ppid)
 {
     // Runs on the polling thread. The event is only a hint: the discovered Job
     // is built from current procfs/ad evidence and registered right here, in
@@ -465,7 +473,7 @@ inline void SlurmJobWatcher::handle_exec_event(uint32_t pid)
 
     std::optional<Job> discovered;
     try {
-        discovered = observeForHint(static_cast<pid_t>(pid));
+        discovered = observeForHint(static_cast<pid_t>(pid), static_cast<pid_t>(ppid));
     } catch (const std::exception& error) {
         spdlog::debug("SlurmJobWatcher: exec hint {} could not be resolved: {}", pid, error.what());
     }
@@ -759,7 +767,10 @@ inline bool SlurmJobWatcher::init_event_source()
         if (ptr->stop_requested()) return -ECANCELED;
         // Handle the CURRENT sample first: libbpf has already advanced the
         // consumer position, so a sample that is not taken now is lost.
-        ptr->handle_exec_event(event_ptr->pid);
+        // The event carries its ppid: no /proc stat read is needed on this
+        // path (old event objects without the field hand 0 and the
+        // observation falls back to reading it).
+        ptr->handle_exec_event(event_ptr->pid, event_ptr->ppid);
         // Bound the turn: the sample above is already handled, so yielding now
         // only ends libbpf's consume loop and lets the stop/scan checks run.
         ++ptr->samples_this_turn_;
