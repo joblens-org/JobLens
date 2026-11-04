@@ -226,10 +226,13 @@ DiscoveryOptions fixture_options(const Fixture& fixture,
     return options;
 }
 
-const Job* find_complete(const ScanResult& result, const std::string& native_job_id)
+// `ready` is the owning watcher's readiness rule (scheduler-owned semantics
+// since the free discovery_job_ready was retired).
+const Job* find_complete(const ScanResult& result, const std::string& native_job_id,
+                         bool (*ready)(const Job&))
 {
     for (const auto& job : result.jobs) {
-        if (discovery_job_ready(job) && job.NativeJobID == native_job_id)
+        if (ready(job) && job.NativeJobID == native_job_id)
             return &job;
     }
     return nullptr;
@@ -295,7 +298,7 @@ void condor_scan_finds_fixture_job(const Fixture& fixture)
         check(discovered.execution && discovered.execution->read_order > 0,
               "a discovered Job must carry a read order");
 
-    const auto* job = find_complete(result, "76226337.0");
+    const auto* job = find_complete(result, "76226337.0", &CondorJobWatcher::discovery_ready);
     check(job != nullptr, "the fixture Condor job must be a complete discovery");
     check(job->subtype_name == "condor", "scheduler type must be condor");
     const auto identity = canonicalize(selector_of(*job));
@@ -342,7 +345,7 @@ void condor_incomplete_observations_are_explicit(const Fixture& fixture)
     bool saw_unreadable_ad = false;
     bool saw_missing_global_job_id = false;
     for (const auto& discovered : result.jobs) {
-        if (discovery_job_ready(discovered)) continue;
+        if (CondorJobWatcher::discovery_ready(discovered)) continue;
         check(!discovered.execution->incomplete_reason.empty(),
               "an incomplete discovery must always explain why");
         check(discovered.NativeJobID.empty(),
@@ -380,7 +383,7 @@ void slurm_scan_finds_fixture_job(const Fixture& fixture)
               std::to_string(result.counts.incomplete));
     check(result.counts.skipped >= 1, "a non job<id> spool entry must be counted as skipped");
 
-    const auto* job = find_complete(result, "9002");
+    const auto* job = find_complete(result, "9002", &SlurmJobWatcher::discovery_ready);
     check(job != nullptr, "the fixture Slurm job must be a complete discovery");
     check(job->subtype_name == "slurm", "scheduler type must be slurm");
     check(job->execution->step_id && *job->execution->step_id == "3",
@@ -405,7 +408,7 @@ void slurm_scan_finds_fixture_job(const Fixture& fixture)
     bool saw_unattributable_stepd = false;
     bool saw_spool_entry = false;
     for (const auto& discovered : result.jobs) {
-        if (discovery_job_ready(discovered)) continue;
+        if (SlurmJobWatcher::discovery_ready(discovered)) continue;
         check(!discovered.execution->incomplete_reason.empty(),
               "an incomplete slurm discovery must explain itself");
         if (contains(discovered.execution->incomplete_reason, "no attributable job members"))
@@ -483,7 +486,7 @@ void observe_hint_targets_one_execution(const Fixture& fixture)
     // 4110 is a member process whose parent is the starter 4101.
     const auto targeted = condor.observeForHint(4110);
     check(targeted.has_value(), "a hint under a starter must resolve");
-    check(discovery_job_ready(*targeted), "the targeted discovery must be ready");
+    check(CondorJobWatcher::discovery_ready(*targeted), "the targeted discovery must be ready");
     check(targeted->NativeJobID == "76226337.0",
           "the targeted discovery must name the fixture job");
     check(targeted->execution->generation.manager_pid == 4101,
@@ -502,7 +505,7 @@ void observe_hint_targets_one_execution(const Fixture& fixture)
     // 5110's parent is the stepd 5101 of job 9002 step 3.
     const auto step = slurm.observeForHint(5110);
     check(step.has_value(), "a hint under a stepd must resolve");
-    check(discovery_job_ready(*step), "the targeted slurm discovery must be ready");
+    check(SlurmJobWatcher::discovery_ready(*step), "the targeted slurm discovery must be ready");
     check(step->NativeJobID == "9002" && step->execution->step_id &&
               *step->execution->step_id == "3",
           "the targeted slurm discovery must name job and step");
@@ -626,7 +629,7 @@ void condor_ad_on_member_process_is_found(const Fixture& fixture)
     CondorJobWatcher watcher(fixture_options(fixture));
     const auto result = watcher.scan();
     check(result.ok(), "the scan must succeed: " + result.error);
-    const auto* job = find_complete(result, "76226340.0");
+    const auto* job = find_complete(result, "76226340.0", &CondorJobWatcher::discovery_ready);
     check(job != nullptr,
           "an ad that lives on the job process must be discovered by the scan");
     check(std::get<CondorJobAttr>(job->sub_attr).owner == "carol",
@@ -636,7 +639,7 @@ void condor_ad_on_member_process_is_found(const Fixture& fixture)
     CondorJobWatcher hints(fixture_options(fixture));
     const auto targeted = hints.observeForHint(4410);
     check(targeted.has_value(), "a hint for the job process must resolve");
-    check(discovery_job_ready(*targeted) && targeted->NativeJobID == "76226340.0",
+    check(CondorJobWatcher::discovery_ready(*targeted) && targeted->NativeJobID == "76226340.0",
           "the targeted discovery must resolve the ad from the hinted pid");
     bool ad_note = false;
     if (targeted->execution) {
@@ -666,7 +669,7 @@ void condor_without_cgroup_still_resolves_members(const Fixture& fixture)
     CondorJobWatcher watcher(fixture_options(fixture));
     const auto result = watcher.scan();
     check(result.ok(), "the scan must succeed: " + result.error);
-    const auto* job = find_complete(result, "76226341.0");
+    const auto* job = find_complete(result, "76226341.0", &CondorJobWatcher::discovery_ready);
     check(job != nullptr, "an execution without a cgroup must still be identified");
     const auto members = member_pids(*job);
     check(members.size() == 2,

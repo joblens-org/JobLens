@@ -97,27 +97,6 @@ struct DiscoveryEnvironment {
 };
 
 // ---------------------------------------------------------------------------
-// Discovered Job readiness
-// ---------------------------------------------------------------------------
-
-// One discovered job IS the registration unit: typed facts on the Job itself
-// plus one `Job::execution` evidence group. There is no second envelope — the
-// watcher fills the Job where it parses its sources, and the registry derives
-// the selector/identity from the Job on admission (selector_of/canonicalize).
-//
-// Readiness is the old two-level rule: the logical identity resolves AND the
-// execution generation is complete (boot id + manager pid + manager start
-// ticks). An unresolvable identity stays out of the identity index and is
-// retried on the next observation; an incomplete generation is an unverified
-// execution, never a guess.
-bool discovery_job_ready(const Job& job);
-
-// Fills `job.execution->incomplete_reason` from the identity/generation checks
-// plus adapter-level source reasons (unreadable ad, missing env var). Ensures
-// the execution group exists so the reasons survive with the evidence.
-void finalize_discovery_job(Job& job, std::vector<std::string> source_reasons = {});
-
-// ---------------------------------------------------------------------------
 // Scan result
 // ---------------------------------------------------------------------------
 

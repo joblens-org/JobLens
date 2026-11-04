@@ -302,7 +302,7 @@ Job make_condor_job(const std::string& native,
     for (const pid_t member : members) {
         execution.members.push_back(ProcessIdentity{member, manager_ticks, "boot-aaa"});
     }
-    finalize_discovery_job(job);
+    CondorJobWatcher::finalize_discovery(job);
     return job;
 }
 
@@ -310,7 +310,7 @@ Job make_unresolved_job(const std::string& native, pid_t manager_pid)
 {
     Job job = make_condor_job(native, manager_pid, 900000);
     job.cluster_name.clear();
-    finalize_discovery_job(job);
+    CondorJobWatcher::finalize_discovery(job);
     return job;
 }
 
@@ -324,7 +324,7 @@ ScanResult scan_with(std::vector<Job> jobs, bool complete = true,
     result.finished_at_ms = 11;
     result.jobs = std::move(jobs);
     for (const auto& job : result.jobs) {
-        if (discovery_job_ready(job)) ++result.counts.complete;
+        if (CondorJobWatcher::discovery_ready(job)) ++result.counts.complete;
         else ++result.counts.incomplete;
     }
     result.counts.candidates = result.jobs.size();
@@ -746,7 +746,7 @@ void run_a11(const std::string& base)
     // An unresolved namespace cannot be indexed, is counted as incomplete and
     // is retried once the namespace resolves.
     const Job unresolved = make_unresolved_job("401.0", 5501);
-    check(!discovery_job_ready(unresolved), "A11: fixture should be incomplete");
+    check(!CondorJobWatcher::discovery_ready(unresolved), "A11: fixture should be incomplete");
     scan_jobs = {unresolved};
     registry.reconcileInventoryNow();
     check(!find_native(registry, "401.0").has_value(),
@@ -1304,7 +1304,7 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
     job.execution->generation.boot_id = boot;
     job.execution->members.clear();
     job.execution->members.push_back(ProcessIdentity{child_pid, 191919, boot});
-    finalize_discovery_job(job);
+    CondorJobWatcher::finalize_discovery(job);
 
     {
         FakeSource source("condor");

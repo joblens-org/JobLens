@@ -22,16 +22,6 @@
 namespace {
 std::atomic<std::uint64_t> g_read_order{0};
 
-std::string join_reasons(const std::vector<std::string>& reasons)
-{
-    std::string joined;
-    for (const auto& reason : reasons) {
-        if (!joined.empty()) joined += "; ";
-        joined += reason;
-    }
-    return joined;
-}
-
 void merge_members(std::vector<ProcessIdentity>& into, const std::vector<ProcessIdentity>& extra)
 {
     for (const auto& member : extra) {
@@ -78,37 +68,11 @@ const char* to_string(SourceState state)
 }
 
 // ---------------------------------------------------------------------------
-// Discovered Job finalization
+// Discovered Job readiness moved to the watchers (CondorJobWatcher /
+// SlurmJobWatcher discovery_ready/finalize_discovery): "is my discovery
+// finished" is scheduler-owned semantics, while the registry keeps the
+// admission rule (identity resolvable + generation complete).
 // ---------------------------------------------------------------------------
-
-bool discovery_job_ready(const Job& job)
-{
-    if (!job.execution || !job.execution->generation.complete()) return false;
-    // A finalized discovery records every missing piece (identity, generation
-    // AND source reasons — e.g. an unresolved Slurm step) in
-    // incomplete_reason; any of them disqualifies admission, exactly like the
-    // old Observation.identity_complete two-level rule. Jobs that never went
-    // through finalize_discovery_job still get the honest recomputation.
-    if (!job.execution->incomplete_reason.empty()) return false;
-    return canonicalize(selector_of(job)).has_value();
-}
-
-void finalize_discovery_job(Job& job, std::vector<std::string> source_reasons)
-{
-    std::vector<std::string> reasons = std::move(source_reasons);
-
-    if (!canonicalize(selector_of(job))) {
-        reasons.push_back(
-            "logical identity unresolved: scheduler type, cluster namespace or native job id missing");
-    }
-
-    if (!job.execution || !job.execution->generation.complete()) {
-        reasons.push_back(
-            "execution generation unresolved: manager pid, manager start ticks or boot id missing");
-    }
-
-    ensure_execution(job).incomplete_reason = join_reasons(reasons);
-}
 
 std::uint64_t next_discovery_read_order()
 {

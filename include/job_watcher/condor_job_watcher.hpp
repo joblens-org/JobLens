@@ -69,6 +69,17 @@ public:
     // Legacy spelling kept for existing callers.
     void request_rescan() { requestRescan(); }
 
+    // ---- Watcher-owned discovery semantics ---------------------------------
+    // Whether a Condor discovery counts as ready, and which reasons to stamp
+    // on an incomplete one, are this adapter's own rules — deliberately NOT
+    // an IDiscoverySource virtual (it is not an external dependency). The
+    // registry keeps deciding whether a Job may be *registered* (identity
+    // resolvable + generation complete); the watcher decides when *its*
+    // discovery is finished. Each scheduler holds its own copy so the rules
+    // may diverge later.
+    static bool discovery_ready(const Job& job);
+    static void finalize_discovery(Job& job, std::vector<std::string> source_reasons = {});
+
     // Discovery inputs (paths, namespaces) may be re-resolved between passes.
     void set_discovery_environment(const DiscoveryEnvironment& environment);
     DiscoveryEnvironment discovery_environment() const;
@@ -153,6 +164,46 @@ inline CondorJobWatcher::CondorJobWatcher(DiscoveryOptions options)
     if (!options_.enable_event_source)
         event_source_note_ =
             "eBPF event source disabled by configuration (scan-only adapter)";
+}
+
+// ---------------------------------------------------------------------------
+// Watcher-owned discovery semantics
+// ---------------------------------------------------------------------------
+
+inline bool CondorJobWatcher::discovery_ready(const Job& job)
+{
+    if (!job.execution || !job.execution->generation.complete()) return false;
+    // A finalized discovery records every missing piece (identity, generation
+    // AND source reasons — e.g. an unreadable job ad) in incomplete_reason;
+    // any of them disqualifies admission. Jobs that never went through
+    // finalize_discovery still get the honest recomputation.
+    if (!job.execution->incomplete_reason.empty()) return false;
+    return canonicalize(selector_of(job)).has_value();
+}
+
+inline void CondorJobWatcher::finalize_discovery(Job& job,
+                                                 std::vector<std::string> source_reasons)
+{
+    std::vector<std::string> reasons = std::move(source_reasons);
+
+    if (!canonicalize(selector_of(job))) {
+        reasons.push_back(
+            "logical identity unresolved: scheduler type, cluster namespace or native job id missing");
+    }
+
+    if (!job.execution || !job.execution->generation.complete()) {
+        reasons.push_back(
+            "execution generation unresolved: manager pid, manager start ticks or boot id missing");
+    }
+
+    std::string joined;
+    for (const auto& reason : reasons) {
+        if (!joined.empty()) joined += "; ";
+        joined += reason;
+    }
+    // ensure_execution (never optional::emplace) so an already-built evidence
+    // group survives the finalization.
+    ensure_execution(job).incomplete_reason = joined;
 }
 
 inline bool CondorJobWatcher::start(const DiscoverySink& sink)
@@ -446,7 +497,7 @@ inline void CondorJobWatcher::handle_exec_event(uint32_t pid, uint32_t ppid)
     }
     if (!discovered) return;   // not a JobLens execution, or it already exited
 
-    if (discovery_job_ready(*discovered)) {
+    if (CondorJobWatcher::discovery_ready(*discovered)) {
         UpsertResult result;
         try {
             result = sink(*discovered);
@@ -474,7 +525,7 @@ inline ScanResult CondorJobWatcher::finish_scan(ScanResult result)
     result.counts.complete = 0;
     result.counts.incomplete = 0;
     for (const auto& job : result.jobs) {
-        if (discovery_job_ready(job)) ++result.counts.complete;
+        if (CondorJobWatcher::discovery_ready(job)) ++result.counts.complete;
         else ++result.counts.incomplete;
     }
 
@@ -674,7 +725,7 @@ inline Job CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,
     }
 
     job.sub_attr = attributes;
-    finalize_discovery_job(job, std::move(reasons));
+    finalize_discovery(job, std::move(reasons));
     return job;
 }
 
