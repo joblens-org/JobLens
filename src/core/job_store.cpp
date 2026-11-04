@@ -361,9 +361,6 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
         }
         execution.members = normalized_processes(std::move(execution.members));
     }
-    fmt::print(stderr, "DBG parse_record id={} has_gen={} has_members={} gen_pid={} members={}\n",
-               internal_id, j.contains("generation"), j.contains("members"),
-               execution.generation.manager_pid, execution.members.size());
     return record;
 }
 

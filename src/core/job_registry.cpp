@@ -346,11 +346,6 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
     });
     {
         auto rows = store_->loadAll();
-        for (const auto& row : rows)
-            fmt::print(stderr, "DBG ctor-restore id={} exec={} gen_pid={} members={}\n",
-                       row.internal_id, row.job.execution.has_value(),
-                       row.job.execution ? row.job.execution->generation.manager_pid : 0,
-                       row.job.execution ? row.job.execution->members.size() : 0);
         validateRestoredExecutions(rows);
         for (auto& row : rows) publishRecord(std::move(row));
     }
@@ -2566,11 +2561,6 @@ void JobRegistry::validateRestoredExecutions(std::vector<JobRecord>& rows) {
     for (auto& record : rows) {
         if (record.state == kStateClosing) continue;   // the drain owns it
         JobExecution& execution = ensure_execution(record.job);
-        fmt::print(stderr,
-                   "DBG validate id={} gen_pid={} gen_boot={} members={} cur_boot={} observed={}\n",
-                   record.internal_id, execution.generation.manager_pid,
-                   execution.generation.boot_id, execution.members.size(), boot_id,
-                   record.execution_observed);
         switch (verify_execution(execution.generation, record.execution_observed,
                                  boot_id, process_probe_)) {
             case ExecutionVerdict::Stale:
