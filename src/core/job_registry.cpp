@@ -213,40 +213,52 @@ bool merge_job_facts(Job& target, const Job& observed, bool replace_members) {
     return changed;
 }
 
-nlohmann::json facts_fingerprint(const Job& job, const JobRecord& record) {
-    nlohmann::json out;
-    out["jobtype"] = static_cast<int>(job.jobtype);
-    out["subtype"] = static_cast<int>(job.subtype);
-    out["native_job_id"] = job.NativeJobID;
-    out["cluster_name"] = job.cluster_name;
-    out["clusterTag"] = job.clusterTag;
+// Same-facts predicate for the merge idempotency gate (was a JSON
+// fingerprint: two full serializations per observation). Compares exactly the
+// field set the fingerprint serialized: typed identity facts, the pid
+// projection, the execution evidence and the typed attributes.
+template <typename T>
+bool reflected_equal(const T& a, const T& b)
+{
+    bool same = true;
+    std::apply([&](const auto&... pairs) {
+        ((same = same && (a.*(pairs.second)) == (b.*(pairs.second))), ...);
+    }, T::reflection());
+    return same;
+}
 
-    auto pids = job.JobPIDs;
-    std::sort(pids.begin(), pids.end());
-    pids.erase(std::unique(pids.begin(), pids.end()), pids.end());
-    out["pids"] = pids;
+bool sub_attr_equal(const SubAttr& a, const SubAttr& b)
+{
+    if (a.index() != b.index()) return false;
+    if (std::holds_alternative<nlohmann::json>(a))
+        return std::get<nlohmann::json>(a) == std::get<nlohmann::json>(b);
+    if (std::holds_alternative<CondorJobAttr>(a))
+        return reflected_equal(std::get<CondorJobAttr>(a), std::get<CondorJobAttr>(b));
+    if (std::holds_alternative<SlurmJobAttr>(a))
+        return reflected_equal(std::get<SlurmJobAttr>(a), std::get<SlurmJobAttr>(b));
+    return reflected_equal(std::get<CommonJobAttr>(a), std::get<CommonJobAttr>(b));
+}
 
-    nlohmann::json members = nlohmann::json::array();
-    for (const auto& member : members_of(record.job)) {
-        nlohmann::json entry;
-        entry["pid"] = member.pid;
-        entry["start_ticks"] = member.start_ticks;
-        entry["boot_id"] = member.boot_id;
-        members.push_back(std::move(entry));
+bool same_discovered_facts(const Job& a, const Job& b)
+{
+    if (a.jobtype != b.jobtype || a.subtype != b.subtype) return false;
+    if (a.NativeJobID != b.NativeJobID || a.cluster_name != b.cluster_name ||
+        a.clusterTag != b.clusterTag) {
+        return false;
     }
-    out["members"] = std::move(members);
-
-    std::visit([&out](const auto& attr) {
-        out["sub_attr"] = nlohmann::json(attr);
-    }, job.sub_attr);
-    const ExecutionGeneration& generation = generation_of(record.job);
-    nlohmann::json generation_json;
-    generation_json["boot_id"] = generation.boot_id;
-    generation_json["manager_pid"] = generation.manager_pid;
-    generation_json["manager_start_ticks"] = generation.manager_start_ticks;
-    generation_json["cgroup_identity"] = generation.cgroup_identity;
-    out["generation"] = std::move(generation_json);
-    return out;
+    auto sorted_pids = [](std::vector<pid_t> pids) {
+        std::sort(pids.begin(), pids.end());
+        pids.erase(std::unique(pids.begin(), pids.end()), pids.end());
+        return pids;
+    };
+    if (sorted_pids(a.JobPIDs) != sorted_pids(b.JobPIDs)) return false;
+    if (members_of(a) != members_of(b)) return false;
+    if (!sub_attr_equal(a.sub_attr, b.sub_attr)) return false;
+    const auto& ga = generation_of(a);
+    const auto& gb = generation_of(b);
+    // Generation equality ignores the cgroup by contract; the fingerprint
+    // compared it, so compare it here too.
+    return ga == gb && ga.cgroup_identity == gb.cgroup_identity;
 }
 
 // Best-effort selector reconstruction for legacy (schema < 2) records. A
@@ -2343,9 +2355,15 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     const bool generation_became_complete =
         !generation_of(stored.job).complete() && generation.complete();
     // The record's one evidence copy rides the Job: the discovery execution
-    // group (normalized) replaces the stored one under the same rules.
+    // group (normalized) replaces the stored one under the same rules. The
+    // ordering token advances with every accepted observation so the
+    // stale-pass guard compares against the newest read, not the first.
     JobExecution& updated_execution = ensure_execution(updated.job);
     if (generation.complete()) updated_execution.generation = generation;
+    if (job.execution) {
+        updated_execution.read_at_us = job.execution->read_at_us;
+        updated_execution.read_order = job.execution->read_order;
+    }
     if (!processes.empty()) {
         updated_execution.members = normalized_processes(processes);
     } else if (members_complete) {
@@ -2367,7 +2385,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     const bool provenance_changed =
         updated.execution_observed != stored.execution_observed;
     const bool changed = recovered || provenance_changed ||
-        facts_fingerprint(merged, updated) != facts_fingerprint(stored.job, stored);
+        !same_discovered_facts(stored.job, updated.job);
     if (!changed) {
         updated.revision = stored.revision;
         result.ok = true;
@@ -2795,12 +2813,11 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job) {
     JobExecution& created_execution = ensure_execution(created.job);
         created_execution.generation = generation;
         created_execution.members_authoritative = members_complete;
+        // The ordering token is record business (the stale-pass guard
+        // compares against it); the observation's reasons/notes stay
+        // producer-side diagnostics and are not copied.
         created_execution.read_at_us = read_at_us_of(job);
         created_execution.read_order = job.execution ? job.execution->read_order : 0;
-        created_execution.incomplete_reason =
-            job.execution ? job.execution->incomplete_reason : std::string{};
-        created_execution.notes = job.execution ? job.execution->notes
-                                                 : std::vector<std::string>{};
         created.revision = 1;
         created.state = kStateActive;
         created.first_seen_us = observed_at;

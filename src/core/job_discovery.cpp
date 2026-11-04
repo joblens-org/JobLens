@@ -205,6 +205,36 @@ bool read_proc_env(const std::string& proc_root, pid_t pid, const std::string& k
     return true;
 }
 
+bool read_proc_env_values(const std::string& proc_root, pid_t pid,
+                          const std::vector<std::string>& keys,
+                          std::map<std::string, std::string>& out,
+                          std::string& error)
+{
+    out.clear();
+    std::string raw;
+    if (!read_file(pid_path(proc_root, pid, "environ"), raw, error)) return false;
+
+    std::size_t pos = 0;
+    while (pos < raw.size()) {
+        std::size_t end = raw.find('\0', pos);
+        if (end == std::string::npos) end = raw.size();
+        const std::size_t eq = raw.find('=', pos);
+        if (eq != std::string::npos && eq < end) {
+            // entry = key '=' value; a wanted key matches when the entry
+            // starts with it and '=' follows immediately after.
+            const std::size_t key_len = eq - pos;
+            for (const auto& key : keys) {
+                if (key.size() == key_len && raw.compare(pos, key_len, key) == 0) {
+                    out[key] = raw.substr(eq + 1, end - eq - 1);
+                    break;
+                }
+            }
+        }
+        pos = end + 1;
+    }
+    return true;
+}
+
 std::optional<pid_t> read_proc_ppid(const std::string& proc_root, pid_t pid)
 {
     const auto fields = read_stat_fields(proc_root, pid);
@@ -229,11 +259,25 @@ std::optional<std::uint64_t> read_proc_start_ticks(const std::string& proc_root,
 
 std::string read_boot_id(const std::string& proc_root)
 {
+    // The boot id of one root never changes while the process runs; the
+    // discovery hot path (every exec hint) reads it, so cache per root.
+    // Production has a single root ("/proc"); fixtures get their own entry.
+    static std::mutex cache_mutex;
+    static std::map<std::string, std::string> cache;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        const auto it = cache.find(proc_root);
+        if (it != cache.end()) return it->second;
+    }
     std::string content;
     std::string error;
     if (!read_file(fs::path(proc_root) / "sys" / "kernel" / "random" / "boot_id", content, error))
         return {};
     while (!content.empty() && (content.back() == '\n' || content.back() == '\r')) content.pop_back();
+    if (!content.empty()) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache.emplace(proc_root, content);
+    }
     return content;
 }
 
@@ -318,6 +362,12 @@ ProcessIdentity read_process_identity(const std::string& proc_root,
 bool discovery_job_ready(const Job& job)
 {
     if (!job.execution || !job.execution->generation.complete()) return false;
+    // A finalized discovery records every missing piece (identity, generation
+    // AND source reasons — e.g. an unresolved Slurm step) in
+    // incomplete_reason; any of them disqualifies admission, exactly like the
+    // old Observation.identity_complete two-level rule. Jobs that never went
+    // through finalize_discovery_job still get the honest recomputation.
+    if (!job.execution->incomplete_reason.empty()) return false;
     return canonicalize(selector_of(job)).has_value();
 }
 

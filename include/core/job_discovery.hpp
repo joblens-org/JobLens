@@ -276,6 +276,14 @@ bool read_proc_cmdline(const std::string& proc_root, pid_t pid, std::string& out
 bool read_proc_env(const std::string& proc_root, pid_t pid, const std::string& key,
                    std::string& out, std::string& error);
 
+// Reads <pid>/environ ONCE and extracts every requested key in a single pass
+// (the discovery hot path asks for several variables of the same process).
+// Absent keys are simply missing from the map; false = environ unreadable.
+bool read_proc_env_values(const std::string& proc_root, pid_t pid,
+                          const std::vector<std::string>& keys,
+                          std::map<std::string, std::string>& out,
+                          std::string& error);
+
 std::optional<pid_t> read_proc_ppid(const std::string& proc_root, pid_t pid);
 std::optional<std::uint64_t> read_proc_start_ticks(const std::string& proc_root, pid_t pid);
 

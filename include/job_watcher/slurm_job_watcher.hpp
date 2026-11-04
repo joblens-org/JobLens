@@ -557,17 +557,26 @@ inline Job SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& env,
     if (found != children.end()) member_pids = found->second;
 
     // Logical identity comes from the members' environment, exactly like
-    // SlurmJob::getJobID()/getStepID().
+    // SlurmJob::getJobID()/getStepID(). One environ read per member covers
+    // every key (the hot path used to re-read the whole file per variable).
+    static const std::vector<std::string> kEnvKeys = {
+        "SLURM_JOB_ID", "SLURM_STEP_ID", "SLURM_JOB_USER",
+        "SLURM_JOB_NAME", "SLURM_JOB_PARTITION", "SLURM_CLUSTER_NAME",
+    };
     std::optional<std::uint64_t> job_id;
     std::optional<std::uint32_t> step_id;
     for (pid_t member_pid : member_pids) {
-        std::string job_env;
+        std::map<std::string, std::string> env_values;
         std::string env_error;
-        if (!read_proc_env(env.proc_root, member_pid, "SLURM_JOB_ID", job_env, env_error)) {
+        if (!read_proc_env_values(env.proc_root, member_pid, kEnvKeys,
+                                  env_values, env_error)) {
             execution.notes.push_back(fmt::format(
                 "child pid {} environment unreadable: {}", member_pid, env_error));
             continue;
         }
+        const auto job_it = env_values.find("SLURM_JOB_ID");
+        const std::string job_env = job_it != env_values.end() ? job_it->second
+                                                               : std::string{};
         if (job_env.empty()) continue;  // not a job process
 
         std::string parse_error;
@@ -584,12 +593,9 @@ inline Job SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& env,
         }
         job_id = candidate_job;
 
-        std::string step_env;
-        if (!read_proc_env(env.proc_root, member_pid, "SLURM_STEP_ID", step_env, env_error)) {
-            reasons.push_back(fmt::format("child pid {} SLURM_STEP_ID unreadable: {}",
-                                          member_pid, env_error));
-            continue;
-        }
+        const auto step_it = env_values.find("SLURM_STEP_ID");
+        const std::string step_env = step_it != env_values.end() ? step_it->second
+                                                                 : std::string{};
         std::string step_error;
         const auto candidate_step = SlurmJob::parse_step_id(step_env, step_error);
         if (!candidate_step) {
@@ -605,24 +611,20 @@ inline Job SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& env,
         step_id = candidate_step;
 
         if (attributes.user.empty()) {
-            std::string value;
-            if (read_proc_env(env.proc_root, member_pid, "SLURM_JOB_USER", value, env_error) && !value.empty())
-                attributes.user = value;
+            const auto it = env_values.find("SLURM_JOB_USER");
+            if (it != env_values.end() && !it->second.empty()) attributes.user = it->second;
         }
         if (attributes.job_name.empty()) {
-            std::string value;
-            if (read_proc_env(env.proc_root, member_pid, "SLURM_JOB_NAME", value, env_error) && !value.empty())
-                attributes.job_name = value;
+            const auto it = env_values.find("SLURM_JOB_NAME");
+            if (it != env_values.end() && !it->second.empty()) attributes.job_name = it->second;
         }
         if (attributes.partition.empty()) {
-            std::string value;
-            if (read_proc_env(env.proc_root, member_pid, "SLURM_JOB_PARTITION", value, env_error) && !value.empty())
-                attributes.partition = value;
+            const auto it = env_values.find("SLURM_JOB_PARTITION");
+            if (it != env_values.end() && !it->second.empty()) attributes.partition = it->second;
         }
         if (job.cluster_name.empty()) {
-            std::string value;
-            if (read_proc_env(env.proc_root, member_pid, "SLURM_CLUSTER_NAME", value, env_error))
-                job.cluster_name = value;
+            const auto it = env_values.find("SLURM_CLUSTER_NAME");
+            if (it != env_values.end()) job.cluster_name = it->second;
         }
     }
 
