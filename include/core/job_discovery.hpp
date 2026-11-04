@@ -184,6 +184,13 @@ struct DiscoveryOptions {
     // Periodic scan tick of the adapter's poll thread; 0 disables it (the
     // maintenance controller owns pacing and runs the authoritative passes).
     std::uint32_t scan_interval_ms = 0;
+    // Condor tier-1 starter enumeration: path of the slot cgroup subtree
+    // RELATIVE to discovery.cgroup_root (verified layout: the startd keeps
+    // one directory per slot under <cgroup_root>/system.slice/htcondor, each
+    // listing that slot's processes in cgroup.procs). Empty, unreadable or
+    // starter-less subtrees fall back to the full process-table scan. Slurm
+    // does not use this field.
+    std::string starter_cgroup_subtree;
 
     DiscoveryEnvironment discovery;
     ScanClock clock;

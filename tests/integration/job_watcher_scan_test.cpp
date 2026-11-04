@@ -177,6 +177,10 @@ void make_fixture(Fixture& fixture, const std::string& base)
     make_process(fixture.proc, 4111, "sleep", 4101, 7011, {{"CONDOR_SLOT", "1"}},
                  "/htcondor/slot1");
     make_cgroup(fixture.cgroup, "/htcondor/slot1", {4101, 4110, 4111});
+    // Every slot directory exists with its cgroup.procs, mirroring the real
+    // startd layout the cgroup-subtree enumeration tier lists.
+    make_cgroup(fixture.cgroup, "/htcondor/slot2", {4201});
+    make_cgroup(fixture.cgroup, "/htcondor/slot3", {4301});
 
     make_process(fixture.proc, 4201, "condor_starter", 1, 7020,
                  {{"_CONDOR_JOB_AD", fixture.missing_ad.string()}}, "/htcondor/slot2");
@@ -222,6 +226,10 @@ DiscoveryOptions fixture_options(const Fixture& fixture,
     options.discovery.proc_root = fixture.proc.string();
     options.discovery.cgroup_root = fixture.cgroup.string();
     options.discovery.cluster_name = cluster_name;
+    // The fixture's slot cgroups live at <cgroup>/htcondor/slotN: the
+    // cgroup-subtree enumeration tier must engage for the condor cases
+    // (slurm ignores the field).
+    options.starter_cgroup_subtree = "htcondor";
     options.clock = [] { return kFakeNowMs; };
     return options;
 }
@@ -283,12 +291,18 @@ void condor_scan_finds_fixture_job(const Fixture& fixture)
     const auto result = watcher.scan();
     check(result.ok(), "condor scan must succeed on the fixture: " + result.error);
     check(result.complete, "condor scan must report complete source coverage");
-    check(result.counts.candidates == 3, "three condor_starter processes were discovered, got " +
+    check(result.counts.candidates == 3, "three slot cgroups enumerated as candidates, got " +
                                              std::to_string(result.counts.candidates));
     check(result.counts.complete == 1 && result.counts.incomplete == 2,
           "one complete and two incomplete condor observations, got complete=" +
               std::to_string(result.counts.complete) + " incomplete=" +
               std::to_string(result.counts.incomplete));
+    bool saw_subtree_note = false;
+    for (const auto& note : result.notes) {
+        if (contains(note, "starters enumerated from cgroup subtree")) saw_subtree_note = true;
+    }
+    check(saw_subtree_note,
+          "the cgroup-subtree enumeration tier must engage and say so in the notes");
     check(has_source_note(result),
           "an unavailable/disabled eBPF event source must be reported as an explicit note");
     // Every discovered Job carries a process-monotonic read order, assigned
@@ -654,7 +668,9 @@ void condor_without_cgroup_still_resolves_members(const Fixture& fixture)
 {
     // Starter with the ad in its own environment but no usable cgroup
     // ("0::/" resolves to no execution cgroup). Members must still be
-    // discovered through the starter's children, flagged as partial.
+    // discovered through the starter's children, flagged as partial. The
+    // cgroup-subtree tier cannot see this starter (no slot directory lists
+    // it), so this case pins the full process-table path: subtree off.
     const auto ad = fixture.ads / "76226341.0.ad";
     write_file(ad,
                "GlobalJobId = \"scheduler@schedd07.fixture#76226341.0#1775723895\"\n"
@@ -666,7 +682,9 @@ void condor_without_cgroup_still_resolves_members(const Fixture& fixture)
     make_process(fixture.proc, 4510, "sleep", 4501, 7210, {{}}, "/");
     make_process(fixture.proc, 4511, "sleep", 4501, 7211, {{}}, "/");
 
-    CondorJobWatcher watcher(fixture_options(fixture));
+    auto options = fixture_options(fixture);
+    options.starter_cgroup_subtree.clear();   // this layout predates slot cgroups
+    CondorJobWatcher watcher(options);
     const auto result = watcher.scan();
     check(result.ok(), "the scan must succeed: " + result.error);
     const auto* job = find_complete(result, "76226341.0", &CondorJobWatcher::discovery_ready);
@@ -677,6 +695,60 @@ void condor_without_cgroup_still_resolves_members(const Fixture& fixture)
               std::to_string(members.size()));
     check(!job->execution->members_authoritative,
           "members resolved without a cgroup must be reported as partial evidence");
+}
+
+// ---------------------------------------------------------------------------
+// Cgroup-subtree tier fallbacks: a subtree that cannot be read and a readable
+// subtree that lists no starter must both fall back to the process table.
+// They run last: by then the shared fixture holds five starters (the three
+// fixture slots, slot4 from the ad-on-member regression and the cgroup-less
+// starter of the previous case).
+// ---------------------------------------------------------------------------
+
+void condor_cgroup_subtree_missing_falls_back(const Fixture& fixture)
+{
+    auto options = fixture_options(fixture);
+    options.starter_cgroup_subtree = "no-such-subtree";
+    CondorJobWatcher watcher(options);
+    const auto result = watcher.scan();
+    check(result.ok(), "the scan must succeed despite the missing subtree: " + result.error);
+    check(result.complete, "a missing subtree must fall back to a complete pass");
+    bool saw_fallback_note = false;
+    for (const auto& note : result.notes) {
+        if (contains(note, "fell back to process-table scan")) saw_fallback_note = true;
+    }
+    check(saw_fallback_note, "the fallback must be visible in the notes");
+    check(result.counts.candidates == 5,
+          "the fallback scan must still find every starter, got " +
+              std::to_string(result.counts.candidates));
+    check(find_complete(result, "76226337.0", &CondorJobWatcher::discovery_ready) != nullptr,
+          "the fixture job must still be discovered through the fallback");
+}
+
+void condor_cgroup_subtree_without_starters_falls_back(const Fixture& fixture)
+{
+    // A readable subtree whose slot lists no starter process must not be read
+    // as "no starters on this node".
+    const auto empty_subtree = fixture.cgroup / "htcondor-empty";
+    fs::create_directories(empty_subtree / "slot1");
+    write_file(empty_subtree / "slot1" / "cgroup.procs", "");
+
+    auto options = fixture_options(fixture);
+    options.starter_cgroup_subtree = "htcondor-empty";
+    CondorJobWatcher watcher(options);
+    const auto result = watcher.scan();
+    check(result.ok() && result.complete,
+          "a starter-less subtree must fall back to a complete pass: " + result.error);
+    bool saw_fallback_note = false;
+    for (const auto& note : result.notes) {
+        if (contains(note, "fell back to process-table scan")) saw_fallback_note = true;
+    }
+    check(saw_fallback_note, "the starter-less subtree must fall back visibly");
+    check(result.counts.candidates == 5,
+          "the fallback scan must still find every starter, got " +
+              std::to_string(result.counts.candidates));
+    check(find_complete(result, "76226337.0", &CondorJobWatcher::discovery_ready) != nullptr,
+          "the fixture job must still be discovered through the fallback");
 }
 
 
@@ -713,6 +785,10 @@ int main(int argc, char** argv)
             {"condor_ad_on_member_process_is_found", condor_ad_on_member_process_is_found},
             {"condor_without_cgroup_still_resolves_members",
              condor_without_cgroup_still_resolves_members},
+            {"condor_cgroup_subtree_missing_falls_back",
+             condor_cgroup_subtree_missing_falls_back},
+            {"condor_cgroup_subtree_without_starters_falls_back",
+             condor_cgroup_subtree_without_starters_falls_back},
         };
 
         for (const auto& test : tests) {

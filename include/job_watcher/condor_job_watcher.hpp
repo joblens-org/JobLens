@@ -107,6 +107,18 @@ private:
     std::atomic<bool> yield_requested_{false};
     ScanResult finish_scan(ScanResult result);
 
+    // Tier-1 starter enumeration: the configured slot cgroup subtree holds one
+    // directory per slot whose cgroup.procs lists that slot's processes. Only
+    // those pids' cmdlines are read (O(slots x procs) instead of the whole
+    // process table). On success `slot_dirs` is the number of slot directories
+    // (the candidate count of this pass) and `starters` the deduplicated
+    // starter pids. False = subtree missing/unreadable/empty or no starter
+    // found; the caller falls back to the full process-table scan.
+    bool enumerate_starters_from_cgroup(const DiscoveryEnvironment& env,
+                                        const std::string& subtree_root,
+                                        std::size_t& slot_dirs,
+                                        std::vector<pid_t>& starters) const;
+
     // Builds one discovered Job from a condor_starter candidate using the same
     // sources the scan path reads (starter environ, _CONDOR_JOB_AD file, slot
     // cgroup), through the injectable discovery roots. `preferred_member_pid`
@@ -290,23 +302,45 @@ inline ScanResult CondorJobWatcher::scan()
     if (boot_id.empty())
         result.notes.push_back("boot id unavailable: no process identity can be complete");
 
-    std::size_t unreadable_entries = 0;
+    // Tier 1: enumerate starters from the slot cgroup subtree when one is
+    // configured. Tier 2 (fallback): the full process-table scan.
     std::vector<pid_t> starters;
-    for (pid_t pid : list_proc_pids(env.proc_root)) {
-        std::string cmdline;
-        std::string cmdline_error;
-        if (!read_proc_cmdline(env.proc_root, pid, cmdline, cmdline_error)) {
-            ++unreadable_entries;
-            continue;
+    std::size_t unreadable_entries = 0;
+    bool enumerated_from_cgroup = false;
+    if (!options_.starter_cgroup_subtree.empty()) {
+        const std::string subtree_root =
+            (std::filesystem::path(env.cgroup_root) / options_.starter_cgroup_subtree)
+                .lexically_normal()
+                .string();
+        std::size_t slot_dirs = 0;
+        if (enumerate_starters_from_cgroup(env, subtree_root, slot_dirs, starters)) {
+            enumerated_from_cgroup = true;
+            result.counts.candidates = slot_dirs;
+            result.notes.push_back(fmt::format(
+                "starters enumerated from cgroup subtree {}", subtree_root));
+        } else {
+            result.notes.push_back(fmt::format(
+                "cgroup subtree unavailable/empty ({}); fell back to process-table scan",
+                subtree_root));
         }
-        if (cmdline.find("condor_starter") != std::string::npos) starters.push_back(pid);
     }
-    result.counts.candidates = starters.size();
-    result.counts.skipped = unreadable_entries;
-    if (unreadable_entries > 0) {
-        result.notes.push_back(fmt::format(
-            "{} process entries unreadable (permission denied or exited mid-scan); "
-            "they cannot be attributed to condor", unreadable_entries));
+    if (!enumerated_from_cgroup) {
+        for (pid_t pid : list_proc_pids(env.proc_root)) {
+            std::string cmdline;
+            std::string cmdline_error;
+            if (!read_proc_cmdline(env.proc_root, pid, cmdline, cmdline_error)) {
+                ++unreadable_entries;
+                continue;
+            }
+            if (cmdline.find("condor_starter") != std::string::npos) starters.push_back(pid);
+        }
+        result.counts.candidates = starters.size();
+        result.counts.skipped = unreadable_entries;
+        if (unreadable_entries > 0) {
+            result.notes.push_back(fmt::format(
+                "{} process entries unreadable (permission denied or exited mid-scan); "
+                "they cannot be attributed to condor", unreadable_entries));
+        }
     }
 
     // One discovered Job per manager, built directly: the store is the identity
@@ -595,6 +629,42 @@ inline std::vector<pid_t> CondorJobWatcher::collect_member_pids(
             "cgroup unavailable; {} member pid(s) resolved from the starter's children",
             members.size()));
     return members;
+}
+
+inline bool CondorJobWatcher::enumerate_starters_from_cgroup(
+    const DiscoveryEnvironment& env, const std::string& subtree_root,
+    std::size_t& slot_dirs, std::vector<pid_t>& starters) const
+{
+    std::string subtree_error;
+    if (!ensure_readable_directory(subtree_root, subtree_error)) return false;
+
+    std::error_code ec;
+    std::vector<std::filesystem::path> slot_directories;
+    for (const auto& entry : std::filesystem::directory_iterator(subtree_root, ec)) {
+        std::error_code type_ec;
+        if (!entry.is_directory(type_ec) || type_ec) continue;
+        slot_directories.push_back(entry.path());
+    }
+    if (ec || slot_directories.empty()) return false;
+
+    // Directory order is unspecified; sort so a pass reads slots in a stable
+    // order and the starter list comes out sorted like the process-table tier.
+    std::sort(slot_directories.begin(), slot_directories.end());
+    for (const auto& slot : slot_directories) {
+        for (pid_t pid : read_cgroup_members(slot.string())) {
+            std::string cmdline;
+            std::string cmdline_error;
+            if (!read_proc_cmdline(env.proc_root, pid, cmdline, cmdline_error)) continue;
+            if (cmdline.find("condor_starter") == std::string::npos) continue;
+            if (std::find(starters.begin(), starters.end(), pid) == starters.end())
+                starters.push_back(pid);
+        }
+    }
+    // A readable subtree with zero starters is not evidence that no starter
+    // runs (the layout may predate per-slot cgroups): fall back.
+    if (starters.empty()) return false;
+    slot_dirs = slot_directories.size();
+    return true;
 }
 
 inline Job CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,

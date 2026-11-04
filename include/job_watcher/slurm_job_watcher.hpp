@@ -41,6 +41,11 @@
 // Discovery inputs are slurmstepd processes and their children in the process
 // table plus the optional slurmd spool, read through an injectable
 // DiscoveryEnvironment so an unprivileged host can present a fake tree.
+//
+// No cgroup-subtree starter enumeration here (DiscoveryOptions::
+// starter_cgroup_subtree is Condor-only for now): the observed slurm layout
+// nests job_X/step_Y directories under the cgroup root, and which level
+// reliably lists slurmstepd per step must be probed on a real node first.
 class SlurmJobWatcher final : public IDiscoverySource{
 public:
     // Options only: nothing is loaded and nothing polls until start().
