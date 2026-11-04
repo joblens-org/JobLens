@@ -119,4 +119,22 @@ private:
     CondorJobWatcher watcher_;
 };
 
+// The adapter owns its native-id rule, registered alongside it: Condor
+// native ids are "<ClusterId>.<ProcId>" with decimal parts; leading zeros
+// are tolerated and canonicalized ("012.3" == "12.3") so digit
+// concatenation can never merge two different jobs ("12.34" versus
+// "123.4"). No steps. The namespace separates schedds.
+REGISTER_NATIVE_ID_RULE("condor", [](const NativeSelector& selector)
+    -> std::optional<CanonicalParts> {
+    if (!selector.step_id.empty()) return std::nullopt;  // Condor has no steps
+    auto parsed = parse_condor_native(selector.native_job_id);
+    if (!parsed) return std::nullopt;
+    CanonicalParts parts;
+    parts.cluster_namespace = selector.cluster_name;
+    if (!selector.cluster_tag.empty())
+        parts.cluster_namespace += "@" + selector.cluster_tag;
+    parts.canonical_native = parsed->cluster + "." + parsed->proc;
+    return parts;
+})
+
 REGISTER_SCHEDULER_ADAPTER("condor", CondorSchedulerAdapter)

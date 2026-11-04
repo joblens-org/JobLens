@@ -129,4 +129,22 @@ private:
     SlurmJobWatcher watcher_;
 };
 
+// The adapter owns its native-id rule, registered alongside it: Slurm
+// native ids are the logical job number without a step; a step refines the
+// identity (normalized, special names preserved).
+REGISTER_NATIVE_ID_RULE("slurm", [](const NativeSelector& selector)
+    -> std::optional<CanonicalParts> {
+    auto job_number = strip_leading_zeros(selector.native_job_id);
+    if (!job_number) return std::nullopt;
+    CanonicalParts parts;
+    if (!selector.step_id.empty()) {
+        auto step = normalize_slurm_step_id(selector.step_id);
+        if (!step) return std::nullopt;
+        parts.step_id = *step;
+    }
+    parts.cluster_namespace = selector.cluster_name;
+    parts.canonical_native = *job_number;
+    return parts;
+})
+
 REGISTER_SCHEDULER_ADAPTER("slurm", SlurmSchedulerAdapter)

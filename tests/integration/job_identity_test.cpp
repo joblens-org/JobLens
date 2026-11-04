@@ -23,6 +23,11 @@
  */
 #include "core/job_identity.hpp"
 #include "core/collector_type.h"
+// The built-in rules live next to their adapters now: including the adapter
+// headers registers them, and the tests below exercise those production
+// rules (the only ones a real deployment ever sees).
+#include "job_watcher/condor_adapter.hpp"
+#include "job_watcher/slurm_adapter.hpp"
 
 #include <cstdint>
 #include <iostream>

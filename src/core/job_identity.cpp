@@ -28,36 +28,6 @@ bool is_decimal(const std::string& text)
                        [](unsigned char c) { return std::isdigit(c) != 0; });
 }
 
-// Leading zeros are tolerated on native components; the canonical numeric
-// value removes them so "012.3" and "12.3" name the same job.
-std::optional<std::string> strip_leading_zeros(const std::string& decimal)
-{
-    if (!is_decimal(decimal)) return std::nullopt;
-    const auto first_non_zero = decimal.find_first_not_of('0');
-    if (first_non_zero == std::string::npos) return std::string{"0"};
-    return decimal.substr(first_non_zero);
-}
-
-// Condor native id: "<ClusterId>.<ProcId>", both decimal, both non-empty.
-struct CondorNativeId {
-    std::string cluster;
-    std::string proc;
-};
-
-std::optional<CondorNativeId> parse_condor_native(const std::string& raw)
-{
-    const auto dot = raw.find('.');
-    if (dot == std::string::npos) return std::nullopt;
-    const auto cluster = raw.substr(0, dot);
-    const auto proc = raw.substr(dot + 1);
-    if (cluster.empty() || proc.empty()) return std::nullopt;
-    if (proc.find('.') != std::string::npos) return std::nullopt;
-    auto canonical_cluster = strip_leading_zeros(cluster);
-    auto canonical_proc = strip_leading_zeros(proc);
-    if (!canonical_cluster || !canonical_proc) return std::nullopt;
-    return CondorNativeId{*canonical_cluster, *canonical_proc};
-}
-
 uint64_t mix_fnv1a(uint64_t seed, const void* data, size_t size)
 {
     const auto* bytes = static_cast<const unsigned char*>(data);
@@ -111,54 +81,33 @@ const NativeIdRule* NativeIdRuleRegistry::find(const std::string& adapter) const
     return it == rules_.end() ? nullptr : &it->second;
 }
 
-namespace {
+// Shared helpers of the adapters' native-id rules (declared in the header so
+// the adapter headers' REGISTER_NATIVE_ID_RULE bodies can call them).
 
-// Built-in rule: Condor native ids are "<ClusterId>.<ProcId>" with decimal
-// parts; leading zeros are tolerated and canonicalized ("012.3" == "12.3")
-// so digit concatenation can never merge two different jobs ("12.34" versus
-// "123.4"). No steps. The namespace separates schedds.
-NativeIdRule condor_native_id_rule = [](const NativeSelector& selector)
-    -> std::optional<CanonicalParts> {
-    if (!selector.step_id.empty()) return std::nullopt;  // Condor has no steps
-    auto parsed = parse_condor_native(selector.native_job_id);
-    if (!parsed) return std::nullopt;
-    CanonicalParts parts;
-    parts.cluster_namespace = selector.cluster_name;
-    if (!selector.cluster_tag.empty())
-        parts.cluster_namespace += "@" + selector.cluster_tag;
-    parts.canonical_native = parsed->cluster + "." + parsed->proc;
-    return parts;
-};
+// Leading zeros are tolerated on native components; the canonical numeric
+// value removes them so "012.3" and "12.3" name the same job.
+std::optional<std::string> strip_leading_zeros(const std::string& decimal)
+{
+    if (!is_decimal(decimal)) return std::nullopt;
+    const auto first_non_zero = decimal.find_first_not_of('0');
+    if (first_non_zero == std::string::npos) return std::string{"0"};
+    return decimal.substr(first_non_zero);
+}
 
-// Built-in rule: Slurm native ids are the logical job number without a step;
-// a step refines the identity (normalized, special names preserved).
-NativeIdRule slurm_native_id_rule = [](const NativeSelector& selector)
-    -> std::optional<CanonicalParts> {
-    auto job_number = strip_leading_zeros(selector.native_job_id);
-    if (!job_number) return std::nullopt;
-    CanonicalParts parts;
-    if (!selector.step_id.empty()) {
-        auto step = normalize_slurm_step_id(selector.step_id);
-        if (!step) return std::nullopt;
-        parts.step_id = *step;
-    }
-    parts.cluster_namespace = selector.cluster_name;
-    parts.canonical_native = *job_number;
-    return parts;
-};
-
-// The built-ins are data owned by this TU: identity tests and fixtures get
-// them without linking any adapter. New schedulers register alongside their
-// adapter (REGISTER_NATIVE_ID_RULE) and this layer never learns about them.
-const bool joblens_builtin_native_id_rules = [] {
-    NativeIdRuleRegistry::instance().registerRule(kAdapterCondor,
-                                                  condor_native_id_rule);
-    NativeIdRuleRegistry::instance().registerRule(kAdapterSlurm,
-                                                  slurm_native_id_rule);
-    return true;
-}();
-
-}  // namespace
+// Condor native id: "<ClusterId>.<ProcId>", both decimal, both non-empty.
+std::optional<CondorNativeId> parse_condor_native(const std::string& raw)
+{
+    const auto dot = raw.find('.');
+    if (dot == std::string::npos) return std::nullopt;
+    const auto cluster = raw.substr(0, dot);
+    const auto proc = raw.substr(dot + 1);
+    if (cluster.empty() || proc.empty()) return std::nullopt;
+    if (proc.find('.') != std::string::npos) return std::nullopt;
+    auto canonical_cluster = strip_leading_zeros(cluster);
+    auto canonical_proc = strip_leading_zeros(proc);
+    if (!canonical_cluster || !canonical_proc) return std::nullopt;
+    return CondorNativeId{*canonical_cluster, *canonical_proc};
+}
 
 // ---------------------------------------------------------------------------
 // Internal IDs

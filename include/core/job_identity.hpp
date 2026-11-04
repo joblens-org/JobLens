@@ -131,6 +131,23 @@ bool operator!=(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs);
 bool operator<(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs);
 
 // ---------------------------------------------------------------------------
+// Native-id rule helpers (used by the built-in adapters' rules)
+// ---------------------------------------------------------------------------
+
+// Leading zeros are tolerated on native components; the canonical numeric
+// value removes them so "012.3" and "12.3" name the same job. Nullopt for
+// anything that is not pure decimal digits.
+std::optional<std::string> strip_leading_zeros(const std::string& decimal);
+
+// Condor native id: "<ClusterId>.<ProcId>", both decimal, both non-empty,
+// canonicalized through strip_leading_zeros.
+struct CondorNativeId {
+    std::string cluster;
+    std::string proc;
+};
+std::optional<CondorNativeId> parse_condor_native(const std::string& raw);
+
+// ---------------------------------------------------------------------------
 // Native-id rules (per-adapter, self-registered)
 // ---------------------------------------------------------------------------
 
@@ -164,15 +181,19 @@ private:
     std::map<std::string, NativeIdRule> rules_;
 };
 
-// Registers a native-id rule at TU scope. The built-ins (condor, slurm) are
-// registered by job_identity.cpp itself; a new scheduler registers its rule
-// next to its adapter, e.g.
+// Registers a native-id rule at TU scope. Every adapter — the built-ins
+// included — registers its rule alongside the adapter, e.g.
 //   REGISTER_NATIVE_ID_RULE("ssh", [](const NativeSelector& s) { ... })
+// JOBLENS_GLUE makes __COUNTER__ expand before token pasting: one TU may
+// include several adapters' headers (job_registry.hpp includes both
+// built-ins), and a literal paste would collide on the second registration.
+#define JOBLENS_GLUE_(a, b) a##b
+#define JOBLENS_GLUE(a, b) JOBLENS_GLUE_(a, b)
 #define REGISTER_NATIVE_ID_RULE(NAME, FN)                                       \
-    static bool joblens_native_id_reg_##__COUNTER__ = [] {                      \
+    static bool JOBLENS_GLUE(joblens_native_id_reg_, __COUNTER__) = [] {        \
         NativeIdRuleRegistry::instance().registerRule(NAME, FN);                \
         return true;                                                            \
-    }()
+    }();
 
 // Validates and completes a selector through the adapter's registered rule.
 // No rule, an empty adapter name, a missing cluster namespace or an
