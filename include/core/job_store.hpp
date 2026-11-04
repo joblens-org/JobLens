@@ -221,9 +221,13 @@ struct JobRecord {
     // job.execution carries the one copy of the execution evidence
     // (generation / members / members_authoritative) every record owns;
     // manual registrations emplace the group when they bind their PIDs.
+    // The Job is also the one copy of the selector facts (subtype_name,
+    // cluster namespace, native id, execution->step_id): the wire selector
+    // is a projection (selector_of) derived on demand — persisted rows write
+    // that projection under "selector" so the frozen schema 4 layout is
+    // unchanged, and readers fold it back onto the Job on restore.
     Job job;
     // --- execution evidence ---------------------------------------------
-    NativeSelector selector;             // original wire identity (verbatim)
     CanonicalIdentity identity;          // valid only when identity_complete
     bool identity_complete = false;
     bool quarantined = false;

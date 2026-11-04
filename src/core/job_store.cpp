@@ -217,10 +217,14 @@ nlohmann::json record_json(const JobRecord& record) {
     out["members_authoritative"] = members_authoritative_of(record.job);
     out["execution_observed"] = record.execution_observed;
     if (!record.job.subtype_name.empty()) out["adapter"] = record.job.subtype_name;
-    if (record.selector.adapter.empty()) {
+    // The selector is a projection of the Job (selector_of): the row keeps
+    // the frozen schema-4 shape, and readers fold the projection back onto
+    // the Job's own fields on restore.
+    const NativeSelector row_selector = selector_of(record.job);
+    if (row_selector.adapter.empty()) {
         out["selector"] = nullptr;
     } else {
-        out["selector"] = record.selector;
+        out["selector"] = row_selector;
     }
     if (record.identity_complete) out["identity"] = record.identity;
     else                          out["identity"] = nullptr;
@@ -306,8 +310,23 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
         j["selector"].value("scheduler_type", std::string{"unknown"}) != "unknown") {
         // Legacy rows carry "scheduler_type": "unknown" for "no selector";
         // the selector round trip itself accepts either key (adapter wins).
+        // The row's selector is a projection of the Job: fold its fields
+        // back onto the Job (backfill only — facts already in the row win).
         try {
-            record.selector = j["selector"].get<NativeSelector>();
+            const auto selector = j["selector"].get<NativeSelector>();
+            if (record.job.subtype_name.empty() && !selector.adapter.empty())
+                record.job.subtype_name = selector.adapter;
+            if (record.job.cluster_name.empty())
+                record.job.cluster_name = selector.cluster_name;
+            if (record.job.clusterTag.empty())
+                record.job.clusterTag = selector.cluster_tag;
+            if (record.job.NativeJobID.empty())
+                record.job.NativeJobID = selector.native_job_id;
+            // Step presence rides the selector's verbatim copy (plan §4.3:
+            // the row layout is unchanged and the Job stays the single
+            // source of truth).
+            if (!selector.step_id.empty())
+                execution.step_id = selector.step_id;
         } catch (const std::exception& error) {
             spdlog::warn("JobStore: invalid stored selector for job {}: {}",
                          internal_id, error.what());
@@ -342,10 +361,6 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
         }
         execution.members = normalized_processes(std::move(execution.members));
     }
-    // Step presence rides the selector's verbatim copy (plan §4.3: the row
-    // layout is unchanged and the Job stays the single source of truth).
-    if (!record.selector.step_id.empty())
-        execution.step_id = record.selector.step_id;
     fmt::print(stderr, "DBG parse_record id={} has_gen={} has_members={} gen_pid={} members={}\n",
                internal_id, j.contains("generation"), j.contains("members"),
                execution.generation.manager_pid, execution.members.size());

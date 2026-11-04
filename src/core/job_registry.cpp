@@ -290,6 +290,23 @@ ISchedulerAdapter* JobRegistry::adapterOf(const Job& job) const {
     return nullptr;
 }
 
+NativeSelector JobRegistry::legacySelectorOf(Job& job) const {
+    const auto* adapter = adapterOf(job);
+    if (!adapter) return {};
+    NativeSelector selector = adapter->legacySelector(job);
+    // The selector folds onto the Job: its derived fields backfill the Job's
+    // empty ones (non-empty facts win — the adapter derived FROM them), and
+    // a step claim materializes into the execution group. attr-numeric step
+    // 0 never reaches here as a claim (0-vs-missing rule holds at the
+    // adapter boundary).
+    job.subtype_name = selector.adapter;
+    if (job.cluster_name.empty()) job.cluster_name = selector.cluster_name;
+    if (job.clusterTag.empty()) job.clusterTag = selector.cluster_tag;
+    if (job.NativeJobID.empty()) job.NativeJobID = selector.native_job_id;
+    if (!selector.step_id.empty()) ensure_execution(job).step_id = selector.step_id;
+    return selector;
+}
+
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
@@ -570,7 +587,7 @@ bool JobRegistry::retireIfConfirmed(const JobRecord& record, const std::string& 
 }
 
 void JobRegistry::rememberEnded(const JobRecord& record) {
-    const auto identity = canonicalize(record.selector);
+    const auto identity = canonicalize(selector_of(record.job));
     if (!identity) return;
     std::lock_guard<std::mutex> lock(hb_mtx_);
     ended_generations_[identity->key()] = generation_of(record.job);
@@ -1567,19 +1584,15 @@ bool JobRegistry::addJob(const Job& job) {
     if (record.state.empty()) record.state = kStateActive;
     if (record.first_seen_us == 0) record.first_seen_us = now_us();
     if (record.last_seen_us == 0) record.last_seen_us = record.first_seen_us;
-    if (record.selector.adapter.empty()) {
+    if (record.job.subtype_name.empty()) {
         // Legacy registrations carry their identity only inside the typed
-        // facts; the adapter owning those facts reconstructs the selector.
-        // No configured adapter owns the record: the selector stays empty —
-        // incomplete, never a guess.
-        if (const auto* adapter = adapterOf(record.job)) {
-            record.selector = adapter->legacySelector(record.job);
-            // One copy of the adapter name: on the Job itself.
-            record.job.subtype_name = record.selector.adapter;
-            if (const auto identity = canonicalize(record.selector)) {
-                record.identity = *identity;
-                record.identity_complete = true;
-            }
+        // facts; the adapter owning those facts reconstructs the selector and
+        // folds it onto the Job. No configured adapter owns the record: the
+        // selector stays empty — incomplete, never a guess.
+        const NativeSelector selector = legacySelectorOf(record.job);
+        if (const auto identity = canonicalize(selector)) {
+            record.identity = *identity;
+            record.identity_complete = true;
         }
     }
     {
@@ -2338,7 +2351,8 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     // (that is what the branches below decide). merged still carries the
     // stored execution group; the runtime metadata of the observation
     // (read_at/read_order/reasons) is diagnostic and stays with the producer.
-    updated.selector = selector;
+    // The selector is a projection of the Job: merged carries every field it
+    // needs (selector_of), so no separate copy is stored.
     updated.last_seen_us = observed_at;
     const bool generation_became_complete =
         !generation_of(stored.job).complete() && generation.complete();
@@ -2792,7 +2806,6 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job) {
 
         created.internal_id = allocated;
         created.instance_id = store_->instanceId(allocated);
-        created.selector = selector;
         created.identity = *identity;
         created.identity_complete = true;
         created.execution_observed = true;   // created by a discovery observation
@@ -3396,12 +3409,10 @@ bool JobRegistry::refreshJobFacts(uint64_t jobID) {
         record.first_seen_us = now_us();
         // Legacy repair routes through the adapter owning the facts; without
         // one the selector stays empty — incomplete, never a guess.
-        if (const auto* adapter = adapterOf(record.job)) {
-            record.selector = adapter->legacySelector(record.job);
-            if (const auto identity = canonicalize(record.selector)) {
-                record.identity = *identity;
-                record.identity_complete = true;
-            }
+        const NativeSelector selector = legacySelectorOf(record.job);
+        if (const auto identity = canonicalize(selector)) {
+            record.identity = *identity;
+            record.identity_complete = true;
         }
     }
     // A durable record mutation advances the one record revision. This is the

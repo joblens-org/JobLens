@@ -282,6 +282,14 @@ std::string inventory_source(const JobRecord& record)
     return record.job.subtype_name.empty() ? "manual" : record.job.subtype_name;
 }
 
+// Step claim as the RPC surface reports it: the value or empty, never a
+// bare nullopt (the optional itself is store-internal, 0-vs-missing rule).
+std::string step_id_text(const JobRecord& record)
+{
+    const auto& execution = record.job.execution;
+    return execution && execution->step_id ? *execution->step_id : std::string{};
+}
+
 nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& record)
 {
     nlohmann::json out;
@@ -294,11 +302,13 @@ nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& rec
     out["source"] = inventory_source(record);
     out["quarantined"] = record.quarantined;
     out["identity_complete"] = record.identity_complete;
-    out["scheduler_type"] = record.selector.adapter;
-    out["cluster_name"] = record.selector.cluster_name;
-    out["cluster_tag"] = record.selector.cluster_tag;
-    out["native_job_id"] = record.selector.native_job_id;
-    out["step_id"] = record.selector.step_id;
+    // Selector fields are projections of the Job: the typed facts are the
+    // single source of truth, no second copy rides the record.
+    out["scheduler_type"] = record.job.subtype_name;
+    out["cluster_name"] = record.job.cluster_name;
+    out["cluster_tag"] = record.job.clusterTag;
+    out["native_job_id"] = record.job.NativeJobID;
+    out["step_id"] = step_id_text(record);
     out["first_seen_us"] = record.first_seen_us;
     out["last_seen_us"] = record.last_seen_us;
     out["generation"] = generation_to_json(generation_of(record.job));
@@ -484,7 +494,7 @@ nlohmann::json collection_target_json(JobRegistry& registry, const JobRecord& re
     nlohmann::json out;
     out["instance_id"] = record.instance_id;
     out["internal_job_id"] = format_internal_id(record.internal_id);
-    out["native_job_id"] = record.selector.native_job_id;
+    out["native_job_id"] = record.job.NativeJobID;
     // Accepted: the durable record revision the command committed.
     out["record_revision"] = revision;
     out["mode"] = to_string(selection.mode());
@@ -626,12 +636,12 @@ std::optional<nlohmann::json> try_legacy_add_by_identity(JobRegistry& registry,
         out["ignored_job_id_hint"] = format_internal_id(hint.value);
         spdlog::warn("JobRegistry: legacy add for native job '{}' carried JobID {} as a "
                      "compatibility hint; resolved to inventory instance {} (internal {})",
-                     record.selector.native_job_id, hint.value, target.instance_id,
+                     record.job.NativeJobID, hint.value, target.instance_id,
                      target.internal_id);
     }
     spdlog::info("JobRegistry: legacy add resolved native job '{}' to inventory instance {} "
                  "(internal {}), record revision {}",
-                 record.selector.native_job_id, target.instance_id, target.internal_id,
+                 record.job.NativeJobID, target.instance_id, target.internal_id,
                  target.revision);
     return out;
 }
@@ -1057,9 +1067,9 @@ void registerInventoryRpc(JobRegistry& registry) {
             for (auto& record : registry.inventoryRecords()) {
                 if (is_reserved_internal_id(record.internal_id)) continue;
                 if (!scheduler_filter.empty() &&
-                    record.selector.adapter != scheduler_filter)
+                    record.job.subtype_name != scheduler_filter)
                     continue;
-                if (!native_filter.empty() && record.selector.native_job_id != native_filter)
+                if (!native_filter.empty() && record.job.NativeJobID != native_filter)
                     continue;
                 if (!state_filter.empty() && record.state != state_filter) continue;
                 matching.push_back(std::move(record));
@@ -1345,10 +1355,10 @@ void registerInventoryRpc(JobRegistry& registry) {
             out["instance_id"] = target["instance_id"];
             out["internal_job_id"] = target["internal_job_id"];
             out["native_job_id"] = target["native_job_id"];
-            out["scheduler_type"] = record.selector.adapter;
-            out["cluster_name"] = record.selector.cluster_name;
-            out["cluster_tag"] = record.selector.cluster_tag;
-            out["step_id"] = record.selector.step_id;
+            out["scheduler_type"] = record.job.subtype_name;
+            out["cluster_name"] = record.job.cluster_name;
+            out["cluster_tag"] = record.job.clusterTag;
+            out["step_id"] = step_id_text(record);
             out["state"] = record.state;
             out["quarantined"] = record.quarantined;
             out["mode"] = target["mode"];

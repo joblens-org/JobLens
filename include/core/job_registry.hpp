@@ -395,6 +395,12 @@ private:
     // configured adapter owns the Job — callers keep an incomplete selector
     // rather than guessing.
     ISchedulerAdapter* adapterOf(const Job& job) const;
+    // Legacy selector reconstruction, shared by manual registration and the
+    // refreshJobFacts repair: the adapter owning the facts rebuilds the
+    // selector and folds its derived fields onto the Job (backfill only —
+    // facts a caller set explicitly are never overwritten). Returns an empty
+    // selector when no adapter owns the Job — incomplete, never a guess.
+    NativeSelector legacySelectorOf(Job& job) const;
     // Atomic selection command batch (moved from the store): reads the
     // records under records_mtx_, checks the revision CAS there, transforms
     // into pending images and writes every changed row in ONE unsynced

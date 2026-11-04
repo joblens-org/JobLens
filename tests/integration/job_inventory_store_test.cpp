@@ -241,7 +241,7 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
         check(record->identity_complete, "canonicalizable identity must be complete");
         check(record->identity.key() == canonicalize(selector_of(observation))->key(),
               "record must carry the canonical identity");
-        check(record->selector.native_job_id == "172.0",
+        check(record->job.NativeJobID == "172.0",
               "original native string must be preserved");
     }
 
