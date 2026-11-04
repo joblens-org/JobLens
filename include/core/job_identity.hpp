@@ -19,8 +19,9 @@
 //                             0 reserved for the system sentinel
 //   * logical scheduler identity - NativeSelector/CanonicalIdentity here
 //   * local execution identity   - ExecutionGeneration (+ ProcessIdentity)
-//   * external instance handle   - opaque string derived from the Agent DB
-//                             UUID plus the internal ID
+//   * external instance handle   - the internal ID as a decimal string
+//                             (format_internal_id); the opaque UUID-mixed
+//                             handle form is retired
 //
 // A native scheduler number, a caller hash or a bare PID is never an internal
 // ID and never a complete identity. Incomplete identities fail explicitly and
@@ -215,7 +216,6 @@ void from_json(const nlohmann::json& in, CanonicalIdentity& identity);
 // ---------------------------------------------------------------------------
 // Process and execution-generation identity
 // ---------------------------------------------------------------------------
-
 // A numeric PID alone is insufficient: the same number maps to different
 // processes across forks and reboots. Equality uses the full triple.
 struct ProcessIdentity {
@@ -245,14 +245,3 @@ struct ExecutionGeneration {
 };
 bool operator==(const ExecutionGeneration& lhs, const ExecutionGeneration& rhs);
 bool operator!=(const ExecutionGeneration& lhs, const ExecutionGeneration& rhs);
-
-// ---------------------------------------------------------------------------
-// Opaque external instance handles
-// ---------------------------------------------------------------------------
-
-// Derives the external handle from the persisted Agent/DB identity UUID and
-// the allocated internal ID. Stable for one execution's lifetime, opaque to
-// callers, not globally ordered and not a scheduler ID. A recreated DB gets a
-// different UUID and therefore different handles; nothing ever parses the
-// handle back into parts.
-std::string derive_instance_id(const std::string& db_uuid, uint64_t internal_id);

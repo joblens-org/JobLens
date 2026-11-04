@@ -34,6 +34,8 @@ struct UpsertResult {
     bool ok = false;
     UpsertDisposition disposition = UpsertDisposition::Rejected;
     uint64_t internal_id = 0;
+    // Deprecated wire spelling of internal_id (format_internal_id); the
+    // opaque-handle derivation is retired.
     std::string instance_id;
     // The accepted record revision this result committed (0 = nothing durable
     // was written). It orders the record; it is not runtime proof.

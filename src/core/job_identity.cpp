@@ -28,22 +28,6 @@ bool is_decimal(const std::string& text)
                        [](unsigned char c) { return std::isdigit(c) != 0; });
 }
 
-uint64_t mix_fnv1a(uint64_t seed, const void* data, size_t size)
-{
-    const auto* bytes = static_cast<const unsigned char*>(data);
-    uint64_t hash = seed;
-    for (size_t index = 0; index < size; ++index) {
-        hash ^= bytes[index];
-        hash *= 0x100000001b3ULL;
-    }
-    return hash;
-}
-
-void append_hex(char* out, uint64_t value)
-{
-    std::snprintf(out, 17, "%016llx", static_cast<unsigned long long>(value));
-}
-
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -281,24 +265,6 @@ bool operator==(const ExecutionGeneration& lhs, const ExecutionGeneration& rhs)
 bool operator!=(const ExecutionGeneration& lhs, const ExecutionGeneration& rhs)
 {
     return !(lhs == rhs);
-}
-
-// ---------------------------------------------------------------------------
-// Opaque instance handles
-// ---------------------------------------------------------------------------
-
-std::string derive_instance_id(const std::string& db_uuid, uint64_t internal_id)
-{
-    constexpr uint64_t kSeed = 0xcbf29ce484222325ULL;
-    const uint64_t first =
-        mix_fnv1a(kSeed, db_uuid.data(), db_uuid.size());
-    const uint64_t second =
-        mix_fnv1a(first, &internal_id, sizeof(internal_id));
-    const uint64_t third = mix_fnv1a(second, db_uuid.data(), db_uuid.size());
-    char hex[33];
-    append_hex(hex, second);
-    append_hex(hex + 16, third);
-    return std::string{"ji1-"} + std::string(hex, 32);
 }
 
 // ---------------------------------------------------------------------------

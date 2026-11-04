@@ -293,7 +293,9 @@ std::string step_id_text(const JobRecord& record)
 nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& record)
 {
     nlohmann::json out;
-    out["instance_id"] = record.instance_id;
+    // Deprecated key kept for old readers; the value is the internal id as a
+    // decimal string (same as internal_job_id).
+    out["instance_id"] = format_internal_id(record.internal_id);
     // New APIs carry internal ids as decimal strings (JavaScript uint64 safety).
     out["internal_job_id"] = format_internal_id(record.internal_id);
     out["schema_version"] = kRpcSchemaVersion;
@@ -329,7 +331,8 @@ std::vector<std::string> instance_ids_of(const std::vector<JobRecord>& records)
 {
     std::vector<std::string> ids;
     ids.reserve(records.size());
-    for (const auto& record : records) ids.push_back(record.instance_id);
+    // Deprecated key spelling: the value is the internal id, decimal string.
+    for (const auto& record : records) ids.push_back(format_internal_id(record.internal_id));
     return ids;
 }
 
@@ -452,7 +455,7 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
     for (const auto& record : matches) {
         if (!registry.findJob(record.internal_id).has_value()) {
             result.code = "generation_closing";
-            result.message = "instance " + record.instance_id +
+            result.message = "instance " + format_internal_id(record.internal_id) +
                              " is closing and rejects new binding mutations";
             result.records.clear();
             return result;
@@ -462,30 +465,10 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
     return result;
 }
 
-TargetResolution resolve_instance_handle(JobRegistry& registry, const std::string& instance_id)
-{
-    TargetResolution result;
-    for (auto& record : registry.inventoryRecords()) {
-        if (record.instance_id != instance_id) continue;
-        if (!registry.findJob(record.internal_id).has_value()) {
-            result.code = "generation_closing";
-            result.message = "instance " + instance_id +
-                             " is closing and rejects new binding mutations";
-            return result;
-        }
-        result.records.push_back(std::move(record));
-        return result;
-    }
-    result.code = "not_found";
-    result.message = "no verified current instance with instance_id '" + instance_id + "'";
-    return result;
-}
-
 // Instance addressing by internal_job_id: the durable id resolves in O(1)
-// through the registry's record map instead of a scan comparing derived
-// handles. Addressability matches the opaque-handle path exactly: an active
-// record only (findJob), a closing instance rejects with generation_closing,
-// and the reserved system sentinel is never addressable.
+// through the registry's record map. Addressability: an active record only
+// (findJob), a closing instance rejects with generation_closing, and the
+// reserved system sentinel is never addressable.
 TargetResolution resolve_instance_handle_by_id(JobRegistry& registry, uint64_t internal_id)
 {
     TargetResolution result;
@@ -500,7 +483,7 @@ TargetResolution resolve_instance_handle_by_id(JobRegistry& registry, uint64_t i
     }
     if (!registry.findJob(record->internal_id).has_value()) {
         result.code = "generation_closing";
-        result.message = "instance " + record->instance_id +
+        result.message = "instance " + format_internal_id(record->internal_id) +
                          " is closing and rejects new binding mutations";
         return result;
     }
@@ -519,7 +502,8 @@ nlohmann::json collection_target_json(JobRegistry& registry, const JobRecord& re
     const auto desired = selection.effectiveCollectors();
 
     nlohmann::json out;
-    out["instance_id"] = record.instance_id;
+    // Deprecated key kept for old readers; same value as internal_job_id.
+    out["instance_id"] = format_internal_id(record.internal_id);
     out["internal_job_id"] = format_internal_id(record.internal_id);
     out["native_job_id"] = record.job.NativeJobID;
     // Accepted: the durable record revision the command committed.
@@ -1228,40 +1212,34 @@ void registerInventoryRpc(JobRegistry& registry) {
                 return selector_error("selector is required");
             const auto& selector = req["selector"];
 
-            const bool has_instance =
-                selector.contains("instance_id") && !selector["instance_id"].is_null();
-            // Preferred instance form: the durable internal id as a decimal
-            // string. instance_id stays accepted through the transition.
             const bool has_internal_id =
                 selector.contains("internal_job_id") &&
                 !selector["internal_job_id"].is_null();
-            const bool has_handle = has_instance || has_internal_id;
             std::vector<std::string> native_fields;
             for (const char* name : {"scheduler_type", "adapter", "cluster_name",
                                      "cluster_tag", "native_job_id", "step_id"}) {
                 if (selector.contains(name) && !selector[name].is_null())
                     native_fields.emplace_back(name);
             }
-            if (has_instance && has_internal_id)
-                return selector_error("selector must use exactly one instance form: "
-                                      "internal_job_id or instance_id, not both");
-            if (has_handle && !native_fields.empty())
+            if (selector.contains("instance_id") && !selector["instance_id"].is_null())
+                return selector_error(
+                    "instance_id is retired; address the instance by "
+                    "internal_job_id (decimal string) or native identity fields");
+            if (has_internal_id && !native_fields.empty())
                 return selector_error("selector must use exactly one form: an instance "
-                                      "handle (internal_job_id, instance_id) or native "
+                                      "handle (internal_job_id) or native "
                                       "identity fields, not both");
-            if (!has_handle && native_fields.empty())
+            if (!has_internal_id && native_fields.empty())
                 return selector_error("selector is required: an instance handle "
-                                      "(internal_job_id, instance_id) or native identity "
+                                      "(internal_job_id) or native identity "
                                       "fields");
-            if (has_handle && scope != "instance")
+            if (has_internal_id && scope != "instance")
                 return selector_error("instance handle selectors only support "
                                       "scope=instance");
 
             NativeSelector native_selector;
-            std::string instance_handle;
             std::optional<uint64_t> internal_handle;
             try {
-                instance_handle = has_instance ? optional_string(selector, "instance_id") : "";
                 if (has_internal_id) {
                     const auto raw = optional_string(selector, "internal_job_id");
                     internal_handle = parse_internal_id(raw);
@@ -1270,7 +1248,7 @@ void registerInventoryRpc(JobRegistry& registry) {
                             "internal_job_id must be a decimal internal id string (got '" +
                             raw + "')");
                 }
-                if (!has_handle) {
+                if (!has_internal_id) {
                     native_selector.cluster_tag = optional_string(selector, "cluster_tag");
                     native_selector.step_id = optional_string(selector, "step_id");
                     native_selector.native_job_id = optional_string(selector, "native_job_id");
@@ -1295,8 +1273,6 @@ void registerInventoryRpc(JobRegistry& registry) {
             } catch (const std::exception& error) {
                 return selector_error(error.what());
             }
-            if (has_instance && instance_handle.empty())
-                return selector_error("instance_id must not be empty");
 
             std::optional<std::vector<std::string>> collectors;
             if (operation == "set") {
@@ -1337,10 +1313,8 @@ void registerInventoryRpc(JobRegistry& registry) {
             const auto resolution =
                 has_internal_id
                     ? resolve_instance_handle_by_id(registry, *internal_handle)
-                    : has_instance
-                          ? resolve_instance_handle(registry, instance_handle)
-                          : resolve_native_target(registry, native_selector, scope,
-                                                  ensure_registered);
+                    : resolve_native_target(registry, native_selector, scope,
+                                            ensure_registered);
             if (!resolution.ok()) {
                 if (resolution.code == "ambiguous_selector")
                     return error_payload(resolution.code, resolution.message,
@@ -1383,16 +1357,28 @@ void registerInventoryRpc(JobRegistry& registry) {
                 return error_payload("invalid_request", "request body must be a JSON object");
             if (auto not_ready = store_not_ready_payload(registry.storeHealth()))
                 return *not_ready;
-            std::string instance_id;
+            // internal_job_id is the addressing field; instance_id is the
+            // deprecated spelling kept for readers echoing an old response —
+            // both carry the same decimal-string value now.
+            std::string internal_job_id;
             try {
-                instance_id = optional_string(req, "instance_id");
+                if (req.contains("internal_job_id") && !req["internal_job_id"].is_null())
+                    internal_job_id = optional_string(req, "internal_job_id");
+                else
+                    internal_job_id = optional_string(req, "instance_id");
             } catch (const std::exception& error) {
                 return error_payload("invalid_request", error.what());
             }
-            if (instance_id.empty())
-                return error_payload("invalid_request", "instance_id is required");
+            if (internal_job_id.empty())
+                return error_payload("invalid_request", "internal_job_id is required");
+            const auto internal_id = parse_internal_id(internal_job_id);
+            if (!internal_id)
+                return error_payload(
+                    "invalid_request",
+                    "internal_job_id must be a decimal internal id string (got '" +
+                        internal_job_id + "')");
 
-            const auto resolution = resolve_instance_handle(registry, instance_id);
+            const auto resolution = resolve_instance_handle_by_id(registry, *internal_id);
             if (!resolution.ok())
                 return error_payload(resolution.code, resolution.message);
 

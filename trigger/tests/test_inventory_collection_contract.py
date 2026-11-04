@@ -153,28 +153,26 @@ def test_a30_native_selector_defaults_ensure_registered_to_false(install_core) -
     assert fake.calls[0][1]["ensure_registered"] is False
 
 
-def test_a30_instance_handle_selector_forwards_instance_id_only(install_core) -> None:
-    fake = install_core(
-        response={
-            "status": "accepted",
-            "targets": [_target(instance_id="opaque-handle-9", native_job_id=None)],
-        }
-    )
+def test_a30_retired_instance_id_selector_is_rejected_at_the_boundary(
+    install_core,
+) -> None:
+    """旧版不透明 instance_id 句柄已退役：边界显式拒绝，绝不下发 Core。"""
+    fake = install_core()
+    client = _app().test_client()
 
     response = _post_collection(
-        _app().test_client(),
+        client,
         {"selector": {"instance_id": "opaque-handle-9"}, "operation": "set", "collectors": []},
     )
 
-    assert response.status_code == 200
-    forwarded = fake.calls[0][1]
-    assert forwarded["selector"] == {"instance_id": "opaque-handle-9"}
-    assert forwarded["scope"] == "instance"
-    assert response.get_json()["targets"][0]["instance_id"] == "opaque-handle-9"
+    assert response.status_code == 400
+    assert "instance_id" in response.get_json()["message"]
+    # 边界拒绝：Core 从未被调用
+    assert fake.calls == []
 
 
 def test_a30_internal_job_id_selector_forwards_verbatim(install_core) -> None:
-    """internal_job_id 实例句柄（推荐形式）：原样转发，不注入 instance_id/内部推导。"""
+    """internal_job_id 实例句柄（唯一形式）：原样转发，不注入内部推导。"""
     fake = install_core(
         response={
             "status": "accepted",
@@ -195,8 +193,8 @@ def test_a30_internal_job_id_selector_forwards_verbatim(install_core) -> None:
     assert "instance_id" not in forwarded["selector"]
 
 
-def test_a30_internal_job_id_rejects_non_decimal_and_dual_forms(install_core) -> None:
-    """非十进制 internal_job_id 与两种句柄并用在边界即拒绝，不打扰 Core。"""
+def test_a30_internal_job_id_rejects_non_decimal(install_core) -> None:
+    """非十进制 internal_job_id 在边界即拒绝，不打扰 Core。"""
     fake = install_core()
     client = _app().test_client()
 
@@ -205,18 +203,6 @@ def test_a30_internal_job_id_rejects_non_decimal_and_dual_forms(install_core) ->
         {"selector": {"internal_job_id": "4x2"}, "operation": "set", "collectors": []},
     )
     assert response.status_code == 400
-
-    response = _post_collection(
-        client,
-        {
-            "selector": {"internal_job_id": "42", "instance_id": "opaque-handle-9"},
-            "operation": "set",
-            "collectors": [],
-        },
-    )
-    assert response.status_code == 400
-    assert "exactly one instance form" in response.get_json()["message"]
-    # 边界拒绝：Core 从未被调用
     assert fake.calls == []
 
 
@@ -334,7 +320,8 @@ def test_a30_both_selector_forms_are_rejected(install_core) -> None:
 
     assert response.status_code == 400
     assert fake.calls == []
-    assert "exactly one form" in response.get_json()["message"]
+    # 退役的 instance_id 键在任何组合里都是边界错误
+    assert "instance_id" in response.get_json()["message"]
 
 
 def test_a30_non_object_request_body_is_rejected(install_core) -> None:
@@ -585,7 +572,7 @@ def test_a31_instance_scope_forwards_expected_revision(install_core) -> None:
     response = _post_collection(
         _app().test_client(),
         {
-            "selector": {"instance_id": "inst-condor-01"},
+            "selector": {"internal_job_id": "42"},
             "operation": "set",
             "collectors": ["cpumem_collector"],
             "expected_revision": 2,

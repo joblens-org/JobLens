@@ -1572,7 +1572,6 @@ bool JobRegistry::addJob(const Job& job) {
     JobRecord record;
     record.job = job_copy;
     record.internal_id = job_copy.JobID;
-    record.instance_id = store_->instanceId(job_copy.JobID);
     // A legacy register IS a manual selection: the caller explicitly asked
     // for these collectors, so it can never be reported as an automatic
     // origin.
@@ -2114,20 +2113,15 @@ std::optional<JobRecord> JobRegistry::ownRecord(uint64_t id) const {
     std::shared_lock lg(records_mtx_);
     const auto it = records_.find(id);
     if (it == records_.end()) return std::nullopt;
-    auto record = it->second;
-    record.instance_id = store_->instanceId(id);
-    return record;
+    return it->second;
 }
 
 std::vector<JobRecord> JobRegistry::ownRecords() const {
     std::shared_lock lg(records_mtx_);
     std::vector<JobRecord> out;
     out.reserve(records_.size());
-    for (const auto& entry : records_) {
-        auto record = entry.second;
-        record.instance_id = store_->instanceId(entry.first);
-        out.push_back(std::move(record));
-    }
+    for (const auto& entry : records_)
+        out.push_back(entry.second);
     return out;
 }
 
@@ -2138,9 +2132,7 @@ std::vector<JobRecord> JobRegistry::ownFindActive(
     for (const auto& entry : records_) {
         if (entry.second.state == kStateClosing) continue;
         if (!pred(entry.second.job)) continue;
-        auto record = entry.second;
-        record.instance_id = store_->instanceId(entry.first);
-        out.push_back(std::move(record));
+        out.push_back(entry.second);
     }
     return out;
 }
@@ -2167,9 +2159,7 @@ std::optional<JobRecord> JobRegistry::ownRecordByIdentity(
     if (it == identity_index_.end()) return std::nullopt;
     const auto record = records_.find(it->second);
     if (record == records_.end()) return std::nullopt;
-    auto value = record->second;
-    value.instance_id = store_->instanceId(it->second);
-    return value;
+    return record->second;
 }
 
 CollectionSelection JobRegistry::ownSelection(uint64_t id) const {
@@ -2262,7 +2252,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
                                            JobRecord& updated_out) {
     UpsertResult result;
     result.internal_id = internal_id;
-    result.instance_id = store_->instanceId(internal_id);
+    result.instance_id = format_internal_id(internal_id);
     result.revision = stored.revision;
 
     const ExecutionGeneration generation = generation_of(job);
@@ -2805,7 +2795,6 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job) {
             created.job.JobPIDs.end());
 
         created.internal_id = allocated;
-        created.instance_id = store_->instanceId(allocated);
         created.identity = *identity;
         created.identity_complete = true;
         created.execution_observed = true;   // created by a discovery observation
@@ -2864,7 +2853,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job) {
         result.ok = true;
         result.disposition = UpsertDisposition::Created;
         result.internal_id = allocated;
-        result.instance_id = store_->instanceId(allocated);
+        result.instance_id = format_internal_id(allocated);
         std::shared_lock lg(records_mtx_);
         result.revision = records_[allocated].revision;
         record = records_[allocated];
@@ -3116,7 +3105,7 @@ CollectionOutcome JobRegistry::mutateSelection(const CollectionRequest& request,
     for (const auto& result : results) {
         CollectionTargetOutcome target;
         target.internal_id = result.internal_id;
-        target.instance_id = store_->instanceId(result.internal_id);
+        target.instance_id = format_internal_id(result.internal_id);
         target.selection = result.selection;
         target.revision = result.revision;
         target.changed = result.intent_changed;
@@ -3171,7 +3160,7 @@ CollectionOutcome JobRegistry::applyAutoPolicy(
     for (const auto& selection : selections) {
         CollectionTargetOutcome target;
         target.internal_id = selection.internal_id;
-        target.instance_id = store_->instanceId(selection.internal_id);
+        target.instance_id = format_internal_id(selection.internal_id);
 
         if (!ownHasActive(selection.internal_id)) {
             ++outcome.skipped_invalid;
@@ -3268,10 +3257,6 @@ bool JobRegistry::recoverStoreIfNeeded(std::string& error) {
         return false;
     }
     return true;
-}
-
-std::string JobRegistry::instanceId(uint64_t jobID) const {
-    return store_->instanceId(jobID);
 }
 
 StoreHealth JobRegistry::storeHealth() const {

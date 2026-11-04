@@ -262,14 +262,22 @@ struct Fixture {
 
 void run_selector_cases(JobRegistry& registry, const Fixture& ids)
 {
-    // --- A30: both selector forms are rejected -----------------------------
+    // --- A30: retired instance_id selectors are rejected -------------------
     {
         auto selector = condor_selector_json("172.0", "schedd-a");
         selector["instance_id"] = "ji1-deadbeef";
         const auto response = rpc("JobCollection/set",
                                   collection_request(selector, "set", json::array()));
         check(response["status"] == "error" && response["code"] == "invalid_request",
-              "both selector forms must be invalid_request: " + response.dump());
+              "the retired instance_id key must be invalid_request: " + response.dump());
+    }
+    {
+        const auto response = rpc(
+            "JobCollection/set",
+            collection_request(json{{"instance_id", "ji1-deadbeef"}}, "set", json::array()));
+        check(response["status"] == "error" && response["code"] == "invalid_request",
+              "a lone retired instance_id selector must be invalid_request: " +
+                  response.dump());
     }
     // --- A30: incomplete namespace -----------------------------------------
     {
@@ -312,8 +320,8 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
         check(response["code"] == "ambiguous_selector",
               "condor selector without schedd tag must be ambiguous: " + response.dump());
         check(candidates(response) ==
-                  sorted_ids({registry.instanceId(ids.condor_a),
-                              registry.instanceId(ids.condor_a_other)}),
+                  sorted_ids({format_internal_id(ids.condor_a),
+                              format_internal_id(ids.condor_a_other)}),
               "ambiguous condor selector must list the candidate instance ids: " +
                   response.dump());
     }
@@ -369,8 +377,8 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
         check(response["code"] == "ambiguous_selector",
               "slurm instance scope without step must be ambiguous: " + response.dump());
         check(candidates(response) ==
-                  sorted_ids({registry.instanceId(ids.slurm_step1),
-                              registry.instanceId(ids.slurm_step2)}),
+                  sorted_ids({format_internal_id(ids.slurm_step1),
+                              format_internal_id(ids.slurm_step2)}),
               "ambiguous slurm selector must list both step instances: " + response.dump());
     }
     // --- A30: exact step selector resolves one step ------------------------
@@ -412,7 +420,7 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     {
         const auto response = rpc(
             "JobCollection/set",
-            collection_request(json{{"instance_id", registry.instanceId(ids.condor_a)}}, "set",
+            collection_request(json{{"internal_job_id", format_internal_id(ids.condor_a)}}, "set",
                                json::array({"cpumem_collector"})));
         check(target_ids(response) == std::vector<uint64_t>({ids.condor_a}),
               "instance handle must resolve its own instance: " + response.dump());
@@ -421,7 +429,7 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     {
         const auto response = rpc("JobCollection/set",
                                   collection_request(
-                                      json{{"instance_id", registry.instanceId(ids.condor_a)}},
+                                      json{{"internal_job_id", format_internal_id(ids.condor_a)}},
                                       "set", json::array(), "job"));
         check(response["code"] == "invalid_request",
               "instance handle with job scope must be invalid_request: " + response.dump());
@@ -430,7 +438,7 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     {
         const auto response = rpc(
             "JobCollection/set",
-            collection_request(json{{"instance_id", "ji1-unknown"}}, "set", json::array()));
+            collection_request(json{{"internal_job_id", "999999999"}}, "set", json::array()));
         check(response["code"] == "not_found",
               "unknown instance handle must be not_found: " + response.dump());
     }
@@ -438,7 +446,7 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
 
 void run_intent_cases(JobRegistry& registry, const Fixture& ids)
 {
-    const auto selector = json{{"instance_id", registry.instanceId(ids.condor_b)}};
+    const auto selector = json{{"internal_job_id", format_internal_id(ids.condor_b)}};
 
     // --- A31: missing / null collectors ------------------------------------
     {
@@ -562,7 +570,7 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
                   stop["targets"].front()["record_revision"],
               "the reported revision must be the persisted revision");
         const auto status = rpc("JobCollection/get",
-                                json{{"instance_id", registry.instanceId(ids.condor_b)}});
+                                json{{"internal_job_id", format_internal_id(ids.condor_b)}});
         check(status["status"] == "ok" && status["desired_collectors"].empty(),
               "collection get must report the stopped selection: " + status.dump());
         check(status["applied_collectors"].empty(), "nothing applied after a stop");
@@ -574,7 +582,7 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
         registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite);
         const auto response = rpc(
             "JobCollection/set",
-            collection_request(json{{"instance_id", registry.instanceId(ids.condor_b)}}, "set",
+            collection_request(json{{"internal_job_id", format_internal_id(ids.condor_b)}}, "set",
                                json::array({"cpumem_collector"})));
         registry.clearStoreFaultsForTest();
         check(response["code"] == "store_unavailable",
@@ -585,12 +593,14 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
     }
     // --- A31: get on an unknown instance ----------------------------------
     {
-        const auto response = rpc("JobCollection/get", json{{"instance_id", "ji1-missing"}});
+        const auto response = rpc("JobCollection/get",
+                                  json{{"internal_job_id", "999999999"}});
         check(response["code"] == "not_found",
               "collection get on an unknown instance must be not_found: " + response.dump());
         const auto missing = rpc("JobCollection/get", json::object());
         check(missing["code"] == "invalid_request",
-              "collection get without instance_id must be invalid_request: " + missing.dump());
+              "collection get without internal_job_id must be invalid_request: " +
+                  missing.dump());
     }
 }
 
@@ -678,7 +688,7 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
               "legacy remove must persist a manual empty selection");
 
         const auto status = rpc("JobCollection/get",
-                                json{{"instance_id", registry.instanceId(ids.condor_legacy)}});
+                                json{{"internal_job_id", format_internal_id(ids.condor_legacy)}});
         check(status["desired_collectors"].empty(),
               "collection get must report the stopped selection after remove: " + status.dump());
         const auto listed = rpc("JobRegistry/inventory_list", json{{"scheduler_type", "condor"}});
@@ -856,7 +866,7 @@ void run_closing_case(JobRegistry& registry, const Fixture& ids)
 
     const auto response = rpc(
         "JobCollection/set",
-        collection_request(json{{"instance_id", registry.instanceId(ids.condor_extra)}}, "set",
+        collection_request(json{{"internal_job_id", format_internal_id(ids.condor_extra)}}, "set",
                            json::array({"cpumem_collector"})));
     check(response["code"] == "generation_closing",
           "a closing instance must reject new intent with generation_closing: " + response.dump());

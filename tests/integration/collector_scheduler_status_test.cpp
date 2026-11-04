@@ -583,7 +583,6 @@ void run(const std::string& base) {
                         std::vector<std::string> manual) {
         JobRecord record;
         record.internal_id = id;
-        record.instance_id = "regression-" + std::to_string(id);
         record.state = state;
         record.revision = 1;
         record.job.JobID = id;
@@ -1108,7 +1107,6 @@ void run(const std::string& base) {
     StaticSource injected;
     JobRecord injected_record;
     injected_record.internal_id = 777;
-    injected_record.instance_id = "injected-777";
     injected_record.state = kStateActive;
     injected_record.revision = 1;
     injected_record.job.JobID = 777;

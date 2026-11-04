@@ -244,18 +244,6 @@ void slurm_steps_and_pid_reuse()
           "a reboot is a new execution generation");
     check(!ExecutionGeneration{"boot-1", 0, 0, ""}.complete(),
           "generation without manager identity is incomplete");
-
-    // Opaque handles: deterministic per (db uuid, internal id), distinct across
-    // both inputs, never a scheduler id or a parseable composite.
-    const auto handle_a = derive_instance_id("uuid-aaa", 42);
-    const auto handle_b = derive_instance_id("uuid-aaa", 43);
-    const auto handle_c = derive_instance_id("uuid-bbb", 42);
-    check(handle_a == derive_instance_id("uuid-aaa", 42),
-          "instance handles are deterministic");
-    check(handle_a != handle_b && handle_a != handle_c && handle_b != handle_c,
-          "instance handles differ per id and per db uuid");
-    check(handle_a.rfind("ji1-", 0) == 0 && handle_a.size() == 4 + 32,
-          "instance handle keeps its opaque prefixed form");
 }
 
 // Serialization round trips ---------------------------------------------------
@@ -309,8 +297,8 @@ int main()
     try {
         run();
         std::cout << "PASS job identity: Condor/Slurm canonical identities, uint64 "
-                     "internal IDs, step normalization, PID-reuse detection, opaque "
-                     "instance handles, serialization round trips\n";
+                     "internal IDs, step normalization, PID-reuse detection, "
+                     "serialization round trips\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

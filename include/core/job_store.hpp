@@ -240,7 +240,6 @@ struct JobRecord {
     bool execution_observed = false;
     // --- JobLens management state ----------------------------------------
     uint64_t internal_id = 0;
-    std::string instance_id;             // opaque handle (db uuid + id)
     std::string state = kStateActive;    // active | closing
     // The ONE record revision. Every durable mutation of this record advances
     // it: facts, automatic bookkeeping and manual selection commands alike. A
@@ -309,10 +308,10 @@ public:
     // record image, before commit() ever sees a row.
 
     // --- restore (once, right after construction) ------------------------
-    // Raw rows only: parse every `j:` row and return it with its instance_id
-    // derived. NO validation, NO suspect marking, NO index building — the
-    // registry owns the records and decides what a restored execution is
-    // worth. Corrupt rows are counted and skipped.
+    // Raw rows only: parse every `j:` row and return it. NO validation, NO
+    // suspect marking, NO index building — the registry owns the records and
+    // decides what a restored execution is worth. Corrupt rows are counted
+    // and skipped.
     std::vector<JobRecord> loadAll();
     // Durable identity resolution for the registry's upsert: reports the `j:`
     // row the `i:` index names. The registry consults this when its in-memory
@@ -387,11 +386,7 @@ public:
     // Row content comes from the RowProvider.
     bool flushDirty(const char* reason);
 
-    // Pure derivation from the db uuid: no record access.
-    std::string instanceId(uint64_t id) const;
-
-private:
-    // Injected by the registry; see setRowProvider.
+private:    // Injected by the registry; see setRowProvider.
     RowProvider row_provider_;
 
     bool init_db(const Options& options);

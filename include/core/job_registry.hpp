@@ -95,6 +95,8 @@ struct CollectionRequest {
 
 struct CollectionTargetOutcome {
     uint64_t internal_id = 0;
+    // Deprecated wire spelling of internal_id (format_internal_id); the
+    // opaque-handle derivation is retired.
     std::string instance_id;
     // The accepted desired state after the command.
     CollectionSelection selection;
@@ -220,7 +222,6 @@ public:
     // state.
     void setKernelCleanupForTest(
         std::function<bool(uint64_t, const Job&, std::string&)> cleanup);
-    std::string instanceId(uint64_t jobID) const;
     StoreHealth storeHealth() const;
 
     // --- Collection runtime seam ------------------------------------------
@@ -361,7 +362,7 @@ private:
     mutable std::mutex mutation_mtx_;
 
     // Registry-side record-map accessors and publish points. Query helpers
-    // return snapshot copies with instance_id derived.
+    // return snapshot copies.
     std::optional<JobRecord> ownRecord(uint64_t id) const;
     std::vector<JobRecord> ownRecords() const;
     std::vector<JobRecord> ownFindActive(

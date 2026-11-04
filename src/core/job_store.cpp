@@ -660,7 +660,6 @@ std::vector<JobRecord> JobStore::loadAll() {
             if (jobID == kSystemSentinelJobId) continue;
             try {
                 auto record = parse_record(it->value().ToString(), jobID);
-                record.instance_id = derive_instance_id(db_uuid_, record.internal_id);
                 restored.push_back(std::move(record));
             } catch (const std::exception& error) {
                 ++corrupt_records_;
@@ -1097,7 +1096,6 @@ bool JobStore::adopt_durable_locked(uint64_t internal_id, std::optional<ArchiveF
                       "recovery: {}", internal_id, exc.what());
         return false;
     }
-    record.instance_id = derive_instance_id(db_uuid_, internal_id);
     adopted_record = std::move(record);
     return true;
 }
@@ -1372,7 +1370,6 @@ std::optional<JobRecord> JobStore::readRowByIdentity(const CanonicalIdentity& id
     }
     try {
         auto record = parse_record(raw, internal_id);
-        record.instance_id = derive_instance_id(db_uuid_, internal_id);
         return record;
     } catch (const std::exception& error) {
         spdlog::warn("JobStore: unreadable record {}: {}", internal_id, error.what());
@@ -1560,11 +1557,6 @@ bool JobStore::commit(std::vector<WriteOp> ops, bool durable,
 // ---------------------------------------------------------------------------
 // Queries
 // ---------------------------------------------------------------------------
-
-std::string JobStore::instanceId(uint64_t id) const {
-    if (id == kSystemSentinelJobId) return "";
-    return derive_instance_id(db_uuid_, id);
-}
 
 StoreHealth JobStore::health() const {
     StoreHealth store_health;

@@ -18,7 +18,7 @@ JobLens Trigger API Schemas
 """
 
 from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 
 # ==================== 请求体模型 ====================
@@ -231,9 +231,12 @@ class CollectionSelector(BaseModel):
 
     形式 1（原生身份）: scheduler_type + cluster_name + native_job_id
                         [+ cluster_tag] [+ step_id]
-    形式 2（实例句柄）: internal_job_id（推荐的持久内部 ID 十进制字符串）
-                        或 instance_id（旧版不透明句柄），二者只能取其一
+    形式 2（实例句柄）: internal_job_id（持久内部 ID 十进制字符串）；
+                        旧版不透明 instance_id 句柄已退役，边界即拒绝
     """
+    # 退役的 instance_id 键不再被静默丢弃：显式拒绝，调用方立刻看见迁移点
+    model_config = ConfigDict(extra="forbid")
+
     scheduler_type: Optional[str] = Field(None, description="调度器类型，如 condor/slurm")
     cluster_name: Optional[str] = Field(None, description="调度器命名空间；原生身份必填")
     cluster_tag: Optional[str] = Field(None, description="调度器命名空间标签，可选")
@@ -242,9 +245,8 @@ class CollectionSelector(BaseModel):
     internal_job_id: Optional[str] = Field(
         None,
         pattern=r"^[0-9]+$",
-        description="内部作业 ID 十进制字符串；推荐的实例句柄形式，仅支持 instance scope",
+        description="内部作业 ID 十进制字符串；实例句柄形式，仅支持 instance scope",
     )
-    instance_id: Optional[str] = Field(None, description="不透明实例句柄（旧版形式），仅支持 instance scope")
 
     @field_validator("*", mode="before")
     @classmethod
@@ -293,23 +295,17 @@ class CollectionControlRequest(BaseModel):
     def _validate_contract(self) -> "CollectionControlRequest":
         selector = self.selector
         has_internal = selector.internal_job_id is not None
-        has_instance = selector.instance_id is not None
-        has_handle = has_internal or has_instance
         native_fields = [
             name for name in ("scheduler_type", "cluster_name", "cluster_tag", "native_job_id", "step_id")
             if getattr(selector, name) is not None
         ]
 
-        if has_internal and has_instance:
+        if has_internal and native_fields:
             raise ValueError(
-                "selector must use exactly one instance form: internal_job_id or instance_id, not both"
-            )
-        if has_handle and native_fields:
-            raise ValueError(
-                "selector must use exactly one form: an instance handle (internal_job_id, instance_id) "
+                "selector must use exactly one form: an instance handle (internal_job_id) "
                 "or native identity fields, not both"
             )
-        if not has_handle:
+        if not has_internal:
             missing = [
                 name for name in ("scheduler_type", "cluster_name", "native_job_id")
                 if getattr(selector, name) is None
@@ -318,7 +314,7 @@ class CollectionControlRequest(BaseModel):
                 raise ValueError(
                     "incomplete native selector, missing: " + ", ".join(missing)
                 )
-        if has_handle and self.scope != "instance":
+        if has_internal and self.scope != "instance":
             raise ValueError("instance handle selectors only support scope=instance")
         if self.operation == "set" and self.collectors is None:
             raise ValueError(

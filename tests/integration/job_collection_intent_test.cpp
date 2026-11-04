@@ -429,8 +429,8 @@ void durable_intent_survives_restart_and_generation_change(const std::string& ba
 
         const auto record = registry.inventoryRecord(internal_id);
         check(record.has_value(), "restart must restore the inventory record");
-        check(record->instance_id == instance_id,
-              "restart must keep the same opaque instance handle");
+        check(format_internal_id(record->internal_id) == instance_id,
+              "restart must keep the same instance handle (the internal id)");
 
         const auto same_generation = registry.upsertObservedJob(condor_observation("172.0"));
         check(same_generation.ok, "rescanning the same generation must succeed");

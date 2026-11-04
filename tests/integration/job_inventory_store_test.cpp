@@ -231,8 +231,8 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
     check(created.disposition == UpsertDisposition::Created,
           "first observation must report created");
     check(created.internal_id > 0, "created inventory must carry an internal id");
-    check(created.instance_id.rfind("ji1-", 0) == 0,
-          "created inventory must carry an opaque instance handle");
+    check(created.instance_id == format_internal_id(created.internal_id),
+          "created inventory must report the decimal-string instance handle");
     check(created.revision == 1, "first revision must be 1");
 
     {
