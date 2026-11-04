@@ -389,6 +389,12 @@ private:
     // adapters the observed facts are stored verbatim.
     void applyIdentityToFacts(Job& facts, const NativeSelector& selector,
                               const CanonicalIdentity& identity) const;
+    // Resolves the adapter that owns one Job's scheduler facts: the Job's
+    // subtype_name first (the one copy of the adapter name), the subtype
+    // enum as a fallback for pre-name legacy rows. nullptr when no
+    // configured adapter owns the Job — callers keep an incomplete selector
+    // rather than guessing.
+    ISchedulerAdapter* adapterOf(const Job& job) const;
     // Atomic selection command batch (moved from the store): reads the
     // records under records_mtx_, checks the revision CAS there, transforms
     // into pending images and writes every changed row in ONE unsynced

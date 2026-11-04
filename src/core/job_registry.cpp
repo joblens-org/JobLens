@@ -261,41 +261,6 @@ bool same_discovered_facts(const Job& a, const Job& b)
     return ga == gb && ga.cgroup_identity == gb.cgroup_identity;
 }
 
-// Best-effort selector reconstruction for legacy (schema < 2) records. A
-// missing namespace or native id yields an incomplete selector, never a guess.
-NativeSelector selector_from_legacy_job(const Job& job) {
-    NativeSelector selector;
-    if (job.subtype == JobSubType::Condor) {
-        selector.adapter = kAdapterCondor;
-        selector.cluster_name = job.cluster_name;
-        selector.cluster_tag = job.clusterTag;
-        selector.native_job_id = job.NativeJobID;
-        if (selector.native_job_id.empty()) {
-            if (const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr)) {
-                selector.native_job_id = fmt::format("{}.{}", attr->cluster_id, attr->proc_id);
-            }
-        }
-    } else if (job.subtype == JobSubType::Slurm) {
-        selector.adapter = kAdapterSlurm;
-        selector.cluster_name = job.cluster_name;
-        selector.native_job_id = job.NativeJobID;
-        if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr)) {
-            if (selector.cluster_name.empty()) selector.cluster_name = attr->cluster_name;
-            if (selector.native_job_id.empty()) {
-                selector.native_job_id = std::to_string(attr->job_id);
-            }
-            if (attr->step_id != 0) {
-                if (const auto name = slurm_step_name(attr->step_id)) {
-                    selector.step_id = *name;
-                } else {
-                    selector.step_id = std::to_string(attr->step_id);
-                }
-            }
-        }
-    }
-    return selector;
-}
-
 JobStore::WriteOp put_record_op(const JobRecord& record) {
     JobStore::WriteOp op;
     op.kind = JobStore::WriteOp::PutRecord;
@@ -305,6 +270,25 @@ JobStore::WriteOp put_record_op(const JobRecord& record) {
 }
 
 }  // namespace
+
+// Adapter-owned legacy decode dispatch: the Job's subtype_name (or the
+// subtype enum for pre-name rows) names the owning adapter; without one the
+// caller keeps an incomplete selector, never a guess.
+ISchedulerAdapter* JobRegistry::adapterOf(const Job& job) const {
+    const std::string* wanted = &job.subtype_name;
+    std::string enum_fallback;
+    if (wanted->empty()) {
+        switch (job.subtype) {
+            case JobSubType::Condor: enum_fallback = kAdapterCondor; break;
+            case JobSubType::Slurm:  enum_fallback = kAdapterSlurm;  break;
+            default: return nullptr;
+        }
+        wanted = &enum_fallback;
+    }
+    for (const auto& adapter : adapters_)
+        if (adapter->name() == *wanted) return adapter.get();
+    return nullptr;
+}
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -1585,13 +1569,17 @@ bool JobRegistry::addJob(const Job& job) {
     if (record.last_seen_us == 0) record.last_seen_us = record.first_seen_us;
     if (record.selector.adapter.empty()) {
         // Legacy registrations carry their identity only inside the typed
-        // facts; reconstruct the selector, never a guess.
-        record.selector = selector_from_legacy_job(record.job);
-        // One copy of the adapter name: on the Job itself.
-        record.job.subtype_name = record.selector.adapter;
-        if (const auto identity = canonicalize(record.selector)) {
-            record.identity = *identity;
-            record.identity_complete = true;
+        // facts; the adapter owning those facts reconstructs the selector.
+        // No configured adapter owns the record: the selector stays empty —
+        // incomplete, never a guess.
+        if (const auto* adapter = adapterOf(record.job)) {
+            record.selector = adapter->legacySelector(record.job);
+            // One copy of the adapter name: on the Job itself.
+            record.job.subtype_name = record.selector.adapter;
+            if (const auto identity = canonicalize(record.selector)) {
+                record.identity = *identity;
+                record.identity_complete = true;
+            }
         }
     }
     {
@@ -3406,10 +3394,14 @@ bool JobRegistry::refreshJobFacts(uint64_t jobID) {
     if (record.revision == 0) {
         record.revision = 1;
         record.first_seen_us = now_us();
-        record.selector = selector_from_legacy_job(record.job);
-        if (const auto identity = canonicalize(record.selector)) {
-            record.identity = *identity;
-            record.identity_complete = true;
+        // Legacy repair routes through the adapter owning the facts; without
+        // one the selector stays empty — incomplete, never a guess.
+        if (const auto* adapter = adapterOf(record.job)) {
+            record.selector = adapter->legacySelector(record.job);
+            if (const auto identity = canonicalize(record.selector)) {
+                record.identity = *identity;
+                record.identity_complete = true;
+            }
         }
     }
     // A durable record mutation advances the one record revision. This is the
