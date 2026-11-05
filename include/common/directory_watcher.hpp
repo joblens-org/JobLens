@@ -53,12 +53,6 @@ public:
     
     // 设置事件回调
     void setEventCallback(EventCallback callback);
-    
-    // 获取目录下所有文件列表（线程安全）
-    std::vector<std::string> getAllFiles() const;
-    
-    // 检查是否正在运行
-    bool isRunning() const { return running; }
 
 private:
     // 私有成员变量
@@ -68,14 +62,11 @@ private:
     std::thread watchThread;                       // 监控线程
     mutable std::mutex mutex;                      // 保护文件列表的互斥锁
     std::unordered_map<int, std::string> watchMap; // wd到路径的映射
-    std::vector<std::string> allFiles;             // 缓存的文件列表
     EventCallback eventCallback;                   // 事件回调
-    std::atomic<bool> needUpdate{true};            // 文件列表需要更新标志
     
     // 私有方法
     void watchThreadFunc();                       // 监控线程主函数
     void recursiveAddWatch(const std::string& path); // 递归添加监控
     void handleEvent(struct inotify_event* event); // 处理inotify事件
-    void collectAllFiles();                       // 收集所有文件
     void addWatchForPath(const std::string& path); // 为单个路径添加监控
 };

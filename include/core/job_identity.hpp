@@ -129,7 +129,6 @@ struct CanonicalIdentity {
 
 bool operator==(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs);
 bool operator!=(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs);
-bool operator<(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs);
 
 // ---------------------------------------------------------------------------
 // Native-id rule helpers (used by the built-in adapters' rules)
@@ -226,7 +225,6 @@ struct ProcessIdentity {
     bool complete() const { return pid > 0 && start_ticks > 0 && !boot_id.empty(); }
 };
 bool operator==(const ProcessIdentity& lhs, const ProcessIdentity& rhs);
-bool operator!=(const ProcessIdentity& lhs, const ProcessIdentity& rhs);
 
 // Evidence that two observations belong to the same local execution of one
 // logical job. Neither a slot name nor a cgroup path alone proves generation

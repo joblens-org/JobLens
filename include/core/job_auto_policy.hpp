@@ -40,7 +40,6 @@ class AutoCollectorPolicy {
 public:
     AutoCollectorPolicy() = default;
 
-    static AutoCollectorPolicy disabled();
     static AutoCollectorPolicy defaults(std::vector<std::string> collectors);
     static AutoCollectorPolicy rules(std::string rules_dir, std::string rules_prefix);
 

@@ -34,7 +34,6 @@
 #include <mutex>
 #include <set>
 
-#include "common/streamer_watcher.hpp"
 #include "core/collector_type.h"
 #include "core/job_identity.hpp"
 #include "job_lifecycle_event.h"

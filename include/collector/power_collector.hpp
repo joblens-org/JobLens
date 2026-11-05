@@ -138,7 +138,6 @@ private:
 
     /* ── CPU频率与调速器 ──────────────────────────────────────────── */
     std::vector<double> read_cpu_freqs_mhz();          // 读每核瞬时频率
-    std::vector<std::string> read_cpu_governors();     // 读每核调速器模式
     int detect_core_count();                            // 检测CPU核心数
 
     /* ── IPMI交叉验证 ──────────────────────────────────────────────── */
