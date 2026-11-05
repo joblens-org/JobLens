@@ -532,27 +532,6 @@ nlohmann::json collection_target_json(JobRegistry& registry, const JobRecord& re
     return out;
 }
 
-// Collector names are collector-instance names from
-// collectors_config.collectors[].name (what CollectorNames historically meant)
-// plus registered collector types. Unknown names are rejected before mutation.
-std::set<std::string> known_collector_names()
-{
-    std::set<std::string> names;
-    for (const auto& name : CollectorRegistry::instance().list()) names.insert(name);
-    try {
-        const auto collectors = Config::instance().getRawNode("collectors_config")["collectors"];
-        if (collectors && collectors.IsSequence()) {
-            for (const auto& item : collectors) {
-                if (item["name"] && item["name"].IsScalar())
-                    names.insert(item["name"].as<std::string>());
-            }
-        }
-    } catch (const std::exception& error) {
-        spdlog::warn("JobRegistry: could not read configured collector names: {}", error.what());
-    }
-    return names;
-}
-
 // Legacy add identity (§9.4). The supplied JobID is never consulted; only the
 // typed sub_attr plus the scheduler namespace the discovery sources use.
 std::optional<NativeSelector> legacy_add_selector(const Job& job, const nlohmann::json& req)

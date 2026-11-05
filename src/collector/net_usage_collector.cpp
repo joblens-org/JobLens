@@ -367,25 +367,6 @@ struct NamespaceSockets {
     std::unordered_map<uint64_t, std::vector<size_t>> inode_to_connections;
 };
 
-void print_hex(const void* p, std::size_t len, bool upper_case = false)
-{
-    const unsigned char* buf = static_cast<const unsigned char*>(p);
-    auto old_flags = std::cout.flags();          // 保存原来的格式标志
-    std::cout << std::hex << std::setfill('0');
-
-    for (std::size_t i = 0; i < len; ++i)
-    {
-        if (upper_case)
-            std::cout << std::uppercase;
-        else
-            std::cout << std::nouppercase;
-
-        std::cout << std::setw(2) << static_cast<unsigned>(buf[i]) << ' ';
-    }
-    std::cout << std::dec << std::endl;          // 切换回十进制输出
-    std::cout.flags(old_flags);                  // 恢复原来的格式
-}
-
 namespace {
 // The diagnostic socket is non-blocking, so send/recv retry after the socket
 // becomes ready again.
@@ -505,7 +486,6 @@ int NetUsageCollector::query_single_tcp(Connection& conn) {
             struct tcp_info sample{};
             std::memcpy(&sample, RTA_DATA(rta), std::min<size_t>(sizeof(sample), RTA_PAYLOAD(rta)));
             const struct tcp_info* info = &sample;
-            // print_hex(info, rta->rta_len, true);
             conn.sent = info->tcpi_bytes_sent;
             conn.recv = info->tcpi_bytes_received;
             conn.delivery_rate = info->tcpi_delivery_rate;

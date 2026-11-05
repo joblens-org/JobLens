@@ -214,11 +214,6 @@ bool operator!=(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs)
     return !(lhs == rhs);
 }
 
-bool operator<(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs)
-{
-    return lhs.key() < rhs.key();
-}
-
 std::optional<CanonicalIdentity> canonicalize(const NativeSelector& selector)
 {
     if (selector.adapter.empty()) return std::nullopt;
@@ -249,11 +244,6 @@ bool operator==(const ProcessIdentity& lhs, const ProcessIdentity& rhs)
 {
     return lhs.pid == rhs.pid && lhs.start_ticks == rhs.start_ticks &&
            lhs.boot_id == rhs.boot_id;
-}
-
-bool operator!=(const ProcessIdentity& lhs, const ProcessIdentity& rhs)
-{
-    return !(lhs == rhs);
 }
 
 bool operator==(const ExecutionGeneration& lhs, const ExecutionGeneration& rhs)

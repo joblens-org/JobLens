@@ -22,24 +22,6 @@
 namespace {
 std::atomic<std::uint64_t> g_read_order{0};
 
-void merge_members(std::vector<ProcessIdentity>& into, const std::vector<ProcessIdentity>& extra)
-{
-    for (const auto& member : extra) {
-        const auto found = std::find_if(into.begin(), into.end(), [&member](const ProcessIdentity& existing) {
-            return existing.pid == member.pid;
-        });
-        if (found == into.end()) into.push_back(member);
-    }
-}
-
-// Disambiguation key of one local execution: two observations merge only when
-// they agree on the manager identity (boot id, pid, start ticks).
-std::string generation_key(const ExecutionGeneration& generation)
-{
-    return generation.boot_id + '|' + std::to_string(generation.manager_pid) + '|' +
-           std::to_string(generation.manager_start_ticks);
-}
-
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -56,16 +38,6 @@ std::int64_t now_epoch_ms()
 // ---------------------------------------------------------------------------
 // Source state
 // ---------------------------------------------------------------------------
-
-const char* to_string(SourceState state)
-{
-    switch (state) {
-        case SourceState::Healthy: return "healthy";
-        case SourceState::Degraded: return "degraded";
-        case SourceState::Initializing: break;
-    }
-    return "initializing";
-}
 
 // ---------------------------------------------------------------------------
 // Discovered Job readiness moved to the watchers (CondorJobWatcher /

@@ -81,16 +81,6 @@ StatRead read_start_ticks_raw(const std::string& proc_root, pid_t pid, std::uint
 
 }  // namespace
 
-const char* to_string(LivenessState state)
-{
-    switch (state) {
-        case LivenessState::Alive: return "alive";
-        case LivenessState::Dead: return "dead";
-        case LivenessState::Unknown: break;
-    }
-    return "unknown";
-}
-
 std::optional<std::uint64_t> read_process_start_ticks(pid_t pid, const std::string& proc_root)
 {
     if (pid <= 0) return std::nullopt;

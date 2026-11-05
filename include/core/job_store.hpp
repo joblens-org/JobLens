@@ -84,8 +84,6 @@ inline const char* to_string(CollectionMode mode)
     return mode == CollectionMode::Manual ? "manual" : "auto";
 }
 
-std::optional<CollectionMode> collection_mode_from_string(const std::string& raw);
-
 // Desired collection selection. It carries no revision and no identity of its
 // own: JobRecord::revision is the ONE monotonic counter that orders every
 // record mutation, including the selection commands guarded by a CAS.
@@ -102,7 +100,6 @@ struct CollectionSelection {
     std::string automatic_source;
     std::optional<std::vector<std::string>> manual;
 
-    bool hasManual() const { return manual.has_value(); }
     bool stopped() const { return manual.has_value() && manual->empty(); }
     // manual wins over automatic, the explicit empty stop included.
     std::vector<std::string> effectiveCollectors() const;

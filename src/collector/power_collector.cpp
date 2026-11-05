@@ -394,8 +394,6 @@ PowerSnapshot PowerCollector::compute_energy(
     };
     std::unordered_map<uint64_t, JobAccum> job_map;
 
-    double attributed_weighted_ns = 0.0;
-
     for (const auto& [pt, acc] : pid_map) {
         uint64_t jid = 0;
         std::string native_jid;
@@ -429,8 +427,6 @@ PowerSnapshot PowerCollector::compute_energy(
             : 0.0;
         /* energy assigned below after total is known */
         ja.pids.push_back(pp);
-
-        attributed_weighted_ns += acc.weighted_ns;
     }
 
     /* ── Assign energy per job ── */
@@ -622,32 +618,6 @@ void PowerCollector::validate_against_baseline(const PowerSnapshot& snap)
             }
         }
     }
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Gap 1: CPU调速器记录 (对标DESY log-power-consumption.sh)
- * DESY每次IPMI采样时同时记录cpu0的scaling_governor。
- * 我们遍历所有CPU核心读取governor，输出各模式的数量分布。
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-std::vector<std::string> PowerCollector::read_cpu_governors()
-{
-    std::vector<std::string> governors;
-    governors.reserve(core_count_);
-
-    for (int cpu = 0; cpu < core_count_; ++cpu) {
-        std::string path = "/sys/devices/system/cpu/cpu"
-                         + std::to_string(cpu)
-                         + "/cpufreq/scaling_governor";
-        std::ifstream f(path);
-        std::string gov = "unknown";
-        if (f.is_open()) {
-            std::getline(f, gov);
-            if (gov.empty()) gov = "unknown";
-        }
-        governors.push_back(gov);
-    }
-    return governors;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

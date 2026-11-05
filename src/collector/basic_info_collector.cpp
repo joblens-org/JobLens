@@ -275,30 +275,6 @@ std::vector<BasicInfo> BasicInfoCollector::sample_job(const Job& job) {
     std::vector<BasicInfo> infos;
     auto now = std::chrono::steady_clock::now();
     
-    // 如果summary为true且只有一个PID，尝试获取TGID汇总
-    // if (summary && job.JobPIDs.size() > 1) {
-    //     // 使用第一个PID作为TGID尝试获取汇总
-    //     int tgid = job.JobPIDs[0];
-    //     struct taskstats stats;
-        
-    //     if (get_taskstats_for_tgid(tgid, stats)) {
-    //         BasicInfo info;
-    //         info.pid = 0; // 汇总信息的特殊标记
-    //         info.name = "JOB-SUMMARY";
-            
-    //         calculate_cpu_percent(info, stats, now);
-    //         calculate_io_speed(info, stats, now);
-    //         calculate_memory_percent(info, stats);
-            
-    //         info.numThreads = stats.nvcsw + stats.nivcsw; // 近似值
-    //         info.voluntaryCtxSw = stats.nvcsw;
-    //         info.nonvoluntaryCtxSw = stats.nivcsw;
-            
-    //         infos.push_back(info);
-    //         return infos;
-    //     }
-    // }
-    
     // 逐个进程采集
     for (int pid : job.JobPIDs) {
         if (pid <= 0) continue;

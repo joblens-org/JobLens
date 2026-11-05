@@ -151,8 +151,6 @@ enum class SourceState {
     Degraded,
 };
 
-const char* to_string(SourceState state);
-
 struct SourceHealth {
     SourceState state = SourceState::Initializing;
     // True while the adapter owns a running poll/scan thread.

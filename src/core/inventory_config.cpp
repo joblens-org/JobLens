@@ -115,33 +115,6 @@ std::string scalar_field(const nlohmann::json& node, const char* key, const std:
 
 }  // namespace
 
-nlohmann::json InventoryMaintenanceConfig::to_json() const
-{
-    nlohmann::json types_json = nlohmann::json::array();
-    for (const auto& name : types) types_json.push_back(name);
-
-    nlohmann::json out;
-    out["types"] = std::move(types_json);
-    out["reconcile_interval_sec"] = reconcile_interval_sec;
-    nlohmann::json sources = nlohmann::json::array();
-    for (const auto& entry : settings) {
-        sources.push_back(nlohmann::json{
-            {"type", entry.first},
-            {"inventory", entry.second.inventory},
-            {"auto_collect", entry.second.auto_collect},
-            {"auto_collect_explicit", entry.second.auto_collect_explicit},
-            {"legacy_auto_collect", entry.second.legacy_auto_collect},
-            {"use_rules", entry.second.use_rules},
-            {"rules_dir", entry.second.rules_dir},
-            {"rules_prefix", entry.second.rules_prefix},
-            {"default_collectors", entry.second.default_collectors},
-            {"cluster_name", entry.second.cluster_name},
-        });
-    }
-    out["sources"] = std::move(sources);
-    return out;
-}
-
 namespace {
 
 constexpr std::string_view kSectionSuffix = "_job_watcher";

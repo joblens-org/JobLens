@@ -43,7 +43,6 @@ void DirectoryWatcher::start() {
     }
     
     running = true;
-    needUpdate = true;
     
     // 启动监控线程
     watchThread = std::thread(&DirectoryWatcher::watchThreadFunc, this);
@@ -65,18 +64,6 @@ void DirectoryWatcher::stop() {
 void DirectoryWatcher::setEventCallback(EventCallback callback) {
     std::lock_guard<std::mutex> lock(mutex);
     eventCallback = callback;
-}
-
-std::vector<std::string> DirectoryWatcher::getAllFiles() const {
-    std::lock_guard<std::mutex> lock(mutex);
-    
-    // 如果需要更新或文件列表为空，则重新收集
-    if (needUpdate || allFiles.empty()) {
-        const_cast<DirectoryWatcher*>(this)->collectAllFiles();
-        const_cast<DirectoryWatcher*>(this)->needUpdate = false;
-    }
-    
-    return allFiles;
 }
 
 void DirectoryWatcher::recursiveAddWatch(const std::string& path) {
@@ -168,9 +155,6 @@ void DirectoryWatcher::handleEvent(struct inotify_event* event) {
         fullPath = parentPath;
     }
     
-    // 标记需要更新文件列表
-    needUpdate = true;
-    
     // 处理不同类型的事件
     if (event->mask & IN_CREATE) {
         // 新文件或目录创建
@@ -220,20 +204,5 @@ void DirectoryWatcher::handleEvent(struct inotify_event* event) {
         if (eventCallback) {
             eventCallback(fullPath, IN_CLOSE_WRITE);
         }
-    }
-}
-
-void DirectoryWatcher::collectAllFiles() {
-    allFiles.clear();
-    
-    try {
-        // 使用C++17 filesystem递归遍历
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(rootPath)) {
-            if (entry.is_regular_file()) {
-                allFiles.push_back(entry.path().string());
-            }
-        }
-    } catch (const std::exception& e) {
-        spdlog::error("DirectoryWatcher: 收集文件列表失败 root={} err={}", rootPath, e.what());
     }
 }

@@ -40,8 +40,6 @@ struct InventoryMaintenanceConfig {
     // Keyed by adapter name; contains every registered adapter plus every
     // type the configuration mentions, so the resolved picture is complete.
     std::map<std::string, InventoryTypeSettings> settings;
-
-    nlohmann::json to_json() const;
 };
 
 // Throws std::invalid_argument with a stable message on an invalid document.

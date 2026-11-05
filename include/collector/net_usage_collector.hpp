@@ -84,9 +84,6 @@ public:
 private:
     void init_netlink();
     int query_single_tcp(Connection& conn); //使用netlink机制查询
-    void parse_tcp_info(const struct inet_diag_msg *m,
-                                       unsigned nlmsg_len,
-                                       Connection& conn);
     int netlink_fd = -1;
     bool netlink_inited = false;
     bool netlink_requested = false;

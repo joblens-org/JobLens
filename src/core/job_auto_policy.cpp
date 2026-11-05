@@ -15,11 +15,6 @@
 
 #include <spdlog/spdlog.h>
 
-AutoCollectorPolicy AutoCollectorPolicy::disabled()
-{
-    return AutoCollectorPolicy{};
-}
-
 AutoCollectorPolicy AutoCollectorPolicy::defaults(std::vector<std::string> collectors)
 {
     AutoCollectorPolicy policy;

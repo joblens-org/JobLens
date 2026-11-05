@@ -20,7 +20,6 @@
 // trigger.
 #include "core/job_registry.hpp"
 #include <spdlog/spdlog.h>
-#include "common/streamer_watcher.hpp"
 #include <date/date.h>
 #include "common/config.hpp"
 #include <signal.h>
@@ -394,12 +393,6 @@ JobRegistry& JobRegistry::instance() {
 namespace {
 constexpr int kAbsencesBeforeRetirement = 2;
 constexpr std::size_t kEndedGenerationCapacity = 4096;
-constexpr std::size_t kIngestQueueCapacity = 1024;
-constexpr std::size_t kIngestRetryCapacity = 256;
-// The exec-hint retry ladder: scheduler state (job ad, spool dir) may not be
-// written yet at exec time. Sub-second retries cover the race; the ladder's
-// exhaustion hands the pid to one coalesced authoritative rescan.
-constexpr int kExecRetryDelaysMs[] = {5, 25, 100, 500};
 constexpr std::uint32_t kWaitSliceMs = 100;
 }  // namespace
 

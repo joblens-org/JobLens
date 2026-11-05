@@ -19,11 +19,7 @@
 #include "icollector.h"
 #include <spdlog/spdlog.h>
 #include "common/ebpf_common.hpp"
-#include "common/spin_lock.hpp"
-// #include "ebpf/job_fd_basic.h"
 #include "ebpf/job_fd_rw_stat.h"
-#include <queue>
-#include <thread>
 
 struct FileIOInfo{
     std::string path;
@@ -139,12 +135,7 @@ private:
     bool include_file_paths{false};
     bool init_ebpf();
     void deinit_ebpf();
-    bool polling_running;
-    std::unique_ptr<std::thread> poll_thread;
     std::optional<IOUsageCollector::user_rw_stat> get_fd_stat(pid_t pid, uint32_t fd);
-    SpinLock event_swap_mtx_;
-    std::unique_ptr<std::queue<event>> event_front_;
-    std::unique_ptr<std::queue<event>> event_back_;
     std::string rb_name = "event_rb";
     std::string pid2fdstat_map_name = "job_fd_stat";
     std::vector<bpf_link*> bpf_links_;

@@ -263,28 +263,6 @@ inline uint64_t getJobID(pid_t pid){
     return parse_uint64(condor_jobid);
 }
 
-inline std::string getOwner(pid_t pid){
-    std::string ad_path = get_env_field(pid, "_CONDOR_JOB_AD");
-    if (ad_path.empty()) return "";
-    return get_ad_field(ad_path, "Owner");
-}
-
-inline std::vector<pid_t> get_all_condor_job_pids(){
-    std::vector<pid_t> condor_pids;
-    namespace fs = std::filesystem;
-    for (const auto& entry : fs::directory_iterator("/proc")) {
-        if (!entry.is_directory()) continue;
-        std::string filename = entry.path().filename().string();
-        if (!std::all_of(filename.begin(), filename.end(), ::isdigit)) continue;
-        pid_t pid = static_cast<pid_t>(std::stol(filename));
-        std::string cmdline = get_cmdline_of(pid);
-        if (cmdline.find("condor_starter") != std::string::npos) {
-            condor_pids.push_back(pid);
-        }
-    }
-    return condor_pids;
-}
-
 inline std::string get_scheduler_host(pid_t pid){
     std::string ad_path = get_env_field(pid, "_CONDOR_JOB_AD");
     if (ad_path.empty()) return "";
@@ -333,11 +311,6 @@ inline std::pair<size_t, size_t> get_cluster_and_proc_id(pid_t pid){
     size_t proc_id = parse_uint64(cluster_proc.substr(dot_pos + 1));
     
     return {cluster_id, proc_id};
-}
-
-inline std::string get_native_job_id(pid_t pid){
-    auto [cluster_id, proc_id] = get_cluster_and_proc_id(pid);
-    return fmt::format("{}.{}", cluster_id, proc_id);
 }
 
 /* ===================== 组归属（只读上游标准 ClassAd 属性） =====================

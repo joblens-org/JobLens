@@ -27,7 +27,6 @@
 #include "core/collector_registry.hpp"
 #include "writer/prometheus_exporter_writer.hpp"
 #include "ebpf/job_pid_track.h"
-// #include "ebpf/job_fd_basic.h"
 
 AUTO_REGISTER_JOB_COLLECTOR(
     IOUsageCollector, 
@@ -46,19 +45,9 @@ using namespace std::chrono;
 bool IOUsageCollector::init_ebpf(){
     auto path = EbpfCommon::resolve_bpf_obj("job_fd_rw_stat.bpf.o");
     if (path.empty()) return false;
-    // event_front_ = std::make_unique<std::queue<event>>();
-    // event_back_ = std::make_unique<std::queue<event>>();
     bpf_obj_ = EbpfCommon::load_bpf_obj_pinned(path, bpf_links_, JOBLENS_BPF_PIN_ROOT);
     ring_buffer_sample_fn fn  = [](void *ctx, void *data, size_t size){
         spdlog::trace("IOUsageCollector: ebpf got io event");
-        // auto ptr = static_cast<IOUsageCollector*>(ctx);
-        // auto event_ptr = static_cast<struct event*>(data);
-        // auto event_copy = *event_ptr;
-        // {
-        //     ptr->event_swap_mtx_.lock();
-        //     ptr->event_front_->push(event_copy);
-        //     ptr->event_swap_mtx_.unlock();
-        // }
         return 0;
     };
 
@@ -66,19 +55,6 @@ bool IOUsageCollector::init_ebpf(){
     if(!bpf_obj_ && !bpf_rb_){
         return false;
     }
-    // poll_thread = std::make_unique<std::thread>([this](){
-    //     spdlog::debug("IOUsageCollector: ebpf poll thread started");
-    //     while(polling_running){
-    //         int err = ring_buffer__poll(bpf_rb_, 100 /* ms */);
-    //         if (err == -EINTR){
-    //             spdlog::error("JobRegistry: error EINTR");
-    //             break;
-    //         }
-    //         if (err < 0){
-    //             spdlog::error("JobRegistry: error {}", err);
-    //         }
-    //     }
-    // });
     return true;
 }
 
@@ -93,40 +69,6 @@ void IOUsageCollector::deinit_ebpf(){
     EbpfCommon::unload_bpf_obj(bpf_obj_, bpf_links_);
     spdlog::info("IOUsageCollector: deinit_ebpf");
 }
-
-// std::optional<IOUsageCollector::user_rw_stat> IOUsageCollector::get_fd_stat(pid_t pid, uint32_t fd)
-// {
-    
-//     event_swap_mtx_.lock(); // 使用自旋锁，减轻损耗
-//     event_front_.swap(event_back_);
-//     event_swap_mtx_.unlock();
-
-//     while(!event_back_->empty()){
-//         auto event = event_back_->front();
-//         event_back_->pop();
-//         auto& stat = pidfd_stat_map[{event.pid, event.fd}];
-//         if (event.is_write){
-//             stat.write_bytes += event.cnt;
-//             // stat.write_time = event.ktimestamp;
-//         }else{
-//             stat.read_bytes += event.cnt;
-//             // stat.read_time = event.ktimestamp;
-//         }
-//     }
-
-//     user_pidfd_key usr_key = { .pid = static_cast<u32>(pid), .fd = fd };
-//     user_rw_stat& usr = pidfd_stat_map[usr_key]; // 上次用户态记录
-//     auto now = std::chrono::steady_clock::now();
-//     // 按照调用作为采样时间点计算速度
-//     usr.read_speed = usr.read_bytes - usr.last_read_bytes / (std::chrono::duration<double>(now - usr.last_read_time).count());
-//     usr.write_speed = usr.write_bytes - usr.last_write_bytes / (std::chrono::duration<double>(now - usr.last_write_time).count());
-//     usr.last_read_bytes = usr.read_bytes;
-//     usr.last_write_bytes = usr.write_bytes;
-//     usr.last_read_time = now;
-//     usr.last_write_time = now;
-    
-//     return usr;
-// }
 
 std::optional<IOUsageCollector::user_rw_stat> IOUsageCollector::get_fd_stat(pid_t pid, uint32_t fd)
 {

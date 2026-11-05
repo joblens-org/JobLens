@@ -31,8 +31,6 @@ enum class LivenessState {
     Unknown,
 };
 
-const char* to_string(LivenessState state);
-
 struct LivenessResult {
     LivenessState state = LivenessState::Unknown;
     std::string note;  // e.g. "EPERM reading /proc/1234/stat"

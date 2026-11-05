@@ -436,13 +436,6 @@ std::vector<std::string> CollectionSelection::effectiveCollectors() const
     return {};
 }
 
-std::optional<CollectionMode> collection_mode_from_string(const std::string& raw)
-{
-    if (raw == "manual") return CollectionMode::Manual;
-    if (raw == "auto") return CollectionMode::Auto;
-    return std::nullopt;
-}
-
 // ---------------------------------------------------------------------------
 // Construction / open / schema admission
 // ---------------------------------------------------------------------------

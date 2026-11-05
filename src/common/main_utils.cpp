@@ -18,7 +18,6 @@
 #include "core/writer_manager.hpp"
 #include "core/job_registry.hpp"
 #include "core/collector_scheduler.hpp"
-#include "common/permission_opt.hpp"
 #include "common/local_rpc.hpp"
 #include "common/version.h"
 
