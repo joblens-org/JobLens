@@ -17,6 +17,54 @@ fi
 
 source /etc/os-release
 
+# ---------------------------------------------------------------------------
+# 下载物完整性校验
+#
+# 三个源码/二进制依赖都从 GitHub 拉取；这里按 "类型:版本[:架构]" 固定 sha256。
+# 未登记的版本默认失败（fail closed），确需临时跳过时显式设置
+# JOBLENS_SKIP_DOWNLOAD_VERIFY=1。
+# ---------------------------------------------------------------------------
+pinned_sha256() {
+    local key="$1"
+    case "${key}" in
+        date:v3.0.1)
+            echo "7a390f200f0ccd207e8cff6757e04817c1a0aec3e327b006b7eb451c57ee3538" ;;
+        sol2:v3.5.0)
+            echo "86c0f6d2836b184a250fc2907091c076bf53c9603dd291eaebade36cc342e13c" ;;
+        bpftool:v7.7.0:amd64)
+            echo "09150596f09356b0ff632dd7f9856e0ea86bf96b269e9bc94278d9a9432a268c" ;;
+        bpftool:v7.7.0:arm64)
+            echo "d68443d945c146080151eb215bebaa400294ab7ada22af4f5d0a940f5992b9d9" ;;
+        *)
+            return 1 ;;
+    esac
+}
+
+verify_download() {
+    local file="$1" key="$2" label="$3"
+    if [ "${JOBLENS_SKIP_DOWNLOAD_VERIFY:-0}" = "1" ]; then
+        echo "    WARNING: skipping sha256 verification for ${label} (JOBLENS_SKIP_DOWNLOAD_VERIFY=1)"
+        return 0
+    fi
+    local expected
+    expected="$(pinned_sha256 "${key}" || true)"
+    if [ -z "${expected}" ]; then
+        echo "ERROR: no pinned sha256 for ${label} (key '${key}')"
+        echo "       add it to pinned_sha256() in scripts/install-deps.sh, or set"
+        echo "       JOBLENS_SKIP_DOWNLOAD_VERIFY=1 to bypass (not recommended)"
+        return 1
+    fi
+    local actual
+    actual="$(sha256sum "${file}" | awk '{print $1}')"
+    if [ "${actual}" != "${expected}" ]; then
+        echo "ERROR: sha256 mismatch for ${label}"
+        echo "       expected: ${expected}"
+        echo "       actual:   ${actual}"
+        return 1
+    fi
+    echo "    verified sha256 for ${label}"
+}
+
 install_date() {
     local DATE_VERSION="${DATE_VERSION:-v3.0.1}"
     local INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
@@ -38,6 +86,7 @@ install_date() {
         echo "ERROR: Failed to download date"
         return 1
     }
+    verify_download "${DATE_TMP_DIR}/date.tar.gz" "date:${DATE_VERSION}" "date ${DATE_VERSION}" || return 1
 
     tar -xzf "${DATE_TMP_DIR}/date.tar.gz" -C "${DATE_TMP_DIR}"
     cd "${DATE_TMP_DIR}/date-${DATE_VERSION#v}"
@@ -87,6 +136,7 @@ install_sol2() {
         echo "ERROR: Failed to download sol2 (HTTP 500 is transient GitHub tarball issue, retry later)"
         return 1
     }
+    verify_download "${SOL2_TMP_DIR}/sol2.tar.gz" "sol2:${SOL2_VERSION}" "sol2 ${SOL2_VERSION}" || return 1
 
     tar -xzf "${SOL2_TMP_DIR}/sol2.tar.gz" -C "${SOL2_TMP_DIR}"
 
@@ -156,6 +206,11 @@ install_bpftool_deb() {
     BPFTOOL_TMP_DIR=$(mktemp -d)
     if ! curl -fsSL --retry 3 --retry-delay 5 --retry-max-time 60 \
         "${BPFTOOL_URL}" -o "${BPFTOOL_TMP_DIR}/bpftool.tar.gz"; then
+        rm -rf "${BPFTOOL_TMP_DIR}"
+        return 1
+    fi
+    if ! verify_download "${BPFTOOL_TMP_DIR}/bpftool.tar.gz" \
+        "bpftool:${BPFTOOL_VERSION}:${BPFTOOL_ARCH}" "bpftool ${BPFTOOL_VERSION} ${BPFTOOL_ARCH}"; then
         rm -rf "${BPFTOOL_TMP_DIR}"
         return 1
     fi

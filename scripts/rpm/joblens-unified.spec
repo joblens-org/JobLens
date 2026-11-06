@@ -201,11 +201,16 @@ ln -sfn python3 %{buildroot}/usr/lib/joblens/trigger-venv/bin/python
 ln -sfn python3 %{buildroot}/usr/lib/joblens/trigger-venv/bin/python%{joblens_python_abi}
 
 # 9. 安装运行时 Python 依赖 + trigger 包本身
+#    --require-hashes: 只接受 requirements.lock 中带哈希的精确版本；
+#    --no-deps: 本地 trigger 包不再二次解析依赖（依赖已由 lock 安装）。
 #    --no-compile: 不生成 .pyc，避免嵌入 buildroot 路径被 check-buildroot 拦截
 export JOBLENS_VERSION="%{_version}"
 %{buildroot}/usr/lib/joblens/trigger-venv/bin/pip install \
     --no-input --no-cache-dir --no-compile \
-    -r trigger/requirements.txt trigger/
+    --require-hashes -r trigger/requirements.lock
+%{buildroot}/usr/lib/joblens/trigger-venv/bin/pip install \
+    --no-input --no-cache-dir --no-compile \
+    --no-deps trigger/
 
 # 10. 修复 venv 中硬编码的 buildroot 路径
 #     pip 安装的入口脚本（gunicorn、flask 等）的 shebang 包含 buildroot 路径

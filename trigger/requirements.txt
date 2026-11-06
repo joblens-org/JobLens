@@ -1,11 +1,20 @@
-Flask>=3
-gunicorn
-psutil>=5
-pydantic>=2
-PyYAML>=6
-Requests>=2
+# Trigger runtime dependencies (input constraints).
+#
+# 精确版本与传递依赖哈希在 requirements.lock 中；安装/打包一律使用：
+#   pip install --require-hashes -r trigger/requirements.lock
+# 升级依赖时：改本文件 -> 重新生成 lock -> 两者一起提交。
+#
+# 约束按 AlmaLinux 9 的 python3.9 解析（CI 构建机），不要放宽到只有
+# 更高 Python 才有的版本。
+
+Flask>=3,<4
+gunicorn>=21,<22
+psutil>=5,<8
+pydantic>=2,<3
+PyYAML>=6,<7
+Requests>=2,<3
 setuptools>=53
-watchdog>=4
-grpcio>=1.80
+watchdog>=4,<7
+grpcio>=1.76,<1.77
 protobuf<=3.20
-etcd3
+etcd3==0.12.0
