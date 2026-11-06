@@ -15,6 +15,7 @@ from flask import Flask, jsonify
 import subprocess
 import json
 import re
+import shlex
 import threading
 from pathlib import Path
 
@@ -24,11 +25,12 @@ _hardware_cache = None
 _cache_lock = threading.Lock()
 
 def run_cmd(cmd, default=""):
-    """安全执行shell命令"""
+    """执行命令并返回 stdout，不经过 shell。"""
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        argv = shlex.split(cmd) if isinstance(cmd, str) else [str(part) for part in cmd]
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
         return result.stdout.strip() if result.returncode == 0 else default
-    except:
+    except Exception:
         return default
 
 def get_system_static():
@@ -52,7 +54,7 @@ def get_system_static():
     
     # 如果sysfs没有，尝试dmidecode（需要root）
     if not info.get("product_name"):
-        dmi_output = run_cmd("dmidecode -t system 2>/dev/null", "")
+        dmi_output = run_cmd(["dmidecode", "-t", "system"], "")
         if dmi_output:
             for line in dmi_output.split('\n'):
                 if ':' in line:
@@ -72,7 +74,7 @@ def get_cpu_static():
     info = {}
     
     # 使用 lscpu --json（现代Linux支持）
-    lscpu_json = run_cmd("lscpu -J 2>/dev/null", "")
+    lscpu_json = run_cmd(["lscpu", "-J"], "")
     if lscpu_json:
         try:
             data = json.loads(lscpu_json)
@@ -111,7 +113,7 @@ def get_memory_static():
                 break
     
     # 获取详细插槽信息（需要root权限）
-    dmi_output = run_cmd("dmidecode -t memory 2>/dev/null", "")
+    dmi_output = run_cmd(["dmidecode", "-t", "memory"], "")
     if dmi_output:
         slot = {}
         for line in dmi_output.split('\n'):
@@ -147,7 +149,7 @@ def get_storage_static():
     devices = []
     
     # 使用 lsblk 获取磁盘信息
-    lsblk_json = run_cmd("lsblk -J -o NAME,MODEL,SIZE,TYPE,ROTA,SERIAL 2>/dev/null", "")
+    lsblk_json = run_cmd(["lsblk", "-J", "-o", "NAME,MODEL,SIZE,TYPE,ROTA,SERIAL"], "")
     if lsblk_json:
         try:
             data = json.loads(lsblk_json)
@@ -167,14 +169,15 @@ def get_storage_static():
         except:
             pass
     
-    # Fallback: fdisk -l
+    # Fallback: fdisk -l；原先用 `| grep 'Disk model'`，现在在 Python 侧过滤
     if not devices:
-        fdisk = run_cmd("fdisk -l 2>/dev/null | grep 'Disk model'", "")
+        fdisk = run_cmd(["fdisk", "-l"], "")
         for line in fdisk.split('\n'):
-            if line:
-                match = re.search(r'Disk model:\s*(.+)', line)
-                if match:
-                    devices.append({"model": match.group(1).strip()})
+            if 'Disk model' not in line:
+                continue
+            match = re.search(r'Disk model:\s*(.+)', line)
+            if match:
+                devices.append({"model": match.group(1).strip()})
     
     return devices
 
@@ -201,12 +204,12 @@ def _get_gpus_from_lspci():
     """
     # -nn 会同时输出 class code（如 [0300]）与 vendor:device ID（如 [10de:2204]）
     lspci = run_cmd(
-        "lspci -nn -d '::0300' -d '::0301' -d '::0302' -d '::0380' 2>/dev/null",
+        ["lspci", "-nn", "-d", "::0300", "-d", "::0301", "-d", "::0302", "-d", "::0380"],
         ""
     )
     # 旧版 lspci 可能不支持多次 -d，回退到全量输出后自行按 class 过滤
     if not lspci:
-        lspci = run_cmd("lspci -nn 2>/dev/null", "")
+        lspci = run_cmd(["lspci", "-nn"], "")
 
     gpus = []
     for line in lspci.split('\n'):
@@ -263,7 +266,9 @@ def get_gpu_static():
     gpus = []
     
     # 1. 尝试 NVIDIA（nvidia-smi）
-    nvidia = run_cmd("nvidia-smi --query-gpu=name,memory.total,pci.bus_id --format=csv,noheader 2>/dev/null", "")
+    nvidia = run_cmd(
+        ["nvidia-smi", "--query-gpu=name,memory.total,pci.bus_id", "--format=csv,noheader"],
+        "")
     if nvidia:
         for line in nvidia.split('\n'):
             if line:
@@ -283,12 +288,13 @@ def get_gpu_static():
     
     # 2. 尝试 AMD ROCm（rocm-smi）
     if not gpus:
-        rocm = run_cmd("rocm-smi --showproductname 2>/dev/null | grep 'GPU'", "")
-        if rocm:
-            for line in rocm.split('\n'):
-                match = re.search(r'GPU\[\d+\]\s*:\s*([^\n]+)', line)
-                if match:
-                    gpus.append({"vendor": "AMD", "model": match.group(1).strip()})
+        rocm = run_cmd(["rocm-smi", "--showproductname"], "")
+        for line in rocm.split('\n'):
+            if 'GPU' not in line:
+                continue
+            match = re.search(r'GPU\[\d+\]\s*:\s*([^\n]+)', line)
+            if match:
+                gpus.append({"vendor": "AMD", "model": match.group(1).strip()})
     
     # 3. 通用兜底：lspci 按 PCI class code 精确匹配显示控制器
     if not gpus:
@@ -330,7 +336,7 @@ def get_network_static():
                 iface_info["driver"] = driver
             
             # 使用 ethtool 获取更详细信息（需root或权限）
-            ethtool = run_cmd(f"ethtool -i {iface.name} 2>/dev/null", "")
+            ethtool = run_cmd(["ethtool", "-i", str(iface.name)], "")
             if ethtool:
                 for line in ethtool.split('\n'):
                     if "bus-info" in line:

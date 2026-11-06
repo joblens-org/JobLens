@@ -174,11 +174,14 @@ def test_perf_routes_preserve_abort_status_for_rpc_error_dict(path: str) -> None
     register_routes(app, ErrorStatusRPCClient(), None, None, None)
 
     response = app.test_client().get(path)
-    body = response.get_data(as_text=True)
 
     assert response.status_code == 500
-    assert "perf failed" in body
-    assert "Unexpected error" not in body
+    body = response.get_json()
+    assert body["error"] == "internal error"
+    assert body["request_id"]
+    assert response.headers["X-Request-Id"] == body["request_id"]
+    # 内部错误细节只进日志，不回显给调用方
+    assert "perf failed" not in response.get_data(as_text=True)
 
 
 def test_use_rpc_opt_falls_back_when_function_list_uses_legacy_error(monkeypatch: pytest.MonkeyPatch) -> None:

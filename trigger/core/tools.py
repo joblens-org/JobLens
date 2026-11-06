@@ -145,15 +145,23 @@ def job_opt(data):
             f.flush()
         return True
     
+def _to_argv(cmd) -> list:
+    """把命令统一成 argv 列表，禁止经过 shell。"""
+    if isinstance(cmd, str):
+        return shlex.split(cmd)
+    return [str(part) for part in cmd]
+
+
 def run(cmd, check=True):
     if 'USE_MOCK_TOOLS' in globals() and USE_MOCK_TOOLS:
         # 使用 mock 版本
         return mock_run(cmd, check)
-    
-    cp = subprocess.run(cmd, shell=True, text=True,
+
+    argv = _to_argv(cmd)
+    cp = subprocess.run(argv, text=True,
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if check and cp.returncode != 0:
-        raise RuntimeError(f"命令失败: {cmd}\n{cp.stdout}")
+        raise RuntimeError(f"命令失败: {argv}\n{cp.stdout}")
     return cp.stdout.strip()
 
 # docker start 命令行中容器名的提取正则
@@ -547,14 +555,13 @@ def restart_joblens() -> bool:
         logger.exception("restart_joblens: restart failed")
         return False
 
-def run_command(cmd: str) -> Optional[str]:
-    """执行 shell 命令并返回输出"""
+def run_command(cmd) -> Optional[str]:
+    """执行命令（argv 列表或可安全拆分的字符串）并返回输出，不经过 shell。"""
     try:
         result = subprocess.run(
-            cmd, 
-            shell=True, 
-            capture_output=True, 
-            text=True, 
+            _to_argv(cmd),
+            capture_output=True,
+            text=True,
             timeout=30
         )
         return result.stdout.strip() if result.returncode == 0 else None
@@ -573,15 +580,13 @@ def get_job_nodes(job_id: str) -> List[str]:
     3. 解析 NodeList 格式 (处理 node[01-05],node07 这种压缩格式)
     """
     # 方法1: 使用 squeue 查询运行中作业的节点 (最轻量)
-    cmd = f"squeue -j {job_id} -h -o %N"
-    output = run_command(cmd)
+    output = run_command(["squeue", "-j", str(job_id), "-h", "-o", "%N"])
     
     if output:
         return _expand_nodelist(output)
     
     # 方法2: 使用 scontrol 查询 (适用于已完成作业)
-    cmd = f"scontrol show job {job_id}"
-    output = run_command(cmd)
+    output = run_command(["scontrol", "show", "job", str(job_id)])
     
     if output:
         # 从多行输出中提取 NodeList=xxx
@@ -653,8 +658,7 @@ def get_job_processes(job_id: str) -> List[Tuple[str, str, str]]:
     pids = []
     
     # 方法1: 使用 sstat 查询 (仅运行中作业，且需要适当权限)
-    cmd = f"sstat -j {job_id}.0 --format=PID -h -n"
-    output = run_command(cmd)
+    output = run_command(["sstat", "-j", f"{job_id}.0", "--format=PID", "-h", "-n"])
     if output:
         for line in output.split('\n'):
             pid = line.strip()
@@ -664,8 +668,7 @@ def get_job_processes(job_id: str) -> List[Tuple[str, str, str]]:
             return pids
     
     # 方法2: 使用 scontrol listpids (如果 Slurm 配置支持)
-    cmd = f"scontrol listpids {job_id}"
-    output = run_command(cmd)
+    output = run_command(["scontrol", "listpids", str(job_id)])
     if output and "PID" in output:
         for line in output.split('\n')[1:]:  # 跳过表头
             cols = line.split()
@@ -683,8 +686,7 @@ def get_job_processes(job_id: str) -> List[Tuple[str, str, str]]:
     for node in nodes:
         # 查找 slurmstepd 进程 (它是所有作业进程的父进程/管理进程)
         # 然后通过 /proc/<pid>/status 的 PPid 找到其子进程
-        cmd = f"ps -eo pid,ppid,comm,args | grep slurmstepd"
-        output = run_command(cmd)
+        output = run_command(["ps", "-eo", "pid,ppid,comm,args"])
         
         if not output:
             continue
@@ -692,7 +694,7 @@ def get_job_processes(job_id: str) -> List[Tuple[str, str, str]]:
         # 解析 slurmstepd 行，找到对应 job_id 的进程
         slurm_pids = []
         for line in output.split('\n'):
-            if job_id in line and 'grep' not in line:
+            if 'slurmstepd' in line and str(job_id) in line:
                 parts = line.split()
                 if len(parts) >= 4:
                     pid, ppid, comm = parts[0], parts[1], parts[2]
@@ -703,8 +705,7 @@ def get_job_processes(job_id: str) -> List[Tuple[str, str, str]]:
         # 查找这些 slurmstepd 的子进程 (实际的作业进程)
         for slurm_pid in slurm_pids:
             # 查找 PPID 匹配 slurmstepd 的进程
-            cmd = f"ps --ppid {slurm_pid} -o pid,comm"
-            child_output = run_command(cmd)
+            child_output = run_command(["ps", "--ppid", str(slurm_pid), "-o", "pid,comm"])
             if child_output:
                 for line in child_output.split('\n')[1:]:  # 跳过标题
                     parts = line.split()

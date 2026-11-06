@@ -28,6 +28,7 @@ from werkzeug.exceptions import HTTPException
 from trigger.core.tools import joblens_format_metrics, systemd_status, job_opt, add_condorjob, add_slurmjob
 from trigger.core.rpc_client import RPCError
 from trigger.api.auth import install_auth
+from trigger.api.errors import install_error_handlers
 from trigger.utils.hardware_info import hardware_info
 
 # 兼容两种运行方式：以项目根目录运行或以 trigger 目录运行
@@ -70,6 +71,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     """
     # 统一鉴权必须在业务路由之前安装；健康/指标端点由 auth 模块放行。
     install_auth(app)
+    install_error_handlers(app)
 
     def rpc_call(method: str, params=None):
         """RPC 调用兜底：core 未连接时抛 RPCError，由各路由已有的 503 分支统一处理"""
