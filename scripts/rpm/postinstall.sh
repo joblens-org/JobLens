@@ -24,6 +24,20 @@ if [ -x /usr/bin/systemctl ]; then
     /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || :
 fi
 
+# ---- 收紧历史版本遗留的宽松权限 ----
+# %config(noreplace) 升级不会修改已存在文件的权限。
+if [ -f /etc/JobLens/config.yaml ]; then
+    chown root:root /etc/JobLens/config.yaml 2>/dev/null || :
+    chmod 0640 /etc/JobLens/config.yaml 2>/dev/null || :
+fi
+chmod 0750 /etc/JobLens 2>/dev/null || :
+if [ -d /var/JobLens ]; then
+    chown -R root:root /var/JobLens 2>/dev/null || :
+    find /var/JobLens -xdev -type d -exec chmod 0700 {} + 2>/dev/null || :
+    find /var/JobLens -xdev -type f -exec chmod 0600 {} + 2>/dev/null || :
+    find /var/JobLens -xdev -type p -exec chmod 0600 {} + 2>/dev/null || :
+fi
+
 if [ "$1" -eq 1 ] && [ -x /usr/bin/systemctl ]; then
     # 首次安装：preset 启用服务（由 preset 文件决定是否 auto-start）
     /usr/bin/systemctl preset joblens.service >/dev/null 2>&1 || :

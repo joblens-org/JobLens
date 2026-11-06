@@ -3,6 +3,10 @@
 # This is a template — copy to config.yaml and modify for your environment.
 # Full configuration reference: https://github.com/joblens-org/JobLens/blob/main/doc/configuration.md
 #
+# 敏感值（ES 口令等）不要明文写入本文件。C++ 配置支持环境变量占位符：
+#   passwd: "{{ES_PASSWORD}}"
+# 由 systemd 的 EnvironmentFile=/etc/JobLens/secrets.env（0600 root）提供。
+#
 # Start command: ./JobLens -m service -c config/config.yaml
 
 # ============================================================

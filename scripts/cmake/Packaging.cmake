@@ -77,9 +77,11 @@ install(DIRECTORY ${BPF_OBJECT_DIR}/
         FILES_MATCHING PATTERN "*.bpf.o")
 
 # 配置文件
+# 0640：配置里可能出现 ES 凭据；普通用户不得读取。
 install(FILES ${CMAKE_SOURCE_DIR}/config/config.example.yaml
         DESTINATION /etc/JobLens
-        RENAME config.yaml)
+        RENAME config.yaml
+        PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ)
 
 # 运行时目录
 install(DIRECTORY DESTINATION /var/JobLens

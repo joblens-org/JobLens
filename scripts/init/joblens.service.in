@@ -8,6 +8,14 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/var/JobLens
+# 敏感值（ES 口令等）通过 {{ENV}} 占位符读取；文件必须 0600 root。
+EnvironmentFile=-/etc/JobLens/secrets.env
+# 运行时产物（rpc.sock / FIFO / LevelDB / 日志）只允许 root 访问。
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=yes
+PrivateTmp=yes
+RestrictSUIDSGID=yes
 @JOBLENS_SERVICE_ENV@
 ExecStartPre=@CMAKE_INSTALL_FULL_BINDIR@/JobLens -v
 ExecStartPre=-/bin/sh -c 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'

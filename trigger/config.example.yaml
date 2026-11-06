@@ -1,6 +1,10 @@
 # ============================================================================
 # JobLens Trigger Configuration
 # ============================================================================
+#
+# HTTP 鉴权：除 `/`、`/metrics`、`/trigger/health`、`/joblens/healthy` 外的
+# 所有端点都要求 JOBLENS_TRIGGER_TOKEN。令牌放在 root-only 的
+# /etc/JobLens/secrets.env（0600），不要写进本文件。
 
 service:
   # 默认只监听回环；需要对外时改这里或用 JOBLENS_HOST 覆盖，并在防火墙层限制来源。
