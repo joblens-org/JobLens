@@ -153,7 +153,7 @@ class AppContext:
         ))
         self.config['service']['host'] = os.environ.get(
             'JOBLENS_HOST',
-            self._get_config_value('service.host', '0.0.0.0')
+            self._get_config_value('service.host', '127.0.0.1')
         )
         
         # 设置服务注册配置

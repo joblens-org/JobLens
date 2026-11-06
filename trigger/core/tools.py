@@ -26,6 +26,8 @@ import logging
 import subprocess
 import re
 import shlex
+import threading
+import time
 from trigger.core.rpc_client import RPCClient, RPCError
 import yaml
 from datetime import datetime, timezone
@@ -499,21 +501,51 @@ def joblens_format_metrics(jobs: dict) -> str:
 
     return "\n".join(lines)
 
-def restart_joblens():
+_RESTART_LOCK = threading.Lock()
+_last_restart_at = 0.0
+
+
+def _restart_debounce_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("JOBLENS_RESTART_DEBOUNCE_SECONDS", "10")))
+    except ValueError:
+        return 10.0
+
+
+def restart_joblens() -> bool:
+    """重启 joblens core，带去抖与审计日志。
+
+    配置变更、etcd 推送或未授权的重复调用都可能触发重启；没有去抖时，
+    短时间内多次变更会把监控进程反复拉起。去抖窗口内第二次起只记录并返回 False。
+    """
+    global _last_restart_at
+
+    now = time.monotonic()
+    cooldown = _restart_debounce_seconds()
+    with _RESTART_LOCK:
+        if _last_restart_at and now - _last_restart_at < cooldown:
+            logger.warning(
+                "restart_joblens: skipped, debounced (last attempt %.1fs ago, window %.1fs)",
+                now - _last_restart_at, cooldown,
+            )
+            return False
+        _last_restart_at = now
+
     try:
         active, sub = systemd_status('joblens')
-    except RuntimeError as e:
-        print("Get Joblens status error")
-        return
-    healthy = (active == "active") and (sub == "running")
-    if healthy == False:
-        print('JobLens 没有在运行，已返回')
-        return
+    except RuntimeError:
+        logger.exception("restart_joblens: failed to query joblens systemd status")
+        return False
+    if not (active == "active" and sub == "running"):
+        logger.warning("restart_joblens: joblens is not running (active=%s, sub=%s), skip", active, sub)
+        return False
     try:
-        print('正在重启JobLens')
+        logger.warning("restart_joblens: restarting joblens core")
         run('/usr/bin/systemctl restart joblens')
-    except Exception as e:
-        print('JobLens重启失败, 原因:', e)
+        return True
+    except Exception:
+        logger.exception("restart_joblens: restart failed")
+        return False
 
 def run_command(cmd: str) -> Optional[str]:
     """执行 shell 命令并返回输出"""

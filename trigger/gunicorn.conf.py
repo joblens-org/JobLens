@@ -52,7 +52,9 @@ def _resolve_loglevel() -> str:
 
 
 # Network binding
-bind = "0.0.0.0:7592"
+# 默认只监听回环：Trigger 以 root 运行在多用户节点上，0.0.0.0 会让任意可达
+# 用户操作控制面。需要对外时显式设置 JOBLENS_TRIGGER_BIND，并在防火墙层限制。
+bind = os.environ.get("JOBLENS_TRIGGER_BIND", "127.0.0.1:7592")
 
 # Worker configuration
 workers = 1

@@ -25,8 +25,9 @@ from typing import Optional
 from werkzeug.exceptions import HTTPException
 
 # 业务操作函数
-from trigger.core.tools import joblens_format_metrics, systemd_status, job_opt, add_condorjob, add_slurmjob, restart_joblens
+from trigger.core.tools import joblens_format_metrics, systemd_status, job_opt, add_condorjob, add_slurmjob
 from trigger.core.rpc_client import RPCError
+from trigger.api.auth import install_auth
 from trigger.utils.hardware_info import hardware_info
 
 # 兼容两种运行方式：以项目根目录运行或以 trigger 目录运行
@@ -53,34 +54,7 @@ except ImportError:
         VersionResponse, UpgradeResponse, HardwareInfoResponse, PidTrackerStatsResponse
     )
 
-# 升级接口的访问 token，建议从环境变量读取，默认为空表示不校验
-UPGRADE_TOKEN = '3P843X9A5L4Vrt1s3mv9CH7yYt6ZcPUp0BZt2adDlCAUBLlsX8BPe3b7KzQyV6h5'
-
 logger = logging.getLogger(__name__)
-
-
-def require_upgrade_token(f):
-    """升级接口权限校验装饰器"""
-    from functools import wraps
-    
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        # 如果未设置 token，则允许访问（开发环境）
-        if not UPGRADE_TOKEN:
-            return f(*args, **kwargs)
-        
-        # 从请求头获取 token
-        auth_header = request.headers.get('Authorization', '')
-        if not auth_header.startswith('Bearer '):
-            return jsonify({'error': 'Missing or invalid Authorization header'}), 401
-        
-        token = auth_header.replace('Bearer ', '').strip()
-        if token != UPGRADE_TOKEN:
-            return jsonify({'error': 'Invalid upgrade token'}), 403
-        
-        return f(*args, **kwargs)
-    
-    return decorated_function
 
 
 def register_routes(app: Flask, rpc_client, config_manager, service_registrar, rule_manager):
@@ -94,6 +68,8 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         service_registrar: 服务注册器（可选）
         rule_manager: 规则管理器（可选）
     """
+    # 统一鉴权必须在业务路由之前安装；健康/指标端点由 auth 模块放行。
+    install_auth(app)
 
     def rpc_call(method: str, params=None):
         """RPC 调用兜底：core 未连接时抛 RPCError，由各路由已有的 503 分支统一处理"""
@@ -529,7 +505,8 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         """手动触发配置更新"""
         if not config_manager:
             return abort(503, description="ConfigManager未初始化")
-        
+
+        logger.warning("config_update requested by %s", request.remote_addr)
         try:
             # 强制重新加载配置
             config_manager._handle_config_change()

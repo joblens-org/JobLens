@@ -124,8 +124,14 @@ if __name__ == "__main__":
     # 从_app_context获取配置
     port = app._app_context.config['service']['port']
     host = app._app_context.config['service']['host']
-    
+
+    debug = os.environ.get('JOBLENS_DEBUG', '').strip().lower() in {'1', 'true', 'yes', 'on'}
+    if debug and host not in {'127.0.0.1', 'localhost', '::1'}:
+        raise SystemExit(
+            f"拒绝在非回环地址 {host} 上以 debug 模式启动：这等于远程代码执行。"
+        )
+
     print(f"启动开发服务器")
     print(f"地址: http://{host}:{port}")
-    
-    app.run(host=host, port=port, debug=True)
+
+    app.run(host=host, port=port, debug=debug)
