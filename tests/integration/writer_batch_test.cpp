@@ -444,6 +444,24 @@ void writer_raii() {
 }
 }
 
+void file_writer_rejects_symlink() {
+    const std::string link = "/tmp/joblens-writer-symlink-" + std::to_string(getpid()) + ".txt";
+    unlink(link.c_str());
+    check(symlink("/etc/hostname", link.c_str()) == 0, "create symlink fixture");
+
+    auto& config = Config::instance();
+    config.getRawNode("es_test")["path"] = link;
+
+    bool threw = false;
+    try {
+        FileWriter writer("symlink", "FileWriter", "symlink_test");
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    check(threw, "file_writer must refuse a symlink output path");
+    unlink(link.c_str());
+}
+
 int main(int argc, char** argv) {
     if (argc != 2 && argc != 3) return 2;
     spdlog::set_level(spdlog::level::off);
@@ -454,6 +472,7 @@ int main(int argc, char** argv) {
     int failures = 0;
     for (const auto& test : std::vector<std::pair<const char*, std::function<void()>>>{
             {"FileWriter batch parser cache and fallback", file_batch},
+            {"FileWriter rejects symlink output path", file_writer_rejects_symlink},
             {"ESWriter batch parser cache and JSON", es_batch},
             {"Prometheus PID merging, order, and concurrent RPC", [&] { rpc.start(); prometheus_batch(socket_path); }},
             {"KafkaWriter batch parser cache and wire format", kafka_batch},

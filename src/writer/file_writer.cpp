@@ -18,8 +18,73 @@
 #include <map>
 #include <unordered_set>
 #include <filesystem>
+#include <cerrno>
+#include <cstring>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "core/collector_registry.hpp"
+
+namespace {
+
+// 运行期写入路径的安全检查：
+// - 目标文件不能是符号链接（防止预置链接让 root 覆盖任意文件）；
+// - 非普通文件一律拒绝（/dev/null 例外）；
+// - **以 root 运行时**父目录不能是世界可写（/tmp、/var/tmp、/dev/shm）；
+//   普通用户运行的测试/调试仍允许 /tmp。
+// 说明：这里在打开前检查，仍有一个极短的 TOCTOU 窗口；父目录不可被普通
+// 用户写入是关闭该窗口的关键。彻底消除需要 O_NOFOLLOW/openat2。
+bool ensure_safe_output_path(const std::string& raw, std::string& why)
+{
+    if (raw.empty()) {
+        why = "path is empty";
+        return false;
+    }
+    const std::filesystem::path path(raw);
+    std::filesystem::path parent = path.parent_path();
+    if (parent.empty()) parent = ".";
+
+    struct stat parent_st {};
+    if (::stat(parent.c_str(), &parent_st) != 0) {
+        why = "parent directory is not accessible: " + parent.string() +
+              " (" + std::strerror(errno) + ")";
+        return false;
+    }
+    if (!S_ISDIR(parent_st.st_mode)) {
+        why = "parent is not a directory: " + parent.string();
+        return false;
+    }
+    if ((parent_st.st_mode & S_IWOTH) != 0 && ::geteuid() == 0) {
+        why = "parent directory is world-writable: " + parent.string();
+        return false;
+    }
+
+    struct stat st {};
+    if (::lstat(path.c_str(), &st) == 0) {
+        if (S_ISLNK(st.st_mode)) {
+            why = "refusing to follow symlink: " + raw;
+            return false;
+        }
+        const bool dev_null = (raw == "/dev/null") && S_ISCHR(st.st_mode);
+        if (!S_ISREG(st.st_mode) && !dev_null) {
+            why = "existing path is not a regular file: " + raw;
+            return false;
+        }
+    } else if (errno != ENOENT) {
+        why = "cannot stat output path: " + raw + " (" + std::strerror(errno) + ")";
+        return false;
+    }
+    return true;
+}
+
+void require_safe_output_path(const std::string& raw, const std::string& label)
+{
+    std::string why;
+    if (!ensure_safe_output_path(raw, why)) {
+        throw std::runtime_error("file_writer: unsafe " + label + ": " + why);
+    }
+}
+
+} // namespace
 
 AUTO_REGISTER_WRITER(
     FileWriter,
@@ -73,6 +138,8 @@ void FileWriter::validateOptions(const FileWriterOptions& opts)
             "file_writer: 'path' is required and must be non-empty");
     }
 
+    require_safe_output_path(opts.path, "'path'");
+
     if (opts.write_mode != "append" && opts.write_mode != "overwrite") {
         throw std::runtime_error(
             "file_writer: invalid write_mode '" + opts.write_mode +
@@ -115,6 +182,10 @@ void FileWriter::validateOptions(const FileWriterOptions& opts)
                     "file_writer: 'outputs' entry for collector '" +
                     entry.collector_name + "' has empty file_path");
             }
+
+            require_safe_output_path(
+                entry.file_path,
+                "'outputs' file_path for collector '" + entry.collector_name + "'");
 
             // 不允许重复的 collector_name
             if (!collector_names.insert(entry.collector_name).second) {
@@ -161,6 +232,7 @@ FileWriter::FileWriter(std::string name, std::string type, std::string config_na
         collector_to_path_[entry.collector_name] = entry.file_path;
     }
 
+    require_safe_output_path(options_.path, "output path");
     ofs_.open(options_.path, std::ios::app);
     if (!ofs_.is_open()) {
         spdlog::error("file_writer: failed to open file '{}'", options_.path);
@@ -446,6 +518,11 @@ bool FileWriter::flush_impl(const std::vector<write_data>& batch)
                         spdlog::error("file_writer: rotation failed for '{}'", path);
                         all_success = false;
                         // 最佳努力重新打开流，供后续 flush 使用
+                        std::string why;
+                        if (!ensure_safe_output_path(path, why)) {
+                            spdlog::error("file_writer: refusing unsafe reopen '{}': {}", path, why);
+                            continue;
+                        }
                         if (path == options_.path) {
                             ofs_.open(path, std::ios::app);
                         } else {
@@ -455,6 +532,14 @@ bool FileWriter::flush_impl(const std::vector<write_data>& batch)
                     }
 
                     // 旋转成功：重新打开流，写入整个批次
+                    {
+                        std::string why;
+                        if (!ensure_safe_output_path(path, why)) {
+                            spdlog::error("file_writer: refusing unsafe reopen '{}': {}", path, why);
+                            all_success = false;
+                            continue;
+                        }
+                    }
                     if (path == options_.path) {
                         ofs_.open(path, std::ios::app);
                         if (!ofs_.is_open()) {
@@ -495,6 +580,12 @@ bool FileWriter::flush_impl(const std::vector<write_data>& batch)
                 // 非默认路径：使用持久化流（懒加载打开，完整关闭留给 Task 8）
                 auto& ofs = destination_streams_[path];
                 if (!ofs.is_open()) {
+                    std::string why;
+                    if (!ensure_safe_output_path(path, why)) {
+                        spdlog::error("file_writer: refusing unsafe output '{}': {}", path, why);
+                        all_success = false;
+                        continue;
+                    }
                     ofs.open(path, std::ios::app);
                     if (!ofs.is_open()) {
                         spdlog::error("file_writer: failed to open persistent stream for '{}'", path);
