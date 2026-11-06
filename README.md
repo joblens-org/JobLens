@@ -37,6 +37,7 @@ curl http://localhost:7592/joblens/healthy
 |----------|-------------|
 | [API Documentation](doc/api_documentation.md) | Trigger RESTful API reference |
 | [Configuration Manual](doc/configuration.md) | Complete configuration parameters |
+| [Security Model](doc/security.md) | Trust boundary, hardening baseline, upgrade notes |
 | [Development Guide](doc/develop_guide.md) | Branch structure, commit conventions, etc. |
 | [Minimal Deployment Kit](doc/joblens_simplest_deployable_suite.md) | Production deployment guide |
 

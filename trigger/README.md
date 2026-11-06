@@ -58,11 +58,15 @@ gunicorn --config gunicorn.conf.py trigger.app:app
 
 ### Verify the Service
 ```bash
-# Check service health
-curl http://localhost:7592/joblens/healthy
+# Check service health (public endpoint)
+curl http://127.0.0.1:7592/joblens/healthy
 
-# Get Prometheus metrics
-curl http://localhost:7592/metrics
+# Get Prometheus metrics (public endpoint)
+curl http://127.0.0.1:7592/metrics
+
+# Every other endpoint requires the trigger token
+curl -H "Authorization: Bearer $JOBLENS_TRIGGER_TOKEN" \
+     http://127.0.0.1:7592/joblens/jobs
 ```
 
 ## Configuration
@@ -82,7 +86,11 @@ lens_config:
 ```
 
 ### Environment Variables
-- `UPGRADE_TOKEN`: Authentication token for the upgrade endpoint (read from environment; no validation by default)
+- `JOBLENS_TRIGGER_TOKEN`: Bearer token required by every endpoint except `/`, `/metrics`, `/trigger/health`, `/joblens/healthy`. If unset, protected endpoints fail closed (503). Set it in `/etc/JobLens/secrets.env` (0600 root), loaded by the systemd unit.
+- `JOBLENS_TRIGGER_AUTH`: `on` (default) or `off`. `off` is for tests only and logs a warning.
+- `JOBLENS_TRIGGER_BIND` / `JOBLENS_HOST`: listen address; default is `127.0.0.1:7592`.
+- `JOBLENS_ETCD_CA_CERT` / `JOBLENS_ETCD_CERT_KEY` / `JOBLENS_ETCD_CERT_CERT` / `JOBLENS_ETCD_USER` / `JOBLENS_ETCD_PASSWORD`: etcd mTLS and credentials. etcd requires TLS by default; `JOBLENS_ETCD_TLS_REQUIRED=off` allows plaintext explicitly (not recommended).
+- `JOBLENS_RESTART_DEBOUNCE_SECONDS`: minimum interval between core restarts triggered by config changes (default 10).
 
 ### Service Registry Configuration
 - Registry address: `http://your-registry-host:8080` (configured via `REGISTRY_URL` environment variable)
@@ -231,7 +239,7 @@ sudo systemctl start joblens-trigger
 
 ### Gunicorn Configuration
 Gunicorn config file (`gunicorn.conf.py`) key settings:
-- Bind address: `0.0.0.0:7592`
+- Bind address: `127.0.0.1:7592` (override with `JOBLENS_TRIGGER_BIND`)
 - Worker count: 1 (sync mode)
 - Timeout: 120 seconds
 - Log level: info
