@@ -130,6 +130,8 @@ private:
 
     
     bool use_ebpf{false};
+    // 是否输出每个 fd 的文件路径与挂载点（敏感信息，默认关闭）
+    bool include_file_paths{false};
     bool init_ebpf();
     void deinit_ebpf();
     bool polling_running;

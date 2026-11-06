@@ -28,8 +28,25 @@ void run_legacy_without_metadata() {
     const auto output = std::any_cast<nlohmann::json>(collector.get_writer_parser("ESWriter")(result));
     for (const auto& file_json : output.at("process_data").at(0).at("files")) {
         require(file_json.at("pos").is_null(), "unknown file size must be null");
+        require(!file_json.contains("path"), "file path must not leak by default");
+        require(!file_json.contains("mount_point"), "mount point must not leak by default");
     }
     collector.deinit();
+
+    // 显式开启后才输出路径
+    IOUsageCollector with_paths;
+    require(with_paths.init(nlohmann::json{{"collect_file_paths", "true"}}),
+            "collector with paths init failed");
+    Job job2{}; job2.JobID = 8; job2.JobPIDs = {getpid()};
+    const auto result2 = std::any_cast<std::vector<IOUsageInfo>>(with_paths.collect(job2));
+    const auto output2 = std::any_cast<nlohmann::json>(
+        with_paths.get_writer_parser("ESWriter")(result2));
+    bool saw_path = false;
+    for (const auto& file_json : output2.at("process_data").at(0).at("files")) {
+        if (file_json.contains("path")) saw_path = true;
+    }
+    require(saw_path, "collect_file_paths=true must emit per-fd paths");
+    with_paths.deinit();
     std::cout << "PASS legacy IO details require no target metadata lookup\n";
 }
 

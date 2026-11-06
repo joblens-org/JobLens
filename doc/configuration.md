@@ -168,6 +168,7 @@ The collector's `init(json_cfg)` method receives a JSON object converted from th
 | | `pss_max_processes` | int | Default `64`. When a job has more live pids than this, PSS is skipped for that sample (all-or-nothing, never a partial sum). `0` means unlimited | `cpumem_collector.cpp:42` |
 | **IOUsageCollector** | `summary` | string | When `"true"`, aggregates I/O data across all processes | `io_usage_collector.cpp:186` |
 | | `use_ebpf` | string | When `"true"`, uses eBPF to collect file‑level I/O data (requires root + kernel support) | `io_usage_collector.cpp:192` |
+| | `collect_file_paths` | string | When `"true"`, emits per-fd `path` and `mount_point`. Default `"false"`: file paths reveal what each user reads/writes and should not be collected on shared login nodes unless needed for diagnosis. | `io_usage_collector.cpp` |
 | **NetUsageCollector** | `summary` | string | When `"true"`, aggregates network data across all processes | `net_usage_collector.cpp:477` |
 | | `use_netlink` | string | When `"true"`, uses netlink to query TCP_INFO (RTT, retransmissions, etc.) | `net_usage_collector.cpp:482` |
 | **BasicInfoCollector** | `summary` | string | When `"true"`, aggregates taskstats data across all processes (TGID-level summary) | `basic_info_collector.cpp:45` |
@@ -212,6 +213,8 @@ not the current file offset; it is now `null` in JSON and `unknown` in text outp
 File details are no longer restricted to regular files and block devices: any
 absolute fd target may appear, including directories or deleted open files.
 Existing IO counters remain available without target metadata access.
+Per-fd `path`/`mount_point` are only emitted when `collect_file_paths=true`;
+the default is `false` because paths reveal user file access on shared nodes.
 
 **NewIOUsageCollector Notes**:
 - Generic I/O accounting collector at the VFS syscall layer (rchar/wchar semantics), always eBPF-backed with no `use_ebpf` switch
@@ -700,6 +703,8 @@ io_collector_config:
   freq: 1
   summary: false
   use_ebpf: false
+  # 文件路径属于敏感信息；定位 I/O 卡顿时再设为 true
+  collect_file_paths: false
   use_writers:
     - es_writer
 

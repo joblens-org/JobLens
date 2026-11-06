@@ -167,6 +167,7 @@ net_sys_collector_config:
 | | `pss_max_processes` | int | 默认 `64`。作业存活进程数超过该值时本样本整体跳过 PSS（全有或全无，不做部分求和）；`0` 表示不限 |
 | **IOUsageCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的 I/O 数据 |
 | | `use_ebpf` | string | 为 `"true"` 时，使用 eBPF 采集文件级 I/O 数据（需要 root 权限和内核支持） |
+| | `collect_file_paths` | string | 为 `"true"` 时输出每个 fd 的 `path` 与 `mount_point`；默认 `"false"`。文件路径会暴露用户读写哪些文件，共享登录节点上应仅在排障时开启。 |
 | **NetUsageCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的网络数据 |
 | | `use_netlink` | string | 为 `"true"` 时，使用 netlink 查询 TCP_INFO（RTT、重传次数等） |
 | **BasicInfoCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的 taskstats 数据（TGID 级摘要） |
@@ -666,6 +667,8 @@ io_collector_config:
   freq: 1
   summary: false
   use_ebpf: false
+  # 文件路径属于敏感信息；定位 I/O 卡顿时再设为 true
+  collect_file_paths: false
   use_writers:
     - es_writer
 

@@ -32,7 +32,8 @@ AUTO_REGISTER_JOB_COLLECTOR(
     ConfigParams{
         {"freq", "Sampling frequency in Hz, e.g., 0.2 for once every 5 seconds"},
         {"summary", "Whether to summarize data across all processes (true/false), default false"},
-        {"use_ebpf", "Whether to use ebpf for collecting file io data"}
+        {"use_ebpf", "Whether to use ebpf for collecting file io data"},
+        {"collect_file_paths", "Emit per-fd file paths and mount points (true/false), default false"}
     }
 )
 
@@ -195,6 +196,12 @@ bool IOUsageCollector::init(const nlohmann::json& cfg){
             deinit_ebpf();
             use_ebpf = false;
         };
+    }
+
+    // 文件路径属于敏感信息（登录节点上可暴露用户访问了哪些文件），
+    // 默认不输出；需要定位 I/O 卡顿时显式打开。
+    if(cfg.contains("collect_file_paths") && cfg["collect_file_paths"].get<std::string>() == "true"){
+        include_file_paths = true;
     }
 
     return true;
@@ -421,8 +428,10 @@ CollectDataParseFunc IOUsageCollector::get_writer_parser(const std::string& writ
                 for (const auto& [fd, finfo] : info.file_info) {
                     nlohmann::json fj;
                     fj["fd"] = fd;
-                    fj["path"] = finfo.path;
-                    fj["mount_point"] = finfo.mount_point;
+                    if (include_file_paths) {
+                        fj["path"] = finfo.path;
+                        fj["mount_point"] = finfo.mount_point;
+                    }
                     fj["fs_type"] = finfo.fs_type;
                     fj["pos"] = nullptr; // File size is intentionally not queried.
                     if (use_ebpf) {
@@ -476,10 +485,12 @@ CollectDataParseFunc IOUsageCollector::get_writer_parser(const std::string& writ
                 for (const auto& [fd, finfo] : info.file_info) {
                     out << "IOUsageCollector file"
                         << " pid=" << info.pid
-                        << " fd=" << fd
-                        << " path=" << finfo.path
-                        << " mount_point=" << finfo.mount_point
-                        << " fs_type=" << finfo.fs_type
+                        << " fd=" << fd;
+                    if (include_file_paths) {
+                        out << " path=" << finfo.path
+                            << " mount_point=" << finfo.mount_point;
+                    }
+                    out << " fs_type=" << finfo.fs_type
                         << " pos=unknown";
                     if (use_ebpf) {
                         out << " read_bytes=" << finfo.read_bytes
