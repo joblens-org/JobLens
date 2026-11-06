@@ -12,10 +12,48 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "rule_engine/rule_engine.hpp"
+#include "rule_engine/rule_path.hpp"
 #include "common/utils.hpp"
 #include <sol/sol.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <cstdint>
+#include <system_error>
+
+namespace {
+
+// 规则执行的硬预算。正常规则只有几十条指令，这里的上限只用于拦住恶意/失控规则。
+constexpr int      kHookInterval      = 10'000;   // 每 N 条指令回调一次
+constexpr uint64_t kInstructionBudget = 2'000'000;
+constexpr int      kMemoryBudgetKb    = 32 * 1024; // 单次执行的内存增量
+constexpr std::uintmax_t kMaxRuleBytes = 256 * 1024;
+
+thread_local uint64_t tl_instructions = 0;
+thread_local uint64_t tl_instruction_limit = 0;
+thread_local int      tl_memory_baseline_kb = 0;
+thread_local bool     tl_budget_tripped = false;
+
+void lua_budget_hook(lua_State* L, lua_Debug* /*ar*/) {
+    tl_instructions += static_cast<uint64_t>(kHookInterval);
+    if (tl_instruction_limit != 0 && tl_instructions > tl_instruction_limit) {
+        tl_budget_tripped = true;
+        luaL_error(L, "joblens rule engine: instruction budget exceeded");
+    }
+    if (tl_memory_baseline_kb > 0) {
+        const int now_kb = lua_gc(L, LUA_GCCOUNT, 0);
+        if (now_kb - tl_memory_baseline_kb > kMemoryBudgetKb) {
+            tl_budget_tripped = true;
+            luaL_error(L, "joblens rule engine: memory budget exceeded");
+        }
+    }
+}
+
+bool path_within(const std::filesystem::path& child,
+                 const std::filesystem::path& parent) {
+    return joblens::rules::path_within(child, parent);
+}
+
+} // namespace
 
 // RuleEngine 构造函数实现
 RuleEngine::RuleEngine() : L(nullptr) {
@@ -35,8 +73,28 @@ RuleEngine::~RuleEngine() {
 // 加载单个规则文件
 bool RuleEngine::load_rule(const std::string& filepath) {
     try {
-        // 1. 执行Lua文件
+        // 0. 只接受规则目录内的普通文件，且有大小上限。
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(filepath, ec);
+        if (ec) {
+            spdlog::error("RuleEngine: cannot stat rule {}: {}", filepath, ec.message());
+            return false;
+        }
+        if (size > kMaxRuleBytes) {
+            spdlog::error("RuleEngine: rule {} is too large ({} bytes > {} bytes)",
+                          filepath, size, kMaxRuleBytes);
+            return false;
+        }
+        if (!dir_path_.empty() && !path_within(filepath, dir_path_)) {
+            spdlog::error("RuleEngine: rule {} escapes rules directory {}",
+                          filepath, dir_path_);
+            return false;
+        }
+
+        // 1. 执行Lua文件（带指令/内存预算）
+        begin_rule_execution();
         sol::protected_function_result result = L->script_file(filepath);
+        end_rule_execution();
         if (!result.valid()) {
             sol::error err = result;
             spdlog::error("RuleEngine: Failed to load {}: {}", filepath, err.what());
@@ -200,22 +258,23 @@ void RuleEngine::create_sandbox() {
     try {
         // 创建Lua状态
         L = std::make_unique<sol::state>();
-        
-        // 打开安全库
+
+        // 只打开纯计算库。io/package/os/debug 一律不打开：
+        // 不打开就没有 io.open/io.input、package.loadlib、os.execute，
+        // 比事后删函数可靠。
         L->open_libraries(
             sol::lib::base,
             sol::lib::string,
             sol::lib::table,
-            sol::lib::math,
-            sol::lib::io,
-            sol::lib::package
+            sol::lib::math
         );
-        
-        // 移除危险函数
-        for (const char* func : {"dofile", "loadfile", "load", "loadstring"}) {
+
+        // 移除仍可从 base 触达的动态加载/回收入口。
+        for (const char* func : {"dofile", "loadfile", "load", "loadstring",
+                                 "require", "collectgarbage"}) {
             (*L)[func] = sol::nil;
         }
-        
+
         // 自定义print函数
         (*L)["print"] = [this](sol::variadic_args args) {
             std::string msg;
@@ -233,35 +292,27 @@ void RuleEngine::create_sandbox() {
             }
             spdlog::debug("RuleEngine: [Lua] {}", msg);
         };
-        
-        // 自定义require函数
-        (*L)["require"] = [this](const std::string& modname) -> sol::object {
-            static const std::vector<std::string> blacklist = {
-                "os"
-            };
-            
-            if (std::find(blacklist.begin(), blacklist.end(), modname) != blacklist.end()) {
-                throw sol::error("module '" + modname + "' is banned in sandbox");
-            }
-            
-            auto package = (*L)["package"].get<sol::table>();
-            auto require_func = package["require"].get<sol::protected_function>();
-            return require_func(modname);
-        };
-        
-        // 规则脚本只允许读取入参，不允许通过 io 库写出沙箱。
-        sol::table io = (*L)["io"].get_or(L->create_table());
-        io["open"] = sol::nil;
-        io["output"] = sol::nil;
-        io["tmpfile"] = sol::nil;
-        io["write"] = sol::nil;
-        io["popen"] = sol::nil;
-        (*L)["io"] = io;
-        
+
+        // 指令/内存预算：每 kHookInterval 条指令检查一次，超限抛 Lua 错误，
+        // 由 protected_function 捕获，只让当前规则失败。
+        lua_sethook(L->lua_state(), lua_budget_hook, LUA_MASKCOUNT, kHookInterval);
+
     } catch (const std::exception& e) {
         spdlog::error("RuleEngine: Failed to create sandbox: {}", e.what());
         throw ;
     }
+}
+
+void RuleEngine::begin_rule_execution() {
+    tl_instructions = 0;
+    tl_instruction_limit = kInstructionBudget;
+    tl_memory_baseline_kb = L ? lua_gc(L->lua_state(), LUA_GCCOUNT, 0) : 0;
+    tl_budget_tripped = false;
+}
+
+void RuleEngine::end_rule_execution() {
+    tl_instruction_limit = 0;
+    tl_memory_baseline_kb = 0;
 }
 
 // 验证Lua代码语法

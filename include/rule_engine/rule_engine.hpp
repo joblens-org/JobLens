@@ -24,6 +24,8 @@
 #include <nlohmann/json.hpp>
 #include <sol/sol.hpp>
 
+#include "common/struct2ltable.hpp"
+
 
 namespace fs = std::filesystem;
 
@@ -81,6 +83,13 @@ public:
         }
         
         try {
+            // 每条规则单次执行都有指令/内存预算；超限由 Lua hook 中断。
+            struct BudgetGuard {
+                RuleEngine* engine;
+                explicit BudgetGuard(RuleEngine* e) : engine(e) { engine->begin_rule_execution(); }
+                ~BudgetGuard() { engine->end_rule_execution(); }
+            } budget_guard(this);
+
             // 创建参数表
             auto args_table = to_lua_table(*L, arg);
             
@@ -200,6 +209,10 @@ private:
 
     // 创建安全执行沙箱
     void create_sandbox();
+
+    // 规则执行预算：进入/退出时重置计数器，hook 在超限时抛 Lua 错误。
+    void begin_rule_execution();
+    void end_rule_execution();
 
     // 检测规则文件lua语法
     bool check_lua_syntax(const std::string& filepath);

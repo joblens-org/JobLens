@@ -18,6 +18,7 @@ Rule Manager Module
 """
 
 import os
+import re
 import hashlib
 import threading
 from pathlib import Path
@@ -134,13 +135,36 @@ class RuleManager:
     def set_etcd_priority(self, priority:bool):
         self.etcd_priority = priority
 
+    _RULE_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+    def _safe_rule_path(self, filename: str) -> Path:
+        """把规则名解析为规则目录内的路径。
+
+        规则名来自 etcd / RPC，必须按 basename 处理并做包含性校验，
+        否则 `../` 或绝对路径会把文件写到规则目录之外。
+        """
+        name = Path(filename).name
+        if name != filename:
+            raise ValueError(f"rule filename must not contain a path: {filename!r}")
+        if not self._RULE_FILENAME_RE.fullmatch(name) or name in (".", ".."):
+            raise ValueError(f"invalid rule filename: {filename!r}")
+        root = self.local_rules_dir.resolve()
+        path = (root / name).resolve()
+        if path != root and root not in path.parents:
+            raise ValueError(f"rule path escapes rules dir: {path}")
+        return path
+
     def get_local_rules_list(self) -> List[LocalRuleInfo]:
         return self.local_rules
     
     def get_local_rules_content(self, name:str) -> bytes:
         if not name.endswith('.lua'):
             name += '.lua'
-        full_path = str(self.local_rules_dir / name)
+        try:
+            full_path = str(self._safe_rule_path(name))
+        except ValueError as e:
+            logger.error("非法规则名 %r: %s", name, e)
+            return b''
         if not os.path.exists(full_path):
             logger.error(f'本地路径不存在: {full_path}')
             return b''
@@ -159,7 +183,11 @@ class RuleManager:
             name += '.lua'
         
         is_update = False
-        full_path = str(self.local_rules_dir / name)
+        try:
+            full_path = str(self._safe_rule_path(name))
+        except ValueError as e:
+            logger.error("非法规则名 %r: %s", name, e)
+            return False
         if name not in self.local_rules.keys():
             new_info = LocalRuleInfo(
                 filename=name,
@@ -191,9 +219,13 @@ class RuleManager:
         if not name.endswith('.lua'):
             name += '.lua'
         
-        full_path = str(self.local_rules_dir / name)
+        try:
+            full_path = str(self._safe_rule_path(name))
+        except ValueError as e:
+            logger.error("非法规则名 %r: %s", name, e)
+            return False
         if name not in self.local_rules.keys():
-            logger.info()
+            logger.info("规则不在本地缓存: %s", name)
             return False
         
         self.local_rules.pop(name)
@@ -294,7 +326,7 @@ class RuleManager:
                 return False  # 文件未变化
             
             # 保存到本地
-            local_path = self.local_rules_dir / (filename+'.lua')
+            local_path = self._safe_rule_path(filename + '.lua')
             with open(local_path, 'wb') as f:
                 f.write(remote_rule.lua_content)
                 local_rule.hash = remote_content_hash
@@ -477,7 +509,7 @@ class RuleManager:
                         self.local_rules.pop(file)
                         if not file.endswith('.lua'):
                             file += '.lua'
-                        full_path = str(self.local_rules_dir / file)
+                        full_path = str(self._safe_rule_path(file))
                         self.safe_remove(full_path)
                     
                     for file in to_update_files:
@@ -494,7 +526,7 @@ class RuleManager:
                         content = remote_info.lua_content
                         if not file.endswith('.lua'):
                             file += '.lua'
-                        full_path = str(self.local_rules_dir / file)
+                        full_path = str(self._safe_rule_path(file))
                         with open(full_path, 'wb') as f:
                             f.write(content)
                     
@@ -683,7 +715,11 @@ class RuleManager:
     
     def get_local_rule_path(self, filename: str) -> Optional[Path]:
         """获取本地规则文件路径"""
-        path = self.local_rules_dir / filename
+        try:
+            path = self._safe_rule_path(filename)
+        except ValueError as e:
+            logger.error("非法规则名 %r: %s", filename, e)
+            return None
         return path if path.exists() else None
     
     def _restore_file_from_etcd(self, filename: str) -> None:
@@ -696,7 +732,11 @@ class RuleManager:
             return
 
         local_rule = self.local_rules.get(name)
-        local_path = self.local_rules_dir / filename
+        try:
+            local_path = self._safe_rule_path(filename)
+        except ValueError as e:
+            logger.error("非法规则名 %r: %s", filename, e)
+            return
         if os.path.exists(local_path):
             hash = None
             with open(local_path, 'rb') as f:
@@ -721,7 +761,11 @@ class RuleManager:
     def _update_local_rule_info(self, filename: str, action: str) -> None:
         """根据修改类型更新或新建LocalRuleInfo"""
         name = filename.replace('.lua', '')
-        local_path = self.local_rules_dir / filename
+        try:
+            local_path = self._safe_rule_path(filename)
+        except ValueError as e:
+            logger.error("非法规则名 %r: %s", filename, e)
+            return
         
         if action == 'deleted':
             # 删除文件：移除LocalRuleInfo记录
