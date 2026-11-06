@@ -28,39 +28,76 @@
 
 // 公共工具函数
 namespace {
-    void send_all(int fd, const std::string& data) {
+    // 有界发送：客户端不读时返回 false，由调用方关闭连接。
+    // 绝不把负的 send() 返回值累加进 size_t（旧实现会回绕并静默截断）。
+    bool send_all(int fd, const std::string& data) {
         size_t sent = 0;
         while (sent < data.size()) {
-            ssize_t n = send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+            const ssize_t n = send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
             if (n < 0) {
-                spdlog::error("LocalRPC: send failed, errno: {}", errno);
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    spdlog::debug("LocalRPC: client stopped reading, dropping the response");
+                else
+                    spdlog::debug("LocalRPC: send failed, errno: {}", errno);
+                return false;
             }
-            sent += n;
+            if (n == 0) {
+                spdlog::debug("LocalRPC: send returned 0, dropping the response");
+                return false;
+            }
+            sent += static_cast<size_t>(n);
         }
         spdlog::trace("LocalRPC: sent {} bytes to client", sent);
+        return true;
+    }
+
+    // 250 ms 上限：健康的本地客户端足够，卡死的客户端不能长时间拖住 shutdown。
+    void set_client_timeouts(int fd) {
+        struct timeval tv{0, 250 * 1000};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 
     std::string recv_all(int fd) {
         std::string data;
         char buffer[4096];
-        
-        // 设置接收超时
-        struct timeval tv{1, 0}; // 1秒超时
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        
-        ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
-        if (n < 0) {
+
+        // Bounded read: an idle client must not own this thread, because
+        // stop() joins it. set_client_timeouts() installs both directions.
+        set_client_timeouts(fd);
+
+        // 单条请求上限，避免畸形/恶意客户端把服务端内存打满。
+        constexpr size_t kMaxRequestBytes = 8 * 1024 * 1024;
+
+        // 第一次阻塞读（受 SO_RCVTIMEO 约束），之后只排空已到达的数据，
+        // 不额外等待。这样 >4KB 的合法请求不会再被静默截断。
+        int flags = 0;
+        bool first = true;
+        while (true) {
+            const ssize_t n = recv(fd, buffer, sizeof(buffer), flags);
+            if (n > 0) {
+                if (data.size() + static_cast<size_t>(n) > kMaxRequestBytes) {
+                    spdlog::error("LocalRPC: request exceeds {} bytes, dropping", kMaxRequestBytes);
+                    return "";
+                }
+                data.append(buffer, static_cast<size_t>(n));
+                flags = MSG_DONTWAIT;
+                first = false;
+                continue;
+            }
+            if (n == 0) {
+                if (first) spdlog::debug("LocalRPC: client closed connection");
+                break;
+            }
+            if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                spdlog::debug("LocalRPC: receive timeout");
+                if (first) spdlog::debug("LocalRPC: receive timeout");
+                break;
             }
             spdlog::error("LocalRPC: recv failed, errno: {}", errno);
             return "";
         }
-        if (n == 0) {
-            spdlog::debug("LocalRPC: client closed connection");
-            return "";
-        }
-        data.append(buffer, n);
         spdlog::trace("LocalRPC: received {} bytes from client", data.size());
         return data;
     }
