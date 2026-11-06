@@ -329,8 +329,16 @@ class AppContext:
             self.service_registrar = None
     
     def _initialize_etcd_client(self) -> None:
-        """初始化Etcd客户端"""
+        """初始化Etcd客户端
+
+        etcd 只用于远程规则/配置下发与注册信息；两者都关闭时不必建立连接，
+        避免无谓地尝试明文 etcd。
+        """
         if not self.service_registrar:
+            return
+        if not (self._get_config_value('rule_manager.enabled')
+                or self._get_config_value('config_manager.enabled')):
+            logger.info("✓ EtcdClient初始化跳过（rule_manager/config_manager 均未启用）")
             return
         try:
             status = self.service_registrar.get_status()
@@ -338,7 +346,11 @@ class AppContext:
                 host=status['etcd_addr'],
                 port=status['etcd_port']
             )
-            logger.debug(f"EtcdClient连接信息: {status['etcd_addr']}:{status['etcd_port']}")
+            if not self.etcd_client.is_connected():
+                logger.warning("⚠ EtcdClient未连接（TLS/认证/网络），后续组件使用本地模式")
+                self.etcd_client = None
+                return
+            logger.debug("EtcdClient连接信息: %s:%s", status['etcd_addr'], status['etcd_port'])
             logger.info("✓ EtcdClient初始化成功")
         except Exception as e:
             logger.warning(f"⚠ EtcdClient初始化失败，后续组件将使用本地模式: {e}")

@@ -12,35 +12,80 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # etcd_client.py
+import os
 import threading
 import logging
+from pathlib import Path
 from typing import Optional, Tuple, Any, Callable, Dict, List, Union
 import etcd3
 
 logger = logging.getLogger(__name__)
 
+TLS_ENV = {
+    "ca_cert": "JOBLENS_ETCD_CA_CERT",
+    "cert_key": "JOBLENS_ETCD_CERT_KEY",
+    "cert_cert": "JOBLENS_ETCD_CERT_CERT",
+    "user": "JOBLENS_ETCD_USER",
+    "password": "JOBLENS_ETCD_PASSWORD",
+}
+TLS_REQUIRED_ENV = "JOBLENS_ETCD_TLS_REQUIRED"
+
+_FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
+
+
+def _env(name: str) -> Optional[str]:
+    value = os.environ.get(name, "")
+    value = value.strip()
+    return value or None
+
+
+def _tls_required() -> bool:
+    """etcd 是否必须使用 TLS。
+
+    默认要求；只有显式设置 JOBLENS_ETCD_TLS_REQUIRED=off 才允许明文，
+    用于还没有 etcd TLS 的过渡环境。
+    """
+    raw = os.environ.get(TLS_REQUIRED_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _FALSE_VALUES
+
+
 class EtcdClient:
     """Etcd客户端封装类"""
-    
+
     def __init__(
         self, 
         host: str = "localhost", 
         port: int = 2379,
         timeout: Optional[int] = None,
+        ca_cert: Optional[str] = None,
+        cert_key: Optional[str] = None,
+        cert_cert: Optional[str] = None,
+        user: Optional[str] = None,
+        password: Optional[str] = None,
         **kwargs
     ):
         """
         初始化etcd客户端
-        
+
         Args:
             host: etcd主机地址
             port: etcd端口
             timeout: 超时时间（秒）
+            ca_cert/cert_key/cert_cert: mTLS 证书路径；未显式传入时读环境变量
+            user/password: etcd 认证；未显式传入时读环境变量
             **kwargs: 其他etcd连接参数
         """
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.ca_cert = ca_cert or _env(TLS_ENV["ca_cert"])
+        self.cert_key = cert_key or _env(TLS_ENV["cert_key"])
+        self.cert_cert = cert_cert or _env(TLS_ENV["cert_cert"])
+        self.user = user or _env(TLS_ENV["user"])
+        self.password = password or _env(TLS_ENV["password"])
+        self.tls_required = _tls_required()
         self._client = None
         self._connected = False
         self._watch_threads: Dict[str, threading.Thread] = {}
@@ -49,30 +94,69 @@ class EtcdClient:
         
         # 尝试连接
         self.connect()
-    
+
+    def _validate_tls(self) -> Optional[str]:
+        """校验 TLS 配置，返回错误原因；None 表示可以连接。"""
+        pair = (self.cert_key, self.cert_cert)
+        if bool(pair[0]) != bool(pair[1]):
+            return "cert_key 与 cert_cert 必须同时提供"
+        if self.tls_required and not self.ca_cert:
+            return (
+                f"etcd TLS 已启用但缺少 CA 证书；请设置 {TLS_ENV['ca_cert']}，"
+                f"或显式设置 {TLS_REQUIRED_ENV}=off（不推荐）"
+            )
+        for label, path in (("CA", self.ca_cert), ("cert_key", self.cert_key), ("cert_cert", self.cert_cert)):
+            if path and not Path(path).is_file():
+                return f"etcd {label} 文件不存在: {path}"
+        if self.tls_required and not (self.user and self.password):
+            logger.warning("etcd TLS 已启用但未提供认证信息（%s/%s）", TLS_ENV["user"], TLS_ENV["password"])
+        return None
+
     def connect(self) -> bool:
-        """连接到etcd服务器"""
+        """连接到etcd服务器；TLS 配置不完整时拒绝连接，不回退明文。"""
+        self._connected = False
+        self._client = None
+
+        error = self._validate_tls()
+        if error:
+            logger.error("拒绝连接 etcd %s:%s: %s", self.host, self.port, error)
+            return False
+
+        if not self.ca_cert and not self.cert_cert:
+            logger.warning(
+                "etcd %s:%s 正在使用明文 gRPC（%s=off）；控制面内容可被网络读取/篡改",
+                self.host, self.port, TLS_REQUIRED_ENV,
+            )
+
+        client_kwargs = {
+            "host": self.host,
+            "port": self.port,
+        }
+        if self.timeout:
+            client_kwargs["timeout"] = self.timeout
+        if self.ca_cert:
+            client_kwargs["ca_cert"] = self.ca_cert
+        if self.cert_key:
+            client_kwargs["cert_key"] = self.cert_key
+        if self.cert_cert:
+            client_kwargs["cert_cert"] = self.cert_cert
+        if self.user:
+            client_kwargs["user"] = self.user
+        if self.password:
+            client_kwargs["password"] = self.password
+
         try:
-            if self.timeout:
-                self._client = etcd3.client(
-                    host=self.host,
-                    port=self.port,
-                    timeout=self.timeout
-                )
-            else:
-                self._client = etcd3.client(
-                    host=self.host,
-                    port=self.port
-                )
-            
+            self._client = etcd3.client(**client_kwargs)
+
             # 测试连接
             self._client.get('/')
             self._connected = True
-            logger.info(f"成功连接到etcd: {self.host}:{self.port}")
+            scheme = "https" if self.ca_cert else "http"
+            logger.info("成功连接到etcd: %s://%s:%s", scheme, self.host, self.port)
             return True
             
         except Exception as e:
-            logger.error(f"连接etcd失败: {e}")
+            logger.error("连接etcd失败: %s", e)
             self._connected = False
             self._client = None
             return False

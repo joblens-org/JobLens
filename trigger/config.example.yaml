@@ -34,6 +34,13 @@ rule_manager:
 lens_config:
   rpc_timeout: 5.0  # RPC timeout (seconds)
 
+# etcd（仅 rule_manager / config_manager 启用时使用）
+# 连接默认要求 TLS，证书/认证全部从环境变量读取，不写进本文件：
+#   JOBLENS_ETCD_CA_CERT / JOBLENS_ETCD_CERT_KEY / JOBLENS_ETCD_CERT_CERT
+#   JOBLENS_ETCD_USER   / JOBLENS_ETCD_PASSWORD
+# 尚未部署 etcd TLS 的过渡环境需显式设置 JOBLENS_ETCD_TLS_REQUIRED=off（不推荐，
+# 明文 gRPC 可被网络读取/篡改，并能间接改变 root 进程行为）。
+
 # Email notification configuration (sensitive info read from environment variables)
 email_notifier:
   smtp_server: "smtp.example.com"  # SMTP server, overridden by EMAIL_SMTP_SERVER env var
