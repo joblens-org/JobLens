@@ -227,9 +227,9 @@ void slurm_steps_and_pid_reuse()
     const ProcessIdentity base{4242, 123456, "boot-1"};
     check(base.complete(), "fully populated process identity is complete");
     check(base == ProcessIdentity{4242, 123456, "boot-1"}, "identical triples are equal");
-    check(base != ProcessIdentity{4242, 123457, "boot-1"},
+    check(!(base == ProcessIdentity{4242, 123457, "boot-1"}),
           "same PID with new start ticks is a reused PID, not the same process");
-    check(base != ProcessIdentity{4242, 123456, "boot-2"},
+    check(!(base == ProcessIdentity{4242, 123456, "boot-2"}),
           "same PID across reboots is not the same process");
     check(!ProcessIdentity{4242, 0, ""}.complete(), "partial process identity");
 
