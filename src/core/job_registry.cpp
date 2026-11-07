@@ -332,8 +332,56 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
 
     // The registry owns the records; the store is the persistence executor
     // (it opens the db and admits the schema). Rows are loaded and validated
-    // HERE with the same probe the admission gate uses, so a row cannot be
+    // with the same probe the admission gate uses, so a row cannot be
     // published as verified here and refused there (or worse, vice versa).
+    openStore(options);
+    restoreExistingRecords();
+
+    // Selection validation is registry-owned: one gate for the RPC surface and
+    // the automatic-selection path.
+    installCollectorValidator();
+
+    // Attribution owns the kernel map namespace, so it must exist before any
+    // discovery admission or collector attachment. The capability gate is
+    // installed by armInventory below, before the initial pass.
+    if (options.enable_pid_tracker) init_pid_tracker();
+
+    // Restored active records must be re-seeded into the kernel namespace this
+    // process now owns, before any collector can attach to them.
+    admitRestoredOwners();
+
+    // Inventory startup, in the order that matters: reset the heartbeat
+    // bookkeeping and install the registration sink (both BEFORE the wiring
+    // decision, so a Disabled registry exits in the same state as today),
+    // then arm the components (adapters, policies, probes, capability gate —
+    // the gate must exist before the first pass), then start the sources
+    // (the sink must exist before any poll thread), run the first
+    // authoritative pass (blocking: the inventory is settled before the RPC
+    // surface opens), publish the status providers and finally start the
+    // maintenance worker.
+    if (options.enable_inventory_maintenance) {
+        resetHeartbeatState();
+        installHeartbeatSink();
+        const InventoryWiring wiring = armInventory(options);
+        if (wiring != InventoryWiring::Disabled) {
+            startDiscoverySources(wiring);
+            runInitialInventoryPass();
+            publishStatusProvider();
+            startHeartbeat();
+            if (wiring == InventoryWiring::Test)
+                spdlog::info("JobRegistry: heartbeat running with {} test source(s)",
+                             hb_sources_.size());
+            else
+                spdlog::info("JobRegistry: inventory heartbeat running with {} discovery type(s)",
+                             hb_sources_.size());
+        }
+    }
+
+    if (options.register_rpc) regRPCHandle();
+}
+
+void JobRegistry::openStore(const JobRegistryOptions& options)
+{
     JobStore::Options store_options;
     store_options.db_path = options.db_path;
     store_ = std::make_unique<JobStore>(store_options);
@@ -343,11 +391,6 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
         if (it == records_.end()) return std::nullopt;
         return it->second;
     });
-    {
-        auto rows = store_->loadAll();
-        validateRestoredExecutions(rows);
-        for (auto& row : rows) publishRecord(std::move(row));
-    }
     if (store_->ready()) {
         const auto health = store_->health();
         spdlog::info("JobRegistry: store ready (schema {}, migration {})",
@@ -355,28 +398,27 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
     } else {
         spdlog::warn("JobRegistry: job db not running");
     }
+}
 
-    // Selection validation is registry-owned: one gate for the RPC surface and
-    // the automatic-selection path.
-    {
-        const auto known = known_collector_names();
-        setCollectorValidator(
-            [known](const std::string& name) { return known.count(name) != 0; });
+void JobRegistry::restoreExistingRecords()
+{
+    auto rows = store_->loadAll();
+    validateRestoredExecutions(rows);
+    for (auto& row : rows) publishRecord(std::move(row));
+}
+
+void JobRegistry::installCollectorValidator()
+{
+    const auto known = known_collector_names();
+    setCollectorValidator(
+        [known](const std::string& name) { return known.count(name) != 0; });
+}
+
+void JobRegistry::runInitialInventoryPass()
+{
+    if (!runPass(true, /*wait=*/true)) {
+        spdlog::warn("JobRegistry: the initial inventory pass did not run");
     }
-
-
-    // Attribution owns the kernel map namespace, so it must exist before any
-    // discovery admission or collector attachment. The capability gate is
-    // installed by resolve_inventory_components before the initial pass.
-    if (options.enable_pid_tracker) init_pid_tracker();
-
-    // Restored active records must be re-seeded into the kernel namespace this
-    // process now owns, before any collector can attach to them.
-    admitRestoredOwners();
-
-    if (options.enable_inventory_maintenance) init_inventory(options);
-
-    if (options.register_rpc) regRPCHandle();
 }
 
 JobRegistry& JobRegistry::instance() {
@@ -977,53 +1019,43 @@ void JobRegistry::retractStatusProvider() {
     }
 }
 
-void JobRegistry::init_inventory(const JobRegistryOptions& options)
+// Heartbeat bookkeeping reset. Idempotent across test registries; runs
+// before the wiring decision so a Disabled registry exits with the same
+// state it would have had today (sink installed, nothing started).
+void JobRegistry::resetHeartbeatState()
 {
-    // Prepare heartbeat state (idempotent across test registries).
-    {
-        std::lock_guard<std::mutex> lock(hb_mtx_);
-        hb_admitted_ = true;
-        hb_stopping_ = false;
-        hb_running_ = false;
-        hb_wake_ = false;
-        degraded_ = false;
-        incomplete_drain_ = false;
-        hb_last_error_.clear();
-        absences_.clear();
-        suspect_ids_.clear();
-        ended_generations_.clear();
-        closing_generations_.clear();
-        last_scan_start_ms_ = 0;
-        last_scan_success_ms_ = 0;
-        last_scan_complete_ = false;
-        hb_passes_ = 0;
-        hb_stop_errors_ = 0;
-    }
-    installHeartbeatSink();
-
-    const InventoryWiring wiring = resolve_inventory_components(options);
-    if (wiring == InventoryWiring::Disabled) return;
-
-    // Sink first, then the poll threads, the initial authoritative pass, the
-    // status provider and finally the worker.
-    startDiscoverySources(wiring);
-    if (!runPass(true, /*wait=*/true)) {
-        spdlog::warn("JobRegistry: the initial inventory pass did not run");
-    }
-    publishStatusProvider();
-    startHeartbeat();
-
-    if (wiring == InventoryWiring::Test)
-        spdlog::info("JobRegistry: heartbeat running with {} test source(s)",
-                     hb_sources_.size());
-    else
-        spdlog::info("JobRegistry: inventory heartbeat running with {} discovery type(s)",
-                     hb_sources_.size());
+    std::lock_guard<std::mutex> lock(hb_mtx_);
+    hb_admitted_ = true;
+    hb_stopping_ = false;
+    hb_running_ = false;
+    hb_wake_ = false;
+    degraded_ = false;
+    incomplete_drain_ = false;
+    hb_last_error_.clear();
+    absences_.clear();
+    suspect_ids_.clear();
+    ended_generations_.clear();
+    closing_generations_.clear();
+    last_scan_start_ms_ = 0;
+    last_scan_success_ms_ = 0;
+    last_scan_complete_ = false;
+    hb_passes_ = 0;
+    hb_stop_errors_ = 0;
 }
 
+// Arms the inventory components from the resolved configuration: one adapter
+// per configured type, the automatic-selection policies, the production
+// liveness probes and the kernel-attribution capability gate. Nothing is
+// started here; the caller starts sources and the first pass afterwards, so
+// the gate is guaranteed to exist before any attribution can activate.
 JobRegistry::InventoryWiring
-JobRegistry::resolve_inventory_components(const JobRegistryOptions& options)
+JobRegistry::armInventory(const JobRegistryOptions& options)
 {
+    // Symmetric resets first: every exit path (including failures) leaves the
+    // same armed-state behind.
+    adapters_.clear();
+    auto_policies_.clear();
+
     // Test wiring: pre-built sources and injected probes, no configuration
     // and no automatic selection.
     if (!options.test_sources.empty() || options.test_heartbeat) {
@@ -1054,7 +1086,6 @@ JobRegistry::resolve_inventory_components(const JobRegistryOptions& options)
     // Exactly one adapter per configured scheduler name, built through the
     // self-registration registry; the heartbeat drives them through
     // IDiscoverySource and owns no adapter details.
-    adapters_.clear();
     for (const auto& name : config.types) {
         const auto& settings = config.settings.at(name);
         auto adapter = SchedulerAdapterRegistry::instance().build(name, settings);
@@ -1076,7 +1107,6 @@ JobRegistry::resolve_inventory_components(const JobRegistryOptions& options)
     // Automatic selection is armed per adapter name: use_rules=false adds the
     // configured defaults to every job, use_rules=true asks the rule engine
     // per job (reject = empty selection, the job stays inventoried).
-    auto_policies_.clear();
     for (const auto& [adapter_name, settings] : config.settings) {
         if (!settings.auto_collect) continue;
         if (settings.use_rules)

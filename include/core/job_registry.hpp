@@ -298,8 +298,17 @@ private:
     // drives, once, before any source starts. Test wiring copies the
     // constructor-provided seams verbatim; production resolves the
     // configuration and builds one adapter per configured type.
-    InventoryWiring resolve_inventory_components(const JobRegistryOptions& options);
-    void init_inventory(const JobRegistryOptions& options);
+    // Construction phases, called in order by the constructor: open the
+    // store, restore and validate existing rows, gate collector names, arm
+    // the inventory components (adapters/policies/probes/capability gate),
+    // then start sources, the first authoritative pass, the status providers
+    // and the maintenance worker.
+    void openStore(const JobRegistryOptions& options);
+    void restoreExistingRecords();
+    void installCollectorValidator();
+    void resetHeartbeatState();
+    InventoryWiring armInventory(const JobRegistryOptions& options);
+    void runInitialInventoryPass();
     // Admit restored active records to kernel ownership through the single
     // admission path (a restarted process starts with an empty namespace).
     void admitRestoredOwners();
@@ -477,7 +486,7 @@ private:
     ProcessLivenessProbe process_probe_;
     CgroupMembershipProbe cgroup_probe_;
     // Every discovery source the heartbeat drives (adapters or test sources),
-    // populated by resolve_inventory_components().
+    // populated by armInventory().
     std::vector<std::pair<std::string, IDiscoverySource*>> hb_sources_;
     DiscoverySink heartbeat_sink_;
     // Control-plane validation. Guarded because tests install it after
