@@ -1104,17 +1104,24 @@ JobRegistry::armInventory(const JobRegistryOptions& options)
                      "existing records are still maintained");
     }
 
-    // Automatic selection is armed per adapter name: use_rules=false adds the
-    // configured defaults to every job, use_rules=true asks the rule engine
-    // per job (reject = empty selection, the job stays inventoried).
+    // Automatic selection is armed per adapter name from the resolved
+    // tri-state: Default adds the configured defaults to every job, Rule
+    // asks the rule engine per job (reject = empty selection, the job stays
+    // inventoried). Off arms nothing — the type is inventoried with no
+    // automatic collectors.
     for (const auto& [adapter_name, settings] : config.settings) {
-        if (!settings.auto_collect) continue;
-        if (settings.use_rules)
-            auto_policies_[adapter_name] =
-                AutoCollectorPolicy::rules(settings.rules_dir, settings.rules_prefix);
-        else
-            auto_policies_[adapter_name] =
-                AutoCollectorPolicy::defaults(settings.default_collectors);
+        switch (settings.auto_add) {
+            case AutoAdd::Off:
+                break;
+            case AutoAdd::Default:
+                auto_policies_[adapter_name] =
+                    AutoCollectorPolicy::defaults(settings.default_collectors);
+                break;
+            case AutoAdd::Rule:
+                auto_policies_[adapter_name] =
+                    AutoCollectorPolicy::rules(settings.rules_dir, settings.rules_prefix);
+                break;
+        }
     }
 
     hb_sources_.clear();

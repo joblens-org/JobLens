@@ -496,6 +496,83 @@ void case_config()
         }
         check(threw, "config: an interval below one second must reject startup");
     }
+    {
+        // Tri-state auto_add: the explicit key wins, and each legacy pair
+        // combination folds onto the same resolved state.
+        const auto resolve = [](const nlohmann::json& document) {
+            return resolve_inventory_maintenance_config(document);
+        };
+        const auto condor_add = [](const char* auto_add) {
+            nlohmann::json watcher{{"auto_add", auto_add}};
+            return nlohmann::json{
+                {"job_registry_config", nlohmann::json{
+                    {"inventory", nlohmann::json{{"types", nlohmann::json::array({"condor"})}}},
+                }},
+                {"condor_job_watcher", std::move(watcher)},
+            };
+        };
+        check(resolve(condor_add("off")).settings.at("condor").auto_add == AutoAdd::Off,
+              "config: explicit auto_add=off resolves to Off");
+        check(resolve(condor_add("default")).settings.at("condor").auto_add ==
+                  AutoAdd::Default,
+              "config: explicit auto_add=default resolves to Default");
+        check(resolve(condor_add("rule")).settings.at("condor").auto_add == AutoAdd::Rule,
+              "config: explicit auto_add=rule resolves to Rule");
+
+        const auto with_pair = [](bool auto_collect, std::optional<bool> use_rules) {
+            nlohmann::json watcher{{"auto_collect", auto_collect}};
+            if (use_rules) watcher["use_rules"] = *use_rules;
+            return nlohmann::json{
+                {"job_registry_config", nlohmann::json{
+                    {"inventory", nlohmann::json{{"types", nlohmann::json::array({"condor"})}}},
+                }},
+                {"condor_job_watcher", std::move(watcher)},
+            };
+        };
+        check(resolve(with_pair(false, std::nullopt)).settings.at("condor").auto_add ==
+                  AutoAdd::Off,
+              "config: auto_collect=false maps to Off");
+        check(resolve(with_pair(false, true)).settings.at("condor").auto_add == AutoAdd::Off,
+              "config: auto_collect=false maps to Off regardless of use_rules");
+        check(resolve(with_pair(true, false)).settings.at("condor").auto_add ==
+                  AutoAdd::Default,
+              "config: auto_collect=true + use_rules=false maps to Default");
+        check(resolve(with_pair(true, true)).settings.at("condor").auto_add ==
+                  AutoAdd::Rule,
+              "config: auto_collect=true + use_rules=true maps to Rule");
+
+        // The explicit tri-state beats a contradicting legacy pair.
+        {
+            const auto config = resolve(nlohmann::json{
+                {"job_registry_config", nlohmann::json{
+                    {"inventory", nlohmann::json{{"types", nlohmann::json::array({"condor"})}}},
+                }},
+                {"condor_job_watcher", nlohmann::json{
+                    {"auto_add", "off"},
+                    {"auto_collect", true},
+                    {"use_rules", true},
+                }},
+            });
+            check(config.settings.at("condor").auto_add == AutoAdd::Off,
+                  "config: an explicit auto_add wins over the legacy pair");
+        }
+        // The legacy flag folds into the same mapping (Default here).
+        {
+            const auto config = resolve(nlohmann::json{
+                {"job_registry_config", nlohmann::json{{"auto_add_condorjob", true}}},
+            });
+            check(config.settings.at("condor").auto_add == AutoAdd::Default,
+                  "config: the legacy auto_add flag folds onto Default");
+        }
+        // An invalid tri-state value rejects startup.
+        bool threw = false;
+        try {
+            (void)resolve(condor_add("sometimes"));
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        check(threw, "config: an invalid auto_add value must reject startup");
+    }
     pass_case("CONFIG", "section 8 precedence, defaults and startup rejection");
 }
 

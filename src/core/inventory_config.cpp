@@ -258,6 +258,23 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
             if (const auto* use_rules = member(*node, "use_rules")) {
                 settings.use_rules = parse_bool(*use_rules, prefix + "use_rules");
             }
+            if (const auto* auto_add = member(*node, "auto_add")) {
+                // The tri-state key is the contract; an explicit value wins
+                // over every legacy combination once resolution completes.
+                const std::string text = scalar_text(*auto_add, prefix + "auto_add");
+                if (text == "off") {
+                    settings.auto_add = AutoAdd::Off;
+                } else if (text == "default") {
+                    settings.auto_add = AutoAdd::Default;
+                } else if (text == "rule") {
+                    settings.auto_add = AutoAdd::Rule;
+                } else {
+                    config_error(prefix + "auto_add must be one of off/default/rule, "
+                                         "got '" +
+                                 text + "'");
+                }
+                settings.auto_add_explicit = true;
+            }
             if (const auto* defaults = member(*node, "auto_add_collectors")) {
                 if (!defaults->is_array())
                     config_error(prefix + "auto_add_collectors must be a list");
@@ -307,6 +324,19 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
                      "into inventory discovery with automatic collection; set {}.auto_collect "
                      "explicitly to override",
                      legacy.key, section_of(legacy.adapter));
+    }
+
+    // Resolve the tri-state for every type: an explicit `auto_add` stands;
+    // everything else derives from the legacy pair (auto_collect already
+    // carries the legacy flag folding by this point).
+    for (auto& [name, settings] : resolved.settings) {
+        if (settings.auto_add_explicit) continue;
+        if (!settings.auto_collect)
+            settings.auto_add = AutoAdd::Off;
+        else if (settings.use_rules)
+            settings.auto_add = AutoAdd::Rule;
+        else
+            settings.auto_add = AutoAdd::Default;
     }
     return resolved;
 }

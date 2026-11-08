@@ -35,18 +35,39 @@
 #include "core/collector_type.h"
 #include "core/job_discovery.hpp"
 
+// Tri-state automatic-addition policy for one scheduler type (the resolved
+// form of the auto_collect/use_rules pair and the legacy auto_add_<type>job
+// flags). Off is the default: the automatic path takes no action for the
+// type. Default registers discovered jobs and arms the configured default
+// collector list. Rule registers them and lets the Lua rule engine decide.
+enum class AutoAdd {
+    Off,
+    Default,
+    Rule,
+};
+
 // Resolved settings for one scheduler type (v2: keyed by adapter name).
 // `inventory` mirrors job_registry_config.inventory.types membership;
-// `auto_collect` resolution precedence:
-//   explicit <type>_job_watcher.auto_collect  wins
-//   otherwise   job_registry_config.auto_add_<type>job (legacy)
-//   otherwise   false
+// `auto_add` resolution precedence:
+//   explicit <type>_job_watcher.auto_add (off/default/rule)  wins
+//   otherwise derived from the legacy pair:
+//     auto_collect=false                 -> Off
+//     auto_collect=true + use_rules=false -> Default
+//     auto_collect=true + use_rules=true  -> Rule
+//   with job_registry_config.auto_add_<type>job (legacy) folded into
+//   auto_collect first.
 struct InventoryTypeSettings {
     bool inventory = false;
+    // DEPRECATED as an input contract: auto_collect/use_rules (and the
+    // explicit/legacy provenance flags below) remain parsed and tracked as
+    // the mapping sources for one more schema version; consumers read the
+    // resolved `auto_add` instead.
     bool auto_collect = false;
     bool auto_collect_explicit = false;
     bool legacy_auto_collect = false;
     bool use_rules = false;
+    AutoAdd auto_add = AutoAdd::Off;
+    bool auto_add_explicit = false;
     std::string rules_dir;
     std::string rules_prefix;
     // Legacy auto_add_* folding: collectors added to every job of this type
