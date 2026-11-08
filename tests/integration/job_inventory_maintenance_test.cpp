@@ -36,6 +36,8 @@
  *   A25  heartbeat stop is idempotent and ordered; a failed source start is
  *        not fatal; an interrupted closing survives a restart and archives
  *   A28  unknown cgroup members are not death evidence; confirmed death retires
+ *   RETIRE-EXPLICIT an explicit retirement marks the ended generation; a
+ *        late same-generation observation is refused, a new one registers
  *   LEGACY  manual registrations retire on process evidence without a source
  *   RESCAN  event-driven and on-demand passes run the same reconcile path
  *   EXEC    exec hints resolve to targeted observations without a full scan
@@ -1390,6 +1392,65 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
 }
 
 // ---------------------------------------------------------------------------
+// RETIRE-EXPLICIT - an explicit retirement marks the ended generation
+// ---------------------------------------------------------------------------
+
+void run_retire_explicit(const std::string& base)
+{
+    FakeSource source("condor");
+    FakeProbes probes;
+    const Job job =
+        make_condor_job("310.0", 5400, 888, "htcondor01", "schedd-a", "/cg/slot-31");
+    probes.set_process(5400, LivenessState::Alive, 888);
+    source.set_scan([&]() { return scan_with({job}); });
+    JobRegistry registry(
+        heartbeat_options(fresh_dir(base, "retire-explicit"), source, probes));
+
+    const auto active = find_native(registry, "310.0");
+    check(active.has_value(), "RETIRE-EXPLICIT: the live instance was not inventoried");
+    const std::uint64_t retired_id = active->internal_id;
+
+    // Explicit retirement while every process is still alive: no evidence
+    // path runs, so the command itself must mark the ended generation.
+    check(registry.retireInstance(retired_id),
+          "RETIRE-EXPLICIT: the explicit retirement was refused");
+    check(!find_native(registry, "310.0").has_value(),
+          "RETIRE-EXPLICIT: the retired instance stayed active");
+
+    // A scan observation of the SAME execution generation must not
+    // re-register the retired instance: isObsolete() refuses it.
+    const std::uint64_t obsolete_before =
+        heartbeat_status()["obsolete_hints"].get<std::uint64_t>();
+    check(registry.reconcileInventoryNow(),
+          "RETIRE-EXPLICIT: the post-retirement pass did not run");
+    check(!find_native(registry, "310.0").has_value(),
+          "RETIRE-EXPLICIT: a same-generation observation resurrected the "
+          "explicitly retired instance");
+    check(heartbeat_status()["obsolete_hints"].get<std::uint64_t>() > obsolete_before,
+          "RETIRE-EXPLICIT: the refused observation was not counted as obsolete");
+
+    // A NEW generation (different manager, different start ticks) registers
+    // as a new instance: the mark is per generation, never per identity.
+    const Job revived =
+        make_condor_job("310.0", 5401, 889, "htcondor01", "schedd-a", "/cg/slot-31");
+    probes.set_process(5401, LivenessState::Alive, 889);
+    source.set_scan([&]() { return scan_with({revived}); });
+    check(registry.reconcileInventoryNow(),
+          "RETIRE-EXPLICIT: the revival pass did not run");
+    const auto revived_record = find_native(registry, "310.0");
+    check(revived_record.has_value() &&
+              revived_record->job.execution->generation.manager_pid == 5401,
+          "RETIRE-EXPLICIT: a new generation was refused after the explicit "
+          "retirement");
+    check(count_records(registry) == 1, "RETIRE-EXPLICIT: unexpected record count");
+
+    registry.deinit();
+    pass_case("RETIRE-EXPLICIT",
+              "explicit retirement marks the ended generation; a same-generation "
+              "observation is refused, a new generation registers");
+}
+
+// ---------------------------------------------------------------------------
 // RESCAN - event-driven and on-demand passes
 // ---------------------------------------------------------------------------
 
@@ -1449,6 +1510,7 @@ int main(int argc, char** argv)
         run_a28(base);
         run_legacy(base);
         run_restore_unknown_keeps_evidence(base);
+        run_retire_explicit(base);
         run_rescan(base);
         std::cout << "ALL PASS\n";
         return 0;

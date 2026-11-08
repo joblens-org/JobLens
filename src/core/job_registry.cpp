@@ -1757,6 +1757,14 @@ bool JobRegistry::retireInstance(uint64_t jobID) {
                           "retirement refused (the record stays active)", jobID);
             return false;
         }
+        // The heartbeat path (retireIfConfirmed) records the ended generation
+        // before retiring; an explicit retirement carries no such caller, so
+        // the mark is made here. It is idempotent (a map insert) and uses the
+        // record snapshot taken before the closing write, so the generation
+        // remembered is the one that actually ended. Without it, a late
+        // observation of the same execution would re-register the retired
+        // instance instead of being refused by isObsolete().
+        rememberEnded(*record);
         spdlog::info("JobRegistry: JobID {} is Closing; the collection runtime drains it",
                      jobID);
     }
