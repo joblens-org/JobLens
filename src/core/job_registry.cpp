@@ -681,10 +681,13 @@ std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const
         decision.policy_revision = revision;
         return decision;
     }
+    // Rules mode: reject = no registration at all (S1 off), unlike the
+    // blanket mode where a reject keeps the job inventoried with an
+    // empty selection. NOTE: select() currently conflates "rule said
+    // reject" with "rule said accept with zero collectors" — both return
+    // an empty vector. Until select() exposes the verdict separately,
+    // an accept-with-empty-list is indistinguishable from reject here.
     if (collectors.empty()) {
-        // Rules mode: reject = no registration at all (S1 off), unlike the
-        // blanket mode where a reject keeps the job inventoried with an
-        // empty selection.
         std::lock_guard<std::mutex> lock(hb_mtx_);
         ++hb_rejected_observations_;
         return std::nullopt;
