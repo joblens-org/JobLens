@@ -433,8 +433,171 @@ void run(const std::string& base)
         registry.deinit();
     }
 
+    // Manual CRUD upsert (§9.4 merge): one entry point for the manual add and
+    // update routes. Identity hit → UPDATE (collectors union, facts fill-only);
+    // sub_attr duplicate without identity → UPDATE by internal id (the old
+    // duplicate refusal is gone); no hit → CREATE.
+    {
+        // --- identity route: add the same identity twice -------------------
+        {
+            JobRegistryOptions options;
+            options.db_path = fresh_dir(base, "lifecycle-upsert-identity");
+            options.enable_pid_tracker = false;
+            options.register_rpc = false;
+            JobRegistry registry(options);
+
+            NativeSelector selector;
+            selector.adapter = "condor";
+            selector.cluster_name = "htcondor01";
+            selector.native_job_id = "740.0";
+            ExecutionGeneration generation;
+            generation.boot_id = "boot";
+            generation.manager_pid = 4747;
+            generation.manager_start_ticks = 940000;
+            Job observation = discovered_job(
+                selector, generation, {ProcessIdentity{4747, 940000, "boot"}}, true);
+            observation.subtype = JobSubType::Condor;
+            observation.sub_attr = CondorJobAttr{};
+            std::get<CondorJobAttr>(observation.sub_attr).cluster_id = 740;
+            std::get<CondorJobAttr>(observation.sub_attr).proc_id = 0;
+
+            const auto created = registry.upsertObservedJob(observation);
+            check(created.ok && created.disposition == UpsertDisposition::Created,
+                  "upsert: the inventoried instance must exist");
+
+            Job manual;
+            manual.jobtype = JobType::Job;
+            manual.subtype = JobSubType::Condor;
+            manual.sub_attr = CondorJobAttr{};
+            std::get<CondorJobAttr>(manual.sub_attr).cluster_id = 740;
+            std::get<CondorJobAttr>(manual.sub_attr).proc_id = 0;
+            manual.CollectorNames = {"cpumem_collector"};
+
+            const auto first =
+                registry.upsertJob(manual, nlohmann::json::object(), selector);
+            check(first["status"] == "success",
+                  "upsert: the identity route must succeed: " + first.dump());
+            check(first["JobID"] == created.internal_id,
+                  "upsert: the identity route must resolve the existing id");
+            const uint64_t revision_first = first["record_revision"];
+            {
+                const auto binding = registry.selectionRecord(created.internal_id);
+                check(binding.mode() == CollectionMode::Manual &&
+                          binding.manual.has_value() &&
+                          *binding.manual == std::vector<std::string>{"cpumem_collector"},
+                      "upsert: the first manual add must set the manual selection");
+            }
+
+            manual.CollectorNames = {"io_collector"};
+            const auto second =
+                registry.upsertJob(manual, nlohmann::json::object(), selector);
+            check(second["status"] == "success",
+                  "upsert: the repeated identity add must succeed: " + second.dump());
+            check(second["JobID"] == created.internal_id,
+                  "upsert: the repeated add must keep the same instance");
+            const uint64_t revision_second = second["record_revision"];
+            check(revision_second > revision_first,
+                  "upsert: the second add must advance the record revision");
+            {
+                const auto binding = registry.selectionRecord(created.internal_id);
+                check(binding.manual.has_value() && binding.manual->size() == 2,
+                      "upsert: the second add must UNION into the manual selection, "
+                      "not replace it");
+            }
+
+            // Empty collectors on UPDATE = a pure facts update: valid, and the
+            // selection is untouched.
+            manual.CollectorNames.clear();
+            const auto facts_only =
+                registry.upsertJob(manual, nlohmann::json::object(), selector);
+            check(facts_only["status"] == "success",
+                  "upsert: an empty-collector update must stay valid: " + facts_only.dump());
+            {
+                const auto binding = registry.selectionRecord(created.internal_id);
+                check(binding.manual.has_value() && binding.manual->size() == 2,
+                      "upsert: a facts-only update must not touch the selection");
+            }
+            registry.deinit();
+        }
+
+        // --- sub_attr route: the duplicate refusal became an update --------
+        {
+            JobRegistryOptions options;
+            options.db_path = fresh_dir(base, "lifecycle-upsert-subattr");
+            options.enable_pid_tracker = false;
+            options.register_rpc = false;
+            JobRegistry registry(options);
+
+            // A Condor-typed manual row (the Common matcher matches nothing by
+            // definition); no identity selector is passed, so only the typed
+            // facts route the request.
+            Job manual;
+            manual.jobtype = JobType::Job;
+            manual.subtype = JobSubType::Condor;
+            manual.NativeJobID = "810.0";
+            manual.sub_attr = CondorJobAttr{};
+            std::get<CondorJobAttr>(manual.sub_attr).cluster_id = 810;
+            std::get<CondorJobAttr>(manual.sub_attr).proc_id = 0;
+            manual.CollectorNames = {"cpumem_collector"};
+            check(registry.addJob(manual), "upsert: the manual create must succeed");
+            const uint64_t created_id = registry.inventoryRecords().front().internal_id;
+            const uint64_t revision_before =
+                registry.inventoryRecord(created_id)->revision;
+
+            Job repeat = manual;
+            repeat.CollectorNames = {"io_collector"};
+            const auto updated =
+                registry.upsertJob(repeat, nlohmann::json::object(), std::nullopt);
+            check(updated["status"] == "success",
+                  "upsert: a sub_attr duplicate must update, not error: " + updated.dump());
+            check(updated["JobID"] == created_id,
+                  "upsert: the sub_attr route must resolve the existing id: " +
+                      updated.dump());
+            check(registry.inventoryRecords().size() == 1,
+                  "upsert: the sub_attr route must not create a second record");
+            const auto binding = registry.selectionRecord(created_id);
+            check(binding.manual.has_value() && binding.manual->size() == 2 &&
+                      (*binding.manual)[0] == "cpumem_collector",
+                  "upsert: the sub_attr update must union into the manual selection");
+            check(registry.inventoryRecord(created_id)->revision > revision_before,
+                  "upsert: the sub_attr update must advance the revision");
+            registry.deinit();
+        }
+
+        // --- no hit: CREATE keeps the legacy semantics ---------------------
+        {
+            JobRegistryOptions options;
+            options.db_path = fresh_dir(base, "lifecycle-upsert-create");
+            options.enable_pid_tracker = false;
+            options.register_rpc = false;
+            JobRegistry registry(options);
+
+            Job manual = make_common_job();
+            manual.NativeJobID = "820.0";
+            const auto created = registry.upsertJob(manual, nlohmann::json::object());
+            check(created["status"] == "success",
+                  "upsert: a fresh manual add must create: " + created.dump());
+            check(registry.inventoryRecords().size() == 1,
+                  "upsert: the create branch must persist one record");
+
+            Job empty_collectors = manual;
+            empty_collectors.NativeJobID = "830.0";
+            empty_collectors.CollectorNames.clear();
+            const auto refused =
+                registry.upsertJob(empty_collectors, nlohmann::json::object());
+            check(refused["status"] == "error",
+                  "upsert: empty collectors on CREATE must stay rejected");
+            check(registry.inventoryRecords().size() == 1,
+                  "upsert: the rejected create must persist nothing");
+            registry.deinit();
+        }
+    }
+
     pass_case("LIFECYCLE",
               "construction starts inventory, stop/deinit are idempotent and ordered");
+    pass_case("UPSERT",
+              "manual upsert: identity/sub_attr routes update with collector union, "
+              "a fresh add creates, create still rejects empty collectors");
     pass_case("AUTOPOLICY",
               "auto_add folding selects collectors on registration; rules decide per job");
 }

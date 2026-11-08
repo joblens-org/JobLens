@@ -568,74 +568,6 @@ std::optional<NativeSelector> legacy_add_selector(const Job& job, const nlohmann
     return selector;
 }
 
-// Returns a final response when the legacy add resolved to an inventoried
-// instance, or nullopt when the request must fall back to legacy registration.
-std::optional<nlohmann::json> try_legacy_add_by_identity(JobRegistry& registry,
-                                                         const Job& job,
-                                                         const nlohmann::json& req)
-{
-    const auto selector = legacy_add_selector(job, req);
-    if (!selector || job.CollectorNames.empty()) return std::nullopt;
-
-    const auto resolved =
-        resolve_native_target(registry, *selector, /*scope=*/"instance",
-                             /*ensure_registered=*/false);
-    if (!resolved.ok()) {
-        if (resolved.code == "not_found") return std::nullopt;
-        if (resolved.code == "ambiguous_selector")
-            return error_payload(resolved.code, resolved.message,
-                                 instance_ids_of(resolved.records));
-        return error_payload(resolved.code, resolved.message);
-    }
-
-    const auto& record = resolved.records.front();
-    CollectionRequest request;
-    request.targets = {record.internal_id};
-    request.collectors = job.CollectorNames;
-    const auto outcome = registry.setCollectors(request);
-    if (!outcome.ok) return error_payload(to_string(outcome.error), outcome.message);
-
-    const auto& target = outcome.targets.front();
-    nlohmann::json out;
-    out["status"] = "success";
-    // Legacy numeric field for old consumers; the value is the internal id of
-    // the existing instance, never a fresh allocation from the JobID hint.
-    out["JobID"] = target.internal_id;
-    out["internal_job_id"] = format_internal_id(target.internal_id);
-    out["instance_id"] = target.instance_id;
-    out["record_revision"] = target.revision;
-    out["mode"] = to_string(target.selection.mode());
-    out["desired_collectors"] = target.selection.effectiveCollectors();
-    // Accepted versus actual stays explicit for legacy callers too: the request
-    // is accepted when the record revision is durable, while collection only
-    // starts when the runtime attaches.
-    out["applied_collectors"] = target.actual.collectors;
-    out["applied_attach_token"] = target.actual.attach_token;
-    out["errors"] = nlohmann::json::array();
-    if (!target.actual.error.empty()) {
-        out["errors"].push_back(nlohmann::json{
-            {"code", "apply_failed"},
-            {"message", target.actual.error},
-        });
-    }
-    out["duplicate_observation"] = !target.changed;
-
-    const auto hint = parse_legacy_job_id(
-        req.contains("JobID") ? req["JobID"] : nlohmann::json(nullptr));
-    if (hint.status == LegacyIdStatus::Valid && hint.value != target.internal_id) {
-        out["ignored_job_id_hint"] = format_internal_id(hint.value);
-        spdlog::warn("JobRegistry: legacy add for native job '{}' carried JobID {} as a "
-                     "compatibility hint; resolved to inventory instance {} (internal {})",
-                     record.job.NativeJobID, hint.value, target.instance_id,
-                     target.internal_id);
-    }
-    spdlog::info("JobRegistry: legacy add resolved native job '{}' to inventory instance {} "
-                 "(internal {}), record revision {}",
-                 record.job.NativeJobID, target.instance_id, target.internal_id,
-                 target.revision);
-    return out;
-}
-
 SubAttrMatcher parse_legacy_matcher(const nlohmann::json& matcher_json)
 {
     SubAttrMatcher matcher;
@@ -902,20 +834,12 @@ void registerInventoryRpc(JobRegistry& registry) {
                 Job job;
                 std::string opt = json2JobOpt(req, job);
                 if(opt.compare("add") == 0){
-                    // §9.4: identity resolution first. A legacy JobID is only a
-                    // compatibility hint, so it never allocates or overrides the
-                    // internal id of an existing inventoried instance.
-                    if (auto resolved = try_legacy_add_by_identity(registry, job, req)) {
-                        return *resolved;
-                    }
-                    if (registry.addJob(job)) {
-                        j["status"] = "success";
-                    } else {
-                        j["status"] = "error";
-                        j["msg"] = fmt::format("failed to add job {} (type={}): empty collectors, duplicate sub_attr, "
-                                               "duplicate JobID, or a rejected durable write — check server logs",
-                                               job.JobID, job.NativeJobID);
-                    }
+                    // §9.4: the manual add and update routes are ONE upsert.
+                    // The identity selector (kept here as the compatibility
+                    // resolution) routes a request naming a live inventoried
+                    // instance to UPDATE; a legacy JobID is only a hint and
+                    // never allocates or overrides the internal id.
+                    j = registry.upsertJob(job, req, legacy_add_selector(job, req));
                 }else if(opt.compare("remove") == 0){
                     // §9.4: remove stops collection for resolved live jobs and
                     // keeps the inventory fact instead of forgetting the

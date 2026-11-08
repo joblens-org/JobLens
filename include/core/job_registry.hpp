@@ -176,6 +176,22 @@ public:
     JobRegistry& operator=(const JobRegistry&) = delete;
 
     // Job 增删
+    // Manual CRUD upsert: one entry point for the manual add and update
+    // routes (orthogonal to the automatic paths — never routed through the
+    // admission gate). Routing, in order: an identity selector naming a live
+    // inventoried instance (the §9.4 legacy-add resolution, kept in the RPC
+    // layer) takes the UPDATE branch; an active record with matching typed
+    // sub_attr but no resolvable identity routes to UPDATE by internal id;
+    // anything else takes the CREATE branch. UPDATE merges the requested
+    // collectors into the existing manual selection (union, never a
+    // wholesale replace) and fills empty facts only; CREATE is the legacy
+    // addJob semantics verbatim (empty collectors still rejected there).
+    // Returns the command response JSON (status success/error plus the
+    // instance payload).
+    nlohmann::json upsertJob(const Job& job, const nlohmann::json& request,
+                             std::optional<NativeSelector> identity_selector = std::nullopt);
+    // Thin alias for the CREATE branch — the historical manual registration
+    // entry (same semantics as before the merge).
     bool addJob(const Job& job);
     void delJob(uint64_t jobID);
     // Inventory-grade retirement: archive atomically (active -> history,
@@ -361,6 +377,27 @@ private:
     void evaluateAutoPolicies(const std::vector<uint64_t>& internal_ids,
                               std::vector<AutoSelection>& out);
     void regRPCHandle();
+    // --- Manual CRUD upsert internals ----------------------------------------
+    // The CREATE branch: the legacy manual registration body verbatim.
+    bool createManualJob(const Job& job);
+    // UPDATE-branch routing: the identity selector first (§9.4 namespace
+    // rules), then the typed sub_attr matcher. A closing identity target is
+    // reported through `closing`; more than one identity match is reported
+    // through `ambiguous` with the candidate ids; no target falls through to
+    // CREATE.
+    struct ManualTarget {
+        enum class Kind { None, Closing, Ambiguous, Update };
+        Kind kind = Kind::None;
+        JobRecord record;
+        std::vector<std::string> candidates;
+        std::string message;
+    };
+    ManualTarget manualUpdateTarget(const Job& job,
+                                    const std::optional<NativeSelector>& selector);
+    // UPDATE mechanics: collectors union into the manual selection, facts
+    // fill-empty merge (JobPIDs ignored), response in the legacy add shape.
+    nlohmann::json updateManualInstance(const JobRecord& target, const Job& job,
+                                        const nlohmann::json& request);
     // Guards the sentinel job and the active-reader set.
     mutable std::shared_mutex mtx_;
     Job sentinel_job_;   // system JobID 0 (in-memory only, never stored)

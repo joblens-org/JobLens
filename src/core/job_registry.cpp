@@ -1642,7 +1642,7 @@ void JobRegistry::remove_job_from_kernel(const Job& job, bool& ok, std::string& 
 // discovery upsert; doc/job_inventory_v2_architecture.md §4.2)
 // ---------------------------------------------------------------------------
 
-bool JobRegistry::addJob(const Job& job) {
+bool JobRegistry::createManualJob(const Job& job) {
     spdlog::info("JobRegistry: addJob entry JobID={}, native_id={}, collectors={}, PIDs={}",
                  job.JobID, job.NativeJobID, job.CollectorNames.size(), job.JobPIDs.size());
     // 错误检查
@@ -1799,6 +1799,271 @@ bool JobRegistry::addJob(const Job& job) {
     wake_runtime();
     spdlog::info("JobRegistry: add job with JobID {}", job_copy.JobID);
     return true;
+}
+
+bool JobRegistry::addJob(const Job& job) {
+    // Thin alias: the CREATE branch of the manual upsert, exactly the
+    // historical registration semantics.
+    return createManualJob(job);
+}
+
+JobRegistry::ManualTarget JobRegistry::manualUpdateTarget(
+    const Job& job, const std::optional<NativeSelector>& selector) {
+    ManualTarget target;
+    // §9.4 identity resolution first: same adapter/canonical-native/namespace
+    // rules as the RPC target resolution (a Condor selector without a cluster
+    // tag matches the whole cluster namespace).
+    if (selector) {
+        const auto identity = canonicalize(*selector);
+        if (identity) {
+            std::vector<JobRecord> matches;
+            for (const auto& record : ownRecords()) {
+                if (record.internal_id == kSystemSentinelJobId) continue;
+                if (!record.identity_complete) continue;
+                if (record.identity.adapter != identity->adapter) continue;
+                if (record.identity.canonical_native != identity->canonical_native)
+                    continue;
+                if (selector->cluster_tag.empty()
+                        ? (record.identity.cluster_namespace !=
+                               identity->cluster_namespace &&
+                           record.identity.cluster_namespace.rfind(
+                               identity->cluster_namespace + "@", 0) != 0)
+                        : record.identity.cluster_namespace !=
+                              identity->cluster_namespace)
+                    continue;
+                if (!identity->step_id.empty() &&
+                    record.identity.step_id != identity->step_id)
+                    continue;
+                matches.push_back(record);
+            }
+            if (!matches.empty()) {
+                // The identity index owns one live row per identity; several
+                // namespace-relaxed matches are an ambiguity the caller must
+                // resolve, never a guess. Ids are reported ascending, exactly
+                // like the RPC target resolution.
+                std::sort(matches.begin(), matches.end(),
+                          [](const JobRecord& lhs, const JobRecord& rhs) {
+                              return lhs.internal_id < rhs.internal_id;
+                          });
+                if (matches.size() > 1) {
+                    target.kind = ManualTarget::Kind::Ambiguous;
+                    for (const auto& match : matches)
+                        target.candidates.push_back(format_internal_id(match.internal_id));
+                    target.message =
+                        fmt::format("native job '{}' matches {} current local instances in "
+                                    "cluster '{}'; add step_id or use scope=job",
+                                    selector->native_job_id, matches.size(),
+                                    selector->cluster_name);
+                    return target;
+                }
+                target.record = matches.front();
+                target.kind = ownHasActive(target.record.internal_id)
+                                  ? ManualTarget::Kind::Update
+                                  : ManualTarget::Kind::Closing;
+                return target;
+            }
+        }
+    }
+    // A manual old row (typed sub_attr duplicate, identity never resolved):
+    // the historical duplicate refusal becomes an UPDATE route by id.
+    SubAttrMatcher matcher;
+    matcher.subtype = job.subtype;
+    if (std::holds_alternative<CondorJobAttr>(job.sub_attr)) {
+        const auto& attr = std::get<CondorJobAttr>(job.sub_attr);
+        matcher.subtype = JobSubType::Condor;
+        matcher.condor_cluster_id = attr.cluster_id;
+        matcher.condor_proc_id = attr.proc_id;
+    } else if (std::holds_alternative<SlurmJobAttr>(job.sub_attr)) {
+        const auto& attr = std::get<SlurmJobAttr>(job.sub_attr);
+        matcher.subtype = JobSubType::Slurm;
+        matcher.slurm_job_id = attr.job_id;
+        matcher.slurm_step_id = attr.step_id;
+    }
+    const auto duplicates =
+        ownFindActive([&matcher](const Job& existing) { return matches_job(matcher, existing); });
+    if (!duplicates.empty()) {
+        auto record = ownRecord(duplicates.front().job.JobID);
+        if (record) {
+            target.record = std::move(*record);
+            target.kind = ManualTarget::Kind::Update;
+        }
+    }
+    return target;
+}
+
+nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& request,
+                                      std::optional<NativeSelector> identity_selector) {
+    std::string recovery_error;
+    if (!recoverStoreIfNeeded(recovery_error)) {
+        nlohmann::json out;
+        out["status"] = "error";
+        out["msg"] = "registration refused: " + recovery_error;
+        return out;
+    }
+
+    const ManualTarget target = manualUpdateTarget(job, identity_selector);
+    if (target.kind == ManualTarget::Kind::Closing) {
+        nlohmann::json out;
+        out["status"] = "error";
+        out["code"] = "generation_closing";
+        out["message"] = "instance " + format_internal_id(target.record.internal_id) +
+                         " is closing and rejects new binding mutations";
+        return out;
+    }
+    if (target.kind == ManualTarget::Kind::Ambiguous) {
+        nlohmann::json out;
+        out["status"] = "error";
+        out["code"] = "ambiguous_selector";
+        out["message"] = target.message;
+        out["candidates"] = target.candidates;
+        return out;
+    }
+    if (target.kind == ManualTarget::Kind::Update)
+        return updateManualInstance(target.record, job, request);
+
+    // CREATE branch: the legacy manual registration, verbatim. An empty
+    // collector list is a CREATE-only rejection — an UPDATE with no
+    // collectors is a pure facts update and stays valid.
+    if (!createManualJob(job)) {
+        nlohmann::json out;
+        out["status"] = "error";
+        out["msg"] = fmt::format(
+            "failed to add job {} (type={}): empty collectors on create, duplicate "
+            "JobID, or a rejected durable write — check server logs",
+            job.JobID, job.NativeJobID);
+        return out;
+    }
+    // The create response keeps the historical shape (status only): old
+    // consumers of the manual add see no contract change on this path.
+    nlohmann::json out;
+    out["status"] = "success";
+    return out;
+}
+
+nlohmann::json JobRegistry::updateManualInstance(const JobRecord& target, const Job& job,
+                                                 const nlohmann::json& request) {
+    const uint64_t internal_id = target.internal_id;
+
+    // Facts first, fill-empty only: empty request fields never erase stored
+    // facts, and the PID list is intent-hostile input on the update route
+    // (never trusted from a manual re-add).
+    {
+        Job facts = job;
+        facts.JobPIDs.clear();
+        facts.CollectorNames.clear();
+        std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
+        JobRecord record;
+        {
+            std::shared_lock lg(records_mtx_);
+            const auto it = records_.find(internal_id);
+            if (it == records_.end()) {
+                nlohmann::json out;
+                out["status"] = "error";
+                out["msg"] = "instance vanished while updating";
+                return out;
+            }
+            record = it->second;
+        }
+        if (merge_job_facts(record.job, facts, /*replace_members=*/false)) {
+            record.last_seen_us = now_us();
+            ++record.revision;
+            std::vector<JobStore::WriteOp> ops{put_record_op(record)};
+            std::vector<uint64_t> touched{internal_id};
+            std::string error;
+            if (!store_->commit(std::move(ops), /*durable=*/true, touched,
+                                "manual upsert facts", error)) {
+                nlohmann::json out;
+                out["status"] = "error";
+                out["msg"] = "facts update failed: " + error;
+                return out;
+            }
+            std::unique_lock lg(records_mtx_);
+            records_[internal_id] = std::move(record);
+        }
+    }
+
+    // Collectors: union into the existing manual selection, never a wholesale
+    // replace; an empty request list leaves the selection untouched (pure
+    // facts update).
+    std::optional<CollectionTargetOutcome> selection_outcome;
+    if (!job.CollectorNames.empty()) {
+        std::vector<std::string> merged;
+        if (const auto current = ownSelection(internal_id); current.manual.has_value())
+            merged = *current.manual;
+        for (const auto& name : job.CollectorNames) {
+            if (std::find(merged.begin(), merged.end(), name) == merged.end())
+                merged.push_back(name);
+        }
+        CollectionRequest command;
+        command.targets = {internal_id};
+        command.collectors = std::move(merged);
+        const auto outcome = setCollectors(command);
+        if (!outcome.ok) {
+            nlohmann::json out;
+            out["status"] = "error";
+            out["code"] = to_string(outcome.error);
+            out["msg"] = outcome.message;
+            return out;
+        }
+        selection_outcome = outcome.targets.front();
+    }
+
+    // Response in the §9.4 legacy-add shape.
+    const auto record = ownRecord(internal_id);
+    const auto selection = record ? record->selection : ownSelection(internal_id);
+    const auto actual = actualCollection(internal_id);
+    const uint64_t revision = record ? record->revision : 0;
+    const bool changed = selection_outcome.has_value() && selection_outcome->changed;
+
+    nlohmann::json out;
+    out["status"] = "success";
+    // Legacy numeric field for old consumers; the value is the internal id of
+    // the existing instance, never a fresh allocation from the JobID hint.
+    out["JobID"] = internal_id;
+    out["internal_job_id"] = format_internal_id(internal_id);
+    out["instance_id"] = format_internal_id(internal_id);
+    out["record_revision"] = revision;
+    out["mode"] = to_string(selection.mode());
+    out["desired_collectors"] = selection.effectiveCollectors();
+    // Accepted versus actual stays explicit: the request is accepted when the
+    // record revision is durable, while collection only starts when the
+    // runtime attaches.
+    out["applied_collectors"] = actual.collectors;
+    out["applied_attach_token"] = actual.attach_token;
+    out["errors"] = nlohmann::json::array();
+    if (!actual.error.empty()) {
+        out["errors"].push_back(nlohmann::json{
+            {"code", "apply_failed"},
+            {"message", actual.error},
+        });
+    }
+    out["duplicate_observation"] = !changed;
+
+    if (request.contains("JobID") && !request["JobID"].is_null()) {
+        const auto hint = request["JobID"];
+        uint64_t hint_value = 0;
+        bool hint_valid = false;
+        if (hint.is_number_unsigned()) {
+            hint_value = hint.get<uint64_t>();
+            hint_valid = true;
+        } else if (hint.is_string() && !hint.get<std::string>().empty() &&
+                   hint.get<std::string>().find_first_not_of("0123456789") ==
+                       std::string::npos) {
+            hint_value = std::stoull(hint.get<std::string>());
+            hint_valid = true;
+        }
+        if (hint_valid && hint_value != internal_id) {
+            out["ignored_job_id_hint"] = format_internal_id(hint_value);
+            spdlog::warn("JobRegistry: manual upsert for native job '{}' carried JobID {} "
+                         "as a compatibility hint; resolved to inventory instance {}",
+                         record ? record->job.NativeJobID : job.NativeJobID, hint_value,
+                         internal_id);
+        }
+    }
+    spdlog::info("JobRegistry: manual upsert resolved to inventory instance {} (internal "
+                 "{}, revision {})",
+                 format_internal_id(internal_id), internal_id, revision);
+    return out;
 }
 
 bool JobRegistry::retireInstance(uint64_t jobID) {
