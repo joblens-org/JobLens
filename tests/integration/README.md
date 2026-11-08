@@ -67,6 +67,18 @@ bash tests/integration/run_writer_retry_test.sh
 
 可传入构建目录作为第一个参数。脚本复用 JobLens 的实际目标文件和链接参数，运行本地随机端口 HTTP 模拟服务与独立 Unix socket RPC，不连接生产 ES，不需要 eBPF 权限。覆盖 Bulk 部分失败、成功项不重发、永久错误、异常响应、超时、指数退避、次数耗尽、重试字节分包、非法配置、真实后台失败钩子，以及 writer/collector 的 call_cnt 单次计数。测试程序和 socket 在结束时清理。
 
+### Lua 规则沙箱回归
+
+在已配置 Ninja 构建目录的本机运行：
+
+```bash
+bash tests/integration/run_rule_engine_sandbox_test.sh
+```
+
+脚本链接实际 `RuleEngine` / `RulesManager`，覆盖：`io`/`package`/`require`/`load`
+不可达、加载期与执行期死循环被指令/内存预算中断、超大规则被拒、规则目录
+之外的路径与 `../` 穿越被拒。不加载 BPF，不需要 root。
+
 ### NewIOUsage 按作业缓存索引回归
 
 在有项目 Ninja 构建目录及 BPF 权限的 Linux 主机运行：
