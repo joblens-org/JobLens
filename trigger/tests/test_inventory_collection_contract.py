@@ -879,3 +879,60 @@ def test_a33_contract_violating_collection_target_is_not_reported_as_success(
 
     assert response.status_code == 502
     assert response.get_json()["code"] == "core_response_invalid"
+
+
+# ==================== A34: job_opt remove erase tier pass-through ====================
+
+
+def test_a34_job_remove_forwards_the_erase_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """remove 的真删档必须原样透传给核心；默认不携带 erase。"""
+    from trigger.api import routes as routes_module
+
+    forwarded: dict[str, object] = {}
+
+    def fake_job_opt(data: object) -> object:
+        forwarded.clear()
+        forwarded.update(data)  # type: ignore[arg-type]
+        return {"status": "success", "mode": "erase", "deleted_count": 1}
+
+    monkeypatch.setattr(routes_module, "job_opt", fake_job_opt)
+    client = _app().test_client()
+
+    response = client.post(
+        "/joblens/job",
+        json={"opt": "remove", "type": "job.condor", "JobID": 7, "erase": True},
+    )
+
+    assert response.status_code == 200
+    assert forwarded.get("erase") is True
+
+    # Default (absent): the stop tier, no erase key on the wire.
+    response = client.post(
+        "/joblens/job", json={"opt": "remove", "type": "job.condor", "JobID": 7}
+    )
+
+    assert response.status_code == 200
+    assert "erase" not in forwarded
+
+
+def test_a34_job_remove_erase_is_coerced_to_boolean(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pydantic 宽松模式：'true'/1 强转为布尔后透传，核心只见到布尔档位。"""
+    from trigger.api import routes as routes_module
+
+    forwarded: dict[str, object] = {}
+
+    def fake_job_opt(data: object) -> object:
+        forwarded.clear()
+        forwarded.update(data)  # type: ignore[arg-type]
+        return {"status": "success", "mode": "stop", "stopped_count": 1}
+
+    monkeypatch.setattr(routes_module, "job_opt", fake_job_opt)
+    client = _app().test_client()
+
+    response = client.post(
+        "/joblens/job",
+        json={"opt": "remove", "type": "job.condor", "JobID": 7, "erase": "true"},
+    )
+
+    assert response.status_code == 200
+    assert forwarded.get("erase") is True

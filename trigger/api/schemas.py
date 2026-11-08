@@ -31,6 +31,7 @@ class JobRequest(BaseModel):
     JobPIDs: Optional[List[int]] = Field(None, description="进程ID列表")
     Lens: Optional[List[str]] = Field(None, description="采集器列表，默认 ['cpumem_collector', 'io_collector', 'net_collector']")
     sub_attr: Optional[Dict[str, Any]] = Field(None, description="子属性，condor类型需cluster_id/proc_id，slurm类型需job_id/step_id")
+    erase: Optional[bool] = Field(None, description="remove 的真删档：true=退役实例（采集过归档 h: 行，未采集过纯删）；默认 false 保留 stop 语义（停采集、留库存）")
 
 
 class CondorJobRequest(BaseModel):

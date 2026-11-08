@@ -37,6 +37,8 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <leveldb/db.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -872,6 +874,137 @@ void run_closing_case(JobRegistry& registry, const Fixture& ids)
           "a closing instance must reject new intent with generation_closing: " + response.dump());
 }
 
+// The remove two-tier (§9.4): the default keeps the stop semantics; erase:true
+// retires the instance for real — a collected instance leaves a durable h:
+// history row, a never-collected one leaves none. This runs LAST and closes
+// the registry so the raw LevelDB image can be inspected.
+void run_erase_cases(JobRegistry& registry, const Fixture& ids, const std::string& db_path)
+{
+    const auto hex64 = [](uint64_t value) {
+        std::string out;
+        for (int shift = 60; shift >= 0; shift -= 4) {
+            const int digit = static_cast<int>((value >> shift) & 0xf);
+            out.push_back(static_cast<char>(digit < 10 ? '0' + digit : 'a' + digit - 10));
+        }
+        return out;
+    };
+    const auto raw_keys_with_prefix = [&db_path](const std::string& prefix) {
+        leveldb::Options options;
+        options.create_if_missing = false;
+        leveldb::DB* db = nullptr;
+        const auto opened = leveldb::DB::Open(options, db_path, &db);
+        check(opened.ok(), "open raw db: " + opened.ToString());
+        std::vector<std::string> keys;
+        leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+        for (it->SeekToFirst(); it->Valid(); it->Next()) {
+            const std::string key = it->key().ToString();
+            if (key.rfind(prefix, 0) == 0) keys.push_back(key);
+        }
+        check(it->status().ok(), "iterate raw db: " + it->status().ToString());
+        delete it;
+        delete db;
+        return keys;
+    };
+
+    // The closing case left the runtime double in deferred-drain mode; restore
+    // the auto-drain so the retirements below converge through reconcile.
+    install_collection_runtime(
+        registry, [](const Job& job, std::vector<std::string>& applied, std::string& error) {
+            applied = job.CollectorNames;
+            error.clear();
+            return true;
+        });
+    test_runtime(registry).setDeferredDrain(false);
+
+    // Default remove (no erase): stop semantics, mode observable.
+    {
+        const auto response = rpc("JobRegistry/job_opt",
+                                  json{{"opt", "remove"},
+                                       {"type", "job.condor"},
+                                       {"JobID", ids.condor_b}});
+        check(response["status"] == "success",
+              "default remove must keep succeeding: " + response.dump());
+        check(response["mode"] == "stop",
+              "default remove must identify itself as the stop tier");
+        check(response["inventory_retained"] == true,
+              "default remove must keep the inventory");
+        check(registry.inventoryRecord(ids.condor_b).has_value(),
+              "default remove must keep the record");
+    }
+
+    // Erase a never-collected instance (nothing was ever attached to it):
+    // the retirement is a durable delete, no history row.
+    {
+        const auto response = rpc("JobRegistry/job_opt",
+                                  json{{"opt", "remove"},
+                                       {"type", "job.condor"},
+                                       {"JobID", ids.condor_a_other},
+                                       {"erase", true}});
+        check(response["status"] == "success",
+              "erase of a never-collected instance must succeed: " + response.dump());
+        check(response["mode"] == "erase",
+              "erase must identify itself as the erase tier: " + response.dump());
+        check(response["deleted_count"] == 1, "erase must count the retirement");
+        check(response["inventory_retained"] == false,
+              "erase must not claim inventory retention");
+        // The runtime owns the drain; reconcile drives it to completion, and
+        // the never-collected fact turns the archive into a durable delete.
+        test_runtime(registry).reconcile(ids.condor_a_other);
+        check(!registry.inventoryRecord(ids.condor_a_other).has_value(),
+              "erase must remove the instance from the active map");
+    }
+
+    // Erase a COLLECTED instance: with the runtime holding a real attachment,
+    // the retirement archives a durable history row instead of discarding.
+    {
+        CollectionRequest bind;
+        bind.targets = {ids.slurm_batch};
+        bind.collectors = {"cpumem_collector"};
+        check(registry.setCollectors(bind).ok, "erase: binding must commit");
+        test_runtime(registry).reconcile(ids.slurm_batch);
+        check(registry.actualCollection(ids.slurm_batch).collectors.size() == 1,
+              "erase: the runtime must hold a real attachment before the erase");
+
+        const auto response = rpc("JobRegistry/job_opt",
+                                  json{{"opt", "remove"},
+                                       {"type", "job.slurm"},
+                                       {"JobID", ids.slurm_batch},
+                                       {"erase", true}});
+        check(response["status"] == "success",
+              "erase of a collected instance must succeed: " + response.dump());
+        check(response["mode"] == "erase" && response["deleted_count"] == 1,
+              "erase must report one retired instance: " + response.dump());
+        // The drain converges through the test runtime (auto-drain), which
+        // archives the closing record.
+        test_runtime(registry).reconcile(ids.slurm_batch);
+        check(!registry.inventoryRecord(ids.slurm_batch).has_value(),
+              "the collected instance must leave the active map after the drain");
+    }
+
+    // The durable image, read with the store closed.
+    check(registry.deinit(), "erase: shutdown must succeed");
+    {
+        const auto history_collected = raw_keys_with_prefix("h:" + hex64(ids.slurm_batch) + ":");
+        check(history_collected.size() == 1,
+              "a collected instance must leave exactly one history row, found " +
+                  std::to_string(history_collected.size()));
+        const auto active_collected = raw_keys_with_prefix("j:" + hex64(ids.slurm_batch));
+        check(active_collected.empty(),
+              "the erased instance must leave no active row");
+        const auto history_discarded =
+            raw_keys_with_prefix("h:" + hex64(ids.condor_a_other) + ":");
+        check(history_discarded.empty(),
+              "a never-collected instance must be deleted without a history row");
+        const auto active_discarded = raw_keys_with_prefix("j:" + hex64(ids.condor_a_other));
+        check(active_discarded.empty(),
+              "the discarded instance must leave no active row");
+    }
+
+    std::cout << "PASS erase tier: remove keeps stop semantics; erase retires for "
+                 "real (collected -> history row, never-collected -> delete)"
+              << std::endl;
+}
+
 } // namespace
 
 // A24 (shutdown) ------------------------------------------------------------
@@ -986,6 +1119,7 @@ int main(int argc, char** argv)
         run_legacy_cases(registry, ids);
         run_inventory_cases(registry, ids);
         run_closing_case(registry, ids);
+        run_erase_cases(registry, ids, base + "/job.db");
         slow_client_does_not_block_stop(base);
 
         std::cout << "PASS collection rpc: A30 selector forms, snapshot job scope, "

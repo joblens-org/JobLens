@@ -606,8 +606,21 @@ SubAttrMatcher parse_legacy_matcher(const nlohmann::json& matcher_json)
 
 // §9.4 legacy remove: stop collection, keep the inventory fact. Only records
 // outside the inventory (pure legacy registrations) are archived as before.
+// With "erase": true the command becomes the real-delete tier — every target
+// is retired (closing -> archive for collected instances, durable delete for
+// never-collected ones) instead of stopped.
 nlohmann::json legacy_remove(JobRegistry& registry, const nlohmann::json& req)
 {
+    bool erase = false;
+    if (req.contains("erase") && !req["erase"].is_null()) {
+        if (!req["erase"].is_boolean()) {
+            return error_payload("invalid_request",
+                                 "erase must be a boolean (true retires the instance for "
+                                 "real, the default keeps the stop semantics)");
+        }
+        erase = req["erase"].get<bool>();
+    }
+
     std::vector<uint64_t> targets;
     if (req.contains("JobID") && !req["JobID"].is_null()) {
         const auto parsed = parse_legacy_job_id(req["JobID"]);
@@ -621,6 +634,35 @@ nlohmann::json legacy_remove(JobRegistry& registry, const nlohmann::json& req)
         }
     } else {
         spdlog::warn("JobRegistry: legacy remove request carries neither 'JobID' nor 'matcher'");
+    }
+
+    if (erase) {
+        // The erase tier: a real retirement. The closing fact is durable
+        // before anything destructive starts; collected instances end as a
+        // history row, never-collected ones as a durable delete.
+        std::vector<std::string> erased_instances;
+        size_t erased = 0;
+        for (const auto id : targets) {
+            if (id == kSystemSentinelJobId) continue;
+            if (!registry.retireInstance(id)) {
+                return error_payload(
+                    "remove_failed",
+                    fmt::format("could not retire instance {}; the record stays "
+                                "active and the command is retryable",
+                                format_internal_id(id)));
+            }
+            ++erased;
+            erased_instances.push_back(format_internal_id(id));
+        }
+        nlohmann::json out;
+        out["status"] = "success";
+        out["mode"] = "erase";
+        out["deleted_count"] = erased;
+        out["erased_instances"] = std::move(erased_instances);
+        out["inventory_retained"] = false;
+        out["msg"] = "erase retired the instances (collected ones archived, "
+                     "never-collected ones deleted)";
+        return out;
     }
 
     std::vector<std::string> stopped_instances;
@@ -668,6 +710,7 @@ nlohmann::json legacy_remove(JobRegistry& registry, const nlohmann::json& req)
 
     nlohmann::json out;
     out["status"] = "success";
+    out["mode"] = "stop";
     out["deleted_count"] = retired;
     out["stopped_count"] = stopped;
     out["stopped_instances"] = stopped_instances;

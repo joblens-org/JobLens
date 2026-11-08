@@ -40,6 +40,8 @@
  *        late same-generation observation is refused, a new one registers
  *   ADMIT  the inventory capture_all admission gate: S1/S3 combinations,
  *        drop/reject counters, NotAdmitted on the event path
+ *   STOP-PIN a manual empty selection survives scan rotation and fact
+ *        changes; automatic policy never re-pins collectors over a stop
  *   LEGACY  manual registrations retire on process evidence without a source
  *   RESCAN  event-driven and on-demand passes run the same reconcile path
  *   EXEC    exec hints resolve to targeted observations without a full scan
@@ -1702,6 +1704,61 @@ void run_admit(const std::string& base)
 }
 
 // ---------------------------------------------------------------------------
+// STOP-PIN - a manual stop survives scan rotation and fact changes
+// ---------------------------------------------------------------------------
+
+void run_stop_pin(const std::string& base)
+{
+    FakeSource source("condor");
+    FakeProbes probes;
+    Job job =
+        make_condor_job("360.0", 5900, 555, "htcondor01", "schedd-a", "/cg/slot-36");
+    probes.set_process(5900, LivenessState::Alive, 555);
+    source.set_scan([&]() { return scan_with({job}); });
+    auto options = heartbeat_options(fresh_dir(base, "stop-pin"), source, probes);
+    options.test_auto_policy = [] {
+        return AutoCollectorPolicy::defaults({"CPUMemCollector"});
+    };
+    JobRegistry registry(options);
+
+    const auto record = find_native(registry, "360.0");
+    check(record.has_value(), "STOP-PIN: the job must register");
+    const auto initial = registry.selectionRecord(record->internal_id);
+    check(initial.automatic.has_value() && initial.automatic->size() == 1,
+          "STOP-PIN: the automatic selection must start armed");
+
+    // The stop: an explicit manual empty selection.
+    CollectionRequest stop;
+    stop.targets = {record->internal_id};
+    stop.collectors = std::vector<std::string>{};
+    check(registry.setCollectors(stop).ok, "STOP-PIN: the stop must commit");
+
+    // Scan rotation with a FACT CHANGE (a new member process): the
+    // observation merges, but the automatic policy must never re-pin
+    // collectors over an explicit manual stop.
+    job = make_condor_job("360.0", 5900, 555, "htcondor01", "schedd-a", "/cg/slot-36",
+                          {5901, 5902});
+    probes.set_process(5901, LivenessState::Alive, 555);
+    probes.set_process(5902, LivenessState::Alive, 555);
+    for (int pass = 0; pass < 3; ++pass) {
+        check(registry.reconcileInventoryNow(), "STOP-PIN: the pass must run");
+        const auto binding = registry.selectionRecord(record->internal_id);
+        check(binding.mode() == CollectionMode::Manual && binding.manual.has_value() &&
+                  binding.manual->empty(),
+              "STOP-PIN: the manual stop must survive the observation merge");
+        check(binding.effectiveCollectors().empty(),
+              "STOP-PIN: applied/desired collectors must stay empty after scans");
+        check(registry.actualCollection(record->internal_id).collectors.empty(),
+              "STOP-PIN: nothing may actually attach after a stop");
+    }
+
+    registry.deinit();
+    pass_case("STOP-PIN",
+              "a manual stop survives scan rotation and fact changes; the empty "
+              "manual selection always pins down the automatic policy");
+}
+
+// ---------------------------------------------------------------------------
 // RESCAN - event-driven and on-demand passes
 // ---------------------------------------------------------------------------
 
@@ -1763,6 +1820,7 @@ int main(int argc, char** argv)
         run_restore_unknown_keeps_evidence(base);
         run_retire_explicit(base);
         run_admit(base);
+        run_stop_pin(base);
         run_rescan(base);
         std::cout << "ALL PASS\n";
         return 0;
