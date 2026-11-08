@@ -71,6 +71,7 @@ job_registry_config:
   auto_add_slurmjob: true                # 已弃用：Slurm 自动监控（改用 inventory）
   inventory:
     types: [condor, slurm]               # 需要完整本地清单的调度器类型（opt-in，缺省为 []）
+    capture_all: true                    # S1：无条件登记每个捕获的作业（默认）；false = 登记与否交给 auto_add
     reconcile_interval_sec: 30           # 对账周期，最小 1 秒
 ```
 
@@ -80,29 +81,64 @@ job_registry_config:
 | `auto_add_condorjob` | bool | false | **已弃用**。启动旧版 CondorJobWatcher 并自动登记作业。该类型出现在 `inventory.types` 时忽略（由清单发现源负责） |
 | `auto_add_slurmjob` | bool | false | **已弃用**。同上，作用于 Slurm |
 | `inventory.types` | list | `[]` | 需要完整本地清单的调度器类型（包含未被采集的作业）。取值 `condor` / `slurm`，未知值启动即拒绝 |
+| `inventory.capture_all` | bool | `true` | 全量登记开关（S1）。`true`：捕获的作业无条件登记；`false`：观测是否登记由该类型的 `<type>_job_watcher.auto_add`（S3）判定 |
 | `inventory.reconcile_interval_sec` | int | 30 | 周期性全量对账间隔，单位秒，最小 1 |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs`（Condor）或 `{JobLensRootDir}/../config/rules/slurm_jobs`（Slurm） | Lua 规则文件目录，CondorJobWatcher 和 SlurmJobWatcher 在 `use_rules` 启用时使用。注意：默认值因 watcher 而异。 |
 
-**清单维护**与**自动采集**是两个独立开关，旧的 `auto_add_*` 旗标折算进它们：
+### 三开关模型
 
-| `inventory.types` 包含该类型 | `<type>_job_watcher.auto_collect` | 行为 |
-|---|---|---|
-| 是 | 否 | 维护全部本地实例的清单；只有显式采集请求才会开始采集 |
-| 是 | 是 | 维护清单；每个新登记的实例自动获得采集器（见下表） |
-| 否 | 是（显式或经 `auto_add_<type>job` 折算） | 与上一行等价：折算会自动把该类型纳入清单 |
-| 否 | 否 | 不做广泛发现；显式且经过校验的登记/控制仍然可用 |
+自动登记与自动采集由且仅由三个开关决定，各自回答不同的问题，互不越权：
 
-自动采集列表的来源：
+| 开关 | 键 | 回答的问题 | 默认值 |
+|---|---|---|---|
+| S1 —— 全量库存 | `job_registry_config.inventory.capture_all` | 捕获的作业是否可以无条件进入清单？ | `true` |
+| S2 —— 按类型启停 Watcher | `job_registry_config.inventory.types` | 该调度器类型是否启动发现 Watcher？ | `[]`（关） |
+| S3 —— 自动路径动作 | `<type>_job_watcher.auto_add`（`off` / `default` / `rule`） | 自动路径对该类型的观测做什么？ | `off` |
 
-| `use_rules` | 首次登记时的选择 |
+S3 的三态：
+
+| `auto_add` | 含义 |
 |---|---|
-| `false`/缺省 | `<type>_job_watcher.auto_add_collectors`，逐字加给每个作业 |
-| `true` | Lua 规则引擎逐作业判定：accept = 规则给出的采集器，reject = 空选择（作业仍在清单中） |
+| `off` | 自动路径对该类型零动作 |
+| `default` | 登记作业，并把 `<type>_job_watcher.auto_add_collectors` 逐字武装上去 |
+| `rule` | 是否登记由 Lua 规则引擎逐作业判定：accept = 登记并加规则的采集器列表；reject = 不登记（S1 开启时为历史行为：登记空选择留在库中） |
 
-因此 `job_registry_config.auto_add_<type>job: true` 等价于"该类型入清单，
-所有作业都加这些采集器"（`use_rules` 只决定列表怎么选）。显式的
-`<type>_job_watcher.auto_collect` 或 `inventory.types` 永远胜过旧旗标。
-规则 reject 不会把作业从清单里删掉——规则只决定采集器，不决定存在性。
+`auto_add` 的非法取值（非 `off`/`default`/`rule`）启动即拒绝。
+
+### 八状态组合矩阵
+
+S2 关闭时 Watcher 不启动，S3 失去意义，只有 S1 区分两行；S2 开启时
+S1 × S3 共六种组合：
+
+| # | S2 | S1 `capture_all` | S3 `auto_add` | 该类型观测的行为 |
+|---|---|---|---|---|
+| 1 | 关 | ——（开） | —— | 该类型无发现；手工 CRUD 仍可用 |
+| 2 | 关 | ——（关） | —— | 同上：无发现，自然无登记 |
+| 3 | 开 | 开 | off | 全量登记；无自动采集器（仅显式请求） |
+| 4 | 开 | 开 | default | 全量登记 + 默认采集器列表自动武装 |
+| 5 | 开 | 开 | rule | 全量登记；规则引擎选采集器（reject = 登记空选择） |
+| 6 | 开 | 关 | off | Watcher 照常扫描，但不登记任何作业（丢弃计入 `dropped_observations`） |
+| 7 | 开 | 关 | default | 登记并把默认采集器列表作为初始选择 |
+| 8 | 开 | 关 | rule | accept = 登记并加规则列表；reject = 不登记（计入 `rejected_observations`）；引擎错误 = 本次不登记，下一条观测重试 |
+
+S1 关闭时，准入计数在清单状态中可见：`capture_all`、
+`dropped_observations`、`rejected_observations`、`admission_errors`。
+事件路径返回类型化的 `not_admitted` 结果，且绝不会要求 watcher 重扫。
+
+### 旧键映射与废弃时间线
+
+三态键取代 `auto_collect` / `use_rules` 组合。旧键保留解析一个 schema
+版本作为映射来源，解析结果永远落在三态上：
+
+| 旧配置 | 折算后的 `auto_add` |
+|---|---|
+| `auto_collect: false`（或缺省） | `off` |
+| `auto_collect: true` + `use_rules: false` | `default` |
+| `auto_collect: true` + `use_rules: true` | `rule` |
+| `auto_add_<type>job: true`（旧旗标） | 先折算为 `auto_collect: true`，再按上表映射 |
+
+显式给出的 `<type>_job_watcher.auto_add` 永远优先于旧键组合。废弃窗口
+结束后旧键不再解析；在此之前，现网每种旧组合的行为与今天完全一致。
 
 `<type>_job_watcher.cluster_name`（可选）在环境变量
 （`COLLECTOR_HOST` / `SLURM_CLUSTER_NAME`）无法推导命名空间时显式指定；
@@ -115,7 +151,21 @@ job_registry_config:
 采集意图（期望选择）持久化在 LevelDB 中，由运行中的调度器应用到采集通道。
 `JobCollection/get` 区分 `desired_collectors` 与 `applied_collectors`：请求可以被
 受理而运行时应用失败（见 `errors`），接口绝不会把未生效的绑报成"正在采集"。
-停止采集（`collectors: []`）会保留清单记录，实例由维护流程退休，而不是由请求删除。
+
+### 手工 CRUD 面
+
+手工路径与三开关正交——它不经由准入门，自动策略也永远不覆盖手工选择
+（显式空的手工选择即 stop，会恒压自动策略）。
+
+| 操作 | 入口 | 语义 |
+|---|---|---|
+| 增 / 改 | `JobRegistry/job_opt`，`opt: "add"`（单次 upsert） | 身份命中活跃实例（类型化 `sub_attr` + 调度器命名空间）路由到 UPDATE：请求采集器**并入**现有手工选择（union 去重，绝不整替），事实只补空合并。类型化 sub_attr 命中但身份未解析的按 internal id 路由 UPDATE。其余走 CREATE：旧版手工登记语义，空采集器列表仍被拒绝（UPDATE 允许空列表 = 纯事实补录） |
+| 查 / 改选择 | `JobCollection/get`、`JobCollection/set`、`JobCollection/reset_auto` | 不变；手工选择（含空 stop）永远压过自动选择 |
+| 删 —— stop 档（默认） | `JobRegistry/job_opt`，`opt: "remove"` | 停止采集（持久化空的手工选择）；清单记录保留 |
+| 删 —— erase 档 | `JobRegistry/job_opt`，`opt: "remove"`，`"erase": true` | 真删：先持久化 closing，采集过的实例归档为 `h:` 历史行，从未采集过的直接持久化删除。响应以 `mode: stop\|erase` 区分两档 |
+
+两档删除都支持按 `JobID` 或 `matcher` 寻址（与 stop 档一直使用的目标解析
+一致）。trigger 的 `/joblens/job` 端点原样透传 `erase` 字段；缺省即 stop 档。
 
 **作业数据存储**（LevelDB 键值存储）：
 - 键使用前缀 `j:`（活跃作业）、`h:`（历史）、`c:`（ID 分配器）、`m:`（schema/DB UUID/迁移）、`i:`（规范身份索引）、`b:`（采集意图），值以 JSON 序列化
@@ -546,8 +596,10 @@ condor_job_watcher:
 
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
-| `auto_add_collectors` | string[] | 无 | 自动添加到 Condor 作业的收集器名称列表 |
-| `use_rules` | bool | `false` | 是否使用规则引擎过滤作业（不匹配规则的作业不添加） |
+| `auto_add` | string（`off`/`default`/`rule`） | `off` | 自动路径动作三态（S3）；显式给出时优先于已弃用的 `auto_collect`/`use_rules` 组合 |
+| `auto_add_collectors` | string[] | 无 | `auto_add: default` 时武装的默认收集器列表 |
+| `auto_collect` | bool | `false` | **已弃用**（仅作映射来源）：再保留一个 schema 版本后折算入 `auto_add` |
+| `use_rules` | bool | `false` | **已弃用**（仅作映射来源）：`auto_collect: true` + `use_rules: true` 折算为 `auto_add: rule` |
 | `rules_prefix` | string | `"condor_job_"` | 规则引擎加载的规则文件前缀 |
 
 ### `slurm_job_watcher`
@@ -568,8 +620,10 @@ slurm_job_watcher:
 
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
-| `auto_add_collectors` | string[] | 无 | 自动添加到 Slurm 作业的收集器名称列表 |
-| `use_rules` | bool | `false` | 是否使用规则引擎过滤作业 |
+| `auto_add` | string（`off`/`default`/`rule`） | `off` | 自动路径动作三态（S3）；显式给出时优先于已弃用的 `auto_collect`/`use_rules` 组合 |
+| `auto_add_collectors` | string[] | 无 | `auto_add: default` 时武装的默认收集器列表 |
+| `auto_collect` | bool | `false` | **已弃用**（仅作映射来源）：再保留一个 schema 版本后折算入 `auto_add` |
+| `use_rules` | bool | `false` | **已弃用**（仅作映射来源）：`auto_collect: true` + `use_rules: true` 折算为 `auto_add: rule` |
 | `rules_prefix` | string | `"slurm_job_"` | 规则引擎加载的规则文件前缀 |
 
 ---

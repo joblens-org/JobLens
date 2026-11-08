@@ -72,6 +72,7 @@ job_registry_config:
   auto_add_slurmjob: true                # Deprecated: automatic Slurm monitoring (see inventory below)
   inventory:
     types: [condor, slurm]               # Types with a full local inventory (opt-in, absent = [])
+    capture_all: true                    # S1: register every captured job (default), false = admission by auto_add
     reconcile_interval_sec: 30           # Reconciliation interval, must be >= 1
 ```
 
@@ -81,32 +82,69 @@ job_registry_config:
 | `auto_add_condorjob` | bool | false | **Deprecated.** Automatically start the legacy CondorJobWatcher and auto-add jobs. Ignored for a type listed in `inventory.types` (the inventory discovery source owns it) |
 | `auto_add_slurmjob` | bool | false | **Deprecated.** Same as above for Slurm |
 | `inventory.types` | list | `[]` | Scheduler types that get a complete local inventory, including unselected jobs. `condor` / `slurm`; unknown values are rejected at startup |
+| `inventory.capture_all` | bool | `true` | The blanket-registration switch (S1). `true`: every captured job registers unconditionally. `false`: whether an observation registers is decided by the type's `<type>_job_watcher.auto_add` (S3) |
 | `inventory.reconcile_interval_sec` | int | 30 | Periodic full reconciliation interval in seconds (minimum 1) |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` (Condor) or `{JobLensRootDir}/../config/rules/slurm_jobs` (Slurm) | Directory for Lua rule files, used by CondorJobWatcher and SlurmJobWatcher when `use_rules` is enabled. Note: the default varies by watcher context. |
 
-**Inventory and automatic collection** are separate switches, and the legacy
-`auto_add_*` flags are folded into them:
+### The three switches
 
-| `inventory.types` contains the type | `<type>_job_watcher.auto_collect` | Behavior |
-|---|---|---|
-| Yes | No | Keep an inventory of every local instance; collection only starts through an explicit collection request |
-| Yes | Yes | Keep the inventory; every newly registered instance gets collectors automatically (see below) |
-| No | Yes (explicit or via `auto_add_<type>job`) | Same as above: the type is inventoried automatically through the fold |
-| No | No | No broad discovery; explicit verified registration/control still works |
+Automatic registration and collection are governed by exactly three
+switches. They answer different questions and never override each other:
 
-How the automatic list is chosen:
+| Switch | Key | Question it answers | Default |
+|---|---|---|---|
+| S1 — capture all | `job_registry_config.inventory.capture_all` | May every captured job enter the inventory unconditionally? | `true` |
+| S2 — per-type watcher | `job_registry_config.inventory.types` | Does this scheduler type get a discovery watcher at all? | `[]` (off) |
+| S3 — automatic action | `<type>_job_watcher.auto_add` (`off` / `default` / `rule`) | What does the automatic path do with an observation of this type? | `off` |
 
-| `use_rules` | Selection on first registration |
+S3's tri-state:
+
+| `auto_add` | Meaning |
 |---|---|
-| `false`/absent | `<type>_job_watcher.auto_add_collectors`, verbatim, for every job |
-| `true` | The Lua rule engine decides per job: accept = the rule's collector list, reject = empty selection (the job stays in the inventory) |
+| `off` | The automatic path takes no action for this type |
+| `default` | Register the job and arm `<type>_job_watcher.auto_add_collectors` verbatim |
+| `rule` | Register is decided per job by the Lua rule engine: accept = register with the rule's collector list, reject = do not register (with S1 on: register with an empty selection, the historical behavior) |
 
-`job_registry_config.auto_add_<type>job: true` is therefore equivalent to
-"inventory this type and add these collectors to every job" (`use_rules`
-only decides how the list is chosen). An explicit
-`<type>_job_watcher.auto_collect` or `inventory.types` entry always wins over
-the legacy flag. A rejected job is never dropped from the inventory - rules
-decide collectors, never existence.
+An invalid `auto_add` value (anything but `off`/`default`/`rule`) rejects
+startup.
+
+### The eight-state matrix
+
+S2 off disables the watcher, so S3 is irrelevant and only S1 distinguishes
+the two rows; S2 on leaves six combinations of S1 x S3:
+
+| # | S2 | S1 `capture_all` | S3 `auto_add` | Behavior for an observation of this type |
+|---|---|---|---|---|
+| 1 | off | — (on) | — | No discovery for the type; manual CRUD still works |
+| 2 | off | — (off) | — | Same: nothing is discovered, so nothing is admitted |
+| 3 | on | on | off | Blanket registration; no automatic collectors (explicit requests only) |
+| 4 | on | on | default | Blanket registration + the default collector list armed automatically |
+| 5 | on | on | rule | Blanket registration; the rule engine picks the collectors (reject = registered with an empty selection) |
+| 6 | on | off | off | The watcher keeps scanning, but nothing registers (drops counted in `dropped_observations`) |
+| 7 | on | off | default | Registers with the default collector list as the initial selection |
+| 8 | on | off | rule | accept = registers with the rule's list; reject = never registers (`rejected_observations`); an engine error registers nothing and is retried on the next observation |
+
+With S1 off, the admission counters are observable in the inventory status:
+`capture_all`, `dropped_observations`, `rejected_observations` and
+`admission_errors`. The event path reports a typed `not_admitted` result
+that never asks the watcher to rescan.
+
+### Legacy key mapping and deprecation
+
+The tri-state replaces the `auto_collect` / `use_rules` pair. The old keys
+stay parsed for one more schema version as the mapping source; the resolved
+state is always the tri-state:
+
+| Old configuration | Resolved `auto_add` |
+|---|---|
+| `auto_collect: false` (or absent) | `off` |
+| `auto_collect: true` + `use_rules: false` | `default` |
+| `auto_collect: true` + `use_rules: true` | `rule` |
+| `auto_add_<type>job: true` (legacy flag) | folded into `auto_collect: true` first, then mapped as above |
+
+An explicit `<type>_job_watcher.auto_add` always wins over the legacy
+combination. After the deprecation window the legacy keys stop being
+parsed; until then every shipped combination behaves exactly as before.
 
 `<type>_job_watcher.cluster_name` (optional) pins the scheduler namespace used
 for identity when it cannot be derived from the environment
@@ -122,8 +160,25 @@ Collection intent (desired selection) is stored in LevelDB and applied to the
 collector lanes by the running scheduler. `JobCollection/get` distinguishes
 `desired_collectors` from `applied_collectors`: a request can be accepted while
 runtime application fails (`errors`), and the response never claims collection
-is active when it is not. Stopping collection (`collectors: []`) keeps the
-inventory record; the instance is retired by maintenance, not by the request.
+is active when it is not.
+
+### The manual CRUD surface
+
+The manual path is orthogonal to the three switches — it never runs through
+the admission gate, and the automatic policy never overwrites a manual
+selection (an explicit empty manual selection, a stop, pins the automatic
+policy down forever).
+
+| Operation | Entry | Semantics |
+|---|---|---|
+| Create / Update | `JobRegistry/job_opt` with `opt: "add"` (one upsert) | Identity hit on a live instance (typed `sub_attr` + scheduler namespace) routes to UPDATE: the requested collectors UNION into the existing manual selection (never a wholesale replace) and facts merge fill-empty-only. A typed-sub_attr duplicate without an identity routes to UPDATE by internal id. Otherwise CREATE: the legacy manual registration, which still rejects an empty collector list (an UPDATE with no collectors is a pure facts update and stays valid) |
+| Read / modify selection | `JobCollection/get`, `JobCollection/set`, `JobCollection/reset_auto` | Unchanged; a manual selection (including the empty stop) always wins over the automatic one |
+| Remove — stop tier (default) | `JobRegistry/job_opt` with `opt: "remove"` | Stops collection (a persistent empty manual selection); the inventory record is retained |
+| Remove — erase tier | `JobRegistry/job_opt` with `opt: "remove"`, `"erase": true` | Retires the instance for real: the closing fact is durable first, then a collected instance is archived as an `h:` history row and a never-collected one is durably deleted. The response distinguishes the tiers through `mode: stop\|erase` |
+
+Both remove tiers address targets by `JobID` or by `matcher`, the same
+resolution the stop tier always used. The trigger's `/joblens/job` endpoint
+forwards the `erase` field verbatim; absent means the stop tier.
 
 **Job data storage** (LevelDB key-value store):
 - Keys use prefixes `j:` (active jobs), `h:` (history), `c:` (ID allocator), `m:` (schema/DB UUID/migration), `i:` (canonical identity index) and `b:` (collection intent) with values serialized as JSON
@@ -589,8 +644,10 @@ condor_job_watcher:
 
 | Key | Type | Default | Description | Source Reference |
 |-----|------|---------|-------------|------------------|
-| `auto_add_collectors` | string[] | none | List of collector names to automatically add to Condor jobs | `condor_job_watcher.hpp:28` |
-| `use_rules` | bool | `false` | Whether to filter jobs using the rule engine (jobs not matching the rules are not added) | `condor_job_watcher.hpp:29` |
+| `auto_add` | string (`off`/`default`/`rule`) | `off` | The automatic-action tri-state (S3); an explicit value wins over the deprecated `auto_collect`/`use_rules` pair | `inventory_config.cpp` |
+| `auto_add_collectors` | string[] | none | The default collector list armed for `auto_add: default` | `condor_job_watcher.hpp:28` |
+| `auto_collect` | bool | `false` | **Deprecated** (mapping source only): folds into `auto_add` for one more schema version | `inventory_config.cpp` |
+| `use_rules` | bool | `false` | **Deprecated** (mapping source only): `auto_collect: true` + `use_rules: true` maps to `auto_add: rule` | `condor_job_watcher.hpp:29` |
 | `rules_prefix` | string | `"condor_job_"` | Prefix for rule files loaded by the rule engine | `condor_job_watcher.hpp:34` |
 
 ### `slurm_job_watcher`
@@ -611,8 +668,10 @@ slurm_job_watcher:
 
 | Key | Type | Default | Description | Source Reference |
 |-----|------|---------|-------------|------------------|
-| `auto_add_collectors` | string[] | none | List of collector names to automatically add to Slurm jobs | `slurm_job_watcher.hpp:29` |
-| `use_rules` | bool | `false` | Whether to filter jobs using the rule engine | `slurm_job_watcher.hpp:30` |
+| `auto_add` | string (`off`/`default`/`rule`) | `off` | The automatic-action tri-state (S3); an explicit value wins over the deprecated `auto_collect`/`use_rules` pair | `inventory_config.cpp` |
+| `auto_add_collectors` | string[] | none | The default collector list armed for `auto_add: default` | `slurm_job_watcher.hpp:29` |
+| `auto_collect` | bool | `false` | **Deprecated** (mapping source only): folds into `auto_add` for one more schema version | `inventory_config.cpp` |
+| `use_rules` | bool | `false` | **Deprecated** (mapping source only): `auto_collect: true` + `use_rules: true` maps to `auto_add: rule` | `slurm_job_watcher.hpp:30` |
 | `rules_prefix` | string | `"slurm_job_"` | Prefix for rule files loaded by the rule engine | `slurm_job_watcher.hpp:35` |
 
 ---
