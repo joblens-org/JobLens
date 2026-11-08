@@ -1,7 +1,9 @@
 """JobLens integration test fixtures and shared configuration."""
 
 import importlib
+import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -49,7 +51,7 @@ def _write_export_file(target: Path, content: str) -> None:
 def _export_remote_command(worker: RemoteClient, command: str, target: Path) -> None:
     """执行远程命令并将 stdout/stderr 最佳努力写入本地文件。"""
     try:
-        result = worker.sudo(command, hide=True, warn=True)
+        result = worker.sudo(command, hide=True, warn=True, timeout=30)
         content = result.stdout or result.stderr
         _write_export_file(target, content)
     except Exception as e:
@@ -71,7 +73,7 @@ def _export_joblens_logs(
 
     _export_remote_command(
         worker,
-        f"test -f {JOBLENS_OUTPUT_LOG} && cat {JOBLENS_OUTPUT_LOG} || true",
+        f"test -f {JOBLENS_OUTPUT_LOG} && tail -n 5000 {JOBLENS_OUTPUT_LOG} || true",
         test_log_dir / "output.log",
     )
     if extra_paths is not None:
@@ -81,7 +83,7 @@ def _export_joblens_logs(
             safe_name = Path(ap).name
             _export_remote_command(
                 worker,
-                f"test -f {ap} && cat {ap} || true",
+                f"test -f {ap} && tail -n 5000 {ap} || true",
                 test_log_dir / safe_name,
             )
         for rg in extra_paths.rotated_globs:
@@ -98,12 +100,12 @@ def _export_joblens_logs(
             )
     _export_remote_command(
         worker,
-        "journalctl -u joblens --no-pager --since '30 minutes ago' 2>&1 || true",
+        "journalctl -u joblens --no-pager -n 2000 --since '30 minutes ago' 2>&1 || true",
         test_log_dir / "joblens-journal.log",
     )
     _export_remote_command(
         worker,
-        "journalctl -u joblens-trigger --no-pager --since '30 minutes ago' 2>&1 || true",
+        "journalctl -u joblens-trigger --no-pager -n 2000 --since '30 minutes ago' 2>&1 || true",
         test_log_dir / "joblens-trigger-journal.log",
     )
 
@@ -179,11 +181,28 @@ def joblens_api(request: pytest.FixtureRequest) -> JobLensAPI:
 
 def _cleanup_condor(controller: RemoteClient) -> None:
     try:
-        controller.run(
-            "condor_rm -all 2>/dev/null || true", hide=True, warn=True
-        )
-    except Exception:
-        pass
+        submit_user = os.environ.get("JOBLENS_TEST_CONDOR_USER", "").strip()
+
+        def as_user(command: str) -> str:
+            if not submit_user:
+                return command
+            return f"su - {shlex.quote(submit_user)} -c {shlex.quote(command)}"
+
+        controller.run(as_user("condor_rm -all 2>/dev/null || true"), hide=True, warn=True)
+        # 单 slot 环境：等作业真正离队，避免下一个测试的作业排队到超时。
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            result = controller.run(
+                as_user("condor_q -allusers -af ClusterId 2>/dev/null"),
+                hide=True, warn=True,
+            )
+            if not (result.stdout or "").strip():
+                break
+            time.sleep(1)
+        time.sleep(2)
+    except Exception as e:
+        print(f"[cleanup] condor cleanup failed: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
 
 
 def _cleanup_slurm(controller: RemoteClient) -> None:
@@ -205,8 +224,14 @@ def _wait_ebpf_ready(worker: RemoteClient, timeout: float = 15.0) -> None:
     """等待 eBPF 程序加载完成 (bpftool prog list 包含 joblens)."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        result = worker.sudo("bpftool prog list", hide=True, warn=True)
-        if "joblens" in result.stdout.lower():
+        # 测试环境用 root SSH，无需 sudo；避免 Fabric sudo 的 pty 提示处理。
+        result = worker.run(
+            "if command -v bpftool >/dev/null 2>&1; then "
+            "bpftool prog list; else ls /sys/fs/bpf/joblens 2>/dev/null; fi",
+            hide=True, warn=True,
+        )
+        out = (result.stdout or "").lower()
+        if "joblens" in out or "pid2job" in out:
             return
         time.sleep(0.5)
     raise RuntimeError(f"eBPF 未在 {timeout}s 内就绪")

@@ -68,9 +68,16 @@ writers_config:
     - name: file_writer
       type: FileWriter
       config: file_writer_config
+    # /metrics 端点依赖这个固定名字的 writer（Trigger 调用 prmxs_writer/metrics）
+    - name: prmxs_writer
+      type: PrometheusExporterWriter
+      config: prmxs_writer_config
 
 file_writer_config:
   path: /var/log/joblens/output.log              # 纯文本本地输出路径
+
+prmxs_writer_config:
+  fifo_path: /var/JobLens/prometheus.fifo        # 未被采集器引用时仅提供 RPC 指标
 
 # ============================================================
 # 单节点服务组件 (全部禁用)

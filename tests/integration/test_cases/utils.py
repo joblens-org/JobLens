@@ -5,6 +5,7 @@ import io
 import importlib
 import json
 import os
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -150,11 +151,18 @@ class RemoteClient:
 # ── 7. JobLensAPI ──────────────────────────────────────────────────────
 
 class JobLensAPI:
-    """JobLens Trigger REST API 封装，默认指向 worker VM."""
+    """JobLens Trigger REST API 封装，默认指向 worker VM.
+
+    Trigger 默认开启鉴权；从环境变量读取 Bearer token，方便在安全加固版本上
+    跑同一套回归。未设置时保持无鉴权（旧版本/本地调试）。
+    """
 
     def __init__(self, base_url: str = TRIGGER_BASE_URL) -> None:
         self.base_url = base_url.rstrip("/")
         self._session = requests.Session()
+        token = os.environ.get("JOBLENS_TRIGGER_TOKEN", "").strip()
+        if token:
+            self._session.headers["Authorization"] = f"Bearer {token}"
 
     def get(self, path: str, **kwargs: Any) -> requests.Response:
         """通用 GET 请求."""
@@ -352,10 +360,18 @@ arguments = {sleep_seconds}
 output = /tmp/condor_test.out
 error  = /tmp/condor_test.err
 log    = /tmp/condor_test.log
-queue
 """
+    requirements = os.environ.get("JOBLENS_TEST_CONDOR_REQUIREMENTS", "").strip()
+    if requirements:
+        submit_text += f"requirements = {requirements}\n"
+    submit_text += "queue\n"
     controller.sudo("cat > /tmp/test_job.sub", in_stream=io.StringIO(submit_text))
-    result = controller.run("condor_submit /tmp/test_job.sub", hide=True)
+    controller.sudo("chmod 644 /tmp/test_job.sub")
+    submit_cmd = "condor_submit /tmp/test_job.sub"
+    submit_user = os.environ.get("JOBLENS_TEST_CONDOR_USER", "").strip()
+    if submit_user:
+        submit_cmd = f"su - {shlex.quote(submit_user)} -c {shlex.quote(submit_cmd)}"
+    result = controller.run(submit_cmd, hide=True)
     for line in result.stdout.splitlines():
         if "submitted to cluster" in line:
             return line.strip().split()[-1].rstrip(".")
