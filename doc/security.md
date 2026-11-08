@@ -156,11 +156,18 @@ journalctl -u joblens-trigger | grep -i 'etcd'
 
 ---
 
-## 7. 升级注意（0.3.7 → 安全加固版）
+## 7. 升级注意（0.3.7 → 0.3.8）
 
 - **默认监听从 `0.0.0.0` 改为 `127.0.0.1`**：远程调用会断，需要隧道或显式覆盖。
-- **鉴权默认开启**：旧脚本调用写接口会收到 401/403；先配置 token。
+  注意 `gunicorn.conf.py` 是 `%config(noreplace)`，已部署节点升级后仍保留旧的
+  `0.0.0.0`；需要回环监听时手工改这一行。
+- **鉴权默认开启**：旧脚本调用受保护接口会收到 401/403。RPM 的 `%post` 会在
+  `/etc/JobLens/secrets.env`（0600）中自动生成 `JOBLENS_TRIGGER_TOKEN`（已有则
+  保留），从该文件读取后放进运维脚本的请求头即可，无需手写配置。
 - **IO 文件路径默认关闭**：需要文件级排障时显式 `collect_file_paths: true`。
 - **5xx 响应不再包含内部错误文本**：排障改用 `request_id` + 日志。
 - 配置文件权限会被 `%post` 收敛为 0640；如果 Trigger 以后改为非 root 运行，
   需要把它加入 `joblens` 组并相应调整。
+- 二进制、systemd unit、Lua 沙箱、RPC 与 FileWriter 的修复都在 RPM 内容里，
+  升级即生效；只有 `%config(noreplace)` 的配置项（监听地址、etcd/ES 凭据、
+  采集器开关）需要按上面的说明手工决定。

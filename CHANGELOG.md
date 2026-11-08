@@ -1,5 +1,33 @@
 # JobLens Changelog
 
+## v0.3.8 (2026-11-08)
+
+### Security Hardening
+
+- **Trigger control plane**: the HTTP gateway now binds `127.0.0.1:7592` by default (`JOBLENS_TRIGGER_BIND` overrides) and requires a bearer token (`JOBLENS_TRIGGER_TOKEN`) for every endpoint except `/`, `/metrics`, `/trigger/health` and `/joblens/healthy`. With no token configured, protected endpoints fail closed with 503 instead of allowing access. Debug mode is refused on non-loopback addresses, and config-triggered core restarts are debounced.
+- **Lua rule sandbox**: only `base` (without `load`/`loadfile`/`dofile`/`require`/`collectgarbage`), `string`, `table` and `math` are exposed. `io`, `package`, `os` and `debug` are not loaded, so rules cannot read files, load native libraries or execute commands. Rule execution has an instruction budget (2M) and a memory-delta budget (32 MB); rule files are capped at 256 KB.
+- **Rule path safety**: rule names from etcd/RPC must be a single safe filename and are validated against the rules directory with `weakly_canonical` both in C++ and in the Trigger.
+- **etcd**: connections require TLS and credentials by default (`JOBLENS_ETCD_*`); missing certificates refuse the connection instead of silently falling back to plaintext.
+- **Packaging/permissions**: config files install as `0640`, `/var/JobLens` as `0700`, `/var/lib/joblens` as `0750`; both units set `UMask=0077`, `LimitCORE=0`, `NoNewPrivileges`, `PrivateTmp` and `RestrictSUIDSGID`. `%post` tightens permissions left by older versions and generates a Trigger token in `/etc/JobLens/secrets.env` (0600) when none exists.
+- **FileWriter**: refuses symlink targets and, when running as root, world-writable parent directories.
+- **RPC**: sends no longer wrap a negative `send()` into `size_t`; requests larger than 4 KiB are drained instead of truncated, with an 8 MiB cap.
+- **Dependencies**: Trigger dependencies are locked with hashes (`trigger/requirements.lock`, `pip install --require-hashes`); build-time downloads are verified with sha256.
+- **Trigger hardening**: no `shell=True` command construction, 5xx responses return only `internal error` + `request_id`, and `JOBLENS_UPGRADE_TOKEN` is no longer hardcoded.
+- **Privacy**: `IOUsageCollector` no longer emits per-fd file paths or mount points unless `collect_file_paths: true`.
+
+### Breaking Changes
+
+- Trigger defaults to loopback; remote callers need an SSH tunnel or an explicit `JOBLENS_TRIGGER_BIND`.
+- Trigger HTTP auth is on by default; scripts calling protected endpoints must send the bearer token.
+- 5xx bodies no longer contain internal error text; use the `request_id` in the logs.
+- IO file paths are off by default.
+
+### Documentation
+
+- Added `doc/security.md` (trust boundary, hardening baseline, upgrade notes) and a Lua sandbox regression runner.
+
+---
+
 ## v0.3.7 (2026-10-22)
 
 ### Scheduler Correctness and Observability

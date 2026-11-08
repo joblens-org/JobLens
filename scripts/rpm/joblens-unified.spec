@@ -429,6 +429,25 @@ if [ -d /var/JobLens ]; then
     find /var/JobLens -xdev -type p -exec chmod 0600 {} + 2>/dev/null || :
 fi
 
+# ---- 确保 Trigger 鉴权令牌存在 ----
+# 0.3.8 起保护端点默认 fail-closed：没有 JOBLENS_TRIGGER_TOKEN 时运维接口会 503。
+# 升级不应要求人工先写令牌，因此首次安装/升级时在 root-only 文件中生成一个；
+# 已存在的文件保持不动，只收紧权限。
+if [ ! -f %{_sysconfdir}/JobLens/secrets.env ]; then
+    umask 077
+    jl_token="$(/usr/bin/openssl rand -hex 24 2>/dev/null || \
+        head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    {
+        echo "JOBLENS_TRIGGER_TOKEN=${jl_token}"
+        echo "JOBLENS_TRIGGER_AUTH=on"
+    } > %{_sysconfdir}/JobLens/secrets.env
+    echo "joblens: generated Trigger token in %{_sysconfdir}/JobLens/secrets.env (root-only)"
+fi
+if [ -f %{_sysconfdir}/JobLens/secrets.env ]; then
+    chown root:root %{_sysconfdir}/JobLens/secrets.env 2>/dev/null || :
+    chmod 0600 %{_sysconfdir}/JobLens/secrets.env 2>/dev/null || :
+fi
+
 # systemd 操作
 if [ -x /usr/bin/systemctl ]; then
     /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || :
