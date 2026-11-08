@@ -217,6 +217,10 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
             resolved.reconcile_interval_sec = parse_interval_sec(
                 *interval, "job_registry_config.inventory.reconcile_interval_sec");
         }
+        if (const auto* capture_all = member(*inventory, "capture_all")) {
+            resolved.capture_all =
+                parse_bool(*capture_all, "job_registry_config.inventory.capture_all");
+        }
         if (member(*inventory, "registration_batch_size") != nullptr) {
             spdlog::warn("inventory: registration_batch_size was removed; a discovery event "
                          "registers its job immediately");

@@ -27,7 +27,7 @@ struct Entry {
     bool source_retry;
 };
 
-constexpr std::array<Entry, 18> kEntries{{
+constexpr std::array<Entry, 19> kEntries{{
     {RegistrationError::None, "", false},
     {RegistrationError::IncompleteIdentity, "incomplete_identity", true},
     {RegistrationError::IncompleteExecution, "incomplete_execution", true},
@@ -44,6 +44,9 @@ constexpr std::array<Entry, 18> kEntries{{
     {RegistrationError::IdentityQuarantined, "identity_quarantined", false},
     {RegistrationError::IdentityIndexMismatch, "identity_index_mismatch", false},
     {RegistrationError::StaleRevision, "stale_revision", false},
+    // Admission is a configuration decision: the watcher must not loop
+    // rescans against it.
+    {RegistrationError::NotAdmitted, "not_admitted", false},
     {RegistrationError::PolicyEvaluationFailed, "policy_evaluation_failed", false},
     {RegistrationError::InitialIntentWriteFailed, "initial_intent_write_failed", false},
     {RegistrationError::ObserverDeliveryFailed, "observer_delivery_failed", false},

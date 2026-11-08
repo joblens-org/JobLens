@@ -155,6 +155,12 @@ struct JobRegistryOptions {
     // below is the key it is armed under.
     std::function<AutoCollectorPolicy()> test_auto_policy;
     std::string test_auto_policy_adapter{"condor"};
+    // Admission-gate test wiring (production reads inventory.capture_all and
+    // the per-type auto_add tri-state from the resolved configuration).
+    // test_capture_all=false arms the gate; the state map carries the
+    // per-subtype tri-state (a missing entry behaves as Off).
+    bool test_capture_all = true;
+    std::map<std::string, AutoAdd> test_auto_add_states;
 };
 
 class JobRegistry : private KernelAttribution::Host,
@@ -194,11 +200,24 @@ public:
     size_t delJobByRequest(const nlohmann::json& req);
 
     // --- Inventory store facade --------------------------------------------
+    // Admission outcome for one observation (capture_all=false): whether the
+    // observation may register, and — when the gate pre-evaluated the type's
+    // automatic selection — the initial collector list to apply instead of
+    // re-running the policy after registration (no double Lua). A nullopt
+    // decision from the gate drops the observation before any store work.
+    struct InitialDecision {
+        bool register_job = false;
+        std::optional<std::vector<std::string>> initial_collectors;
+        std::string policy_revision;
+    };
     // Identity-resolving idempotent upsert. Incomplete identities and
     // conflicting live generations are rejected explicitly and never indexed.
     // An upsert never fires lifecycle callbacks or starts collection: runtime
-    // application is binding-driven.
-    UpsertResult upsertObservedJob(const Job& job);
+    // application is binding-driven. `admission` (internal) carries a
+    // pre-evaluated admission decision: when it holds an initial collector
+    // list, that list is applied as the initial automatic selection instead
+    // of re-evaluating the policy.
+    UpsertResult upsertObservedJob(const Job& job, const InitialDecision* admission = nullptr);
     std::optional<JobRecord> inventoryRecord(uint64_t jobID) const;
     std::optional<JobRecord> inventoryRecordByIdentity(
         const CanonicalIdentity& identity) const;
@@ -472,6 +491,9 @@ private:
     std::uint64_t hb_obsolete_hints_ = 0;
     std::uint64_t hb_incomplete_observations_ = 0;
     std::uint64_t hb_upsert_conflicts_ = 0;
+    std::uint64_t hb_dropped_observations_ = 0;
+    std::uint64_t hb_rejected_observations_ = 0;
+    std::uint64_t hb_admission_errors_ = 0;
     std::uint64_t hb_retirements_ = 0;
     std::uint64_t hb_passes_ = 0;
     std::uint64_t hb_stop_errors_ = 0;
@@ -497,6 +519,11 @@ private:
     // Automatic collector selection keyed by adapter name, armed from the
     // resolved inventory configuration. A disabled entry selects nothing.
     std::map<std::string, AutoCollectorPolicy> auto_policies_;
+    // Admission gate state: the blanket-registration switch (S1) and the
+    // per-adapter auto_add tri-state (S3), armed from the resolved inventory
+    // configuration in armInventory().
+    bool inventory_capture_all_ = true;
+    std::map<std::string, AutoAdd> auto_add_states_;
     bool deinit_done_{false};
     bool deinit_ok_{true};
 
@@ -505,6 +532,12 @@ private:
     void heartbeatLoop();
     bool runPass(bool do_scan, bool wait);
     void processObservation(const Job& job, std::set<uint64_t>& observed);
+    // Registration admission gate (inventory.capture_all=false). Returns
+    // nullopt to drop the observation (counted by the caller-visible
+    // hb_dropped_/hb_rejected_ counters); otherwise the register decision
+    // and, when the type's policy was pre-evaluated, the initial collector
+    // list. Evaluated outside every registry lock.
+    std::optional<InitialDecision> admissionDecision(const Job& job);
     void requestRescan(const std::string& reason);
     bool rescanRequested() const;
     void refreshLegacyRecords();

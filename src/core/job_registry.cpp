@@ -492,6 +492,11 @@ bool JobRegistry::rescanRequested() const {
 }
 
 void JobRegistry::processObservation(const Job& job, std::set<uint64_t>& observed) {
+    // Admission first: with blanket registration off, a dropped observation
+    // never reaches identity resolution or the store.
+    const auto admission = admissionDecision(job);
+    if (!admission) return;
+
     const auto identity = canonicalize(selector_of(job));
     const ExecutionGeneration generation = generation_of(job);
     if (identity && generation.complete() && isObsolete(*identity, generation)) {
@@ -513,7 +518,7 @@ void JobRegistry::processObservation(const Job& job, std::set<uint64_t>& observe
                       job.execution ? job.execution->incomplete_reason : std::string{});
     }
 
-    const auto result = upsertObservedJob(job);
+    const auto result = upsertObservedJob(job, &*admission);
     if (result.ok) {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         observed.insert(result.internal_id);
@@ -614,6 +619,81 @@ bool JobRegistry::retireIfConfirmed(const JobRecord& record, const std::string& 
     }
     spdlog::info("JobRegistry: retired JobID {}: {}", record.internal_id, reason);
     return true;
+}
+
+std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const Job& job) {
+    // Blanket registration (S1 on): every captured job registers; the
+    // automatic selection stays with the post-registration path
+    // (apply_auto_policy), so no decision is pre-evaluated here.
+    if (inventory_capture_all_) {
+        InitialDecision blanket;
+        blanket.register_job = true;
+        return blanket;
+    }
+
+    // S1 off: the type's tri-state (S3) decides. A type without an entry —
+    // including subtypes no configured adapter owns — behaves as Off.
+    const auto state = auto_add_states_.find(job.subtype_name);
+    if (state == auto_add_states_.end() || state->second == AutoAdd::Off) {
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        ++hb_dropped_observations_;
+        return std::nullopt;
+    }
+
+    // Default/Rule: the armed policy carries the answer (the configured list
+    // verbatim, or the rule engine's per-job verdict). An armed state without
+    // a policy is inconsistent arming; refusing admission keeps the contract
+    // (never register without the promised selection) instead of guessing.
+    const auto policy = auto_policies_.find(job.subtype_name);
+    if (policy == auto_policies_.end() || !policy->second.enabled()) {
+        spdlog::error("JobRegistry: auto_add state for '{}' is armed without a policy; "
+                      "refusing admission",
+                      job.subtype_name);
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        ++hb_dropped_observations_;
+        return std::nullopt;
+    }
+
+    std::string revision;
+    std::string error;
+    const auto collectors = policy->second.select(job, revision, error);
+    if (!error.empty()) {
+        // Engine failure keeps the old decision (plan section 6.1): nothing
+        // is registered now and the observation is not a reject — the next
+        // one re-evaluates with the same evidence plus time.
+        spdlog::warn("JobRegistry: admission evaluation failed for '{}' ({}); the "
+                     "observation is not registered",
+                      job.NativeJobID, error);
+        {
+            std::lock_guard<std::mutex> lock(hb_mtx_);
+            ++hb_admission_errors_;
+        }
+        noteHeartbeatError("admission evaluation failed for '" + job.NativeJobID +
+                           "': " + error);
+        return std::nullopt;
+    }
+    if (state->second == AutoAdd::Default) {
+        // Defaults mode: the (possibly empty) configured list is the initial
+        // selection; an empty list registers the job with no collectors.
+        InitialDecision decision;
+        decision.register_job = true;
+        decision.initial_collectors = collectors;
+        decision.policy_revision = revision;
+        return decision;
+    }
+    if (collectors.empty()) {
+        // Rules mode: reject = no registration at all (S1 off), unlike the
+        // blanket mode where a reject keeps the job inventoried with an
+        // empty selection.
+        std::lock_guard<std::mutex> lock(hb_mtx_);
+        ++hb_rejected_observations_;
+        return std::nullopt;
+    }
+    InitialDecision accepted;
+    accepted.register_job = true;
+    accepted.initial_collectors = collectors;
+    accepted.policy_revision = revision;
+    return accepted;
 }
 
 void JobRegistry::rememberEnded(const JobRecord& record) {
@@ -992,7 +1072,17 @@ void JobRegistry::installHeartbeatSink() {
             std::lock_guard<std::mutex> lock(hb_mtx_);
             ++hb_events_received_;
         }
-        return upsertObservedJob(job);
+        // The same admission gate as the scan path: a refused observation is
+        // not an error of the source, and retry_registration() is false for
+        // it, so the watcher never loops rescans against the policy.
+        const auto admission = admissionDecision(job);
+        if (!admission) {
+            UpsertResult refused;
+            refused.fail(RegistrationError::NotAdmitted,
+                         "the inventory admission policy refused this observation");
+            return refused;
+        }
+        return upsertObservedJob(job, &*admission);
     };
 }
 
@@ -1055,6 +1145,8 @@ JobRegistry::armInventory(const JobRegistryOptions& options)
     // same armed-state behind.
     adapters_.clear();
     auto_policies_.clear();
+    auto_add_states_.clear();
+    inventory_capture_all_ = true;
 
     // Test wiring: pre-built sources and injected probes, no configuration
     // and no automatic selection.
@@ -1066,6 +1158,8 @@ JobRegistry::armInventory(const JobRegistryOptions& options)
             auto_policies_.clear();
             auto_policies_[options.test_auto_policy_adapter] = options.test_auto_policy();
         }
+        inventory_capture_all_ = options.test_capture_all;
+        auto_add_states_ = options.test_auto_add_states;
         reconcile_interval_sec_ = 30;
         return InventoryWiring::Test;
     }
@@ -1080,6 +1174,11 @@ JobRegistry::armInventory(const JobRegistryOptions& options)
         return InventoryWiring::Disabled;
     }
     reconcile_interval_sec_ = config.reconcile_interval_sec;
+    // The admission gate follows the resolved configuration (S1 + S3).
+    inventory_capture_all_ = config.capture_all;
+    for (const auto& [adapter_name, settings] : config.settings) {
+        auto_add_states_[adapter_name] = settings.auto_add;
+    }
     // Configuration wins over the construction default so the budget is a
     // deployment knob, not a rebuild.
 
@@ -2677,7 +2776,8 @@ std::optional<bool> JobRegistry::repair_initial_decision(const JobRecord& record
     return committed;
 }
 
-UpsertResult JobRegistry::upsertObservedJob(const Job& job) {
+UpsertResult JobRegistry::upsertObservedJob(const Job& job,
+                                            const InitialDecision* admission) {
     // A registration is also the record-driven repair point (A14): verify every
     // row whose last write outcome is unknown before touching any record.
     std::string recovery_error;
@@ -2905,10 +3005,15 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job) {
         // 6.2); Lua evaluation happens outside every registry lock. An
         // observation whose execution generation is not verified yet is never
         // auto-collected: the update that completes the generation re-runs
-        // the selection instead.
+        // the selection instead. An admission decision that carried its own
+        // evaluation is applied verbatim: the rule already ran once at the
+        // gate and must not run twice for one registration.
         if (generation_of(job).complete()) {
             result.intent_committed =
-                apply_auto_policy(record.job, record.identity.adapter);
+                admission != nullptr && admission->initial_collectors.has_value()
+                    ? applyAutoSelection(record.job.JobID, *admission->initial_collectors,
+                                         admission->policy_revision)
+                    : apply_auto_policy(record.job, record.identity.adapter);
             if (result.intent_committed == false) {
                 result.code = RegistrationError::InitialIntentWriteFailed;
                 result.error = to_string(result.code);
@@ -3468,6 +3573,9 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     std::uint64_t obsolete_hints = 0;
     std::uint64_t incomplete_observations = 0;
     std::uint64_t upsert_conflicts = 0;
+    std::uint64_t dropped_observations = 0;
+    std::uint64_t rejected_observations = 0;
+    std::uint64_t admission_errors = 0;
     std::uint64_t retirements = 0;
     std::uint64_t passes = 0;
     std::size_t exec_ingest_depth = 0;
@@ -3490,6 +3598,9 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
         obsolete_hints = hb_obsolete_hints_;
         incomplete_observations = hb_incomplete_observations_;
         upsert_conflicts = hb_upsert_conflicts_;
+        dropped_observations = hb_dropped_observations_;
+        rejected_observations = hb_rejected_observations_;
+        admission_errors = hb_admission_errors_;
         retirements = hb_retirements_;
         passes = hb_passes_;
         last_scan_start_ms = last_scan_start_ms_;        last_scan_success_ms = last_scan_success_ms_;
@@ -3589,6 +3700,10 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     out["obsolete_hints"] = obsolete_hints;
     out["incomplete_observations"] = incomplete_observations;
     out["upsert_conflicts"] = upsert_conflicts;
+    out["capture_all"] = inventory_capture_all_;
+    out["dropped_observations"] = dropped_observations;
+    out["rejected_observations"] = rejected_observations;
+    out["admission_errors"] = admission_errors;
     out["retirements"] = retirements;
     out["pass_count"] = passes;
     out["tracker_unavailable"] = tracker_unavailable;

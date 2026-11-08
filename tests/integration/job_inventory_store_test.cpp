@@ -686,7 +686,7 @@ void registration_errors_are_typed_and_exhaustively_mapped(const std::string& ba
         E::None, E::IncompleteIdentity, E::IncompleteExecution, E::SourceMetadataUnavailable,
         E::StoreUnavailable, E::StoreReadFailed, E::StoreWriteFailed, E::WriteOutcomeUnknown,
         E::IdExhausted, E::GenerationConflict, E::InstanceClosing, E::IdentityQuarantined,
-        E::IdentityIndexMismatch, E::StaleRevision, E::PolicyEvaluationFailed,
+        E::IdentityIndexMismatch, E::StaleRevision, E::NotAdmitted, E::PolicyEvaluationFailed,
         E::InitialIntentWriteFailed, E::ObserverDeliveryFailed, E::ReentrantMutation,
     };
     for (const auto code : codes) {

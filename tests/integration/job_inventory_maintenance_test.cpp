@@ -38,6 +38,8 @@
  *   A28  unknown cgroup members are not death evidence; confirmed death retires
  *   RETIRE-EXPLICIT an explicit retirement marks the ended generation; a
  *        late same-generation observation is refused, a new one registers
+ *   ADMIT  the inventory capture_all admission gate: S1/S3 combinations,
+ *        drop/reject counters, NotAdmitted on the event path
  *   LEGACY  manual registrations retire on process evidence without a source
  *   RESCAN  event-driven and on-demand passes run the same reconcile path
  *   EXEC    exec hints resolve to targeted observations without a full scan
@@ -55,6 +57,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <mutex>
@@ -1528,6 +1531,177 @@ void run_retire_explicit(const std::string& base)
 }
 
 // ---------------------------------------------------------------------------
+// ADMIT - inventory capture_all admission gate (S1 x S3 matrix)
+// ---------------------------------------------------------------------------
+
+void run_admit(const std::string& base)
+{
+    const auto rules_root = std::filesystem::path(base) / "admit-rules";
+    std::filesystem::create_directories(rules_root / "accept");
+    std::filesystem::create_directories(rules_root / "reject");
+    {
+        std::ofstream accept(rules_root / "accept" / "condor_job_admit.lua");
+        accept << "local rule = {}\n"
+                  "rule.name = \"admit_accept\"\n"
+                  "rule.priority = 10\n"
+                  "function rule.condition(job)\n"
+                  "    return {passed = true, collectors = {\"CPUMemCollector\"}}\n"
+                  "end\n"
+                  "return rule\n";
+        std::ofstream reject(rules_root / "reject" / "condor_job_admit.lua");
+        reject << "local rule = {}\n"
+                  "rule.name = \"admit_reject\"\n"
+                  "rule.priority = 10\n"
+                  "function rule.condition(job)\n"
+                  "    return {passed = false, collectors = {}}\n"
+                  "end\n"
+                  "return rule\n";
+    }
+
+    // S1 off x S3 off: the scan keeps running, nothing registers, drops are
+    // counted, and the event path reports NotAdmitted without a retry ask.
+    {
+        FakeSource source("condor");
+        FakeProbes probes;
+        const Job job =
+            make_condor_job("320.0", 5500, 111, "htcondor01", "schedd-a", "/cg/slot-32");
+        probes.set_process(5500, LivenessState::Alive, 111);
+        source.set_scan([&]() { return scan_with({job}); });
+        auto options = heartbeat_options(fresh_dir(base, "admit-off"), source, probes);
+        options.test_capture_all = false;
+        JobRegistry registry(options);
+
+        check(source.scans() >= 1, "ADMIT: the watcher must keep scanning with the gate closed");
+        check(count_records(registry) == 0,
+              "ADMIT: S1off x S3off must register nothing from the scan");
+        const auto refused = source.inject(job);
+        check(!refused.ok && refused.code == RegistrationError::NotAdmitted,
+              "ADMIT: the event path must report NotAdmitted");
+        check(!refused.retry_registration(),
+              "ADMIT: a refused admission must not ask the watcher to rescan");
+        check(registry.reconcileInventoryNow(), "ADMIT: the pass must run");
+        check(count_records(registry) == 0,
+              "ADMIT: S1off x S3off must register nothing on a pass");
+        check(!find_native(registry, "320.0").has_value(),
+              "ADMIT: the observed job must stay unregistered");
+        const auto status = heartbeat_status();
+        check(status["capture_all"].get<bool>() == false,
+              "ADMIT: the status must report the gate state");
+        check(status["dropped_observations"].get<std::uint64_t>() >= 2,
+              "ADMIT: drops from the scan and event paths must be counted");
+        registry.deinit();
+    }
+
+    // S1 off x S3 default: registration plus the configured default list as
+    // the initial automatic selection.
+    {
+        FakeSource source("condor");
+        FakeProbes probes;
+        const Job job =
+            make_condor_job("330.0", 5600, 222, "htcondor01", "schedd-a", "/cg/slot-33");
+        probes.set_process(5600, LivenessState::Alive, 222);
+        source.set_scan([&]() { return scan_with({job}); });
+        auto options = heartbeat_options(fresh_dir(base, "admit-default"), source, probes);
+        options.test_capture_all = false;
+        options.test_auto_add_states = {{"condor", AutoAdd::Default}};
+        options.test_auto_policy = [] {
+            return AutoCollectorPolicy::defaults({"CPUMemCollector"});
+        };
+        JobRegistry registry(options);
+
+        const auto record = find_native(registry, "330.0");
+        check(record.has_value(), "ADMIT: S1off x S3default must register the job");
+        const auto binding = registry.selectionRecord(record->internal_id);
+        check(binding.mode() == CollectionMode::Auto &&
+                  binding.automatic.has_value() &&
+                  binding.automatic->size() == 1 &&
+                  binding.automatic->front() == "CPUMemCollector",
+              "ADMIT: the default list must become the initial automatic selection");
+        check(binding.automatic_source == "defaults",
+              "ADMIT: the selection must identify the defaults source");
+        const auto status = heartbeat_status();
+        check(status["dropped_observations"].get<std::uint64_t>() == 0 &&
+                  status["rejected_observations"].get<std::uint64_t>() == 0,
+              "ADMIT: an admitted job must not count as dropped or rejected");
+        registry.deinit();
+    }
+
+    // S1 off x S3 rule: a rejecting rule keeps the job out of the inventory
+    // (unlike blanket mode, where a reject registers an empty selection); an
+    // accepting rule registers with the rule's list.
+    {
+        FakeSource source("condor");
+        FakeProbes probes;
+        const Job rejected_job =
+            make_condor_job("340.0", 5700, 333, "htcondor01", "schedd-a", "/cg/slot-34");
+        probes.set_process(5700, LivenessState::Alive, 333);
+        source.set_scan([&]() { return scan_with({rejected_job}); });
+        auto options = heartbeat_options(fresh_dir(base, "admit-reject"), source, probes);
+        options.test_capture_all = false;
+        options.test_auto_add_states = {{"condor", AutoAdd::Rule}};
+        options.test_auto_policy = [&] {
+            return AutoCollectorPolicy::rules((rules_root / "reject").string(),
+                                              "condor_job_");
+        };
+        JobRegistry registry(options);
+
+        check(count_records(registry) == 0,
+              "ADMIT: a rejecting rule must not register the job");
+        check(registry.reconcileInventoryNow(), "ADMIT: the reject pass must run");
+        check(count_records(registry) == 0,
+              "ADMIT: a rejecting rule must keep the job out across passes");
+        check(heartbeat_status()["rejected_observations"].get<std::uint64_t>() >= 1,
+              "ADMIT: rule rejections must be counted");
+        registry.deinit();
+    }
+    {
+        FakeSource source("condor");
+        FakeProbes probes;
+        const Job accepted_job =
+            make_condor_job("350.0", 5800, 444, "htcondor01", "schedd-a", "/cg/slot-35");
+        probes.set_process(5800, LivenessState::Alive, 444);
+        source.set_scan([&]() { return scan_with({accepted_job}); });
+        auto options = heartbeat_options(fresh_dir(base, "admit-accept"), source, probes);
+        options.test_capture_all = false;
+        options.test_auto_add_states = {{"condor", AutoAdd::Rule}};
+        options.test_auto_policy = [&] {
+            return AutoCollectorPolicy::rules((rules_root / "accept").string(),
+                                              "condor_job_");
+        };
+        JobRegistry registry(options);
+
+        const auto record = find_native(registry, "350.0");
+        check(record.has_value(), "ADMIT: an accepting rule must register the job");
+        const auto binding = registry.selectionRecord(record->internal_id);
+        check(binding.automatic.has_value() && binding.automatic->size() == 1 &&
+                  binding.automatic->front() == "CPUMemCollector",
+              "ADMIT: the rule's list must become the initial automatic selection");
+        check(binding.automatic_source.rfind("rules:", 0) == 0,
+              "ADMIT: the selection must identify the rules source");
+        check(heartbeat_status()["dropped_observations"].get<std::uint64_t>() == 0,
+              "ADMIT: an accepted job must not count as dropped");
+        registry.deinit();
+    }
+
+    // S1 on is guarded by the whole existing suite (default options keep the
+    // gate open); this case pins the default itself.
+    {
+        const auto config = resolve_inventory_maintenance_config(nlohmann::json::object());
+        check(config.capture_all, "ADMIT: capture_all must default to true");
+        const auto off = resolve_inventory_maintenance_config(nlohmann::json{
+            {"job_registry_config", nlohmann::json{
+                {"inventory", nlohmann::json{{"capture_all", false}}},
+            }},
+        });
+        check(!off.capture_all, "ADMIT: capture_all=false must parse");
+    }
+
+    pass_case("ADMIT",
+              "capture_all gate: off+off registers nothing, default/rule register with "
+              "their lists, a rule reject stays out and is counted");
+}
+
+// ---------------------------------------------------------------------------
 // RESCAN - event-driven and on-demand passes
 // ---------------------------------------------------------------------------
 
@@ -1588,6 +1762,7 @@ int main(int argc, char** argv)
         run_legacy(base);
         run_restore_unknown_keeps_evidence(base);
         run_retire_explicit(base);
+        run_admit(base);
         run_rescan(base);
         std::cout << "ALL PASS\n";
         return 0;

@@ -35,6 +35,10 @@ struct InventoryMaintenanceConfig {
     // Adapter names that opted into broad discovery. Empty means "inventory
     // off", preserving the pre-decoupling opt-in behavior.
     std::vector<std::string> types;
+    // Blanket registration switch (S1): true (the default) registers every
+    // captured job unconditionally; false leaves admission to each type's
+    // auto_add tri-state.
+    bool capture_all = true;
     // Default 30 s; minimum 1 s (validated at startup).
     std::uint32_t reconcile_interval_sec = 30;
     // Keyed by adapter name; contains every registered adapter plus every

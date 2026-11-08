@@ -41,6 +41,10 @@ enum class RegistrationError {
     IdentityQuarantined,
     IdentityIndexMismatch,
     StaleRevision,
+    // The admission gate (inventory capture_all=false) refused the
+    // observation before any registration work: no record was created and no
+    // state changed. Re-reading the source cannot change the decision.
+    NotAdmitted,
     // Post-commit obligations: facts are durable, the decision/application is
     // repaired by record-driven maintenance, never by re-reading the source.
     PolicyEvaluationFailed,
