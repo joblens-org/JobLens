@@ -241,6 +241,16 @@ using SubAttr = std::variant<CondorJobAttr, CommonJobAttr, SlurmJobAttr, nlohman
 // JSON object the adapter owns (schema, keys, evolution). Built-in attrs
 // stay strongly typed so existing collectors and matchers are untouched.
 
+// Condor scheduler (schedd) attribution comparison with legacy tolerance:
+// when both sides hold the attribution it must be equal to match; either side
+// unknown (empty) keeps the historical match behavior. Rows restored from an
+// old schema may carry an empty scheduler_name (the field sits outside its
+// serialization list), so an unknown row can never contradict a claimed one.
+inline bool scheduler_attribution_equal(const std::string& claimed,
+                                        const std::string& held) {
+    return claimed.empty() || held.empty() || claimed == held;
+}
+
 // SubAttr 匹配器，用于通过 sub_attr 字段匹配作业
 struct SubAttrMatcher {
     // 通用匹配条件
@@ -251,6 +261,11 @@ struct SubAttrMatcher {
     std::optional<size_t> condor_proc_id;
     std::optional<std::string> condor_owner;
     std::optional<pid_t> condor_starter_pid;
+    // Condor scheduler (schedd) attribution. A matcher field is a claim from
+    // the request side: a row holding the same attribution must be equal to
+    // match, a row without it is "unknown" and keeps the legacy behavior.
+    std::optional<std::string> condor_scheduler_name;
+    std::optional<std::string> condor_scheduler_host;
     
     // SlurmJobAttr 匹配字段
     std::optional<size_t> slurm_job_id;
@@ -283,12 +298,18 @@ struct SubAttrMatcher {
         return std::visit([this](const auto& a) -> bool {
             using T = std::decay_t<decltype(a)>;
             if constexpr (std::is_same_v<T, CondorJobAttr>) {
-                spdlog::debug("SubAttrMatcher: matching CondorJobAttr with cluster_id={}, proc_id={}, owner={}, starter_pid={}", 
-                    a.cluster_id, a.proc_id, a.owner, a.starter_pid);
+                spdlog::debug("SubAttrMatcher: matching CondorJobAttr with cluster_id={}, proc_id={}, owner={}, starter_pid={}, scheduler_name={}, scheduler_host={}", 
+                    a.cluster_id, a.proc_id, a.owner, a.starter_pid, a.scheduler_name, a.scheduler_host);
                 if (condor_cluster_id.has_value() && a.cluster_id != condor_cluster_id.value()) return false;
                 if (condor_proc_id.has_value() && a.proc_id != condor_proc_id.value()) return false;
                 if (condor_owner.has_value() && a.owner != condor_owner.value()) return false;
                 if (condor_starter_pid.has_value() && a.starter_pid != condor_starter_pid.value()) return false;
+                if (condor_scheduler_name.has_value() &&
+                    !scheduler_attribution_equal(*condor_scheduler_name, a.scheduler_name))
+                    return false;
+                if (condor_scheduler_host.has_value() &&
+                    !scheduler_attribution_equal(*condor_scheduler_host, a.scheduler_host))
+                    return false;
                 spdlog::debug("SubAttrMatcher: CondorJobAttr matched successfully");
                 return true;
             } else if constexpr (std::is_same_v<T, SlurmJobAttr>) {

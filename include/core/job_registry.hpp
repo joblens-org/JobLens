@@ -386,10 +386,12 @@ private:
     // The CREATE branch: the legacy manual registration body verbatim.
     bool createManualJob(const Job& job);
     // UPDATE-branch routing: the identity selector first (namespace rules),
-    // then the typed sub_attr matcher. A closing identity target is
-    // reported through `closing`; more than one identity match is reported
-    // through `ambiguous` with the candidate ids; no target falls through to
-    // CREATE.
+    // then the typed sub_attr matcher, which discriminates by the
+    // subtype's scheduler (schedd) attribution — an identity-less row keeps
+    // the legacy tolerance, an identity-bearing row joins only when its
+    // scheduler attribution agrees, and more than one surviving duplicate is
+    // reported through `ambiguous`, never guessed. A closing identity target
+    // is reported through `closing`; no target falls through to CREATE.
     struct ManualTarget {
         enum class Kind { None, Closing, Ambiguous, Update };
         Kind kind = Kind::None;

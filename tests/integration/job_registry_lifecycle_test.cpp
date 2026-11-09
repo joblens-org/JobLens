@@ -707,6 +707,217 @@ void run(const std::string& base)
             registry.deinit();
         }
 
+        // --- schedd discrimination: the same native id, another scheduler --
+        {
+            JobRegistryOptions options;
+            options.db_path = fresh_dir(base, "lifecycle-upsert-schedd");
+            options.enable_pid_tracker = false;
+            options.register_rpc = false;
+            JobRegistry registry(options);
+
+            // Two manual rows of one native id, one per schedd. A manual add
+            // carries no cluster_name, so the rows resolve no identity and
+            // only the typed facts plus the scheduler (schedd) attribution
+            // route them.
+            const auto manual_condor = [](const char* name, const char* host) {
+                Job job;
+                job.jobtype = JobType::Job;
+                job.subtype = JobSubType::Condor;
+                job.NativeJobID = "172.0";
+                job.sub_attr = CondorJobAttr{};
+                std::get<CondorJobAttr>(job.sub_attr).cluster_id = 172;
+                std::get<CondorJobAttr>(job.sub_attr).proc_id = 0;
+                if (name != nullptr) {
+                    std::get<CondorJobAttr>(job.sub_attr).scheduler_name = name;
+                    std::get<CondorJobAttr>(job.sub_attr).scheduler_host = host;
+                }
+                job.CollectorNames = {"cpumem_collector"};
+                return job;
+            };
+            check(registry.addJob(manual_condor("schedd-a", "sa.example.com")),
+                  "schedd: the schedd-a create must succeed");
+            check(registry.addJob(manual_condor("schedd-b", "sb.example.com")),
+                  "schedd: the same native id under another schedd must create, "
+                  "not refuse as a sub_attr duplicate");
+            check(registry.inventoryRecords().size() == 2,
+                  "schedd: two schedds must persist two records");
+            const auto row_of = [&registry](const char* schedd) {
+                for (const auto& record : registry.inventoryRecords()) {
+                    const auto* attr = std::get_if<CondorJobAttr>(&record.job.sub_attr);
+                    if (attr != nullptr && attr->scheduler_name == schedd)
+                        return record;
+                }
+                throw std::runtime_error(std::string("schedd: no row for ") + schedd);
+            };
+            const uint64_t id_a = row_of("schedd-a").internal_id;
+            const uint64_t id_b = row_of("schedd-b").internal_id;
+            check(std::get<CondorJobAttr>(row_of("schedd-b").job.sub_attr).scheduler_name ==
+                      "schedd-b",
+                  "schedd: the created row must keep the claimed scheduler attribution");
+
+            // Same-schedd duplicate: the historical CREATE refusal stays.
+            check(!registry.addJob(manual_condor("schedd-b", "sb.example.com")),
+                  "schedd: a same-schedd duplicate add must stay refused");
+            check(registry.inventoryRecords().size() == 2,
+                  "schedd: the refused duplicate must persist nothing");
+
+            // A schedd-b claim routes to schedd-b's row only; schedd-a's
+            // selection is a different job's and must stay untouched.
+            Job claim_b = manual_condor("schedd-b", "sb.example.com");
+            claim_b.CollectorNames = {"io_collector"};
+            const auto updated_b =
+                registry.upsertJob(claim_b, nlohmann::json::object(), std::nullopt);
+            check(updated_b["status"] == "success" && updated_b["JobID"] == id_b,
+                  "schedd: the schedd-b claim must update schedd-b's row: " +
+                      updated_b.dump());
+            {
+                const auto binding_a = registry.selectionRecord(id_a);
+                check(binding_a.manual.has_value() &&
+                          *binding_a.manual == std::vector<std::string>{"cpumem_collector"},
+                      "schedd: the schedd-a selection must stay untouched");
+                const auto binding_b = registry.selectionRecord(id_b);
+                check(binding_b.manual.has_value() && binding_b.manual->size() == 2,
+                      "schedd: the schedd-b claim must union into schedd-b's selection");
+            }
+            Job claim_a = manual_condor("schedd-a", "sa.example.com");
+            claim_a.CollectorNames = {"io_collector"};
+            const auto updated_a =
+                registry.upsertJob(claim_a, nlohmann::json::object(), std::nullopt);
+            check(updated_a["status"] == "success" && updated_a["JobID"] == id_a,
+                  "schedd: the schedd-a claim must update schedd-a's row: " +
+                      updated_a.dump());
+
+            // A legacy request with no scheduler attribution matches both
+            // rows: an ambiguity the caller must resolve, never a guess.
+            Job bare = manual_condor(nullptr, nullptr);
+            bare.CollectorNames = {"io_collector"};
+            const auto ambiguous =
+                registry.upsertJob(bare, nlohmann::json::object(), std::nullopt);
+            check(ambiguous["status"] == "error" &&
+                      ambiguous["code"] == "ambiguous_selector",
+                  "schedd: a bare native id across two schedds must be ambiguous: " +
+                      ambiguous.dump());
+            check(ambiguous["candidates"].size() == 2,
+                  "schedd: the ambiguity must list both rows: " + ambiguous.dump());
+            check(registry.inventoryRecords().size() == 2,
+                  "schedd: the ambiguous route must create nothing");
+
+            // An old row without any scheduler attribution stays reachable:
+            // a claimed schedd cannot contradict an unknown one (legacy
+            // tolerance), so the claim updates the legacy row in place.
+            Job legacy;
+            legacy.jobtype = JobType::Job;
+            legacy.subtype = JobSubType::Condor;
+            legacy.NativeJobID = "180.0";
+            legacy.sub_attr = CondorJobAttr{};
+            std::get<CondorJobAttr>(legacy.sub_attr).cluster_id = 180;
+            std::get<CondorJobAttr>(legacy.sub_attr).proc_id = 0;
+            legacy.CollectorNames = {"cpumem_collector"};
+            check(registry.addJob(legacy),
+                  "schedd: the attribution-less legacy row must create");
+            const auto legacy_row = [&registry]() {
+                for (const auto& record : registry.inventoryRecords()) {
+                    const auto* attr = std::get_if<CondorJobAttr>(&record.job.sub_attr);
+                    if (attr != nullptr && attr->cluster_id == 180) return record;
+                }
+                throw std::runtime_error("schedd: no legacy 180.0 row");
+            }();
+            Job claim_legacy = legacy;
+            std::get<CondorJobAttr>(claim_legacy.sub_attr).scheduler_name = "schedd-a";
+            std::get<CondorJobAttr>(claim_legacy.sub_attr).scheduler_host = "sa.example.com";
+            claim_legacy.CollectorNames = {"io_collector"};
+            const auto tolerated =
+                registry.upsertJob(claim_legacy, nlohmann::json::object(), std::nullopt);
+            check(tolerated["status"] == "success" &&
+                      tolerated["JobID"] == legacy_row.internal_id,
+                  "schedd: a claim on an unknown schedd must tolerate and update the "
+                  "legacy row: " + tolerated.dump());
+            check(registry.inventoryRecords().size() == 3,
+                  "schedd: the tolerated claim must not create a second 180.0");
+            registry.deinit();
+        }
+
+        // --- schedd vs a resolved row with a serialization gap -------------
+        {
+            JobRegistryOptions options;
+            options.db_path = fresh_dir(base, "lifecycle-upsert-schedd-identity");
+            options.enable_pid_tracker = false;
+            options.register_rpc = false;
+            JobRegistry registry(options);
+
+            // A discovered row with a resolved identity whose typed
+            // scheduler_name predates serialization (the field sits outside
+            // the old list): the "@schedd-a" namespace tag is the same fact's
+            // durable form and must still discriminate.
+            NativeSelector selector;
+            selector.adapter = "condor";
+            selector.cluster_name = "htcondor01";
+            selector.cluster_tag = "schedd-a";
+            selector.native_job_id = "172.0";
+            ExecutionGeneration generation;
+            generation.boot_id = "boot";
+            generation.manager_pid = 4747;
+            generation.manager_start_ticks = 940000;
+            Job observation = discovered_job(
+                selector, generation, {ProcessIdentity{4747, 940000, "boot"}}, true);
+            observation.subtype = JobSubType::Condor;
+            observation.sub_attr = CondorJobAttr{};
+            std::get<CondorJobAttr>(observation.sub_attr).cluster_id = 172;
+            std::get<CondorJobAttr>(observation.sub_attr).proc_id = 0;
+            const auto created = registry.upsertObservedJob(observation);
+            check(created.ok && created.disposition == UpsertDisposition::Created,
+                  "schedd: the resolved 172.0 instance must exist");
+            const uint64_t resolved_id = created.internal_id;
+
+            const auto manual_claim = [](const char* name, const char* host) {
+                Job job;
+                job.jobtype = JobType::Job;
+                job.subtype = JobSubType::Condor;
+                job.NativeJobID = "172.0";
+                job.sub_attr = CondorJobAttr{};
+                std::get<CondorJobAttr>(job.sub_attr).cluster_id = 172;
+                std::get<CondorJobAttr>(job.sub_attr).proc_id = 0;
+                if (name != nullptr) {
+                    std::get<CondorJobAttr>(job.sub_attr).scheduler_name = name;
+                    std::get<CondorJobAttr>(job.sub_attr).scheduler_host = host;
+                }
+                job.CollectorNames = {"cpumem_collector"};
+                return job;
+            };
+
+            // Another schedd's claim must not adopt the resolved row: it
+            // creates beside it and the resolved row stays untouched.
+            const auto claim_b =
+                registry.upsertJob(manual_claim("schedd-b", "sb.example.com"),
+                                   nlohmann::json::object(), std::nullopt);
+            check(claim_b["status"] == "success",
+                  "schedd: another schedd must create beside the resolved row: " +
+                      claim_b.dump());
+            check(registry.inventoryRecords().size() == 2,
+                  "schedd: the schedd-b claim must persist its own record");
+            check(!registry.selectionRecord(resolved_id).manual.has_value(),
+                  "schedd: the resolved schedd-a row must stay untouched by the "
+                  "schedd-b claim");
+
+            // The agreeing claim adopts the resolved row through the typed
+            // fallback: the namespace tag agrees with the request.
+            const auto claim_a =
+                registry.upsertJob(manual_claim("schedd-a", "sa.example.com"),
+                                   nlohmann::json::object(), std::nullopt);
+            check(claim_a["status"] == "success" && claim_a["JobID"] == resolved_id,
+                  "schedd: the agreeing claim must update the resolved row: " +
+                      claim_a.dump());
+            check(registry.inventoryRecords().size() == 2,
+                  "schedd: the agreeing claim must not create a second record");
+            {
+                const auto binding = registry.selectionRecord(resolved_id);
+                check(binding.manual.has_value() &&
+                          *binding.manual == std::vector<std::string>{"cpumem_collector"},
+                      "schedd: the agreeing claim must set the manual selection");
+            }
+            registry.deinit();
+        }
+
         // --- no hit: CREATE keeps the legacy semantics ---------------------
         {
             JobRegistryOptions options;
@@ -740,7 +951,9 @@ void run(const std::string& base)
               "construction starts inventory, stop/deinit are idempotent and ordered");
     pass_case("UPSERT",
               "manual upsert: identity/sub_attr routes update with collector union, "
-              "a fresh add creates, create still rejects empty collectors");
+              "the sub_attr route discriminates by the subtype's scheduler (schedd) "
+              "with legacy tolerance for an unknown attribution, a fresh add creates, "
+              "create still rejects empty collectors");
     pass_case("AUTOPOLICY",
               "auto_add folding selects collectors on registration; rules decide per job");
 }

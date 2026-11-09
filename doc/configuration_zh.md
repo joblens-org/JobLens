@@ -180,7 +180,7 @@ Watcher 关闭时 `auto_add` 失去意义，只有全量登记区分两行；Wat
 
 | 操作 | 入口 | 语义 |
 |---|---|---|
-| 增 / 改 | `JobRegistry/job_opt`，`opt: "add"`（单次 upsert） | 身份命中活跃实例（类型化 `sub_attr` + 调度器命名空间）路由到 UPDATE：请求采集器**并入**现有手工选择（union 去重，绝不整替），事实只补空合并。类型化 sub_attr 命中但身份未解析的按 internal id 路由 UPDATE。其余走 CREATE：旧版手工登记语义，空采集器列表仍被拒绝（UPDATE 允许空列表 = 纯事实补录） |
+| 增 / 改 | `JobRegistry/job_opt`，`opt: "add"`（单次 upsert） | 身份命中活跃实例（类型化 `sub_attr` + 调度器命名空间）路由到 UPDATE：请求采集器**并入**现有手工选择（union 去重，绝不整替），事实只补空合并。类型化 sub_attr 命中的行，只有在其身份未解析、或 subtype 携带的 scheduler（schedd）归属与请求一致时，才按 internal id 路由 UPDATE：同一 native id 在另一个 schedd 下属于不同作业（各自 CREATE），归属未知的旧记录保持 legacy 容忍，多条命中报 `ambiguous_selector`，绝不猜测。其余走 CREATE：旧版手工登记语义，其查重按同样的 scheduler（schedd）归属判别，空采集器列表仍被拒绝（UPDATE 允许空列表 = 纯事实补录） |
 | 查 / 改选择 | `JobCollection/get`、`JobCollection/set`、`JobCollection/reset_auto` | 不变；手工选择（含空 stop）永远压过自动选择 |
 | 删 —— stop 档（默认） | `JobRegistry/job_opt`，`opt: "remove"` | 停止采集（持久化空的手工选择）；清单记录保留 |
 | 删 —— erase 档 | `JobRegistry/job_opt`，`opt: "remove"`，`"erase": true` | 真删：先持久化 closing，采集过的实例归档为 `h:` 历史行，从未采集过的直接持久化删除。响应以 `mode: stop\|erase` 区分两档 |

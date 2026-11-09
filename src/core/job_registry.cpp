@@ -268,6 +268,77 @@ JobStore::WriteOp put_record_op(const JobRecord& record) {
     return op;
 }
 
+// The typed duplicate matcher shared by the CREATE dedup and the manual
+// UPDATE fallback: the native ids plus the request's scheduler (schedd)
+// attribution, so the same cluster_id/proc_id under another schedd can never
+// match. An empty attribution on the request claims nothing and discriminates
+// nothing (the legacy behavior).
+SubAttrMatcher native_duplicate_matcher(const Job& job) {
+    SubAttrMatcher matcher;
+    matcher.subtype = job.subtype;
+    if (const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr)) {
+        matcher.subtype = JobSubType::Condor;
+        matcher.condor_cluster_id = attr->cluster_id;
+        matcher.condor_proc_id = attr->proc_id;
+        if (!attr->scheduler_name.empty())
+            matcher.condor_scheduler_name = attr->scheduler_name;
+        if (!attr->scheduler_host.empty())
+            matcher.condor_scheduler_host = attr->scheduler_host;
+    } else if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr)) {
+        matcher.subtype = JobSubType::Slurm;
+        matcher.slurm_job_id = attr->job_id;
+        matcher.slurm_step_id = attr->step_id;
+    }
+    return matcher;
+}
+
+// The scheduler (schedd) attribution of a row, for the doc-contract limit on
+// the typed-facts route: the typed facts first; when they predate the
+// scheduler_name serialization (rows restored from an old schema carry the
+// field empty) the resolved identity's "@<schedd>" namespace tag is the
+// durable form of the same fact.
+std::string row_scheduler_name(const JobRecord& row) {
+    const auto* attr = std::get_if<CondorJobAttr>(&row.job.sub_attr);
+    if (attr == nullptr) return {};
+    if (!attr->scheduler_name.empty()) return attr->scheduler_name;
+    if (row.identity_complete) {
+        const std::string& ns = row.identity.cluster_namespace;
+        const auto at = ns.rfind('@');
+        if (at != std::string::npos) return ns.substr(at + 1);
+    }
+    return {};
+}
+
+// True when the row may answer a request under the scheduler-discriminating
+// duplicate screen. A row without a resolved identity keeps the legacy
+// tolerance (its scheduler attribution is unknown, so a claimed one cannot
+// contradict it); a row already holding a canonical identity joins only when
+// its scheduler (schedd) attribution agrees with the request. Non-Condor
+// requests carry no scheduler attribution and stay unconditional (the defect
+// this screen closes is Condor-schedd specific).
+bool scheduler_attribution_agrees(const Job& request, const JobRecord& row) {
+    const auto* requested = std::get_if<CondorJobAttr>(&request.sub_attr);
+    if (requested == nullptr) return true;
+    const auto* held = std::get_if<CondorJobAttr>(&row.job.sub_attr);
+    if (held == nullptr) return true;
+    if (!scheduler_attribution_equal(requested->scheduler_name, row_scheduler_name(row)))
+        return false;
+    return scheduler_attribution_equal(requested->scheduler_host, held->scheduler_host);
+}
+
+// The surviving rows of the typed-facts duplicate screen, shared by the
+// CREATE dedup and the UPDATE fallback: sub_attr match plus the
+// scheduler-attribution limit above.
+std::vector<JobRecord> scheduler_screened_duplicates(
+    const Job& request, std::vector<JobRecord> rows) {
+    std::vector<JobRecord> out;
+    for (auto& row : rows) {
+        if (!scheduler_attribution_agrees(request, row)) continue;
+        out.push_back(std::move(row));
+    }
+    return out;
+}
+
 }  // namespace
 
 // Adapter-owned legacy decode dispatch: the Job's subtype_name (or the
@@ -1679,21 +1750,15 @@ bool JobRegistry::createManualJob(const Job& job) {
     }
 
     // Duplicate check over active records: same typed sub_attr or same id.
-    SubAttrMatcher matcher;
-    matcher.subtype = job_copy.subtype;
-    if (std::holds_alternative<CondorJobAttr>(job_copy.sub_attr)) {
-        const auto& attr = std::get<CondorJobAttr>(job_copy.sub_attr);
-        matcher.subtype = JobSubType::Condor;
-        matcher.condor_cluster_id = attr.cluster_id;
-        matcher.condor_proc_id = attr.proc_id;
-    } else if (std::holds_alternative<SlurmJobAttr>(job_copy.sub_attr)) {
-        const auto& attr = std::get<SlurmJobAttr>(job_copy.sub_attr);
-        matcher.subtype = JobSubType::Slurm;
-        matcher.slurm_job_id = attr.job_id;
-        matcher.slurm_step_id = attr.step_id;
-    }
-    if (!ownFindActive([&matcher](const Job& existing) {
-            return matches_job(matcher, existing); }).empty()) {
+    // The screen is scheduler (schedd) discriminating: the same
+    // cluster_id/proc_id under another schedd names a different job and is
+    // allowed to create; an identity-bearing row counts as a duplicate only
+    // when its scheduler attribution agrees with the request.
+    const SubAttrMatcher matcher = native_duplicate_matcher(job_copy);
+    const auto duplicates = scheduler_screened_duplicates(
+        job_copy, ownFindActive(
+                      [&matcher](const Job& existing) { return matches_job(matcher, existing); }));
+    if (!duplicates.empty()) {
         spdlog::warn("JobRegistry: job with matching sub_attr already exists, ignored");
         return false;
     }
@@ -1877,28 +1942,37 @@ JobRegistry::ManualTarget JobRegistry::manualUpdateTarget(
         }
     }
     // A manual old row (typed sub_attr duplicate, identity never resolved):
-    // the historical duplicate refusal becomes an UPDATE route by id.
-    SubAttrMatcher matcher;
-    matcher.subtype = job.subtype;
-    if (std::holds_alternative<CondorJobAttr>(job.sub_attr)) {
-        const auto& attr = std::get<CondorJobAttr>(job.sub_attr);
-        matcher.subtype = JobSubType::Condor;
-        matcher.condor_cluster_id = attr.cluster_id;
-        matcher.condor_proc_id = attr.proc_id;
-    } else if (std::holds_alternative<SlurmJobAttr>(job.sub_attr)) {
-        const auto& attr = std::get<SlurmJobAttr>(job.sub_attr);
-        matcher.subtype = JobSubType::Slurm;
-        matcher.slurm_job_id = attr.job_id;
-        matcher.slurm_step_id = attr.step_id;
+    // the historical duplicate refusal becomes an UPDATE route by id. The
+    // screen carries the request's scheduler (schedd) attribution and the
+    // doc-contract limit: an identity-less row keeps the legacy tolerance, an
+    // identity-bearing row joins only when its scheduler attribution agrees —
+    // so a schedd-B request can never adopt a schedd-A row whose typed
+    // scheduler_name was never serialized.
+    const SubAttrMatcher matcher = native_duplicate_matcher(job);
+    auto duplicates = scheduler_screened_duplicates(
+        job, ownFindActive(
+                 [&matcher](const Job& existing) { return matches_job(matcher, existing); }));
+    if (duplicates.size() > 1) {
+        // Several surviving duplicates are an ambiguity the caller must
+        // resolve (claim the scheduler attribution or pass an identity
+        // selector), never a guess. Ids are reported ascending, exactly like
+        // the selector route above.
+        std::sort(duplicates.begin(), duplicates.end(),
+                  [](const JobRecord& lhs, const JobRecord& rhs) {
+                      return lhs.internal_id < rhs.internal_id;
+                  });
+        target.kind = ManualTarget::Kind::Ambiguous;
+        for (const auto& match : duplicates)
+            target.candidates.push_back(format_internal_id(match.internal_id));
+        target.message =
+            fmt::format("typed sub_attr '{}' matches {} current local instances; "
+                        "claim the scheduler attribution or use an identity selector",
+                        job.NativeJobID, duplicates.size());
+        return target;
     }
-    const auto duplicates =
-        ownFindActive([&matcher](const Job& existing) { return matches_job(matcher, existing); });
     if (!duplicates.empty()) {
-        auto record = ownRecord(duplicates.front().job.JobID);
-        if (record) {
-            target.record = std::move(*record);
-            target.kind = ManualTarget::Kind::Update;
-        }
+        target.record = std::move(duplicates.front());
+        target.kind = ManualTarget::Kind::Update;
     }
     return target;
 }

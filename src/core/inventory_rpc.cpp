@@ -96,6 +96,8 @@ std::string json2JobOpt(const nlohmann::json& obj, Job& job) {
             .auto_update_child = obj.value("auto_update_child", true),
             .cluster_id = cid,
             .proc_id = proc,
+            .scheduler_host = sub.value("scheduler_host", ""),
+            .scheduler_name = sub.value("scheduler_name", ""),
             .owner = sub.value("owner", ""),
         };
         job.NativeJobID = fmt::format("{}.{}", cid, proc);
