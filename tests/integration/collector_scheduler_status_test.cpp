@@ -216,6 +216,58 @@ struct CollectorSchedulerTestAccess {
         std::lock_guard lock(state.m_);
         state.pending_close.push_back({job_id, token});
     }
+
+    // ---- yielded-drain test seam -------------------------------------------
+    // The per-round drain plan of a controlled event collector: call n returns
+    // more=more_plan[n] (the last entry repeats), and each round records how
+    // many readiness entries it was handed, so a test can pin the number of
+    // on_ready rounds and prove a continuation ran without new readiness.
+    struct EventDrainPlan {
+        std::atomic<int> ready_calls{0};
+        std::vector<bool> more_plan;
+        mutable std::mutex mutex;
+        std::vector<size_t> source_sizes;
+        bool more_for(int call) const {
+            if (more_plan.empty()) return false;
+            const auto index = static_cast<size_t>(call < 0 ? 0 : call);
+            return more_plan[index < more_plan.size() ? index : more_plan.size() - 1];
+        }
+        void record_sources(size_t count) {
+            std::lock_guard lock(mutex);
+            source_sizes.push_back(count);
+        }
+        size_t sources_of(int call) const {
+            std::lock_guard lock(mutex);
+            if (call < 0 || static_cast<size_t>(call) >= source_sizes.size()) return 0;
+            return source_sizes[static_cast<size_t>(call)];
+        }
+    };
+    static void addPlannedEvent(CollectorScheduler& scheduler, const std::string& name,
+                                const std::shared_ptr<EventDrainPlan>& plan,
+                                JobLifecycleFunc on_added = {},
+                                JobLifecycleFunc on_removed = {}) {
+        CollectorHandle handle;
+        handle.scope = CollectorScope::Job;
+        handle.trigger = CollectorTrigger::Event;
+        handle.binding = EventJobBinding{
+            [plan](const ReadySources& sources, const WorkBudget&, JobEventContext&) {
+                const int call = plan->ready_calls.fetch_add(1);
+                plan->record_sources(sources.size());
+                return DrainOutcome{CollectOutcome{}, sources.size(), plan->more_for(call)};
+            }};
+        handle.init = [](const nlohmann::json&, CollectorInitContext&) { return true; };
+        handle.deinit = [] {};
+        handle.on_job_added = std::move(on_added);
+        handle.on_job_removed = std::move(on_removed);
+        scheduler.addJobEventCollectFunc(name, "PlannedEventCollector", "ev_cfg", handle);
+    }
+    // Stage one poller readiness exactly as the sink would, but without waking
+    // the executor: the test drives the lane body itself through drainLane.
+    static void stageReadiness(CollectorScheduler& scheduler, const std::string& name) {
+        auto& state = scheduler.collector_state_dict.at(name);
+        std::lock_guard lock(state.ready_m_);
+        state.ready.push_back(ReadySource{});
+    }
 };
 void check(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -929,6 +981,116 @@ void run(const std::string& base) {
         CollectorSchedulerTestAccess::reconcile(scheduler);
     });
 
+    run_regression("yield-defers-closing", [&] {
+        // A close whose lane reported an unfinished drain (on_ready returned
+        // more=true) must not be acknowledged, must not fire Removed, and must
+        // not release the snapshot: the tail records of the next round resolve
+        // through that snapshot. Only a round whose on_ready finished without
+        // asking for more proves the drain and may process the close.
+        auto plan = std::make_shared<CollectorSchedulerTestAccess::EventDrainPlan>();
+        plan->more_plan = {true, false}; // round one exceeds its budget, round two finishes
+        std::atomic<int> planned_added{0}, planned_removed{0};
+        CollectorSchedulerTestAccess::addPlannedEvent(scheduler, "ev_yield", plan,
+                                                      bump(planned_added), bump(planned_removed));
+        close_source.set({record_of(7201, kStateActive, {"ev_yield"})});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+        check(CollectorSchedulerTestAccess::memberCount(scheduler, "ev_yield") == 1,
+              "the yielding lane must attach");
+        CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_yield");
+
+        // The record turns Closing while the lane still owes more than one
+        // round of tail records.
+        close_source.set({record_of(7201, kStateClosing, {})});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+        check(CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_yield") == 1,
+              "the Closing boundary must defer the close to the lane");
+        check(close_sink.count(7201) == 0,
+              "a Closing record must not complete before the lane ran");
+
+        // The input that exceeds one round's budget: a single readiness
+        // notification whose backlog on_ready cannot finish inside the round.
+        CollectorSchedulerTestAccess::stageReadiness(scheduler, "ev_yield");
+
+        // Round one: the budget is exhausted (more=true). Nothing may be
+        // acknowledged or released, even though the round itself succeeded.
+        CollectorSchedulerTestAccess::drainLane(scheduler, "ev_yield");
+        check(plan->ready_calls.load() == 1, "round one must run on_ready exactly once");
+        check(planned_removed.load() == 0,
+              "a budget-exhausted round must not deliver Removed");
+        check(CollectorSchedulerTestAccess::snapshotCount(scheduler, "ev_yield") == 1,
+              "a budget-exhausted round must not release the snapshot");
+        check(CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_yield") == 1,
+              "a budget-exhausted round must not consume the close");
+        check(close_sink.count(7201) == 0,
+              "no completion may be reported while the tail is still being produced");
+
+        // Round two: the executor requeues a yielded lane by itself, so this
+        // round runs without any new readiness notification. Only now is the
+        // drain proven and the close processed.
+        CollectorSchedulerTestAccess::drainLane(scheduler, "ev_yield");
+        check(plan->ready_calls.load() == 2,
+              "the continuation must call on_ready again without new readiness");
+        check(CollectorSchedulerTestAccess::snapshotCount(scheduler, "ev_yield") == 0,
+              "the proven drain must release the snapshot");
+        check(CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_yield") == 0,
+              "the proven drain must consume the close");
+        check(planned_removed.load() == 1,
+              "Removed must be delivered only after the drain is proven");
+        check(close_sink.count(7201) == 1,
+              "the completion must land exactly after the final round");
+        check(planned_added.load() == 1, "the attachment must deliver exactly one Added");
+
+        close_source.set({});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+    });
+
+    run_regression("single-notification-two-rounds", [&] {
+        // One readiness notification, two on_ready rounds. The continuation
+        // must run without a second notification (sources empty in the second
+        // round) and carry the drain to its acknowledgement.
+        auto plan = std::make_shared<CollectorSchedulerTestAccess::EventDrainPlan>();
+        plan->more_plan = {true, false};
+        std::atomic<int> cont_added{0}, cont_removed{0};
+        CollectorSchedulerTestAccess::addPlannedEvent(scheduler, "ev_cont", plan,
+                                                      bump(cont_added), bump(cont_removed));
+        close_source.set({record_of(7202, kStateActive, {"ev_cont"})});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+        check(CollectorSchedulerTestAccess::memberCount(scheduler, "ev_cont") == 1,
+              "the continuing lane must attach");
+        CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_cont");
+
+        // The single readiness notification, staged before the first round.
+        CollectorSchedulerTestAccess::stageReadiness(scheduler, "ev_cont");
+        CollectorSchedulerTestAccess::drainLane(scheduler, "ev_cont");
+        check(plan->ready_calls.load() == 1, "the first round must run on_ready once");
+        check(plan->sources_of(0) == 1, "the first round must receive the staged readiness");
+        check(cont_added.load() == 1, "the attachment must deliver exactly one Added");
+
+        // The close arrives between the two rounds, while the drain is still
+        // unfinished. The deferred state must survive the intervening
+        // reconcile: the next round continues without new readiness.
+        close_source.set({record_of(7202, kStateClosing, {})});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+        check(CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_cont") == 1,
+              "the mid-drain Closing must defer the close");
+
+        CollectorSchedulerTestAccess::drainLane(scheduler, "ev_cont");
+        check(plan->ready_calls.load() == 2,
+              "the second round must run without a second notification");
+        check(plan->sources_of(1) == 0,
+              "the continuation round must run on an empty readiness list");
+        check(CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_cont") == 0 &&
+                  CollectorSchedulerTestAccess::snapshotCount(scheduler, "ev_cont") == 0,
+              "the completed drain must release the close and the snapshot");
+        check(cont_removed.load() == 1,
+              "the continuation must deliver exactly one Removed");
+        check(close_sink.count(7202) == 1,
+              "the single notification must carry the drain to its acknowledgement");
+
+        close_source.set({});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+    });
+
     run_regression("real-archive-boundary", [&] {
         // The completion sink used by the other regressions is a fake: it never
         // reaches the checked cleanup or the durable archive. This fixture runs
@@ -1134,6 +1296,8 @@ void run(const std::string& base) {
     server.stop();
     std::this_thread::sleep_for(150ms);
     unlink((base + ".yaml").c_str());
+    std::cout << "PASS: a yielded event drain defers the closing acknowledgement until the tail is proven\n";
+    std::cout << "PASS: a single readiness notification sustains a two-round drain to its final ack\n";
     std::cout << "PASS: actual scheduler + actual Unix-socket RPC boundary tests\n";
 }
 

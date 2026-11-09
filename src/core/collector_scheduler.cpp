@@ -234,6 +234,8 @@ void CollectorScheduler::startEventJobCollector(const std::string& name,
     (void)info;
     (void)lane;
     state.running = true;
+    // A fresh attachment starts with no unfinished drain from a previous run.
+    state.drain_pending = false;
     runtime_->timer(name, false);
 }
 
@@ -244,6 +246,8 @@ void CollectorScheduler::startEventSystemCollector(const std::string& name,
     (void)info;
     (void)lane;
     state.running = true;
+    // A fresh attachment starts with no unfinished drain from a previous run.
+    state.drain_pending = false;
     runtime_->timer(name, false);
 }
 

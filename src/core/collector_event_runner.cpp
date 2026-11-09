@@ -31,14 +31,16 @@ WorkResult CollectorScheduler::runEventDrain(CollectorLaneContext& lane) {
 
     std::vector<uint64_t> completed;
     WorkResult result = WorkResult::Complete;
+    std::vector<collector_state::PendingClose> closes;
     {
         std::unique_lock<std::mutex> lock(state.m_);
         if (!state.running) return WorkResult::Complete;
 
-        std::vector<collector_state::PendingClose> closes;
-        closes.swap(state.pending_close);
+        // A yielded round continues the previous drain without new readiness;
+        // its pending closes wait until the drain is proven complete below.
+        const bool drain_continues = state.drain_pending;
 
-        if (!ready.empty()) {
+        if (!ready.empty() || drain_continues) {
             CollectorRuntime::Operation callback(runtime_, lane.name, "callback");
             CallbackJobBindingResolver resolver(
                 [state_ptr = &state](uint64_t job_id, uint64_t generation) -> std::optional<Job> {
@@ -104,8 +106,28 @@ WorkResult CollectorScheduler::runEventDrain(CollectorLaneContext& lane) {
             } else if (outcome.outcome.state == CollectState::Success) {
                 runtime_->clear_error(lane.name);
             }
-            if (outcome.more) result = WorkResult::Yield;
+            // A round that hit its budget must not touch this lane's pending
+            // closes: their tail records are still being produced, and
+            // releasing the snapshots now would leave the continuation round's
+            // resolver lookups without a snapshot. The executor requeues a
+            // Yield lane on its own, and drain_pending keeps those rounds
+            // calling on_ready even when no new readiness arrived. A failed
+            // round cannot prove anything either, but holding the closes on a
+            // broken collector would leak the snapshots and stall the registry
+            // forever, so a failure keeps the existing acknowledge-anyway
+            // behaviour (result stays Complete below).
+            if (ok && outcome.more) {
+                result = WorkResult::Yield;
+                state.drain_pending = true;
+            } else {
+                state.drain_pending = false;
+            }
         }
+
+        // A round that did not yield has a proven drain: either on_ready
+        // finished without asking for more, or the collector had nothing in
+        // flight this round. Only such a round may consume the closes.
+        if (result != WorkResult::Yield) closes.swap(state.pending_close);
 
         if (!closes.empty()) {
             for (const auto& close : closes) {

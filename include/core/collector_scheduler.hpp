@@ -102,6 +102,16 @@ private:
         std::mutex ready_m_;
         std::vector<ReadySource> ready;
 
+        // A drain that outlived its round budget (on_ready returned more=true)
+        // is still producing its accepted tail. The executor requeues the lane
+        // on Yield; this flag makes the continuation rounds call on_ready even
+        // when no new readiness was staged, and keeps pending_close untouched
+        // until a round reports the drain complete. Guarded by m_, like every
+        // other lane-owned field. A continuation round may pass an empty
+        // ReadySources list: on_ready drains the collector's own backlog, the
+        // list only names sources that signalled readiness.
+        bool drain_pending = false;
+
         // Immutable Job snapshots visible to event contexts. Closing snapshots
         // stay until their lane tail has been finalized.
         std::mutex snapshot_m_;
