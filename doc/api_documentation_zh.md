@@ -108,6 +108,7 @@
 | `JobPIDs` | array[int] | 否 | 进程 PID 列表 |
 | `Lens` | array[string] | 否 | 收集器列表（默认：`["cpumem_collector", "io_collector", "net_collector"]`） |
 | `sub_attr` | object | 否 | 子属性：`condor` 类型需 `cluster_id`/`proc_id`，`slurm` 类型需 `job_id`/`step_id` |
+| `erase` | bool | 否 | 仅用于 `remove`。缺省或 `false` 为 stop 档：停止采集、保留库存事实。`true` 为真删档：采集过的实例归档为 `h:` 历史行，从未采集过的实例直接删除 |
 
 **示例请求：**
 ```json
@@ -126,6 +127,9 @@
 |---|---|---|
 | `status` | string | 操作状态（如 `"ok"`） |
 | `received` | object | 处理后的请求数据 |
+| `mode` | string | 仅 `remove`：`"stop"` 或 `"erase"` |
+| `stopped_count` / `deleted_count` | int | 所选档位处理的实例数 |
+| `stopped_instances` / `erased_instances` | array[string] | 所选档位处理的实例句柄 |
 
 **状态码：**
 - `200` - 成功
@@ -548,7 +552,7 @@ Slurm 作业专用操作，目前仅支持 `"add"`。
 
 ## 12. 作业清单与采集控制
 
-以下接口透传 Core 的清单/采集契约（`doc/job_inventory_collection_decoupling_plan.md` §9）。
+以下接口透传 Core 的清单/采集契约。
 Trigger 只做校验与转发：不分配、不推导内部 ID，Core 的错误绝不会被包装成 HTTP 200。
 
 ### `GET /joblens/inventory`

@@ -11,8 +11,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Inventory/collection RPC registration (v2 stage S2 split). Implemented in
-// inventory_rpc.cpp; reads state only through the public JobRegistry API.
+// Inventory/collection RPC registration. Implemented in inventory_rpc.cpp;
+// reads state only through the public JobRegistry API.
 #pragma once
 
 #include "core/job_registry.hpp"

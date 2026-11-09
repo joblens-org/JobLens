@@ -12,7 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 // One thread-local "mutation gate" shared by the registry and the collection
-// manager (plan §7.3).
+// manager.
 //
 // A lifecycle hook or collection applier runs inside the registry's apply gate.
 // If it synchronously mutates intent (another `setCollectors`, another

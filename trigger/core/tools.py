@@ -753,7 +753,7 @@ def get_job_processes(job_id: str) -> List[Tuple[str, str, str]]:
 
 
 # ==================== 作业清单 / 采集控制 RPC ====================
-# doc/job_inventory_collection_decoupling_plan.md §9：Trigger 只校验并转发，
+# Trigger 只校验并转发，
 # 不分配、不推导内部 ID，也不在 Core 不可用时伪造响应。
 
 INVENTORY_RPC_TIMEOUT_DEFAULT = 5.0

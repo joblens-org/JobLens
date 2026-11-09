@@ -30,9 +30,8 @@
 #include <vector>
 #include "ebpf/trace_condor_starter.h"
 
-// Condor discovery adapter (doc/job_inventory_collection_decoupling_plan.md
-// section 3.1). One construction path for broad discovery and legacy auto-add
-// alike:
+// Condor discovery adapter. One construction path for broad discovery and
+// legacy auto-add alike:
 //
 //   * explicit DiscoveryOptions only: no Config access, no eBPF load and no
 //     thread in the constructor;
@@ -41,8 +40,9 @@
 //   * scan() is the authoritative pass, observeForHint(pid) the O(job)
 //     targeted pass used for exec events.
 //
-// The exec-event callback only hands the pid to the sink: policy, storage and
-// /proc work never run on the polling thread (plan section 5.2).
+// The poll thread resolves each exec event into a Job and registers it
+// synchronously through the sink; policy, storage and /proc work stay on that
+// thread, while the heartbeat keeps scans, retirement and reconciliation.
 class CondorJobWatcher final : public IDiscoverySource{
 public:
     // Options only: nothing is loaded and nothing polls until start().
@@ -92,16 +92,16 @@ private:
     void register_scan_jobs(const ScanResult& result);
     // An exec event is handled on the polling thread: resolve the pid, offer
     // the built Job to this turn's batch, and remember the pid when the
-    // scheduler metadata is not ready yet (bounded re-read, plan §6.3).
+    // scheduler metadata is not ready yet (bounded re-read).
     // `ppid` comes from the event itself; the observation skips the ppid
     // read when it is positive.
     void handle_exec_event(uint32_t pid, uint32_t ppid);
     // One sample ended the turn: libbpf must stop consuming so the tail batch,
-    // the due re-reads and the stop check can run (plan §6.2).
+    // the due re-reads and the stop check can run.
     bool stop_requested();
     // One bounded re-read pass over the pids whose deadline expired.
     // Samples handled in the current poll call; the turn ends at
-    // kSamplesPerTurn so the stop/scan checks always get a chance (plan §6.2).
+    // kSamplesPerTurn so the stop/scan checks always get a chance.
     static constexpr std::size_t kSamplesPerTurn = 32;
     std::size_t samples_this_turn_ = 0;
     std::atomic<bool> yield_requested_{false};
@@ -678,7 +678,7 @@ inline Job CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,
     Job job;
     JobExecution& execution = job.execution.emplace();
     // Assigned before the first read so the store can reject an older pass
-    // overwriting newer facts (plan §4.1).
+    // overwriting newer facts.
     execution.read_order = next_discovery_read_order();
     std::vector<std::string> reasons;
     job.subtype_name = name_;

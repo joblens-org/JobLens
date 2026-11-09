@@ -12,7 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 // ISchedulerAdapter — the extension point that turns one scheduler type into
-// an inventory citizen (doc/job_inventory_v2_architecture.md §2.2).
+// an inventory citizen.
 //
 // Everything scheduler-specific lives behind this interface: discovery
 // (through IDiscoverySource), legacy-row
@@ -46,7 +46,7 @@ enum class AutoAdd {
     Rule,
 };
 
-// Resolved settings for one scheduler type (v2: keyed by adapter name).
+// Resolved settings for one scheduler type, keyed by adapter name.
 // `inventory` mirrors job_registry_config.inventory.types membership;
 // `auto_add` resolution precedence:
 //   explicit <type>_job_watcher.auto_add (off/default/rule)  wins

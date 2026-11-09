@@ -23,30 +23,35 @@ lens_config:
 # ============================================================
 job_registry_config:
   job_db_path: /var/JobLens/job.db          # LevelDB database directory for job persistence
-  # Inventory maintenance (doc/job_inventory_collection_decoupling_plan.md
-  # section 8). `types` is opt-in: an absent list means [] (no broad discovery).
-  # `reconcile_interval_sec` defaults to 30 and must be >= 1; invalid values are
-  # rejected at startup.
+  # Inventory discovery. `types` is opt-in: an absent list means [] (no broad
+  # discovery). `reconcile_interval_sec` defaults to 30 and must be >= 1;
+  # invalid values are rejected at startup. `capture_all` (default true)
+  # registers every captured job unconditionally; when false, registration is
+  # decided by the type's `<type>_job_watcher.auto_add`.
   inventory:
     types: [condor, slurm]
     reconcile_interval_sec: 30
+    capture_all: true
 
-# Scheduler discovery. `auto_collect` is the per-type switch: an explicit value
-# here wins over the legacy job_registry_config.auto_add_condorjob /
-# auto_add_slurmjob flags (default false). Listing a type under
-# job_registry_config.inventory.types maintains every recognized local instance;
-# auto_collect only decides whether automatic policy may select collection for
-# those instances (policy itself ships separately).
+# Scheduler discovery. Listing a type under job_registry_config.inventory.types
+# maintains every recognized local instance. `auto_add` is the tri-state
+# automatic path:
+#   off     - never select collectors automatically (the job still registers
+#             when capture_all is true);
+#   default - apply auto_add_collectors verbatim to every new job;
+#   rule    - let the Lua rule engine decide per job (first accepting rule wins;
+#             an accept without a collector list falls back to
+#             auto_add_collectors).
+# The legacy auto_collect/use_rules pair is accepted as a mapping source when
+# auto_add is absent.
 condor_job_watcher:
-  auto_collect: false
-  use_rules: true
+  auto_add: rule
   rules_dir: /etc/JobLens/rules/condor_jobs
   rules_prefix: condor_job_
   auto_add_collectors: [cpumem_collector]
 
 slurm_job_watcher:
-  auto_collect: false
-  use_rules: false
+  auto_add: off
   rules_dir: /etc/JobLens/rules/slurm_jobs
   rules_prefix: slurm_job_
   auto_add_collectors: [cpumem_collector]

@@ -292,7 +292,7 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
             settings.rules_prefix = scalar_field(*node, "rules_prefix", section,
                                                  settings.rules_prefix);
             // Per-type rules_dir wins over the legacy shared one; otherwise
-            // the per-type convention default stays in place (plan section 8).
+            // the per-type convention default stays in place.
             settings.rules_dir = scalar_field(
                 *node, "rules_dir", section,
                 legacy_rules_dir.empty() ? settings.rules_dir : legacy_rules_dir);

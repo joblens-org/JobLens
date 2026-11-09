@@ -11,8 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Identity foundation for the job-inventory/collection decoupling
-// (doc/job_inventory_collection_decoupling_plan.md section 4).
+// Identity foundation for the job inventory.
 //
 // Layers kept strictly apart:
 //   * internal storage key  - uint64 JobID allocated by this Agent DB,
@@ -20,8 +19,7 @@
 //   * logical scheduler identity - NativeSelector/CanonicalIdentity here
 //   * local execution identity   - ExecutionGeneration (+ ProcessIdentity)
 //   * external instance handle   - the internal ID as a decimal string
-//                             (format_internal_id); the opaque UUID-mixed
-//                             handle form is retired
+//                             (format_internal_id)
 //
 // A native scheduler number, a caller hash or a bare PID is never an internal
 // ID and never a complete identity. Incomplete identities fail explicitly and
@@ -41,11 +39,11 @@
 // Scheduler identity — the adapter name (string)
 // ---------------------------------------------------------------------------
 //
-// v2 G4 completion: shared code never branches on a scheduler. The adapter
-// registry name IS the identity ("condor", "slurm", "ssh", ...); the built-in
-// names below are data, not a type. Empty string means "unresolved" (the old
-// Unknown). Per-scheduler native-id knowledge lives in self-registered rules
-// (NativeIdRuleRegistry), mirroring REGISTER_SCHEDULER_ADAPTER.
+// Shared code never branches on a scheduler. The adapter registry name IS the
+// identity ("condor", "slurm", "ssh", ...); the built-in names below are data,
+// not a type. Empty string means "unresolved". Per-scheduler native-id
+// knowledge lives in self-registered rules (NativeIdRuleRegistry), mirroring
+// REGISTER_SCHEDULER_ADAPTER.
 inline constexpr const char* kAdapterCondor = "condor";
 inline constexpr const char* kAdapterSlurm = "slurm";
 

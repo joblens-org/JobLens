@@ -11,15 +11,14 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-/* Deterministic identity acceptance for the job-inventory decoupling
- * (A01-A03 in doc/job_inventory_collection_decoupling_validation.md).
+/* Deterministic identity acceptance for the job inventory.
  *
- *   A01 Condor namespace separation, "12.34" versus "123.4", original native
- *       strings preserved, no digit concatenation.
- *   A02 Internal IDs above UINT32_MAX and 2^53: exact uint64 round trips,
- *       decimal-string output, JobID 0 reserved, ES JobID stays numeric.
- *   A03 Slurm steps stay distinct (batch/extern never collapse to zero), PID
- *       reuse detected through start ticks and boot identity.
+ *   * Condor namespace separation, "12.34" versus "123.4", original native
+ *     strings preserved, no digit concatenation.
+ *   * Internal IDs above UINT32_MAX and 2^53: exact uint64 round trips,
+ *     decimal-string output, JobID 0 reserved, ES JobID stays numeric.
+ *   * Slurm steps stay distinct (batch/extern never collapse to zero), PID
+ *     reuse detected through start ticks and boot identity.
  */
 #include "core/job_identity.hpp"
 #include "core/collector_type.h"
@@ -61,9 +60,6 @@ NativeSelector slurm(const std::string& native, const std::string& step = "",
     selector.step_id = step;
     return selector;
 }
-
-// A01 -----------------------------------------------------------------------
-
 void condor_namespace_separation()
 {
     const auto first = canonicalize(condor("12.34"));
@@ -113,9 +109,6 @@ void condor_namespace_separation()
     with_step.step_id = "1";
     check(!canonicalize(with_step), "Condor selectors cannot carry a step");
 }
-
-// A02 -----------------------------------------------------------------------
-
 void internal_id_bounds()
 {
     const uint64_t above_u32 = 4294967296ULL;              // 2^32
@@ -174,9 +167,6 @@ void internal_id_bounds()
     check(serialized.at("JobID").get<uint64_t>() == above_js,
           "numeric JobID must survive serialization exactly");
 }
-
-// A03 -----------------------------------------------------------------------
-
 void slurm_steps_and_pid_reuse()
 {
     const auto step0 = canonicalize(slurm("7", "0"));

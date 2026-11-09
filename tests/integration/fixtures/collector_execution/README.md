@@ -1,18 +1,13 @@
 # Collector execution fixtures
 
-These files are **contracts for future implementation tests**, not runnable
-collectors and not production configuration. They were added before the unified
-execution framework exists so that later tasks assert against a fixed,
-reviewable expectation instead of inventing behavior while implementing.
-
-The design is described in:
-
-- `doc/collector_execution_refactor_plan.md`
-- `doc/collector_execution_refactor_validation.md`
+These files are **deterministic contracts** for the collector execution tests,
+not runnable collectors and not production configuration. They pin the expected
+shape of the four scope/trigger combinations so a test asserts against a fixed,
+reviewable expectation instead of inventing behavior.
 
 ## Combinations
 
-| File | Scope | Trigger | Planned interface |
+| File | Scope | Trigger | Interface |
 | --- | --- | --- | --- |
 | `periodic_job.json` | Job | Periodic | `IPeriodicJobCollector` |
 | `periodic_system.json` | System | Periodic | `IPeriodicSystemCollector` |
@@ -41,7 +36,7 @@ output-attribution contract, finish boundary, and expected behavior for
 
 ## Consumption
 
-Tasks 3, 5, 6, and 7 add executable fixtures that load these files and compare
-deterministic fields (scope, trigger, envelope JobID, invocation count, report
-count, finish reason). Hardware-dependent eBPF cases are reported separately;
+`collector_execution_matrix_test.cpp` asserts the same contracts in-process
+with fake collectors: scope, trigger, envelope JobID, invocation count, report
+count and finish reason. Hardware-dependent eBPF cases are reported separately;
 a skipped run is not a pass.

@@ -66,7 +66,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-# 新接口（§9.2）Core 结构化错误码 -> HTTP 状态码。
+# 新接口的 Core 结构化错误码 -> HTTP 状态码。
 # Flask 只按这张表映射，不对 Core 语义做额外猜测；未知码按 503 处理并告警，
 # 保证任何 Core 错误都不会被吞成 200。
 _COLLECTION_ERROR_STATUS = {
@@ -102,7 +102,7 @@ _COLLECTION_ERROR_STATUS = {
 
 
 def _error_response(status: int, code: str, message: str, candidates=None):
-    """§9.2 结构化错误响应：code + message [+ candidates]"""
+    """结构化错误响应：code + message [+ candidates]"""
     body = CollectionErrorResponse(code=code, message=message, candidates=candidates)
     return jsonify(body.model_dump(exclude_none=True)), status
 
@@ -150,7 +150,7 @@ def _candidate_instance_id(candidate):
 
 
 def _structured_core_error(payload):
-    """把 Core 结构化错误翻译成 §9 的 HTTP 响应；非错误 payload 返回 None。
+    """把 Core 结构化错误翻译成 HTTP 响应；非错误 payload 返回 None。
 
     约定的 Core 错误信封：{"status": "error", "code": ..., "message": ...,
     "candidates": [...]}。同时兼容嵌套 {"error": {...}}、候选人字段
@@ -486,7 +486,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             return abort(500, description=str(e))
     
     # ==================== 作业清单与采集控制接口 ====================
-    # 契约：doc/job_inventory_collection_decoupling_plan.md §9。
+    # 契约：见 doc/api_documentation.md 第 12 节。
     # 与现有控制接口（/joblens/job 等）一致，请求鉴权沿用部署层/网关策略，
     # 路由内不再额外套 token。Trigger 只校验并转发，不分配内部 ID。
 
@@ -498,7 +498,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         return core_tools.call_inventory_rpc(method, params, rpc_client)
 
     def forward_inventory_rpc(method: str, params, response_model):
-        """转发一次 RPC：Core 错误按 §9 映射，成功则原样透传 Core payload。"""
+        """转发一次 RPC：Core 错误按契约映射，成功则原样透传 Core payload。"""
         try:
             payload = inventory_rpc(method, params)
         except RPCError as e:
@@ -517,7 +517,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
 
     @app.route('/joblens/inventory', methods=['GET'])
     def inventory_list():
-        """分页查询作业清单（§9.3），支持 scheduler_type/native_job_id/state/limit/cursor"""
+        """分页查询作业清单，支持 scheduler_type/native_job_id/state/limit/cursor"""
         raw_limit = request.args.get('limit')
         try:
             limit = INVENTORY_DEFAULT_LIMIT if raw_limit in (None, '') else int(raw_limit)
@@ -542,14 +542,14 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
 
     @app.route('/joblens/inventory/status', methods=['GET'])
     def inventory_status():
-        """透传 Core 的来源/持久化/队列/对账健康状态（§9.3）"""
+        """透传 Core 的来源/持久化/队列/对账健康状态"""
         return forward_inventory_rpc(
             'JobRegistry/inventory_status', {}, InventoryStatusResponse
         )
 
     @app.route('/joblens/collection', methods=['POST'])
     def collection_set():
-        """按实例句柄或原生身份设置/重置采集意图（§9.2）"""
+        """按实例句柄或原生身份设置/重置采集意图"""
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
             return _invalid_request('request body must be a JSON object')
@@ -569,7 +569,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
 
     @app.route('/joblens/collection', methods=['GET'])
     def collection_get():
-        """查询单个实例的期望/已生效采集选择与错误（§9.1）"""
+        """查询单个实例的期望/已生效采集选择与错误"""
         instance_id = (request.args.get('instance_id') or '').strip()
         if not instance_id:
             return _invalid_request('instance_id query parameter is required')
@@ -580,7 +580,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
 
     @app.route('/joblens/capabilities', methods=['GET'])
     def capabilities():
-        """只透传 Core 的能力声明；Core 不支持时返回 503，绝不代其声明能力（§9.3）"""
+        """只透传 Core 的能力声明；Core 不支持时返回 503，绝不代其声明能力"""
         return forward_inventory_rpc(
             'JobRegistry/capabilities', {}, CapabilitiesResponse
         )

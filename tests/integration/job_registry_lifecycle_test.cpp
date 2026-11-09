@@ -11,11 +11,11 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-/* Registry lifecycle acceptance (plan section 5.1 / 5.3):
+/* Registry lifecycle acceptance:
  *
  *   * construction is the single assembly point: the store opens, the
- *     inventory maintenance controller starts (providers published) even with
- *     no configured discovery type;
+ *     inventory heartbeat starts (providers published) even with no
+ *     configured discovery type;
  *   * stopInventoryDiscovery() is idempotent and keeps the status provider
  *     published while records drain;
  *   * deinit() finalizes retirements, closes the store, retracts the
@@ -206,7 +206,7 @@ void run(const std::string& base)
     Config::instance(config_path.string());
 
     // Construction with an empty inventory configuration: no watchers, but the
-    // maintenance controller still starts and publishes its providers.
+    // heartbeat still starts and publishes its providers.
     {
         JobRegistryOptions options;
         options.db_path = fresh_dir(base, "lifecycle-empty");
@@ -258,7 +258,7 @@ void run(const std::string& base)
         check(registry.deinit(), "deinit after retirement must succeed");
     }
 
-    // Automatic selection (S5): with auto_add folded on, every created
+    // Automatic selection: with auto_add armed, every created
     // instance receives the configured collectors; a manual override still
     // wins; rule evaluation is covered by the policy object below.
     {
@@ -470,7 +470,7 @@ void run(const std::string& base)
               "auto policy: a rules policy with no rules selects nothing");
     }
 
-    // A14/A32: facts durable but the initial intent write failed. The result
+    // /facts durable but the initial intent write failed. The result
     // must say the decision is not committed (not "ok = everything worked"),
     // the instance must stay inventoried with no binding, and a repeated
     // registration (the record-driven repair) must converge.
@@ -524,7 +524,7 @@ void run(const std::string& base)
         registry.deinit();
     }
 
-    // A14 (production entry): the event path and a maintenance pass must repair
+    // production entry: the event path and a maintenance pass must repair
     // a missing initial decision, not only the single-upsert entry.
     {
         JobRegistryOptions options;
@@ -576,7 +576,7 @@ void run(const std::string& base)
         registry.deinit();
     }
 
-    // Manual CRUD upsert (§9.4 merge): one entry point for the manual add and
+    // Manual CRUD upsert (merge): one entry point for the manual add and
     // update routes. Identity hit → UPDATE (collectors union, facts fill-only);
     // sub_attr duplicate without identity → UPDATE by internal id (the old
     // duplicate refusal is gone); no hit → CREATE.

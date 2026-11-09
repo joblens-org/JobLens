@@ -12,7 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 // Shared test fixture for the registration unit: builds the Job a discovery
-// source hands over (plan §4.1) — facts plus ONE execution evidence group.
+// source hands over: facts plus ONE execution evidence group.
 #pragma once
 
 #include "core/collector_type.h"

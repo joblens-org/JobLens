@@ -71,7 +71,7 @@ job_registry_config:
   auto_add_slurmjob: true                # 已弃用：Slurm 自动监控（改用 inventory）
   inventory:
     types: [condor, slurm]               # 需要完整本地清单的调度器类型（opt-in，缺省为 []）
-    capture_all: true                    # S1：无条件登记每个捕获的作业（默认）；false = 登记与否交给 auto_add
+    capture_all: true                    # 无条件登记每个捕获的作业（默认）；false = 登记与否交给 auto_add
     reconcile_interval_sec: 30           # 对账周期，最小 1 秒
 ```
 
@@ -81,9 +81,9 @@ job_registry_config:
 | `auto_add_condorjob` | bool | false | **已弃用**。启动旧版 CondorJobWatcher 并自动登记作业。该类型出现在 `inventory.types` 时忽略（由清单发现源负责） |
 | `auto_add_slurmjob` | bool | false | **已弃用**。同上，作用于 Slurm |
 | `inventory.types` | list | `[]` | 需要完整本地清单的调度器类型（包含未被采集的作业）。取值 `condor` / `slurm`，未知值启动即拒绝 |
-| `inventory.capture_all` | bool | `true` | 全量登记开关（S1）。`true`：捕获的作业无条件登记；`false`：观测是否登记由该类型的 `<type>_job_watcher.auto_add`（S3）判定 |
+| `inventory.capture_all` | bool | `true` | 全量登记开关。`true`：捕获的作业无条件登记；`false`：观测是否登记由该类型的 `<type>_job_watcher.auto_add`判定 |
 | `inventory.reconcile_interval_sec` | int | 30 | 周期性全量对账间隔，单位秒，最小 1 |
-| `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs`（Condor）或 `{JobLensRootDir}/../config/rules/slurm_jobs`（Slurm） | Lua 规则文件目录，CondorJobWatcher 和 SlurmJobWatcher 在 `use_rules` 启用时使用。注意：默认值因 watcher 而异。 |
+| `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs`（Condor）或 `{JobLensRootDir}/../config/rules/slurm_jobs`（Slurm） | Lua 规则文件目录，在该类型的 `<type>_job_watcher.auto_add` 为 `rule` 时使用。注意：默认值因 watcher 而异。 |
 
 ### 三开关模型
 
@@ -91,17 +91,17 @@ job_registry_config:
 
 | 开关 | 键 | 回答的问题 | 默认值 |
 |---|---|---|---|
-| S1 —— 全量库存 | `job_registry_config.inventory.capture_all` | 捕获的作业是否可以无条件进入清单？ | `true` |
-| S2 —— 按类型启停 Watcher | `job_registry_config.inventory.types` | 该调度器类型是否启动发现 Watcher？ | `[]`（关） |
-| S3 —— 自动路径动作 | `<type>_job_watcher.auto_add`（`off` / `default` / `rule`） | 自动路径对该类型的观测做什么？ | `off` |
+| 全量登记 | `job_registry_config.inventory.capture_all` | 捕获的作业是否可以无条件进入清单？ | `true` |
+| 按类型启停 Watcher | `job_registry_config.inventory.types` | 该调度器类型是否启动发现 Watcher？ | `[]`（关） |
+| 自动路径动作 | `<type>_job_watcher.auto_add`（`off` / `default` / `rule`） | 自动路径对该类型的观测做什么？ | `off` |
 
-S3 的三态：
+`auto_add` 的三态：
 
 | `auto_add` | 含义 |
 |---|---|
 | `off` | 自动路径对该类型零动作 |
 | `default` | 登记作业，并把 `<type>_job_watcher.auto_add_collectors` 逐字武装上去 |
-| `rule` | 是否登记由 Lua 规则引擎逐作业判定：accept = 登记并加规则的采集器列表（规则未指定时回退 `auto_add_collectors`）；reject = 不登记（S1 开启时为历史行为：登记空选择留在库中） |
+| `rule` | 是否登记由 Lua 规则引擎逐作业判定：accept = 登记并加规则的采集器列表（规则未指定时回退 `auto_add_collectors`）；reject = 不登记（全量登记开启时：登记空选择留在库中） |
 
 `auto_add` 的非法取值（非 `off`/`default`/`rule`）启动即拒绝。
 
@@ -114,7 +114,7 @@ S3 的三态：
 - 可选的 **string** 是逗号分隔的采集器列表（如
   `"cpumem_collector, net_collector"`）；空串或缺省即"接受但未指定列表"。
 
-旧的 `{passed = ..., collectors = {...}}` 表返回已删除：返回表、缺首个
+旧的 `{passed = ..., collectors = {...}}` 表返回不属于契约：返回表、缺首个
 返回值或第二个返回值非字符串都按评估错误处理——该观测不登记（也不计
 入 reject），下一条观测重新评估。
 
@@ -129,10 +129,10 @@ reject）。
 
 ### 八状态组合矩阵
 
-S2 关闭时 Watcher 不启动，S3 失去意义，只有 S1 区分两行；S2 开启时
-S1 × S3 共六种组合：
+Watcher 关闭时 `auto_add` 失去意义，只有全量登记区分两行；Watcher 开启时
+全量登记 × `auto_add` 共六种组合：
 
-| # | S2 | S1 `capture_all` | S3 `auto_add` | 该类型观测的行为 |
+| # | Watcher | `capture_all` | `auto_add` | 该类型观测的行为 |
 |---|---|---|---|---|
 | 1 | 关 | ——（开） | —— | 该类型无发现；手工 CRUD 仍可用 |
 | 2 | 关 | ——（关） | —— | 同上：无发现，自然无登记 |
@@ -143,14 +143,14 @@ S1 × S3 共六种组合：
 | 7 | 开 | 关 | default | 登记并把默认采集器列表作为初始选择 |
 | 8 | 开 | 关 | rule | accept = 登记并加规则列表（裸接受回退 `auto_add_collectors`）；reject = 不登记（计入 `rejected_observations`）；引擎错误或无缺省的裸接受 = 本次不登记（计入 `admission_errors`），下一条观测重试 |
 
-S1 关闭时，准入计数在清单状态中可见：`capture_all`、
+全量登记关闭时，准入计数在清单状态中可见：`capture_all`、
 `dropped_observations`、`rejected_observations`、`admission_errors`。
 事件路径返回类型化的 `not_admitted` 结果，且绝不会要求 watcher 重扫。
 
-### 旧键映射与废弃时间线
+### 旧键映射
 
-三态键取代 `auto_collect` / `use_rules` 组合。旧键保留解析一个 schema
-版本作为映射来源，解析结果永远落在三态上：
+当 `auto_add` 缺省时，`auto_collect` / `use_rules` 组合与旧
+`auto_add_<type>job` 旗标仍作为映射来源被接受，解析结果永远落在三态上：
 
 | 旧配置 | 折算后的 `auto_add` |
 |---|---|
@@ -159,8 +159,7 @@ S1 关闭时，准入计数在清单状态中可见：`capture_all`、
 | `auto_collect: true` + `use_rules: true` | `rule` |
 | `auto_add_<type>job: true`（旧旗标） | 先折算为 `auto_collect: true`，再按上表映射 |
 
-显式给出的 `<type>_job_watcher.auto_add` 永远优先于旧键组合。废弃窗口
-结束后旧键不再解析；在此之前，现网每种旧组合的行为与今天完全一致。
+显式给出的 `<type>_job_watcher.auto_add` 永远优先于旧键组合。
 
 `<type>_job_watcher.cluster_name`（可选）在环境变量
 （`COLLECTOR_HOST` / `SLURM_CLUSTER_NAME`）无法推导命名空间时显式指定；
@@ -606,22 +605,22 @@ prmxs_writer_config: {}    # 当前无配置参数；此节必须存在以供 `c
 
 ```yaml
 condor_job_watcher:
-  auto_add_collectors:          # 当 use_rules 为 false 时，发现新 Condor 作业后自动追加的默认收集器列表
+  auto_add: rule                # off | default | rule
+  auto_add_collectors:          # auto_add: default 时逐字武装；rule 裸接受时作为回退
     - cpumem_collector
     - net_collector
     - io_collector
-  use_rules: false              # 是否启用规则引擎过滤作业
   rules_prefix: condor_job_     # Lua 规则文件前缀（默认：condor_job_）
 ```
 
-> **说明**：Lua 规则的 `rules_dir` 从 `job_registry_config.rules_dir` 读取，不在此节中。当 Condor 启用 `use_rules` 时，默认值为 `{JobLensRootDir}/../config/rules/condor_jobs`。
+> **说明**：Lua 规则的 `rules_dir` 从 `job_registry_config.rules_dir` 读取，不在此节中。当 Condor 的 `auto_add` 为 `rule` 时，默认值为 `{JobLensRootDir}/../config/rules/condor_jobs`。
 
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
-| `auto_add` | string（`off`/`default`/`rule`） | `off` | 自动路径动作三态（S3）；显式给出时优先于已弃用的 `auto_collect`/`use_rules` 组合 |
+| `auto_add` | string（`off`/`default`/`rule`） | `off` | 自动路径动作三态；显式给出时优先于已弃用的 `auto_collect`/`use_rules` 组合 |
 | `auto_add_collectors` | string[] | 无 | 默认收集器列表：`auto_add: default` 时逐字武装；`auto_add: rule` 的裸接受以它回退 |
-| `auto_collect` | bool | `false` | **已弃用**（仅作映射来源）：再保留一个 schema 版本后折算入 `auto_add` |
-| `use_rules` | bool | `false` | **已弃用**（仅作映射来源）：`auto_collect: true` + `use_rules: true` 折算为 `auto_add: rule` |
+| `auto_collect` | bool | `false` | 旧键映射来源：`auto_add` 缺省时折算入 `auto_add` |
+| `use_rules` | bool | `false` | 旧键映射来源：`auto_collect: true` + `use_rules: true` 折算为 `auto_add: rule` |
 | `rules_prefix` | string | `"condor_job_"` | 规则引擎加载的规则文件前缀 |
 
 ### `slurm_job_watcher`
@@ -630,22 +629,22 @@ condor_job_watcher:
 
 ```yaml
 slurm_job_watcher:
+  auto_add: off                 # off | default | rule
   auto_add_collectors:
     - cpumem_collector
     - net_collector
     - io_collector
-  use_rules: false
   rules_prefix: slurm_job_
 ```
 
-> **说明**：Lua 规则的 `rules_dir` 从 `job_registry_config.rules_dir` 读取，不在此节中。当 Slurm 启用 `use_rules` 时，默认值为 `{JobLensRootDir}/../config/rules/slurm_jobs`。
+> **说明**：Lua 规则的 `rules_dir` 从 `job_registry_config.rules_dir` 读取，不在此节中。当 Slurm 的 `auto_add` 为 `rule` 时，默认值为 `{JobLensRootDir}/../config/rules/slurm_jobs`。
 
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
-| `auto_add` | string（`off`/`default`/`rule`） | `off` | 自动路径动作三态（S3）；显式给出时优先于已弃用的 `auto_collect`/`use_rules` 组合 |
+| `auto_add` | string（`off`/`default`/`rule`） | `off` | 自动路径动作三态；显式给出时优先于已弃用的 `auto_collect`/`use_rules` 组合 |
 | `auto_add_collectors` | string[] | 无 | 默认收集器列表：`auto_add: default` 时逐字武装；`auto_add: rule` 的裸接受以它回退 |
-| `auto_collect` | bool | `false` | **已弃用**（仅作映射来源）：再保留一个 schema 版本后折算入 `auto_add` |
-| `use_rules` | bool | `false` | **已弃用**（仅作映射来源）：`auto_collect: true` + `use_rules: true` 折算为 `auto_add: rule` |
+| `auto_collect` | bool | `false` | 旧键映射来源：`auto_add` 缺省时折算入 `auto_add` |
+| `use_rules` | bool | `false` | 旧键映射来源：`auto_collect: true` + `use_rules: true` 折算为 `auto_add: rule` |
 | `rules_prefix` | string | `"slurm_job_"` | 规则引擎加载的规则文件前缀 |
 
 ---
@@ -843,11 +842,11 @@ file_writer_config:
   #     file_path: /var/log/joblens/cpumem.log
 
 condor_job_watcher:
+  auto_add: off
   auto_add_collectors:
     - cpumem_collector
     - net_collector
     - io_collector
-  use_rules: false
 ```
 
 ---

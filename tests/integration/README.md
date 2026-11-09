@@ -77,12 +77,13 @@ bash tests/integration/run_watcher_scan_test.sh build
 - `job_inventory_maintenance_test.cpp`：启动竞争、事件回放、两次完整缺席才退休、EPERM 不算死亡、
   队列溢出与重扫、tracker 不可用、旧代际迟到清理；另含**无发现源时手工登记记录的刷新与退休**
   以及**事件触发/按需（`ensure_registered`）的全量对账**。
-- `collection_rpc_test.cpp`：§9 全部方法通过真实 AF_UNIX RPC 驱动，覆盖选择器形式、
+- `collection_rpc_test.cpp`：全部清单/采集 RPC 方法通过真实 AF_UNIX RPC 驱动，覆盖选择器形式、
   分页游标失效、409/503/404 分类、`ensure_registered` 实际触发一次权威发现、
   以及“无采集运行时不虚报 applied_collectors”的契约。
 - `job_watcher_scan_test.cpp`：fixture procfs/cgroup/job-ad 下的扫描、健康状态与
-  start/stop 幂等；`RegistrationTurn` 覆盖 poll turn 内批登记（1/4/尾批）、
-  未就绪 hint 的 5/25/100/500 ms→1 s 有界重读、30 s 过期与 1024 项上限。`run_watcher_scan_test.sh` 默认优先使用 `build-watcher/`（若存在），
+  start/stop 幂等；exec 事件在 poll 线程同步登记，未就绪或执行证据不完整时
+  请求一次合并 rescan，由下一轮权威扫描收敛（无登记批次队列）。
+  `run_watcher_scan_test.sh` 默认优先使用 `build-watcher/`（若存在），
   因此改动头文件后请勿设置 `SKIP_BUILD=1` 复用过期的私有构建目录。
 
 采集意图真正落到采集器的端到端验证在
@@ -95,8 +96,8 @@ JobRegistry 自己的生命周期与自动选择：构造即启动清单栈（pr
 `stopInventoryDiscovery` 幂等且排空期间状态可见、`deinit` 归档并关库且幂等；
 `auto_add` 折算后新实例自动获得配置的采集器、手工覆盖不被覆盖、
 defaults/rules/reject 三种选择语义直接断言。exec hint 的定向观察（不触发全量扫描）
-在 maintenance 套件的 `EXEC` 用例中验证；`EXEC2` 现在的契约是"一次 hint 一次同步
-尝试，由发现源自己的 poll 循环重读收敛"，注册表不再持有 exec ingest 线程。
+在 maintenance 套件的 `EXEC` 用例中验证；`EXEC2` 的契约是"一次 hint 一次同步
+尝试，由发现源自己的 poll 循环重读收敛"，注册表不持有 exec ingest 线程。
 
 ### 统一采集执行套件 / Unified collector execution suites
 

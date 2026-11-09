@@ -11,8 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Automatic collector selection for newly registered instances
-// (doc/job_inventory_collection_decoupling_plan.md section 6.1).
+// Automatic collector selection for newly registered instances.
 //
 // The policy answers exactly one question: "which collectors does this job
 // get?" - never "is this job allowed to exist". A rejected job stays in the
@@ -20,8 +19,8 @@
 //
 //   * disabled:      nothing is selected automatically.
 //   * defaults:      the configured default list, verbatim, for every job
-//                    (use_rules=false: no per-job decision at all).
-//   * rules:         the Lua rule engine decides per job (use_rules=true:
+//                    (`auto_add: default`: no per-job decision at all).
+//   * rules:         the Lua rule engine decides per job (`auto_add: rule`:
 //                    the first accepting rule in priority order wins and
 //                    its list is the selection). An accepted rule that does
 //                    not name collectors falls back to the configured

@@ -1,27 +1,22 @@
 # Job Watcher 接入指南
 
-**状态：** 已在 `feature/collector-output-refactor` 落地（2026-10-29，
-commits 76dc9ea..）：调度器身份端到端就是 adapter 名字——`SchedulerType`/
-`InventoryType` 枚举已删除，native-id 规则与配置节自注册/按约定解析，
-新调度器的 facts 走 `SubAttr` 的 JSON 通道。"文件清单"里现在只剩
-watcher 自己的文件。English version:
-[job_watcher_integration.md](job_watcher_integration.md)
-
 本指南描述如何向作业清单（inventory）接入一种**新的调度器类型**——例如一个
 `ssh` 会话源：写一个 *job watcher*（发现源）和一个 *scheduler adapter*
 （调度器适配器）。其余所有环节（`JobStore` 的 merge 语义、心跳的退休证据
-规则、采集绑定与对账、RPC 面、内核归因）对新类型零改动直接生效。
+规则、采集绑定与对账、RPC 面、内核归因）对新类型零改动直接生效。English
+version: [job_watcher_integration.md](job_watcher_integration.md)
 
 参考实现：`condor` / `slurm`
 （[include/job_watcher/](../include/job_watcher/)）。下文的示例用 `ssh`——
-架构文档用来演示扩展点的同一个假想案例。
+一个没有内建调度器 schema 的源。
 
 ---
 
 ## 1. 你要添加什么
 
-接入一种调度器 = **两个类 + 一行注册**，外加少量当前配置层仍然硬编码的
-机械性共享代码修改（见 §4 第 1 步）：
+接入一种调度器 = **两个类 + 一行注册**，外加一个链接入口，使 TU 作用域的
+注册器进入 Agent 二进制（在已编译的 TU 中 include adapter 头，或把它的 TU
+加入构建）：
 
 ```
 include/job_watcher/ssh_job_watcher.hpp   # IDiscoverySource 实现（watcher）
@@ -44,8 +39,7 @@ src/ebpf/trace_ssh_session.bpf.c          # 可选：exec-hint 事件源
 1. **注册（`main()` 之前）：** TU 作用域的 `REGISTER_SCHEDULER_ADAPTER("ssh",
    SshSchedulerAdapter)` 把工厂函数插入 `SchedulerAdapterRegistry`——和
    `AUTO_REGISTER_COLLECTOR` 同一套约定。
-2. **装配（`JobRegistry::resolve_inventory_components()`，由
-   `init_inventory()` 调用）：** 配置解析出的
+2. **装配（`JobRegistry::armInventory()`，由注册表构造函数调用）：** 配置解析出的
    `inventory.types` 逐项通过注册表构建，每种类型恰好一个 adapter。
    adapter 是**唯一**知道该调度器属性 schema、身份格式和能力的东西。
 3. **运行：** 心跳驱动 adapter 的 `IDiscoverySource`：周期性权威
@@ -81,7 +75,7 @@ src/ebpf/trace_ssh_session.bpf.c          # 可选：exec-hint 事件源
    与 `events_dropped` 作为废弃的恒零键：ingest worker 与 observation
    队列已不存在。
 
-这里**刻意**不解决（层 2，需要单独设计）：进程第一条指令到用户态
+已知限制：进程第一条指令到用户态
 `pid2job` 播种之间的事件，对 syscall-tracepoint 采集器仍然不可见。由
 exec tracer 自己写入 provisional `pid2job` 条目可以关掉这个窗口——但那会
 把"捕获起点"与 collector attach 解耦，从而改变 collector 的生命周期契约。
@@ -139,7 +133,7 @@ store/intent 所有。
   `DiscoveryOptions`（事件源开关、扫描间隔、集群命名空间）。
 - （发现期 facts 由 watcher 自己填写；没有经过中立字段的
   `encodeFacts` 中转。）
-- `decodeFacts(row)` / `legacySelector(job)`：为 schema<2 的行做尽力而为
+- `decodeFacts(row)` / `legacySelector(job)`：为历史行做尽力而为
   的重建。可以不完整；不可以瞎猜。
 - `traits()`：如实声明。
   `cgroup_scoped_membership = true` 仅当 `cgroup.procs` 是你的执行实例的
@@ -149,15 +143,18 @@ store/intent 所有。
 
 ## 4. 分步操作
 
-### 第 1 步 — 无共享代码修改
+### 第 1 步 — 最小共享接线
 
-G4 完成后，接入一种调度器类型**不再触碰任何共享文件**。adapter 名字就是
-处处通行的调度器身份：配置 `types` 是启动时对注册表校验的名字，
-`<name>_job_watcher` 配置节按约定解析，native-id 规则自注册
-（`REGISTER_NATIVE_ID_RULE`），非内置调度器的 facts 走 `SubAttr` 的 JSON
-通道（配 `subtype_name`），身份/cgroup 推导经 `ISchedulerAdapter` 接口分派。
-唯一可能的可选修改是给 `DiscoveryEnvironment` 加一个特殊根字段（如 Slurm
-的 spool 目录）；通用根（`proc_root`、`cgroup_root`）已经存在。
+调度器逻辑只住在 watcher 和 adapter 里。adapter 名字就是处处通行的调度器
+身份：配置 `types` 是启动时对注册表校验的名字，`<name>_job_watcher` 配置节
+按约定解析，native-id 规则自注册（`REGISTER_NATIVE_ID_RULE`），非内置调度器
+的 facts 走 `SubAttr` 的 JSON 通道（配 `subtype_name`），身份/cgroup 推导经
+`ISchedulerAdapter` 接口分派。
+
+唯一的共享修改是让注册器进入 Agent 二进制：在已编译的 TU 中 include
+adapter 头（内置 adapter 由 `job_registry.hpp` include），或把 adapter 的
+TU 加入构建。另一个可选修改是给 `DiscoveryEnvironment` 加一个特殊根字段
+（如 Slurm 的 spool 目录）；通用根（`proc_root`、`cgroup_root`）已经存在。
 
 ### 第 2 步 — 写 watcher
 
@@ -316,8 +313,8 @@ ssh_job_watcher:
 
 | 修改 | 用途 |
 |---|---|
-| `include/core/job_registry.hpp` | include adapter 头（做法 (a)）；仅此而已 |
-| `include/core/job_observation.hpp` | 可选：特殊 `DiscoveryEnvironment` 根字段（如 spool 目录） |
+| `include/core/job_registry.hpp`（或任一已编译 TU） | include adapter 头，使其 `REGISTER_SCHEDULER_ADAPTER` 注册器被链接 |
+| `include/core/job_discovery.hpp` | 可选：特殊 `DiscoveryEnvironment` 根字段（如 spool 目录） |
 | `config/config.example.yaml` | `<t>_job_watcher` 配置节 + `inventory.types` 一项 |
 
 `collector_type.h`、`job_identity`、`inventory_config`、`JobStore`、
@@ -325,22 +322,22 @@ ssh_job_watcher:
 身份、配置节、native-id 规则、facts（JSON 通道）、匹配与 cgroup 推导全部
 由 adapter 驱动。
 
-## 6. 最终检查清单
+## 6. 实现不变量
 
-- [ ] 构造函数：只存 options——不读 Config、不加载 eBPF、不开线程。
-- [ ] `start()` 在任何可能的回调之前装好 sink。
-- [ ] 轮询线程把 exec hint 经 `on_job` 同步登记；周期性自扫
+- 构造函数：只存 options——不读 Config、不加载 eBPF、不开线程。
+- `start()` 在任何可能的回调之前装好 sink。
+- 轮询线程把 exec hint 经 `on_job` 同步登记；周期性自扫
       （`scan_interval_ms > 0` 时）走同一个入口。
-- [ ] `stop()` 幂等、有界；从析构函数调用安全。
-- [ ] `scan()` 只在 pass 级失败时报 `complete=false`；跳过的源只计数加
+- `stop()` 幂等、有界；从析构函数调用安全。
+- `scan()` 只在 pass 级失败时报 `complete=false`；跳过的源只计数加
       note，绝不当缺席。
-- [ ] 发现的 Job 要么 ready 要么显式不完整
+- 发现的 Job 要么 ready 要么显式不完整
       （`execution->incomplete_reason`）；集群命名空间绝不从原生 id
       瞎猜。
-- [ ] cgroup 成员：读成功（含空列表）即权威；退化路径标记
+- cgroup 成员：读成功（含空列表）即权威；退化路径标记
       `members_authoritative=false`。
-- [ ] 构造方让 `JobID`/`JobPIDs`/`CollectorNames` 保持为空（store 与
+- 构造方让 `JobID`/`JobPIDs`/`CollectorNames` 保持为空（store 与
       intent 所有）。
-- [ ] `traits()` 如实；缺失的能力是正常状态。
-- [ ] eBPF 失败降级为 scan-only 并有显式 note。
-- [ ] 两个测试层级都在无特权环境通过；新不变量在 registry 层覆盖。
+- `traits()` 如实；缺失的能力是正常状态。
+- eBPF 失败降级为 scan-only 并有显式 note。
+- 两个测试层级都在无特权环境通过；新不变量在 registry 层覆盖。

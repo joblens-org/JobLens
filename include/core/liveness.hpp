@@ -11,8 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Liveness probes (v2: thread-free components driven by the registry
-// heartbeat). Production probes read the real procfs/cgroup trees; tests
+// Liveness probes (thread-free components driven by the registry heartbeat). Production probes read the real procfs/cgroup trees; tests
 // install fakes. Error classification is the conservative contract:
 //   ENOENT/ESRCH -> Dead, EACCES/EPERM or anything else -> Unknown,
 // and Unknown is never death evidence (invariant I3).

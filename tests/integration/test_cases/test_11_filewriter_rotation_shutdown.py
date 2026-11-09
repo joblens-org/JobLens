@@ -1,4 +1,4 @@
-"""FileWriter 旋转与优雅关闭集成测试 (Task 11).
+"""FileWriter 旋转与优雅关闭集成测试。
 
 验证:
   1. 追加模式大小旋转: max_file_size_bytes 小阈值下快速触发旋转,
@@ -18,9 +18,7 @@
 每个测试通过 _deploy_config_and_restart() 部署专用 config 到 worker VM,
 最后通过 _restore_default_config() 恢复默认配置。
 
-依赖: Task 3 的 build_filewriter_paths + FileWriterOutputPaths,
-      Task 7 的 performRotation,
-      Task 8 的 do_shutdown.
+依赖：FileWriterOutputPaths、performRotation 和 do_shutdown。
 """
 
 import base64
@@ -173,7 +171,7 @@ def _restore_default_config(worker: RemoteClient) -> None:
 def filewriter_output_paths() -> FileWriterOutputPaths:
     """旋转测试使用 max_rotated_files=2 的路径配置。
 
-    Task 11 的旋转测试使用 max_files: 2 配置,
+    旋转测试使用 max_files: 2 配置,
     因此旋转文件仅有 .1 和 .2, .3 不应存在。
     """
     return build_filewriter_paths(["output.log"], max_rotated_files=2)

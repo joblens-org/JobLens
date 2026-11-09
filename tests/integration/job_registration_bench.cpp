@@ -11,9 +11,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-/* Measurement harness for "register the discovered Job directly inside the
- * discovery callback" (doc/job_inventory_v2_architecture.md / the synchronous
- * discovery plan).
+/* Measurement harness for synchronous registration inside the discovery
+ * callback.
  *
  * The registration chain this harness measures is exactly:
  *
@@ -659,8 +658,7 @@ int main(int argc, char** argv)
 
     // ---- synthetic burst: fresh identities through the same chain ---------
     // The ad/proc read is the fixture-dependent part; the burst isolates the
-    // durable + intent + attach path at the width the plan targets (hundreds
-    // of simultaneous job starts).
+    // durable + intent + attach path at hundreds of simultaneous job starts.
     if (args.burst > 0 && !executions.empty()) {
         const Job& templ = executions.front();
         for (int i = 0; i < args.burst; ++i) {

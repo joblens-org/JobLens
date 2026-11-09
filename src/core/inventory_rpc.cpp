@@ -11,9 +11,9 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Section 9 inventory/collection RPC surface, split out of the registry facade
-// (v2 stage S2). Everything here reads state through the public JobRegistry
-// API, so no registry lock is held while a mutation or provider call runs.
+// Inventory/collection RPC surface, split out of the registry facade.
+// Everything here reads state through the public JobRegistry API, so no
+// registry lock is held while a mutation or provider call runs.
 
 #include "core/inventory_rpc.hpp"
 
@@ -344,7 +344,7 @@ void sort_records(std::vector<JobRecord>& records)
               });
 }
 
-// Resolution outcome of section 9.2 selectors. Empty `code` means success;
+// Resolution outcome of collection selectors. Empty `code` means success;
 // on ambiguity `records` carries the candidate instances.
 struct TargetResolution {
     std::vector<JobRecord> records;
@@ -377,7 +377,7 @@ bool namespace_matches(const CanonicalIdentity& stored, const NativeSelector& se
     return stored.cluster_namespace.rfind(requested.cluster_namespace + "@", 0) == 0;
 }
 
-// One on-demand authoritative pass through the maintenance controller. Returns
+// One on-demand authoritative pass through the registry heartbeat. Returns
 // false when no controller is running, so callers keep an explicit "not found"
 // instead of inventing a record. Never allocates ids or guesses an identity.
 bool refresh_inventory_once()
@@ -423,7 +423,7 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
 
     if (matches.empty()) {
         if (ensure_registered) {
-            // Plan 4.3: refresh discovery before declaring the target missing.
+            // Refresh discovery before declaring the target missing.
             // Only a real source pass may create the record; no caller-supplied
             // PID or native number authorizes an invented live instance.
             if (refresh_inventory_once()) {
@@ -532,7 +532,7 @@ nlohmann::json collection_target_json(JobRegistry& registry, const JobRecord& re
     return out;
 }
 
-// Legacy add identity (§9.4). The supplied JobID is never consulted; only the
+// Legacy add identity. The supplied JobID is never consulted; only the
 // typed sub_attr plus the scheduler namespace the discovery sources use.
 std::optional<NativeSelector> legacy_add_selector(const Job& job, const nlohmann::json& req)
 {
@@ -604,7 +604,7 @@ SubAttrMatcher parse_legacy_matcher(const nlohmann::json& matcher_json)
     return matcher;
 }
 
-// §9.4 legacy remove: stop collection, keep the inventory fact. Only records
+// Legacy remove: stop collection, keep the inventory fact. Only records
 // outside the inventory (pure legacy registrations) are archived as before.
 // With "erase": true the command becomes the real-delete tier — every target
 // is retired (closing -> archive for collected instances, durable delete for
@@ -703,8 +703,7 @@ nlohmann::json legacy_remove(JobRegistry& registry, const nlohmann::json& req)
 
     if (!targets.empty()) {
         spdlog::warn("JobRegistry: legacy remove is deprecated and now stops collection for "
-                     "{} instance(s); inventory records are retained "
-                     "(doc/job_inventory_collection_decoupling_plan.md section 9.4)",
+                     "{} instance(s); inventory records are retained",
                      stopped);
     }
 
@@ -877,14 +876,14 @@ void registerInventoryRpc(JobRegistry& registry) {
                 Job job;
                 std::string opt = json2JobOpt(req, job);
                 if(opt.compare("add") == 0){
-                    // §9.4: the manual add and update routes are ONE upsert.
+                    // The manual add and update routes are one upsert.
                     // The identity selector (kept here as the compatibility
                     // resolution) routes a request naming a live inventoried
                     // instance to UPDATE; a legacy JobID is only a hint and
                     // never allocates or overrides the internal id.
                     j = registry.upsertJob(job, req, legacy_add_selector(job, req));
                 }else if(opt.compare("remove") == 0){
-                    // §9.4: remove stops collection for resolved live jobs and
+                    // Remove stops collection for resolved live jobs and
                     // keeps the inventory fact instead of forgetting the
                     // execution.
                     j = legacy_remove(registry, req);
@@ -960,7 +959,7 @@ void registerInventoryRpc(JobRegistry& registry) {
     );
 
     // -----------------------------------------------------------------------
-    // §9.1 / §9.3 inventory read surface
+    // Inventory read surface
     // -----------------------------------------------------------------------
     RPCServer::instance().register_method("JobRegistry/inventory_list",
         [&registry](const nlohmann::json& req) -> nlohmann::json {
@@ -1118,7 +1117,7 @@ void registerInventoryRpc(JobRegistry& registry) {
     );
 
     // -----------------------------------------------------------------------
-    // §9.1 / §9.2 collection control surface
+    // Collection control surface
     // -----------------------------------------------------------------------
     RPCServer::instance().register_method("JobCollection/set",
         [&registry](const nlohmann::json& req) -> nlohmann::json {

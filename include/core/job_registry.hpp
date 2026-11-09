@@ -182,8 +182,8 @@ public:
     // Manual CRUD upsert: one entry point for the manual add and update
     // routes (orthogonal to the automatic paths — never routed through the
     // admission gate). Routing, in order: an identity selector naming a live
-    // inventoried instance (the §9.4 legacy-add resolution, kept in the RPC
-    // layer) takes the UPDATE branch; an active record with matching typed
+    // inventoried instance (the legacy-add resolution, kept in the RPC layer)
+    // takes the UPDATE branch; an active record with matching typed
     // sub_attr but no resolvable identity routes to UPDATE by internal id;
     // anything else takes the CREATE branch. UPDATE merges the requested
     // collectors into the existing manual selection (union, never a
@@ -303,7 +303,7 @@ public:
     // destructor calls it as a fallback.
     bool deinit();
 
-    // --- Inventory heartbeat (v2 §2.3) ---------------------------------------
+    // --- Inventory heartbeat --------------------------------------------------
     // One on-demand authoritative pass (the `ensure_registered` refresh
     // provider): scan -> upsert -> hint merge -> retirement -> reconciliation,
     // exactly what the periodic worker runs. Returns false when the heartbeat
@@ -352,7 +352,8 @@ private:
     void admitRestoredOwners();
     void startDiscoverySources(InventoryWiring wiring);
     // Automatic selection for one newly created instance, evaluated outside
-    // every registry lock (plan 6.2: Lua never runs under a lock).
+    // every registry lock: a Lua rule may be slow or re-enter the registry,
+    // so it must never run under a lock that serializes inventory changes.
     // Returns nullopt when no automatic decision was needed, true when the
     // decision (including an explicit reject) is durable, false otherwise.
     std::optional<bool> apply_auto_policy(const Job& job, const std::string& adapter);
@@ -362,8 +363,8 @@ private:
     CollectionOutcome mutateSelection(const CollectionRequest& request, bool manual);
     bool validate_collectors(const std::vector<std::string>& collectors,
                              std::string& bad_name) const;
-    // Record-driven repair of a missing initial automatic decision (plan §5.5):
-    // the predicate is derived from durable state so a restart repairs too.
+    // Record-driven repair of a missing initial automatic decision: the
+    // predicate is derived from durable state so a restart repairs too.
     bool missing_initial_decision(const JobRecord& record) const;
     std::optional<bool> repair_initial_decision(const JobRecord& record,
                                                 UpsertResult& result);
@@ -376,15 +377,16 @@ private:
     std::optional<AutoDecision> autoSelectionFor(const Job& job, const std::string& adapter);
     // Evaluates the automatic policy for a set of live instances. Synchronous
     // by design: a slow rule set costs latency and is warned about, it is never
-    // deferred to another thread (plan §1.1.3).
+    // deferred to another thread, so the decision always reflects the current
+    // observation.
     void evaluateAutoPolicies(const std::vector<uint64_t>& internal_ids,
                               std::vector<AutoSelection>& out);
     void regRPCHandle();
     // --- Manual CRUD upsert internals ----------------------------------------
     // The CREATE branch: the legacy manual registration body verbatim.
     bool createManualJob(const Job& job);
-    // UPDATE-branch routing: the identity selector first (§9.4 namespace
-    // rules), then the typed sub_attr matcher. A closing identity target is
+    // UPDATE-branch routing: the identity selector first (namespace rules),
+    // then the typed sub_attr matcher. A closing identity target is
     // reported through `closing`; more than one identity match is reported
     // through `ambiguous` with the candidate ids; no target falls through to
     // CREATE.
@@ -496,8 +498,9 @@ private:
     std::vector<std::unique_ptr<ISchedulerAdapter>> adapters_;
 
     // --- inventory heartbeat state (guarded by hb_mtx_ unless noted) --------
-    // Discovery registration is synchronous on the producing threads (plan
-    // P4): there is no observation queue and no drain step.
+    // Discovery registration is synchronous on the producing threads: there is
+    // no observation queue and no drain step, so a discovered job is durable
+    // before the watcher continues with the next event.
     struct AbsenceEntry {
         ExecutionGeneration generation;
         int complete_absences = 0;
@@ -559,8 +562,8 @@ private:
     // Automatic collector selection keyed by adapter name, armed from the
     // resolved inventory configuration. A disabled entry selects nothing.
     std::map<std::string, AutoCollectorPolicy> auto_policies_;
-    // Admission gate state: the blanket-registration switch (S1) and the
-    // per-adapter auto_add tri-state (S3), armed from the resolved inventory
+    // Admission gate state: the blanket-registration switch and the
+    // per-adapter auto_add tri-state, armed from the resolved inventory
     // configuration in armInventory().
     bool inventory_capture_all_ = true;
     std::map<std::string, AutoAdd> auto_add_states_;
@@ -582,7 +585,7 @@ private:
     bool rescanRequested() const;
     void refreshLegacyRecords();
     // Re-evaluates the automatic decision for live instances that never got a
-    // durable one (plan §5.5). Bounded per pass.
+    // durable one. Bounded per pass so the heartbeat keeps its cadence.
     void repairMissingInitialDecisions();
     void evaluateRetirements(const std::set<uint64_t>& observed_ids,
                              const std::map<std::string, bool>& source_complete);

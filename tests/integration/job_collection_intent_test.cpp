@@ -11,16 +11,15 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-/* Deterministic collection-intent acceptance (task 2 of
- * doc/job_inventory_collection_decoupling_plan.md).
+/* Deterministic collection-intent acceptance.
  *
- *   A05 Manual selection wins over observation updates and automatic policy.
- *   A06 A manual empty set (persistent stop) survives rescans and policy
- *       reload; reset_auto alone restores the current automatic selection.
- *   A07 Identical repeats add no revision, stale expected_revision conflicts,
- *       and an invalid collector in a multi-target request changes no target.
- *   A22 Durable intent survives a restart on the same DB; a replacement
- *       execution generation never inherits the old manual selection.
+ *   * Manual selection wins over observation updates and automatic policy.
+ *   * A manual empty set (persistent stop) survives rescans and policy
+ *     reload; reset_auto alone restores the current automatic selection.
+ *   * Identical repeats add no revision, stale expected_revision conflicts,
+ *     and an invalid collector in a multi-target request changes no target.
+ *   * Durable intent survives a restart on the same DB; a replacement
+ *     execution generation never inherits the old manual selection.
  */
 #include "core/job_registry.hpp"
 #include "core/reentrancy_gate.hpp"
@@ -128,9 +127,6 @@ bool same(const std::vector<std::string>& lhs, const std::vector<std::string>& r
 {
     return lhs == rhs;
 }
-
-// A05 -----------------------------------------------------------------------
-
 void manual_selection_wins_over_observations_and_policy(const std::string& base)
 {
     const auto path = fresh_dir(base, "a05");
@@ -213,9 +209,6 @@ void manual_selection_wins_over_observations_and_policy(const std::string& base)
               "the client-visible automatic decision under manual is not a change");
     }
 }
-
-// A06 -----------------------------------------------------------------------
-
 void persistent_stop_survives_rescan_and_reset_restores_auto(const std::string& base)
 {
     const auto path = fresh_dir(base, "a06");
@@ -282,9 +275,6 @@ void persistent_stop_survives_rescan_and_reset_restores_auto(const std::string& 
     check(!repeated.targets.front().changed,
           "repeated reset_auto must report no change");
 }
-
-// A07 -----------------------------------------------------------------------
-
 void duplicate_requests_stale_revisions_and_invalid_targets(const std::string& base)
 {
     const auto path = fresh_dir(base, "a07");
@@ -397,9 +387,6 @@ void duplicate_requests_stale_revisions_and_invalid_targets(const std::string& b
               "a skipped automatic decision must not rewrite the selection");
     }
 }
-
-// A22 -----------------------------------------------------------------------
-
 void durable_intent_survives_restart_and_generation_change(const std::string& base)
 {
     const auto path = fresh_dir(base, "a22");
@@ -474,9 +461,6 @@ void durable_intent_survives_restart_and_generation_change(const std::string& ba
               "a replacement generation must not inherit the old manual stop");
     }
 }
-
-// A27 -----------------------------------------------------------------------
-
 // A selection command commits intent and only wakes the runtime. Convergence
 // is the runtime's job: it retries a failed application on the next pass, and
 // the command's answer never claims an attachment it did not observe.
@@ -560,7 +544,7 @@ void repeated_requests_converge_a_failed_application(const std::string& base)
 
 } // namespace
 
-// A04 (runtime refresh) -----------------------------------------------------
+// runtime refresh -----------------------------------------------------
 
 // A facts update with an unchanged binding must refresh the runtime snapshot:
 // convergence compares the facts revision the runtime actually saw, not only
@@ -617,9 +601,6 @@ void facts_update_refreshes_a_converged_runtime(const std::string& base)
               "the refreshed attachment must name the newer record revision");
     }
 }
-
-// A21 -----------------------------------------------------------------------
-
 // A runtime is woken from the command stack. A runtime that mutates intent from
 // its wake callback would recurse back into the command path; the mutation gate
 // refuses it before anything is committed.
@@ -682,9 +663,6 @@ void reentrant_intent_mutation_is_refused(const std::string& base)
               after.manual == outer_binding.manual,
           "the nested manual stop must not survive in the durable selection");
 }
-
-// A31 -----------------------------------------------------------------------
-
 // The expected_revision guard is compared against the same durable image the
 // transaction writes. Two concurrent requests that both read revision R must
 // not both commit: exactly one wins and the other reports a stale revision.
@@ -881,9 +859,6 @@ void ambiguous_selection_write_retry_publishes_durable_state(const std::string& 
               published.manual == returned.manual,
           "a successful retry must publish the durable selection it read");
 }
-
-// A06/A22 -------------------------------------------------------------------
-
 // The automatic decision recorded under a manual override is durable even
 // though it is not effective, and reset_auto after a restart applies exactly
 // that decision. Both the override and the reset survive their own restart.
@@ -951,7 +926,7 @@ void reset_after_restart_uses_durable_automatic_decision(const std::string& base
     }
 }
 
-// A21 (recovery latch) ------------------------------------------------------
+// recovery latch ------------------------------------------------------
 
 // An ambiguous intent write leaves memory and disk disagreeing. Until an
 // explicit recovery verifies the affected row, the store refuses mutations,
@@ -1071,7 +1046,7 @@ void ambiguous_intent_write_survives_the_shutdown_checkpoint(const std::string& 
     }
 }
 
-// A23 (closing runtime) -----------------------------------------------------
+// closing runtime -----------------------------------------------------
 
 // Entering closing must not speculatively clear the applied set: the holders
 // are still attached until the collectors acknowledge the drain, and the
@@ -1135,14 +1110,14 @@ int main(int argc, char** argv)
         ambiguous_intent_write_latches_until_verified(base);
         ambiguous_intent_write_survives_the_shutdown_checkpoint(base);
         closing_keeps_the_runtime_holders_until_the_archive(base);
-        std::cout << "PASS collection intent: A05 manual over discovery and "
-                     "policy, A06 persistent stop and reset_auto, A07 "
-                     "duplicate/stale/invalid request atomicity, A22 durable "
-                     "intent across restart and generation change, A27 "
-                     "repeated requests converge a failed application, A31 "
-                     "transaction-bound revision CAS, A05 runtime projection "
-                     "under a manual override, A21 ambiguous selection write, "
-                     "A21 recovery latch/reopen, A23 closing runtime holders\n";
+        std::cout << "PASS collection intent: manual over discovery and "
+                     "policy, persistent stop and reset_auto, "
+                     "duplicate/stale/invalid request atomicity, durable "
+                     "intent across restart and generation change, "
+                     "repeated requests converge a failed application, "
+                     "transaction-bound revision CAS, runtime projection "
+                     "under a manual override, ambiguous selection write, "
+                     "recovery latch/reopen, closing runtime holders\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

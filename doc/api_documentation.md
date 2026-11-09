@@ -108,6 +108,7 @@ Generic job operation (add or remove).
 | `JobPIDs` | array[int] | No | List of process PIDs |
 | `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "io_collector", "net_collector"]`) |
 | `sub_attr` | object | No | Sub-attributes: `condor` type needs `cluster_id`/`proc_id`, `slurm` type needs `job_id`/`step_id` |
+| `erase` | bool | No | For `remove` only. `false` or absent keeps the stop tier: collection stops, the inventory fact remains. `true` retires the instance: a collected instance is archived as an `h:` history row, a never-collected instance is deleted |
 
 **Example request:**
 ```json
@@ -126,6 +127,9 @@ Generic job operation (add or remove).
 |---|---|---|
 | `status` | string | Operation status (e.g., `"ok"`) |
 | `received` | object | The processed request data |
+| `mode` | string | For `remove`: `"stop"` or `"erase"` |
+| `stopped_count` / `deleted_count` | int | Number of targets handled by the selected tier |
+| `stopped_instances` / `erased_instances` | array[string] | Instance handles processed by the selected tier |
 
 **Status Codes:**
 - `200` - Success
@@ -547,8 +551,7 @@ Get hardware information including CPU model, memory size, disk info, etc.
 
 ## 12. Job Inventory and Collection Control
 
-These routes proxy the Core inventory/collection contract
-(`doc/job_inventory_collection_decoupling_plan.md` §9). Trigger validates and
+These routes proxy the Core inventory/collection contract. Trigger validates and
 forwards only: it never allocates or derives internal IDs, and a Core error is
 never turned into HTTP 200.
 

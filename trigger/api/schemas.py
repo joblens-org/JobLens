@@ -46,7 +46,7 @@ class CondorJobRequest(BaseModel):
 class SlurmJobRequest(BaseModel):
     """Slurm作业专用请求
 
-    §9.4：JobID 是兼容提示，不是权威身份。原生身份以 sub_attr 的
+    JobID 是兼容提示，不是权威身份。原生身份以 sub_attr 的
     job_id/step_id + 调度器命名空间为准，因此 identity-only 的
     legacy add 可以不带 JobID。
     """
@@ -224,7 +224,7 @@ class HardwareInfoResponse(BaseModel):
 
 
 # ==================== 作业清单 / 采集控制模型 ====================
-# 契约见 doc/job_inventory_collection_decoupling_plan.md §9。
+# 契约见 doc/api_documentation.md 第 12 节。
 # Trigger 只做边界校验与透传：不分配、不推导内部 ID。
 
 class CollectionSelector(BaseModel):
@@ -270,7 +270,7 @@ class CollectionSelector(BaseModel):
 
 
 class CollectionControlRequest(BaseModel):
-    """POST /joblens/collection 请求体（§9.2）"""
+    """POST /joblens/collection 请求体"""
     selector: CollectionSelector = Field(..., description="实例句柄或原生身份选择器，二者只能取其一")
     scope: Literal["instance", "job"] = Field("instance", description="instance 或 job；实例句柄只支持 instance")
     ensure_registered: bool = Field(False, description="为 true 时要求 Core 先刷新发现再匹配")
@@ -331,14 +331,14 @@ class CollectionControlRequest(BaseModel):
 
 
 class CollectionErrorResponse(BaseModel):
-    """§9.2 结构化错误体"""
+    """结构化错误体"""
     code: str = Field(..., description="机器可读错误码")
     message: str = Field(..., description="人类可读错误信息")
     candidates: Optional[List[str]] = Field(None, description="歧义选择器的候选实例句柄")
 
 
 class CollectionTarget(BaseModel):
-    """§9.2 被精确解析到的单个实例"""
+    """被精确解析到的单个实例"""
     instance_id: str = Field(..., description="不透明实例句柄")
     internal_job_id: str = Field(..., pattern=r"^[0-9]+$", description="内部作业 ID，十进制字符串")
     native_job_id: Optional[str] = Field(None, description="调度器原生作业 ID 字符串")
@@ -365,7 +365,7 @@ class CollectionStatusResponse(BaseModel):
 
 
 class InventoryListResponse(BaseModel):
-    """GET /joblens/inventory 响应（§9.3）"""
+    """GET /joblens/inventory 响应"""
     snapshot_revision: int = Field(..., description="首页捕获的快照修订号")
     records: List[Dict[str, Any]] = Field(..., description="清单记录，内部 ID 为十进制字符串")
     next_cursor: Optional[str] = Field(None, description="下一页不透明游标；无更多数据为 null")
@@ -378,7 +378,7 @@ class InventoryStatusResponse(BaseModel):
 
 
 class CapabilitiesResponse(BaseModel):
-    """GET /joblens/capabilities 响应（§9.3）- 只透传，绝不代 Core 声明能力"""
+    """GET /joblens/capabilities 响应 - 只透传，绝不代 Core 声明能力"""
     inventory_version: Optional[int] = Field(None, description="清单契约版本")
     collection_control_version: Optional[int] = Field(None, description="采集控制契约版本")
     native_identity_selectors: Optional[bool] = Field(None, description="是否支持原生身份选择器")

@@ -11,7 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Typed registration outcome contract (plan §5.1).
+// Typed registration outcome contract.
 //
 // The store reports why a registration attempt did not fully succeed as an
 // enum, not by asking every caller to parse a message string. `to_string()`

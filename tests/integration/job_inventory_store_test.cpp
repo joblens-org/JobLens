@@ -11,19 +11,18 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-/* Deterministic inventory-store acceptance (task 2 of
- * doc/job_inventory_collection_decoupling_plan.md).
+/* Deterministic inventory-store acceptance.
  *
- *   A04 One complete upsert with zero bindings, repeat and fact update:
- *       one entry, stable ID/instance handle, revision advances only on real
- *       fact change, nothing activated.
- *   A19 Legacy restore with non-empty CollectorNames: inventory appears
- *       without any lifecycle subscriber, identity index built, selection
- *       migrated to a manual binding.
- *   A20 Interrupted migration resumes idempotently with preserved IDs;
- *       conflicting live identities are quarantined, never merged.
- *   A21 Injected LevelDB write failures: no false durable success, no ID
- *       reuse, health records the failure.
+ *   * One complete upsert with zero bindings, repeat and fact update: one
+ *     entry, stable ID/instance handle, revision advances only on real fact
+ *     change, nothing activated.
+ *   * Legacy restore with non-empty CollectorNames: inventory appears
+ *     without any lifecycle subscriber, identity index built, selection
+ *     migrated to a manual binding.
+ *   * Interrupted migration resumes idempotently with preserved IDs;
+ *     conflicting live identities are quarantined, never merged.
+ *   * Injected LevelDB write failures: no false durable success, no ID
+ *     reuse, health records the failure.
  *
  * Fault-injection mechanism (honest and deterministic): JobRegistry exposes
  * injectStoreFaultForTest(mode, skip, count), a seam around its single durable
@@ -217,9 +216,6 @@ std::vector<std::string> raw_keys_with_prefix(const std::string& path,
     }
     return keys;
 }
-
-// A04 -----------------------------------------------------------------------
-
 void upsert_is_idempotent_and_activates_nothing(const std::string& base)
 {
     const auto path = fresh_dir(base, "a04");
@@ -315,9 +311,6 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
     check(registry.inventoryRecords().size() == 1,
           "rejected observations must not create records");
 }
-
-// A19 -----------------------------------------------------------------------
-
 // Schema 3 is a hard boundary. A store with data but no schema marker is an
 // old-schema store: this build rejects it and leaves every row untouched. It
 // never migrates or deletes in place.
@@ -364,9 +357,6 @@ void legacy_schema_is_rejected_without_migration(const std::string& base)
               "an old-schema store must stay rejected on every open");
     }
 }
-
-// A20 -----------------------------------------------------------------------
-
 // Rejection is all-or-nothing and idempotent, even for a populated store.
 void unsupported_schema_is_rejected_idempotently(const std::string& base)
 {
@@ -436,7 +426,7 @@ void conflicting_live_execution_is_not_merged(const std::string& base)
           "a live conflict is rejected, not quarantined");
 }
 
-// Restore validation (supports A03/A20) --------------------------------------
+// Restore validation (supports /) --------------------------------------
 
 void stale_generation_is_not_replayed(const std::string& base)
 {
@@ -468,7 +458,7 @@ void stale_generation_is_not_replayed(const std::string& base)
               "stale PIDs must not be replayed into the registry");
 
         // The same generation observed again recovers the record; a different
-        // generation is a conflict, not a revival (covered by A22).
+        // generation is a conflict, not a revival (covered by ).
         auto same = condor_observation("172.0");
         same.execution->generation = ExecutionGeneration{"boot-does-not-exist", manager_pid, 123456, ""};
         same.execution->members = {ProcessIdentity{manager_pid, 123456, "boot-does-not-exist"}};
@@ -480,9 +470,6 @@ void stale_generation_is_not_replayed(const std::string& base)
               "a valid observation must reactivate a suspect record");
     }
 }
-
-// A21 -----------------------------------------------------------------------
-
 void write_failures_reject_mutations_without_id_reuse(const std::string& base)
 {
     const auto path = fresh_dir(base, "a21");
@@ -573,9 +560,6 @@ void write_failures_reject_mutations_without_id_reuse(const std::string& base)
 
     registry.clearStoreFaultsForTest();
 }
-
-// A24 -----------------------------------------------------------------------
-
 void closing_state_is_durable_and_not_resurrected(const std::string& base)
 {
     const auto path = fresh_dir(base, "a24-closing");
@@ -634,9 +618,6 @@ void closing_state_is_durable_and_not_resurrected(const std::string& base)
               "after the archive the identity can register again as a new instance");
     }
 }
-
-// A25 -----------------------------------------------------------------------
-
 void restored_suspect_instances_are_not_replayed(const std::string& base)
 {
     const auto path = fresh_dir(base, "a25-suspect");
@@ -672,9 +653,6 @@ void restored_suspect_instances_are_not_replayed(const std::string& base)
               "a facts-only restored record selects no collector");
     }
 }
-
-// A32 -----------------------------------------------------------------------
-
 // Every registration error enumerator has one stable wire string and one fixed
 // retry projection; an unmapped value must fail loudly instead of degrading to
 // "success" or an empty code.
@@ -737,7 +715,7 @@ void registration_errors_are_typed_and_exhaustively_mapped(const std::string& ba
     check(rejected.retry_registration(), "the typed result must project to a source retry");
 }
 
-// A03 (durability tiering) ---------------------------------------------------
+// durability tiering ---------------------------------------------------
 
 // The registration hot path must not fence: facts and intent are written
 // without a sync and made durable by one checkpoint (or by shutdown).
@@ -782,7 +760,7 @@ void hot_path_registration_does_not_fsync(const std::string& base)
     (void)synced_before;
 }
 
-// A03 (shutdown recovery) ----------------------------------------------------
+// shutdown recovery ----------------------------------------------------
 
 // Everything written during runtime survives a graceful restart even though the
 // hot path never fenced: deinit() flushes the dirty set before closing.
@@ -819,7 +797,7 @@ void shutdown_flush_persists_runtime_changes(const std::string& base)
     }
 }
 
-// A05 (fresh candidates) ----------------------------------------------------
+// fresh candidates ----------------------------------------------------
 
 // A second observation for one identity with a different live manager triple
 // conflicts exactly like a merge would: it never overwrites the first.
@@ -846,7 +824,7 @@ void conflicting_fresh_candidates_are_rejected(const std::string& base)
     check(registry.inventoryRecords().size() == 1, "only one instance may exist");
 }
 
-// A04 (working set) ---------------------------------------------------------
+// working set ---------------------------------------------------------
 
 // Repeated observations for one existing identity publish the last state, and
 // the published memory state equals what a restart reads back.
@@ -895,9 +873,6 @@ void repeated_observations_keep_memory_and_disk_in_sync(const std::string& base)
               "the restarted revision must match the published revision");
     }
 }
-
-// A26 -----------------------------------------------------------------------
-
 void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string& base)
 {
     const auto path = fresh_dir(base, "a26-members");
@@ -936,9 +911,6 @@ void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string
 }
 
 } // namespace
-
-// A29 -----------------------------------------------------------------------
-
 void registration_keeps_single_upsert_semantics(const std::string& base)
 {
     const auto path = fresh_dir(base, "a29");
@@ -996,9 +968,6 @@ void registration_keeps_single_upsert_semantics(const std::string& base)
               "without a runtime the actual state must stay untracked");
     }
 }
-
-// A26 -----------------------------------------------------------------------
-
 // The internal ID space must never reissue a value it already handed out. The
 // legacy allocator stores only `c:job_id`; at the ceiling that is ambiguous
 // ("MAX is still available" vs "MAX was already issued"), so the process must
@@ -1088,9 +1057,6 @@ void max_internal_id_is_never_reissued(const std::string& base)
               "an existing MAX record must force exhaustion");
     }
 }
-
-// A11 -----------------------------------------------------------------------
-
 // The runtime result is memory-only truth for this process: unchanged facts,
 // changed facts and intent commits must never clear or fabricate it.
 void runtime_state_survives_later_durable_writes(const std::string& base)
@@ -1204,12 +1170,9 @@ void runtime_state_survives_later_durable_writes(const std::string& base)
               "the applied revision must converge to the current record revision");
     }
 }
-
-// A12 -----------------------------------------------------------------------
-
 // Archiving must leave no active `j:` row behind, even when the runtime result
 // of that instance was recorded as a coalesced hint that had not been flushed
-// to disk yet. This is the deterministic half of A12; the coalesced flush is
+// to disk yet. This is the deterministic half of ; the coalesced flush is
 // deleted in P2b, so a concurrent interleaving has no code path to race after
 // that change.
 void archived_instances_leave_no_active_row(const std::string& base)
@@ -1252,9 +1215,6 @@ void archived_instances_leave_no_active_row(const std::string& base)
     const auto history_keys = raw_keys_with_prefix(path, "h:");
     check(history_keys.size() == 1, "the archive must leave exactly one history row");
 }
-
-// A10 -----------------------------------------------------------------------
-
 // An ambiguous create (the batch landed but LevelDB reported failure) must
 // resolve to the same instance after a restart instead of minting a new one.
 void ambiguous_registration_resolves_after_restart(const std::string& base)
@@ -1292,9 +1252,6 @@ void ambiguous_registration_resolves_after_restart(const std::string& base)
               "exactly the two real instances may exist");
     }
 }
-
-// A03/A04/A05 ---------------------------------------------------------------
-
 // A create, a fact merge, a conflicting generation and a repeat of the newly
 // created identity each resolve to the single-upsert semantics; the conflict is
 // reported per call without blocking the others.
@@ -1421,7 +1378,7 @@ void closing_write_failure_keeps_the_instance(const std::string& base)
           "the instance must remain readable after the refused retirement");
 }
 
-// A19 (canonical marker) ----------------------------------------------------
+// canonical marker ----------------------------------------------------
 
 // The schema marker this build writes is a canonical decimal. Anything else -
 // a prefix parse like "3garbage", a value that only fits after truncation, an
@@ -1468,7 +1425,7 @@ void schema_marker_must_be_canonical(const std::string& base)
     }
 }
 
-// A24 (ambiguous closing) ---------------------------------------------------
+// ambiguous closing ---------------------------------------------------
 
 // A closing write whose outcome is unknown may have landed. The process must
 // keep the pre-failure view, refuse the shutdown checkpoint for that row, and
@@ -1516,7 +1473,7 @@ void ambiguous_closing_state_is_not_reverted(const std::string& base)
     }
 }
 
-// A24 (cleanup ordering) ----------------------------------------------------
+// cleanup ordering ----------------------------------------------------
 
 // The archive releases the identity index, so it must come last: a failed
 // owner-sensitive kernel cleanup keeps the durable closing reservation, blocks
@@ -1588,7 +1545,7 @@ void cleanup_failure_keeps_the_closing_reservation(const std::string& base)
           "only after the archive may the identity be registered again");
 }
 
-// A24 (ambiguous closing retry) ---------------------------------------------
+// ambiguous closing retry ---------------------------------------------
 
 // A closing write whose outcome is unknown may have landed. Memory keeps the
 // active view until recovery, so the first retire reports failure without a
@@ -1642,7 +1599,7 @@ void ambiguous_closing_retry_restores_the_drain(const std::string& base)
           "after the archive the identity can be registered as a new instance");
 }
 
-// A24 (cleanup after ack) ---------------------------------------------------
+// cleanup after ack ---------------------------------------------------
 
 // The cleanup happens after the last collection ack, so a failed cleanup is
 // not a lost drain: the closing reservation stays and the same ack path can be
@@ -1697,7 +1654,7 @@ void cleanup_failure_after_ack_is_retryable(const std::string& base)
     check(removed_events == 1, "the retry must not emit a second Removed");
 }
 
-// A05/A23 (runtime projection) ----------------------------------------------
+// /(runtime projection) ----------------------------------------------
 
 // The runtime result and the Job.collection projection are one piece of
 // in-memory truth. A whole-record publication (an ordinary unchanged
@@ -1760,7 +1717,7 @@ void runtime_projection_survives_repeated_observation(const std::string& base)
           "a fact change must not erase the runtime holders");
 }
 
-// A21 (recovery fence) ------------------------------------------------------
+// recovery fence ------------------------------------------------------
 
 // An ambiguous unsynced selection may have landed. Recovery adopts the durable
 // row, but adoption alone is not durable: the recovered row (and any remaining
@@ -1837,7 +1794,7 @@ void recovery_fences_the_adopted_selection(const std::string& base)
           "recovery must publish the ONE revision of the landed write");
 }
 
-// A24/A21 (ambiguous archive image) -----------------------------------------
+// /(ambiguous archive image) -----------------------------------------
 
 // An archive write that landed but reported failure leaves no active row to
 // rewrite and no dirty snapshot to fence. Recovery must read the durable `h:`
@@ -2200,20 +2157,20 @@ int main(int argc, char** argv)
         never_collected_instances_are_discarded(base);
         ambiguous_discard_is_confirmed_by_the_missing_row(base);
         restored_closing_archives_with_effective_fallback(base);
-        std::cout << "PASS inventory store: A04 empty-binding upsert idempotency, "
-                     "A19 old-schema rejection without migration or deletion, "
-                     "A19 canonical schema marker, A20 idempotent rejection and "
-                     "live-generation conflict, A21 "
-                     "durable-write failure handling and no ID reuse, A24 "
-                     "durable closing state, A24 ambiguous closing write and "
-                     "missing-drain recovery, A24 cleanup ordering and retry "
-                     "after the ack, A25 suspect replay filter, A26 "
-                     "member semantics (unknown vs confirmed empty), A29 "
-                     "registration parity, A26 max-ID exhaustion across restart, "
-                     "A11 runtime state across later durable writes, A12 archive "
-                     "leaves no active row, A05 runtime projection across "
-                     "republication, A21 recovery fences the adopted selection, "
-                     "A24 ambiguous archive recovery fences the durable history "
+        std::cout << "PASS inventory store: empty-binding upsert idempotency, "
+                     "old-schema rejection without migration or deletion, "
+                     "canonical schema marker, idempotent rejection and "
+                     "live-generation conflict, "
+                     "durable-write failure handling and no ID reuse, "
+                     "durable closing state, ambiguous closing write and "
+                     "missing-drain recovery, cleanup ordering and retry "
+                     "after the ack, suspect replay filter, "
+                     "member semantics (unknown vs confirmed empty), "
+                     "registration parity, max-ID exhaustion across restart, "
+                     "runtime state across later durable writes, archive "
+                     "leaves no active row, runtime projection across "
+                     "republication, recovery fences the adopted selection, "
+                     "ambiguous archive recovery fences the durable history "
                      "image, archive split by the fact criterion (never-collected "
                       "discard, ambiguous discard recovery, restored-closing "
                       "effective fallback), "

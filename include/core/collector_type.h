@@ -25,7 +25,11 @@
 #include "core/job_identity.hpp"
 #include <spdlog/spdlog.h>
 
-//TODO: 其实更好的方案是设计Job描述方法，但是设计和实现都很痛苦，先开摆
+// Job is a concrete struct rather than a generic property bag: collectors and
+// the store read its fields directly, and the typed SubAttr alternative keeps
+// scheduler-specific facts out of shared code. A generic descriptor would move
+// the same knowledge into string keys and runtime validation without removing
+// any of the coupling.
 
 enum class JobType{
     Unknown = 0,
@@ -232,7 +236,7 @@ inline void from_json(const nlohmann::json& j, SlurmJobAttr& t) {
 }
 
 using SubAttr = std::variant<CondorJobAttr, CommonJobAttr, SlurmJobAttr, nlohmann::json>;
-// The json alternative is the open-world facts channel (v2 G4): a scheduler
+// The json alternative is the open-world facts channel: a scheduler
 // whose adapter registered after the built-ins carries its typed facts as a
 // JSON object the adapter owns (schema, keys, evolution). Built-in attrs
 // stay strongly typed so existing collectors and matchers are untouched.
@@ -316,7 +320,7 @@ struct SubAttrMatcher {
     }
 };
 
-// Execution evidence a discovery source actually observed (plan §4.1). It is a
+// Execution evidence a discovery source actually observed. It is a
 // value group on the Job, not another transport envelope: the watcher fills it
 // while parsing, the store persists the compatible projection and compares
 // generations by boot/PID/start only.
@@ -349,7 +353,7 @@ struct Job {
 
     SubAttr                                 sub_attr;
 
-    // 通用采集状态 (v2 G6)：表示"已进入采集管线"——调度器当前实际持有本 Job
+    // 通用采集状态：表示"已进入采集管线"——调度器当前实际持有本 Job
     // 的 collector 集合（部分成功保留实际生效子集）。只由采集运行时的
     // attach/detach 完成结果写入，绝不从 CollectorNames 推断，也绝不跨重启
     // 恢复为 true（重启后由 replay 重新 attach 时再置位）。不参与序列化。
@@ -390,7 +394,7 @@ struct Job {
 };
 
 // ---------------------------------------------------------------------------
-// Execution evidence projection (plan §4.2)
+// Execution evidence projection
 //
 // The Job is the single source of truth; these accessors are the only way the
 // store derives the identity selector, generation and members it persists, so

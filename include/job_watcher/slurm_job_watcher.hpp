@@ -32,20 +32,19 @@
 #include <vector>
 #include "ebpf/trace_slurm_stepd.h"
 
-// Slurm discovery adapter (doc/job_inventory_collection_decoupling_plan.md
-// section 3.1). Same single construction path as CondorJobWatcher: explicit
-// DiscoveryOptions only (no Config, no eBPF, no thread in the constructor),
-// start(DiscoverySink) begins operation, scan() is the authoritative pass and
-// observeForHint(pid) the targeted pass for exec events.
+// Slurm discovery adapter. Same single construction path as CondorJobWatcher:
+// explicit DiscoveryOptions only (no Config, no eBPF, no thread in the
+// constructor), start(DiscoverySink) begins operation, scan() is the
+// authoritative pass and observeForHint(pid) the targeted pass for exec events.
 //
 // Discovery inputs are slurmstepd processes and their children in the process
 // table plus the optional slurmd spool, read through an injectable
 // DiscoveryEnvironment so an unprivileged host can present a fake tree.
 //
-// No cgroup-subtree starter enumeration here (DiscoveryOptions::
-// starter_cgroup_subtree is Condor-only for now): the observed slurm layout
-// nests job_X/step_Y directories under the cgroup root, and which level
-// reliably lists slurmstepd per step must be probed on a real node first.
+// No cgroup-subtree starter enumeration here (`starter_cgroup_subtree` is
+// Condor-only): the Slurm cgroup layout nests job_X/step_Y directories under
+// the root, and the process table is the stable source for slurmstepd per
+// step across supported Slurm versions.
 class SlurmJobWatcher final : public IDiscoverySource{
 public:
     // Options only: nothing is loaded and nothing polls until start().
@@ -101,10 +100,10 @@ private:
     // read when it is positive.
     void handle_exec_event(uint32_t pid, uint32_t ppid);
     // One sample ended the turn: libbpf must stop consuming so the tail batch,
-    // the due re-reads and the stop check can run (plan §6.2).
+    // the due re-reads and the stop check can run.
     bool stop_requested();
     // Samples handled in the current poll call; the turn ends at
-    // kSamplesPerTurn so the stop/scan checks always get a chance (plan §6.2).
+    // kSamplesPerTurn so the stop/scan checks always get a chance.
     static constexpr std::size_t kSamplesPerTurn = 32;
     std::size_t samples_this_turn_ = 0;
     std::atomic<bool> yield_requested_{false};
@@ -598,7 +597,7 @@ inline Job SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& env,
     Job job;
     JobExecution& execution = job.execution.emplace();
     // Assigned before the first read so the store can reject an older pass
-    // overwriting newer facts (plan §4.1).
+    // overwriting newer facts.
     execution.read_order = next_discovery_read_order();
     std::vector<std::string> reasons;
     job.subtype_name = name_;

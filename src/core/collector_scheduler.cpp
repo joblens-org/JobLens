@@ -740,8 +740,8 @@ bool CollectorScheduler::applyJobBindingLocked(const Job& job, std::vector<std::
     }
 
     // Stamp the actual holders onto the per-collector snapshots: the generic
-    // collection status is scheduler-reported runtime state (v2 G6), partial
-    // success included, never inferred from the desired list.
+    // collection status is scheduler-reported runtime state, partial success
+    // included, never inferred from the desired list.
     for (const auto& collector_name : applied) {
         auto it = collector_state_dict.find(collector_name);
         if (it == collector_state_dict.end()) continue;
@@ -793,8 +793,8 @@ bool CollectorScheduler::parse_output_policy(const std::string& raw, bool suppor
         error = "output_policy '" + raw + "' is not supported by this collector";
         return false;
     }
-    // Scoped finalization is added by a later task. Reject it explicitly instead
-    // of silently dropping the requested report.
+    // Scoped finalization is not implemented: reject it explicitly instead of
+    // silently dropping the requested report.
     error = "output_policy '" + raw + "' is not implemented in this build";
     return false;
 }

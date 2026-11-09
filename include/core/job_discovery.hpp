@@ -11,25 +11,20 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Discovery-adapter observation model for the job-inventory/collection
-// decoupling (doc/job_inventory_collection_decoupling_plan.md sections 3.1,
-// 4.1 and 5.2).
+// Discovery-adapter contract for the job inventory.
 //
-// This header is the contract between the scheduler discovery adapters
-// (CondorJobWatcher, SlurmJobWatcher) and the inventory maintenance
-// controller:
-//
-// Discovery contract (renamed from job_observation when registration became a
-// Job-based synchronous path; plan §5.1). The header owns source and scan —
-// the root-explicit proc/cgroup readers live in common/procfs.hpp — and it
-// must never depend on LevelDB; the registration result type lives in its own
-// contract header.
+// This header is the boundary between the scheduler discovery adapters
+// (CondorJobWatcher, SlurmJobWatcher) and the registry heartbeat:
 //
 //   * scan()      - one synchronous source pass, returns ScanResult
 //   * health()    - SourceHealth of that source (initializing/healthy/degraded)
+//   * observeForHint(pid) - O(job) targeted pass for one exec-event pid
 //   * jobs        - discovered Jobs (typed facts + execution evidence group)
-//                   the controller admits through JobRegistry upserts; never a
-//                   JobRegistry dependency of its own
+//                   the sink admits through JobRegistry upserts
+//
+// The header owns source and scan. The root-explicit proc/cgroup readers live
+// in common/procfs.hpp, and this contract must never depend on LevelDB; the
+// registration result type lives in its own contract header.
 //
 // Two rules are structural rather than conventional:
 //
@@ -62,7 +57,7 @@
 // ---------------------------------------------------------------------------
 
 // Wall-clock epoch milliseconds. Discovery adapters take a ScanClock so tests
-// and the maintenance controller can drive a deterministic clock.
+// and the registry heartbeat can drive a deterministic clock.
 std::int64_t now_epoch_ms();
 using ScanClock = std::function<std::int64_t()>;
 
@@ -180,7 +175,7 @@ struct DiscoveryOptions {
     // always started by start(), never by the constructor.
     bool enable_event_source = true;
     // Periodic scan tick of the adapter's poll thread; 0 disables it (the
-    // maintenance controller owns pacing and runs the authoritative passes).
+    // registry heartbeat owns pacing and runs the authoritative passes).
     std::uint32_t scan_interval_ms = 0;
     // Condor tier-1 starter enumeration: path of the slot cgroup subtree
     // RELATIVE to discovery.cgroup_root (verified layout: the startd keeps
@@ -194,7 +189,7 @@ struct DiscoveryOptions {
     ScanClock clock;
 };
 
-// Synchronous single-job registration entry (plan §3/§5.1): registers one
+// Synchronous single-job registration entry: registers one
 // discovered Job and returns the result. It runs on the caller's
 // thread (the source's poll thread), never on a worker. Both discovery
 // paths — exec events and the source's own periodic scan — use it.
@@ -242,7 +237,7 @@ public:
 };
 
 // Process-monotonic read order, assigned before a builder starts reading. The
-// store uses it so an older scan can never overwrite a newer event (plan §4.1).
+// store uses it so an older scan can never overwrite a newer event.
 std::uint64_t next_discovery_read_order();
 
 // Process identity from the fake or real procfs (see common/procfs.hpp).

@@ -167,7 +167,7 @@ def test_cpumem_dump_contains_thread_field(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# V2 parser context 字段验证（Task 10: V1 fallback 和 V2 context 访问测试）
+# V2 parser context 字段验证（V1 fallback 和 V2 context 访问测试）
 # ═══════════════════════════════════════════════════════════════════════════════
 
 V2_CONTEXT_FIELDS = [

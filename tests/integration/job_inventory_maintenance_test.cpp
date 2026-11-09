@@ -11,42 +11,39 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-/* Deterministic inventory-heartbeat acceptance (v2 architecture §2.3).
+/* Deterministic inventory-heartbeat acceptance.
  *
- * The maintenance controller is gone: every case drives the JobRegistry
- * heartbeat (test sources + injected probes + test facts encoder) and asserts
- * the same behaviors the v1 controller suites pinned:
+ * Every case drives the JobRegistry heartbeat (test sources + injected probes
+ * + test facts encoder) and asserts:
  *
- *   CONFIG section 8 precedence, defaults and startup rejection
- *   A08  start-before-scan, events injected during a scan are replayed,
- *        duplicate hints do not duplicate records, obsolete hints do not
- *        resurrect an ended generation
- *   A09  one missed scan recovers; two complete absences retire; failed or
- *        incomplete scans never count as absence
- *   A10  empty PID list with a live manager/cgroup does not retire; positive
- *        evidence (manager ended + confirmed empty cgroup) retires
- *   A11  EPERM/unreadable/unresolved input is unknown, not death; incomplete
- *        identities stay visible and retried; no wrong merge
- *   A12  bounded hint queue overflow counts drops, degrades and requests a
- *        rescan; the rescan repairs the dropped hints
- *   A13  tracker-unavailable mode (source started without an event source)
- *   A14  a late acknowledgement for an old generation never removes the new
- *        instance's ownership (real drain-ack path)
- *   A23  reads are side-effect free; snapshots coherent; sentinel excluded
- *   A25  heartbeat stop is idempotent and ordered; a failed source start is
- *        not fatal; an interrupted closing survives a restart and archives
- *   A28  unknown cgroup members are not death evidence; confirmed death retires
- *   RETIRE-EXPLICIT an explicit retirement marks the ended generation; a
- *        late same-generation observation is refused, a new one registers
- *   ADMIT  the inventory capture_all admission gate: S1/S3 combinations,
- *        drop/reject counters, NotAdmitted on the event path
- *   STOP-PIN a manual empty selection survives scan rotation and fact
- *        changes; automatic policy never re-pins collectors over a stop
- *   LEGACY  manual registrations retire on process evidence without a source
- *   RESCAN  event-driven and on-demand passes run the same reconcile path
- *   EXEC    exec hints resolve to targeted observations without a full scan
- *   EXEC2   an incomplete exec observation (job ad not yet written) retries
- *           on a short ladder instead of waiting for the next reconcile
+ *   * CONFIG precedence, defaults and startup rejection
+ *   * start-before-scan: events injected during a scan are replayed,
+ *     duplicate hints do not duplicate records, obsolete hints do not
+ *     resurrect an ended generation
+ *   * one missed scan recovers; two complete absences retire; failed or
+ *     incomplete scans never count as absence
+ *   * empty PID list with a live manager/cgroup does not retire; positive
+ *     evidence (manager ended + confirmed empty cgroup) retires
+ *   * EPERM/unreadable/unresolved input is unknown, not death; incomplete
+ *     identities stay visible and retried; no wrong merge
+ *   * tracker-unavailable mode (source started without an event source)
+ *   * a late acknowledgement for an old generation never removes the new
+ *     instance's ownership (real drain-ack path)
+ *   * reads are side-effect free; snapshots coherent; sentinel excluded
+ *   * heartbeat stop is idempotent and ordered; a failed source start is
+ *     not fatal; an interrupted closing survives a restart and archives
+ *   * unknown cgroup members are not death evidence; confirmed death retires
+ *   * RETIRE-EXPLICIT: an explicit retirement marks the ended generation; a
+ *     late same-generation observation is refused, a new one registers
+ *   * ADMIT: the capture_all admission gate (capture_all/auto_add
+ *     combinations), drop/reject counters, NotAdmitted on the event path
+ *   * STOP-PIN: a manual empty selection survives scan rotation and fact
+ *     changes; automatic policy never re-pins collectors over a stop
+ *   * LEGACY: manual registrations retire on process evidence without a source
+ *   * RESCAN: event-driven and on-demand passes run the same reconcile path
+ *   * EXEC: exec hints resolve to targeted observations without a full scan
+ *   * EXEC2: an incomplete exec observation converges through a coalesced
+ *     rescan instead of waiting for the next reconcile
  */
 #include "core/inventory_config.hpp"
 #include "core/inventory_status_provider.hpp"
@@ -580,7 +577,7 @@ void case_config()
 }
 
 // ---------------------------------------------------------------------------
-// A08 - start before scan, in-scan event replay, duplicate/obsolete hints
+// start before scan, in-scan event replay, duplicate/obsolete hints
 // ---------------------------------------------------------------------------
 
 void run_a08(const std::string& base)
@@ -593,10 +590,10 @@ void run_a08(const std::string& base)
     source.set_scan([&]() { return scan_with({scanned}); });
     JobRegistry registry(heartbeat_options(fresh_dir(base, "a08"), source, probes));
 
-    check(source.scans() == 1, "A08: the initial full scan did not run");
-    check(!source.scanned_without_start(), "A08: scan ran before the source was started");
-    check(source.starts() == 1, "A08: the source was not started exactly once");
-    check(find_native(registry, "100.0").has_value(), "A08: scan observation missing");
+    check(source.scans() == 1, "the initial full scan did not run");
+    check(!source.scanned_without_start(), "scan ran before the source was started");
+    check(source.starts() == 1, "the source was not started exactly once");
+    check(find_native(registry, "100.0").has_value(), "scan observation missing");
 
     // An event buffered during the initial pass is committed by the pass that
     // drains it, through the same upsert path.
@@ -604,19 +601,19 @@ void run_a08(const std::string& base)
         make_condor_job("101.0", 5101, 555, "htcondor01", "schedd-a", "/cg/slot-2");
     source.inject(injected);
     check(wait_until([&]() { return find_native(registry, "101.0").has_value(); }, 5000),
-          "A08: buffered event during the scan was not merged");
-    check(count_records(registry) == 2, "A08: duplicate hints duplicated records");
+          "buffered event during the scan was not merged");
+    check(count_records(registry) == 2, "duplicate hints duplicated records");
 
     const auto before = find_native(registry, "101.0");
-    check(before.has_value(), "A08: injected record vanished");
+    check(before.has_value(), "injected record vanished");
     source.inject(injected);   // duplicate hint for the same generation
     check(wait_until([&]() {
               auto record = find_native(registry, "101.0");
               return record.has_value() &&
                      record->internal_id == before->internal_id;
           }, 3000),
-          "A08: duplicate hint changed the internal id");
-    check(count_records(registry) == 2, "A08: duplicate hints duplicated records");
+          "duplicate hint changed the internal id");
+    check(count_records(registry) == 2, "duplicate hints duplicated records");
 
     // Termination + obsolete hint: a hint for an ended generation must not
     // resurrect it.
@@ -624,33 +621,33 @@ void run_a08(const std::string& base)
     probes.set_process(5101, LivenessState::Dead);
     probes.set_cgroup("/cg/slot-2", {}, true);
     source.set_scan([&]() { return scan_with({}); });
-    check(registry.reconcileInventoryNow(), "A08: the retirement pass did not run");
+    check(registry.reconcileInventoryNow(), "the retirement pass did not run");
     check(!find_native(registry, "101.0").has_value(),
-          "A08: terminated execution not retired");
+          "terminated execution not retired");
     source.inject(injected);
     wait_hb_quiet();
     registry.reconcileInventoryNow();
     check(!find_native(registry, "101.0").has_value(),
-          "A08: obsolete hint resurrected an ended generation");
+          "obsolete hint resurrected an ended generation");
 
     // A new generation for the same identity registers as a new instance.
     const Job revived =
         make_condor_job("101.0", 5102, 556, "htcondor01", "schedd-a", "/cg/slot-2");
     probes.set_process(5102, LivenessState::Alive, 556);
     source.set_scan([&]() { return scan_with({revived}); });
-    check(registry.reconcileInventoryNow(), "A08: the revival pass did not run");
+    check(registry.reconcileInventoryNow(), "the revival pass did not run");
     const auto revived_record = find_native(registry, "101.0");
     check(revived_record.has_value() &&
               revived_record->job.execution->generation.manager_pid == 5102,
-          "A08: a new generation was rejected after retirement");
-    check(count_records(registry) == 2, "A08: duplicate entry for one generation");
+          "a new generation was rejected after retirement");
+    check(count_records(registry) == 2, "duplicate entry for one generation");
 
     registry.deinit();
-    pass_case("A08", "start-before-scan, in-scan event replay, duplicate hints, no resurrection");
+    pass_case("", "start-before-scan, in-scan event replay, duplicate hints, no resurrection");
 }
 
 // ---------------------------------------------------------------------------
-// A09 - absence accounting
+// absence accounting
 // ---------------------------------------------------------------------------
 
 void run_a09(const std::string& base)
@@ -671,12 +668,12 @@ void run_a09(const std::string& base)
         probes.set_process(5200, LivenessState::Dead);
         probes.unset_cgroup("/cg/slot-1");   // unreadable: absence-only retirement
         JobRegistry registry(heartbeat_options(fresh_dir(base, "a09-recover"), source, probes));
-        check(registry.reconcileInventoryNow(), "A09: pass 2 did not run");
+        check(registry.reconcileInventoryNow(), "pass 2 did not run");
         check(find_native(registry, "200.0").has_value(),
-              "A09: one missed scan retired the instance");
-        check(registry.reconcileInventoryNow(), "A09: pass 3 did not run");
+              "one missed scan retired the instance");
+        check(registry.reconcileInventoryNow(), "pass 3 did not run");
         check(find_native(registry, "200.0").has_value(),
-              "A09: recovered instance was retired");
+              "recovered instance was retired");
         registry.deinit();
     }
 
@@ -696,12 +693,12 @@ void run_a09(const std::string& base)
         JobRegistry registry(heartbeat_options(fresh_dir(base, "a09-retire"), source, probes));
         registry.reconcileInventoryNow();   // complete miss #1
         check(find_native(registry, "210.0").has_value(),
-              "A09: retirement happened after a single absence");
+              "retirement happened after a single absence");
         check(heartbeat_status()["suspect_count"] == 1,
-              "A09: an absent instance was not reported suspect");
+              "an absent instance was not reported suspect");
         registry.reconcileInventoryNow();
         check(!find_native(registry, "210.0").has_value(),
-              "A09: two complete absences did not retire");
+              "two complete absences did not retire");
         registry.deinit();
     }
 
@@ -724,23 +721,23 @@ void run_a09(const std::string& base)
         registry.reconcileInventoryNow();   // pass 2: failed
         registry.reconcileInventoryNow();   // pass 3: failed
         check(find_native(registry, "220.0").has_value(),
-              "A09: failed scans were treated as absence");
+              "failed scans were treated as absence");
         check(heartbeat_status()["suspect_count"] == 0,
-              "A09: failed scans marked the instance suspect");
+              "failed scans marked the instance suspect");
         registry.reconcileInventoryNow();   // pass 4: complete miss #1
         check(find_native(registry, "220.0").has_value(),
-              "A09: retirement after one complete absence");
-        check(registry.reconcileInventoryNow(), "A09: pass 5 did not run");   // complete miss #2
+              "retirement after one complete absence");
+        check(registry.reconcileInventoryNow(), "pass 5 did not run");   // complete miss #2
         check(!find_native(registry, "220.0").has_value(),
-              "A09: two complete absences after failures did not retire");
+              "two complete absences after failures did not retire");
         registry.deinit();
     }
 
-    pass_case("A09", "recovery after one miss, retirement after two complete absences only");
+    pass_case("", "recovery after one miss, retirement after two complete absences only");
 }
 
 // ---------------------------------------------------------------------------
-// A10 - empty PID window vs positive termination evidence
+// empty PID window vs positive termination evidence
 // ---------------------------------------------------------------------------
 
 void run_a10(const std::string& base)
@@ -759,16 +756,16 @@ void run_a10(const std::string& base)
     probes.set_process(6001, LivenessState::Alive, 777);
     probes.set_cgroup("/cg/slot-4", {6001}, true);
     const auto record = find_native(registry, "300.0");
-    check(record.has_value(), "A10: record missing");
+    check(record.has_value(), "record missing");
     check(record->job.execution->members.empty(),
-          "A10: fixture should have an empty PID list");
+          "fixture should have an empty PID list");
 
     source.set_scan([&]() { return scan_with({}); });
     registry.reconcileInventoryNow();
     registry.reconcileInventoryNow();
     registry.reconcileInventoryNow();
     check(find_native(registry, "300.0").has_value(),
-          "A10: an empty PID list retired a live execution");
+          "an empty PID list retired a live execution");
 
     // Positive evidence: manager ended and the execution cgroup is empty. An
     // exit hint is enough: the targeted pass retires it without any source
@@ -782,16 +779,16 @@ void run_a10(const std::string& base)
     const int scans_before = source.scans();
     registry.notifyExit(5400);
     check(wait_until([&]() { return !find_native(registry, "300.0").has_value(); }, 3000),
-          "A10: positive termination evidence did not retire");
+          "positive termination evidence did not retire");
     check(source.scans() == scans_before,
-          "A10: retirement needed a source scan instead of targeted evidence");
+          "retirement needed a source scan instead of targeted evidence");
 
     registry.deinit();
-    pass_case("A10", "no premature retirement on an empty PID window; positive evidence retires");
+    pass_case("", "no premature retirement on an empty PID window; positive evidence retires");
 }
 
 // ---------------------------------------------------------------------------
-// A11 - unknown is not death, incomplete identities are retried
+// unknown is not death, incomplete identities are retried
 // ---------------------------------------------------------------------------
 
 void run_a11(const std::string& base)
@@ -823,19 +820,19 @@ void run_a11(const std::string& base)
     registry.reconcileInventoryNow();
     registry.reconcileInventoryNow();
     check(find_native(registry, "400.0").has_value(),
-          "A11: an unreadable liveness check was treated as death");
+          "an unreadable liveness check was treated as death");
 
     // An unresolved namespace cannot be indexed, is counted as incomplete and
     // is retried once the namespace resolves.
     const Job unresolved = make_unresolved_job("401.0", 5501);
-    check(!CondorJobWatcher::discovery_ready(unresolved), "A11: fixture should be incomplete");
+    check(!CondorJobWatcher::discovery_ready(unresolved), "fixture should be incomplete");
     scan_jobs = {unresolved};
     registry.reconcileInventoryNow();
     check(!find_native(registry, "401.0").has_value(),
-          "A11: an unresolved identity was indexed");
+          "an unresolved identity was indexed");
     check(heartbeat_status()["incomplete_observations"].get<std::uint64_t>() >= 1,
-          "A11: incomplete observation was not reported");
-    check(count_records(registry) == 1, "A11: an incomplete identity created a record");
+          "incomplete observation was not reported");
+    check(count_records(registry) == 1, "an incomplete identity created a record");
 
     const Job resolved =
         make_condor_job("401.0", 5501, 999, "htcondor01", "schedd-a", "/cg/slot-6");
@@ -845,13 +842,13 @@ void run_a11(const std::string& base)
     scan_jobs = {resolved};
     registry.reconcileInventoryNow();
     check(find_native(registry, "401.0").has_value(),
-          "A11: a retried complete identity was not indexed");
-    check(count_records(registry) == 2, "A11: retry duplicated or merged records");
+          "a retried complete identity was not indexed");
+    check(count_records(registry) == 2, "retry duplicated or merged records");
 
     // A namespace-less discovery must never merge into another namespace.
     scan_jobs = {make_unresolved_job("400.0", 5502)};
     registry.reconcileInventoryNow();
-    check(count_records(registry) == 2, "A11: an unresolved identity merged into a record");
+    check(count_records(registry) == 2, "an unresolved identity merged into a record");
 
     // A second cluster namespace with the same native id stays distinct.
     const Job other_cluster =
@@ -859,18 +856,18 @@ void run_a11(const std::string& base)
     probes.set_process(5600, LivenessState::Alive, 1111);
     scan_jobs = {other_cluster};
     registry.reconcileInventoryNow();
-    check(count_records(registry) == 3, "A11: namespaces merged");
+    check(count_records(registry) == 3, "namespaces merged");
     check(find_native(registry, "400.0", "htcondor02", "schedd-b").has_value(),
-          "A11: second namespace record missing");
+          "second namespace record missing");
     check(find_native(registry, "400.0")->job.execution->generation.manager_pid == 5500,
-          "A11: wrong record was updated");
+          "wrong record was updated");
 
     registry.deinit();
-    pass_case("A11", "EPERM/unknown is not death; incomplete identities visible and retried");
+    pass_case("", "EPERM/unknown is not death; incomplete identities visible and retried");
 }
 
 // ---------------------------------------------------------------------------
-// A12 - producer registration proceeds while a pass is in flight; nothing
+// producer registration proceeds while a pass is in flight; nothing
 //       is queued, so nothing can be dropped
 // ---------------------------------------------------------------------------
 
@@ -904,15 +901,15 @@ void run_a12(const std::string& base)
     const UpsertResult alpha_result = source.inject(alpha);
     const UpsertResult beta_result = source.inject(beta);
     check(alpha_result.ok && beta_result.ok,
-          "A12: producer-side registration failed while a pass was in flight");
+          "producer-side registration failed while a pass was in flight");
     check(count_records(registry) == 2,
-          "A12: synchronous registration did not land while the pass was blocked");
+          "synchronous registration did not land while the pass was blocked");
 
     const auto status = heartbeat_status();
     check(status["events_dropped"].get<std::uint64_t>() == 0,
-          "A12: an event was dropped even though no queue exists");
+          "an event was dropped even though no queue exists");
     check(status["queue_depth"].get<std::size_t>() == 0,
-          "A12: the deprecated queue-depth key must report zero");
+          "the deprecated queue-depth key must report zero");
 
     release_scan.set_value();
     reconciler.join();
@@ -921,14 +918,14 @@ void run_a12(const std::string& base)
     // needed, nothing duplicated.
     source.set_scan([&]() { return scan_with({alpha, beta}); });
     registry.reconcileInventoryNow();
-    check(count_records(registry) == 2, "A12: the rescan duplicated live instances");
+    check(count_records(registry) == 2, "the rescan duplicated live instances");
 
     registry.deinit();
-    pass_case("A12", "synchronous producer registration under an in-flight pass loses nothing");
+    pass_case("", "synchronous producer registration under an in-flight pass loses nothing");
 }
 
 // ---------------------------------------------------------------------------
-// A13 - source started without an event source (scan-only)
+// source started without an event source (scan-only)
 // ---------------------------------------------------------------------------
 
 void run_a13(const std::string& base)
@@ -941,8 +938,8 @@ void run_a13(const std::string& base)
 
     const auto status = heartbeat_status();
     check(status["tracker_unavailable"] == true,
-          "A13: a scan-only source was not reported");
-    check(status["state"] != "stopped", "A13: the heartbeat did not run");
+          "a scan-only source was not reported");
+    check(status["state"] != "stopped", "the heartbeat did not run");
 
     const Job job =
         make_condor_job("600.0", 5800, 1414, "htcondor01", "schedd-a", "/cg/slot-10");
@@ -960,14 +957,14 @@ void run_a13(const std::string& base)
     probes.set_cgroup("/cg/slot-10", {}, true);
     registry.reconcileInventoryNow();
     check(!find_native(registry, "600.0").has_value(),
-          "A13: retirement did not work in tracker-unavailable mode");
+          "retirement did not work in tracker-unavailable mode");
 
     registry.deinit();
-    pass_case("A13", "tracker unavailable: maintenance and retirement continue, health reports it");
+    pass_case("", "tracker unavailable: maintenance and retirement continue, health reports it");
 }
 
 // ---------------------------------------------------------------------------
-// A14 - old closing record vs a new instance reusing pid/cgroup
+// old closing record vs a new instance reusing pid/cgroup
 // ---------------------------------------------------------------------------
 
 void run_a14(const std::string& base)
@@ -990,24 +987,24 @@ void run_a14(const std::string& base)
     });
 
     const auto old_record = find_native(registry, "700.0");
-    check(old_record.has_value(), "A14: old record missing");
+    check(old_record.has_value(), "old record missing");
 
     source.set_scan([&]() { return scan_with({}); });
     probes.set_process(5900, LivenessState::Dead);
     probes.set_cgroup("/cg/slot-11", {}, true);
     registry.reconcileInventoryNow();
     check(registry.closingJobCount() == 1,
-          "A14: retirement did not enter the closing state");
+          "retirement did not enter the closing state");
     // The runtime's own pass is what dispatches the drain/Removed; the
     // heartbeat only committed the Closing intent.
     test_runtime(registry).reconcile(old_record->internal_id);
     {
         std::lock_guard<std::mutex> lock(observer_mutex);
         check(removed.size() == 1 && removed.front() == old_record->internal_id,
-              "A14: the closing retirement was not published to observers");
+              "the closing retirement was not published to observers");
     }
     check(registry.inventoryRecord(old_record->internal_id).has_value(),
-          "A14: closing instance disappeared before acknowledgement");
+          "closing instance disappeared before acknowledgement");
 
     // A new job reuses the same PID and cgroup path while the old record is
     // still closing.
@@ -1017,37 +1014,37 @@ void run_a14(const std::string& base)
     registry.reconcileInventoryNow();
 
     const auto new_record = find_native(registry, "700.1");
-    check(new_record.has_value(), "A14: new instance was not registered");
+    check(new_record.has_value(), "new instance was not registered");
     check(new_record->internal_id != old_record->internal_id,
-          "A14: new instance reused the retired internal id");
+          "new instance reused the retired internal id");
 
     // The collector drain acknowledges the removal: this is the real
     // production ack path, and it must never touch the new ownership.
     check(test_runtime(registry).completeDrain(old_record->internal_id),
-          "A14: the drain acknowledgement failed");
-    check(registry.closingJobCount() == 0, "A14: old closing record was not finalized");
+          "the drain acknowledgement failed");
+    check(registry.closingJobCount() == 0, "old closing record was not finalized");
     check(registry.inventoryRecord(new_record->internal_id).has_value(),
-          "A14: old acknowledgement deleted the new instance");
+          "old acknowledgement deleted the new instance");
     const auto still_new = find_native(registry, "700.1");
     check(still_new.has_value() && still_new->internal_id == new_record->internal_id,
-          "A14: old acknowledgement removed the new identity index");
+          "old acknowledgement removed the new identity index");
     check(still_new->job.execution->generation.manager_start_ticks == 1616,
-          "A14: new generation was replaced by stale state");
+          "new generation was replaced by stale state");
 
     // A stale discovery for the retired generation still cannot resurrect it.
     source.set_scan([&]() { return scan_with({old_job}); });
     registry.reconcileInventoryNow();
     check(!find_native(registry, "700.0").has_value(),
-          "A14: a stale discovery resurrected the retired generation");
+          "a stale discovery resurrected the retired generation");
     check(find_native(registry, "700.1").has_value(),
-          "A14: a stale discovery disturbed the new instance");
+          "a stale discovery disturbed the new instance");
 
     registry.deinit();
-    pass_case("A14", "late cleanup of an old generation cannot remove new ownership");
+    pass_case("", "late cleanup of an old generation cannot remove new ownership");
 }
 
 // ---------------------------------------------------------------------------
-// A23 - reads are side-effect free and snapshots are coherent
+// reads are side-effect free and snapshots are coherent
 // ---------------------------------------------------------------------------
 
 void run_a23(const std::string& base)
@@ -1078,7 +1075,7 @@ void run_a23(const std::string& base)
             if (record.identity_complete) {
                 const auto by_identity = registry.inventoryRecordByIdentity(record.identity);
                 check(by_identity.has_value() && by_identity->internal_id == record.internal_id,
-                      "A23: identity lookup disagrees with the snapshot");
+                      "identity lookup disagrees with the snapshot");
             }
         }
         (void)registry.findJob(0);
@@ -1087,28 +1084,28 @@ void run_a23(const std::string& base)
     }
     const auto after = heartbeat_status();
     check(before["pass_count"] == after["pass_count"],
-          "A23: reads triggered a maintenance pass");
+          "reads triggered a maintenance pass");
     check(before["retirements"] == after["retirements"],
-          "A23: reads triggered retirements");
+          "reads triggered retirements");
     check(before["events_received"] == after["events_received"],
-          "A23: reads emitted events");
+          "reads emitted events");
     check(before["last_scan_start_ms"] == after["last_scan_start_ms"],
-          "A23: reads changed scan timestamps");
-    check(before["queue_depth"] == after["queue_depth"], "A23: reads changed the queue");
+          "reads changed scan timestamps");
+    check(before["queue_depth"] == after["queue_depth"], "reads changed the queue");
 
     // Concurrent phase: the heartbeat mutates while reads keep observing.
     std::atomic<bool> stop{false};
     std::thread reader([&]() {
         while (!stop.load()) {
             const auto records = registry.inventoryRecords();
-            if (records.size() > 5u) throw std::runtime_error("A23: duplicate records appeared");
+            if (records.size() > 5u) throw std::runtime_error("duplicate records appeared");
             for (const auto& record : records) {
-                check(record.internal_id != 0, "A23: the system sentinel leaked into inventory");
+                check(record.internal_id != 0, "the system sentinel leaked into inventory");
                 if (!record.identity_complete) continue;
                 const auto by_identity = registry.inventoryRecordByIdentity(record.identity);
-                check(by_identity.has_value(), "A23: snapshot references a missing identity");
+                check(by_identity.has_value(), "snapshot references a missing identity");
                 check(by_identity->internal_id == record.internal_id,
-                      "A23: snapshot and identity index disagree");
+                      "snapshot and identity index disagree");
             }
             (void)heartbeat_status();
         }
@@ -1122,15 +1119,15 @@ void run_a23(const std::string& base)
 
     const auto final_records = registry.inventoryRecords();
     for (const auto& record : final_records) {
-        check(record.internal_id != 0, "A23: sentinel present in the final snapshot");
+        check(record.internal_id != 0, "sentinel present in the final snapshot");
     }
-    check(count_records(registry) == 2, "A23: mutation loop lost an instance");
+    check(count_records(registry) == 2, "mutation loop lost an instance");
     registry.deinit();
-    pass_case("A23", "reads are side-effect free; snapshots coherent; sentinel excluded");
+    pass_case("", "reads are side-effect free; snapshots coherent; sentinel excluded");
 }
 
 // ---------------------------------------------------------------------------
-// A25 - stop safety, failed source start, interrupted closing across restart
+// stop safety, failed source start, interrupted closing across restart
 // ---------------------------------------------------------------------------
 
 void run_a25(const std::string& base)
@@ -1143,22 +1140,22 @@ void run_a25(const std::string& base)
         JobRegistry registry(heartbeat_options(fresh_dir(base, "a25-repeat"), source, probes));
 
         check(static_cast<bool>(get_inventory_status_provider()),
-              "A25: status provider was not published");
+              "status provider was not published");
         check(heartbeat_status()["state"] != "stopped",
-              "A25: status reports stopped while running");
-        check(source.starts() == 1, "A25: source start count mismatch");
+              "status reports stopped while running");
+        check(source.starts() == 1, "source start count mismatch");
 
         registry.stopInventoryDiscovery();
         registry.stopInventoryDiscovery();
         check(static_cast<bool>(get_inventory_status_provider()),
-              "A25: status provider was not kept while draining");
-        check(source.stops() == 1, "A25: source stop count mismatch");
+              "status provider was not kept while draining");
+        check(source.stops() == 1, "source stop count mismatch");
 
-        check(registry.deinit(), "A25: deinit must succeed");
-        check(!get_inventory_status_provider(), "A25: status provider was not cleared");
-        check(registry.deinit(), "A25: a second deinit must keep the result");
+        check(registry.deinit(), "deinit must succeed");
+        check(!get_inventory_status_provider(), "status provider was not cleared");
+        check(registry.deinit(), "a second deinit must keep the result");
         check(source.starts() == 1 && source.stops() == 1,
-              "A25: sources must not restart after discovery stopped");
+              "sources must not restart after discovery stopped");
     }
 
     // Stop while a pass is blocked inside a source scan stays bounded.
@@ -1186,12 +1183,12 @@ void run_a25(const std::string& base)
         stopper.join();
         check(!get_inventory_status_provider() ||
                   heartbeat_status()["state"] == "stopped",
-              "A25: stop during a blocked scan left the heartbeat running");
+              "stop during a blocked scan left the heartbeat running");
 
         // Nothing may touch the store after it is closed: destroy the
         // registry and verify no crash and no dangling provider.
         registry.reset();
-        check(!get_inventory_status_provider(), "A25: provider survived registry teardown");
+        check(!get_inventory_status_provider(), "provider survived registry teardown");
     }
 
     // Source initialization failure is not fatal.
@@ -1202,9 +1199,9 @@ void run_a25(const std::string& base)
         JobRegistry registry(heartbeat_options(fresh_dir(base, "a25-startfail"),
                                                source, probes));
         check(heartbeat_status()["tracker_unavailable"] == true,
-              "A25: a failed source start was not reported");
+              "a failed source start was not reported");
         registry.deinit();
-        check(!get_inventory_status_provider(), "A25: provider survived deinit");
+        check(!get_inventory_status_provider(), "provider survived deinit");
     }
 
     // Interrupted closing: the archive fails, shutdown reports it, and a
@@ -1228,20 +1225,20 @@ void run_a25(const std::string& base)
             });
 
             const auto created = find_native(registry, "900.0");
-            check(created.has_value(), "A25: the observation was not registered");
+            check(created.has_value(), "the observation was not registered");
             closing_id = created->internal_id;
 
             source.set_scan([&]() { return scan_with({}); });
             probes.set_process(6100, LivenessState::Dead);
             probes.set_cgroup("/cg/slot-14", {}, true);
             registry.reconcileInventoryNow();
-            check(registry.closingJobCount() == 1, "A25: closing state missing");
+            check(registry.closingJobCount() == 1, "closing state missing");
 
             // Both archive attempts (the closing cleanup and the drain ack)
             // must fail so the interrupted closing survives the shutdown.
             registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite, 0, 2);
             check(!registry.deinit(),
-                  "A25: an incomplete drain was not reported");
+                  "an incomplete drain was not reported");
         }
 
         {
@@ -1256,21 +1253,21 @@ void run_a25(const std::string& base)
             JobRegistry registry(restart_options);
             const auto record = registry.inventoryRecord(closing_id);
             check(record.has_value() && record->state == "closing",
-                  "A25: the interrupted closing was not restored");
+                  "the interrupted closing was not restored");
             check(registry.cleanupClosingJobs(),
-                  "A25: the restart closing cleanup did not archive the record");
+                  "the restart closing cleanup did not archive the record");
             check(registry.closingJobCount() == 0,
-                  "A25: closing record survived the retry");
-            check(registry.deinit(), "A25: retry after the fault did not finalize");
+                  "closing record survived the retry");
+            check(registry.deinit(), "retry after the fault did not finalize");
         }
     }
 
-    pass_case("A25", "heartbeat stop is ordered and idempotent; a failed source start is "
+    pass_case("", "heartbeat stop is ordered and idempotent; a failed source start is "
                      "not fatal; an interrupted closing survives a restart");
 }
 
 // ---------------------------------------------------------------------------
-// A28 - a readable but unprobeable cgroup is not an empty cgroup
+// a readable but unprobeable cgroup is not an empty cgroup
 // ---------------------------------------------------------------------------
 
 void run_a28(const std::string& base)
@@ -1301,17 +1298,17 @@ void run_a28(const std::string& base)
     registry.reconcileInventoryNow();
     registry.reconcileInventoryNow();
     check(find_native(registry, "600.0").has_value(),
-          "A28: unknown cgroup members were read as death evidence");
+          "unknown cgroup members were read as death evidence");
 
     // Once the member reads as dead the execution is conclusively gone: the
     // cgroup member is dead and no other member evidence exists.
     probes.set_process(6101, LivenessState::Dead);
     registry.reconcileInventoryNow();
     check(!find_native(registry, "600.0").has_value(),
-          "A28: a conclusively dead execution was not retired");
+          "a conclusively dead execution was not retired");
 
     registry.deinit();
-    pass_case("A28", "unknown cgroup members are not death evidence; confirmed death retires");
+    pass_case("", "unknown cgroup members are not death evidence; confirmed death retires");
 }
 
 // ---------------------------------------------------------------------------
@@ -1531,7 +1528,7 @@ void run_retire_explicit(const std::string& base)
 }
 
 // ---------------------------------------------------------------------------
-// ADMIT - inventory capture_all admission gate (S1 x S3 matrix)
+// ADMIT - inventory capture_all admission gate (capture_all x auto_add matrix)
 // ---------------------------------------------------------------------------
 
 void run_admit(const std::string& base)
@@ -1567,7 +1564,7 @@ void run_admit(const std::string& base)
                   "return rule\n";
     }
 
-    // S1 off x S3 off: the scan keeps running, nothing registers, drops are
+    // capture_all off x auto_add off: the scan keeps running, nothing registers, drops are
     // counted, and the event path reports NotAdmitted without a retry ask.
     {
         FakeSource source("condor");
@@ -1601,7 +1598,7 @@ void run_admit(const std::string& base)
         registry.deinit();
     }
 
-    // S1 off x S3 default: registration plus the configured default list as
+    // capture_all off x auto_add default: registration plus the configured default list as
     // the initial automatic selection.
     {
         FakeSource source("condor");
@@ -1635,7 +1632,7 @@ void run_admit(const std::string& base)
         registry.deinit();
     }
 
-    // S1 off x S3 rule: a rejecting rule keeps the job out of the inventory
+    // capture_all off x auto_add rule: a rejecting rule keeps the job out of the inventory
     // (unlike blanket mode, where a reject registers an empty selection); an
     // accepting rule registers with the rule's list.
     {
@@ -1692,7 +1689,7 @@ void run_admit(const std::string& base)
         registry.deinit();
     }
 
-    // S1 off x S3 rule, bare accept: the rule accepts without naming
+    // capture_all off x auto_add rule, bare accept: the rule accepts without naming
     // collectors and the configured auto_add_collectors defaults become the
     // selection.
     {
@@ -1728,7 +1725,7 @@ void run_admit(const std::string& base)
         registry.deinit();
     }
 
-    // S1 off x S3 rule, bare accept without configured defaults: the decision
+    // capture_all off x auto_add rule, bare accept without configured defaults: the decision
     // is refused — nothing registers and the error is counted (it is an
     // admission error, not a rule reject).
     {
@@ -1762,7 +1759,7 @@ void run_admit(const std::string& base)
         registry.deinit();
     }
 
-    // S1 on is guarded by the whole existing suite (default options keep the
+    // capture_all on is guarded by the whole existing suite (default options keep the
     // gate open); this case pins the default itself.
     {
         const auto config = resolve_inventory_maintenance_config(nlohmann::json::object());

@@ -11,9 +11,9 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// SlurmSchedulerAdapter — the Slurm inventory adapter
-// (doc/job_inventory_v2_architecture.md §2.2). Owns the discovery watcher and
-// every Slurm-specific fact encoding; registered under the name "slurm".
+// SlurmSchedulerAdapter — the Slurm inventory adapter. Owns the discovery
+// watcher and every Slurm-specific fact encoding; registered under the name
+// "slurm".
 #pragma once
 
 #include "core/scheduler_adapter.hpp"

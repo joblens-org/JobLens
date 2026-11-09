@@ -1,8 +1,8 @@
-"""Section 9 contract tests for the inventory/collection Flask gateway.
+"""Contract tests for the inventory/collection Flask gateway.
 
-Normative contract: doc/job_inventory_collection_decoupling_plan.md section 9
-(9.1 new methods, 9.2 control request, 9.3 inventory/capabilities, 9.4 legacy).
-Acceptance cases: doc/job_inventory_collection_decoupling_validation.md A30, A31, A33.
+Covers the collection-control request, inventory/capabilities reads and the
+legacy add/remove routes. The HTTP contract is documented in
+doc/api_documentation.md section 12.
 
 The Core is mocked at the single RPC seam in trigger/core/tools.py
 (``call_inventory_rpc``), so these tests pass independently of C++ progress.
@@ -103,9 +103,9 @@ def _post_collection(client, body: object):
     return client.post("/joblens/collection", json=body)
 
 
-# ==================== A30: selector forms and error distinctions ====================
+# ==================== selector forms and error distinctions ====================
 
-def test_a30_condor_native_selector_forwards_scope_and_ensure_registered(install_core) -> None:
+def test_selector_condor_native_selector_forwards_scope_and_ensure_registered(install_core) -> None:
     fake = install_core(response={"status": "accepted", "targets": [_target()]})
 
     response = _post_collection(_app().test_client(), _set_body())
@@ -129,7 +129,7 @@ def test_a30_condor_native_selector_forwards_scope_and_ensure_registered(install
     assert [target["instance_id"] for target in body["targets"]] == ["inst-condor-01"]
     assert body["targets"][0]["internal_job_id"] == "42"
 
-    # 不猜身份、不分配内部 ID：转发体里只有 §9.2 的字段，没有 JobID/internal_job_id 注入
+    # 不猜身份、不分配内部 ID：转发体里只有契约字段，没有 JobID/internal_job_id 注入
     forwarded = fake.calls[0][1]
     assert set(forwarded) == {
         "selector",
@@ -143,7 +143,7 @@ def test_a30_condor_native_selector_forwards_scope_and_ensure_registered(install
     assert "internal_job_id" not in forwarded["selector"]
 
 
-def test_a30_native_selector_defaults_ensure_registered_to_false(install_core) -> None:
+def test_selector_native_selector_defaults_ensure_registered_to_false(install_core) -> None:
     fake = install_core(response={"status": "accepted", "targets": [_target()]})
     body = _set_body(ensure_registered=False)
 
@@ -153,7 +153,7 @@ def test_a30_native_selector_defaults_ensure_registered_to_false(install_core) -
     assert fake.calls[0][1]["ensure_registered"] is False
 
 
-def test_a30_retired_instance_id_selector_is_rejected_at_the_boundary(
+def test_selector_retired_instance_id_selector_is_rejected_at_the_boundary(
     install_core,
 ) -> None:
     """旧版不透明 instance_id 句柄已退役：边界显式拒绝，绝不下发 Core。"""
@@ -171,7 +171,7 @@ def test_a30_retired_instance_id_selector_is_rejected_at_the_boundary(
     assert fake.calls == []
 
 
-def test_a30_internal_job_id_selector_forwards_verbatim(install_core) -> None:
+def test_selector_internal_job_id_selector_forwards_verbatim(install_core) -> None:
     """internal_job_id 实例句柄（唯一形式）：原样转发，不注入内部推导。"""
     fake = install_core(
         response={
@@ -193,7 +193,7 @@ def test_a30_internal_job_id_selector_forwards_verbatim(install_core) -> None:
     assert "instance_id" not in forwarded["selector"]
 
 
-def test_a30_internal_job_id_rejects_non_decimal(install_core) -> None:
+def test_selector_internal_job_id_rejects_non_decimal(install_core) -> None:
     """非十进制 internal_job_id 在边界即拒绝，不打扰 Core。"""
     fake = install_core()
     client = _app().test_client()
@@ -206,10 +206,10 @@ def test_a30_internal_job_id_rejects_non_decimal(install_core) -> None:
     assert fake.calls == []
 
 
-# ==================== A30: job scope reports each observed step ====================
+# ==================== job scope reports each observed step ====================
 
 
-def test_a30_slurm_job_scope_reports_each_observed_step(install_core) -> None:
+def test_selector_slurm_job_scope_reports_each_observed_step(install_core) -> None:
     targets = [
         _target(instance_id="inst-step-batch", native_job_id="9001", mode="auto"),
         _target(
@@ -247,7 +247,7 @@ def test_a30_slurm_job_scope_reports_each_observed_step(install_core) -> None:
     ]
 
 
-def test_a30_slurm_step_selector_is_forwarded_as_native_string(install_core) -> None:
+def test_selector_slurm_step_selector_is_forwarded_as_native_string(install_core) -> None:
     fake = install_core(response={"status": "accepted", "targets": [_target(native_job_id="9001")]})
 
     response = _post_collection(
@@ -273,7 +273,7 @@ def test_a30_slurm_step_selector_is_forwarded_as_native_string(install_core) -> 
     }
 
 
-def test_a30_missing_target_returns_404_and_no_fabricated_targets(install_core) -> None:
+def test_selector_missing_target_returns_404_and_no_fabricated_targets(install_core) -> None:
     install_core(
         response={
             "status": "error",
@@ -291,7 +291,7 @@ def test_a30_missing_target_returns_404_and_no_fabricated_targets(install_core) 
     }
 
 
-def test_a30_incomplete_native_namespace_is_rejected_before_rpc(install_core) -> None:
+def test_selector_incomplete_native_namespace_is_rejected_before_rpc(install_core) -> None:
     fake = install_core(response={"status": "accepted", "targets": []})
 
     response = _post_collection(
@@ -310,7 +310,7 @@ def test_a30_incomplete_native_namespace_is_rejected_before_rpc(install_core) ->
     assert "cluster_name" in payload["message"]
 
 
-def test_a30_both_selector_forms_are_rejected(install_core) -> None:
+def test_selector_both_selector_forms_are_rejected(install_core) -> None:
     fake = install_core(response={"status": "accepted", "targets": []})
 
     response = _post_collection(
@@ -324,7 +324,7 @@ def test_a30_both_selector_forms_are_rejected(install_core) -> None:
     assert "instance_id" in response.get_json()["message"]
 
 
-def test_a30_non_object_request_body_is_rejected(install_core) -> None:
+def test_selector_non_object_request_body_is_rejected(install_core) -> None:
     fake = install_core(response={"status": "accepted", "targets": []})
 
     response = _post_collection(_app().test_client(), ["not", "an", "object"])
@@ -334,7 +334,7 @@ def test_a30_non_object_request_body_is_rejected(install_core) -> None:
     assert response.get_json()["code"] == "invalid_request"
 
 
-def test_a30_invalid_scope_is_rejected(install_core) -> None:
+def test_selector_invalid_scope_is_rejected(install_core) -> None:
     fake = install_core(response={"status": "accepted", "targets": []})
 
     response = _post_collection(_app().test_client(), _set_body(scope="cluster"))
@@ -344,7 +344,7 @@ def test_a30_invalid_scope_is_rejected(install_core) -> None:
     assert "scope" in response.get_json()["message"]
 
 
-def test_a30_ambiguous_slurm_scope_returns_409_with_candidates(install_core) -> None:
+def test_selector_ambiguous_slurm_scope_returns_409_with_candidates(install_core) -> None:
     install_core(
         response={
             "status": "error",
@@ -373,7 +373,7 @@ def test_a30_ambiguous_slurm_scope_returns_409_with_candidates(install_core) -> 
     }
 
 
-def test_a30_nested_core_error_envelope_preserves_code_and_candidates(install_core) -> None:
+def test_selector_nested_core_error_envelope_preserves_code_and_candidates(install_core) -> None:
     install_core(
         response={
             "status": "error",
@@ -401,7 +401,7 @@ def test_a30_nested_core_error_envelope_preserves_code_and_candidates(install_co
     }
 
 
-def test_a30_core_unavailable_returns_structured_503(install_core) -> None:
+def test_selector_core_unavailable_returns_structured_503(install_core) -> None:
     install_core(error=RPCError("Socket file not found: /var/JobLens/rpc.sock"))
 
     response = _post_collection(_app().test_client(), _set_body())
@@ -413,9 +413,9 @@ def test_a30_core_unavailable_returns_structured_503(install_core) -> None:
     assert "targets" not in payload
 
 
-# ==================== A31: set / stop / reset_auto and forwarded errors ====================
+# ==================== set / stop / reset_auto and forwarded errors ====================
 
-def test_a31_set_distinguishes_accepted_from_applied(install_core) -> None:
+def test_control_set_distinguishes_accepted_from_applied(install_core) -> None:
     fake = install_core(response={"status": "accepted", "targets": [_target()]})
 
     response = _post_collection(_app().test_client(), _set_body())
@@ -433,7 +433,7 @@ def test_a31_set_distinguishes_accepted_from_applied(install_core) -> None:
     assert target["errors"] == []
 
 
-def test_a31_empty_collectors_forwarded_as_persistent_stop(install_core) -> None:
+def test_control_empty_collectors_forwarded_as_persistent_stop(install_core) -> None:
     fake = install_core(
         response={
             "status": "accepted",
@@ -453,7 +453,7 @@ def test_a31_empty_collectors_forwarded_as_persistent_stop(install_core) -> None
     assert response.get_json()["targets"][0]["desired_collectors"] == []
 
 
-def test_a31_reset_auto_omits_collectors(install_core) -> None:
+def test_control_reset_auto_omits_collectors(install_core) -> None:
     fake = install_core(response={"status": "accepted", "targets": [_target(mode="auto")]})
 
     response = _post_collection(
@@ -471,7 +471,7 @@ def test_a31_reset_auto_omits_collectors(install_core) -> None:
     assert response.get_json()["targets"][0]["mode"] == "auto"
 
 
-def test_a31_reset_auto_with_collectors_is_rejected(install_core) -> None:
+def test_control_reset_auto_with_collectors_is_rejected(install_core) -> None:
     fake = install_core(response={"status": "accepted", "targets": []})
 
     response = _post_collection(
@@ -488,7 +488,7 @@ def test_a31_reset_auto_with_collectors_is_rejected(install_core) -> None:
     assert "must omit collectors" in response.get_json()["message"]
 
 
-def test_a31_missing_collectors_on_set_is_rejected(install_core) -> None:
+def test_control_missing_collectors_on_set_is_rejected(install_core) -> None:
     fake = install_core(response={"status": "accepted", "targets": []})
     body = _set_body()
     del body["collectors"]
@@ -502,7 +502,7 @@ def test_a31_missing_collectors_on_set_is_rejected(install_core) -> None:
     assert "collectors" in payload["message"]
 
 
-def test_a31_null_collectors_on_set_is_rejected(install_core) -> None:
+def test_control_null_collectors_on_set_is_rejected(install_core) -> None:
     fake = install_core(response={"status": "accepted", "targets": []})
 
     response = _post_collection(_app().test_client(), _set_body(collectors=None))
@@ -512,7 +512,7 @@ def test_a31_null_collectors_on_set_is_rejected(install_core) -> None:
     assert "collectors" in response.get_json()["message"]
 
 
-def test_a31_unknown_collector_is_forwarded_as_400(install_core) -> None:
+def test_control_unknown_collector_is_forwarded_as_400(install_core) -> None:
     install_core(
         response={
             "status": "error",
@@ -533,7 +533,7 @@ def test_a31_unknown_collector_is_forwarded_as_400(install_core) -> None:
     }
 
 
-def test_a31_stale_expected_revision_is_forwarded_intact(install_core) -> None:
+def test_control_stale_expected_revision_is_forwarded_intact(install_core) -> None:
     install_core(
         response={
             "status": "error",
@@ -553,7 +553,7 @@ def test_a31_stale_expected_revision_is_forwarded_intact(install_core) -> None:
     assert body.get("status") != "accepted"
 
 
-def test_a31_expected_revision_is_rejected_for_job_scope(install_core) -> None:
+def test_control_expected_revision_is_rejected_for_job_scope(install_core) -> None:
     fake = install_core(response={"status": "accepted", "targets": []})
 
     response = _post_collection(
@@ -566,7 +566,7 @@ def test_a31_expected_revision_is_rejected_for_job_scope(install_core) -> None:
     assert "expected_revision" in response.get_json()["message"]
 
 
-def test_a31_instance_scope_forwards_expected_revision(install_core) -> None:
+def test_control_instance_scope_forwards_expected_revision(install_core) -> None:
     fake = install_core(response={"status": "accepted", "targets": [_target()]})
 
     response = _post_collection(
@@ -584,7 +584,7 @@ def test_a31_instance_scope_forwards_expected_revision(install_core) -> None:
     assert fake.calls[0][1]["scope"] == "instance"
 
 
-def test_a31_core_down_returns_503_for_set_and_get(install_core) -> None:
+def test_control_core_down_returns_503_for_set_and_get(install_core) -> None:
     install_core(error=RPCError("Failed to connect to RPC server: [Errno 2]"))
     client = _app().test_client()
 
@@ -597,7 +597,7 @@ def test_a31_core_down_returns_503_for_set_and_get(install_core) -> None:
     assert get_response.get_json()["code"] == "rpc_unavailable"
 
 
-def test_a31_get_forwards_instance_id_and_passes_selection_through(install_core) -> None:
+def test_control_get_forwards_instance_id_and_passes_selection_through(install_core) -> None:
     core_payload = {
         "status": "ok",
         "instance_id": "inst-condor-01",
@@ -617,7 +617,7 @@ def test_a31_get_forwards_instance_id_and_passes_selection_through(install_core)
     assert response.get_json() == core_payload
 
 
-def test_a31_get_requires_instance_id(install_core) -> None:
+def test_control_get_requires_instance_id(install_core) -> None:
     fake = install_core(response={"status": "ok"})
 
     response = _app().test_client().get("/joblens/collection")
@@ -627,7 +627,7 @@ def test_a31_get_requires_instance_id(install_core) -> None:
     assert "instance_id" in response.get_json()["message"]
 
 
-def test_a31_get_missing_instance_returns_404(install_core) -> None:
+def test_control_get_missing_instance_returns_404(install_core) -> None:
     install_core(
         response={
             "status": "error",
@@ -642,7 +642,7 @@ def test_a31_get_missing_instance_returns_404(install_core) -> None:
     assert response.get_json()["code"] == "not_found"
 
 
-def test_a31_per_target_applied_error_is_not_masked(install_core) -> None:
+def test_control_per_target_applied_error_is_not_masked(install_core) -> None:
     install_core(
         response={
             "status": "accepted",
@@ -664,9 +664,9 @@ def test_a31_per_target_applied_error_is_not_masked(install_core) -> None:
     assert target["errors"] == [{"code": "collector_init_failed", "message": "bpf load failed"}]
 
 
-# ==================== A33: list / status / capabilities across health states ====================
+# ==================== list / status / capabilities across health states ====================
 
-def test_a33_inventory_list_forwards_filters_and_paging(install_core) -> None:
+def test_read_inventory_list_forwards_filters_and_paging(install_core) -> None:
     core_payload = {
         "snapshot_revision": 7,
         "records": [{"instance_id": "inst-condor-01", "internal_job_id": "42"}],
@@ -697,7 +697,7 @@ def test_a33_inventory_list_forwards_filters_and_paging(install_core) -> None:
     assert set(body) == {"snapshot_revision", "records", "next_cursor"}
 
 
-def test_a33_inventory_list_defaults_limit_to_100(install_core) -> None:
+def test_read_inventory_list_defaults_limit_to_100(install_core) -> None:
     fake = install_core(
         response={"snapshot_revision": 1, "records": [], "next_cursor": None}
     )
@@ -710,7 +710,7 @@ def test_a33_inventory_list_defaults_limit_to_100(install_core) -> None:
 
 
 @pytest.mark.parametrize("limit", ["0", "1001", "abc", "-5"])
-def test_a33_inventory_list_rejects_out_of_range_limit(install_core, limit: str) -> None:
+def test_read_inventory_list_rejects_out_of_range_limit(install_core, limit: str) -> None:
     fake = install_core(response={"snapshot_revision": 1, "records": [], "next_cursor": None})
 
     response = _app().test_client().get(f"/joblens/inventory?limit={limit}")
@@ -720,7 +720,7 @@ def test_a33_inventory_list_rejects_out_of_range_limit(install_core, limit: str)
     assert response.get_json()["code"] == "invalid_request"
 
 
-def test_a33_inventory_list_accepts_max_limit(install_core) -> None:
+def test_read_inventory_list_accepts_max_limit(install_core) -> None:
     fake = install_core(response={"snapshot_revision": 1, "records": [], "next_cursor": None})
 
     response = _app().test_client().get("/joblens/inventory?limit=1000")
@@ -729,7 +729,7 @@ def test_a33_inventory_list_accepts_max_limit(install_core) -> None:
     assert fake.calls[0][1] == {"limit": 1000}
 
 
-def test_a33_records_pass_through_decimal_string_ids_without_sentinel(install_core) -> None:
+def test_read_records_pass_through_decimal_string_ids_without_sentinel(install_core) -> None:
     records = [
         {"instance_id": "inst-1", "internal_job_id": "42", "state": "running"},
         {"instance_id": "inst-2", "internal_job_id": "9007199254740993", "state": "running"},
@@ -748,7 +748,7 @@ def test_a33_records_pass_through_decimal_string_ids_without_sentinel(install_co
     assert len(body["records"]) == 2
 
 
-def test_a33_stale_cursor_returns_409_without_retry(install_core) -> None:
+def test_read_stale_cursor_returns_409_without_retry(install_core) -> None:
     fake = install_core(
         response={
             "status": "error",
@@ -791,7 +791,7 @@ def test_a33_stale_cursor_returns_409_without_retry(install_core) -> None:
         },
     ],
 )
-def test_a33_status_passes_through_lifecycle_states(install_core, core_status: dict) -> None:
+def test_read_status_passes_through_lifecycle_states(install_core, core_status: dict) -> None:
     install_core(response=core_status)
 
     response = _app().test_client().get("/joblens/inventory/status")
@@ -800,7 +800,7 @@ def test_a33_status_passes_through_lifecycle_states(install_core, core_status: d
     assert response.get_json() == core_status
 
 
-def test_a33_status_does_not_upgrade_disabled_inventory_to_healthy(install_core) -> None:
+def test_read_status_does_not_upgrade_disabled_inventory_to_healthy(install_core) -> None:
     core_status = {"status": "disabled", "inventory_enabled": False, "sources": []}
     install_core(response=core_status)
 
@@ -811,7 +811,7 @@ def test_a33_status_does_not_upgrade_disabled_inventory_to_healthy(install_core)
     assert "healthy" not in body
 
 
-def test_a33_status_missing_inventory_returns_404(install_core) -> None:
+def test_read_status_missing_inventory_returns_404(install_core) -> None:
     install_core(
         response={
             "status": "error",
@@ -826,7 +826,7 @@ def test_a33_status_missing_inventory_returns_404(install_core) -> None:
     assert response.get_json()["code"] == "not_found"
 
 
-def test_a33_capabilities_are_forwarded_verbatim(install_core) -> None:
+def test_read_capabilities_are_forwarded_verbatim(install_core) -> None:
     core_payload = {
         "status": "ok",
         "inventory_version": 1,
@@ -844,7 +844,7 @@ def test_a33_capabilities_are_forwarded_verbatim(install_core) -> None:
     assert response.get_json() == core_payload
 
 
-def test_a33_capabilities_are_not_invented_when_core_lacks_them(install_core) -> None:
+def test_read_capabilities_are_not_invented_when_core_lacks_them(install_core) -> None:
     install_core(error=RPCError("method not found: JobRegistry/capabilities"))
 
     response = _app().test_client().get("/joblens/capabilities")
@@ -856,7 +856,7 @@ def test_a33_capabilities_are_not_invented_when_core_lacks_them(install_core) ->
     assert "collection_control_version" not in body
 
 
-def test_a33_non_object_core_payload_is_not_reported_as_success(install_core) -> None:
+def test_read_non_object_core_payload_is_not_reported_as_success(install_core) -> None:
     install_core(response=["unexpected", "shape"])
 
     response = _app().test_client().get("/joblens/inventory")
@@ -865,7 +865,7 @@ def test_a33_non_object_core_payload_is_not_reported_as_success(install_core) ->
     assert response.get_json()["code"] == "core_response_invalid"
 
 
-def test_a33_contract_violating_collection_target_is_not_reported_as_success(
+def test_read_contract_violating_collection_target_is_not_reported_as_success(
     install_core,
 ) -> None:
     install_core(
@@ -881,10 +881,10 @@ def test_a33_contract_violating_collection_target_is_not_reported_as_success(
     assert response.get_json()["code"] == "core_response_invalid"
 
 
-# ==================== A34: job_opt remove erase tier pass-through ====================
+# ==================== job_opt remove erase tier pass-through ====================
 
 
-def test_a34_job_remove_forwards_the_erase_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_erase_job_remove_forwards_the_erase_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     """remove 的真删档必须原样透传给核心；默认不携带 erase。"""
     from trigger.api import routes as routes_module
 
@@ -915,7 +915,7 @@ def test_a34_job_remove_forwards_the_erase_flag(monkeypatch: pytest.MonkeyPatch)
     assert "erase" not in forwarded
 
 
-def test_a34_job_remove_erase_is_coerced_to_boolean(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_erase_job_remove_erase_is_coerced_to_boolean(monkeypatch: pytest.MonkeyPatch) -> None:
     """pydantic 宽松模式：'true'/1 强转为布尔后透传，核心只见到布尔档位。"""
     from trigger.api import routes as routes_module
 

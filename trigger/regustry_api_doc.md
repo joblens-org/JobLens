@@ -279,7 +279,7 @@ Get detailed statistics for the registry, including service status distribution 
 
 ### 7. Manually Trigger Database Backup
 
-Manually trigger a database backup (etcd snapshot). Note: snapshot functionality is not yet fully implemented in the current version.
+Manually trigger a database backup (etcd snapshot). In this version the endpoint acknowledges the request but does not create an etcd snapshot.
 
 **Endpoint**: `POST /persistence/backup`
 

@@ -11,8 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Inventory configuration contract (plan section 8). Split out of the
-// maintenance controller in v2 stage S4. The scheduler identity here is the
+// Inventory configuration contract. The scheduler identity here is the
 // ADAPTER REGISTRY NAME (open world, no enum): a new scheduler appears the
 // moment it registers and gets a `<name>_job_watcher` config section. The
 // resolver keeps the legacy auto_add_condorjob/auto_add_slurmjob folding as
@@ -35,7 +34,7 @@ struct InventoryMaintenanceConfig {
     // Adapter names that opted into broad discovery. Empty means "inventory
     // off", preserving the pre-decoupling opt-in behavior.
     std::vector<std::string> types;
-    // Blanket registration switch (S1): true (the default) registers every
+    // Blanket registration switch: true (the default) registers every
     // captured job unconditionally; false leaves admission to each type's
     // auto_add tri-state.
     bool capture_all = true;

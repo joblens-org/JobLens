@@ -237,7 +237,7 @@ public:
     }
     
     // Active client descriptors, so stop() can unblock a read/write instead of
-    // waiting for it (plan §7.3: closing must not depend on a slow client).
+    // waiting for it (closing must not depend on a slow client).
     void track_client(int fd) {
         std::lock_guard<std::mutex> lock(client_mutex_);
         clients_.insert(fd);

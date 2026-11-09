@@ -114,7 +114,7 @@ ps aux | grep -i joblens
 
 ### 6.2 与上游 Manager 对接（预留模式）
 - Trigger 配置上游 Manager 地址，实现服务注册，规则和配置集中分发
-- 本套件仅预留接口，Manager 部署后续会提供
+- 本套件仅预留接口，Manager 部署不属于本套件
 
 ### 6.3 作业关联方式
 - 手动关联：Trigger 提供 API 注入 PID → Job 映射
@@ -143,6 +143,6 @@ JobLens 正积极迈向 **v1.0 API 稳定性**。我们欢迎您的参与：
 - **调度器集成**：如果您在 SLURM、PBS、UGE 等批处理系统的作业发现机制方面有经验，我们非常乐意在自动关联方面展开合作。
 - **后端验证**：帮助我们在您的环境中验证已实现的存储/导出路径，如 Kafka 和 Prometheus。
 
-核心 Agent 已在 **IHEP 生产环境经受考验**（~1,200 节点）。外围组件（Manager、Web UI）正根据反馈快速迭代。您的参与将帮助 JobLens 成为面向 HPC/HTC 站点的可移植、Job-Native 可观测性基础组件。
+核心 Agent 已在 **IHEP 生产环境经受考验**（~1,200 节点）。外围组件（Manager、Web UI）独立于本套件部署。您的参与将帮助 JobLens 成为面向 HPC/HTC 站点的可移植、Job-Native 可观测性基础组件。
 
 联系方式：wangzhenyuan@ihep.ac.cn（抄送：shijy@ihep.ac.cn）

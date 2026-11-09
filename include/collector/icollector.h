@@ -40,7 +40,7 @@ public:
     virtual std::vector<OutputChannel> output_channels() const = 0;
 
     /// Final/Both are rejected unless the collector explicitly implements the
-    /// scoped finish contract in a later task.
+    /// scoped finish contract.
     virtual bool supports_final() const { return false; }
 
     // ------------------------------------------------------------------

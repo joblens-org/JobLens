@@ -552,7 +552,7 @@ bool FileWriter::write_payloads(const std::map<std::string, std::vector<std::str
                     all_success = false;
                 }
             } else {
-                // 非默认路径：使用持久化流（懒加载打开，完整关闭留给 Task 8）
+                // 非默认路径：使用持久化流（懒加载打开，完整关闭由 do_shutdown 负责）
                 auto& ofs = destination_streams_[path];
                 if (!ofs.is_open()) {
                     std::string why;

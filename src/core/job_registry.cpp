@@ -11,7 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// job_registry.cpp — the registry facade (v2 stage S2/S3).
+// job_registry.cpp — the registry facade.
 //
 // Durable state lives in JobStore (JobRecord); kernel attribution lives in
 // KernelAttribution; the RPC surface lives in inventory_rpc.cpp. This file
@@ -54,7 +54,7 @@
 #include <type_traits>
 
 // Maintenance-side inventory health (source/queue/reconciliation state) is
-// published by the maintenance controller through this seam. When no provider
+// published by the heartbeat through this seam. When no provider
 // is registered, the status handler serves the explicit "not_configured"
 // marker instead of guessing a source state.
 #if __has_include("core/inventory_status_provider.hpp")
@@ -429,7 +429,7 @@ JobRegistry& JobRegistry::instance() {
 }
 
 // ---------------------------------------------------------------------------
-// Inventory heartbeat (v2 §2.3) — the maintenance function of the registry.
+// Inventory heartbeat — the maintenance function of the registry.
 // Thread-free policy components (probes, retirement rules, absence counters)
 // are driven from one periodic worker; there is no separate service object.
 // ---------------------------------------------------------------------------
@@ -469,7 +469,7 @@ void JobRegistry::requestRescan(const std::string& reason) {
         // Wake the maintenance loop instead of waiting for its next 100 ms
         // slice: the first request of a burst is serviced at once, while the
         // forced-scan cooldown keeps a job-start storm from becoming a scan
-        // storm (plan §6.3).
+        // storm.
         hb_wake_ = true;
         hb_cv_.notify_all();
     }
@@ -624,7 +624,7 @@ bool JobRegistry::retireIfConfirmed(const JobRecord& record, const std::string& 
 }
 
 std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const Job& job) {
-    // Blanket registration (S1 on): every captured job registers; the
+    // Blanket registration on: every captured job registers; the
     // automatic selection stays with the post-registration path
     // (apply_auto_policy), so no decision is pre-evaluated here.
     if (inventory_capture_all_) {
@@ -633,8 +633,9 @@ std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const
         return blanket;
     }
 
-    // S1 off: the type's tri-state (S3) decides. A type without an entry —
-    // including subtypes no configured adapter owns — behaves as Off.
+    // Blanket registration off: the type's auto_add tri-state decides. A type
+    // without an entry — including subtypes no configured adapter owns —
+    // behaves as Off.
     const auto state = auto_add_states_.find(job.subtype_name);
     if (state == auto_add_states_.end() || state->second == AutoAdd::Off) {
         std::lock_guard<std::mutex> lock(hb_mtx_);
@@ -661,8 +662,8 @@ std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const
     const auto decision = policy->second.select(job, revision, error);
     if (!error.empty()) {
         // Engine failure or a refused decision (accepted without collectors
-        // and no defaults configured) keeps the old decision (plan section
-        // 6.1): nothing is registered now and the observation is neither a
+        // and no defaults configured) keeps the old decision: nothing is
+        // registered now and the observation is neither a
         // reject nor a drop — the next one re-evaluates with the same
         // evidence plus time.
         spdlog::warn("JobRegistry: admission evaluation failed for '{}' ({}); the "
@@ -686,10 +687,10 @@ std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const
         return default_decision;
     }
     // Rules mode: the rule's own verdict decides — reject = no registration
-    // at all (S1 off), unlike the blanket mode where a reject keeps the job
-    // inventoried with an empty selection. An accept without collectors has
-    // already resolved to the configured defaults inside the policy (or was
-    // refused there as an error).
+    // at all when blanket registration is off, unlike the blanket mode where
+    // a reject keeps the job inventoried with an empty selection. An accept
+    // without collectors has already resolved to the configured defaults
+    // inside the policy (or was refused there as an error).
     if (!decision.accepted) {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         ++hb_rejected_observations_;
@@ -938,7 +939,7 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
     }
 
     // Automatic policy is synchronous with registration; there is no deferred
-    // backlog to drain here (plan §1.1.3).
+    // backlog to drain here.
 
     // Exec events and the sources' own scans never reach this pass: they
     // register synchronously on their producing threads through on_job.
@@ -948,7 +949,7 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
     if (do_scan) refreshLegacyRecords();
 
     // Missing initial decisions are a record-driven obligation: repair them on
-    // every pass, even when no new observation arrived (plan §5.5).
+    // every pass, even when no new observation arrived.
     repairMissingInitialDecisions();
 
     // Checkpoint: facts and intent are written without a fence on the hot path,
@@ -1180,7 +1181,7 @@ JobRegistry::armInventory(const JobRegistryOptions& options)
         return InventoryWiring::Disabled;
     }
     reconcile_interval_sec_ = config.reconcile_interval_sec;
-    // The admission gate follows the resolved configuration (S1 + S3).
+    // The admission gate follows the resolved configuration.
     inventory_capture_all_ = config.capture_all;
     for (const auto& [adapter_name, settings] : config.settings) {
         auto_add_states_[adapter_name] = settings.auto_add;
@@ -1650,7 +1651,7 @@ void JobRegistry::remove_job_from_kernel(const Job& job, bool& ok, std::string& 
 
 // ---------------------------------------------------------------------------
 // Registration (the manual/legacy path — deliberately separate from the
-// discovery upsert; doc/job_inventory_v2_architecture.md §4.2)
+// discovery upsert: manual input has no execution evidence to merge)
 // ---------------------------------------------------------------------------
 
 bool JobRegistry::createManualJob(const Job& job) {
@@ -1821,9 +1822,9 @@ bool JobRegistry::addJob(const Job& job) {
 JobRegistry::ManualTarget JobRegistry::manualUpdateTarget(
     const Job& job, const std::optional<NativeSelector>& selector) {
     ManualTarget target;
-    // §9.4 identity resolution first: same adapter/canonical-native/namespace
-    // rules as the RPC target resolution (a Condor selector without a cluster
-    // tag matches the whole cluster namespace).
+    // Identity resolution first: same adapter/canonical-native/namespace rules
+    // as the RPC target resolution (a Condor selector without a cluster tag
+    // matches the whole cluster namespace).
     if (selector) {
         const auto identity = canonicalize(*selector);
         if (identity) {
@@ -2019,7 +2020,7 @@ nlohmann::json JobRegistry::updateManualInstance(const JobRecord& target, const 
         selection_outcome = outcome.targets.front();
     }
 
-    // Response in the §9.4 legacy-add shape.
+    // Response in the legacy-add shape.
     const auto record = ownRecord(internal_id);
     const auto selection = record ? record->selection : ownSelection(internal_id);
     const auto actual = actualCollection(internal_id);
@@ -2466,7 +2467,7 @@ inline void JobRegistry::update_job(Job& job){
 
 std::optional<Job> JobRegistry::findJob(uint64_t jobID) {
     // Read-only snapshot: the heartbeat owns PID/attribute refresh and
-    // retirement, so reads never mutate the registry (plan section 3.2).
+    // retirement, so reads never mutate the registry.
     if (jobID == kSystemSentinelJobId) return sentinel_job_;
     auto record = ownRecord(jobID);
     if (!record || record->state == kStateClosing) return std::nullopt;
@@ -2694,7 +2695,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     }
     // Out-of-order commits: an older source read must never overwrite newer
     // facts. read_order is process-monotonic and assigned before reading, so a
-    // late scan loses to an event that was committed first (plan §4.1, A09).
+    // late scan loses to an event that was committed first.
     if (stored.job.execution && job.execution &&
         stored.job.execution->read_order != 0 && job.execution->read_order != 0 &&
         job.execution->read_order < stored.job.execution->read_order) {
@@ -3054,7 +3055,7 @@ std::optional<bool> JobRegistry::repair_initial_decision(const JobRecord& record
 
 UpsertResult JobRegistry::upsertObservedJob(const Job& job,
                                             const InitialDecision* admission) {
-    // A registration is also the record-driven repair point (A14): verify every
+    // A registration is also the record-driven repair point: verify every
     // row whose last write outcome is unknown before touching any record.
     std::string recovery_error;
     if (!recoverStoreIfNeeded(recovery_error)) {
@@ -3277,8 +3278,8 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         // collection runtime must learn the instance exists (System collectors
         // are its concern). A coalesced wake, never a synchronous apply here.
         wake_runtime();
-        // First complete registration is an automatic-selection trigger (plan
-        // 6.2); Lua evaluation happens outside every registry lock. An
+        // First complete registration is an automatic-selection trigger; Lua
+        // evaluation happens outside every registry lock. An
         // observation whose execution generation is not verified yet is never
         // auto-collected: the update that completes the generation re-runs
         // the selection instead. An admission decision that carried its own
@@ -3305,7 +3306,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         // an automatic selection. The pass that completes its execution
         // generation is its first complete registration. A record whose
         // initial decision never became durable is repaired here too, not
-        // only on the Created path (plan §5.5).
+        // only on the Created path.
         if (result.generation_became_complete || missing_initial_decision(record))
             result.intent_committed = repair_initial_decision(record, result);
         // An observation is also the admission repair point: a live instance
@@ -3886,9 +3887,9 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
         degraded = degraded_;
         last_error = hb_last_error_;
     }
-    // Deprecated: the exec ingest worker and the observation hint queue are
-    // gone (plan P4). The keys stay for status compatibility and are always
-    // zero; a fake queue is not reported.
+    // Deprecated: inventory has no exec ingest worker or observation hint
+    // queue. The keys stay for status compatibility and are always zero; a
+    // fake queue is not reported.
     (void)exec_ingest_depth;
     // The deferred-policy FIFO was removed with the experimental budget: the
     // keys stay for status compatibility and always report zero.
@@ -3964,8 +3965,8 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     out["incomplete_count"] = incomplete_count;
     out["quarantined_count"] = quarantined_count;
     out["events_received"] = events_received;
-    out["events_dropped"] = 0;   // no queue since P4: nothing is dropped
-    out["queue_depth"] = 0;   // no queue since P4
+    out["events_dropped"] = 0;   // no ingest queue: nothing is dropped
+    out["queue_depth"] = 0;   // no ingest queue
     out["exec_ingest_depth"] = exec_ingest_depth;
     out["policy_pending"] = policy_pending;
     out["policy_deferred_total"] = policy_deferred_total;

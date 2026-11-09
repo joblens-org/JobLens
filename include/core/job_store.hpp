@@ -11,8 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// JobStore — the pure persistence service behind JobRegistry
-// (doc/jobstore_persistence_service.md).
+// JobStore — the pure persistence service behind JobRegistry.
 //
 // The store owns the LevelDB layout and nothing else: key namespaces, row
 // encode/decode, batch atomicity, tiered durability, recovery fences and the

@@ -1,32 +1,24 @@
 # Job Watcher Integration Guide
 
-**Status:** Implemented on `feature/collector-output-refactor` (2026-10-29,
-commits 76dc9ea..): scheduler identity is the adapter name end to end —
-`SchedulerType`/`InventoryType` enums deleted, native-id rules and config
-sections self-register/by-convention, facts ride the `SubAttr` JSON
-alternative for post-built-in schedulers. See the "File touch list" — it now
-contains only the watcher's own files. Chinese version:
-[job_watcher_integration.zh-CN.md](job_watcher_integration.zh-CN.md)
-
 This guide describes how to add a **new scheduler type** to the job inventory —
 for example an `ssh` session source — by writing one *job watcher* (a discovery
 source) and one *scheduler adapter*. Everything downstream (the `JobStore`
 merge semantics, the heartbeat's retirement rules, the collection binding and
 reconciliation, the RPC surface, kernel attribution) works for the new type
-without modification.
+without modification. Chinese version:
+[job_watcher_integration.zh-CN.md](job_watcher_integration.zh-CN.md)
 
 Reference implementation: `condor` / `slurm`
-([include/job_watcher/](../include/job_watcher/)). The imagined example below
-is `ssh`, the same case the architecture doc uses to demonstrate the
-extension point.
+([include/job_watcher/](../include/job_watcher/)). The example below uses
+`ssh` as a source that has no built-in scheduler schema.
 
 ---
 
 ## 1. What you are adding
 
 Exactly one scheduler type costs you **two classes and one registration line**,
-plus a handful of mechanical shared-code edits that the current config layer
-still hardcodes (§4 Step 1):
+plus one linkage hook so the TU-scope registrar is part of the agent binary
+(include the adapter header from a compiled TU or add its TU to the build):
 
 ```
 include/job_watcher/ssh_job_watcher.hpp   # IDiscoverySource impl (the watcher)
@@ -50,8 +42,8 @@ What you get for free:
 1. **Registration (before `main()`):** `REGISTER_SCHEDULER_ADAPTER("ssh",
    SshSchedulerAdapter)` at TU scope inserts a factory into
    `SchedulerAdapterRegistry` — same convention as `AUTO_REGISTER_COLLECTOR`.
-2. **Assembly (`JobRegistry::resolve_inventory_components()`, invoked from
-   `init_inventory()`):** the resolved config's
+2. **Assembly (`JobRegistry::armInventory()`, called from the registry
+   constructor):** the resolved config's
    `inventory.types` entries are built through the registry, one adapter per
    type. The adapter is the *only* component that knows the scheduler's
    attribute schema, identity format and capabilities.
@@ -89,14 +81,13 @@ Latency-critical discovery never waits for a heartbeat pass:
    of milliseconds.
 4. `JobRegistry/inventory_status` keeps `exec_ingest_depth`,
    `queue_depth` and `events_dropped` as deprecated constant-zero keys:
-   the ingest worker and the observation queue no longer exist.
+   inventory has no ingest worker or observation queue.
 
-Deliberately **not** solved here (layer 2, needs its own design): events
-between the process's first instruction and the user-space `pid2job` seeding
-are still invisible to the syscall-tracepoint collectors. Seeding a
-provisional `pid2job` entry from the exec tracer itself would close that
-window — but it decouples capture start from collector attach and therefore
-changes the collector lifecycle contract.
+Known limitation: events between the process's first instruction and the
+user-space `pid2job` seeding are still invisible to the syscall-tracepoint
+collectors. Seeding a provisional `pid2job` entry from the exec tracer itself
+would close that window, but it decouples capture start from collector attach
+and therefore changes the collector lifecycle contract.
 
 ## 3. Contracts your watcher must honor
 
@@ -157,7 +148,7 @@ group, filled where the source parses its inputs. `JobID`, `JobPIDs` and
 - (Discovery facts are filled by the watcher itself; there is no
   `encodeFacts` detour through neutral fields.)
 - `decodeFacts(row)` / `legacySelector(job)`: best-effort reconstruction for
-  schema<2 rows. Incomplete is fine; a guess is not.
+  legacy rows. Incomplete is fine; a guess is not.
 - `traits()`: be honest.
   `cgroup_scoped_membership = true` only if `cgroup.procs` is the
   authoritative membership for your executions;
@@ -168,17 +159,20 @@ group, filled where the source parses its inputs. `JobID`, `JobPIDs` and
 
 ## 4. Step by step
 
-### Step 1 — no shared-code edits
+### Step 1 — minimal shared wiring
 
-Since the G4 completion, adding a scheduler type touches **no shared file**.
-The adapter name is the scheduler identity everywhere: config `types` are
-registry names validated at startup, `<name>_job_watcher` sections resolve by
-convention, native-id rules self-register (`REGISTER_NATIVE_ID_RULE`), facts
-for non-built-in schedulers ride the `SubAttr` JSON alternative with
-`subtype_name`, and identity/cgroup derivation dispatches through
-`ISchedulerAdapter` methods. The only optional edit is a
-`DiscoveryEnvironment` field if your source needs a special root (like
-Slurm's spool dir); generic roots (`proc_root`, `cgroup_root`) already exist.
+No scheduler logic is added outside the watcher and adapter. The adapter name is
+the scheduler identity everywhere: config `types` are registry names validated
+at startup, `<name>_job_watcher` sections resolve by convention, native-id
+rules self-register (`REGISTER_NATIVE_ID_RULE`), facts for non-built-in
+schedulers ride the `SubAttr` JSON alternative with `subtype_name`, and
+identity/cgroup derivation dispatches through `ISchedulerAdapter` methods. The
+only shared edit is making the registrar reachable from the agent binary: add
+one include to a compiled TU (the built-ins are included from
+`job_registry.hpp`) or add the adapter's TU to the build. The other optional
+edit is a `DiscoveryEnvironment` field if your source needs a special root
+(like Slurm's spool dir); generic roots (`proc_root`, `cgroup_root`) already
+exist.
 
 ### Step 2 — write the watcher
 
@@ -345,8 +339,8 @@ For eBPF-dependent tests, guard on namespace availability the way
 
 | Edited | Purpose |
 |---|---|
-| `include/core/job_registry.hpp` | include the adapter header (option (a)); nothing else |
-| `include/core/job_observation.hpp` | optional: a special `DiscoveryEnvironment` root (e.g. a spool dir) |
+| `include/core/job_registry.hpp` (or any compiled TU) | include the adapter header so its `REGISTER_SCHEDULER_ADAPTER` registrar is linked |
+| `include/core/job_discovery.hpp` | optional: a special `DiscoveryEnvironment` root (e.g. a spool dir) |
 | `config/config.example.yaml` | `<t>_job_watcher` section + `inventory.types` entry |
 
 No changes are needed in `collector_type.h`, `job_identity`, `inventory_config`,
@@ -354,23 +348,23 @@ No changes are needed in `collector_type.h`, `job_identity`, `inventory_config`,
 or the trigger: identity, config sections, native-id rules, facts (JSON
 alternative), matching and cgroup derivation are all adapter-driven.
 
-## 6. Final checklist
+## 6. Implementation invariants
 
-- [ ] Constructor: options only — no Config, no eBPF, no threads.
-- [ ] `start()` installs the sink before any possible callback.
-- [ ] Poll thread registers exec hints synchronously through `on_job`;
+- Constructor: options only — no Config, no eBPF, no threads.
+- `start()` installs the sink before any possible callback.
+- Poll thread registers exec hints synchronously through `on_job`;
       periodic self-scans (if `scan_interval_ms > 0`) use the same entry.
-- [ ] `stop()` is idempotent and bounded; safe from the destructor.
-- [ ] `scan()` reports `complete=false` only for pass-level failures;
+- `stop()` is idempotent and bounded; safe from the destructor.
+- `scan()` reports `complete=false` only for pass-level failures;
       skipped sources are counted and noted, never treated as absence.
-- [ ] Discovered Jobs are ready or explicitly incomplete
+- Discovered Jobs are ready or explicitly incomplete
       (`execution->incomplete_reason`); the cluster namespace is never guessed
       from a native id.
-- [ ] Cgroup membership: successful read (including empty) is authoritative;
+- Cgroup membership: successful read (including empty) is authoritative;
       fallback paths mark `members_authoritative=false`.
-- [ ] The builder leaves `JobID`/`JobPIDs`/`CollectorNames` empty (store and
+- The builder leaves `JobID`/`JobPIDs`/`CollectorNames` empty (store and
       intent own them).
-- [ ] `traits()` is truthful; missing capabilities are normal states.
-- [ ] eBPF failures degrade to scan-only with an explicit note.
-- [ ] Both test tiers pass unprivileged; new invariants covered in the
+- `traits()` is truthful; missing capabilities are normal states.
+- eBPF failures degrade to scan-only with an explicit note.
+- Both test tiers pass unprivileged; new invariants covered in the
       registry tier.

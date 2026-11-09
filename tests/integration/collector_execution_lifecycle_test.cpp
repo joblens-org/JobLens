@@ -444,7 +444,7 @@ void run(const std::string& base)
           "System event lost its Job 0 envelope after Job removal");
 
     // ---------------------------------------------------------------------
-    // Collection intent reaches the lanes (decoupling task 4/6).
+    // Collection intent reaches the lanes.
     //
     // An inventoried-but-unbound instance must create no collector work; a
     // committed binding must attach the lane and report itself as applied; a

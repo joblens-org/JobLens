@@ -11,8 +11,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// The registration result contract (plan §5.1). It lives on its own so a
-// discovery source can consume results without pulling in LevelDB.
+// The registration result contract. It lives on its own so a discovery source
+// can consume results without pulling in LevelDB.
 #pragma once
 
 #include <cstdint>
@@ -43,7 +43,7 @@ struct UpsertResult {
     // True when this upsert completed the execution generation of a record
     // that was stored unverified: its first-complete-registration trigger.
     bool generation_became_complete = false;
-    // Typed reason (plan §5.1). `error` is the stable wire string derived from
+    // Typed reason. `error` is the stable wire string derived from
     // it; callers must branch on the code, never parse the string.
     RegistrationError code = RegistrationError::None;
     std::string error;                   // to_string(code), stable wire form

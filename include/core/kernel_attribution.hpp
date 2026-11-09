@@ -11,8 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// KernelAttribution — the optional kernel-side job attribution capability
-// (doc/job_inventory_v2_architecture.md §2.6).
+// KernelAttribution — the optional kernel-side job attribution capability.
 //
 // Owns the eBPF pid tracker, the cgroup-id cache and the fork/exit
 // reconciliation. Invariants (I8):

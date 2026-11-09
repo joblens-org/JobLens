@@ -11,8 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-/* Discovery-adapter acceptance for Task 3 (doc/job_inventory_collection_
- * decoupling_plan.md sections 3.1 and 5.2):
+/* Discovery-adapter acceptance:
  *
  *   * scan() finds fixture jobs and returns complete observations with the
  *     correct native identity fields, manager generation, cgroup and members.
@@ -307,7 +306,7 @@ void condor_scan_finds_fixture_job(const Fixture& fixture)
           "an unavailable/disabled eBPF event source must be reported as an explicit note");
     // Every discovered Job carries a process-monotonic read order, assigned
     // before the builder reads, so the store can reject an older pass
-    // (plan §4.1).
+
     for (const auto& discovered : result.jobs)
         check(discovered.execution && discovered.execution->read_order > 0,
               "a discovered Job must carry a read order");

@@ -322,9 +322,8 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
                 record.job.clusterTag = selector.cluster_tag;
             if (record.job.NativeJobID.empty())
                 record.job.NativeJobID = selector.native_job_id;
-            // Step presence rides the selector's verbatim copy (plan §4.3:
-            // the row layout is unchanged and the Job stays the single
-            // source of truth).
+            // Step presence rides the selector's verbatim copy: the row layout
+            // is unchanged and the Job stays the single source of truth.
             if (!selector.step_id.empty())
                 execution.step_id = selector.step_id;
         } catch (const std::exception& error) {
@@ -1241,7 +1240,7 @@ void JobStore::init_id_counter() {
 
 uint64_t JobStore::allocateId(std::string& error) {
     // Every allocator consumer shares the same admission order as the inventory
-    // registration path (plan §5.3): a standalone reservation can never land
+    // registration path: a standalone reservation can never land
     // between a batch's id reservation and that batch's commit, which would let
     // the batch write an older counter back and reissue a published id.
     std::lock_guard<std::mutex> id_lock(id_mtx_);
