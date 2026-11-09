@@ -1547,7 +1547,7 @@ void run_admit(const std::string& base)
                   "rule.name = \"admit_accept\"\n"
                   "rule.priority = 10\n"
                   "function rule.condition(job)\n"
-                  "    return {passed = true, collectors = {\"CPUMemCollector\"}}\n"
+                  "    return true, \"CPUMemCollector\"\n"
                   "end\n"
                   "return rule\n";
         std::ofstream reject(rules_root / "reject" / "condor_job_admit.lua");
@@ -1555,7 +1555,7 @@ void run_admit(const std::string& base)
                   "rule.name = \"admit_reject\"\n"
                   "rule.priority = 10\n"
                   "function rule.condition(job)\n"
-                  "    return {passed = false, collectors = {}}\n"
+                  "    return false\n"
                   "end\n"
                   "return rule\n";
     }

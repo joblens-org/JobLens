@@ -22,15 +22,12 @@ public:
     RulesManager(const std::string& name, const std::string& rules_dir, const std::string& rules_prefix);
     ~RulesManager();
 
-    // 执行所有规则评估
-    // 返回值: std::pair<bool, std::vector<std::string>>
-    // 第一个元素: 是否所有规则都通过
-    // 第二个元素: 所有规则添加的采集器名称列表（去重）
+    // 执行所有规则评估（首个接受者胜出；error 非空 = 整次评估无判定）
     template<typename RuleArg>
-    std::pair<bool, std::vector<std::string>> evaluate_all(const RuleArg& arg) {
+    RuleOutcome evaluate_all(const RuleArg& arg) {
         auto result = rule_engine_.evaluate_all<RuleArg>(arg);
         current_passed_rules_ = {};  // 清空旧的通过规则列表（如果需要保留，可以修改逻辑）
-        current_collectors_ = result.second;
+        current_collectors_ = result.collectors;
         return result;
     }
 

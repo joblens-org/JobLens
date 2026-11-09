@@ -22,7 +22,8 @@
 //   * defaults:      the configured default list, verbatim, for every job
 //                    (use_rules=false: no per-job decision at all).
 //   * rules:         the Lua rule engine decides per job (use_rules=true:
-//                    accept = the rule's collector list, reject = empty
+//                    the first accepting rule in priority order wins and
+//                    its list is the selection; nobody accepting = empty
 //                    selection). An evaluation error is reported to the
 //                    caller, which keeps the previous decision instead of
 //                    guessing.

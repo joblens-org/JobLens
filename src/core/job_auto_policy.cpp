@@ -49,25 +49,25 @@ std::vector<std::string> AutoCollectorPolicy::select(const Job& job,
         return defaults_;
     }
 
-    // use_rules=true: the rule engine decides per job. A rejected job gets an
-    // empty selection but stays inventoried; an evaluation error is reported
-    // so the caller keeps the previous decision instead of guessing.
-    //
-    // The overall verdict is authoritative: a rule that passes late (high
-    // priority) and a rule that rejects after it must yield an empty
-    // selection, not the passing rule's list. evaluate_all() stops at the
-    // first rejecting rule precisely so `!all_passed` disqualifies whatever
-    // collectors were gathered before it.
+    // use_rules=true: the rule engine decides per job — the first accepting
+    // rule (priority order) wins and its collector list is the selection; an
+    // empty list means "accepted but unspecified" and the caller decides the
+    // fallback; an evaluation error is reported so the caller keeps the
+    // previous decision instead of guessing.
     try {
         std::lock_guard<std::mutex> lock(rules_->mutex);
         if (!rules_->manager) {
             rules_->manager =
                 std::make_unique<RulesManager>("AutoCollectorPolicy", rules_dir_, rules_prefix_);
         }
-        const auto result = rules_->manager->evaluate_all<Job>(job);
+        const RuleOutcome outcome = rules_->manager->evaluate_all<Job>(job);
         policy_revision = "rules:" + rules_prefix_;
-        if (!result.first) return {};
-        return result.second;
+        if (!outcome.error.empty()) {
+            error = outcome.error;
+            return {};
+        }
+        if (!outcome.accepted) return {};
+        return outcome.collectors;
     } catch (const std::exception& failure) {
         error = std::string("rule evaluation failed: ") + failure.what();
         return {};

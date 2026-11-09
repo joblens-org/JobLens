@@ -94,7 +94,7 @@ void run(const std::string& base)
                   "rule.description = \"always accept and collect cpumem\"\n"
                   "rule.priority = 10\n"
                   "function rule.condition(job)\n"
-                  "    return {passed = true, collectors = {\"cpumem_collector\"}}\n"
+                  "    return true, \"cpumem_collector\"\n"
                   "end\n"
                   "return rule\n";
         std::ofstream accept_shared(rules_root / "condor_jobs" / "condor_job_accept.lua");
@@ -103,18 +103,82 @@ void run(const std::string& base)
                          "rule.description = \"always accept and collect cpumem\"\n"
                          "rule.priority = 10\n"
                          "function rule.condition(job)\n"
-                         "    return {passed = true, collectors = {\"cpumem_collector\"}}\n"
+                         "    return true, \"cpumem_collector\"\n"
                          "end\n"
                          "return rule\n";
         std::ofstream reject(rules_root / "condor_jobs" / "condor_job_reject.lua");
         reject << "local rule = {}\n"
                   "rule.name = \"reject_everything\"\n"
-                  "rule.description = \"reject: no collectors, job stays inventoried\"\n"
+                  "rule.description = \"never accepts: later rules may still win\"\n"
                   "rule.priority = 5\n"
                   "function rule.condition(job)\n"
-                  "    return {passed = false, collectors = {}}\n"
+                  "    return false\n"
                   "end\n"
                   "return rule\n";
+    }
+    // Contract fixtures: one directory per engine-level behaviour.
+    {
+        std::filesystem::create_directories(rules_root / "condor_contract_table");
+        std::ofstream table(rules_root / "condor_contract_table" / "condor_job_table.lua");
+        table << "local rule = {}\n"
+                 "rule.name = \"table_return\"\n"
+                 "rule.priority = 10\n"
+                 "function rule.condition(job)\n"
+                 "    return {passed = true, collectors = {\"cpumem_collector\"}}\n"
+                 "end\n"
+                 "return rule\n";
+        std::filesystem::create_directories(rules_root / "condor_contract_comma");
+        std::ofstream comma(rules_root / "condor_contract_comma" / "condor_job_comma.lua");
+        comma << "local rule = {}\n"
+                 "rule.name = \"comma_list\"\n"
+                 "rule.priority = 10\n"
+                 "function rule.condition(job)\n"
+                 "    return true, \" io_collector,,cpumem_collector , \"\n"
+                 "end\n"
+                 "return rule\n";
+        std::filesystem::create_directories(rules_root / "condor_contract_second");
+        std::ofstream second(rules_root / "condor_contract_second" / "condor_job_second.lua");
+        second << "local rule = {}\n"
+                  "rule.name = \"bad_second\"\n"
+                  "rule.priority = 10\n"
+                  "function rule.condition(job)\n"
+                  "    return true, 42\n"
+                  "end\n"
+                  "return rule\n";
+        std::filesystem::create_directories(rules_root / "condor_order");
+        std::ofstream decline(rules_root / "condor_order" / "condor_job_decline.lua");
+        decline << "local rule = {}\n"
+                   "rule.name = \"decline_high\"\n"
+                   "rule.priority = 10\n"
+                   "function rule.condition(job)\n"
+                   "    return false\n"
+                   "end\n"
+                   "return rule\n";
+        std::ofstream late(rules_root / "condor_order" / "condor_job_late.lua");
+        late << "local rule = {}\n"
+                "rule.name = \"accept_low\"\n"
+                "rule.priority = 5\n"
+                "function rule.condition(job)\n"
+                "    return true, \"io_collector\"\n"
+                "end\n"
+                "return rule\n";
+        std::filesystem::create_directories(rules_root / "condor_order_both");
+        std::ofstream first(rules_root / "condor_order_both" / "condor_job_first.lua");
+        first << "local rule = {}\n"
+                 "rule.name = \"accept_first\"\n"
+                 "rule.priority = 10\n"
+                 "function rule.condition(job)\n"
+                 "    return true, \"io_collector\"\n"
+                 "end\n"
+                 "return rule\n";
+        std::ofstream also(rules_root / "condor_order_both" / "condor_job_also.lua");
+        also << "local rule = {}\n"
+                "rule.name = \"accept_second\"\n"
+                "rule.priority = 5\n"
+                "function rule.condition(job)\n"
+                "    return true, \"cpumem_collector\"\n"
+                "end\n"
+                "return rule\n";
     }
     const auto config_path = std::filesystem::path(base) / "config.yaml";
     {
@@ -289,9 +353,9 @@ void run(const std::string& base)
     }
 
     // The policy object itself: defaults add the list verbatim, rules decide
-    // per job (accept = the rule's collectors, reject = empty) and an error
-    // keeps the previous decision. A rejection is authoritative: a later
-    // rejecting rule voids the collectors an earlier rule gathered.
+    // per job and an error keeps the previous decision. The walk is
+    // first-accept-wins: the highest-priority accepting rule selects, a
+    // rejecting rule only declines and never vetoes a later accept.
     {
         const Job job = make_common_job();
 
@@ -312,14 +376,55 @@ void run(const std::string& base)
         check(accepted.size() == 1 && accepted.front() == "cpumem_collector",
               "auto policy: an accepting rule must select its collectors");
 
-        // The shared dir accepts with a high-priority rule and rejects with a
-        // lower-priority one. The overall verdict must win: an empty
-        // selection, not the passing rule's collectors.
+        // The shared dir accepts with a high-priority rule and declines with
+        // a lower-priority one: the accepting rule wins, its list is the
+        // selection and the declining rule cannot veto it.
         auto mixed = AutoCollectorPolicy::rules(
             (rules_root / "condor_jobs").string(), "condor_job_");
-        const auto rejected = mixed.select(job, revision, error);
-        check(error.empty() && rejected.empty(),
-              "auto policy: a rejecting rule must void earlier collectors");
+        const auto mixed_selected = mixed.select(job, revision, error);
+        check(error.empty() && mixed_selected.size() == 1 &&
+                  mixed_selected.front() == "cpumem_collector",
+              "auto policy: a declining rule must not veto the accepting rule");
+
+        // A high-priority decline followed by a low-priority accept: the walk
+        // continues past the decline and the accept selects.
+        auto ordered = AutoCollectorPolicy::rules(
+            (rules_root / "condor_order").string(), "condor_job_");
+        const auto late = ordered.select(job, revision, error);
+        check(error.empty() && late.size() == 1 && late.front() == "io_collector",
+              "auto policy: the walk must continue past a declining rule");
+
+        // Two accepting rules: only the higher-priority one selects.
+        auto both = AutoCollectorPolicy::rules(
+            (rules_root / "condor_order_both").string(), "condor_job_");
+        const auto first_win = both.select(job, revision, error);
+        check(error.empty() && first_win.size() == 1 && first_win.front() == "io_collector",
+              "auto policy: the first accepting rule must win exclusively");
+
+        // The collector string is a comma-separated list: trimmed, empty
+        // tokens dropped.
+        auto comma = AutoCollectorPolicy::rules(
+            (rules_root / "condor_contract_comma").string(), "condor_job_");
+        const auto list = comma.select(job, revision, error);
+        check(error.empty() && list.size() == 2 &&
+                  ((list[0] == "cpumem_collector" && list[1] == "io_collector") ||
+                   (list[0] == "io_collector" && list[1] == "cpumem_collector")),
+              "auto policy: the collector string must split on commas");
+
+        // Contract violations are errors, not verdicts: the table format is
+        // gone, and a non-string second return rejects the evaluation.
+        auto table = AutoCollectorPolicy::rules(
+            (rules_root / "condor_contract_table").string(), "condor_job_");
+        const auto table_selected = table.select(job, revision, error);
+        check(!error.empty() && table_selected.empty(),
+              "auto policy: a table return must be an evaluation error");
+        error.clear();
+        auto bad_second = AutoCollectorPolicy::rules(
+            (rules_root / "condor_contract_second").string(), "condor_job_");
+        const auto bad_second_selected = bad_second.select(job, revision, error);
+        check(!error.empty() && bad_second_selected.empty(),
+              "auto policy: a non-string second return must be an evaluation error");
+        error.clear();
 
         auto broken = AutoCollectorPolicy::rules(
             (rules_root / "does-not-exist").string(), "nope_");

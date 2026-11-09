@@ -468,14 +468,17 @@ void run_batch_probe(const fs::path& dir, int records)
 
 // Realistic deployment rules: each one reads a few nested fields of the job
 // table and returns a decision, like the shipped examples in the API guide.
+// With first-accept-wins the walk stops at the first accepting rule, so every
+// rule declines except the last: the benchmark still pays K per-job
+// evaluations per decision instead of short-circuiting after one.
 void write_probe_rules(const fs::path& dir, int count)
 {
     fs::remove_all(dir);
     fs::create_directories(dir);
-    // Every rule passes, so evaluate_all() evaluates all of them: the point is
-    // the cost of K per-job evaluations, not short-circuit behaviour.
     for (int i = 0; i < count; ++i) {
-        std::ostringstream lua;        lua << "local rule = {}\n"
+        const bool last = (i == count - 1);
+        std::ostringstream lua;
+        lua << "local rule = {}\n"
                "rule.name = \"probe_" << i << "\"\n"
                "rule.description = \"benchmark rule: inspect owner/cluster/pids\"\n"
                "rule.priority = " << (100 - i) << "\n"
@@ -492,10 +495,14 @@ void write_probe_rules(const fs::path& dir, int count)
                "    for _, pid in ipairs(job.JobPIDs or {}) do\n"
                "        if pid > 0 then live = live + 1 end\n"
                "    end\n"
-               "    if owner ~= \"\" and live > 0 and cluster >= " << i << " then\n"
-               "        return { passed = true, collectors = { \"cpumem_collector\" } }\n"
-               "    end\n"
-               "    return { passed = false, collectors = {} }\n"
+               "    if owner ~= \"\" and live > 0 and cluster >= " << i << " then\n";
+        if (last) {
+            lua << "        return true, \"cpumem_collector\"\n";
+        } else {
+            lua << "        return false\n";
+        }
+        lua << "    end\n"
+               "    return false\n"
                "end\n"
                "return rule\n";
         write_file(dir / ("condor_job_probe_" + std::to_string(i) + ".lua"), lua.str());
