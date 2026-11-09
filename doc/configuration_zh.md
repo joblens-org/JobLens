@@ -101,9 +101,31 @@ S3 的三态：
 |---|---|
 | `off` | 自动路径对该类型零动作 |
 | `default` | 登记作业，并把 `<type>_job_watcher.auto_add_collectors` 逐字武装上去 |
-| `rule` | 是否登记由 Lua 规则引擎逐作业判定：accept = 登记并加规则的采集器列表；reject = 不登记（S1 开启时为历史行为：登记空选择留在库中） |
+| `rule` | 是否登记由 Lua 规则引擎逐作业判定：accept = 登记并加规则的采集器列表（规则未指定时回退 `auto_add_collectors`）；reject = 不登记（S1 开启时为历史行为：登记空选择留在库中） |
 
 `auto_add` 的非法取值（非 `off`/`default`/`rule`）启动即拒绝。
+
+#### Lua 规则契约
+
+规则文件返回一个带 `condition(job)` 函数的表。condition 必须返回
+`(bool[, string])`：
+
+- **bool** 是该规则自己的判定——`true` 接受，`false` 不接受；
+- 可选的 **string** 是逗号分隔的采集器列表（如
+  `"cpumem_collector, net_collector"`）；空串或缺省即"接受但未指定列表"。
+
+旧的 `{passed = ..., collectors = {...}}` 表返回已删除：返回表、缺首个
+返回值或第二个返回值非字符串都按评估错误处理——该观测不登记（也不计
+入 reject），下一条观测重新评估。
+
+规则按优先级降序行走，**首个接受者胜出**：它的列表即选择，后续规则
+不再评估；返回 `false` 的规则只是不接受，不否决后面的接受。所有规则
+都不接受时该作业被拒绝。
+
+接受了但未指定采集器的规则打 info 日志并回退到
+`<type>_job_watcher.auto_add_collectors`；未配置缺省列表时该判定被拒
+绝：打 error 日志、不登记该观测，计入 `admission_errors`（而非
+reject）。
 
 ### 八状态组合矩阵
 
@@ -116,10 +138,10 @@ S1 × S3 共六种组合：
 | 2 | 关 | ——（关） | —— | 同上：无发现，自然无登记 |
 | 3 | 开 | 开 | off | 全量登记；无自动采集器（仅显式请求） |
 | 4 | 开 | 开 | default | 全量登记 + 默认采集器列表自动武装 |
-| 5 | 开 | 开 | rule | 全量登记；规则引擎选采集器（reject = 登记空选择） |
+| 5 | 开 | 开 | rule | 全量登记；规则引擎选采集器（reject 或无缺省的裸接受 = 登记空选择） |
 | 6 | 开 | 关 | off | Watcher 照常扫描，但不登记任何作业（丢弃计入 `dropped_observations`） |
 | 7 | 开 | 关 | default | 登记并把默认采集器列表作为初始选择 |
-| 8 | 开 | 关 | rule | accept = 登记并加规则列表；reject = 不登记（计入 `rejected_observations`）；引擎错误 = 本次不登记，下一条观测重试 |
+| 8 | 开 | 关 | rule | accept = 登记并加规则列表（裸接受回退 `auto_add_collectors`）；reject = 不登记（计入 `rejected_observations`）；引擎错误或无缺省的裸接受 = 本次不登记（计入 `admission_errors`），下一条观测重试 |
 
 S1 关闭时，准入计数在清单状态中可见：`capture_all`、
 `dropped_observations`、`rejected_observations`、`admission_errors`。
@@ -597,7 +619,7 @@ condor_job_watcher:
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
 | `auto_add` | string（`off`/`default`/`rule`） | `off` | 自动路径动作三态（S3）；显式给出时优先于已弃用的 `auto_collect`/`use_rules` 组合 |
-| `auto_add_collectors` | string[] | 无 | `auto_add: default` 时武装的默认收集器列表 |
+| `auto_add_collectors` | string[] | 无 | 默认收集器列表：`auto_add: default` 时逐字武装；`auto_add: rule` 的裸接受以它回退 |
 | `auto_collect` | bool | `false` | **已弃用**（仅作映射来源）：再保留一个 schema 版本后折算入 `auto_add` |
 | `use_rules` | bool | `false` | **已弃用**（仅作映射来源）：`auto_collect: true` + `use_rules: true` 折算为 `auto_add: rule` |
 | `rules_prefix` | string | `"condor_job_"` | 规则引擎加载的规则文件前缀 |
@@ -621,7 +643,7 @@ slurm_job_watcher:
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
 | `auto_add` | string（`off`/`default`/`rule`） | `off` | 自动路径动作三态（S3）；显式给出时优先于已弃用的 `auto_collect`/`use_rules` 组合 |
-| `auto_add_collectors` | string[] | 无 | `auto_add: default` 时武装的默认收集器列表 |
+| `auto_add_collectors` | string[] | 无 | 默认收集器列表：`auto_add: default` 时逐字武装；`auto_add: rule` 的裸接受以它回退 |
 | `auto_collect` | bool | `false` | **已弃用**（仅作映射来源）：再保留一个 schema 版本后折算入 `auto_add` |
 | `use_rules` | bool | `false` | **已弃用**（仅作映射来源）：`auto_collect: true` + `use_rules: true` 折算为 `auto_add: rule` |
 | `rules_prefix` | string | `"slurm_job_"` | 规则引擎加载的规则文件前缀 |

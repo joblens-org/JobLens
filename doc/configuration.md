@@ -103,10 +103,36 @@ S3's tri-state:
 |---|---|
 | `off` | The automatic path takes no action for this type |
 | `default` | Register the job and arm `<type>_job_watcher.auto_add_collectors` verbatim |
-| `rule` | Register is decided per job by the Lua rule engine: accept = register with the rule's collector list, reject = do not register (with S1 on: register with an empty selection, the historical behavior) |
+| `rule` | Register is decided per job by the Lua rule engine: accept = register with the rule's collector list (or the `auto_add_collectors` defaults when the rule names none), reject = do not register (with S1 on: register with an empty selection, the historical behavior) |
 
 An invalid `auto_add` value (anything but `off`/`default`/`rule`) rejects
 startup.
+
+#### The Lua rule contract
+
+A rule file returns a table with a `condition(job)` function. The condition
+must return `(bool[, string])`:
+
+- the **bool** is the rule's own verdict — `true` accepts the job, `false`
+  declines it;
+- the optional **string** is a comma-separated collector list (for example
+  `"cpumem_collector, net_collector"`); an empty or absent string means
+  "accepted without a specified list".
+
+The old `{passed = ..., collectors = {...}}` table return is gone: a table,
+a missing first value or a non-string second value is an evaluation error —
+the observation is not registered (and not counted as a reject) and the next
+one re-evaluates.
+
+Rules walk in priority order (descending) and the **first accepting rule
+wins**: its list is the selection and later rules are not consulted. A
+declining (`false`) rule never vetoes a later accept. When every rule
+declines the job is rejected.
+
+An accepting rule that names no collectors logs at info and falls back to
+`<type>_job_watcher.auto_add_collectors`. When no defaults are configured
+the decision is refused: an error is logged, the observation is not
+registered, and it is counted in `admission_errors` (not as a reject).
 
 ### The eight-state matrix
 
@@ -119,10 +145,10 @@ the two rows; S2 on leaves six combinations of S1 x S3:
 | 2 | off | — (off) | — | Same: nothing is discovered, so nothing is admitted |
 | 3 | on | on | off | Blanket registration; no automatic collectors (explicit requests only) |
 | 4 | on | on | default | Blanket registration + the default collector list armed automatically |
-| 5 | on | on | rule | Blanket registration; the rule engine picks the collectors (reject = registered with an empty selection) |
+| 5 | on | on | rule | Blanket registration; the rule engine picks the collectors (reject or a refused bare accept = registered with an empty selection) |
 | 6 | on | off | off | The watcher keeps scanning, but nothing registers (drops counted in `dropped_observations`) |
 | 7 | on | off | default | Registers with the default collector list as the initial selection |
-| 8 | on | off | rule | accept = registers with the rule's list; reject = never registers (`rejected_observations`); an engine error registers nothing and is retried on the next observation |
+| 8 | on | off | rule | accept = registers with the rule's list (a bare accept falls back to `auto_add_collectors`); reject = never registers (`rejected_observations`); an engine error or a bare accept without defaults registers nothing, is counted in `admission_errors` and is retried on the next observation |
 
 With S1 off, the admission counters are observable in the inventory status:
 `capture_all`, `dropped_observations`, `rejected_observations` and
@@ -645,7 +671,7 @@ condor_job_watcher:
 | Key | Type | Default | Description | Source Reference |
 |-----|------|---------|-------------|------------------|
 | `auto_add` | string (`off`/`default`/`rule`) | `off` | The automatic-action tri-state (S3); an explicit value wins over the deprecated `auto_collect`/`use_rules` pair | `inventory_config.cpp` |
-| `auto_add_collectors` | string[] | none | The default collector list armed for `auto_add: default` | `condor_job_watcher.hpp:28` |
+| `auto_add_collectors` | string[] | none | The default collector list: armed verbatim for `auto_add: default`, and the fallback for an `auto_add: rule` accept that names no collectors | `condor_job_watcher.hpp:28` |
 | `auto_collect` | bool | `false` | **Deprecated** (mapping source only): folds into `auto_add` for one more schema version | `inventory_config.cpp` |
 | `use_rules` | bool | `false` | **Deprecated** (mapping source only): `auto_collect: true` + `use_rules: true` maps to `auto_add: rule` | `condor_job_watcher.hpp:29` |
 | `rules_prefix` | string | `"condor_job_"` | Prefix for rule files loaded by the rule engine | `condor_job_watcher.hpp:34` |
@@ -669,7 +695,7 @@ slurm_job_watcher:
 | Key | Type | Default | Description | Source Reference |
 |-----|------|---------|-------------|------------------|
 | `auto_add` | string (`off`/`default`/`rule`) | `off` | The automatic-action tri-state (S3); an explicit value wins over the deprecated `auto_collect`/`use_rules` pair | `inventory_config.cpp` |
-| `auto_add_collectors` | string[] | none | The default collector list armed for `auto_add: default` | `slurm_job_watcher.hpp:29` |
+| `auto_add_collectors` | string[] | none | The default collector list: armed verbatim for `auto_add: default`, and the fallback for an `auto_add: rule` accept that names no collectors | `slurm_job_watcher.hpp:29` |
 | `auto_collect` | bool | `false` | **Deprecated** (mapping source only): folds into `auto_add` for one more schema version | `inventory_config.cpp` |
 | `use_rules` | bool | `false` | **Deprecated** (mapping source only): `auto_collect: true` + `use_rules: true` maps to `auto_add: rule` | `slurm_job_watcher.hpp:30` |
 | `rules_prefix` | string | `"slurm_job_"` | Prefix for rule files loaded by the rule engine | `slurm_job_watcher.hpp:35` |
