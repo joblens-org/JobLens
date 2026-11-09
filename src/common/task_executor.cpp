@@ -361,11 +361,18 @@ void TaskExecutor::workerLoop(size_t index)
 
         Callback retired;
         bool requeued = false;
+        size_t logged_id = 0;
+        std::string logged_name;
         {
             std::unique_lock lock(mutex_);
             const auto now = Clock::now();
             const double duration = milliseconds(now - slot->running_since);
             slot->last_duration_ms = duration;
+            // Diagnostics for the log below are copied under the lock: the
+            // slot can be reused the moment the lock is released, and a
+            // concurrent registerTask would then reassign slot->name.
+            logged_id = slot->id;
+            logged_name = slot->name;
 
             Worker& worker = workers_[index];
             worker.busy = false;
@@ -417,7 +424,7 @@ void TaskExecutor::workerLoop(size_t index)
 
         if (requeued) ready_cv_.notify_one();
         if (failure) {
-            spdlog::error("TaskExecutor: task {} ({}) failed: {}", slot->id, slot->name,
+            spdlog::error("TaskExecutor: task {} ({}) failed: {}", logged_id, logged_name,
                           bounded_error(error));
         }
         // `retired` releases its captures here, outside the executor lock.
