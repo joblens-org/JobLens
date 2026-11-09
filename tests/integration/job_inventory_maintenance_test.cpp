@@ -1550,6 +1550,15 @@ void run_admit(const std::string& base)
                   "    return true, \"CPUMemCollector\"\n"
                   "end\n"
                   "return rule\n";
+        std::filesystem::create_directories(rules_root / "accept_bare");
+        std::ofstream accept_bare(rules_root / "accept_bare" / "condor_job_admit.lua");
+        accept_bare << "local rule = {}\n"
+                       "rule.name = \"admit_accept_bare\"\n"
+                       "rule.priority = 10\n"
+                       "function rule.condition(job)\n"
+                       "    return true\n"
+                       "end\n"
+                       "return rule\n";
         std::ofstream reject(rules_root / "reject" / "condor_job_admit.lua");
         reject << "local rule = {}\n"
                   "rule.name = \"admit_reject\"\n"
@@ -1685,6 +1694,76 @@ void run_admit(const std::string& base)
         registry.deinit();
     }
 
+    // S1 off x S3 rule, bare accept: the rule accepts without naming
+    // collectors and the configured auto_add_collectors defaults become the
+    // selection.
+    {
+        FakeSource source("condor");
+        FakeProbes probes;
+        const Job job =
+            make_condor_job("355.0", 5850, 445, "htcondor01", "schedd-a", "/cg/slot-35b");
+        probes.set_process(5850, LivenessState::Alive, 445);
+        source.set_scan([&]() { return scan_with({job}); });
+        auto options = heartbeat_options(fresh_dir(base, "admit-bare-defaults"), source, probes);
+        options.test_capture_all = false;
+        options.test_auto_add_states = {{"condor", AutoAdd::Rule}};
+        options.test_auto_policy = [&] {
+            return AutoCollectorPolicy::rules((rules_root / "accept_bare").string(),
+                                              "condor_job_", {"CPUMemCollector"});
+        };
+        JobRegistry registry(options);
+
+        const auto record = find_native(registry, "355.0");
+        check(record.has_value(),
+              "ADMIT: a bare accept must register the job");
+        const auto binding = registry.selectionRecord(record->internal_id);
+        check(binding.automatic.has_value() && binding.automatic->size() == 1 &&
+                  binding.automatic->front() == "CPUMemCollector",
+              "ADMIT: a bare accept must fall back to the configured defaults");
+        check(binding.automatic_source.rfind("rules:", 0) == 0,
+              "ADMIT: the fallback selection must still identify the rules source");
+        const auto status = heartbeat_status();
+        check(status["dropped_observations"].get<std::uint64_t>() == 0 &&
+                  status["rejected_observations"].get<std::uint64_t>() == 0 &&
+                  status["admission_errors"].get<std::uint64_t>() == 0,
+              "ADMIT: a bare accept with defaults must not count as an error");
+        registry.deinit();
+    }
+
+    // S1 off x S3 rule, bare accept without configured defaults: the decision
+    // is refused — nothing registers and the error is counted (it is an
+    // admission error, not a rule reject).
+    {
+        FakeSource source("condor");
+        FakeProbes probes;
+        const Job job =
+            make_condor_job("356.0", 5860, 446, "htcondor01", "schedd-a", "/cg/slot-35c");
+        probes.set_process(5860, LivenessState::Alive, 446);
+        source.set_scan([&]() { return scan_with({job}); });
+        auto options = heartbeat_options(fresh_dir(base, "admit-bare-nodefaults"), source, probes);
+        options.test_capture_all = false;
+        options.test_auto_add_states = {{"condor", AutoAdd::Rule}};
+        options.test_auto_policy = [&] {
+            return AutoCollectorPolicy::rules((rules_root / "accept_bare").string(),
+                                              "condor_job_");
+        };
+        JobRegistry registry(options);
+
+        check(count_records(registry) == 0,
+              "ADMIT: a bare accept without defaults must not register the job");
+        check(registry.reconcileInventoryNow(), "ADMIT: the refused pass must run");
+        check(count_records(registry) == 0,
+              "ADMIT: a bare accept without defaults must stay out across passes");
+        const auto status = heartbeat_status();
+        check(status["admission_errors"].get<std::uint64_t>() >= 1,
+              "ADMIT: the refused decision must count as an admission error");
+        check(status["rejected_observations"].get<std::uint64_t>() == 0,
+              "ADMIT: the refused decision must not count as a rule reject");
+        check(status["dropped_observations"].get<std::uint64_t>() == 0,
+              "ADMIT: the refused decision must not count as dropped");
+        registry.deinit();
+    }
+
     // S1 on is guarded by the whole existing suite (default options keep the
     // gate open); this case pins the default itself.
     {
@@ -1700,7 +1779,8 @@ void run_admit(const std::string& base)
 
     pass_case("ADMIT",
               "capture_all gate: off+off registers nothing, default/rule register with "
-              "their lists, a rule reject stays out and is counted");
+              "their lists, a rule reject stays out and is counted, a bare accept falls "
+              "back to the configured defaults or is refused without them");
 }
 
 // ---------------------------------------------------------------------------

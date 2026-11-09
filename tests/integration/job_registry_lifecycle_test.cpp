@@ -118,6 +118,15 @@ void run(const std::string& base)
     }
     // Contract fixtures: one directory per engine-level behaviour.
     {
+        std::filesystem::create_directories(rules_root / "condor_contract_boolonly");
+        std::ofstream boolonly(rules_root / "condor_contract_boolonly" / "condor_job_bare.lua");
+        boolonly << "local rule = {}\n"
+                   "rule.name = \"accept_bare\"\n"
+                   "rule.priority = 10\n"
+                   "function rule.condition(job)\n"
+                   "    return true\n"
+                   "end\n"
+                   "return rule\n";
         std::filesystem::create_directories(rules_root / "condor_contract_table");
         std::ofstream table(rules_root / "condor_contract_table" / "condor_job_table.lua");
         table << "local rule = {}\n"
@@ -355,7 +364,9 @@ void run(const std::string& base)
     // The policy object itself: defaults add the list verbatim, rules decide
     // per job and an error keeps the previous decision. The walk is
     // first-accept-wins: the highest-priority accepting rule selects, a
-    // rejecting rule only declines and never vetoes a later accept.
+    // rejecting rule only declines and never vetoes a later accept. A rule
+    // that accepts without naming collectors falls back to the configured
+    // defaults; with no defaults the decision is refused as an error.
     {
         const Job job = make_common_job();
 
@@ -363,8 +374,9 @@ void run(const std::string& base)
         std::string revision;
         std::string error;
         const auto selected = defaults.select(job, revision, error);
-        check(error.empty() && revision == "defaults" && selected.size() == 1 &&
-                  selected.front() == "cpumem_collector",
+        check(error.empty() && revision == "defaults" && selected.accepted &&
+                  selected.collectors.size() == 1 &&
+                  selected.collectors.front() == "cpumem_collector",
               "auto policy: defaults must return the configured list verbatim");
 
         auto rules = AutoCollectorPolicy::rules(
@@ -373,7 +385,8 @@ void run(const std::string& base)
         check(error.empty(), "auto policy: rule evaluation must not fail: " + error);
         check(revision.rfind("rules:", 0) == 0,
               "auto policy: the rules revision must identify the source");
-        check(accepted.size() == 1 && accepted.front() == "cpumem_collector",
+        check(accepted.accepted && accepted.collectors.size() == 1 &&
+                  accepted.collectors.front() == "cpumem_collector",
               "auto policy: an accepting rule must select its collectors");
 
         // The shared dir accepts with a high-priority rule and declines with
@@ -382,8 +395,9 @@ void run(const std::string& base)
         auto mixed = AutoCollectorPolicy::rules(
             (rules_root / "condor_jobs").string(), "condor_job_");
         const auto mixed_selected = mixed.select(job, revision, error);
-        check(error.empty() && mixed_selected.size() == 1 &&
-                  mixed_selected.front() == "cpumem_collector",
+        check(error.empty() && mixed_selected.accepted &&
+                  mixed_selected.collectors.size() == 1 &&
+                  mixed_selected.collectors.front() == "cpumem_collector",
               "auto policy: a declining rule must not veto the accepting rule");
 
         // A high-priority decline followed by a low-priority accept: the walk
@@ -391,14 +405,16 @@ void run(const std::string& base)
         auto ordered = AutoCollectorPolicy::rules(
             (rules_root / "condor_order").string(), "condor_job_");
         const auto late = ordered.select(job, revision, error);
-        check(error.empty() && late.size() == 1 && late.front() == "io_collector",
+        check(error.empty() && late.accepted && late.collectors.size() == 1 &&
+                  late.collectors.front() == "io_collector",
               "auto policy: the walk must continue past a declining rule");
 
         // Two accepting rules: only the higher-priority one selects.
         auto both = AutoCollectorPolicy::rules(
             (rules_root / "condor_order_both").string(), "condor_job_");
         const auto first_win = both.select(job, revision, error);
-        check(error.empty() && first_win.size() == 1 && first_win.front() == "io_collector",
+        check(error.empty() && first_win.accepted && first_win.collectors.size() == 1 &&
+                  first_win.collectors.front() == "io_collector",
               "auto policy: the first accepting rule must win exclusively");
 
         // The collector string is a comma-separated list: trimmed, empty
@@ -406,30 +422,52 @@ void run(const std::string& base)
         auto comma = AutoCollectorPolicy::rules(
             (rules_root / "condor_contract_comma").string(), "condor_job_");
         const auto list = comma.select(job, revision, error);
-        check(error.empty() && list.size() == 2 &&
-                  ((list[0] == "cpumem_collector" && list[1] == "io_collector") ||
-                   (list[0] == "io_collector" && list[1] == "cpumem_collector")),
+        check(error.empty() && list.accepted && list.collectors.size() == 2 &&
+                  ((list.collectors[0] == "cpumem_collector" &&
+                    list.collectors[1] == "io_collector") ||
+                   (list.collectors[0] == "io_collector" &&
+                    list.collectors[1] == "cpumem_collector")),
               "auto policy: the collector string must split on commas");
+
+        // A rule that accepts without naming collectors: the configured
+        // defaults become the selection.
+        auto bare = AutoCollectorPolicy::rules(
+            (rules_root / "condor_contract_boolonly").string(), "condor_job_",
+            {"cpumem_collector", "io_collector"});
+        const auto fallback = bare.select(job, revision, error);
+        check(error.empty() && fallback.accepted && fallback.collectors.size() == 2,
+              "auto policy: a bare accept must fall back to the configured defaults");
+
+        // The same bare accept without configured defaults: the decision is
+        // refused as an error, not silently turned into a reject.
+        auto bare_no_defaults = AutoCollectorPolicy::rules(
+            (rules_root / "condor_contract_boolonly").string(), "condor_job_");
+        const auto refused = bare_no_defaults.select(job, revision, error);
+        check(!error.empty() && !refused.accepted && refused.collectors.empty(),
+              "auto policy: a bare accept without defaults must be refused");
+        error.clear();
 
         // Contract violations are errors, not verdicts: the table format is
         // gone, and a non-string second return rejects the evaluation.
         auto table = AutoCollectorPolicy::rules(
             (rules_root / "condor_contract_table").string(), "condor_job_");
         const auto table_selected = table.select(job, revision, error);
-        check(!error.empty() && table_selected.empty(),
+        check(!error.empty() && !table_selected.accepted && table_selected.collectors.empty(),
               "auto policy: a table return must be an evaluation error");
         error.clear();
         auto bad_second = AutoCollectorPolicy::rules(
             (rules_root / "condor_contract_second").string(), "condor_job_");
         const auto bad_second_selected = bad_second.select(job, revision, error);
-        check(!error.empty() && bad_second_selected.empty(),
+        check(!error.empty() && !bad_second_selected.accepted &&
+                  bad_second_selected.collectors.empty(),
               "auto policy: a non-string second return must be an evaluation error");
         error.clear();
 
         auto broken = AutoCollectorPolicy::rules(
             (rules_root / "does-not-exist").string(), "nope_");
         const auto none = broken.select(job, revision, error);
-        check(none.empty(), "auto policy: a rules policy with no rules selects nothing");
+        check(!none.accepted && none.collectors.empty(),
+              "auto policy: a rules policy with no rules selects nothing");
     }
 
     // A14/A32: facts durable but the initial intent write failed. The result

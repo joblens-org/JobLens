@@ -23,10 +23,12 @@
 //                    (use_rules=false: no per-job decision at all).
 //   * rules:         the Lua rule engine decides per job (use_rules=true:
 //                    the first accepting rule in priority order wins and
-//                    its list is the selection; nobody accepting = empty
-//                    selection). An evaluation error is reported to the
-//                    caller, which keeps the previous decision instead of
-//                    guessing.
+//                    its list is the selection). An accepted rule that does
+//                    not name collectors falls back to the configured
+//                    default list; with no defaults configured that is an
+//                    error and the decision is refused. An evaluation error
+//                    is reported to the caller, which keeps the previous
+//                    decision instead of guessing.
 #pragma once
 
 #include <memory>
@@ -39,18 +41,30 @@
 
 class AutoCollectorPolicy {
 public:
+    // One selection verdict. `accepted` is the rule engine's own verdict
+    // (rules mode); `collectors` is the selection to apply — a rule's list,
+    // the configured defaults when the rule accepted without naming any, or
+    // the verbatim configured list in defaults mode.
+    struct Decision {
+        bool accepted = false;
+        std::vector<std::string> collectors;
+    };
+
     AutoCollectorPolicy() = default;
 
     static AutoCollectorPolicy defaults(std::vector<std::string> collectors);
-    static AutoCollectorPolicy rules(std::string rules_dir, std::string rules_prefix);
+    // `fallback_collectors` is the per-type auto_add_collectors list: it is
+    // the selection for a rule that accepts without naming collectors.
+    static AutoCollectorPolicy rules(std::string rules_dir, std::string rules_prefix,
+                                     std::vector<std::string> fallback_collectors = {});
 
     bool enabled() const { return mode_ != Mode::Disabled; }
 
     // `policy_revision` identifies the decision source in the binding record;
-    // `error` is non-empty when the rule engine failed (the caller then keeps
-    // the previous decision rather than applying the returned list).
-    std::vector<std::string> select(const Job& job, std::string& policy_revision,
-                                    std::string& error) const;
+    // `error` is non-empty when the rule engine failed or an accepted rule
+    // named no collectors and no fallback list is configured (the caller then
+    // keeps the previous decision rather than applying the returned list).
+    Decision select(const Job& job, std::string& policy_revision, std::string& error) const;
 
 private:
     enum class Mode { Disabled, Defaults, Rules };
@@ -65,6 +79,8 @@ private:
     };
 
     Mode mode_ = Mode::Disabled;
+    // Defaults mode: the verbatim selection for every job. Rules mode: the
+    // fallback for a rule that accepts without naming collectors.
     std::vector<std::string> defaults_;
     std::string rules_dir_;
     std::string rules_prefix_;

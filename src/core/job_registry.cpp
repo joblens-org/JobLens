@@ -656,14 +656,16 @@ std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const
 
     std::string revision;
     std::string error;
-    const auto collectors = policy->second.select(job, revision, error);
+    const auto decision = policy->second.select(job, revision, error);
     if (!error.empty()) {
-        // Engine failure keeps the old decision (plan section 6.1): nothing
-        // is registered now and the observation is not a reject — the next
-        // one re-evaluates with the same evidence plus time.
+        // Engine failure or a refused decision (accepted without collectors
+        // and no defaults configured) keeps the old decision (plan section
+        // 6.1): nothing is registered now and the observation is neither a
+        // reject nor a drop — the next one re-evaluates with the same
+        // evidence plus time.
         spdlog::warn("JobRegistry: admission evaluation failed for '{}' ({}); the "
                      "observation is not registered",
-                      job.NativeJobID, error);
+                     job.NativeJobID, error);
         {
             std::lock_guard<std::mutex> lock(hb_mtx_);
             ++hb_admission_errors_;
@@ -675,26 +677,25 @@ std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const
     if (state->second == AutoAdd::Default) {
         // Defaults mode: the (possibly empty) configured list is the initial
         // selection; an empty list registers the job with no collectors.
-        InitialDecision decision;
-        decision.register_job = true;
-        decision.initial_collectors = collectors;
-        decision.policy_revision = revision;
-        return decision;
+        InitialDecision default_decision;
+        default_decision.register_job = true;
+        default_decision.initial_collectors = decision.collectors;
+        default_decision.policy_revision = revision;
+        return default_decision;
     }
-    // Rules mode: reject = no registration at all (S1 off), unlike the
-    // blanket mode where a reject keeps the job inventoried with an
-    // empty selection. NOTE: select() currently conflates "rule said
-    // reject" with "rule said accept with zero collectors" — both return
-    // an empty vector. Until select() exposes the verdict separately,
-    // an accept-with-empty-list is indistinguishable from reject here.
-    if (collectors.empty()) {
+    // Rules mode: the rule's own verdict decides — reject = no registration
+    // at all (S1 off), unlike the blanket mode where a reject keeps the job
+    // inventoried with an empty selection. An accept without collectors has
+    // already resolved to the configured defaults inside the policy (or was
+    // refused there as an error).
+    if (!decision.accepted) {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         ++hb_rejected_observations_;
         return std::nullopt;
     }
     InitialDecision accepted;
     accepted.register_job = true;
-    accepted.initial_collectors = collectors;
+    accepted.initial_collectors = decision.collectors;
     accepted.policy_revision = revision;
     return accepted;
 }
@@ -1208,9 +1209,10 @@ JobRegistry::armInventory(const JobRegistryOptions& options)
 
     // Automatic selection is armed per adapter name from the resolved
     // tri-state: Default adds the configured defaults to every job, Rule
-    // asks the rule engine per job (reject = empty selection, the job stays
-    // inventoried). Off arms nothing — the type is inventoried with no
-    // automatic collectors.
+    // asks the rule engine per job (the first accepting rule selects; a rule
+    // that accepts without naming collectors falls back to the configured
+    // defaults, and without defaults the decision is refused). Off arms
+    // nothing — the type is inventoried with no automatic collectors.
     for (const auto& [adapter_name, settings] : config.settings) {
         switch (settings.auto_add) {
             case AutoAdd::Off:
@@ -1220,8 +1222,8 @@ JobRegistry::armInventory(const JobRegistryOptions& options)
                     AutoCollectorPolicy::defaults(settings.default_collectors);
                 break;
             case AutoAdd::Rule:
-                auto_policies_[adapter_name] =
-                    AutoCollectorPolicy::rules(settings.rules_dir, settings.rules_prefix);
+                auto_policies_[adapter_name] = AutoCollectorPolicy::rules(
+                    settings.rules_dir, settings.rules_prefix, settings.default_collectors);
                 break;
         }
     }
@@ -1360,17 +1362,21 @@ std::optional<JobRegistry::AutoDecision> JobRegistry::autoSelectionFor(
     if (policy == auto_policies_.end() || !policy->second.enabled()) return std::nullopt;
     std::string revision;
     std::string error;
-    const auto collectors = policy->second.select(job, revision, error);
+    const auto decision = policy->second.select(job, revision, error);
     if (!error.empty()) {
         spdlog::warn("JobRegistry: automatic selection failed for JobID {}; keeping the "
                      "previous decision: {}",
                      job.JobID, error);
         return std::nullopt;
     }
-    AutoDecision decision;
-    decision.collectors = collectors;
-    decision.policy_revision = revision;
-    return decision;
+    // A rejecting rule resolves to an empty selection here: the job stays
+    // inventoried with no automatic collectors (blanket-mode semantics). An
+    // accept without collectors has already resolved to the configured
+    // defaults inside the policy.
+    AutoDecision resolved;
+    resolved.collectors = decision.collectors;
+    resolved.policy_revision = revision;
+    return resolved;
 }
 
 bool JobRegistry::applyAutoSelection(uint64_t internal_id,

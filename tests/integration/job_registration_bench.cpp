@@ -688,13 +688,14 @@ int main(int argc, char** argv)
             std::string revision;
             std::string error;
             const auto t0 = Clock::now();
-            const auto collectors = policy.select(*probe_job, revision, error);
+            const auto decision = policy.select(*probe_job, revision, error);
             const auto t1 = Clock::now();
             lua_calls.push_back(elapsed_us(t0, t1));
             if (!error.empty()) ++lua_errors;
-            if (collectors.empty()) ++lua_rejected;
+            if (!decision.accepted) ++lua_rejected;
+            else if (decision.collectors.empty()) ++lua_rejected;
             else if (lua_collectors_sample.empty()) {
-                for (const auto& name : collectors) lua_collectors_sample += name + " ";
+                for (const auto& name : decision.collectors) lua_collectors_sample += name + " ";
             }
         }
     }
