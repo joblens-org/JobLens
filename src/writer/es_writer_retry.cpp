@@ -146,6 +146,12 @@ void ESWriter::run_retry_rounds()
         spdlog::warn("elasticsearch_writer: retry round={}/{}, documents={}, backoff_ms={}",
                      attempt, opt_.max_retries, retry_documents_.size(), wait_ms);
         std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+        // The budget booked the set that failed before this round. Release it
+        // and let this round's failures re-book only the documents that stay
+        // alive: consecutive 503 rounds must not accumulate one reservation
+        // per document per round, or a budget sized for the live set would
+        // exhaust after the first retry.
+        release_retry_budget();
         auto pending = std::move(retry_documents_);
         retry_documents_.clear();
         std::vector<BulkDocument> chunk;

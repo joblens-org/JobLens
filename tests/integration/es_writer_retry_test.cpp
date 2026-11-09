@@ -40,7 +40,8 @@ int main(int argc, char** argv) {
             res.set_content("rejected", "text/plain");
             return;
         }
-        if (scenario == "503" || (scenario == "recover" && attempt == 1)) {
+        if (scenario == "503" || (scenario == "recover" && attempt == 1)
+            || (scenario == "recover2" && attempt <= 2)) {
             res.status = 503;
             res.set_content("unavailable", "text/plain");
             return;
@@ -154,6 +155,30 @@ int main(int argc, char** argv) {
         oversized.shutdown();
         check(requests.empty(), "超限文档被重试");
         config.getRawNode("es_test")["max_bulk_bytes"] = 1048576;
+        // 预算只需容纳实际同时存活的重试副本：连续两轮 503 后第三轮成功，
+        // 每个存活副本在重试期间只允许占用一份字节预算。
+        scenario = "success";
+        requests.clear();
+        run("success", 2);
+        const auto batch_bytes = requests[0].size();
+        config.getRawNode("writers_config")["max_pending_bytes"] = static_cast<int>(batch_bytes);
+        config.getRawNode("writers_config")["max_record_bytes"] = static_cast<int>(batch_bytes);
+        scenario = "recover2";
+        requests.clear();
+        times.clear();
+        {
+            TestWriter flaky("flaky", "ESWriter", "es_test");
+            flaky.set_perf(false, 0);
+            const bool first_ok = flaky.flush_impl(batch);
+            check(!first_ok, "首轮 503 误判成功");
+            flaky.on_flush_error(batch);
+            check(requests.size() == 3, "连续两轮 503 后必须重试到第三轮成功");
+            check(requests[1] == requests[0] && requests[2] == requests[0], "重试改变了序列化文档");
+            flaky.shutdown();
+        }
+        std::cout << "PASS: the retry budget tracks only the live retry set\n";
+        config.getRawNode("writers_config")["max_pending_bytes"] = 67108864;
+        config.getRawNode("writers_config")["max_record_bytes"] = 8388608;
         for (const auto& invalid : std::vector<std::pair<std::string, int>>{{"max_retries", -1}, {"max_retries", 11},
                 {"retry_initial_backoff_ms", 0}, {"retry_max_backoff_ms", 1}, {"write_timeout", 0}}) {
             auto node = config.getRawNode("es_test");
