@@ -1081,7 +1081,7 @@ int main(int argc, char** argv)
 
         JobRegistryOptions options;
         options.db_path = base + "/job.db";
-        options.enable_inventory_maintenance = false;
+        options.test_static_inventory = true;
         options.enable_pid_tracker = false;
         options.register_rpc = true;
         JobRegistry registry(options);

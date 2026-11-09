@@ -134,9 +134,6 @@ struct AutoSelection {
 // watchers, eBPF or RPC registration.
 struct JobRegistryOptions {
     std::string db_path;                 // empty: job_registry_config.job_db_path
-    // Start the inventory heartbeat (discovery adapters + maintenance) in the
-    // constructor. Tests and store-only instances disable it.
-    bool enable_inventory_maintenance = true;
     bool enable_pid_tracker = true;
     bool register_rpc = true;
     // --- heartbeat test seams (used instead of the config-driven adapters) --
@@ -147,6 +144,12 @@ struct JobRegistryOptions {
     // With this flag the heartbeat runs without reading Config (test wiring;
     // combine with test_sources, or leave it empty for legacy-only upkeep).
     bool test_heartbeat = false;
+    // Test-only escape hatch: construct a purely static inventory registry
+    // (no heartbeat, no discovery sources, no maintenance pass — only the
+    // restored rows, manual CRUD, the read surface and explicit retirement).
+    // Production never sets it: the inventory stack stays armed so registered
+    // jobs keep their retirement/checkpoint upkeep.
+    bool test_static_inventory = false;
     // Liveness probe overrides (empty = production /proc/cgroup probes).
     ProcessLivenessProbe test_process_probe;
     CgroupMembershipProbe test_cgroup_probe;

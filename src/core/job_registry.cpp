@@ -358,8 +358,10 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
     // (the sink must exist before any poll thread), run the first
     // authoritative pass (blocking: the inventory is settled before the RPC
     // surface opens), publish the status providers and finally start the
-    // maintenance worker.
-    if (options.enable_inventory_maintenance) {
+    // maintenance worker. Production always arms this stack (a registered
+    // job needs retirement/checkpoint upkeep); the purely static form is a
+    // test-only escape hatch (test_static_inventory).
+    if (!options.test_static_inventory) {
         resetHeartbeatState();
         installHeartbeatSink();
         const InventoryWiring wiring = armInventory(options);

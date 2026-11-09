@@ -345,7 +345,6 @@ JobRegistryOptions heartbeat_options(const std::string& path, FakeSource& source
     options.db_path = path;
     options.enable_pid_tracker = false;
     options.register_rpc = false;
-    options.enable_inventory_maintenance = true;
     options.test_sources = {{"condor", &source}};
     options.test_process_probe = probes.process_probe();
     options.test_cgroup_probe = probes.cgroup_probe();
@@ -360,7 +359,6 @@ JobRegistryOptions legacy_heartbeat_options(const std::string& path, FakeProbes&
     options.db_path = path;
     options.enable_pid_tracker = false;
     options.register_rpc = false;
-    options.enable_inventory_maintenance = true;
     options.test_process_probe = probes.process_probe();
     options.test_cgroup_probe = probes.cgroup_probe();
     options.test_heartbeat = true;
@@ -1254,7 +1252,7 @@ void run_a25(const std::string& base)
             // background pass races the assertion).
             FakeSource source2("condor");
             auto restart_options = heartbeat_options(path, source2, probes);
-            restart_options.enable_inventory_maintenance = false;
+            restart_options.test_static_inventory = true;
             JobRegistry registry(restart_options);
             const auto record = registry.inventoryRecord(closing_id);
             check(record.has_value() && record->state == "closing",
@@ -1415,7 +1413,7 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
         options.db_path = path;
         options.enable_pid_tracker = false;
         options.register_rpc = false;
-        options.enable_inventory_maintenance = false;
+        options.test_static_inventory = true;
         options.test_process_probe = probes.process_probe();
         options.test_cgroup_probe = probes.cgroup_probe();
         options.test_heartbeat = true;

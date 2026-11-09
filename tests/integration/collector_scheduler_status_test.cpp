@@ -939,7 +939,7 @@ void run(const std::string& base) {
         std::filesystem::remove_all(live_db);
         JobRegistryOptions options;
         options.db_path = live_db;
-        options.enable_inventory_maintenance = false;
+        options.test_static_inventory = true;
         options.enable_pid_tracker = false;
         options.register_rpc = false;
         JobRegistry archive(options);
