@@ -42,11 +42,25 @@ struct BaseWriter::Buffer
 
 namespace {
 
-std::size_t limit_for(const std::string& config_name, const char* key, int fallback)
+// A queue limit is configured as an int and must stay one until it is proven
+// positive: converting a negative value to size_t up front would wrap it into
+// a huge number and silently bypass the limit. A value that is explicitly
+// configured but does not parse as an int is rejected instead of silently
+// falling back to the default.
+std::size_t positive_limit(const std::string& writer_name, const char* key,
+                           const std::string& override_section, int fallback)
 {
     auto& config = Config::instance();
-    if (config.has(config_name, key)) return static_cast<std::size_t>(config.getInt(config_name, key, fallback));
-    return static_cast<std::size_t>(config.getInt("writers_config", key, fallback));
+    int value = fallback;
+    if (!override_section.empty() && config.has(override_section, key))
+        value = config.getInt(override_section, key);
+    else if (config.has("writers_config", key))
+        value = config.getInt("writers_config", key);
+    if (value <= 0)
+        throw std::invalid_argument("BaseWriter '" + writer_name + "': '" + key +
+                                    "' must be a positive integer, got " +
+                                    std::to_string(value));
+    return static_cast<std::size_t>(value);
 }
 
 } // namespace
@@ -56,15 +70,13 @@ BaseWriter::BaseWriter(std::string name, std::string type, std::string config_na
     : name_(std::move(name)),
       type_(std::move(type)),
       config_name_(std::move(config_name)),
-      buf_capacity_(static_cast<std::size_t>(Config::instance().getInt("writers_config", "buffer_capacity", 1024))),
-      max_pending_records_(limit_for(config_name_, "max_pending_records", 4096)),
-      max_pending_bytes_(limit_for(config_name_, "max_pending_bytes", 67108864)),
-      max_record_bytes_(limit_for(config_name_, "max_record_bytes", 8388608)),
+      buf_capacity_(positive_limit(name_, "buffer_capacity", "", 1024)),
+      max_pending_records_(positive_limit(name_, "max_pending_records", config_name_, 4096)),
+      max_pending_bytes_(positive_limit(name_, "max_pending_bytes", config_name_, 67108864)),
+      max_record_bytes_(positive_limit(name_, "max_record_bytes", config_name_, 8388608)),
       front_(std::make_unique<Buffer>(buf_capacity_)),
       back_(std::make_unique<Buffer>(buf_capacity_))
 {
-    if (max_pending_records_ == 0 || max_pending_bytes_ == 0 || max_record_bytes_ == 0)
-        throw std::invalid_argument("BaseWriter '" + name_ + "': queue limits must be positive integers");
     if (max_record_bytes_ > max_pending_bytes_)
         throw std::invalid_argument("BaseWriter '" + name_ + "': max_record_bytes cannot exceed max_pending_bytes");
     // 所有 worker 可见字段初始化完成后才启动线程。

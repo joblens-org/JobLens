@@ -120,7 +120,49 @@ job_registry_config:
   job_db_path: $work/lifecycle.db
 EOF
 
+cat > "$work/limits_override.yaml" <<EOF
+limits_test: {scenario: overrides}
+writers_config:
+  buffer_capacity: 256
+  max_pending_records: 4096
+  max_pending_bytes: 67108864
+  max_record_bytes: 8388608
+  writers: []
+ctl_cfg: {}
+neg_records_cfg: {max_pending_records: -5}
+zero_records_cfg: {max_pending_records: 0}
+neg_bytes_cfg: {max_pending_bytes: -1}
+zero_bytes_cfg: {max_pending_bytes: 0}
+neg_record_bytes_cfg: {max_record_bytes: -3}
+zero_record_bytes_cfg: {max_record_bytes: 0}
+huge_records_cfg: {max_pending_records: 4294967296}
+huge_bytes_cfg: {max_pending_bytes: 18446744073709551615}
+EOF
+cat > "$work/limits_global_buffer.yaml" <<EOF
+limits_test: {scenario: global_buffer}
+writers_config:
+  buffer_capacity: -9
+  max_pending_records: 4096
+  max_pending_bytes: 67108864
+  max_record_bytes: 8388608
+  writers: []
+ctl_cfg: {}
+EOF
+cat > "$work/limits_global_records.yaml" <<EOF
+limits_test: {scenario: global_records}
+writers_config:
+  buffer_capacity: 256
+  max_pending_records: -7
+  max_pending_bytes: 67108864
+  max_record_bytes: 8388608
+  writers: []
+ctl_cfg: {}
+EOF
+
 run_test output_contract_test "$work/contract.yaml"
 run_test output_routing_test "$work/routing.yaml"
 run_test collector_output_test "$work/collector_output"
 run_test writer_manager_lifecycle_test "$work/wm_lifecycle.yaml"
+run_test writer_queue_limits_test "$work/limits_override.yaml"
+run_test writer_queue_limits_test "$work/limits_global_buffer.yaml"
+run_test writer_queue_limits_test "$work/limits_global_records.yaml"
