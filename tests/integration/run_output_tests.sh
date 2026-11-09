@@ -103,6 +103,24 @@ run_test() {
     timeout 120 "$work/$name" "$config"
 }
 
+cat > "$work/wm_lifecycle.yaml" <<EOF
+writers_config:
+  buffer_capacity: 256
+  max_pending_records: 4096
+  max_pending_bytes: 67108864
+  max_record_bytes: 8388608
+  writers:
+EOF
+for i in $(seq 0 99); do
+    printf '    - {name: wm_probe_%s, type: ProbeWriter, config: wm_cfg}\n' "$i" >> "$work/wm_lifecycle.yaml"
+done
+cat >> "$work/wm_lifecycle.yaml" <<EOF
+wm_cfg: {}
+job_registry_config:
+  job_db_path: $work/lifecycle.db
+EOF
+
 run_test output_contract_test "$work/contract.yaml"
 run_test output_routing_test "$work/routing.yaml"
 run_test collector_output_test "$work/collector_output"
+run_test writer_manager_lifecycle_test "$work/wm_lifecycle.yaml"

@@ -47,8 +47,8 @@ public:
 
     template <typename T>
     void registerWriter(std::string name) {
-        factories_.emplace(std::move(name), [](std::string name, std::string type, std::string config_name) -> std::unique_ptr<BaseWriter> {
-            return std::make_unique<T>(name, type, config_name);
+        factories_.emplace(std::move(name), [](std::string name, std::string type, std::string config_name) -> std::shared_ptr<BaseWriter> {
+            return std::make_shared<T>(name, type, config_name);
         });
     };
 
@@ -63,9 +63,12 @@ public:
     const std::string getFmtHelp(const std::string& name, int width) const;
 
 private:
-    using Factory = std::function<std::unique_ptr<BaseWriter>(std::string name, std::string type, std::string config_name)>;
+    using Factory = std::function<std::shared_ptr<BaseWriter>(std::string name, std::string type, std::string config_name)>;
     std::unordered_map<std::string, Factory> factories_;
-    std::vector<std::unique_ptr<BaseWriter>> writers_;
+    // Shared ownership: a status snapshot hands out shared_ptr copies under
+    // the manager lock and uses them outside it, so a concurrent shutdown can
+    // swap and shut the writers down without destroying one mid-query.
+    std::vector<std::shared_ptr<BaseWriter>> writers_;
     mutable std::mutex m_;
     bool initialized_ = false;
     std::string process_run_id_;
@@ -73,7 +76,7 @@ private:
     std::unordered_map<std::string, WriterHelpInfo> help_;
     void createAllWritersLocked();
     WriterManager();
-    void addWriter(std::unique_ptr<BaseWriter> writer);
+    void addWriter(std::shared_ptr<BaseWriter> writer);
     // writer perf
     void initWriterPerf();
     bool enable_writer_perf = false;

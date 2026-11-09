@@ -149,7 +149,7 @@ void WriterManager::createAllWritersLocked(){
 }
 
 void WriterManager::shutdown() {
-    std::vector<std::unique_ptr<BaseWriter>> writers;
+    std::vector<std::shared_ptr<BaseWriter>> writers;
     {
         std::lock_guard lg(m_);
         spdlog::info("WriterManager: shutting down...");
@@ -159,6 +159,9 @@ void WriterManager::shutdown() {
     for (auto& writer : writers) {
         writer->shutdown();
     }
+    // The writers die when this vector leaves scope. A status query that
+    // copied shared_ptrs under the manager lock keeps every writer it saw
+    // alive until its snapshot is finished, even past this scope.
 }
 
 BaseWriter* WriterManager::find(const std::string& name)
@@ -188,22 +191,23 @@ std::vector<std::string> WriterManager::names() const
 
 nlohmann::json WriterManager::output_status() const
 {
-    std::vector<const BaseWriter*> writers;
+    // Snapshot under the lock, use outside it: the shared_ptr copies keep the
+    // writers alive even if shutdown() swaps and destroys the set in between.
+    std::vector<std::shared_ptr<BaseWriter>> writers;
     {
         std::lock_guard lg(m_);
-        writers.reserve(writers_.size());
-        for (const auto& writer : writers_) writers.push_back(writer.get());
+        writers = writers_;
     }
     nlohmann::json result;
     result["status"] = "ok";
     result["process_run_id"] = process_run_id_;
     result["writer_count"] = writers.size();
     result["writers"] = nlohmann::json::array();
-    for (const auto* writer : writers) result["writers"].push_back(writer->output_status());
+    for (const auto& writer : writers) result["writers"].push_back(writer->output_status());
     return result;
 }
 
-void WriterManager::addWriter(std::unique_ptr<BaseWriter> writer) {
+void WriterManager::addWriter(std::shared_ptr<BaseWriter> writer) {
     std::lock_guard lg(m_);
     writers_.push_back(std::move(writer));
 }
