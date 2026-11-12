@@ -49,7 +49,16 @@ split_two(std::string s, char sep = '.') {
            : std::pair{s.substr(0, p), s.substr(p + 1)};
 }
 
-std::string json2JobOpt(const nlohmann::json& obj, Job& job) {
+namespace {
+
+// The request-level namespace aliases (cluster_name/cluster_tag) contradicted
+// the typed sub_attr facts: an explicit rejection, distinct from a malformed
+// request so the RPC surface can carry the documented error code.
+struct NamespaceConflictError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+std::string json2JobOpt(const nlohmann::json& obj, Job& job, const JobRegistry& registry) {
     auto opt = obj["opt"].get<std::string>();
 
     // Internal IDs parse explicitly as uint64: a JSON number or a decimal
@@ -99,6 +108,7 @@ std::string json2JobOpt(const nlohmann::json& obj, Job& job) {
             .scheduler_host = sub.value("scheduler_host", ""),
             .scheduler_name = sub.value("scheduler_name", ""),
             .owner = sub.value("owner", ""),
+            .collector_host = sub.value("collector_host", ""),
         };
         job.NativeJobID = fmt::format("{}.{}", cid, proc);
     }else if (subtype.compare("slurm") == 0){
@@ -113,6 +123,7 @@ std::string json2JobOpt(const nlohmann::json& obj, Job& job) {
             .auto_update_child = obj.value("auto_update_child", true),
             .job_id = jid,
             .step_id = sid,
+            .cluster_name = sub.value("cluster_name", ""),
             .user = sub.value("user", ""),
         };
         job.NativeJobID = fmt::format("{}", jid);
@@ -133,6 +144,25 @@ std::string json2JobOpt(const nlohmann::json& obj, Job& job) {
         }
     }
 
+    // Structured namespace, by business type: typed schedulers inject the
+    // request-level aliases (cluster_name/cluster_tag) into their typed
+    // facts — the facts win and a contradiction is an explicit rejection —
+    // then render the common fields from the facts. Generic/open-world jobs
+    // keep the common fields as their namespace storage; the aliases land
+    // there verbatim.
+    const std::string request_cluster_name = obj.value("cluster_name", std::string{});
+    const std::string request_cluster_tag = obj.value("cluster_tag", std::string{});
+    if (job.subtype == JobSubType::Condor || job.subtype == JobSubType::Slurm) {
+        if (!registry.adoptNamespaceAliases(job, request_cluster_name, request_cluster_tag)) {
+            throw NamespaceConflictError(
+                "cluster_name/cluster_tag contradict the sub_attr facts");
+        }
+        registry.renderNamespaceOf(job);
+    } else {
+        job.cluster_name = request_cluster_name;
+        job.clusterTag = request_cluster_tag;
+    }
+
     spdlog::info("JobRegistry: json2JobOpt parsed opt={}, type={}, subtype={}, JobID={}, "
                  "PIDs_count={}, Lens_count={}, nativeID={}",
                  opt, type, subtype, job.JobID, job.JobPIDs.size(),
@@ -141,6 +171,7 @@ std::string json2JobOpt(const nlohmann::json& obj, Job& job) {
     return opt;
 }
 
+}  // namespace
 
 namespace {
 
@@ -365,20 +396,6 @@ std::string optional_string(const nlohmann::json& node, const char* key)
     throw std::runtime_error(std::string(key) + " must be a string");
 }
 
-// Condor namespaces separate schedds. A selector without a cluster_tag cannot
-// pick between them, so it matches the whole cluster and then reports the
-// ambiguity instead of guessing one schedd.
-bool namespace_matches(const CanonicalIdentity& stored, const NativeSelector& selector,
-                       const CanonicalIdentity& requested)
-{
-    if (selector.adapter != kAdapterCondor)
-        return stored.cluster_namespace == requested.cluster_namespace;
-    if (!selector.cluster_tag.empty())
-        return stored.cluster_namespace == requested.cluster_namespace;
-    if (stored.cluster_namespace == requested.cluster_namespace) return true;
-    return stored.cluster_namespace.rfind(requested.cluster_namespace + "@", 0) == 0;
-}
-
 // One on-demand authoritative pass through the registry heartbeat. Returns
 // false when no controller is running, so callers keep an explicit "not found"
 // instead of inventing a record. Never allocates ids or guesses an identity.
@@ -412,12 +429,17 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
     }
 
     std::vector<JobRecord> matches;
+    // The selector's namespace facts vs the row's typed facts, compared in
+    // the adapter-owned structured form (never by re-parsing the combined
+    // canonical namespace).
+    const auto selector_facts = registry.selectorFactsOf(selector);
     for (auto& record : registry.inventoryRecords()) {
         if (is_reserved_internal_id(record.internal_id)) continue;
         if (!record.identity_complete) continue;
         if (record.identity.adapter != identity->adapter) continue;
         if (record.identity.canonical_native != identity->canonical_native) continue;
-        if (!namespace_matches(record.identity, selector, *identity)) continue;
+        if (!namespace_facts_compatible(selector_facts, registry.namespaceFactsOf(record.job)))
+            continue;
         if (!identity->step_id.empty() && record.identity.step_id != identity->step_id) continue;
         matches.push_back(std::move(record));
     }
@@ -535,26 +557,26 @@ nlohmann::json collection_target_json(JobRegistry& registry, const JobRecord& re
 }
 
 // Legacy add identity. The supplied JobID is never consulted; only the
-// typed sub_attr plus the scheduler namespace the discovery sources use.
-std::optional<NativeSelector> legacy_add_selector(const Job& job, const nlohmann::json& req)
+// typed sub_attr facts (already holding any injected request aliases) plus
+// the local scheduler configuration the discovery sources use.
+std::optional<NativeSelector> legacy_add_selector(const Job& job)
 {
     NativeSelector selector;
-    const auto sub = req.contains("sub_attr") && req["sub_attr"].is_object()
-                         ? req["sub_attr"] : nlohmann::json::object();
     if (job.subtype == JobSubType::Condor) {
         selector.adapter = kAdapterCondor;
         selector.native_job_id = job.NativeJobID;
-        if (const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr))
+        if (const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr)) {
             selector.native_job_id = fmt::format("{}.{}", attr->cluster_id, attr->proc_id);
-        selector.cluster_tag = sub.value("scheduler_name", std::string{});
-        selector.cluster_name = sub.value("collector_host", std::string{});
-        if (selector.cluster_name.empty()) selector.cluster_name = job.cluster_name;
+            selector.cluster_name = attr->collector_host;
+            selector.cluster_tag = attr->scheduler_name;
+        }
         if (selector.cluster_name.empty())
             selector.cluster_name = Utils::get_condor_collector_host();
     } else if (job.subtype == JobSubType::Slurm) {
         selector.adapter = kAdapterSlurm;
         selector.native_job_id = job.NativeJobID;
-        selector.cluster_name = sub.value("cluster_name", std::string{});
+        if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr))
+            selector.cluster_name = attr->cluster_name;
         if (selector.cluster_name.empty()) selector.cluster_name = SlurmJob::get_cluster_name();
         if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr)) {
             if (attr->step_id != 0) {
@@ -876,14 +898,14 @@ void registerInventoryRpc(JobRegistry& registry) {
             nlohmann::json j;
             try {
                 Job job;
-                std::string opt = json2JobOpt(req, job);
+                std::string opt = json2JobOpt(req, job, registry);
                 if(opt.compare("add") == 0){
                     // The manual add and update routes are one upsert.
                     // The identity selector (kept here as the compatibility
                     // resolution) routes a request naming a live inventoried
                     // instance to UPDATE; a legacy JobID is only a hint and
                     // never allocates or overrides the internal id.
-                    j = registry.upsertJob(job, req, legacy_add_selector(job, req));
+                    j = registry.upsertJob(job, req, legacy_add_selector(job));
                 }else if(opt.compare("remove") == 0){
                     // Remove stops collection for resolved live jobs and
                     // keeps the inventory fact instead of forgetting the
@@ -894,6 +916,10 @@ void registerInventoryRpc(JobRegistry& registry) {
                     j["code"] = "invalid_request";
                     j["msg"] = "invalid operation, expected 'add' or 'remove'";
                 }
+            } catch (const NamespaceConflictError& e) {
+                j["status"] = "error";
+                j["code"] = "namespace_conflict";
+                j["msg"] = fmt::format("failed to add job: {}", e.what());
             } catch (const std::exception& e) {
                 j["status"] = "error";
                 j["code"] = "invalid_request";
@@ -1365,4 +1391,3 @@ void registerInventoryRpc(JobRegistry& registry) {
         }
     );
 }
-

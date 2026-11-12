@@ -323,11 +323,35 @@ public:
     uint64_t attributionPushedEvents() const;
     uint64_t attributionDroppedEvents() const;
 
+    // ---- structured namespace facade ---------------------------------------
+    //
+    // The scheduler-owned namespace semantics (scheduler_adapter.hpp) reached
+    // through this registry's live adapters. Every caller that must compare,
+    // inject or render namespace facts goes through here so no scheduler
+    // knowledge leaks into core call sites. Jobs/selectors without a
+    // configured adapter keep the generic two-component form carried by the
+    // common fields themselves.
+
+    // The structured namespace facts of one Job / one addressing selector.
+    NamespaceFacts namespaceFactsOf(const Job& job) const;
+    NamespaceFacts selectorFactsOf(const NativeSelector& selector) const;
+    // Folds request-level aliases into the typed facts (facts win); false =
+    // the aliases contradict known facts.
+    bool adoptNamespaceAliases(Job& job, const std::string& cluster_name,
+                               const std::string& cluster_tag) const;
+    // Renders the query-side common fields from the typed facts.
+    void renderNamespaceOf(Job& job) const;
+    // Normalizes a Job restored from the store: legacy rows may carry
+    // namespace facts only in the common fields — adopt them into the typed
+    // facts (facts win), then render back.
+    void normalizeRestoredFacts(Job& job) const;
+
     // Test seam only (see StoreFaultMode).
     void injectStoreFaultForTest(StoreFaultMode mode, size_t skip = 0, size_t count = 1);
     void clearStoreFaultsForTest();
 
 private:
+    friend struct JobRegistryNamespaceTestAccess;
     JobRegistry();
     // Which wiring the heartbeat was assembled from: injected test seams or
     // the production configuration/adapter stack.
@@ -467,6 +491,16 @@ private:
     // configured adapter owns the Job — callers keep an incomplete selector
     // rather than guessing.
     ISchedulerAdapter* adapterOf(const Job& job) const;
+    // Interpretation-only adapter access: namespace semantics must not
+    // depend on which discovery types are CONFIGURED. Returns the configured
+    // adapter when the type is armed, otherwise a lazily built and cached
+    // one (never started, facts interpretation only), nullptr for a name no
+    // registered adapter answers to.
+    ISchedulerAdapter* namespaceAdapterOf(const Job& job) const;
+    ISchedulerAdapter* namespaceAdapterNamed(const std::string& name) const;
+    mutable std::mutex namespace_adapter_mtx_;
+    mutable std::map<std::string, std::unique_ptr<ISchedulerAdapter>>
+        namespace_adapters_;
     // Legacy selector reconstruction, shared by manual registration and the
     // refreshJobFacts repair: the adapter owning the facts rebuilds the
     // selector and folds its derived fields onto the Job (backfill only —

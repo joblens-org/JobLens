@@ -70,13 +70,12 @@ public:
         NativeSelector selector;
         if (job.subtype != JobSubType::Slurm) return selector;
         selector.adapter = name_;
-        selector.cluster_name = job.cluster_name;
-        selector.native_job_id = job.NativeJobID;
+        // The typed facts are the namespace source; the common field is
+        // their render (kept as a fallback for facts built before one existed).
         if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr)) {
-            if (selector.cluster_name.empty()) selector.cluster_name = attr->cluster_name;
-            if (selector.native_job_id.empty()) {
+            selector.cluster_name = attr->cluster_name;
+            if (selector.native_job_id.empty())
                 selector.native_job_id = std::to_string(attr->job_id);
-            }
             if (attr->step_id != 0) {
                 if (const auto name = slurm_step_name(attr->step_id)) {
                     selector.step_id = *name;
@@ -85,6 +84,8 @@ public:
                 }
             }
         }
+        if (selector.cluster_name.empty()) selector.cluster_name = job.cluster_name;
+        if (selector.native_job_id.empty()) selector.native_job_id = job.NativeJobID;
         return selector;
     }
 
@@ -94,6 +95,36 @@ public:
                               const CanonicalIdentity& identity) const override
     {
         apply_identity(job, selector, identity);
+    }
+
+    // ---- structured namespace: the cluster name only ----------------------
+    NamespaceFacts namespaceFacts(const Job& job) const override
+    {
+        const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr);
+        return {attr ? attr->cluster_name : std::string{}};
+    }
+    NamespaceFacts selectorNamespaceFacts(const NativeSelector& selector) const override
+    {
+        return {selector.cluster_name};
+    }
+    bool adoptNamespaceAliases(Job& job, const std::string& cluster_name,
+                               const std::string& cluster_tag) const override
+    {
+        (void)cluster_tag;  // Slurm has no schedd-tag namespace component
+        auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr);
+        if (attr == nullptr) return true;
+        if (!cluster_name.empty() && !attr->cluster_name.empty()
+                && cluster_name != attr->cluster_name) return false;
+        if (attr->cluster_name.empty()) attr->cluster_name = cluster_name;
+        return true;
+    }
+    void renderNamespace(Job& job) const override
+    {
+        if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr)) {
+            job.cluster_name = attr->cluster_name;
+            // clusterTag is not a Slurm namespace component and stays as-is:
+            // discovery may carry a display value there.
+        }
     }
 
     std::string cgroupPathOf(const Job& job) const override
@@ -107,8 +138,6 @@ private:
                                const CanonicalIdentity& identity)
     {
         job.NativeJobID = identity.native_job_id;
-        if (!selector.cluster_name.empty()) job.cluster_name = selector.cluster_name;
-        if (!selector.cluster_tag.empty()) job.clusterTag = selector.cluster_tag;
         if (job.jobtype != JobType::Job && job.jobtype != JobType::Sys) {
             job.jobtype = JobType::Job;
         }
@@ -117,7 +146,12 @@ private:
             job.sub_attr = SlurmJobAttr{};
         }
         auto& attr = std::get<SlurmJobAttr>(job.sub_attr);
-        if (attr.cluster_name.empty()) attr.cluster_name = selector.cluster_name;
+        // The typed facts are the single namespace source; fold the resolved
+        // selector's cluster into them (facts win), then render the common
+        // field from the facts (clusterTag is not a Slurm component).
+        if (attr.cluster_name.empty() && !selector.cluster_name.empty())
+            attr.cluster_name = selector.cluster_name;
+        job.cluster_name = attr.cluster_name;
         if (!selector.step_id.empty()) {
             if (const auto numeric = slurm_step_value(selector.step_id)) {
                 attr.step_id = *numeric;

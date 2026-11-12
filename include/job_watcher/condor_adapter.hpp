@@ -74,14 +74,17 @@ public:
         NativeSelector selector;
         if (job.subtype != JobSubType::Condor) return selector;
         selector.adapter = name_;
-        selector.cluster_name = job.cluster_name;
-        selector.cluster_tag = job.clusterTag;
-        selector.native_job_id = job.NativeJobID;
-        if (selector.native_job_id.empty()) {
-            if (const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr)) {
+        // The typed facts are the namespace source; the common fields are
+        // their render (kept as a fallback for facts built before one existed).
+        if (const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr)) {
+            selector.cluster_name = attr->collector_host;
+            selector.cluster_tag = attr->scheduler_name;
+            if (selector.native_job_id.empty())
                 selector.native_job_id = fmt::format("{}.{}", attr->cluster_id, attr->proc_id);
-            }
         }
+        if (selector.cluster_name.empty()) selector.cluster_name = job.cluster_name;
+        if (selector.cluster_tag.empty()) selector.cluster_tag = job.clusterTag;
+        if (selector.native_job_id.empty()) selector.native_job_id = job.NativeJobID;
         return selector;
     }
 
@@ -92,8 +95,6 @@ public:
                               const CanonicalIdentity& identity) const override
     {
         job.subtype = JobSubType::Condor;
-        if (!selector.cluster_name.empty()) job.cluster_name = selector.cluster_name;
-        if (!selector.cluster_tag.empty()) job.clusterTag = selector.cluster_tag;
         if (job.jobtype != JobType::Job && job.jobtype != JobType::Sys) {
             job.jobtype = JobType::Job;
         }
@@ -101,6 +102,14 @@ public:
             job.sub_attr = CondorJobAttr{};
         }
         auto& attr = std::get<CondorJobAttr>(job.sub_attr);
+        // The typed facts are the single namespace source; the resolved
+        // selector's namespace folds into them (facts win), then the common
+        // fields render from the facts.
+        if (attr.collector_host.empty() && !selector.cluster_name.empty())
+            attr.collector_host = selector.cluster_name;
+        if (attr.scheduler_name.empty() && !selector.cluster_tag.empty())
+            attr.scheduler_name = selector.cluster_tag;
+        renderNamespace(job);
         const auto dot = identity.canonical_native.find('.');
         if (dot != std::string::npos) {
             try {
@@ -116,6 +125,38 @@ public:
     {
         const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr);
         return attr ? attr->slots_cgroup_path : std::string{};
+    }
+
+    // ---- structured namespace: pool routing label + schedd name -----------
+    NamespaceFacts namespaceFacts(const Job& job) const override
+    {
+        const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr);
+        return {attr ? attr->collector_host : std::string{},
+                attr ? attr->scheduler_name : std::string{}};
+    }
+    NamespaceFacts selectorNamespaceFacts(const NativeSelector& selector) const override
+    {
+        return {selector.cluster_name, selector.cluster_tag};
+    }
+    bool adoptNamespaceAliases(Job& job, const std::string& cluster_name,
+                               const std::string& cluster_tag) const override
+    {
+        auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr);
+        if (attr == nullptr) return true;  // no typed facts: nothing contradicts
+        if (!cluster_name.empty() && !attr->collector_host.empty()
+                && cluster_name != attr->collector_host) return false;
+        if (!cluster_tag.empty() && !attr->scheduler_name.empty()
+                && cluster_tag != attr->scheduler_name) return false;
+        if (attr->collector_host.empty()) attr->collector_host = cluster_name;
+        if (attr->scheduler_name.empty()) attr->scheduler_name = cluster_tag;
+        return true;
+    }
+    void renderNamespace(Job& job) const override
+    {
+        if (const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr)) {
+            job.cluster_name = attr->collector_host;
+            job.clusterTag = attr->scheduler_name;
+        }
     }
 
 private:

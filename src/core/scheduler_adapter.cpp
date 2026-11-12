@@ -14,6 +14,16 @@
 // SchedulerAdapterRegistry implementation (see scheduler_adapter.hpp).
 #include "core/scheduler_adapter.hpp"
 
+bool namespace_facts_compatible(const NamespaceFacts& left, const NamespaceFacts& right)
+{
+    if (left.size() != right.size()) return false;
+    for (size_t i = 0; i < left.size(); ++i) {
+        if (left[i].empty() || right[i].empty()) continue;  // unknown proves nothing
+        if (left[i] != right[i]) return false;
+    }
+    return true;
+}
+
 #include <spdlog/spdlog.h>
 
 SchedulerAdapterRegistry& SchedulerAdapterRegistry::instance()

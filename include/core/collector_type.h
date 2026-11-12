@@ -241,16 +241,6 @@ using SubAttr = std::variant<CondorJobAttr, CommonJobAttr, SlurmJobAttr, nlohman
 // JSON object the adapter owns (schema, keys, evolution). Built-in attrs
 // stay strongly typed so existing collectors and matchers are untouched.
 
-// Condor scheduler (schedd) attribution comparison with legacy tolerance:
-// when both sides hold the attribution it must be equal to match; either side
-// unknown (empty) keeps the historical match behavior. Rows restored from an
-// old schema may carry an empty scheduler_name (the field sits outside its
-// serialization list), so an unknown row can never contradict a claimed one.
-inline bool scheduler_attribution_equal(const std::string& claimed,
-                                        const std::string& held) {
-    return claimed.empty() || held.empty() || claimed == held;
-}
-
 // SubAttr 匹配器，用于通过 sub_attr 字段匹配作业
 struct SubAttrMatcher {
     // 通用匹配条件
@@ -261,11 +251,6 @@ struct SubAttrMatcher {
     std::optional<size_t> condor_proc_id;
     std::optional<std::string> condor_owner;
     std::optional<pid_t> condor_starter_pid;
-    // Condor scheduler (schedd) attribution. A matcher field is a claim from
-    // the request side: a row holding the same attribution must be equal to
-    // match, a row without it is "unknown" and keeps the legacy behavior.
-    std::optional<std::string> condor_scheduler_name;
-    std::optional<std::string> condor_scheduler_host;
     
     // SlurmJobAttr 匹配字段
     std::optional<size_t> slurm_job_id;
@@ -304,12 +289,6 @@ struct SubAttrMatcher {
                 if (condor_proc_id.has_value() && a.proc_id != condor_proc_id.value()) return false;
                 if (condor_owner.has_value() && a.owner != condor_owner.value()) return false;
                 if (condor_starter_pid.has_value() && a.starter_pid != condor_starter_pid.value()) return false;
-                if (condor_scheduler_name.has_value() &&
-                    !scheduler_attribution_equal(*condor_scheduler_name, a.scheduler_name))
-                    return false;
-                if (condor_scheduler_host.has_value() &&
-                    !scheduler_attribution_equal(*condor_scheduler_host, a.scheduler_host))
-                    return false;
                 spdlog::debug("SubAttrMatcher: CondorJobAttr matched successfully");
                 return true;
             } else if constexpr (std::is_same_v<T, SlurmJobAttr>) {
@@ -359,8 +338,12 @@ struct JobExecution {
 struct Job {
     uint64_t                              JobID{};
     std::string                           NativeJobID{};   // 调度器原生作业ID字符串，用于查询（Condor: cluster_id.proc_id, Slurm: job_id.step_id）
-    std::string                           clusterTag{};    //Job所在集群的标识
-    std::string                           cluster_name{};  // 集群名称（公共属性：Condor=COLLECTOR_HOST, Slurm=SLURM_CLUSTER_NAME）
+    // 命名空间公共字段是 typed sub_attr 的渲染投影（ES job_info 查询契约），
+    // 不是第二事实源：哪个 attr 字段喂哪个分量由 adapter 拥有
+    //（Condor: collector_host/scheduler_name, Slurm: cluster_name）。比较、
+    // 判重与注入永远走结构化事实（ISchedulerAdapter 的 namespace 接口）。
+    std::string                           clusterTag{};    // 渲染：调度器标签（Condor=schedd 名）
+    std::string                           cluster_name{};  // 渲染：集群名（Condor=COLLECTOR_HOST, Slurm=SLURM_CLUSTER_NAME）
     JobType                                 jobtype{JobType::Unknown};
     JobSubType                              subtype{JobSubType::Unknown};
     // Adapter name for open-world schedulers ("" for the built-ins, whose

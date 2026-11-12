@@ -86,6 +86,18 @@ struct AdapterTraits {
     bool kernel_attribution = false;        // participates in pid2job/cgroup2job
 };
 
+// Structured namespace facts one adapter discriminates by: one value per
+// component, empty = unknown. Which typed sub_attr fields feed a component,
+// how request-level aliases fold into them and how the query-side common
+// fields (cluster_name/clusterTag) render from them are adapter implementation
+// details — the virtuals below own every bit of that mapping.
+using NamespaceFacts = std::vector<std::string>;
+
+// Component-wise compatibility: a component where both sides hold a known,
+// different value conflicts; an unknown component (either side empty) proves
+// neither equality nor contradiction. Different shapes never match.
+bool namespace_facts_compatible(const NamespaceFacts& left, const NamespaceFacts& right);
+
 class ISchedulerAdapter {
 public:
     virtual ~ISchedulerAdapter() = default;
@@ -123,6 +135,42 @@ public:
     {
         (void)job;
         return {};
+    }
+
+    // ---- structured namespace (scheduler-owned semantics) -----------------
+    //
+    // The typed sub_attr is the single fact source. The common fields
+    // cluster_name/clusterTag are a rendered projection of those facts —
+    // the ES job_info contract the query side filters on — never an
+    // independent second source. Defaults implement the generic business
+    // (Common jobs, open-world schedulers without a configured adapter):
+    // the common fields ARE the storage, so extract reads them, adoption
+    // has nothing to fold and rendering is a no-op.
+
+    // The namespace facts of one job of this adapter, from its typed facts.
+    virtual NamespaceFacts namespaceFacts(const Job& job) const
+    {
+        return {job.cluster_name, job.clusterTag};
+    }
+    // The namespace facts of a selector addressing jobs of this adapter.
+    virtual NamespaceFacts selectorNamespaceFacts(const NativeSelector& selector) const
+    {
+        return {selector.cluster_name, selector.cluster_tag};
+    }
+    // Fold request-level namespace aliases into the typed facts; existing
+    // facts win. False = the aliases contradict known facts (the caller
+    // rejects the request instead of guessing which side is right).
+    virtual bool adoptNamespaceAliases(Job& job, const std::string& cluster_name,
+                                       const std::string& cluster_tag) const
+    {
+        (void)job; (void)cluster_name; (void)cluster_tag;
+        return true;
+    }
+    // Render the query-side common fields from the typed facts. Idempotent
+    // for facts a watcher already rendered.
+    virtual void renderNamespace(Job& job) const
+    {
+        (void)job;
     }
 
     virtual AdapterTraits traits() const = 0;

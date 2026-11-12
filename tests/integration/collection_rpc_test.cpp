@@ -298,6 +298,14 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     }
     // --- condor native selector resolves one instance -----------------
     {
+        auto selector = condor_selector_json("172.0", "");
+        selector["cluster_name"] = "htcondor01@schedd-a";
+        const auto response = rpc("JobCollection/set",
+                                  collection_request(selector, "set", json::array()));
+        check(response.value("code", "") == "not_found",
+              "a canonical delimiter alias must not target another pool: " + response.dump());
+    }
+    {
         const auto response = rpc(
             "JobCollection/set",
             collection_request(condor_selector_json("172.0", "schedd-a"), "set",
@@ -622,6 +630,14 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
                                {"collector_host", "htcondor01"}}}};
 
     {
+        auto conflicting = add;
+        conflicting["cluster_name"] = "another-pool";
+        const auto response = rpc("JobRegistry/job_opt", conflicting);
+        check(response.value("code", "") == "namespace_conflict",
+              "contradictory top-level and typed pool must be rejected: " + response.dump());
+    }
+
+    {
         const auto response = rpc("JobRegistry/job_opt", add);
         check(response["status"] == "success",
               "legacy add of an inventoried job must succeed: " + response.dump());
@@ -871,6 +887,8 @@ void run_closing_case(JobRegistry& registry, const Fixture& ids)
                            json::array({"cpumem_collector"})));
     check(response["code"] == "generation_closing",
           "a closing instance must reject new intent with generation_closing: " + response.dump());
+    check(test_runtime(registry).completeDrain(ids.condor_extra),
+          "closing case: explicit deferred drain completion must finish retirement");
 }
 
 // The remove two-tier: the default keeps the stop semantics; erase:true

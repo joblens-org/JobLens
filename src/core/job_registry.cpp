@@ -268,11 +268,7 @@ JobStore::WriteOp put_record_op(const JobRecord& record) {
     return op;
 }
 
-// The typed duplicate matcher shared by the CREATE dedup and the manual
-// UPDATE fallback: the native ids plus the request's scheduler (schedd)
-// attribution, so the same cluster_id/proc_id under another schedd can never
-// match. An empty attribution on the request claims nothing and discriminates
-// nothing (the legacy behavior).
+// Screen native fields here; adapters screen structured namespaces below.
 SubAttrMatcher native_duplicate_matcher(const Job& job) {
     SubAttrMatcher matcher;
     matcher.subtype = job.subtype;
@@ -280,10 +276,6 @@ SubAttrMatcher native_duplicate_matcher(const Job& job) {
         matcher.subtype = JobSubType::Condor;
         matcher.condor_cluster_id = attr->cluster_id;
         matcher.condor_proc_id = attr->proc_id;
-        if (!attr->scheduler_name.empty())
-            matcher.condor_scheduler_name = attr->scheduler_name;
-        if (!attr->scheduler_host.empty())
-            matcher.condor_scheduler_host = attr->scheduler_host;
     } else if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr)) {
         matcher.subtype = JobSubType::Slurm;
         matcher.slurm_job_id = attr->job_id;
@@ -292,48 +284,18 @@ SubAttrMatcher native_duplicate_matcher(const Job& job) {
     return matcher;
 }
 
-// The scheduler (schedd) attribution of a row, for the doc-contract limit on
-// the typed-facts route: the typed facts first; when they predate the
-// scheduler_name serialization (rows restored from an old schema carry the
-// field empty) the resolved identity's "@<schedd>" namespace tag is the
-// durable form of the same fact.
-std::string row_scheduler_name(const JobRecord& row) {
-    const auto* attr = std::get_if<CondorJobAttr>(&row.job.sub_attr);
-    if (attr == nullptr) return {};
-    if (!attr->scheduler_name.empty()) return attr->scheduler_name;
-    if (row.identity_complete) {
-        const std::string& ns = row.identity.cluster_namespace;
-        const auto at = ns.rfind('@');
-        if (at != std::string::npos) return ns.substr(at + 1);
-    }
-    return {};
-}
-
-// True when the row may answer a request under the scheduler-discriminating
-// duplicate screen. A row without a resolved identity keeps the legacy
-// tolerance (its scheduler attribution is unknown, so a claimed one cannot
-// contradict it); a row already holding a canonical identity joins only when
-// its scheduler (schedd) attribution agrees with the request. Non-Condor
-// requests carry no scheduler attribution and stay unconditional (the defect
-// this screen closes is Condor-schedd specific).
-bool scheduler_attribution_agrees(const Job& request, const JobRecord& row) {
-    const auto* requested = std::get_if<CondorJobAttr>(&request.sub_attr);
-    if (requested == nullptr) return true;
-    const auto* held = std::get_if<CondorJobAttr>(&row.job.sub_attr);
-    if (held == nullptr) return true;
-    if (!scheduler_attribution_equal(requested->scheduler_name, row_scheduler_name(row)))
-        return false;
-    return scheduler_attribution_equal(requested->scheduler_host, held->scheduler_host);
-}
-
 // The surviving rows of the typed-facts duplicate screen, shared by the
 // CREATE dedup and the UPDATE fallback: sub_attr match plus the
-// scheduler-attribution limit above.
+// adapter-owned namespace limit (structured facts disagree = different job).
+// The namespace semantics live with the adapters; this screen only drives
+// the comparison through the registry facade.
 std::vector<JobRecord> scheduler_screened_duplicates(
-    const Job& request, std::vector<JobRecord> rows) {
+    const JobRegistry& registry, const Job& request, std::vector<JobRecord> rows) {
+    const auto request_facts = registry.namespaceFactsOf(request);
     std::vector<JobRecord> out;
     for (auto& row : rows) {
-        if (!scheduler_attribution_agrees(request, row)) continue;
+        if (!namespace_facts_compatible(request_facts, registry.namespaceFactsOf(row.job)))
+            continue;
         out.push_back(std::move(row));
     }
     return out;
@@ -358,6 +320,74 @@ ISchedulerAdapter* JobRegistry::adapterOf(const Job& job) const {
     for (const auto& adapter : adapters_)
         if (adapter->name() == *wanted) return adapter.get();
     return nullptr;
+}
+
+NamespaceFacts JobRegistry::namespaceFactsOf(const Job& job) const {
+    const auto* adapter = namespaceAdapterOf(job);
+    if (adapter != nullptr) return adapter->namespaceFacts(job);
+    return {job.cluster_name, job.clusterTag};
+}
+
+NamespaceFacts JobRegistry::selectorFactsOf(const NativeSelector& selector) const {
+    const auto* adapter = namespaceAdapterNamed(selector.adapter);
+    if (adapter != nullptr) return adapter->selectorNamespaceFacts(selector);
+    return {selector.cluster_name, selector.cluster_tag};
+}
+
+bool JobRegistry::adoptNamespaceAliases(Job& job, const std::string& cluster_name,
+                                        const std::string& cluster_tag) const {
+    if (const auto* adapter = namespaceAdapterOf(job))
+        return adapter->adoptNamespaceAliases(job, cluster_name, cluster_tag);
+    // No registered adapter answers for this scheduler: the generic business
+    // keeps the aliases in the common fields — the same fields the generic
+    // comparisons read.
+    job.cluster_name = cluster_name;
+    job.clusterTag = cluster_tag;
+    return true;
+}
+
+void JobRegistry::renderNamespaceOf(Job& job) const {
+    if (const auto* adapter = namespaceAdapterOf(job)) adapter->renderNamespace(job);
+}
+
+void JobRegistry::normalizeRestoredFacts(Job& job) const {
+    if (const auto* adapter = namespaceAdapterOf(job)) {
+        // Legacy rows may carry namespace facts only in the common fields;
+        // adopt them into the typed facts (facts win), then render back so
+        // the two can never diverge.
+        adapter->adoptNamespaceAliases(job, job.cluster_name, job.clusterTag);
+        adapter->renderNamespace(job);
+    }
+}
+
+ISchedulerAdapter* JobRegistry::namespaceAdapterNamed(const std::string& name) const {
+    if (name.empty()) return nullptr;
+    for (const auto& adapter : adapters_)
+        if (adapter->name() == name) return adapter.get();
+    std::lock_guard lock(namespace_adapter_mtx_);
+    const auto cached = namespace_adapters_.find(name);
+    if (cached != namespace_adapters_.end()) return cached->second.get();
+    // Built but never armed: the watcher carries no state until a discovery
+    // source starts it, so this instance answers facts questions only.
+    auto built = SchedulerAdapterRegistry::instance().build(name, InventoryTypeSettings{});
+    if (!built) return nullptr;
+    auto* const raw = built.get();
+    namespace_adapters_[name] = std::move(built);
+    return raw;
+}
+
+ISchedulerAdapter* JobRegistry::namespaceAdapterOf(const Job& job) const {
+    const std::string* wanted = &job.subtype_name;
+    std::string enum_fallback;
+    if (wanted->empty()) {
+        switch (job.subtype) {
+            case JobSubType::Condor: enum_fallback = kAdapterCondor; break;
+            case JobSubType::Slurm:  enum_fallback = kAdapterSlurm;  break;
+            default: return nullptr;
+        }
+        wanted = &enum_fallback;
+    }
+    return namespaceAdapterNamed(*wanted);
 }
 
 NativeSelector JobRegistry::legacySelectorOf(Job& job) const {
@@ -477,6 +507,10 @@ void JobRegistry::restoreExistingRecords()
 {
     auto rows = store_->loadAll();
     validateRestoredExecutions(rows);
+    // Legacy rows may carry namespace facts only in the common fields; fold
+    // them into the typed facts so the single-source invariants hold from
+    // the first read.
+    for (auto& row : rows) normalizeRestoredFacts(row.job);
     for (auto& row : rows) publishRecord(std::move(row));
 }
 
@@ -1768,7 +1802,7 @@ bool JobRegistry::createManualJob(const Job& job) {
     // when its scheduler attribution agrees with the request.
     const SubAttrMatcher matcher = native_duplicate_matcher(job_copy);
     const auto duplicates = scheduler_screened_duplicates(
-        job_copy, ownFindActive(
+        *this, job_copy, ownFindActive(
                       [&matcher](const Job& existing) { return matches_job(matcher, existing); }));
     if (!duplicates.empty()) {
         spdlog::warn("JobRegistry: job with matching sub_attr already exists, ignored");
@@ -1899,71 +1933,42 @@ bool JobRegistry::addJob(const Job& job) {
 JobRegistry::ManualTarget JobRegistry::manualUpdateTarget(
     const Job& job, const std::optional<NativeSelector>& selector) {
     ManualTarget target;
-    // Identity resolution first: same adapter/canonical-native/namespace rules
-    // as the RPC target resolution (a Condor selector without a cluster tag
-    // matches the whole cluster namespace).
+    std::vector<JobRecord> duplicates;
+    std::optional<NamespaceFacts> selector_facts;
+    std::optional<CanonicalIdentity> identity;
     if (selector) {
-        const auto identity = canonicalize(*selector);
-        if (identity) {
-            std::vector<JobRecord> matches;
-            for (const auto& record : ownRecords()) {
-                if (record.internal_id == kSystemSentinelJobId) continue;
-                if (!record.identity_complete) continue;
-                if (record.identity.adapter != identity->adapter) continue;
-                if (record.identity.canonical_native != identity->canonical_native)
-                    continue;
-                if (selector->cluster_tag.empty()
-                        ? (record.identity.cluster_namespace !=
-                               identity->cluster_namespace &&
-                           record.identity.cluster_namespace.rfind(
-                               identity->cluster_namespace + "@", 0) != 0)
-                        : record.identity.cluster_namespace !=
-                              identity->cluster_namespace)
-                    continue;
-                if (!identity->step_id.empty() &&
-                    record.identity.step_id != identity->step_id)
-                    continue;
-                matches.push_back(record);
-            }
-            if (!matches.empty()) {
-                // The identity index owns one live row per identity; several
-                // namespace-relaxed matches are an ambiguity the caller must
-                // resolve, never a guess. Ids are reported ascending, exactly
-                // like the RPC target resolution.
-                std::sort(matches.begin(), matches.end(),
-                          [](const JobRecord& lhs, const JobRecord& rhs) {
-                              return lhs.internal_id < rhs.internal_id;
-                          });
-                if (matches.size() > 1) {
-                    target.kind = ManualTarget::Kind::Ambiguous;
-                    for (const auto& match : matches)
-                        target.candidates.push_back(format_internal_id(match.internal_id));
-                    target.message =
-                        fmt::format("native job '{}' matches {} current local instances in "
-                                    "cluster '{}'; add step_id or use scope=job",
-                                    selector->native_job_id, matches.size(),
-                                    selector->cluster_name);
-                    return target;
-                }
-                target.record = matches.front();
-                target.kind = ownHasActive(target.record.internal_id)
-                                  ? ManualTarget::Kind::Update
-                                  : ManualTarget::Kind::Closing;
+        selector_facts = selectorFactsOf(*selector);
+        identity = canonicalize(*selector);
+    }
+    const auto request_facts = namespaceFactsOf(job);
+    const SubAttrMatcher matcher = native_duplicate_matcher(job);
+    for (const auto& record : ownRecords()) {
+        if (record.internal_id == kSystemSentinelJobId) continue;
+        const bool canonical_match = identity && record.identity_complete &&
+            record.identity.adapter == identity->adapter &&
+            record.identity.canonical_native == identity->canonical_native &&
+            (identity->step_id.empty() || record.identity.step_id == identity->step_id);
+        if (identity && record.identity_complete && !canonical_match) continue;
+        const bool typed_match = ownHasActive(record.internal_id) &&
+                                 matches_job(matcher, record.job);
+        if (!canonical_match && !typed_match) continue;
+        const auto record_facts = namespaceFactsOf(record.job);
+        const bool compatible =
+            namespace_facts_compatible(request_facts, record_facts) &&
+            (!selector_facts ||
+             namespace_facts_compatible(*selector_facts, record_facts));
+        if (!compatible) {
+            if (identity && record.identity_complete &&
+                identity->key() == record.identity.key()) {
+                target.kind = ManualTarget::Kind::Ambiguous;
+                target.message = "canonical identity collision between structured namespaces";
+                target.candidates.push_back(format_internal_id(record.internal_id));
                 return target;
             }
+            continue;
         }
+        duplicates.push_back(record);
     }
-    // A manual old row (typed sub_attr duplicate, identity never resolved):
-    // the historical duplicate refusal becomes an UPDATE route by id. The
-    // screen carries the request's scheduler (schedd) attribution and the
-    // doc-contract limit: an identity-less row keeps the legacy tolerance, an
-    // identity-bearing row joins only when its scheduler attribution agrees —
-    // so a schedd-B request can never adopt a schedd-A row whose typed
-    // scheduler_name was never serialized.
-    const SubAttrMatcher matcher = native_duplicate_matcher(job);
-    auto duplicates = scheduler_screened_duplicates(
-        job, ownFindActive(
-                 [&matcher](const Job& existing) { return matches_job(matcher, existing); }));
     if (duplicates.size() > 1) {
         // Several surviving duplicates are an ambiguity the caller must
         // resolve (claim the scheduler attribution or pass an identity
@@ -1984,7 +1989,8 @@ JobRegistry::ManualTarget JobRegistry::manualUpdateTarget(
     }
     if (!duplicates.empty()) {
         target.record = std::move(duplicates.front());
-        target.kind = ManualTarget::Kind::Update;
+        target.kind = ownHasActive(target.record.internal_id)
+                          ? ManualTarget::Kind::Update : ManualTarget::Kind::Closing;
     }
     return target;
 }
@@ -1999,6 +2005,14 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
         return out;
     }
 
+    if (identity_selector) {
+        if (selector_of(job).adapter != identity_selector->adapter ||
+            !namespace_facts_compatible(namespaceFactsOf(job),
+                                        selectorFactsOf(*identity_selector))) {
+            return {{"status", "error"}, {"code", "namespace_conflict"},
+                    {"message", "selector contradicts structured job facts"}};
+        }
+    }
     const ManualTarget target = manualUpdateTarget(job, identity_selector);
     if (target.kind == ManualTarget::Kind::Closing) {
         nlohmann::json out;
@@ -2016,13 +2030,28 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
         out["candidates"] = target.candidates;
         return out;
     }
-    if (target.kind == ManualTarget::Kind::Update)
-        return updateManualInstance(target.record, job, request);
+    if (target.kind == ManualTarget::Kind::Update) {
+        Job claimed_job = job;
+        if (identity_selector) {
+            // The selector's namespace folds into the typed facts (already
+            // proven compatible above), then the common fields render.
+            adoptNamespaceAliases(claimed_job, identity_selector->cluster_name,
+                                  identity_selector->cluster_tag);
+            renderNamespaceOf(claimed_job);
+        }
+        return updateManualInstance(target.record, claimed_job, request);
+    }
 
     // CREATE branch: the legacy manual registration, verbatim. An empty
     // collector list is a CREATE-only rejection — an UPDATE with no
     // collectors is a pure facts update and stays valid.
-    if (!createManualJob(job)) {
+    Job create_job = job;
+    if (identity_selector) {
+        adoptNamespaceAliases(create_job, identity_selector->cluster_name,
+                              identity_selector->cluster_tag);
+        renderNamespaceOf(create_job);
+    }
+    if (!createManualJob(create_job)) {
         nlohmann::json out;
         out["status"] = "error";
         out["msg"] = fmt::format(
@@ -2062,20 +2091,120 @@ nlohmann::json JobRegistry::updateManualInstance(const JobRecord& target, const 
             }
             record = it->second;
         }
+        // Target selection used a snapshot. Another claimant may have
+        // supplied namespace facts since then; reject before changing facts
+        // or collectors while this lock still protects the current image.
+        if (!namespace_facts_compatible(namespaceFactsOf(facts),
+                                        namespaceFactsOf(record.job))) {
+            return {{"status", "error"}, {"code", "namespace_conflict"},
+                    {"message", "target namespace changed before manual update"}};
+        }
+        const auto previous_namespace = namespaceFactsOf(record.job);
+        const auto previous_identity = record.identity;
+        const bool previously_indexed = record.identity_complete && !record.quarantined;
+        // The record image may predate the single-source invariant (a legacy
+        // row carrying namespace facts only in the common fields): adopt
+        // them into the typed facts before merging, so the render below can
+        // never wipe a fact the merge did not see.
+        normalizeRestoredFacts(record.job);
         if (merge_job_facts(record.job, facts, /*replace_members=*/false)) {
+            renderNamespaceOf(record.job);  // the typed facts are the source
+            bool index_changed = false;
+            if (previous_namespace != namespaceFactsOf(record.job)) {
+                // Interpretation goes through the adapter even when the
+                // scheduler's discovery is not configured (never started).
+                const auto* adapter = namespaceAdapterOf(record.job);
+                if (!adapter) {
+                    return {{"status", "error"}, {"code", "identity_adoption_unsafe"},
+                            {"message", "scheduler adapter unavailable for namespace adoption"}};
+                }
+                {
+                    auto selector = adapter->legacySelector(record.job);
+                    if (selector.step_id.empty() && record.job.execution &&
+                        record.job.execution->step_id)
+                        selector.step_id = *record.job.execution->step_id;
+                    const auto resolved = canonicalize(selector);
+                    if (record.identity_complete && !resolved) {
+                        return {{"status", "error"}, {"code", "identity_adoption_unsafe"},
+                                {"message", "cannot derive the adopted canonical identity"}};
+                    }
+                    if (resolved) {
+                        if (record.quarantined ||
+                            (record.identity_complete &&
+                             (resolved->adapter != previous_identity.adapter ||
+                              resolved->canonical_native != previous_identity.canonical_native ||
+                              resolved->step_id != previous_identity.step_id))) {
+                            return {{"status", "error"}, {"code", "identity_adoption_unsafe"},
+                                    {"message", "adoption would change the native identity"}};
+                        }
+                        index_changed = !record.identity_complete || *resolved != previous_identity;
+                        record.identity = *resolved;
+                        record.identity_complete = true;
+                    }
+                }
+            }
+            if (index_changed) {
+                {
+                    std::shared_lock lg(records_mtx_);
+                    if (previously_indexed) {
+                        const auto old = identity_index_.find(identity_index_key(previous_identity));
+                        if (old == identity_index_.end() || old->second != internal_id) {
+                            return {{"status", "error"}, {"code", "identity_conflict"},
+                                    {"message", "previous identity index ownership is uncertain"}};
+                        }
+                    }
+                    const auto owner = identity_index_.find(identity_index_key(record.identity));
+                    if (owner != identity_index_.end() && owner->second != internal_id) {
+                        return {{"status", "error"}, {"code", "identity_conflict"},
+                                {"message", "adopted identity is owned by another instance"}};
+                    }
+                }
+                if (previously_indexed) {
+                    const auto durable_owner = store_->readRowByIdentity(previous_identity);
+                    if (!durable_owner || durable_owner->internal_id != internal_id ||
+                        !durable_owner->identity_complete ||
+                        durable_owner->identity != previous_identity) {
+                        return {{"status", "error"}, {"code", "identity_conflict"},
+                                {"message", "durable previous identity ownership is uncertain"}};
+                    }
+                }
+            }
             record.last_seen_us = now_us();
             ++record.revision;
             std::vector<JobStore::WriteOp> ops{put_record_op(record)};
+            if (index_changed) {
+                if (previously_indexed) {
+                    JobStore::WriteOp release;
+                    release.kind = JobStore::WriteOp::DeleteIdentity;
+                    release.internal_id = internal_id;
+                    release.identity = previous_identity;
+                    ops.push_back(std::move(release));
+                }
+                JobStore::WriteOp acquire;
+                acquire.kind = JobStore::WriteOp::PutIdentity;
+                acquire.internal_id = internal_id;
+                acquire.identity = record.identity;
+                ops.push_back(std::move(acquire));
+            }
             std::vector<uint64_t> touched{internal_id};
             std::string error;
-            if (!store_->commit(std::move(ops), /*durable=*/true, touched,
+            if (!store_->commit(std::move(ops), /*durable=*/!index_changed, touched,
                                 "manual upsert facts", error)) {
                 nlohmann::json out;
                 out["status"] = "error";
+                if (error == "identity_conflict") out["code"] = error;
                 out["msg"] = "facts update failed: " + error;
                 return out;
             }
             std::unique_lock lg(records_mtx_);
+            if (index_changed) {
+                if (previously_indexed) {
+                    const auto old = identity_index_.find(identity_index_key(previous_identity));
+                    if (old != identity_index_.end() && old->second == internal_id)
+                        identity_index_.erase(old);
+                }
+                identity_index_[identity_index_key(record.identity)] = internal_id;
+            }
             records_[internal_id] = std::move(record);
         }
     }
@@ -2715,7 +2844,9 @@ void JobRegistry::eraseRecord(uint64_t id) {
 void JobRegistry::applyRecovered(const std::vector<JobRecord>& adopted,
                                  const std::vector<uint64_t>& removed) {
     std::unique_lock lg(records_mtx_);
-    for (const auto& row : adopted) {
+    for (const auto& row_in : adopted) {
+        auto row = row_in;
+        normalizeRestoredFacts(row.job);
         auto it = records_.find(row.internal_id);
         if (it != records_.end() && it->second.identity_complete) {
             const auto key = identity_index_key(it->second.identity);
@@ -2744,21 +2875,18 @@ void JobRegistry::applyIdentityToFacts(Job& job, const NativeSelector& selector,
                                        const CanonicalIdentity& identity) const {
     // Generic derivation: the authoritative native string and namespace. The
     // scheduler typed-attr derivation dispatches through the adapters by
-    // identity.adapter; without adapters (store-only tests) the observed
-    // facts are stored verbatim — no branch, no misfiling of an open-world
-    // scheduler into a built-in schema.
+    // identity.adapter — interpretation goes through the namespace cache, so
+    // it does not depend on which discovery types are configured. Without a
+    // registered adapter (open-world scheduler) the observed facts are
+    // stored verbatim — no branch, no misfiling into a built-in schema.
     job.NativeJobID = identity.native_job_id;
     if (!selector.cluster_name.empty()) job.cluster_name = selector.cluster_name;
     if (!selector.cluster_tag.empty()) job.clusterTag = selector.cluster_tag;
     if (job.jobtype != JobType::Job && job.jobtype != JobType::Sys) {
         job.jobtype = JobType::Job;
     }
-    for (const auto& adapter : adapters_) {
-        if (adapter->name() == identity.adapter) {
-            adapter->applyIdentityToFacts(job, selector, identity);
-            break;
-        }
-    }
+    if (const auto* adapter = namespaceAdapterNamed(identity.adapter))
+        adapter->applyIdentityToFacts(job, selector, identity);
 }
 
 // One observation against the current record image: pure decision, no
@@ -2847,6 +2975,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
 
     Job merged = stored.job;
     merge_job_facts(merged, observed_job, authoritative_members);
+    renderNamespaceOf(merged);  // the typed facts are the namespace source
     merged.JobID = internal_id;
     merged.CollectorNames = stored.job.CollectorNames;
 
@@ -3228,6 +3357,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
                 // and this identity lookup is the documented repair. Adopt
                 // it, then merge.
                 internal_id = durable->internal_id;
+                normalizeRestoredFacts(durable->job);
                 std::unique_lock lg(records_mtx_);
                 if (durable->identity_complete && !durable->quarantined)
                     identity_index_[index_key] = internal_id;
@@ -3247,6 +3377,14 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
     }
 
     if (have_stored) {
+        if (!namespace_facts_compatible(namespaceFactsOf(job),
+                                        namespaceFactsOf(stored.job))) {
+            result.disposition = UpsertDisposition::Conflict;
+            result.code = RegistrationError::IdentityIndexMismatch;
+            result.error = to_string(result.code);
+            result.message = "canonical identity key aliases conflicting structured namespaces";
+            return result;
+        }
         JobRecord updated;
         result = mergeDiscoveredJob(stored, job, selector, *identity, internal_id,
                                   observed_at, updated);

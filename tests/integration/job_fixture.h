@@ -29,6 +29,29 @@ inline Job discovered_job(NativeSelector selector, ExecutionGeneration generatio
     Job job;
     job.subtype_name = selector.adapter;
     job.NativeJobID = selector.native_job_id;
+    // A discovery source hands over typed facts (the single namespace
+    // source) plus their rendered common fields, exactly like the watchers.
+    if (selector.adapter == "condor") {
+        job.subtype = JobSubType::Condor;
+        auto attr = CondorJobAttr{};
+        attr.collector_host = selector.cluster_name;
+        attr.scheduler_name = selector.cluster_tag;
+        if (const auto parsed = parse_condor_native(selector.native_job_id)) {
+            attr.cluster_id = std::stoull(parsed->cluster);
+            attr.proc_id = std::stoull(parsed->proc);
+        }
+        job.sub_attr = std::move(attr);
+    } else if (selector.adapter == "slurm") {
+        job.subtype = JobSubType::Slurm;
+        auto attr = SlurmJobAttr{};
+        attr.cluster_name = selector.cluster_name;
+        try {
+            attr.job_id = std::stoull(selector.native_job_id);
+        } catch (const std::exception&) {
+            attr.job_id = 0;
+        }
+        job.sub_attr = std::move(attr);
+    }
     job.cluster_name = selector.cluster_name;
     job.clusterTag = selector.cluster_tag;
     job.jobtype = JobType::Job;

@@ -240,6 +240,19 @@ void slurm_steps_and_pid_reuse()
 
 void serialization_round_trip()
 {
+    CondorJobAttr condor_facts;
+    condor_facts.scheduler_name = "schedd#one@submit.example";
+    nlohmann::json facts_wire = condor_facts;
+    check(facts_wire.value("scheduler_name", std::string{}) ==
+              "schedd#one@submit.example",
+          "Condor typed facts must persist the intact schedd name");
+    check(facts_wire.get<CondorJobAttr>().scheduler_name ==
+              "schedd#one@submit.example",
+          "Condor typed facts must restore the intact schedd name");
+    facts_wire.erase("scheduler_name");
+    check(facts_wire.get<CondorJobAttr>().scheduler_name.empty(),
+          "old Condor facts without scheduler_name must remain readable");
+
     const NativeSelector selector = condor("012.34");
     const nlohmann::json wire = selector;
     const NativeSelector restored = wire.get<NativeSelector>();
