@@ -222,12 +222,14 @@ bool ESWriter::build_document(const std::string& collector_name, const Job& job,
                       collector_name, record_id, job.JobID, document.size(), opt_.max_bulk_bytes);
         return false;
     }
-    out = {std::move(document), action["index"]["_index"].get<std::string>(),
-           action["index"]["_id"].get<std::string>(), collector_name};
+    out.ndjson = std::move(document);
+    out.index = action["index"]["_index"].get<std::string>();
+    out.id = action["index"]["_id"].get<std::string>();
+    out.collector = collector_name;
     return true;
 }
 
-bool ESWriter::flush_documents(const std::vector<BulkDocument>& documents)
+bool ESWriter::flush_documents(std::vector<BulkDocument> documents)
 {
     retry_documents_.clear();
     if (documents.empty()) return true;
@@ -242,10 +244,10 @@ bool ESWriter::flush_documents(const std::vector<BulkDocument>& documents)
         chunk_bytes = 0;
     };
 
-    for (const auto& document : documents) {
+    for (auto& document : documents) {
         if (chunk_bytes > opt_.max_bulk_bytes - document.ndjson.size()) send_chunk();
         chunk_bytes += document.ndjson.size();
-        chunk.push_back(document);
+        chunk.push_back(std::move(document));
     }
     send_chunk();
     return flush_ret;
@@ -289,5 +291,5 @@ bool ESWriter::flush_impl(const std::vector<OutputRecordPtr>& batch)
         }
     }
 
-    return flush_documents(documents) && flush_ret;
+    return flush_documents(std::move(documents)) && flush_ret;
 }

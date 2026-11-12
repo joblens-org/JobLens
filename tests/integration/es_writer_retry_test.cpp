@@ -2,10 +2,36 @@
 #include "core/output_record.h"
 #include "thirdparty/httplib.h"
 #include <iostream>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 
 using json = nlohmann::json;
+
+namespace {
+std::mutex curl_fault_mutex;
+std::condition_variable curl_fault_cv;
+bool curl_fault_armed = false;
+bool curl_fault_reached = false;
+bool curl_fault_release = false;
+bool curl_fault_thrown = false;
+int curl_fault_calls = 0;
+}
+
+extern "C" CURLcode __real_curl_easy_perform(CURL* handle);
+extern "C" CURLcode __wrap_curl_easy_perform(CURL* handle) {
+    std::unique_lock<std::mutex> lock(curl_fault_mutex);
+    if (curl_fault_armed && ++curl_fault_calls == 2) {
+        curl_fault_reached = true;
+        curl_fault_cv.notify_all();
+        curl_fault_cv.wait_for(lock, std::chrono::seconds(5), [] { return curl_fault_release; });
+        curl_fault_armed = false;
+        curl_fault_thrown = true;
+        throw std::runtime_error("injected retry transport exception");
+    }
+    lock.unlock();
+    return __real_curl_easy_perform(handle);
+}
 
 struct TestWriter : ESWriter {
     using ESWriter::ESWriter;
@@ -26,22 +52,36 @@ int main(int argc, char** argv) {
     std::vector<std::chrono::steady_clock::time_point> times;
     std::string scenario;
     int forced_status = 0;
+    std::condition_variable barrier;
+    int blocked_attempt = 0;
+    int released_attempt = 0;
     server.Get("/", [](const httplib::Request&, httplib::Response& res) {
         res.set_content("{}", "application/json");
     });
     server.Post("/_bulk", [&](const httplib::Request& req, httplib::Response& res) {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(mutex);
         requests.push_back(req.body);
         times.push_back(std::chrono::steady_clock::now());
         const auto attempt = requests.size();
+        if ((scenario == "barrier" && (attempt == 2 || attempt == 3))
+            || (scenario == "exception" && attempt == 2)) {
+            blocked_attempt = static_cast<int>(attempt);
+            barrier.notify_all();
+            barrier.wait_for(lock, std::chrono::seconds(5), [&] { return released_attempt >= static_cast<int>(attempt); });
+        }
         if (scenario == "timeout" && attempt == 1) std::this_thread::sleep_for(std::chrono::milliseconds(1100));
         if (forced_status != 0) {
             res.status = forced_status;
             res.set_content("rejected", "text/plain");
             return;
         }
-        if (scenario == "503" || (scenario == "recover" && attempt == 1)
-            || (scenario == "recover2" && attempt <= 2)) {
+        if (scenario == "permanent_retry" && attempt > 1) {
+            res.status = 400;
+            res.set_content("rejected", "text/plain");
+            return;
+        }
+        if (scenario == "503" || ((scenario == "recover" || scenario == "permanent_retry" || scenario == "exception") && attempt == 1)
+            || ((scenario == "recover2" || scenario == "barrier") && attempt <= 2)) {
             res.status = 503;
             res.set_content("unavailable", "text/plain");
             return;
@@ -177,8 +217,141 @@ int main(int argc, char** argv) {
             flaky.shutdown();
         }
         std::cout << "PASS: the retry budget tracks only the live retry set\n";
+        // Exercise BaseWriter's actual worker and admission accounting while the
+        // HTTP server holds each retry in flight. The original record, encoded
+        // retry and producer are all simultaneously live at the barrier.
+        scenario = "barrier";
+        requests.clear();
+        times.clear();
+        blocked_attempt = released_attempt = 0;
+        auto original = batch[0];
+        auto producer = make_record(job, 100, json{{"value", 100}});
+        producer->accounted_bytes = 11;
+        const auto limit = original->accounted_bytes + first_end + 10;
+        config.getRawNode("writers_config")["max_pending_bytes"] = static_cast<int>(limit);
+        config.getRawNode("writers_config")["max_record_bytes"] = static_cast<int>(limit);
+        bool reached[2] = {false, false};
+        bool charged[2] = {false, false};
+        bool rejected[2] = {false, false};
+        json final_status;
+        {
+            TestWriter concurrent("concurrent", "ESWriter", "es_test");
+            check(concurrent.try_enqueue(original) == EnqueueCode::Accepted, "initial enqueue failed");
+            for (int round = 0; round < 2; ++round) {
+                const int attempt = round + 2;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    reached[round] = barrier.wait_for(lock, std::chrono::seconds(4), [&] { return blocked_attempt >= attempt; });
+                }
+                if (reached[round]) {
+                    charged[round] = concurrent.output_status()["pending_bytes"] == original->accounted_bytes + first_end;
+                    rejected[round] = concurrent.try_enqueue(producer) == EnqueueCode::QueueFull;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    released_attempt = attempt;
+                }
+                barrier.notify_all();
+            }
+            concurrent.shutdown();
+            final_status = concurrent.output_status();
+        }
+        check(reached[0] && reached[1], "retry HTTP barriers not reached");
+        check(charged[0] && charged[1], "live retry bytes released during HTTP request");
+        check(rejected[0] && rejected[1], "producer admitted while retry occupies its budget");
+        check(final_status["pending_bytes"] == 0 && final_status["pending_records"] == 0
+              && final_status["accepted"] == final_status["released_records"], "queue accounting not conserved");
+        check(requests.size() == 3 && requests[0] == requests[1] && requests[1] == requests[2],
+              "retry rounds did not preserve the document");
+        std::cout << "PASS: in-flight retries retain budget against concurrent producers\n";
         config.getRawNode("writers_config")["max_pending_bytes"] = 67108864;
         config.getRawNode("writers_config")["max_record_bytes"] = 8388608;
+        // Throw on the retry transport call, after the 503 created a real
+        // reservation. Hold the next producer's HTTP call while examining the
+        // accounting after the original worker buffer has been released.
+        scenario = "exception";
+        requests.clear();
+        times.clear();
+        blocked_attempt = released_attempt = 0;
+        auto survivor = make_record(job, 101, json{{"value", 101}});
+        survivor->accounted_bytes = 4096;
+        bool fault_reached = false;
+        bool retry_charged = false;
+        bool survivor_accepted = false;
+        bool producer_blocked = false;
+        bool fault_thrown = false;
+        json intermediate, exception_final;
+        {
+            TestWriter exceptional("exceptional", "ESWriter", "es_test");
+            {
+                std::lock_guard<std::mutex> lock(curl_fault_mutex);
+                curl_fault_armed = true;
+                curl_fault_reached = curl_fault_release = curl_fault_thrown = false;
+                curl_fault_calls = 0;
+            }
+            const auto first_admission = exceptional.try_enqueue(original);
+            {
+                std::unique_lock<std::mutex> lock(curl_fault_mutex);
+                fault_reached = curl_fault_cv.wait_for(lock, std::chrono::seconds(4), [] { return curl_fault_reached; });
+            }
+            if (fault_reached) {
+                retry_charged = exceptional.output_status()["pending_bytes"] == original->accounted_bytes + first_end;
+                survivor_accepted = exceptional.try_enqueue(survivor) == EnqueueCode::Accepted;
+            }
+            {
+                std::lock_guard<std::mutex> lock(curl_fault_mutex);
+                curl_fault_release = true;
+            }
+            curl_fault_cv.notify_all();
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                producer_blocked = barrier.wait_for(lock, std::chrono::seconds(4), [&] { return blocked_attempt == 2; });
+            }
+            if (producer_blocked) intermediate = exceptional.output_status();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                released_attempt = 2;
+            }
+            barrier.notify_all();
+            exceptional.shutdown();
+            exception_final = exceptional.output_status();
+            {
+                std::lock_guard<std::mutex> lock(curl_fault_mutex);
+                fault_thrown = curl_fault_thrown;
+                curl_fault_armed = false;
+            }
+            check(first_admission == EnqueueCode::Accepted, "exception test initial enqueue failed");
+        }
+        check(fault_reached && fault_thrown && retry_charged, "exception was not injected with a live retry reservation");
+        check(survivor_accepted && producer_blocked, "producer was not retained across the retry exception");
+        check(intermediate["pending_bytes"] == survivor->accounted_bytes
+              && intermediate["pending_records"] == 1 && intermediate["accepted"] == 2
+              && intermediate["released_records"] == 1,
+              "retry exception stole producer bytes or violated queue conservation");
+        check(exception_final["pending_bytes"] == 0 && exception_final["pending_records"] == 0
+              && exception_final["accepted"] == 2 && exception_final["released_records"] == 2,
+              "exception test did not finish with a conserved queue");
+        check(requests.size() == 2 && requests[1].find("\"value\":101") != std::string::npos,
+              "producer did not reach the actual HTTP endpoint after the exception");
+        std::cout << "PASS: post-reservation exception preserves the pending producer's exact byte charge\n";
+        for (const auto& terminal : {"503", "permanent_retry", "encoding"}) {
+            scenario = terminal;
+            requests.clear();
+            times.clear();
+            TestWriter terminal_writer("terminal", "ESWriter", "es_test");
+            auto record = scenario == "encoding"
+                ? make_record(job, 20, json{{"value", 20}, {"text", std::string("\xff", 1)}})
+                : make_record(job, 20, json{{"value", 20}});
+            check(terminal_writer.try_enqueue(record) == EnqueueCode::Accepted, "terminal record not admitted");
+            terminal_writer.shutdown();
+            const auto status = terminal_writer.output_status();
+            check(status["pending_bytes"] == 0 && status["pending_records"] == 0
+                  && status["accepted"] == 1 && status["released_records"] == 1,
+                  "terminal outcome leaked or double-released queue budget");
+            const std::size_t expected = scenario == "503" ? 3 : scenario == "permanent_retry" ? 2 : 0;
+            check(requests.size() == expected, "terminal outcome made an unexpected number of requests");
+        }
+        std::cout << "PASS: exhaustion, permanent retry failure and encoding failure conserve the queue\n";
         for (const auto& invalid : std::vector<std::pair<std::string, int>>{{"max_retries", -1}, {"max_retries", 11},
                 {"retry_initial_backoff_ms", 0}, {"retry_max_backoff_ms", 1}, {"write_timeout", 0}}) {
             auto node = config.getRawNode("es_test");

@@ -53,27 +53,35 @@ protected:
 
 private:
     struct BulkDocument {
+        struct Reservation {
+            ESWriter* owner = nullptr;
+            std::size_t bytes = 0;
+            Reservation() = default;
+            Reservation(const Reservation&) = delete;
+            Reservation& operator=(const Reservation&) = delete;
+            Reservation(Reservation&& other) noexcept : owner(other.owner), bytes(other.bytes) { other.owner = nullptr; }
+            Reservation& operator=(Reservation&&) = delete;
+            ~Reservation() { if (owner) owner->release_additional_bytes(bytes); }
+        } reservation; // Destroyed after the strings it accounts for.
         std::string ndjson;
         std::string index;
         std::string id;
         std::string collector;
     };
-    bool flush_documents(const std::vector<BulkDocument>& documents);
+    bool flush_documents(std::vector<BulkDocument> documents);
     struct BulkResponse {
         CURLcode transport;
         long status;
         std::string body;
     };
     BulkResponse post_bulk(const std::string& bulk_body);
-    bool send_documents(const std::vector<BulkDocument>& documents);
+    bool send_documents(std::vector<BulkDocument>& documents);
     void run_retry_rounds();
-    bool reserve_retry_budget(const BulkDocument& document);
-    void release_retry_budget();
+    bool reserve_retry_budget(BulkDocument& document);
     bool build_document(const std::string& collector_name, const Job& job,
                         std::chrono::system_clock::time_point ts, const std::string& record_id,
                         nlohmann::json data, BulkDocument& out);
     std::vector<BulkDocument> retry_documents_;
-    std::size_t retry_reserved_bytes_ = 0;
     bool test_server();
     std::string try_get_index_name(const std::string& collector_name);
     int write_timeout;

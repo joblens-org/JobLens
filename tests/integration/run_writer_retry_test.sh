@@ -40,6 +40,7 @@ for test in es_writer_retry_test perf_counter_call_count_test; do
         $joblens_test_extra_flags -c "$root/tests/integration/$test.cpp" -o "$work/$test.o"
     command=${link/CMakeFiles\/JobLens.dir\/src\/main.cpp.o/\"$work\/$test.o\"}
     command=${command/ -o JobLens / -o \"$work\/$test\" }
+    if [[ "$test" == es_writer_retry_test ]]; then command=${command/ -o / -Wl,--wrap=curl_easy_perform -o }; fi
     (cd "$build"; bash -c "$command")
     timeout 45 "$work/$test" "$root/tests/integration/es_writer_retry_test.yaml"
 done
