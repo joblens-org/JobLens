@@ -101,7 +101,12 @@ bool CollectorScheduler::startEventCollectorLane(const std::string& name,
                     const ReadySources& ready) {
         {
             std::lock_guard lock(state_ptr->ready_m_);
-            state_ptr->ready.insert(state_ptr->ready.end(), ready.begin(), ready.end());
+            for (const auto& source : ready) {
+                auto it = std::find_if(state_ptr->ready.begin(), state_ptr->ready.end(),
+                    [&](const ReadySource& item) { return item.source == source.source; });
+                if (it == state_ptr->ready.end()) state_ptr->ready.push_back(source);
+                else it->readiness |= source.readiness;
+            }
         }
         taskExecutor_.request(lane_handle, RequestPolicy::Remember);
     };
@@ -173,6 +178,10 @@ bool CollectorScheduler::startCollector(std::string collector_name) {
     }
 
     auto& state = collector_state_dict[collector_name];
+    if (state.drain_failed.load()) {
+        spdlog::error("CollectorScheduler: refusing to restart failed event collector {}", collector_name);
+        return false;
+    }
     auto lane = createLane(collector_name, info, state);
     if (!lane) return false;
 
@@ -262,7 +271,11 @@ void CollectorScheduler::stopCollectorInstance(CollectorLaneContext& lane) {
     if (!state.running && !state.initialized && !state.registrar && !state.lane_valid) return;
 
     teardownCollectorLane(lane);
-    notifyDrained(finalizePendingRemovals(lane));
+    // Teardown is not proof of an unfinished tail. The owned snapshots and
+    // close bookkeeping live with the scheduler and are freed with it; no
+    // completion is sent, so the registry retains its durable Closing row.
+    if (!state.drain_pending && !state.drain_failed.load())
+        notifyDrained(finalizePendingRemovals(lane));
 }
 
 void CollectorScheduler::teardownCollectorLane(CollectorLaneContext& lane,
@@ -278,6 +291,13 @@ void CollectorScheduler::teardownCollectorLane(CollectorLaneContext& lane,
     if (state.lane_valid) {
         taskExecutor_.invalidate(state.lane);
         state.lane_valid = false;
+    }
+    {
+        std::lock_guard lock(state.ready_m_);
+        if (state.ready_timer) timerScheduler_.cancelTimer(*state.ready_timer);
+        state.ready_timer.reset();
+        state.ready_after = {};
+        state.ready.clear();
     }
     // Deinit first: collectors own their source registrations and may destroy
     // them here. The registrar must still be alive for those destructors.
@@ -460,7 +480,7 @@ bool CollectorScheduler::detachJobFromCollector(const std::string& collector_nam
     const bool event_scope = info_it != collector_info_dict.end() &&
                              info_it->second.scope == CollectorScope::Job &&
                              info_it->second.trigger == CollectorTrigger::Event;
-    if (job_ending && event_scope) {
+    if (event_scope && (job_ending || state.drain_failed.load())) {
         // Keep the snapshot and let the event lane consume accepted tail input
         // before the registry clears kernel attribution. The token identifies
         // this attachment so a late completion cannot finish a newer one; the
@@ -951,8 +971,6 @@ void CollectorScheduler::notifyDrained(const std::vector<uint64_t>& internal_ids
     IDrainCompletionSink* sink = nullptr;
     {
         std::lock_guard lock(reconcile_m_);
-        // No callback after shutdown began: nothing may depend on one arriving.
-        if (reconcile_stopping_) return;
         sink = drain_sink_;
     }
     if (sink == nullptr) return;
@@ -1252,7 +1270,8 @@ void CollectorScheduler::start() {
 void CollectorScheduler::shutdown() {
     std::lock_guard shutdown_lock(shutdown_mutex_);
     {
-        // No completion callback after shutdown began.
+        // Stop reconciliation first; in-flight proven drains still report to
+        // the attached sink until worker and collector shutdown completes.
         std::lock_guard lock(reconcile_m_);
         reconcile_stopping_ = true;
     }

@@ -19,6 +19,14 @@
 #include <leveldb/db.h>
 
 using namespace std::chrono_literals;
+class DrainCaptureWriter : public BaseWriter {
+public:
+    using BaseWriter::BaseWriter;
+    ~DrainCaptureWriter() override { shutdown(); }
+    bool accepts(OutputKind kind) const override { return kind == OutputKind::Text; }
+protected:
+    bool flush_impl(const std::vector<OutputRecordPtr>&) override { return true; }
+};
 struct CollectorSchedulerTestAccess {
     static CollectorHandle makeHandle(std::function<void(const Job&)> collect,
                                       std::function<bool(const nlohmann::json&)> init,
@@ -148,7 +156,7 @@ struct CollectorSchedulerTestAccess {
         scheduler.taskExecutor_.invalidate(state.lane);
         state.lane_valid = false;
     }
-    static void drainLane(CollectorScheduler& scheduler, const std::string& name) {
+    static WorkResult drainLane(CollectorScheduler& scheduler, const std::string& name) {
         auto info_it = scheduler.collector_info_dict.find(name);
         auto state_it = scheduler.collector_state_dict.find(name);
         if (info_it == scheduler.collector_info_dict.end() ||
@@ -158,7 +166,48 @@ struct CollectorSchedulerTestAccess {
         lane.name = name;
         lane.info = info_it->second;
         lane.state = &state_it->second;
-        scheduler.runEventDrain(lane);
+        return scheduler.runEventDrain(lane);
+    }
+    static void stopLane(CollectorScheduler& scheduler, const std::string& name) {
+        CollectorScheduler::CollectorLaneContext lane;
+        lane.name = name;
+        lane.info = scheduler.collector_info_dict.at(name);
+        lane.state = &scheduler.collector_state_dict.at(name);
+        scheduler.stopCollectorInstance(lane);
+    }
+    static void setStopping(CollectorScheduler& scheduler, bool stopping) {
+        std::lock_guard lock(scheduler.reconcile_m_);
+        scheduler.reconcile_stopping_ = stopping;
+    }
+    static void notifyCompleted(CollectorScheduler& scheduler, uint64_t id) {
+        scheduler.notifyDrained({id});
+    }
+    static bool restartLane(CollectorScheduler& scheduler, const std::string& name) {
+        auto& state = scheduler.collector_state_dict.at(name);
+        std::lock_guard global(scheduler.m_);
+        std::lock_guard lock(state.m_);
+        return scheduler.startCollector(name);
+    }
+    static size_t signalFailedLane(CollectorScheduler& scheduler, const std::string& name) {
+        auto& state = scheduler.collector_state_dict.at(name);
+        auto registration = state.registrar->watch_manual("failed-epoch-test");
+        if (!registration) throw std::runtime_error("manual registration failed");
+        for (int i = 0; i < 8; ++i) {
+            if (!state.registrar->notify_manual(registration->handle()))
+                throw std::runtime_error("manual notification failed");
+        }
+        std::lock_guard lock(state.ready_m_);
+        return state.ready.size();
+    }
+    static void expireBackoff(CollectorScheduler& scheduler, const std::string& name) {
+        auto& state = scheduler.collector_state_dict.at(name);
+        std::lock_guard lock(state.ready_m_);
+        state.ready_after = std::chrono::steady_clock::time_point{};
+    }
+    static void holdBackoff(CollectorScheduler& scheduler, const std::string& name) {
+        auto& state = scheduler.collector_state_dict.at(name);
+        std::lock_guard lock(state.ready_m_);
+        state.ready_after = std::chrono::steady_clock::now() + std::chrono::hours(1);
     }
     static std::vector<uint64_t> finalizeRemovals(CollectorScheduler& scheduler,
                                                   const std::string& name) {
@@ -225,7 +274,15 @@ struct CollectorSchedulerTestAccess {
     struct EventDrainPlan {
         std::atomic<int> ready_calls{0};
         std::vector<bool> more_plan;
+        std::string failure;
+        uint64_t job_id = 0;
+        std::atomic<int> accepted{0};
+        std::atomic<int> rejected{0};
         mutable std::mutex mutex;
+        std::condition_variable barrier_cv;
+        bool block_first = false;
+        bool entered = false;
+        bool release = false;
         std::vector<size_t> source_sizes;
         bool more_for(int call) const {
             if (more_plan.empty()) return false;
@@ -250,16 +307,37 @@ struct CollectorSchedulerTestAccess {
         handle.scope = CollectorScope::Job;
         handle.trigger = CollectorTrigger::Event;
         handle.binding = EventJobBinding{
-            [plan](const ReadySources& sources, const WorkBudget&, JobEventContext&) {
+            [plan](const ReadySources& sources, const WorkBudget&, JobEventContext& context) {
                 const int call = plan->ready_calls.fetch_add(1);
                 plan->record_sources(sources.size());
+                if (call == 0 && plan->block_first) {
+                    std::unique_lock lock(plan->mutex);
+                    plan->entered = true;
+                    plan->barrier_cv.notify_one();
+                    plan->barrier_cv.wait(lock, [&] { return plan->release; });
+                }
+                if (call == 1 && plan->failure == "throw")
+                    throw std::runtime_error("controlled event failure");
+                if (call == 1 && plan->failure == "failed")
+                    return DrainOutcome{{CollectState::Failed, "controlled event failure"}, 0, false};
+                if (call < 2 && plan->failure == "output") {
+                    auto session = context.open_session(plan->job_id);
+                    if (!session) throw std::runtime_error("missing closing snapshot");
+                    auto report = session->context().emit("text", Text{call == 0 ? "accepted" : std::string(65536, 'x')});
+                    if (!report.writers.empty() && report.writers[0].code == EnqueueCode::Accepted)
+                        ++plan->accepted;
+                    else
+                        ++plan->rejected;
+                }
                 return DrainOutcome{CollectOutcome{}, sources.size(), plan->more_for(call)};
             }};
         handle.init = [](const nlohmann::json&, CollectorInitContext&) { return true; };
         handle.deinit = [] {};
         handle.on_job_added = std::move(on_added);
         handle.on_job_removed = std::move(on_removed);
-        scheduler.addJobEventCollectFunc(name, "PlannedEventCollector", "ev_cfg", handle);
+        handle.channels = {{"text", OutputKind::Text}};
+        scheduler.addJobEventCollectFunc(name, "PlannedEventCollector",
+                                        plan->failure == "output" ? "ev_output_cfg" : "ev_cfg", handle);
     }
     // Stage one poller readiness exactly as the sink would, but without waking
     // the executor: the test drives the lane body itself through drainLane.
@@ -267,6 +345,44 @@ struct CollectorSchedulerTestAccess {
         auto& state = scheduler.collector_state_dict.at(name);
         std::lock_guard lock(state.ready_m_);
         state.ready.push_back(ReadySource{});
+    }
+    static void requestLane(CollectorScheduler& scheduler, const std::string& name) {
+        auto& state = scheduler.collector_state_dict.at(name);
+        scheduler.taskExecutor_.request(state.lane, RequestPolicy::Remember);
+    }
+    static size_t backoffTimers(CollectorScheduler& scheduler, const std::string& name) {
+        size_t count = 0;
+        const auto stats = scheduler.timerScheduler_.getPerformanceStats();
+        for (const auto& timer : stats.at("tasks"))
+            if (timer.at("name") == name + ":event-backoff") ++count;
+        return count;
+    }
+    static size_t totalTimersRegistered(CollectorScheduler& scheduler) {
+        return scheduler.timerScheduler_.getPerformanceStats().at("totalTasksRegistered").get<size_t>();
+    }
+    static bool hasTimerId(CollectorScheduler& scheduler, const std::string& name, size_t id) {
+        const auto stats = scheduler.timerScheduler_.getPerformanceStats();
+        for (const auto& timer : stats.at("tasks"))
+            if (timer.at("name") == name + ":event-backoff" && timer.at("task_id") == id) return true;
+        return false;
+    }
+    static void addAlwaysFailingEvent(CollectorScheduler& scheduler, const std::string& name,
+                                      std::atomic<int>& calls) {
+        CollectorHandle handle;
+        handle.scope = CollectorScope::Job;
+        handle.trigger = CollectorTrigger::Event;
+        handle.binding = EventJobBinding{[&calls](const ReadySources&, const WorkBudget&, JobEventContext&) {
+            ++calls;
+            return DrainOutcome{{CollectState::Failed, "controlled cooldown failure"}, 0, false};
+        }};
+        handle.init = [](const nlohmann::json&, CollectorInitContext&) { return true; };
+        handle.deinit = [] {};
+        scheduler.addJobEventCollectFunc(name, "CooldownTestCollector", "ev_cfg", handle);
+    }
+    static bool inBackoff(CollectorScheduler& scheduler, const std::string& name) {
+        auto& state = scheduler.collector_state_dict.at(name);
+        std::lock_guard lock(state.ready_m_);
+        return state.ready_after > std::chrono::steady_clock::now();
     }
 };
 void check(bool condition, const std::string& message) {
@@ -343,7 +459,8 @@ void run(const std::string& base) {
     std::ofstream config(base + ".yaml");
     config << "lens_config:\n  max_collector_threads: 3\n"
               "collectors_config:\n  default_freq: 20\n  default_use_writers: []\n  collectors: []\n"
-              "writers_config:\n  enable_writer_perf: false\n  writers: []\n"
+              "writers_config:\n  enable_writer_perf: false\n  max_record_bytes: 4096\n  writers:\n    - {name: drain_capture, type: DrainCaptureWriter, config: drain_writer_cfg}\n"
+              "drain_writer_cfg: {}\nev_output_cfg:\n  outputs: {text: [drain_capture]}\n"
               "job_registry_config:\n  job_db_path: " << base << ".db\n"
               "sys_test:\n  freq: 20\n  use_writers: []\n  auto_start: true\n"
               "test:\n  freq: 20\n  use_writers: []\n"
@@ -352,8 +469,59 @@ void run(const std::string& base) {
     config.close();
     auto& server = RPCServer::instance(path);
     Config::instance(base + ".yaml");
+    WriterManager::instance().registerWriter<DrainCaptureWriter>("DrainCaptureWriter");
     auto& scheduler = CollectorScheduler::instance();
     JobRegistry::instance().delJob(0);
+    std::vector<std::string> early_timer_failures;
+    const auto timer_test = [&](const char* name, const std::function<void()>& body) {
+        try { body(); }
+        catch (const std::exception& error) {
+            early_timer_failures.push_back(std::string(name) + ": " + error.what());
+            std::cerr << "REGRESSION FAILED " << early_timer_failures.back() << '\n';
+        }
+    };
+    timer_test("zero-timer-ownership", [&] {
+        const std::string name = "zero_timer";
+        CollectorSchedulerTestAccess::addEvent(scheduler, name);
+        check(CollectorSchedulerTestAccess::attach(scheduler, name, 9001), "zero timer lane attach");
+        CollectorSchedulerTestAccess::holdBackoff(scheduler, name);
+        CollectorSchedulerTestAccess::stageReadiness(scheduler, name);
+        CollectorSchedulerTestAccess::drainLane(scheduler, name);
+        const bool first_is_zero = CollectorSchedulerTestAccess::hasTimerId(scheduler, name, 0);
+        CollectorSchedulerTestAccess::drainLane(scheduler, name);
+        const auto count = CollectorSchedulerTestAccess::backoffTimers(scheduler, name);
+        CollectorSchedulerTestAccess::stopLane(scheduler, name);
+        const auto remaining = CollectorSchedulerTestAccess::backoffTimers(scheduler, name);
+        check(first_is_zero && count == 1 && remaining == 0, "timer ID zero must be tracked once and cancelled on teardown");
+    });
+    timer_test("fired-timer-ownership", [&] {
+        const std::string name = "cycling_timer";
+        std::atomic<int> calls{0};
+        CollectorSchedulerTestAccess::addAlwaysFailingEvent(scheduler, name, calls);
+        check(CollectorSchedulerTestAccess::attach(scheduler, name, 9002), "cooldown lane attach");
+        const auto wait_for = [](const std::function<bool()>& predicate) {
+            const auto end = std::chrono::steady_clock::now() + 3s;
+            while (!predicate() && std::chrono::steady_clock::now() < end)
+                std::this_thread::sleep_for(2ms);
+            return predicate();
+        };
+        CollectorSchedulerTestAccess::stageReadiness(scheduler, name);
+        CollectorSchedulerTestAccess::requestLane(scheduler, name);
+        bool progressed = wait_for([&] { return calls.load() == 1 && CollectorSchedulerTestAccess::inBackoff(scheduler, name); });
+        size_t max_timers = 0;
+        for (int cycle = 0; cycle < 8 && progressed; ++cycle) {
+            const auto previous = CollectorSchedulerTestAccess::totalTimersRegistered(scheduler);
+            CollectorSchedulerTestAccess::stageReadiness(scheduler, name);
+            CollectorSchedulerTestAccess::requestLane(scheduler, name);
+            progressed = wait_for([&] { return CollectorSchedulerTestAccess::totalTimersRegistered(scheduler) > previous; });
+            progressed = progressed && wait_for([&] { return calls.load() == cycle + 2 && CollectorSchedulerTestAccess::inBackoff(scheduler, name); });
+            max_timers = std::max(max_timers, CollectorSchedulerTestAccess::backoffTimers(scheduler, name));
+        }
+        CollectorSchedulerTestAccess::stopLane(scheduler, name);
+        const auto remaining = CollectorSchedulerTestAccess::backoffTimers(scheduler, name);
+        check(progressed, "real cooldown timers must repeatedly deliver work to the live lane");
+        check(max_timers <= 1 && remaining == 0, "fired backoff timers must remain bounded and be reclaimed at teardown");
+    });
     std::mutex mutex;
     std::condition_variable cv;
     bool entered = false, released = false;
@@ -621,14 +789,22 @@ void run(const std::string& base) {
         void onDrained(uint64_t internal_id) override {
             std::lock_guard lock(mutex_);
             completed_.push_back(internal_id);
+            cv_.notify_all();
         }
         size_t count(uint64_t internal_id) const {
             std::lock_guard lock(mutex_);
             return static_cast<size_t>(
                 std::count(completed_.begin(), completed_.end(), internal_id));
         }
+        bool wait_for(uint64_t internal_id) {
+            std::unique_lock lock(mutex_);
+            return cv_.wait_for(lock, std::chrono::seconds(5), [&] {
+                return std::count(completed_.begin(), completed_.end(), internal_id) != 0;
+            });
+        }
     private:
         mutable std::mutex mutex_;
+        std::condition_variable cv_;
         std::vector<uint64_t> completed_;
     };
     auto record_of = [](uint64_t id, const std::string& state,
@@ -677,7 +853,7 @@ void run(const std::string& base) {
 
     // Both findings are reported, not just the first: on the pre-fix tree the
     // run must show each defect independently.
-    std::vector<std::string> regression_failures;
+    std::vector<std::string> regression_failures = std::move(early_timer_failures);
     const auto run_regression = [&regression_failures](const char* name,
                                                        const std::function<void()>& body) {
         try {
@@ -1044,6 +1220,160 @@ void run(const std::string& base) {
         CollectorSchedulerTestAccess::reconcile(scheduler);
     });
 
+    for (const std::string kind : {"throw", "failed", "output"}) {
+        run_regression(("yield-failure-" + kind).c_str(), [&] {
+            const uint64_t id = kind == "throw" ? 7203 : kind == "failed" ? 7204 : 7205;
+            const std::string name = "ev_failure_" + kind;
+            auto plan = std::make_shared<CollectorSchedulerTestAccess::EventDrainPlan>();
+            plan->more_plan = {true, true, false};
+            plan->failure = kind;
+            plan->job_id = id;
+            std::atomic<int> removed{0};
+            CollectorSchedulerTestAccess::addPlannedEvent(scheduler, name, plan, {}, bump(removed));
+            close_source.set({record_of(id, kStateActive, {name})});
+            CollectorSchedulerTestAccess::reconcile(scheduler);
+            CollectorSchedulerTestAccess::pauseLane(scheduler, name);
+            close_source.set({record_of(id, kStateClosing, {})});
+            CollectorSchedulerTestAccess::reconcile(scheduler);
+            CollectorSchedulerTestAccess::stageReadiness(scheduler, name);
+            check(CollectorSchedulerTestAccess::drainLane(scheduler, name) == WorkResult::Yield,
+                  "initial unfinished drain must yield");
+            check(CollectorSchedulerTestAccess::drainLane(scheduler, name) == WorkResult::Complete,
+                  "failed drain must stop immediate requeue");
+            check(removed.load() == 0 && close_sink.count(id) == 0 &&
+                      CollectorSchedulerTestAccess::pendingCloses(scheduler, name) == 1 &&
+                      CollectorSchedulerTestAccess::snapshotCount(scheduler, name) == 1,
+                  "failure must retain close and snapshot without Removed or completion");
+            check(status(name)["has_error"] == true, "failure must be visible in status");
+            // The collector would now return success with an empty source list.
+            // That callback cannot prove what the failed round lost.
+            CollectorSchedulerTestAccess::drainLane(scheduler, name);
+            CollectorSchedulerTestAccess::reconcile(scheduler);
+            check(plan->ready_calls.load() == 2 && removed.load() == 0 && close_sink.count(id) == 0 &&
+                      CollectorSchedulerTestAccess::pendingCloses(scheduler, name) == 1 &&
+                      CollectorSchedulerTestAccess::snapshotCount(scheduler, name) == 1,
+                  "empty success must not launder an unresolved failed drain");
+            if (kind == "output")
+                check(plan->accepted.load() == 1 && plan->rejected.load() == 1,
+                      "accepted output must not be replayed after admission rejection");
+            check(status(name)["has_error"] == true, "failed epoch must keep its visible error");
+            close_source.set({});
+            CollectorSchedulerTestAccess::reconcile(scheduler);
+        });
+    }
+
+    run_regression("failed-drain-stop", [&] {
+        auto plan = std::make_shared<CollectorSchedulerTestAccess::EventDrainPlan>();
+        plan->more_plan = {true, true};
+        plan->failure = "throw";
+        plan->job_id = 7206;
+        std::atomic<int> removed{0};
+        CollectorSchedulerTestAccess::addPlannedEvent(scheduler, "ev_failed_stop", plan, {}, bump(removed));
+        close_source.set({record_of(7206, kStateActive, {"ev_failed_stop"})});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+        CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_failed_stop");
+        close_source.set({record_of(7206, kStateClosing, {})});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+        CollectorSchedulerTestAccess::stageReadiness(scheduler, "ev_failed_stop");
+        CollectorSchedulerTestAccess::drainLane(scheduler, "ev_failed_stop");
+        CollectorSchedulerTestAccess::drainLane(scheduler, "ev_failed_stop");
+        CollectorSchedulerTestAccess::stopLane(scheduler, "ev_failed_stop");
+        check(removed.load() == 0 && close_sink.count(7206) == 0,
+              "stopping an unproven drain must not report Removed or completion");
+        check(!CollectorSchedulerTestAccess::restartLane(scheduler, "ev_failed_stop"),
+              "restart must reject a failed epoch with unresolved obligations");
+        check(CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_failed_stop") == 1 &&
+                  CollectorSchedulerTestAccess::snapshotCount(scheduler, "ev_failed_stop") == 1 &&
+                  status("ev_failed_stop")["has_error"] == true,
+              "stop and rejected restart must retain the failed close and error");
+        close_source.set({});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+    });
+
+    run_regression("failed-readiness-suppressed", [&] {
+        auto plan = std::make_shared<CollectorSchedulerTestAccess::EventDrainPlan>();
+        plan->more_plan = {true, true, true, false};
+        plan->failure = "throw";
+        CollectorSchedulerTestAccess::addPlannedEvent(scheduler, "ev_failed_signal", plan);
+        close_source.set({record_of(7207, kStateActive, {"ev_failed_signal"})});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+        CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_failed_signal");
+        close_source.set({record_of(7207, kStateClosing, {})});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+        CollectorSchedulerTestAccess::stageReadiness(scheduler, "ev_failed_signal");
+        CollectorSchedulerTestAccess::drainLane(scheduler, "ev_failed_signal");
+        CollectorSchedulerTestAccess::stageReadiness(scheduler, "ev_failed_signal");
+        CollectorSchedulerTestAccess::drainLane(scheduler, "ev_failed_signal");
+        check(plan->sources_of(1) == 1, "failed callback must actually receive readiness");
+        CollectorSchedulerTestAccess::holdBackoff(scheduler, "ev_failed_signal");
+        check(CollectorSchedulerTestAccess::signalFailedLane(scheduler, "ev_failed_signal") > 0,
+              "fresh readiness must remain available after failure");
+        check(CollectorSchedulerTestAccess::drainLane(scheduler, "ev_failed_signal") == WorkResult::Complete &&
+                  plan->ready_calls.load() == 2,
+              "immediate rearmed readiness must not hot-spin a failed callback");
+        CollectorSchedulerTestAccess::expireBackoff(scheduler, "ev_failed_signal");
+        check(CollectorSchedulerTestAccess::drainLane(scheduler, "ev_failed_signal") == WorkResult::Yield,
+              "fresh work may yield even when an earlier tail failed");
+        CollectorSchedulerTestAccess::drainLane(scheduler, "ev_failed_signal");
+        check(plan->ready_calls.load() == 4 && close_sink.count(7207) == 0 &&
+                  CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_failed_signal") == 1 &&
+                  CollectorSchedulerTestAccess::snapshotCount(scheduler, "ev_failed_signal") == 1,
+              "fresh readiness must run without laundering the failed tail");
+        check(status("ev_failed_signal")["has_error"] == true,
+              "successful fresh Job events must not clear the earlier failed-tail error");
+        close_source.set({});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+    });
+
+    run_regression("failed-manual-stop", [&] {
+        auto plan = std::make_shared<CollectorSchedulerTestAccess::EventDrainPlan>();
+        plan->more_plan = {true, true};
+        plan->failure = "throw";
+        CollectorSchedulerTestAccess::addPlannedEvent(scheduler, "ev_failed_manual", plan);
+        close_source.set({record_of(7208, kStateActive, {"ev_failed_manual"})});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+        CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_failed_manual");
+        CollectorSchedulerTestAccess::stageReadiness(scheduler, "ev_failed_manual");
+        CollectorSchedulerTestAccess::drainLane(scheduler, "ev_failed_manual");
+        CollectorSchedulerTestAccess::drainLane(scheduler, "ev_failed_manual");
+        CollectorSchedulerTestAccess::update(scheduler, 7208, {});
+        check(CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_failed_manual") == 1 &&
+                  CollectorSchedulerTestAccess::snapshotCount(scheduler, "ev_failed_manual") == 1,
+              "manual stop must retain the failed epoch obligation and snapshot");
+        close_source.set({record_of(7208, kStateClosing, {})});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+        check(close_sink.count(7208) == 0, "retirement must adopt the failed manual-stop tail");
+        close_source.set({});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+    });
+
+    run_regression("proven-completion-during-shutdown", [&] {
+        auto plan = std::make_shared<CollectorSchedulerTestAccess::EventDrainPlan>();
+        plan->block_first = true;
+        CollectorSchedulerTestAccess::addPlannedEvent(scheduler, "ev_shutdown_proof", plan);
+        close_source.set({record_of(7299, kStateActive, {"ev_shutdown_proof"})});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+        CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_shutdown_proof");
+        close_source.set({record_of(7299, kStateClosing, {})});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+        CollectorSchedulerTestAccess::stageReadiness(scheduler, "ev_shutdown_proof");
+        std::thread worker([&] {
+            CollectorSchedulerTestAccess::drainLane(scheduler, "ev_shutdown_proof");
+        });
+        {
+            std::unique_lock lock(plan->mutex);
+            plan->barrier_cv.wait(lock, [&] { return plan->entered; });
+            CollectorSchedulerTestAccess::setStopping(scheduler, true);
+            plan->release = true;
+            plan->barrier_cv.notify_one();
+        }
+        worker.join();
+        CollectorSchedulerTestAccess::setStopping(scheduler, false);
+        check(close_sink.count(7299) == 1, "proven completion must survive shutdown start");
+        close_source.set({});
+        CollectorSchedulerTestAccess::reconcile(scheduler);
+    });
+
     run_regression("single-notification-two-rounds", [&] {
         // One readiness notification, two on_ready rounds. The continuation
         // must run without a second notification (sources empty in the second
@@ -1190,7 +1520,11 @@ void run(const std::string& base) {
         check(ri_b_removed.load() == 1 && ri_a_removed.load() == 0,
               "an acknowledgement must not deliver another lane's Removed");
 
+        // The last proven lane completes after shutdown has begun; the real
+        // registry sink must still receive the acknowledgement.
+        CollectorSchedulerTestAccess::setStopping(scheduler, true);
         CollectorSchedulerTestAccess::drainLane(scheduler, "ri_ev_a");
+        CollectorSchedulerTestAccess::setStopping(scheduler, false);
         check(!archive.inventoryRecord(8101).has_value() && !has_active(archive, 8101),
               "the last ack must archive the record and release the instance");
         history_rows = raw_keys_from_store_copy(live_db, base + "-archive-copy-4",

@@ -101,6 +101,8 @@ private:
         // Poller-thread readiness is only staged here; the lane consumes it.
         std::mutex ready_m_;
         std::vector<ReadySource> ready;
+        std::chrono::steady_clock::time_point ready_after{};
+        std::optional<size_t> ready_timer;
 
         // A drain that outlived its round budget (on_ready returned more=true)
         // is still producing its accepted tail. The executor requeues the lane
@@ -111,6 +113,8 @@ private:
         // ReadySources list: on_ready drains the collector's own backlog, the
         // list only names sources that signalled readiness.
         bool drain_pending = false;
+        // Sticky unproven Job tail; later source work cannot prove recovery.
+        std::atomic<bool> drain_failed{false};
 
         // Immutable Job snapshots visible to event contexts. Closing snapshots
         // stay until their lane tail has been finalized.

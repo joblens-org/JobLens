@@ -26,6 +26,19 @@ WorkResult CollectorScheduler::runEventDrain(CollectorLaneContext& lane) {
     std::vector<ReadySource> ready;
     {
         std::lock_guard lock(state.ready_m_);
+        const auto now = std::chrono::steady_clock::now();
+        if (!state.ready.empty() && now < state.ready_after) {
+            if (!state.ready_timer) {
+                const auto delay = std::chrono::ceil<std::chrono::milliseconds>(state.ready_after - now);
+                state.ready_timer = timerScheduler_.registerWorkTimer(
+                    delay, state.lane, RequestPolicy::Remember, lane.name + ":event-backoff");
+            }
+            return WorkResult::Complete;
+        }
+        if (state.ready_timer) {
+            timerScheduler_.cancelTimer(*state.ready_timer);
+            state.ready_timer.reset();
+        }
         ready.swap(state.ready);
     }
 
@@ -103,20 +116,19 @@ WorkResult CollectorScheduler::runEventDrain(CollectorLaneContext& lane) {
                 runtime_->error(lane.name, error);
                 spdlog::error("CollectorScheduler: collector {} event drain failed: {}",
                               lane.name, error);
-            } else if (outcome.outcome.state == CollectState::Success) {
+            } else if (outcome.outcome.state == CollectState::Success && !state.drain_failed.load()) {
                 runtime_->clear_error(lane.name);
             }
-            // A round that hit its budget must not touch this lane's pending
-            // closes: their tail records are still being produced, and
-            // releasing the snapshots now would leave the continuation round's
-            // resolver lookups without a snapshot. The executor requeues a
-            // Yield lane on its own, and drain_pending keeps those rounds
-            // calling on_ready even when no new readiness arrived. A failed
-            // round cannot prove anything either, but holding the closes on a
-            // broken collector would leak the snapshots and stall the registry
-            // forever, so a failure keeps the existing acknowledge-anyway
-            // behaviour (result stays Complete below).
-            if (ok && outcome.more) {
+            if (!ok) {
+                // Never retry an empty failed round. Fresh readiness is
+                // coalesced and rate-limited; it cannot prove the old Job tail.
+                state.drain_pending = false;
+                {
+                    std::lock_guard ready_lock(state.ready_m_);
+                    if (lane.info.scope == CollectorScope::Job) state.drain_failed.store(true);
+                    state.ready_after = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+                }
+            } else if (outcome.more) {
                 result = WorkResult::Yield;
                 state.drain_pending = true;
             } else {
@@ -127,7 +139,7 @@ WorkResult CollectorScheduler::runEventDrain(CollectorLaneContext& lane) {
         // A round that did not yield has a proven drain: either on_ready
         // finished without asking for more, or the collector had nothing in
         // flight this round. Only such a round may consume the closes.
-        if (result != WorkResult::Yield) closes.swap(state.pending_close);
+        if (!state.drain_pending && !state.drain_failed.load()) closes.swap(state.pending_close);
 
         if (!closes.empty()) {
             for (const auto& close : closes) {
@@ -165,4 +177,3 @@ WorkResult CollectorScheduler::runEventDrain(CollectorLaneContext& lane) {
     notifyDrained(completed);
     return result;
 }
-
