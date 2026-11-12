@@ -1027,8 +1027,13 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
     // so one fsynced batch per pass bounds what a process crash can lose. The
     // pass cadence (reconcile_interval_sec) is the checkpoint cadence on
     // purpose: no extra knob, no extra thread.
-    if (!store_->flushDirty("maintenance checkpoint")) {
-        spdlog::warn("JobRegistry: the maintenance checkpoint could not be written");
+    {
+        // Keep the row-provider snapshot and its checkpoint write inside the
+        // same transaction boundary as record/index mutations.
+        std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
+        if (!store_->flushDirty("maintenance checkpoint")) {
+            spdlog::warn("JobRegistry: the maintenance checkpoint could not be written");
+        }
     }
 
     {
@@ -1488,9 +1493,12 @@ bool JobRegistry::deinit()
     // Everything written without a fence becomes durable before the database
     // closes; archive runs (synced) after this so a closing record is archived
     // on top of an up-to-date row.
-    if (!store_->flushDirty("shutdown checkpoint")) {
-        spdlog::warn("JobRegistry: the shutdown checkpoint could not be written");
-        ok = false;
+    {
+        std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
+        if (!store_->flushDirty("shutdown checkpoint")) {
+            spdlog::warn("JobRegistry: the shutdown checkpoint could not be written");
+            ok = false;
+        }
     }
     // Archive leftover closing records first so a restored closing record is
     // not reported as an incomplete drain even though the archive succeeds.
@@ -1542,7 +1550,11 @@ bool JobRegistry::deinit()
     adapters_.clear();
 
     stop_pid_tracker();
-    store_.reset();   // closes the db
+    {
+        // JobStore's destructor performs its own final checkpoint.
+        std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
+        store_.reset();   // closes the db
+    }
 
     deinit_done_ = true;
     deinit_ok_ = ok;
@@ -3724,6 +3736,14 @@ CollectionOutcome JobRegistry::applyAutoPolicy(
 
 bool JobRegistry::recoverStoreIfNeeded(std::string& error) {
     error.clear();
+    if (!store_) {
+        error = "store_unavailable";
+        return false;
+    }
+    if (!store_->recoveryRequired()) return true;
+    // Recovery may also checkpoint row-provider snapshots. Keep its fence and
+    // publication in the same transaction boundary as ordinary checkpoints.
+    std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
     if (!store_) {
         error = "store_unavailable";
         return false;
