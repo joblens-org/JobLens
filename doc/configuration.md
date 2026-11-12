@@ -202,6 +202,16 @@ policy down forever).
 | Remove — stop tier (default) | `JobRegistry/job_opt` with `opt: "remove"` | Stops collection (a persistent empty manual selection); the inventory record is retained |
 | Remove — erase tier | `JobRegistry/job_opt` with `opt: "remove"`, `"erase": true` | Retires the instance for real: the closing fact is durable first, then a collected instance is archived as an `h:` history row and a never-collected one is durably deleted. The response distinguishes the tiers through `mode: stop\|erase` |
 
+Archive-versus-delete is decided by the collection *fact* — the runtime's
+actual attachment snapshot captured when the retirement is accepted. One
+documented exception: when the process restarts between the durable
+Closing write and the finalization (the in-memory capture dies with the
+process), the restored closing row falls back to its durable effective
+selection instead. A selected-but-never-attached instance may therefore
+leave a history row after such a restart. The failure direction is
+keep-a-row over silently dropping one; instances that retired without a
+restart are classified strictly.
+
 Both remove tiers address targets by `JobID` or by `matcher`, the same
 resolution the stop tier always used. The trigger's `/joblens/job` endpoint
 forwards the `erase` field verbatim; absent means the stop tier.

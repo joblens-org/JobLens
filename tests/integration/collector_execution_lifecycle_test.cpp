@@ -27,6 +27,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <fstream>
+#include <leveldb/db.h>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -401,12 +402,6 @@ void run(const std::string& base)
     const auto two = CaptureWriter::wait_for("job_event", 2);
     check(two[1]->sample->job.JobID == 202, "second Job event attribution");
 
-    send_byte(FakeJobEvent::writer_fd.load(), 'x');
-    eventually([&] { return collector_status(scheduler, "job_event").at("has_error").get<bool>(); },
-               "unknown Job event did not produce a diagnostic");
-    check(FakeJobEvent::unknown.load() >= 1, "unknown Job event was not counted");
-    check(CaptureWriter::count("job_event") == 2, "unknown Job event produced output");
-
     // One Job ends; the other continues through the same source/lane.
     JobRegistry::instance().delJob(101);
     eventually([&] { return JobRegistry::instance().closingJobCount() == 0; },
@@ -416,8 +411,6 @@ void run(const std::string& base)
     send_byte(FakeJobEvent::writer_fd.load(), '2');
     const auto after_close = CaptureWriter::wait_for("job_event", 3);
     check(after_close[2]->sample->job.JobID == 202, "surviving Job event attribution");
-    eventually([&] { return !collector_status(scheduler, "job_event").at("has_error").get<bool>(); },
-               "successful event did not clear the unknown-Job error");
 
     const auto event_status = collector_status(scheduler, "job_event");
     check(event_status.at("scope") == "job", "job_event scope status");
@@ -548,7 +541,64 @@ void run(const std::string& base)
     check(collector_status(scheduler, "job_event").at("job_count").get<size_t>() == 0,
           "the retired instance must leave the lane");
 
+    // A distinct final fixture poisons the event lane: the invalid binding is
+    // still diagnosed and emits nothing, but cannot contaminate the successful
+    // lifecycle scenarios above. Its real Closing row must survive shutdown.
+    const auto failed_job = make_job(303, {"job_event"});
+    check(registry.addJob(failed_job), "add failed-drain Job 303");
+    eventually([&] { return scheduler.actual(303).tracked; }, "failed-drain job not attached");
+    const auto before_invalid = CaptureWriter::count("job_event");
+    send_byte(FakeJobEvent::writer_fd.load(), 'x');
+    eventually([&] { return collector_status(scheduler, "job_event").at("has_error").get<bool>(); },
+               "unknown Job event did not produce a diagnostic");
+    check(FakeJobEvent::unknown.load() >= 1, "unknown Job event was not counted");
+    check(CaptureWriter::count("job_event") == before_invalid, "unknown Job event produced output");
+    CollectionRequest stop_failed;
+    stop_failed.targets = {303};
+    stop_failed.collectors = std::vector<std::string>{};
+    check(registry.setCollectors(stop_failed).ok, "manual stop of failed event lane must be accepted");
+    eventually([&] { return collector_status(scheduler, "job_event").at("job_count") == 0; },
+               "manual stop did not detach the failed job");
+    registry.delJob(303);
+    eventually([&] { return scheduler.actual(303).draining; }, "failed drain not owned by scheduler");
+    check(!registry.cleanupClosingJobs(), "shutdown sweep must refuse an unproven live drain");
+    check(registry.inventoryRecord(303).has_value(), "unproven live drain must remain Closing");
     scheduler.shutdown();
+    check(!registry.deinit(), "shutdown with an unproven drain must be incomplete");
+    leveldb::Options options;
+    options.create_if_missing = false;
+    leveldb::DB* raw = nullptr;
+    const auto opened = leveldb::DB::Open(options, base + ".db", &raw);
+    check(opened.ok(), "open closed fixture database: " + opened.ToString());
+    std::unique_ptr<leveldb::DB> db(raw);
+    std::string value;
+    check(db->Get(leveldb::ReadOptions{}, "j:000000000000012f", &value).ok(),
+          "durable Closing row must survive deinit");
+    check(nlohmann::json::parse(value).at("state") == kStateClosing,
+          "surviving durable row must remain Closing");
+    std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions{}));
+    it->Seek("h:000000000000012f:");
+    check(!it->Valid() || it->key().ToString().rfind("h:000000000000012f:", 0) != 0,
+          "unproven drain must not create a history row");
+    check(it->status().ok(), "inspect fixture history rows");
+    it.reset();
+    db.reset();
+
+    // Model a fresh process: only the durable Closing row survives, and a
+    // newly composed runtime has no in-process owner for the old epoch.
+    JobRegistryOptions reopened_options;
+    reopened_options.db_path = base + ".db";
+    reopened_options.test_static_inventory = true;
+    reopened_options.enable_pid_tracker = false;
+    reopened_options.register_rpc = false;
+    JobRegistry reopened(reopened_options);
+    reopened.setKernelCleanupForTest([](uint64_t, const Job&, std::string&) { return true; });
+    TestCollectionRuntime fresh_runtime(reopened);
+    reopened.setCollectionRuntime(&fresh_runtime);
+    check(reopened.inventoryRecord(303).has_value(), "restart must restore the Closing row");
+    check(reopened.cleanupClosingJobs(), "ownerless restored Closing must retain restart fallback");
+    check(!reopened.inventoryRecord(303).has_value(), "restart fallback must finish cleanup");
+    check(reopened.deinit(), "reopened fixture must shut down cleanly");
     WriterManager::instance().shutdown();
 }
 

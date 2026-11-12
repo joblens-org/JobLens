@@ -2289,6 +2289,31 @@ bool JobRegistry::cleanupThenArchive(uint64_t jobID) {
     const auto current = ownRecord(jobID);
     if (!current) return true;   // already archived: the goal is reached
     if (current->state != kStateClosing) return false;
+
+    // A live runtime's accepted tail requires its explicit completion. A
+    // locally captured retirement also covers the window before the runtime
+    // has reconciled the Closing row. Restored Closing rows have no such
+    // capture: if the new runtime has no owner, preserve the restart fallback.
+    if (auto* runtime = collectionRuntime()) {
+        bool drained = false;
+        {
+            std::lock_guard<std::mutex> lock(drain_mtx_);
+            drained = drain_complete_.count(jobID) != 0;
+        }
+        if (!drained) {
+            bool locally_retired = false;
+            {
+                std::lock_guard<std::mutex> lock(retire_applied_mtx_);
+                locally_retired = retire_applied_.count(jobID) != 0;
+            }
+            const auto actual = runtime->actual(jobID);
+            if (locally_retired || actual.tracked || actual.draining) {
+                spdlog::warn("JobRegistry: closing JobID {} has no proven runtime drain; "
+                             "retaining the Closing reservation", jobID);
+                return false;
+            }
+        }
+    }
     const Job& closing_job = current->job;
 
     // Archive-versus-discard is a fact decision made here, not in the store:
