@@ -884,6 +884,47 @@ def test_read_contract_violating_collection_target_is_not_reported_as_success(
 # ==================== job_opt remove erase tier pass-through ====================
 
 
+@pytest.mark.parametrize(
+    "job_type,cluster_name,cluster_tag,sub_attr,core_error",
+    [
+        ("job.condor", "pool-a", "schedd#one@submit", {"cluster_id": 12, "proc_id": 3}, False),
+        ("job.slurm", "cluster-a", "tag-a", {"job_id": 12, "step_id": 1}, False),
+        ("job.condor", "pool-a", "schedd@submit",
+         {"cluster_id": 12, "proc_id": 3, "collector_host": "pool-b"}, True),
+        ("job.slurm", "cluster-a", "tag-a",
+         {"job_id": 12, "step_id": 1, "cluster_name": "cluster-b"}, True),
+    ],
+)
+def test_job_namespace_claims_reach_rpc_unchanged(
+    monkeypatch, job_type, cluster_name, cluster_tag, sub_attr, core_error
+) -> None:
+    calls = []
+
+    class FakeRPC:
+        def __init__(self, socket_path, timeout):
+            pass
+
+        def call(self, method, params):
+            calls.append((method, params))
+            if core_error:
+                return {"status": "error", "msg": "namespace_conflict"}
+            return {"status": "success"}
+
+    monkeypatch.setattr(tools, "USE_MOCK_TOOLS", False)
+    monkeypatch.setattr(tools, "use_rpc_opt", lambda: True)
+    monkeypatch.setattr(tools, "config", {"lens_config": {"rpc_socket_path": "/tmp/test.sock"}})
+    monkeypatch.setattr(tools, "RPCClient", FakeRPC)
+    body = {"opt": "add", "type": job_type, "cluster_name": cluster_name,
+            "cluster_tag": cluster_tag, "sub_attr": sub_attr}
+    response = _app().test_client().post("/joblens/job", json=body)
+
+    assert response.status_code == (500 if core_error else 200)
+    assert len(calls) == 1 and calls[0][0] == "JobRegistry/job_opt"
+    assert calls[0][1]["cluster_name"] == cluster_name
+    assert calls[0][1]["cluster_tag"] == cluster_tag
+    assert calls[0][1]["sub_attr"] == sub_attr
+
+
 def test_erase_job_remove_forwards_the_erase_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     """remove 的真删档必须原样透传给核心；默认不携带 erase。"""
     from trigger.api import routes as routes_module
