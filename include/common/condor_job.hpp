@@ -13,14 +13,20 @@
  * limitations under the License. */
 #pragma once
 #include "core/collector_type.h"
+#include "core/group_probe_stats.hpp"
+#include "common/classad_decode.hpp"
 #include "common/utils.hpp"
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <climits>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <variant>
 #include <spdlog/spdlog.h>
 #include <fmt/core.h>
@@ -220,6 +226,124 @@ inline std::string get_native_job_id(pid_t pid){
     return fmt::format("{}.{}", cluster_id, proc_id);
 }
 
+/* ===================== 组归属（只读上游标准 ClassAd 属性） =====================
+ * - AcctGroup：计费组，完整三段（实验.子组.队列等级）；PrimaryUnixGroup：作业主动
+ *   声明的主 Unix 组（primary_unix_group），未声明为空。不读 AccountingGroup
+ *   （= acct_group + "." + 用户的派生物）与任何站点显示组（如 IHEP_RealGroup）。
+ * - ad 文件来源优先级：starter 进程 env（condor 守护启动，作业用户改不了）>
+ *   作业用户进程 env（兜底，需通过符号链接/属主校验）。
+ * - GlobalJobId 只做“防串号”一致性检查；防伪造靠来源校验（降低风险，非消除——
+ *   同 uid 的作业进程仍可能伪造，残余风险见设计文档信任模型）。
+ * - 读失败不置 group_probed，由 group_probe_attempts 有界重试；采集周期会反复
+ *   走 update_job → update_job_info，probed 标志防止组本就为空的站点每周期重读。
+ */
+inline constexpr size_t kGroupValueMaxLen = 256;
+inline constexpr uint8_t kMaxGroupProbeAttempts = 3;
+
+// 解析 GlobalJobId 中的 cluster.proc（"sched@host#123.0#ts" → {123, 0}）。
+inline std::optional<std::pair<size_t, size_t>> cluster_proc_from_global_job_id(const std::string& g) {
+    auto first = g.find('#');
+    if (first == std::string::npos) return std::nullopt;
+    auto second = g.find('#', first + 1);
+    if (second == std::string::npos) return std::nullopt;
+    std::string cp = g.substr(first + 1, second - first - 1);
+    auto dot = cp.find('.');
+    if (dot == std::string::npos) return std::nullopt;
+    size_t cluster = parse_uint64(cp.substr(0, dot));
+    size_t proc = parse_uint64(cp.substr(dot + 1));
+    if (cluster == 0) return std::nullopt;  // cluster 0 不是合法作业；proc 0 合法
+    return std::make_pair(cluster, proc);
+}
+
+inline bool is_regular_nonsymlink(const std::string& path) {
+    struct stat st{};
+    if (::lstat(path.c_str(), &st) != 0) return false;
+    return S_ISREG(st.st_mode);
+}
+
+inline uid_t proc_owner_uid(pid_t pid) {
+    struct stat st{};
+    if (::stat((fs::path("/proc") / std::to_string(pid)).c_str(), &st) != 0) return static_cast<uid_t>(-1);
+    return st.st_uid;
+}
+
+inline uid_t file_owner_uid(const std::string& path) {
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) return static_cast<uid_t>(-1);
+    return st.st_uid;
+}
+
+// 探测并填充组字段；返回是否取到任一非空组值（供 restore 路径决定 group_need_persist）。
+inline bool probe_groups(Job& job) {
+    auto& attr = std::get<CondorJobAttr>(job.sub_attr);
+    auto& stats = GroupProbeStats::instance();
+    const auto S = GroupProbeStats::Source::CondorAd;
+    stats.record_attempt(S);
+
+    auto bail = [&](const std::string& why) {
+        stats.record_failure(S);
+        ++job.group_probe_attempts;
+        spdlog::debug("CondorJob: group probe failed for JobID {} (attempt {}): {}",
+                      job.JobID, job.group_probe_attempts, why);
+        if (job.group_probe_attempts >= kMaxGroupProbeAttempts) {
+            job.group_probed = true;  // 有界重试后放弃，避免每周期重读
+            spdlog::warn("CondorJob: give up group probe for JobID {} after {} attempts", job.JobID, job.group_probe_attempts);
+        }
+        return false;
+    };
+
+    // 1) ad 文件来源：starter env 优先；用户进程 env 兜底并做来源校验
+    std::string starter_ad;
+    if (attr.starter_pid > 0) starter_ad = get_env_field(attr.starter_pid, "_CONDOR_JOB_AD");
+    std::string user_ad;
+    if (!job.JobPIDs.empty()) user_ad = get_env_field(job.JobPIDs[0], "_CONDOR_JOB_AD");
+
+    std::string ad_path;
+    if (!starter_ad.empty()) {
+        ad_path = starter_ad;
+    } else if (!user_ad.empty()) {
+        ad_path = user_ad;
+        if (!is_regular_nonsymlink(ad_path)) return bail("ad path is not a regular file (symlink?)");
+        uid_t owner = file_owner_uid(ad_path);
+        uid_t job_uid = proc_owner_uid(job.JobPIDs[0]);
+        uid_t starter_uid = attr.starter_pid > 0 ? proc_owner_uid(attr.starter_pid) : static_cast<uid_t>(-1);
+        if (owner != 0 && owner != job_uid && owner != starter_uid) {
+            return bail("ad file owner mismatch");
+        }
+    } else {
+        return bail("no _CONDOR_JOB_AD in starter/user env");
+    }
+
+    // 2) GlobalJobId 一致性（防 ad 文件串号；不是防伪造）
+    auto cp = cluster_proc_from_global_job_id(get_ad_field(ad_path, "GlobalJobId"));
+    if (cp && !job.NativeJobID.empty()) {
+        auto expect = fmt::format("{}.{}", cp->first, cp->second);
+        if (expect != job.NativeJobID) return bail("GlobalJobId mismatch with NativeJobID");
+    }
+
+    // 3) 读取并校验组值
+    auto acct = ClassAdValue::decode_string(get_ad_field(ad_path, "AcctGroup"));
+    auto unix_grp = ClassAdValue::decode_string(get_ad_field(ad_path, "PrimaryUnixGroup"));
+    if (!ClassAdValue::valid_group_value(acct, kGroupValueMaxLen) ||
+        !ClassAdValue::valid_group_value(unix_grp, kGroupValueMaxLen)) {
+        return bail("group value over length limit or contains control chars");
+    }
+
+    attr.acct_group = acct;
+    attr.unix_group = unix_grp;
+    if (!acct.empty()) {
+        stats.record_non_empty(S, acct);
+    } else {
+        stats.record_empty(S);  // 读成功但无组：合法缺失
+    }
+    job.group_probed = true;
+    job.group_probe_attempts = 0;
+    spdlog::debug("CondorJob: JobID {} groups acct_group='{}' unix_group='{}'",
+                  job.JobID, attr.acct_group, attr.unix_group);
+    return !acct.empty() || !unix_grp.empty();
+}
+
+
 inline void update_job_info(Job& job){
     auto& condor_attr = std::get<CondorJobAttr>(job.sub_attr);
     const bool has_job_pid = !job.JobPIDs.empty();
@@ -260,6 +384,11 @@ inline void update_job_info(Job& job){
         if (condor_attr.cluster_id == 0) condor_attr.cluster_id = cid;
         if (condor_attr.proc_id == 0) condor_attr.proc_id = pid_;
         job.NativeJobID = fmt::format("{}.{}", condor_attr.cluster_id, condor_attr.proc_id);
+    }
+
+    // 组字段：只在尚未成功探测过时补（读失败由 group_probe_attempts 有界重试）。
+    if (!job.group_probed) {
+        probe_groups(job);
     }
 
     return;

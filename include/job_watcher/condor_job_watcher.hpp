@@ -105,6 +105,9 @@ private:
         job.clusterTag = condor_attr.scheduler_name;
         job.NativeJobID = fmt::format("{}.{}", condor_attr.cluster_id, condor_attr.proc_id);
 
+        // 发现时探测一次组字段（starter_pid/JobPIDs 已就绪；失败留给 update 路径重试）
+        CondorJob::probe_groups(job);
+
         spdlog::debug("CondorJobWatcher: built job from pid {}, JobID {}, cluster_id {}, proc_id {}, scheduler_host {}, owner {}", 
                     pid, job.JobID, condor_attr.cluster_id, condor_attr.proc_id, condor_attr.scheduler_host, condor_attr.owner);
         return job;
