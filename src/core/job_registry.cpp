@@ -30,6 +30,8 @@
 #include "common/slurm_job.hpp"
 #include "common/common_job.hpp"
 #include "common/local_rpc.hpp"
+#include "core/group_probe_stats.hpp"
+#include <algorithm>
 
 std::pair<std::string, std::string>
 split_two(std::string s, char sep = '.') {
@@ -472,6 +474,18 @@ void JobRegistry::regRPChandle() {
             return j;
         }
     );
+
+    // 组字段探测统计（只读诊断）：attempts/failures/empty/non_empty/skipped、
+    // truncated、acct_group 段数分布。只能发现“格式”异常；站点显示组的语义
+    // 漂移（如 AcctGroup 第 2 段 ≠ 显示组）core 检测不了，责任在消费方。
+    RPCServer::instance().register_method("JobRegistry/group_probe_stats",
+        [this](const nlohmann::json& req) -> nlohmann::json {
+            nlohmann::json j;
+            j["status"] = "ok";
+            j["stats"] = GroupProbeStats::instance().to_json();
+            return j;
+        }
+    );
 }
 
 JobRegistry& JobRegistry::instance() {
@@ -694,6 +708,15 @@ inline void JobRegistry::update_job(Job& job){
         }
     }
 
+    // 组回填落库：write-once + 至多一次回填重写。
+    // group_need_persist 由 restore/探测路径在拿到值时置位；这里首次看到就落库并清除。
+    // （update_job_info 本身对任意 subtype 都执行 Put；现状只是上方调用方只对 Common 触发。）
+    if (job.group_need_persist && !getGroups(job).empty()) {
+        update_job_info(job);
+        job.group_need_persist = false;
+        spdlog::debug("JobRegistry: backfilled groups for JobID {} to db", job.JobID);
+    }
+
 }
 
 std::optional<Job> JobRegistry::findJob(uint64_t jobID) {
@@ -784,12 +807,25 @@ void JobRegistry::deinit_job_db(){
 
 void JobRegistry::restore_jobs_from_db(){
     leveldb::Iterator* it = job_db->NewIterator(leveldb::ReadOptions());
+    // 组字段惰性回填的探测预算：超限部分推迟到首个采集/更新周期，避免 LDAP/ad 读取拖慢启动。
+    const auto probe_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     for (it->Seek(KEY_PREFIX_JOB); it->Valid() && it->key().starts_with(KEY_PREFIX_JOB); it->Next()) {
         std::string key_str = it->key().ToString();
         uint64_t jobID = unhex64(key_str.substr(KEY_PREFIX_JOB.size()));
 
         Job job = persist_json_to_job(it->value().ToString());
         job.JobID = jobID;
+
+        // 旧记录（无组字段）且 PID 存活：探测一次，拿到值等首个 update 落库（need_persist）。
+        if ((job.subtype == JobSubType::Condor || job.subtype == JobSubType::Slurm)
+            && getGroups(job).empty()
+            && std::chrono::steady_clock::now() < probe_deadline
+            && std::any_of(job.JobPIDs.begin(), job.JobPIDs.end(),
+                           [](pid_t p) { return kill(p, 0) == 0; })) {
+            bool got = (job.subtype == JobSubType::Condor) ? CondorJob::probe_groups(job)
+                                                           : SlurmJob::probe_groups(job);
+            if (got) job.group_need_persist = true;
+        }
 
         restore_jobs_.push_back(std::move(job));
         spdlog::debug("JobRegistry: restored job with JobID {} from db", jobID);
