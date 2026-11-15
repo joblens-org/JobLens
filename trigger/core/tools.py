@@ -456,14 +456,20 @@ def joblens_format_metrics(jobs: dict) -> str:
             lines.append(f"# TYPE {metric} gauge")
             types_written.add(metric)
 
+    def _esc_label(v):
+        # Prometheus label 值转义：反斜杠、双引号、换行
+        return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
     for jobid_str, job_body in jobs.items():
         jobid = job_body["JobID"]
+        group = job_body.get("group", "")
         for proc in job_body["process_state"]:
-            # 构造标签串
+            # 构造标签串（group = 原始计费组原值，可能为空）
             labels = (
                 f'jobid="{jobid}",'
                 f'pid="{proc["pid"]}",'
-                f'name="{proc["name"]}"'
+                f'name="{_esc_label(proc["name"])}",'
+                f'group="{_esc_label(group)}"'
             )
 
             # 1. CPU

@@ -82,6 +82,10 @@ public:
     struct prometheus_job_state
     {
         int JobID{};
+        // 组归属 label：getGroups(job).acct_group 的原始计费组原值
+        //（Condor 为完整三段含队列等级，Slurm 为扁平 account）。
+        // 超 128 字节截断（计 GroupProbeStats::truncated），缺失为空串。
+        std::string group;
         std::vector<prometheus_process_state> processes_state;
         // Job 级 I/O（NewIOUsageCollector：VFS syscall 层，弃用物理块字段）
         int64_t io_rchar_total = 0;

@@ -16,6 +16,8 @@
 
 #include "writer/prometheus_exporter_writer.hpp"
 #include "writer/batch_parser_cache.hpp"
+#include "core/collector_type.h"
+#include "core/group_probe_stats.hpp"
 #include <spdlog/spdlog.h>
 #include "core/collector_registry.hpp"
 #include "core/writer_manager.hpp"
@@ -162,6 +164,16 @@ bool PrometheusExporterWriter::flush_impl(const std::vector<write_data>& batch){
         auto parsed = std::any_cast<PrometheusExporterWriter::prometheus_job_state>(parser_func(ctx, any_data));
         spdlog::trace("PrometheusExporterWriter: size of parsed: {}", parsed.processes_state.size());
         parsed.JobID = job.JobID;
+        // 组 label 取原始计费组原值（getGroups 视图）；>128 字节截断并计数。
+        {
+            auto g = getGroups(job);
+            if (g.acct_group.size() > 128) {
+                parsed.group = g.acct_group.substr(0, 125) + "...";
+                GroupProbeStats::instance().record_truncated();
+            } else {
+                parsed.group = g.acct_group;
+            }
+        }
         update_job_metrics(parsed, collector_type);
     }
     return true;
@@ -248,7 +260,7 @@ json nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_job_state>::t
     for (const auto& p : j.processes_state)
         proc_array.push_back(nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_process_state>::to_json(p));
 
-    json result{{"JobID", j.JobID}};
+    json result{{"JobID", j.JobID}, {"group", j.group}};
     result["process_state"] = std::move(proc_array);
     return result;
 }
