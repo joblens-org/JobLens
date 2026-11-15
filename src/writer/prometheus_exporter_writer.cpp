@@ -74,6 +74,8 @@ void PrometheusExporterWriter::update_job_metrics(const prometheus_job_state& da
     auto& metric = job_metrics_[data.JobID];
     
     metric.JobID = data.JobID;
+    // 组 label 是 job 级字段：合并进内存表时必须带上，否则 json_metrics 输出空值。
+    metric.group = data.group;
     spdlog::trace("PrometheusExporterWriter: update job id: {}", metric.JobID);
     
     // Indices survive vector growth and preserve first-seen PID ordering.
