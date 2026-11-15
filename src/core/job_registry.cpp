@@ -816,15 +816,18 @@ void JobRegistry::restore_jobs_from_db(){
         Job job = persist_json_to_job(it->value().ToString());
         job.JobID = jobID;
 
-        // 旧记录（无组字段）且 PID 存活：探测一次，拿到值等首个 update 落库（need_persist）。
-        if ((job.subtype == JobSubType::Condor || job.subtype == JobSubType::Slurm)
-            && getGroups(job).empty()
-            && std::chrono::steady_clock::now() < probe_deadline
-            && std::any_of(job.JobPIDs.begin(), job.JobPIDs.end(),
-                           [](pid_t p) { return kill(p, 0) == 0; })) {
-            bool got = (job.subtype == JobSubType::Condor) ? CondorJob::probe_groups(job)
-                                                           : SlurmJob::probe_groups(job);
-            if (got) job.group_need_persist = true;
+        // 组字段：记录里已有值（新版本写入）→ 直接视为已探测，避免重启后多读一次 ad/env；
+        // 旧记录（无组字段）且 PID 存活 → 探测一次，拿到值等首个 update 落库（need_persist）。
+        if (job.subtype == JobSubType::Condor || job.subtype == JobSubType::Slurm) {
+            if (!getGroups(job).empty()) {
+                job.group_probed = true;
+            } else if (std::chrono::steady_clock::now() < probe_deadline
+                       && std::any_of(job.JobPIDs.begin(), job.JobPIDs.end(),
+                                      [](pid_t p) { return kill(p, 0) == 0; })) {
+                bool got = (job.subtype == JobSubType::Condor) ? CondorJob::probe_groups(job)
+                                                               : SlurmJob::probe_groups(job);
+                if (got) job.group_need_persist = true;
+            }
         }
 
         restore_jobs_.push_back(std::move(job));
