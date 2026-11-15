@@ -338,9 +338,10 @@ struct Job {
 //     std::visit([&j](const auto& obj) { j = obj; }, v);
 // }
 
-// 组归属的规范化只读视图：存储在 sub_attr（源样，随调度器取值），
-// writer/RPC 通过本视图消费，不各自 std::visit 按 subtype 分支。
-// unix_gid 语义：内存/LevelDB/Lua 一律 -1 表示未知；对外 JSON 输出时转 null。
+// 组归属的统一只读访问器：组字段只存在于 sub_attr（源样，随调度器取值，
+// 对外 JSON/LevelDB 也只出现在 sub_attr 下，不再有顶层 groups 对象）。
+// writer/registry 通过本视图取值，不各自 std::visit 按 subtype 分支。
+// unix_gid 语义：-1 表示未知，内存/LevelDB/Lua/对外 JSON 一致。
 struct JobGroupView {
     std::string acct_group;
     std::string unix_group;
@@ -368,21 +369,6 @@ inline JobGroupView getGroups(const Job& job) {
     return v;
 }
 
-// 顶层 "groups" 对象：dump_job()/job_to_json() 的派生视图（gid < 0 → null）。
-// 存储侧（LevelDB）的组字段在 sub_attr 内，gid 未知写数字 -1。
-inline nlohmann::json groups_to_json(const Job& job) {
-    auto g = getGroups(job);
-    nlohmann::json j;
-    j["acct_group"] = g.acct_group;
-    j["unix_group"] = g.unix_group;
-    if (g.unix_gid < 0) {
-        j["unix_gid"] = nullptr;
-    } else {
-        j["unix_gid"] = g.unix_gid;
-    }
-    return j;
-}
-
 inline nlohmann::json dump_job(const Job& job) {
     nlohmann::json j;
     j["JobID"] = job.JobID;
@@ -402,7 +388,6 @@ inline nlohmann::json dump_job(const Job& job) {
     std::visit([&j](const auto& obj) {
         j["sub_attr"] = nlohmann::json(obj);
     }, job.sub_attr);
-    j["groups"] = groups_to_json(job);
     return j;
 }
 
@@ -420,7 +405,6 @@ inline nlohmann::json job_to_json(const Job& job) {
     std::visit([&j](const auto& obj) {
         j["sub_attr"] = nlohmann::json(obj); // 显式转换为 nlohmann::json
     }, job.sub_attr);
-    j["groups"] = groups_to_json(job);
     return j;
 }
 

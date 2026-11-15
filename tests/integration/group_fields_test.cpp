@@ -142,7 +142,7 @@ static void test_slurm_attr_json() {
     CHECK(big.unix_gid == 4294967294LL);
 }
 
-// ---------- 3. getGroups 视图与对外 JSON（gid<0 → null） ----------
+// ---------- 3. getGroups 访问器与对外 JSON（组只在 sub_attr 下，无顶层 groups） ----------
 static void test_groups_view() {
     Job jc;
     jc.subtype = JobSubType::Condor;
@@ -151,24 +151,30 @@ static void test_groups_view() {
     CHECK(gc.acct_group == "JUNO.juno.default");
     CHECK(gc.unix_gid == -1);
     auto dj = dump_job(jc);
-    CHECK(dj.contains("groups"));
-    CHECK(dj["groups"]["acct_group"] == "JUNO.juno.default");
-    CHECK(dj["groups"]["unix_gid"].is_null());
+    CHECK(!dj.contains("groups"));  // 不再输出顶层 groups
+    CHECK(dj["sub_attr"]["acct_group"] == "JUNO.juno.default");
+    CHECK(!dj["sub_attr"].contains("unix_gid"));  // Condor 属性没有 gid 字段
     auto wj = job_to_json(jc);
-    CHECK(wj["groups"]["unix_gid"].is_null());
+    CHECK(!wj.contains("groups"));
+    CHECK(wj["sub_attr"]["acct_group"] == "JUNO.juno.default");
 
     Job js;
     js.subtype = JobSubType::Slurm;
     js.sub_attr = SlurmJobAttr{.acct_group = "gpupwa", .unix_group = "physics", .unix_gid = 290};
     auto gs = getGroups(js);
     CHECK(gs.unix_group == "physics");
-    CHECK(dump_job(js)["groups"]["unix_gid"] == 290);
+    CHECK(dump_job(js)["sub_attr"]["unix_gid"] == 290);
+    // gid 未知的 Slurm 作业：sub_attr 里是 -1（数值，不输出 null）
+    Job jn;
+    jn.subtype = JobSubType::Slurm;
+    jn.sub_attr = SlurmJobAttr{};
+    CHECK(dump_job(jn)["sub_attr"]["unix_gid"] == -1);
 
     Job jm;
     jm.subtype = JobSubType::Common;
     jm.sub_attr = CommonJobAttr{};
     CHECK(getGroups(jm).empty());
-    CHECK(dump_job(jm)["groups"]["acct_group"] == "");
+    CHECK(!dump_job(jm).contains("groups"));
 }
 
 // ---------- 4. GroupProbeStats 计数与 JSON 形状 ----------
