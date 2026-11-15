@@ -237,9 +237,6 @@ inline std::string get_native_job_id(pid_t pid){
  * - 读失败不置 group_probed，由 group_probe_attempts 有界重试；采集周期会反复
  *   走 update_job → update_job_info，probed 标志防止组本就为空的站点每周期重读。
  */
-inline constexpr size_t kGroupValueMaxLen = 256;
-inline constexpr uint8_t kMaxGroupProbeAttempts = 3;
-
 // 解析 GlobalJobId 中的 cluster.proc（"sched@host#123.0#ts" → {123, 0}）。
 inline std::optional<std::pair<size_t, size_t>> cluster_proc_from_global_job_id(const std::string& g) {
     auto first = g.find('#');
@@ -285,7 +282,7 @@ inline bool probe_groups(Job& job) {
         ++job.group_probe_attempts;
         spdlog::debug("CondorJob: group probe failed for JobID {} (attempt {}): {}",
                       job.JobID, job.group_probe_attempts, why);
-        if (job.group_probe_attempts >= kMaxGroupProbeAttempts) {
+        if (job.group_probe_attempts >= ClassAdValue::kMaxGroupProbeAttempts) {
             job.group_probed = true;  // 有界重试后放弃，避免每周期重读
             spdlog::warn("CondorJob: give up group probe for JobID {} after {} attempts", job.JobID, job.group_probe_attempts);
         }
@@ -324,8 +321,8 @@ inline bool probe_groups(Job& job) {
     // 3) 读取并校验组值
     auto acct = ClassAdValue::decode_string(get_ad_field(ad_path, "AcctGroup"));
     auto unix_grp = ClassAdValue::decode_string(get_ad_field(ad_path, "PrimaryUnixGroup"));
-    if (!ClassAdValue::valid_group_value(acct, kGroupValueMaxLen) ||
-        !ClassAdValue::valid_group_value(unix_grp, kGroupValueMaxLen)) {
+    if (!ClassAdValue::valid_group_value(acct, ClassAdValue::kGroupValueMaxLen) ||
+        !ClassAdValue::valid_group_value(unix_grp, ClassAdValue::kGroupValueMaxLen)) {
         return bail("group value over length limit or contains control chars");
     }
 

@@ -47,15 +47,15 @@ void GroupProbeStats::record_non_empty(Source s, const std::string& acct_group) 
     if (static_cast<size_t>(s) >= kSourceCount) return;
     counters_[static_cast<size_t>(s)].non_empty.fetch_add(1, std::memory_order_relaxed);
 
-    // 段数分布：AcctGroup 预期三段（实验.子组.队列等级）；空串记 0，异常（>200 段）记 255。
-    uint32_t segs = 0;
-    if (!acct_group.empty()) {
-        segs = 1;
-        for (char c : acct_group) {
-            if (c == '.') ++segs;
-        }
-        if (segs > 200) segs = 255;
+    // 段数分布只对 acct_group 本体有意义（condor_ad / slurm_env）；NSS 组名不参与。
+    if (s != Source::CondorAd && s != Source::SlurmEnv) return;
+    if (acct_group.empty()) return;
+    // 段数分布：AcctGroup 预期三段（实验.子组.队列等级）；异常（>200 段）记 255。
+    uint32_t segs = 1;
+    for (char c : acct_group) {
+        if (c == '.') ++segs;
     }
+    if (segs > 200) segs = 255;
     std::lock_guard<std::mutex> lk(seg_mtx_);
     ++segments_[segs];
 }

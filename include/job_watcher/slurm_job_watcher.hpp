@@ -105,6 +105,9 @@ private:
         job.cluster_name = SlurmJob::get_cluster_name(pid);
         job.clusterTag = SlurmJob::get_cluster_name(pid);
         job.NativeJobID = SlurmJob::get_native_job_id(pid);
+
+        // 发现时探测一次组字段（失败留给 update 路径重试）
+        SlurmJob::probe_groups(job);
         spdlog::debug("SlurmJobWatcher: built job from pid {}, JobID {}, step_id {}, user {}, partition {}", 
                     pid, job.JobID, slurm_attr.step_id, slurm_attr.user, slurm_attr.partition);
         return job;

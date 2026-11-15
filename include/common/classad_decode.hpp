@@ -22,6 +22,10 @@
 
 namespace ClassAdValue {
 
+// 组值与探测重试的全局上限（Condor/Slurm 共用）。
+inline constexpr size_t kGroupValueMaxLen = 256;      // 字段最大长度；超长拒绝
+inline constexpr uint8_t kMaxGroupProbeAttempts = 3;  // 读失败的有界重试次数
+
 // 解码 ClassAd 字符串字面量：
 // - 去首尾空白与成对双引号
 // - 还原转义：\" \\ \n \t（其余 \x 保留 x）

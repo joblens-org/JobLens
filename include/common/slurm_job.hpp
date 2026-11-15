@@ -13,8 +13,14 @@
  * limitations under the License. */
 #pragma once
 #include "core/collector_type.h"
+#include "core/group_probe_stats.hpp"
+#include "common/classad_decode.hpp"
 #include "common/utils.hpp"
 #include <unistd.h>
+#include <grp.h>
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -22,6 +28,9 @@
 #include <algorithm>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
 #include <variant>
 #include <spdlog/spdlog.h>
 #include <unordered_set>
@@ -165,6 +174,180 @@ inline std::string get_native_job_id(pid_t pid){
     return fmt::format("{}", jid);
 }
 
+/* ===================== 组归属（只读上游标准变量） =====================
+ * - acct_group  ← SLURM_JOB_ACCOUNT（计费账户，与 Condor AcctGroup 同语义）
+ * - unix_gid    ← SLURM_JOB_GID（不回退 /proc/<pid>/status 的 Gid:——那是进程
+ *   real gid，可能因 newgrp/setgid 与作业主 gid 不同；缺失就 -1，不猜）
+ * - unix_group  ← gid 经 getgrgid_r 解析；解析失败为空，不用 account 顶替
+ * - env 读取顺序：作业用户进程优先（SLURM_JOB_* 由 slurmstepd 注入作业环境），
+ *   stepd 自身 env 是 slurmd 派生的、可能不含作业变量，仅作兜底
+ * - 名称解析与 env 探测分离完成态：gid 已知但组名为空时按周期重试
+ *   （受负缓存/熔断限频），避免 LDAP 抖动把 unix_group 永久固定为空
+ */
+inline std::string getAccount(pid_t pid){
+    return get_env_field(pid, "SLURM_JOB_ACCOUNT");
+}
+
+inline int64_t getGid(pid_t pid){
+    std::string gid_str = get_env_field(pid, "SLURM_JOB_GID");
+    if (gid_str.empty()) return -1;
+    try {
+        size_t pos = 0;
+        long long v = std::stoll(gid_str, &pos);
+        if (pos != gid_str.size()) return -1;
+        if (v < 0 || v > 0xFFFFFFFFLL) return -1;  // gid_t 为 uint32；越界按未知处理
+        return static_cast<int64_t>(v);
+    } catch (const std::exception&) {
+        return -1;
+    }
+}
+
+enum class NssOutcome { Ok, Miss, Breaker };
+
+// NSS 熔断/缓存参数：
+//  - 单次解析 >500ms 或连续失败 5 次 → 全局暂停解析 60s（防止 LDAP 故障阻塞发现/采集）
+//  - 成功条目缓存（组名基本不变），容量上限 4096（满则整体清空重建）
+//  - 失败 gid 负缓存 60s（TTL 过后重试，即“独立完成态”的限频器）
+inline constexpr auto kNssSlowThreshold = std::chrono::milliseconds(500);
+inline constexpr uint32_t kNssConsecutiveFailLimit = 5;
+inline constexpr auto kNssBreakerSeconds = std::chrono::seconds(60);
+inline constexpr auto kNssNegativeTtl = std::chrono::seconds(60);
+inline constexpr size_t kNssCacheMaxEntries = 4096;
+
+inline std::string resolve_unix_group_name(int64_t gid, NssOutcome* outcome = nullptr) {
+    struct NssState {
+        std::mutex mtx;
+        std::unordered_map<int64_t, std::string> positive;
+        std::unordered_map<int64_t, std::chrono::steady_clock::time_point> negative;
+        std::chrono::steady_clock::time_point breaker_until{};
+        uint32_t consecutive_fail = 0;
+    };
+    // inline 函数的函数局部 static 在各编译单元间唯一（C++17）
+    static NssState state;
+
+    if (outcome) *outcome = NssOutcome::Miss;
+    if (gid < 0) return "";
+
+    std::lock_guard<std::mutex> lk(state.mtx);
+    const auto now = std::chrono::steady_clock::now();
+
+    // 熔断打开：全局跳过（不计失败，由调用方计 skipped）
+    if (now < state.breaker_until) {
+        if (outcome) *outcome = NssOutcome::Breaker;
+        return "";
+    }
+    // 成功缓存
+    auto pit = state.positive.find(gid);
+    if (pit != state.positive.end()) return pit->second;
+    // 负缓存未到期：本周期跳过
+    auto nit = state.negative.find(gid);
+    if (nit != state.negative.end() && now < nit->second) {
+        if (outcome) *outcome = NssOutcome::Breaker;  // 限频跳过，非解析失败
+        return "";
+    }
+
+    long bufsize = sysconf(_SC_GETGR_R_SIZE_MAX);
+    if (bufsize <= 0) bufsize = 16 * 1024;
+    std::vector<char> buf(static_cast<size_t>(bufsize));
+    struct group grp{};
+    struct group* result = nullptr;
+    const auto t0 = now;
+    int rc = getgrgid_r(static_cast<gid_t>(gid), &grp, buf.data(), buf.size(), &result);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    const bool slow = elapsed > kNssSlowThreshold;
+    if (rc != 0 || result == nullptr) {
+        state.negative[gid] = now + kNssNegativeTtl;
+        if (++state.consecutive_fail >= kNssConsecutiveFailLimit || slow) {
+            state.breaker_until = now + kNssBreakerSeconds;
+            state.consecutive_fail = 0;
+            spdlog::warn("SlurmJob: NSS breaker open for 60s (gid {} rc={} slow={} elapsed_ms={})",
+                         gid, rc, slow,
+                         std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+        }
+        return "";
+    }
+    state.consecutive_fail = 0;
+    state.negative.erase(gid);
+    std::string name = result->gr_name ? result->gr_name : "";
+    if (state.positive.size() >= kNssCacheMaxEntries) state.positive.clear();
+    state.positive[gid] = name;
+    if (slow) {
+        spdlog::warn("SlurmJob: NSS resolve for gid {} took {}ms (still succeeded)",
+                     gid, std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+    }
+    if (outcome) *outcome = NssOutcome::Ok;
+    return name;
+}
+
+// 探测并填充组字段；返回是否取到任一非空组值（供 restore 路径决定 group_need_persist）。
+inline bool probe_groups(Job& job) {
+    auto& attr = std::get<SlurmJobAttr>(job.sub_attr);
+    auto& stats = GroupProbeStats::instance();
+    bool got_any = false;
+
+    // 1) env 探测（account/gid）
+    if (!job.group_probed) {
+        const auto S = GroupProbeStats::Source::SlurmEnv;
+        stats.record_attempt(S);
+        pid_t pid = !job.JobPIDs.empty() ? job.JobPIDs[0] : attr.stepd_pid;
+        bool ok = false;
+        if (pid > 0) {
+            auto account = getAccount(pid);
+            if (ClassAdValue::valid_group_value(account, ClassAdValue::kGroupValueMaxLen)) {
+                attr.acct_group = account;
+                attr.unix_gid = getGid(pid);
+                ok = true;
+            }
+        }
+        if (!ok) {
+            stats.record_failure(S);
+            ++job.group_probe_attempts;
+            spdlog::debug("SlurmJob: group env probe failed for JobID {} (attempt {})",
+                          job.JobID, job.group_probe_attempts);
+            if (job.group_probe_attempts >= ClassAdValue::kMaxGroupProbeAttempts) {
+                job.group_probed = true;  // 有界重试后放弃
+                spdlog::warn("SlurmJob: give up group env probe for JobID {} after {} attempts",
+                             job.JobID, job.group_probe_attempts);
+            }
+        } else {
+            if (!attr.acct_group.empty()) {
+                stats.record_non_empty(S, attr.acct_group);
+            } else {
+                stats.record_empty(S);  // 读成功但无 account：合法缺失
+            }
+            job.group_probed = true;
+            job.group_probe_attempts = 0;
+            got_any = !attr.acct_group.empty() || attr.unix_gid >= 0;
+            spdlog::debug("SlurmJob: JobID {} groups acct_group='{}' unix_gid={}",
+                          job.JobID, attr.acct_group, attr.unix_gid);
+        }
+    }
+
+    // 2) 名称解析：独立完成态，gid 已知且组名为空时重试（负缓存 60s 限频）
+    if (attr.unix_gid >= 0 && attr.unix_group.empty()) {
+        const auto S = GroupProbeStats::Source::SlurmNss;
+        stats.record_attempt(S);
+        NssOutcome outcome = NssOutcome::Miss;
+        auto name = resolve_unix_group_name(attr.unix_gid, &outcome);
+        if (!name.empty()) {
+            if (ClassAdValue::valid_group_value(name, ClassAdValue::kGroupValueMaxLen)) {
+                attr.unix_group = name;
+                stats.record_non_empty(S, std::string());
+                got_any = true;
+            } else {
+                stats.record_failure(S);  // 组名异常（超长/控制字符）
+            }
+        } else if (outcome == NssOutcome::Breaker) {
+            stats.record_skipped(S);      // 熔断/负缓存限频，非失败
+        } else {
+            stats.record_failure(S);      // 解析失败或过慢
+        }
+    }
+    return got_any;
+}
+
+
 inline void update_job_info(Job& job){
     if (job.JobPIDs.empty()) return;
 
@@ -201,6 +384,9 @@ inline void update_job_info(Job& job){
     if (slurm_attr.stepd_pid == 0) {
         slurm_attr.stepd_pid = *std::min_element(job.JobPIDs.begin(), job.JobPIDs.end());
     }
+
+    // 组字段：env 探测未完成时补（有界重试）；组名解析独立完成态，按周期重试。
+    probe_groups(job);
 
     return;
 }
