@@ -82,6 +82,9 @@ struct CondorJobAttr{
     std::string owner{};
     std::string job_ad_path{};
     std::string collector_host{};  // COLLECTOR_HOST 值，用于查询
+    // 组归属（上游标准属性，见 doc 与 group_probe_stats）：
+    std::string acct_group{};      // AcctGroup：计费组，完整三段（实验.子组.队列等级）
+    std::string unix_group{};      // PrimaryUnixGroup：作业主动声明的主 Unix 组；未声明为空
 
     static constexpr auto reflection() {
         return std::make_tuple(
@@ -94,22 +97,51 @@ struct CondorJobAttr{
             std::make_pair("slots_cgroup_path", &CondorJobAttr::slots_cgroup_path),
             std::make_pair("owner", &CondorJobAttr::owner),
             std::make_pair("job_ad_path", &CondorJobAttr::job_ad_path),
-            std::make_pair("collector_host", &CondorJobAttr::collector_host)
+            std::make_pair("collector_host", &CondorJobAttr::collector_host),
+            std::make_pair("acct_group", &CondorJobAttr::acct_group),
+            std::make_pair("unix_group", &CondorJobAttr::unix_group)
         );
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
-    CondorJobAttr, \
-    auto_update_child, \
-    starter_pid, \
-    cluster_id, \
-    proc_id, \
-    scheduler_host, \
-    slots_cgroup_path, \
-    owner, \
-    job_ad_path, \
-    collector_host
-)
+
+// 手写容错序列化（取代 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE）：
+// - from_json 全字段 `contains() && !is_null()` 判断后取值，旧记录缺字段 → 默认值，不抛异常
+//   （宏生成的 from_json 用 j.at()，新增字段会让旧记录恢复时抛 type_error）。
+// - to_json 写全部字段；scheduler_name 自此进入持久化（旧宏漏写，属声明过的行为变化）。
+// - 字段清单必须与 reflection() 保持一致（group_fields_test 锁定）。
+inline void to_json(nlohmann::json& j, const CondorJobAttr& t) {
+    j = nlohmann::json{
+        {"auto_update_child", t.auto_update_child},
+        {"starter_pid", t.starter_pid},
+        {"cluster_id", t.cluster_id},
+        {"proc_id", t.proc_id},
+        {"scheduler_host", t.scheduler_host},
+        {"scheduler_name", t.scheduler_name},
+        {"slots_cgroup_path", t.slots_cgroup_path},
+        {"owner", t.owner},
+        {"job_ad_path", t.job_ad_path},
+        {"collector_host", t.collector_host},
+        {"acct_group", t.acct_group},
+        {"unix_group", t.unix_group},
+    };
+}
+inline void from_json(const nlohmann::json& j, CondorJobAttr& t) {
+    auto rd_bool = [&](const char* k, bool& out) { if (j.contains(k) && !j[k].is_null()) j[k].get_to(out); };
+    auto rd_i64  = [&](const char* k, auto& out) { if (j.contains(k) && !j[k].is_null() && j[k].is_number_integer()) j[k].get_to(out); };
+    auto rd_str  = [&](const char* k, std::string& out) { if (j.contains(k) && !j[k].is_null() && j[k].is_string()) j[k].get_to(out); };
+    rd_bool("auto_update_child", t.auto_update_child);
+    rd_i64("starter_pid", t.starter_pid);
+    rd_i64("cluster_id", t.cluster_id);
+    rd_i64("proc_id", t.proc_id);
+    rd_str("scheduler_host", t.scheduler_host);
+    rd_str("scheduler_name", t.scheduler_name);
+    rd_str("slots_cgroup_path", t.slots_cgroup_path);
+    rd_str("owner", t.owner);
+    rd_str("job_ad_path", t.job_ad_path);
+    rd_str("collector_host", t.collector_host);
+    rd_str("acct_group", t.acct_group);
+    rd_str("unix_group", t.unix_group);
+}
 
 struct CommonJobAttr{
     bool auto_update_child{}; //当为true时，每次采集时自动更新有没有子进程
@@ -131,6 +163,10 @@ struct SlurmJobAttr{
     std::string user{};             // 作业用户
     std::string job_name{};         // 作业名称
     std::string partition{};        // 分区/队列名称
+    // 组归属（上游标准属性，见 doc 与 group_probe_stats）：
+    std::string acct_group{};       // SLURM_JOB_ACCOUNT：计费账户（与 Condor AcctGroup 同语义）
+    std::string unix_group{};       // gid 经 getgrgid_r 解析的主 Unix 组名；解析失败为空
+    int64_t unix_gid{-1};           // SLURM_JOB_GID；-1 = 未知（int64：gid_t 为 uint32，大 gid 不溢出、不与哨兵混淆）
 
     static constexpr auto reflection() {
         return std::make_tuple(
@@ -138,23 +174,52 @@ struct SlurmJobAttr{
             std::make_pair("stepd_pid", &SlurmJobAttr::stepd_pid),
             std::make_pair("job_id", &SlurmJobAttr::job_id),
             std::make_pair("step_id", &SlurmJobAttr::step_id),
+            std::make_pair("cluster_name", &SlurmJobAttr::cluster_name),
             std::make_pair("cgroup_path", &SlurmJobAttr::cgroup_path),
             std::make_pair("user", &SlurmJobAttr::user),
             std::make_pair("job_name", &SlurmJobAttr::job_name),
-            std::make_pair("partition", &SlurmJobAttr::partition)
+            std::make_pair("partition", &SlurmJobAttr::partition),
+            std::make_pair("acct_group", &SlurmJobAttr::acct_group),
+            std::make_pair("unix_group", &SlurmJobAttr::unix_group),
+            std::make_pair("unix_gid", &SlurmJobAttr::unix_gid)
         );
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(SlurmJobAttr, \
-    auto_update_child, \
-    stepd_pid, \
-    job_id, \
-    step_id, \
-    cgroup_path, \
-    user, \
-    job_name, \
-    partition, \
-    cluster_name)
+
+// 手写容错序列化（取代 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE），理由与字段清单约束同 CondorJobAttr。
+inline void to_json(nlohmann::json& j, const SlurmJobAttr& t) {
+    j = nlohmann::json{
+        {"auto_update_child", t.auto_update_child},
+        {"stepd_pid", t.stepd_pid},
+        {"job_id", t.job_id},
+        {"step_id", t.step_id},
+        {"cgroup_path", t.cgroup_path},
+        {"user", t.user},
+        {"job_name", t.job_name},
+        {"partition", t.partition},
+        {"cluster_name", t.cluster_name},
+        {"acct_group", t.acct_group},
+        {"unix_group", t.unix_group},
+        {"unix_gid", t.unix_gid},
+    };
+}
+inline void from_json(const nlohmann::json& j, SlurmJobAttr& t) {
+    auto rd_bool = [&](const char* k, bool& out) { if (j.contains(k) && !j[k].is_null()) j[k].get_to(out); };
+    auto rd_i64  = [&](const char* k, auto& out) { if (j.contains(k) && !j[k].is_null() && j[k].is_number_integer()) j[k].get_to(out); };
+    auto rd_str  = [&](const char* k, std::string& out) { if (j.contains(k) && !j[k].is_null() && j[k].is_string()) j[k].get_to(out); };
+    rd_bool("auto_update_child", t.auto_update_child);
+    rd_i64("stepd_pid", t.stepd_pid);
+    rd_i64("job_id", t.job_id);
+    rd_i64("step_id", t.step_id);
+    rd_str("cgroup_path", t.cgroup_path);
+    rd_str("user", t.user);
+    rd_str("job_name", t.job_name);
+    rd_str("partition", t.partition);
+    rd_str("cluster_name", t.cluster_name);
+    rd_str("acct_group", t.acct_group);
+    rd_str("unix_group", t.unix_group);
+    rd_i64("unix_gid", t.unix_gid);
+}
 
 using SubAttr = std::variant<CondorJobAttr, CommonJobAttr, SlurmJobAttr>;
 
@@ -243,6 +308,16 @@ struct Job {
     // 仅内存缓存, 不参与序列化/持久化 (cgroup inode 重启后可能变化)。
     uint64_t                                cgroup_id{0};
 
+    // 组字段探测状态（仅内存，不序列化、不进 reflection）：
+    // group_probed 仅在“成功读到来源（ad 文件 / env）”后置位——读失败不置位，
+    // 由 group_probe_attempts 有界重试（每个进程生命周期内最多 kMaxGroupProbeAttempts 次）。
+    // 采集每个周期都会走 update_job → update_job_info，若只按“字段为空就重读”，
+    // 组本来就为空的站点会每周期重读 ad 文件（见 collector_scheduler 的 findJob 调用链）。
+    bool                                    group_probed{false};
+    uint8_t                                 group_probe_attempts{0};
+    // restore/更新路径拿到了组值、等待落库一次（write-once + 至多一次回填重写）。
+    bool                                    group_need_persist{false};
+
     static constexpr auto reflection() {
         return std::make_tuple(
             std::make_pair("JobID", &Job::JobID),
@@ -263,6 +338,51 @@ struct Job {
 //     std::visit([&j](const auto& obj) { j = obj; }, v);
 // }
 
+// 组归属的规范化只读视图：存储在 sub_attr（源样，随调度器取值），
+// writer/RPC 通过本视图消费，不各自 std::visit 按 subtype 分支。
+// unix_gid 语义：内存/LevelDB/Lua 一律 -1 表示未知；对外 JSON 输出时转 null。
+struct JobGroupView {
+    std::string acct_group;
+    std::string unix_group;
+    int64_t     unix_gid{-1};
+
+    bool empty() const {
+        return acct_group.empty() && unix_group.empty() && unix_gid < 0;
+    }
+};
+
+inline JobGroupView getGroups(const Job& job) {
+    JobGroupView v;
+    std::visit([&v](const auto& attr) {
+        using T = std::decay_t<decltype(attr)>;
+        if constexpr (std::is_same_v<T, CondorJobAttr>) {
+            v.acct_group = attr.acct_group;
+            v.unix_group = attr.unix_group;
+        } else if constexpr (std::is_same_v<T, SlurmJobAttr>) {
+            v.acct_group = attr.acct_group;
+            v.unix_group = attr.unix_group;
+            v.unix_gid   = attr.unix_gid;
+        }
+        // CommonJobAttr 没有组字段，保持全空
+    }, job.sub_attr);
+    return v;
+}
+
+// 顶层 "groups" 对象：dump_job()/job_to_json() 的派生视图（gid < 0 → null）。
+// 存储侧（LevelDB）的组字段在 sub_attr 内，gid 未知写数字 -1。
+inline nlohmann::json groups_to_json(const Job& job) {
+    auto g = getGroups(job);
+    nlohmann::json j;
+    j["acct_group"] = g.acct_group;
+    j["unix_group"] = g.unix_group;
+    if (g.unix_gid < 0) {
+        j["unix_gid"] = nullptr;
+    } else {
+        j["unix_gid"] = g.unix_gid;
+    }
+    return j;
+}
+
 inline nlohmann::json dump_job(const Job& job) {
     nlohmann::json j;
     j["JobID"] = job.JobID;
@@ -282,6 +402,7 @@ inline nlohmann::json dump_job(const Job& job) {
     std::visit([&j](const auto& obj) {
         j["sub_attr"] = nlohmann::json(obj);
     }, job.sub_attr);
+    j["groups"] = groups_to_json(job);
     return j;
 }
 
@@ -299,6 +420,7 @@ inline nlohmann::json job_to_json(const Job& job) {
     std::visit([&j](const auto& obj) {
         j["sub_attr"] = nlohmann::json(obj); // 显式转换为 nlohmann::json
     }, job.sub_attr);
+    j["groups"] = groups_to_json(job);
     return j;
 }
 
