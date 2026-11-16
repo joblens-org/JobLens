@@ -215,6 +215,8 @@ public:
     };
     // Identity-resolving idempotent upsert. Incomplete identities and
     // conflicting live executions are rejected explicitly and never indexed.
+    // Existing records retain their creation metadata; observations refresh
+    // execution evidence and observation bookkeeping only.
     // An upsert never fires lifecycle callbacks or starts collection: runtime
     // application is binding-driven. `admission` (internal) carries a
     // pre-evaluated admission decision: when it holds an initial collector
@@ -265,9 +267,9 @@ public:
     bool runtimeRecords(std::vector<JobRecord>& out) const override;
     bool runtimeRecord(uint64_t internal_id,
                        std::optional<JobRecord>& out) const override;
-    // Re-read process/attribute facts for one stored job from the host and
-    // persist them. Used by the heartbeat for records no discovery source
-    // covers (manual registrations); reads never do this for themselves.
+    // Re-read local members for records with no discovery source (manual
+    // registrations). Only member evidence is written back; scheduler metadata
+    // remains the creation snapshot. Reads never trigger this refresh.
     bool refreshJobFacts(uint64_t jobID);
     // Liveness evidence from the last scan. Not a lifecycle state: an
     // unverified instance stays Open but must not be admitted to the kernel.
@@ -473,10 +475,8 @@ private:
     class RecordTxn;
     void applyRecovered(const std::vector<JobRecord>& adopted,
                         const std::vector<uint64_t>& removed);
-    // Merge decision for one discovered Job against the current record image
-    // (moved from the store): pure, no durable write and no publish. The
-    // register/merge semantics of a repeated identity live here so every
-    // caller gets the same result.
+    // Execution refresh against an existing creation metadata snapshot.
+    // Pure decision: no durable write and no publication.
     UpsertResult mergeDiscoveredJob(const JobRecord& stored, const Job& job,
                                   const SchedulerKey& key, uint64_t internal_id,
                                   int64_t observed_at, JobRecord& updated_out);

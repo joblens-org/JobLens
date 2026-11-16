@@ -44,6 +44,7 @@
 #include <leveldb/write_batch.h>
 
 #include <cstdint>
+#include <cerrno>
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
@@ -52,6 +53,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <unistd.h>
+#include <sys/wait.h>
 
 namespace {
 
@@ -215,6 +218,159 @@ std::vector<std::string> raw_keys_with_prefix(const std::string& path,
     }
     return keys;
 }
+// Stable metadata is a creation snapshot; only execution evidence refreshes.
+void stable_metadata_is_a_creation_snapshot(const std::string& base)
+{
+    Job condor = condor_observation("177.0");
+    Job slurm = discovered_job(
+        NativeSelector{"slurm", "hpc", "", "178", "batch"},
+        ProcessIdentity{4242, 900000, "boot-aaa"},
+        {ProcessIdentity{4242, 900000, "boot-aaa"}}, true);
+    auto& slurm_attr = std::get<SlurmJobAttr>(slurm.sub_attr);
+    slurm_attr.user = "alice";
+    slurm_attr.job_name = "launch-name";
+    slurm_attr.partition = "batch";
+    slurm_attr.cgroup_path = "/step/original";
+    Job unknown_owner = condor_observation("179.0");
+    std::get<CondorJobAttr>(unknown_owner.sub_attr).owner.clear();
+
+    const auto metadata_of = [](const Job& job) {
+        auto metadata = job_to_json(job);
+        metadata.erase("JobPIDs");
+        metadata["subtype_name"] = job.subtype_name;
+        return metadata;
+    };
+    for (Job initial : {condor, slurm, unknown_owner}) {
+        const auto path = fresh_dir(base, "frozen-" + initial.NativeJobID);
+        JobRegistry registry(isolated(path));
+        initial.execution.read_order = 10;
+        const auto created = registry.upsertObservedJob(initial);
+        check(created.ok, "the immutable metadata fixture must register");
+        const auto original = registry.inventoryRecord(created.internal_id);
+        check(original.has_value(), "the created snapshot must be readable");
+        const auto metadata = metadata_of(original->job);
+        const auto writes_before = registry.storeHealth().durable_commits;
+
+        Job incoming = initial;
+        incoming.jobtype = JobType::Sys;
+        incoming.NativeJobID = "00" + initial.NativeJobID;  // same canonical key
+        incoming.execution.read_order = 11;
+        if (auto* attr = std::get_if<CondorJobAttr>(&incoming.sub_attr)) {
+            attr->owner = "replacement-owner";
+            attr->starter_pid = 8888;
+            attr->cluster_id = 999;
+            attr->proc_id = 7;
+            attr->scheduler_host = "replacement-host";
+            attr->slots_cgroup_path = "/replacement/cgroup";
+            attr->job_ad_path = "/replacement/job.ad";
+            attr->auto_update_child = true;
+        } else {
+            auto& slurm_update = std::get<SlurmJobAttr>(incoming.sub_attr);
+            slurm_update.user = "replacement-user";
+            slurm_update.job_name = "replacement-name";
+            slurm_update.partition = "replacement-partition";
+            slurm_update.stepd_pid = 8888;
+            slurm_update.job_id = 999;
+            slurm_update.cgroup_path = "/replacement/cgroup";
+            slurm_update.auto_update_child = true;
+            incoming.clusterTag = "replacement-display-tag";
+        }
+        const auto repeated = registry.upsertObservedJob(incoming);
+        check(repeated.ok && repeated.disposition == UpsertDisposition::Unchanged &&
+                  repeated.revision == created.revision,
+              "metadata-only observations must not update the creation snapshot or revision");
+        const auto kept = registry.inventoryRecord(created.internal_id);
+        check(kept && metadata_of(kept->job) == metadata &&
+                  kept->job.execution.read_order == 11 &&
+                  kept->index_key == original->index_key &&
+                  registry.storeHealth().durable_commits == writes_before,
+              "metadata-only observations must refresh ordering without a record write");
+
+        incoming.execution.members.push_back({4343, 910000, "boot-aaa"});
+        incoming.execution.read_order = 12;
+        const auto refreshed = registry.upsertObservedJob(incoming);
+        check(refreshed.ok && refreshed.disposition == UpsertDisposition::Updated &&
+                  refreshed.revision == created.revision + 1,
+              "member evidence must still advance the existing record exactly once");
+        const auto updated = registry.inventoryRecord(created.internal_id);
+        check(updated && metadata_of(updated->job) == metadata &&
+                  updated->job.execution.members ==
+                      std::vector<ProcessIdentity>{{4242, 900000, "boot-aaa"},
+                                                   {4343, 910000, "boot-aaa"}},
+              "evidence refresh must preserve every stable metadata field");
+
+        incoming.execution.read_order = 11;
+        incoming.execution.members.clear();
+        const auto stale = registry.upsertObservedJob(incoming);
+        check(stale.ok && stale.disposition == UpsertDisposition::Unchanged &&
+                  registry.inventoryRecord(created.internal_id)->job.execution.members.size() == 2,
+              "an older read must not clear the refreshed member evidence");
+        check(registry.deinit(), "the frozen snapshot must checkpoint");
+        JobRegistry reopened(isolated(path));
+        const auto restored = reopened.inventoryRecord(created.internal_id);
+        check(restored && metadata_of(restored->job) == metadata &&
+                  restored->revision == refreshed.revision,
+              "the creation metadata and evidence revision must survive restart");
+    }
+}
+
+// The manual-only host refresh may use temporary metadata to locate members,
+// but must never write those guesses back into the immutable creation image.
+void host_refresh_preserves_creation_metadata(const std::string& base)
+{
+    JobRegistry registry(isolated(fresh_dir(base, "frozen-host-refresh")));
+    registry.setCollectorValidator(nullptr);
+    Job manual;
+    manual.jobtype = JobType::Job;
+    manual.subtype = JobSubType::Slurm;
+    manual.NativeJobID = "manual-without-native-id";
+    manual.sub_attr = SlurmJobAttr{};
+    auto& attr = std::get<SlurmJobAttr>(manual.sub_attr);
+    attr.cluster_name = "hpc";
+    attr.job_name = "creation-name";
+    set_pids(manual, {getpid()});
+    manual.CollectorNames = {"cpumem_collector"};
+    check(registry.addJob(manual), "the manual-only refresh fixture must register");
+    const auto initial = registry.inventoryRecords().front();
+    // Create a real member only after the initial snapshot. The child uses
+    // async-signal-safe I/O after fork and remains alive until the guard exits.
+    int release[2];
+    check(pipe(release) == 0, "the host refresh child pipe must open");
+    const pid_t child_pid = fork();
+    if (child_pid < 0) {
+        close(release[0]);
+        close(release[1]);
+        throw std::runtime_error("the host refresh child must fork");
+    }
+    if (child_pid == 0) {
+        close(release[1]);
+        char signal;
+        while (read(release[0], &signal, 1) < 0 && errno == EINTR) {}
+        close(release[0]);
+        _exit(0);
+    }
+    close(release[0]);
+    struct WaitingChild {
+        pid_t pid;
+        int release_fd;
+        ~WaitingChild() {
+            close(release_fd);
+            while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+        }
+    } child{child_pid, release[1]};
+    check(registry.refreshJobFacts(initial.job.JobID), "the host member refresh must succeed");
+    const auto refreshed = registry.inventoryRecord(initial.job.JobID);
+    check(refreshed && refreshed->job.NativeJobID == "manual-without-native-id" &&
+              std::get<SlurmJobAttr>(refreshed->job.sub_attr).job_id == 0 &&
+              std::get<SlurmJobAttr>(refreshed->job.sub_attr).job_name == "creation-name" &&
+              refreshed->index_key == initial.index_key,
+          "host refresh must not persist metadata guesses or alter identity");
+    const auto refreshed_pids = pids_of(refreshed->job);
+    check(std::find(refreshed_pids.begin(), refreshed_pids.end(), child.pid) !=
+              refreshed_pids.end(),
+          "host refresh must discover and persist the newly created member");
+}
+
 void upsert_is_idempotent_and_activates_nothing(const std::string& base)
 {
     const auto path = fresh_dir(base, "a04");
@@ -288,8 +444,8 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
     {
         const auto job = registry.findJob(created.internal_id);
         check(job.has_value(), "updated inventory must stay findable");
-        check(std::get<CondorJobAttr>(job->sub_attr).owner == "bob",
-              "attribute changes must merge into facts");
+        check(std::get<CondorJobAttr>(job->sub_attr).owner == "alice",
+              "execution updates must retain the creation-time owner");
         check(pids_of(*job).size() == 2, "new processes must merge into facts");
         check(job->CollectorNames.empty(),
               "fact updates must not activate collection either");
@@ -846,7 +1002,11 @@ void repeated_observations_keep_memory_and_disk_in_sync(const std::string& base)
 
         const auto first = registry.upsertObservedJob(after);
         const auto second = registry.upsertObservedJob(before);
-        check(first.ok && second.ok, "both repeated observations must be accepted");
+        check(first.ok && second.ok &&
+                  first.disposition == UpsertDisposition::Unchanged &&
+                  second.disposition == UpsertDisposition::Unchanged &&
+                  second.revision == created.revision,
+              "metadata-only repeats must be accepted without changing the record revision");
 
         const auto live = registry.inventoryRecord(id);
         check(live.has_value(), "the instance must stay readable");
@@ -854,8 +1014,8 @@ void repeated_observations_keep_memory_and_disk_in_sync(const std::string& base)
         published_revision = live->revision;
         check(published_revision == second.revision,
               "the published revision must be the final observation's");
-        check(published_owner == "before",
-              "the working set must publish the last input, got " + published_owner);
+        check(published_owner == "alice",
+              "the working set must retain the initial owner, got " + published_owner);
         check(registry.deinit(), "shutdown must succeed");
     }
     {
@@ -907,6 +1067,49 @@ void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string
     const auto record = registry.inventoryRecord(created.internal_id);
     check(record.has_value() && record->job.execution.members.empty(),
           "the stored process evidence must follow the confirmed empty set");
+
+    // Normalization removes exact duplicates, not distinct bindings of one PID.
+    auto member_facts = condor_observation("173.0");
+    member_facts.execution.members = {
+        {4444, 920000, "boot-aaa"}, {4343, 910000, "boot-aaa"},
+        {4343, 0, {}}, {4343, 910000, "boot-aaa"}};
+    const auto with_members = registry.upsertObservedJob(member_facts);
+    check(with_members.ok && with_members.disposition == UpsertDisposition::Created,
+          "the member normalization fixture must register");
+    const auto normalized = registry.inventoryRecord(with_members.internal_id);
+    check(normalized.has_value() && normalized->job.execution.members ==
+              std::vector<ProcessIdentity>{{4343, 0, {}}, {4343, 910000, "boot-aaa"},
+                                           {4444, 920000, "boot-aaa"}},
+          "create must sort full identities and retain distinct bindings of one PID");
+    const auto repeated = registry.upsertObservedJob(member_facts);
+    check(repeated.ok && repeated.disposition == UpsertDisposition::Unchanged &&
+              repeated.revision == with_members.revision,
+          "reordered and duplicate input members must not advance the revision");
+
+    // A binding-only change is a fact change even though the PID list is equal.
+    member_facts.execution.members = {
+        {4444, 920000, "boot-aaa"}, {4343, 930000, "boot-aaa"}, {4343, 0, {}}};
+    const auto rebound = registry.upsertObservedJob(member_facts);
+    check(rebound.ok && rebound.disposition == UpsertDisposition::Updated &&
+              rebound.revision == with_members.revision + 1,
+          "a changed start tick with the same PIDs must advance the revision");
+    const auto rebound_record = registry.inventoryRecord(with_members.internal_id);
+    check(rebound_record.has_value() && rebound_record->job.execution.members ==
+              std::vector<ProcessIdentity>{{4343, 0, {}}, {4343, 930000, "boot-aaa"},
+                                           {4444, 920000, "boot-aaa"}},
+          "a merge must retain the newly observed complete process identities");
+
+    // Preserve the current partial-nonempty rule: replace, do not union or bind.
+    member_facts.execution.members = {{4444, 0, {}}};
+    member_facts.execution.members_authoritative = false;
+    const auto replaced = registry.upsertObservedJob(member_facts);
+    check(replaced.ok && replaced.disposition == UpsertDisposition::Updated &&
+              replaced.revision == rebound.revision + 1,
+          "a nonempty partial member observation must replace the stored set");
+    const auto partial_record = registry.inventoryRecord(with_members.internal_id);
+    check(partial_record.has_value() && partial_record->job.execution.members ==
+              std::vector<ProcessIdentity>{{4444, 0, {}}},
+          "partial replacement must neither retain absent PIDs nor reuse old bindings");
 }
 
 } // namespace
@@ -1708,6 +1911,7 @@ void runtime_projection_survives_repeated_observation(const std::string& base)
     // A real facts change reaches the same attachment without a detach.
     Job changed = condor_observation("905.0");
     std::get<CondorJobAttr>(changed.sub_attr).owner = "changed";
+    changed.execution.members.push_back({5151, 424242, "boot-aaa"});
     const auto updated = registry.upsertObservedJob(changed);
     check(updated.ok && updated.disposition == UpsertDisposition::Updated,
           "the fact change must be applied");
@@ -2123,6 +2327,8 @@ int main(int argc, char** argv)
     try {
         const std::string base = argc > 1 ? argv[1] : "/tmp/joblens-inventory-store-test";
         std::filesystem::create_directories(base);
+        stable_metadata_is_a_creation_snapshot(base);
+        host_refresh_preserves_creation_metadata(base);
         upsert_is_idempotent_and_activates_nothing(base);
         legacy_schema_is_rejected_without_migration(base);
         unsupported_schema_is_rejected_idempotently(base);

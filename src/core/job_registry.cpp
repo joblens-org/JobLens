@@ -82,7 +82,7 @@ static std::set<std::string> known_collector_names()
 }
 
 // ---------------------------------------------------------------------------
-// Inventory merge rules (moved from the store; registry-owned business)
+// Inventory record helpers
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -91,111 +91,6 @@ int64_t now_us()
 {
     return std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-}
-
-bool merge_text(std::string& target, const std::string& source) {
-    if (source.empty() || target == source) return false;
-    target = source;
-    return true;
-}
-
-template <typename T>
-bool merge_scalar(T& target, T source) {
-    if (source == T{} || target == source) return false;
-    target = source;
-    return true;
-}
-
-bool merge_flag(bool& target, bool source) {
-    if (!source || target) return false;
-    target = true;
-    return true;
-}
-
-// Merge observation facts into the stored facts. Empty/default observation
-// fields never erase known facts; CollectorNames is never taken from an
-// observation because selection is intent, not a discovery fact.
-//
-// `replace_members` upgrades the PID list to an authoritative replacement: an
-// empty list then means "the source read the membership and found none", which
-// must clear stale PIDs instead of silently keeping them. Without the flag
-// (membership only partially known) an empty list is ignored.
-bool merge_job_facts(Job& target, const Job& observed, bool replace_members) {
-    bool changed = false;
-
-    if (observed.subtype != JobSubType::Unknown && target.subtype != observed.subtype) {
-        target.subtype = observed.subtype;
-        changed = true;
-    }
-    if (observed.jobtype != JobType::Unknown && target.jobtype != observed.jobtype) {
-        target.jobtype = observed.jobtype;
-        changed = true;
-    }
-    changed |= merge_text(target.NativeJobID, observed.NativeJobID);
-    changed |= merge_text(target.cluster_name, observed.cluster_name);
-    changed |= merge_text(target.clusterTag, observed.clusterTag);
-
-    std::vector<pid_t> observed_pids = pids_of(observed);
-    std::sort(observed_pids.begin(), observed_pids.end());
-    observed_pids.erase(std::unique(observed_pids.begin(), observed_pids.end()),
-                        observed_pids.end());
-    // Authoritative replacement (possibly empty), or a non-empty merge list;
-    // a partial member set never erases stored members.
-    if (replace_members || !observed_pids.empty()) {
-        if (observed_pids != pids_of(target)) {
-            set_pids(target, std::move(observed_pids));
-            changed = true;
-        }
-    }
-
-    std::visit([&changed, &target](const auto& source) {
-        using T = std::decay_t<decltype(source)>;
-        if constexpr (std::is_same_v<T, nlohmann::json>) {
-            // Open-world facts keep their historical behavior: a Common
-            // target merges the JSON's generic fields, anything else is
-            // replaced wholesale.
-            if (auto* current = std::get_if<CommonJobAttr>(&target.sub_attr)) {
-                changed |= joblens::facts::merge_from(*current,
-                                                      source.template get<CommonJobAttr>());
-            } else {
-                target.sub_attr = source;
-                changed = true;
-            }
-        } else if (auto* current = std::get_if<T>(&target.sub_attr)) {
-            changed |= joblens::facts::merge_from(*current, source);
-        } else {
-            target.sub_attr = source;
-            changed = true;
-        }
-    }, observed.sub_attr);
-
-    return changed;
-}
-
-bool sub_attr_equal(const SubAttr& a, const SubAttr& b)
-{
-    if (a.index() != b.index()) return false;
-    return std::visit([&](const auto& value) -> bool {
-        using T = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<T, nlohmann::json>)
-            return value == std::get<T>(b);
-        else
-            return joblens::facts::equal(value, std::get<T>(b));
-    }, a);
-}
-
-bool same_discovered_facts(const Job& a, const Job& b)
-{
-    if (a.jobtype != b.jobtype || a.subtype != b.subtype) return false;
-    if (a.NativeJobID != b.NativeJobID || a.cluster_name != b.cluster_name ||
-        a.clusterTag != b.clusterTag) {
-        return false;
-    }
-    if (members_of(a) != members_of(b)) return false;
-    if (!sub_attr_equal(a.sub_attr, b.sub_attr)) return false;
-    const auto& ga = manager_of(a);
-    const auto& gb = manager_of(b);
-    return ga == gb;
 }
 
 JobStore::WriteOp put_record_op(const JobRecord& record) {
@@ -2633,8 +2528,8 @@ inline void JobRegistry::update_job(Job& job){
 }
 
 std::optional<Job> JobRegistry::findJob(uint64_t jobID) {
-    // Read-only snapshot: the heartbeat owns PID/attribute refresh and
-    // retirement, so reads never mutate the registry.
+    // Read-only snapshot: the heartbeat owns member refresh and retirement,
+    // so reads never mutate the registry.
     if (jobID == kSystemSentinelJobId) return sentinel_job_;
     auto record = ownRecord(jobID);
     if (!record || record->state == RecordState::Closing) return std::nullopt;
@@ -2860,46 +2755,13 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
         return result;
     }
 
-    // Merge facts idempotently. The member list is authoritative only when the
-    // source says so: an empty list from a partially-known membership must
-    // never erase stored members.
-    Job observed_job = job;
-    observed_job.JobID = internal_id;
-    // A source may resolve the namespace before its typed attrs carry it: the
-    // rendered fields are the same fact's durable form, so adopt them into the
-    // empty typed slots, then render back from the typed facts.
-    normalizeNamespaceFacts(observed_job);
-    projectRecordFacts(observed_job);   // the typed facts are the record source
-    const bool authoritative_members = members_complete;
-    if (!processes.empty()) {
-        std::vector<pid_t> observed_pids;
-        observed_pids.reserve(processes.size());
-        for (const auto& process : processes) observed_pids.push_back(process.pid);
-        set_pids(observed_job, std::move(observed_pids));
-    } else if (members_complete) {
-        // Read succeeded, no members: an authoritative empty set.
-        observed_job.execution.members.clear();
-    }
-
-    Job merged = stored.job;
-    merge_job_facts(merged, observed_job, authoritative_members);
-    projectRecordFacts(merged);  // the typed facts are the record source
-    merged.JobID = internal_id;
-
     JobRecord updated = stored;
-    // This record now carries a discovery observation, so its execution facts
-    // are owned by the source: an incomplete generation is an unverified
-    // execution from here on, never a manual row that merely lacks one.
+    // Discovery may acquire source-owned execution evidence for a manual row,
+    // but its stable scheduler metadata remains the creation snapshot.
     updated.source = FactSource::Discovery;
-    updated.job = merged;
     updated.job.CollectorNames.clear();   // intent lives in selection
-    // The record's evidence copy is NOT taken wholesale from the incoming
-    // Job: a partially-known member list must never erase stored members
-    // (that is what the branches below decide). merged still carries the
-    // stored execution group; the runtime metadata of the observation
-    // (read_at/read_order/reasons) is diagnostic and stays with the producer.
-    // The selector is a projection of the Job: merged carries every field it
-    // needs (selector_of), so no separate copy is stored.
+    // Keep stored execution evidence until the manager/member rules below
+    // decide which observed evidence can replace it.
     updated.last_seen_us = observed_at;
     const bool execution_became_complete =
         !manager_of(stored.job).complete() && manager.complete();
@@ -2910,12 +2772,12 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     ExecutionEvidence& updated_evidence = updated.job.execution;
     if (manager.complete()) updated_evidence.manager = manager;
     updated_evidence.read_order = job.execution.read_order;
+    // Nonempty input replaces the set even when only partially known. An
+    // empty input clears it only when the source confirms it is authoritative.
     if (!processes.empty()) {
         updated_evidence.members = normalized_processes(processes);
     } else if (members_complete) {
         updated_evidence.members.clear();
-    } else if (!members_of(observed_job).empty()) {
-        updated_evidence.members = normalized_processes(members_of(observed_job));
     }
 
     // A record whose liveness could not be verified is re-admitted by positive
@@ -2928,7 +2790,8 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     // it as an operator binding.
     const bool provenance_changed = updated.source != stored.source;
     const bool changed = recovered || provenance_changed ||
-        !same_discovered_facts(stored.job, updated.job);
+        manager_of(stored.job) != manager_of(updated.job) ||
+        members_of(stored.job) != members_of(updated.job);
     if (!changed) {
         updated.revision = stored.revision;
         result.ok = true;
@@ -2944,7 +2807,6 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     result.revision = updated.revision;
     result.execution_became_complete = execution_became_complete;
     updated_out = std::move(updated);
-    (void)observed_at;
     return result;
 }
 
@@ -3288,8 +3150,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         created.state = RecordState::Active;
         created.first_seen_us = observed_at;
         created.last_seen_us = observed_at;
-        created.job.execution.members = normalized_processes(
-            processes.empty() ? members_of(created.job) : processes);
+        created.job.execution.members = normalized_processes(processes);
 
         // A create has no published memory image to revert: identity
         // lookup repairs an ambiguous create, so it does not fence
@@ -3767,8 +3628,8 @@ bool JobRegistry::refreshJobFacts(uint64_t jobID) {
     std::string recovery_error;
     if (!recoverStoreIfNeeded(recovery_error)) return false;
 
-    // /proc and scheduler metadata I/O run strictly outside every lock; only
-    // the result write happens under them.
+    // Host reads run outside every lock. Any metadata the adapter uses while
+    // locating members is temporary and never replaces the creation snapshot.
     Job job;
     {
         std::shared_lock lg(records_mtx_);
@@ -3786,8 +3647,7 @@ bool JobRegistry::refreshJobFacts(uint64_t jobID) {
         if (it == records_.end()) return false;
         record = it->second;
     }
-    record.job = job;
-    record.job.JobID = jobID;   // the record image carries no dispatch list
+    record.job.execution.members = std::move(job.execution.members);
     record.last_seen_us = now_us();
     if (record.revision == 0) {
         record.revision = 1;

@@ -495,6 +495,7 @@ void manual_selection_wins_over_observations_and_policy(const std::string& base)
     // An inventory observation update must not rewrite collection intent.
     auto updated_observation = observation;
     std::get<CondorJobAttr>(updated_observation.sub_attr).owner = "bob";
+    updated_observation.execution.members.push_back({5151, 424242, "boot-aaa"});
     const auto updated = registry.upsertObservedJob(updated_observation);
     check(updated.ok && updated.disposition == UpsertDisposition::Updated,
           "observation update must be applied to facts");
@@ -898,10 +899,12 @@ void facts_update_refreshes_a_converged_runtime(const std::string& base)
 
     int applies = 0;
     std::string last_owner;
+    std::vector<pid_t> last_pids;
     install_collection_runtime(registry, [&](const Job& job, std::vector<std::string>& applied,
                                       std::string& error) {
         ++applies;
         last_owner = std::get<CondorJobAttr>(job.sub_attr).owner;
+        last_pids = pids_of(job);
         applied = job.CollectorNames;
         error.clear();
         return true;
@@ -922,14 +925,15 @@ void facts_update_refreshes_a_converged_runtime(const std::string& base)
     // attachment lifetime, not the facts revision).
     auto updated = condor_observation("172.0");
     std::get<CondorJobAttr>(updated.sub_attr).owner = "after";
+    updated.execution.members.push_back({5151, 424242, "boot-aaa"});
     const auto upsert = registry.upsertObservedJob(updated);
     check(upsert.ok && upsert.disposition == UpsertDisposition::Updated,
           "the facts update must land");
     test_runtime(registry).reconcile(id);
     check(applies == 2,
           "the facts change must reach the runtime");
-    check(last_owner == "after",
-          "the refreshed snapshot must carry the new facts, got " + last_owner);
+    check(last_owner == "alice" && last_pids == std::vector<pid_t>{4242, 5151},
+          "the runtime refresh must carry new members and the frozen creation owner");
     {
         const auto refreshed = test_runtime(registry).applied(id);
         check(refreshed.applied && refreshed.collectors == converged.collectors,
