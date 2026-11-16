@@ -477,11 +477,11 @@ void JobRegistry::projectRecordFacts(Job& job) const {
     if (const auto* adapter = namespaceAdapterOf(job)) adapter->projectFacts(job);
 }
 
-void JobRegistry::normalizeRestoredFacts(Job& job) const {
+void JobRegistry::normalizeNamespaceFacts(Job& job) const {
     if (const auto* adapter = namespaceAdapterOf(job)) {
-        // Legacy rows may carry namespace facts only in the common fields;
-        // adopt them into the typed facts (facts win), then render back so
-        // the two can never diverge.
+        // Ingress and restored facts may carry namespace aliases only in the
+        // common fields. Adopt them into empty typed slots (facts win), then
+        // render the typed namespace back to the common fields.
         adapter->adoptNamespaceAliases(job, job.cluster_name, job.clusterTag);
         adapter->renderNamespace(job);
     }
@@ -667,10 +667,9 @@ void JobRegistry::restoreExistingRecords()
 {
     auto rows = store_->loadAll();
     validateRestoredExecutions(rows);
-    // Legacy rows may carry namespace facts only in the common fields; fold
-    // them into the typed facts so the single-source invariants hold from
-    // the first read.
-    for (auto& row : rows) normalizeRestoredFacts(row.job);
+    // Adopt any common namespace aliases into the typed facts before the
+    // restored rows become visible.
+    for (auto& row : rows) normalizeNamespaceFacts(row.job);
     for (auto& row : rows) publishRecord(std::move(row));
 }
 
@@ -1999,6 +1998,7 @@ bool JobRegistry::createManualJob(const Job& job) {
     // the adapter owning those facts renders the projections the wire and the
     // collectors read. No configured adapter means the projections stay as
     // given — incomplete, never a guess.
+    normalizeNamespaceFacts(record.job);
     projectRecordFacts(record.job);
     {
         // Bind each numeric PID to the process that holds it NOW. A manual
@@ -2088,9 +2088,8 @@ JobRegistry::ManualTarget JobRegistry::manualUpdateTarget(
         if (record.job.JobID == kSystemSentinelJobId) continue;
         const auto record_key = keyOf(record.job);
         // The structured namespace facts decide whether a typed match is the
-        // same job: a legacy row whose facts carry no namespace tolerates the
-        // claim (and adopts it below), a resolved row with a different schedd
-        // does not.
+        // same job. Unknown components can survive target screening, but
+        // UPDATE never adopts a new namespace into the creation snapshot.
         const bool typed_match = ownHasActive(record.job.JobID) &&
                                  matches_job(matcher, record.job);
         if (!typed_match) continue;
@@ -2185,7 +2184,7 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
 
     // CREATE branch: the manual registration, verbatim. An empty
     // collector list is a CREATE-only rejection — an UPDATE with no
-    // collectors is a pure facts update and stays valid.
+    // collectors is a valid no-op and keeps its creation metadata.
     Job create_job = job;
     if (identity_selector) {
         adoptNamespaceAliases(create_job, identity_selector->cluster_name,
@@ -2212,121 +2211,32 @@ nlohmann::json JobRegistry::updateManualInstance(const JobRecord& target, const 
                                                  const nlohmann::json& request) {
     const uint64_t internal_id = target.job.JobID;
 
-    // Facts first, fill-empty only: empty request fields never erase stored
-    // facts, and the PID list is intent-hostile input on the update route
-    // (never trusted from a manual re-add).
+    // Re-add only changes selection. Metadata and execution evidence remain
+    // the creation/source snapshot; namespace claims cannot rebind that image.
     {
-        Job facts = job;
-        facts.execution.members.clear();
-        facts.CollectorNames.clear();
         std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
-        JobRecord record;
-        {
-            std::shared_lock lg(records_mtx_);
-            const auto it = records_.find(internal_id);
-            if (it == records_.end()) {
-                nlohmann::json out;
-                out["status"] = "error";
-                out["msg"] = "instance vanished while updating";
-                return out;
-            }
-            record = it->second;
+        const auto record = ownRecord(internal_id);
+        if (!record) {
+            return {{"status", "error"}, {"msg", "instance vanished while updating"}};
         }
-        // Target selection used a snapshot. Another claimant may have
-        // supplied namespace facts since then; reject before changing facts
-        // or collectors while this lock still protects the current image.
-        if (!namespace_facts_compatible(namespaceFactsOf(facts),
-                                        namespaceFactsOf(record.job))) {
+        if (record->state == RecordState::Closing) {
+            return {{"status", "error"}, {"code", "generation_closing"},
+                    {"message", "the instance is closing and rejects manual re-add"}};
+        }
+        const auto requested = namespaceFactsOf(job);
+        const auto recorded = namespaceFactsOf(record->job);
+        bool matches = requested.size() == recorded.size();
+        for (size_t i = 0; matches && i < requested.size(); ++i) {
+            if (!requested[i].empty() && requested[i] != recorded[i]) matches = false;
+        }
+        if (!matches) {
             return {{"status", "error"}, {"code", "namespace_conflict"},
-                    {"message", "target namespace changed before manual update"}};
-        }
-        const auto previous_namespace = namespaceFactsOf(record.job);
-        const auto previous_key = keyOf(record.job);
-        const bool previously_indexed = !record.index_key.empty();
-        // The record image may predate the single-source invariant (a legacy
-        // row carrying namespace facts only in the common fields): adopt
-        // them into the typed facts before merging, so the render below can
-        // never wipe a fact the merge did not see.
-        normalizeRestoredFacts(record.job);
-        if (merge_job_facts(record.job, facts, /*replace_members=*/false)) {
-            projectRecordFacts(record.job);  // the typed facts are the source
-            std::optional<SchedulerKey> adopted_key = previous_key;
-            bool index_changed = false;
-            if (previous_namespace != namespaceFactsOf(record.job)) {
-                // Interpretation goes through the adapter even when the
-                // scheduler's discovery is not configured (never started).
-                const auto* adapter = namespaceAdapterOf(record.job);
-                if (!adapter) {
-                    return {{"status", "error"}, {"code", "identity_adoption_unsafe"},
-                            {"message", "scheduler adapter unavailable for namespace adoption"}};
-                }
-                adopted_key = canonicalize(adapter->legacySelector(record.job));
-                if (previously_indexed && !adopted_key) {
-                    return {{"status", "error"}, {"code", "identity_adoption_unsafe"},
-                            {"message", "cannot derive the adopted canonical identity"}};
-                }
-                if (previous_key && adopted_key && *previous_key != *adopted_key &&
-                    (previous_key->adapter != adopted_key->adapter ||
-                     previous_key->canonical_native != adopted_key->canonical_native ||
-                     previous_key->step_id != adopted_key->step_id)) {
-                    return {{"status", "error"}, {"code", "identity_adoption_unsafe"},
-                            {"message", "adoption would change the native identity"}};
-                }
-                // No key to adopt means no index move: the row stays
-                // addressable by internal id only, never restored by identity.
-                index_changed = adopted_key &&
-                                (!previous_key || *previous_key != *adopted_key);
-            }
-            if (index_changed) {
-                {
-                    std::shared_lock lg(records_mtx_);
-                    if (previously_indexed) {
-                        const auto old = identity_index_.find(previous_key->index_key());
-                        if (old == identity_index_.end() || old->second != internal_id) {
-                            return {{"status", "error"}, {"code", "identity_conflict"},
-                                    {"message", "previous identity index ownership is uncertain"}};
-                        }
-                    }
-                    const auto owner = identity_index_.find(adopted_key->index_key());
-                    if (owner != identity_index_.end() && owner->second != internal_id) {
-                        return {{"status", "error"}, {"code", "identity_conflict"},
-                                {"message", "adopted identity is owned by another instance"}};
-                    }
-                }
-                if (previously_indexed) {
-                    const auto durable_owner = store_->readRowByIdentity(*previous_key);
-                    if (!durable_owner || durable_owner->job.JobID != internal_id ||
-                        durable_owner->index_key != previous_key->index_key()) {
-                        return {{"status", "error"}, {"code", "identity_conflict"},
-                                {"message", "durable previous identity ownership is uncertain"}};
-                    }
-                }
-                record.index_key = adopted_key->index_key();
-            }
-            record.last_seen_us = now_us();
-            ++record.revision;
-            // The key adopted above is the one this batch indexes; the record
-            // image itself goes out with put().
-            RecordTxn txn(*this, "manual upsert facts", /*durable=*/!index_changed);
-            txn.touch(internal_id);
-            txn.put(std::move(record));
-            if (index_changed) {
-                if (previously_indexed) txn.indexRelease(*previous_key, internal_id);
-                txn.indexPut(*adopted_key, internal_id);
-            }
-            if (!txn.commit()) {
-                nlohmann::json out;
-                out["status"] = "error";
-                if (txn.error() == "identity_conflict") out["code"] = txn.error();
-                out["msg"] = "facts update failed: " + txn.error();
-                return out;
-            }
+                    {"message", "manual re-add cannot change the creation namespace"}};
         }
     }
 
     // Collectors: union into the existing manual selection, never a wholesale
-    // replace; an empty request list leaves the selection untouched (pure
-    // facts update).
+    // replace; an empty request list leaves the record untouched.
     std::optional<CollectionTargetOutcome> selection_outcome;
     if (!job.CollectorNames.empty()) {
         std::vector<std::string> merged;
@@ -2868,7 +2778,7 @@ void JobRegistry::applyRecovered(const std::vector<JobRecord>& adopted,
     std::unique_lock lg(records_mtx_);
     for (const auto& row_in : adopted) {
         auto row = row_in;
-        normalizeRestoredFacts(row.job);
+        normalizeNamespaceFacts(row.job);
         if (const auto key = keyOf(row.job)) row.index_key = key->index_key();
         auto it = records_.find(row.job.JobID);
         if (it != records_.end() && !it->second.index_key.empty()) {
@@ -2958,7 +2868,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     // A source may resolve the namespace before its typed attrs carry it: the
     // rendered fields are the same fact's durable form, so adopt them into the
     // empty typed slots, then render back from the typed facts.
-    normalizeRestoredFacts(observed_job);
+    normalizeNamespaceFacts(observed_job);
     projectRecordFacts(observed_job);   // the typed facts are the record source
     const bool authoritative_members = members_complete;
     if (!processes.empty()) {
@@ -3286,7 +3196,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
                 // and this identity lookup is the documented repair. Adopt
                 // it, then merge.
                 internal_id = durable->job.JobID;
-                normalizeRestoredFacts(durable->job);
+                normalizeNamespaceFacts(durable->job);
                 std::unique_lock lg(records_mtx_);
                 if (!durable->index_key.empty())
                     identity_index_[durable->index_key] = internal_id;
@@ -3364,7 +3274,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         created.job = job;
         created.job.JobID = allocated;
         created.job.CollectorNames.clear();   // intent lives in selection
-        normalizeRestoredFacts(created.job);
+        normalizeNamespaceFacts(created.job);
         projectRecordFacts(created.job);
         created.source = FactSource::Discovery;
         created.index_key = index_key;

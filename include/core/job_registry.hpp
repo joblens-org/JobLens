@@ -175,22 +175,15 @@ public:
     JobRegistry& operator=(const JobRegistry&) = delete;
 
     // Job 增删
-    // Manual CRUD upsert: one entry point for the manual add and update
-    // routes (orthogonal to the automatic paths — never routed through the
-    // admission gate). Routing, in order: an identity selector naming a live
-    // inventoried instance (the add-route resolution, kept in the RPC layer)
-    // takes the UPDATE branch; an active record with matching typed
-    // sub_attr but no resolvable identity routes to UPDATE by internal id;
-    // anything else takes the CREATE branch. UPDATE merges the requested
-    // collectors into the existing manual selection (union, never a
-    // wholesale replace) and fills empty facts only; CREATE is the plain
-    // addJob semantics (empty collectors still rejected there).
-    // Returns the command response JSON (status success/error plus the
-    // instance payload).
+    // Manual upsert: an active typed match constrained by request/selector
+    // namespaces updates only the manual collector selection (union); metadata
+    // and execution evidence remain unchanged. Unknown namespaces are never
+    // adopted on UPDATE. No match takes CREATE, which rejects empty collectors.
+    // This path is independent of the automatic admission gate.
     nlohmann::json upsertJob(const Job& job, const nlohmann::json& request,
                              std::optional<NativeSelector> identity_selector = std::nullopt);
     // Thin alias for the CREATE branch — the historical manual registration
-    // entry (same semantics as before the merge).
+    // entry.
     bool addJob(const Job& job);
     void delJob(uint64_t jobID);
     // Inventory-grade retirement: archive atomically (active -> history,
@@ -333,13 +326,12 @@ public:
     // the aliases contradict known facts.
     bool adoptNamespaceAliases(Job& job, const std::string& cluster_name,
                                const std::string& cluster_tag) const;
-    // Publishes every record-visible field the adapter derives from the typed
-    // facts (subtype, subtype_name, native id, namespace). Fill-empty only.
+    // Projects record-visible fields using the adapter's policy, independently
+    // of namespace-alias normalization.
     void projectRecordFacts(Job& job) const;
-    // Normalizes a Job restored from the store: legacy rows may carry
-    // namespace facts only in the common fields — adopt them into the typed
-    // facts (facts win), then render back.
-    void normalizeRestoredFacts(Job& job) const;
+    // Adopts common namespace aliases into empty typed slots (facts win), then
+    // renders the typed namespace back for ingress and restored Jobs alike.
+    void normalizeNamespaceFacts(Job& job) const;
 
     // Test seam only (see StoreFaultMode).
     void injectStoreFaultForTest(StoreFaultMode mode, size_t skip = 0, size_t count = 1);
@@ -425,8 +417,8 @@ private:
     };
     ManualTarget manualUpdateTarget(const Job& job,
                                     const std::optional<NativeSelector>& selector);
-    // UPDATE mechanics: collectors union into the manual selection, facts
-    // fill-empty merge (JobPIDs ignored), response in the add response shape.
+    // UPDATE changes selection only: collectors union into the manual list;
+    // metadata and request members are ignored after namespace validation.
     nlohmann::json updateManualInstance(const JobRecord& target, const Job& job,
                                         const nlohmann::json& request);
     // System JobID 0: in-memory only, never stored, never mutated.

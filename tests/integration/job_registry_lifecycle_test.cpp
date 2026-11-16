@@ -139,6 +139,79 @@ Job make_common_job()
     return job;
 }
 
+void manual_readd_preserves_creation_metadata(const std::string& base)
+{
+    JobRegistryOptions options;
+    options.db_path = fresh_dir(base, "manual-frozen-metadata");
+    options.test_static_inventory = true;
+    options.enable_pid_tracker = false;
+    options.register_rpc = false;
+    JobRegistry registry(options);
+    registry.setCollectorValidator(nullptr);
+    NativeSelector selector{"condor", "pool", "schedd", "185.0", ""};
+    Job observation = discovered_job(
+        selector, ProcessIdentity{4747, 940000, "boot"},
+        {ProcessIdentity{4747, 940000, "boot"}}, true);
+    auto& original_attr = std::get<CondorJobAttr>(observation.sub_attr);
+    original_attr.owner = "alice";
+    original_attr.slots_cgroup_path = "/original/cgroup";
+    const auto created = registry.upsertObservedJob(observation);
+    check(created.ok, "manual freeze: the discovery fixture must register");
+    const auto initial = registry.inventoryRecord(created.internal_id);
+    const auto writes = registry.storeHealth().durable_commits;
+
+    Job request = observation;
+    request.jobtype = JobType::Sys;
+    request.NativeJobID = "00185.0";
+    request.execution.members = {{9999, 1234, "forged-boot"}};
+    auto& changed_attr = std::get<CondorJobAttr>(request.sub_attr);
+    changed_attr.owner = "replacement-owner";
+    changed_attr.slots_cgroup_path = "/replacement/cgroup";
+    changed_attr.auto_update_child = true;
+    const auto noop = registry.upsertJob(request, nlohmann::json::object(), selector);
+    const auto kept = registry.inventoryRecord(created.internal_id);
+    check(noop.value("status", "") == "success" && kept && initial &&
+              kept->revision == initial->revision &&
+              registry.storeHealth().durable_commits == writes,
+          "metadata-only manual re-add must be a write-free no-op");
+    check(kept->job.NativeJobID == "185.0" && kept->job.jobtype == JobType::Job &&
+              std::get<CondorJobAttr>(kept->job.sub_attr).owner == "alice" &&
+              std::get<CondorJobAttr>(kept->job.sub_attr).slots_cgroup_path == "/original/cgroup" &&
+              !std::get<CondorJobAttr>(kept->job.sub_attr).auto_update_child &&
+              kept->job.execution.members == initial->job.execution.members &&
+              kept->index_key == initial->index_key,
+          "manual re-add must preserve metadata, identity and execution evidence");
+
+    request.CollectorNames = {"cpumem_collector"};
+    const auto selected = registry.upsertJob(request, nlohmann::json::object(), selector);
+    const auto selected_record = registry.inventoryRecord(created.internal_id);
+    check(selected.value("status", "") == "success" && selected_record &&
+              selected_record->revision == initial->revision + 1 &&
+              std::get<CondorJobAttr>(selected_record->job.sub_attr).owner == "alice" &&
+              registry.selectionRecord(created.internal_id).manual ==
+                  std::optional<std::vector<std::string>>(std::vector<std::string>{"cpumem_collector"}),
+          "manual re-add may change selection without a separate metadata revision");
+    const auto repeated = registry.upsertJob(request, nlohmann::json::object(), selector);
+    check(repeated.value("status", "") == "success" &&
+              registry.inventoryRecord(created.internal_id)->revision == selected_record->revision,
+          "repeating the same manual selection must not create a metadata write");
+
+    registry.setKernelCleanupForTest([](uint64_t, const Job&, std::string& error) {
+        error = "leave the row closing for the stale-target check";
+        return false;
+    });
+    check(!registry.retireInstance(created.internal_id),
+          "manual freeze: failed cleanup must retain a closing row");
+    request.CollectorNames.clear();
+    const auto closing = JobRegistryNamespaceTestAccess::update(registry, *initial, request);
+    check(closing.value("status", "") == "error" &&
+              registry.inventoryRecord(created.internal_id)->state == RecordState::Closing &&
+              std::get<CondorJobAttr>(registry.inventoryRecord(created.internal_id)->job.sub_attr).owner == "alice",
+          "a stale manual target must not accept a closing metadata-only re-add");
+    registry.setKernelCleanupForTest(nullptr);
+    check(registry.deinit(), "manual freeze: cleanup must complete after restoring the seam");
+}
+
 void run(const std::string& base)
 {
     // One configuration file for the whole binary (Config::instance keeps the
@@ -640,7 +713,7 @@ void run(const std::string& base)
     }
 
     // Manual CRUD upsert (merge): one entry point for the manual add and
-    // update routes. Identity hit → UPDATE (collectors union, facts fill-only);
+    // update routes. Identity hit → UPDATE (collectors union, metadata frozen);
     // sub_attr duplicate without identity → UPDATE by internal id (the old
     // duplicate refusal is gone); no hit → CREATE.
     {
@@ -711,8 +784,8 @@ void run(const std::string& base)
                       "not replace it");
             }
 
-            // Empty collectors on UPDATE = a pure facts update: valid, and the
-            // selection is untouched.
+            // Empty collectors on UPDATE are a valid no-op; both the metadata
+            // snapshot and selection stay untouched.
             manual.CollectorNames.clear();
             const auto facts_only =
                 registry.upsertJob(manual, nlohmann::json::object(), selector);
@@ -721,7 +794,7 @@ void run(const std::string& base)
             {
                 const auto binding = registry.selectionRecord(created.internal_id);
                 check(binding.manual.has_value() && binding.manual->size() == 2,
-                      "upsert: a facts-only update must not touch the selection");
+                      "upsert: an empty re-add must not touch the selection");
             }
             registry.deinit();
         }
@@ -865,9 +938,8 @@ void run(const std::string& base)
             check(registry.inventoryRecords().size() == 2,
                   "schedd: the ambiguous route must create nothing");
 
-            // An old row without any scheduler attribution stays reachable:
-            // a claimed schedd cannot contradict an unknown one (legacy
-            // tolerance), so the claim updates the legacy row in place.
+            // An existing unknown namespace is frozen too. A later schedd
+            // claim must not adopt it or change the selection as a side effect.
             Job legacy;
             legacy.jobtype = JobType::Job;
             legacy.subtype = JobSubType::Condor;
@@ -891,12 +963,18 @@ void run(const std::string& base)
             claim_legacy.CollectorNames = {"io_collector"};
             const auto tolerated =
                 registry.upsertJob(claim_legacy, nlohmann::json::object(), std::nullopt);
-            check(tolerated["status"] == "success" &&
-                      tolerated["JobID"] == legacy_row.job.JobID,
-                  "schedd: a claim on an unknown schedd must tolerate and update the "
-                  "legacy row: " + tolerated.dump());
-            check(registry.inventoryRecords().size() == 3,
-                  "schedd: the tolerated claim must not create a second 180.0");
+            check(tolerated["status"] == "error" &&
+                      tolerated.value("code", "") == "namespace_conflict",
+                  "schedd: a claim cannot adopt an unknown creation namespace: " +
+                      tolerated.dump());
+            const auto unchanged_legacy = registry.inventoryRecord(legacy_row.job.JobID);
+            check(unchanged_legacy &&
+                      std::get<CondorJobAttr>(unchanged_legacy->job.sub_attr).scheduler_name.empty() &&
+                      registry.selectionRecord(legacy_row.job.JobID).manual ==
+                          std::optional<std::vector<std::string>>(
+                              std::vector<std::string>{"cpumem_collector"}) &&
+                      registry.inventoryRecords().size() == 3,
+                  "schedd: a rejected adoption must leave metadata, selection and row count unchanged");
             registry.deinit();
         }
 
@@ -1235,21 +1313,21 @@ void run(const std::string& base)
             std::get<CondorJobAttr>(b.sub_attr).scheduler_name = "schedd-b@submit";
             b.CollectorNames = {"io_collector"};
             const auto results = JobRegistryNamespaceTestAccess::updatePreselected(registry, a, b);
-            check(results.first.value("status", "") == "success",
-                  "namespace race: first claim succeeds");
+            check(results.first.value("status", "") == "error" &&
+                      results.first.value("code", "") == "namespace_conflict",
+                  "namespace freeze: the first claim cannot adopt an unknown namespace");
             check(results.second.value("status", "") == "error" &&
                       results.second.value("code", "") == "namespace_conflict",
                   "namespace race: stale conflicting second claim fails");
             const auto row = registry.inventoryRecord(id);
-            check(row && std::get<CondorJobAttr>(row->job.sub_attr).scheduler_name ==
-                             "schedd-a@submit",
-                  "namespace race: rejected claim must not overwrite schedd");
+            check(row && std::get<CondorJobAttr>(row->job.sub_attr).scheduler_name.empty(),
+                  "namespace freeze: both rejected claims leave the initial namespace unknown");
             const auto selection = registry.selectionRecord(id);
             check(selection.manual &&
                       *selection.manual == std::vector<std::string>{"cpumem_collector"},
                   "namespace race: rejected claim must not change collectors");
 
-            const auto same = JobRegistryNamespaceTestAccess::updatePreselected(registry, a, a);
+            const auto same = JobRegistryNamespaceTestAccess::updatePreselected(registry, legacy, legacy);
             check(same.first.value("status", "") == "success" &&
                       same.second.value("status", "") == "success",
                   "namespace race: matching stale claims remain compatible");
@@ -1264,10 +1342,10 @@ void run(const std::string& base)
             NativeSelector selector{"condor", "pool-a", "schedd-a@submit", "909.0", ""};
             const auto selected = registry.upsertJob(other, nlohmann::json::object(), selector);
             const auto selected_row = registry.inventoryRecord(other_id);
-            check(selected.value("status", "") == "success" && selected_row &&
-                      selected_row->job.cluster_name == "pool-a" &&
-                      selected_row->job.clusterTag == "schedd-a@submit",
-                  "namespace race: selector-only claims persist for later validation");
+            check(selected.value("status", "") == "error" &&
+                      selected.value("code", "") == "namespace_conflict" && selected_row &&
+                      selected_row->job.cluster_name.empty() && selected_row->job.clusterTag.empty(),
+                  "namespace freeze: a selector cannot rewrite an existing namespace");
 
             Job pool_legacy = legacy;
             pool_legacy.NativeJobID = "910.0";
@@ -1282,7 +1360,7 @@ void run(const std::string& base)
             pool_b.CollectorNames = {"io_collector"};
             const auto pool_results =
                 JobRegistryNamespaceTestAccess::updatePreselected(registry, pool_a, pool_b);
-            check(pool_results.first.value("status", "") == "success" &&
+            check(pool_results.first.value("code", "") == "namespace_conflict" &&
                       pool_results.second.value("code", "") == "namespace_conflict",
                   "namespace race: stale conflicting pool claim fails");
 
@@ -1301,7 +1379,7 @@ void run(const std::string& base)
             slurm_b.CollectorNames = {"io_collector"};
             const auto slurm_results =
                 JobRegistryNamespaceTestAccess::updatePreselected(registry, slurm_a, slurm_b);
-            check(slurm_results.first.value("status", "") == "success" &&
+            check(slurm_results.first.value("code", "") == "namespace_conflict" &&
                       slurm_results.second.value("code", "") == "namespace_conflict",
                   "namespace race: stale conflicting slurm cluster claim fails");
             registry.deinit();
@@ -1395,38 +1473,40 @@ void run(const std::string& base)
             claim.CollectorNames.clear();
             const auto sync_before = registry.storeHealth().sync_commits;
             const auto adopted = registry.upsertJob(claim, nlohmann::json::object(), selector);
-            check(adopted.value("status", "") == "success" && adopted["JobID"] == id,
-                  "adoption observed: selector-only update keeps ID");
+            check(adopted.value("status", "") == "error" &&
+                      adopted.value("code", "") == "namespace_conflict",
+                  "namespace freeze: a selector-only update cannot move the identity");
             check(registry.storeHealth().sync_commits == sync_before,
                   "adoption observed: index adoption must not fsync");
             NativeSelector old_selector{"condor", "pool", "", "913.0", ""};
             const auto old_identity = canonicalize(old_selector);
             const auto new_identity = canonicalize(selector);
             check(old_identity && new_identity &&
-                      !registry.inventoryRecordByKey(*old_identity) &&
-                      registry.inventoryRecordByKey(*new_identity) &&
-                      registry.inventoryRecordByKey(*new_identity)->job.JobID == id,
-                  "adoption observed: in-memory identity index changes owner key");
+                      registry.inventoryRecordByKey(*old_identity) &&
+                      registry.inventoryRecordByKey(*old_identity)->job.JobID == id &&
+                      !registry.inventoryRecordByKey(*new_identity),
+                  "namespace freeze: a rejected claim leaves the old identity index intact");
             ProcessIdentity generation{4913, 9913, "boot"};
             auto observation = discovered_job(selector, generation,
                                                {ProcessIdentity{4913, 9913, "boot"}}, true);
             const auto result = registry.upsertObservedJob(observation);
-            check(result.ok && result.internal_id == id && registry.inventoryRecords().size() == 1,
-                  "adoption observed: complete observation must reuse adopted ID");
+            check(result.ok && result.internal_id != id && registry.inventoryRecords().size() == 2,
+                  "namespace freeze: a distinct complete identity must create its own record");
             registry.deinit();
             JobRegistry reopened(options);
             const auto restored = reopened.inventoryRecordByKey(*new_identity);
-            check(restored && restored->job.JobID == id &&
-                      !reopened.inventoryRecordByKey(*old_identity),
-                  "adoption observed: durable identity index survives restart");
+            check(restored && restored->job.JobID == result.internal_id &&
+                      reopened.inventoryRecordByKey(*old_identity) &&
+                      reopened.inventoryRecordByKey(*old_identity)->job.JobID == id,
+                  "namespace freeze: both original identities survive restart");
             reopened.deinit();
         }
 
         for (const auto mode : {StoreFaultMode::FailBeforeWrite, StoreFaultMode::FailAfterWrite}) {
             JobRegistryOptions options;
             options.db_path = fresh_dir(base, mode == StoreFaultMode::FailBeforeWrite
-                                                  ? "lifecycle-adoption-fail-before"
-                                                  : "lifecycle-adoption-fail-after");
+                                                  ? "lifecycle-selection-fail-before"
+                                                  : "lifecycle-selection-fail-after");
             options.enable_pid_tracker = false;
             options.register_rpc = false;
             JobRegistry registry(options);
@@ -1438,28 +1518,32 @@ void run(const std::string& base)
             legacy.sub_attr = CondorJobAttr{};
             std::get<CondorJobAttr>(legacy.sub_attr).cluster_id = 914;
             legacy.CollectorNames = {"cpumem_collector"};
-            check(registry.addJob(legacy), "adoption recovery: legacy create");
+            check(registry.addJob(legacy), "selection recovery: legacy create");
             const auto id = registry.inventoryRecords().front().job.JobID;
             Job claim = legacy;
-            claim.CollectorNames.clear();
-            NativeSelector selector{"condor", "pool", "schedd@submit", "914.0", ""};
+            claim.CollectorNames = {"io_collector"};
+            NativeSelector selector{"condor", "pool", "", "914.0", ""};
             registry.injectStoreFaultForTest(mode);
             const auto failed = registry.upsertJob(claim, nlohmann::json::object(), selector);
             check(failed.value("status", "") == "error",
-                  "adoption recovery: injected write failure is reported");
+                  "selection recovery: injected write failure is reported");
             const auto retried = registry.upsertJob(claim, nlohmann::json::object(), selector);
             check(retried.value("status", "") == "success" && retried["JobID"] == id,
-                  "adoption recovery: retry resolves original ID");
+                  "selection recovery: retry resolves original ID");
             const auto identity = canonicalize(selector);
             check(identity && registry.inventoryRecordByKey(*identity) &&
                       registry.inventoryRecordByKey(*identity)->job.JobID == id &&
                       registry.inventoryRecords().size() == 1,
-                  "adoption recovery: row and index resolve together");
+                  "selection recovery: row and index resolve together");
+            check(registry.selectionRecord(id).manual ==
+                      std::optional<std::vector<std::string>>(std::vector<std::string>{"cpumem_collector", "io_collector"}) &&
+                      registry.inventoryRecord(id)->job.clusterTag.empty(),
+                  "selection recovery: retry changes only collectors, never the namespace");
             registry.deinit();
         }
 
         // Pause a real maintenance checkpoint after it snapshots an old row.
-        // The adoption either completes before release (old code) or blocks on
+        // The selection update either completes before release or blocks on
         // checkpoint serialization (fixed code), without scheduler timing.
         {
             JobRegistryOptions options;
@@ -1477,7 +1561,7 @@ void run(const std::string& base)
             old_job.sub_attr = CondorJobAttr{};
             std::get<CondorJobAttr>(old_job.sub_attr).cluster_id = 915;
             const auto original = registry.upsertObservedJob(old_job);
-            check(original.ok, "checkpoint adoption: dirty pool-only row creates");
+            check(original.ok, "checkpoint selection: dirty pool-only row creates");
 
             std::promise<void> captured;
             std::promise<void> release;
@@ -1489,13 +1573,13 @@ void run(const std::string& base)
             captured_future.wait();
             const bool serialized = JobRegistryNamespaceTestAccess::mutationLocked(registry);
             Job claim = old_job;
-            claim.CollectorNames.clear();
+            claim.CollectorNames = {"io_collector"};
             std::promise<void> adoption_started;
             auto started = adoption_started.get_future();
             nlohmann::json adopted;
             std::thread adopter([&] {
                 adoption_started.set_value();
-                adopted = registry.upsertJob(claim, nlohmann::json::object(), new_selector);
+                adopted = registry.upsertJob(claim, nlohmann::json::object(), old_selector);
             });
             started.wait();
             if (!serialized) adopter.join();
@@ -1505,26 +1589,27 @@ void run(const std::string& base)
             JobRegistryNamespaceTestAccess::restoreProvider(registry);
             check(pass_ok && adopted.value("status", "") == "success" &&
                       adopted["JobID"] == original.internal_id,
-                  "checkpoint adoption: both operations complete on original ID");
-            check(registry.deinit(), "checkpoint adoption: clean shutdown");
+                  "checkpoint selection: both operations complete on original ID");
+            check(registry.deinit(), "checkpoint selection: clean shutdown");
 
             JobRegistry reopened(options);
             const auto old_identity = canonicalize(old_selector);
             const auto new_identity = canonicalize(new_selector);
-            check(old_identity && new_identity, "checkpoint adoption: valid identities");
-            const auto durable = JobRegistryNamespaceTestAccess::durableByIdentity(reopened, *new_identity);
-            check(durable && durable->index_key == new_identity->index_key() &&
-                      durable->job.clusterTag == "schedd@submit" &&
-                      !JobRegistryNamespaceTestAccess::durableByIdentity(reopened, *old_identity),
-                  "checkpoint adoption: durable row and identity index must agree after restart");
+            check(old_identity && new_identity, "checkpoint selection: valid identities");
+            const auto durable = JobRegistryNamespaceTestAccess::durableByIdentity(reopened, *old_identity);
+            check(durable && durable->index_key == old_identity->index_key() &&
+                      durable->job.clusterTag.empty() &&
+                      !JobRegistryNamespaceTestAccess::durableByIdentity(reopened, *new_identity) &&
+                      reopened.selectionRecord(original.internal_id).manual ==
+                          std::optional<std::vector<std::string>>(std::vector<std::string>{"io_collector"}),
+                  "checkpoint selection: the frozen identity and new selection must survive restart");
             auto new_job = old_job;
-            new_job.clusterTag = new_selector.cluster_tag;
             const auto observed = reopened.upsertObservedJob(new_job);
             check(observed.ok && observed.internal_id == original.internal_id &&
                       reopened.inventoryRecords().size() == 1,
-                  "checkpoint adoption: observation must reuse original ID after restart");
+                  "checkpoint selection: observation must reuse original ID after restart");
             reopened.deinit();
-            pass_case("CHECKPOINT_NAMESPACE", "checkpoint and adoption preserve row/index across restart");
+            pass_case("CHECKPOINT_NAMESPACE", "checkpoint and selection preserve frozen row/index across restart");
         }
 
         // --- no hit: CREATE keeps the legacy semantics ---------------------
@@ -1561,7 +1646,7 @@ void run(const std::string& base)
     pass_case("UPSERT",
               "manual upsert: identity/sub_attr routes update with collector union, "
               "the sub_attr route discriminates by the subtype's scheduler (schedd) "
-              "with legacy tolerance for an unknown attribution, a fresh add creates, "
+              "with frozen creation namespaces, a fresh add creates, "
               "create still rejects empty collectors");
     pass_case("AUTOPOLICY",
               "auto_add folding selects collectors on registration; rules decide per job");
@@ -1575,6 +1660,7 @@ int main(int argc, char** argv)
         argc > 1 ? std::string(argv[1]) : std::string("/tmp/opencode/joblens-lifecycle-test");
     std::filesystem::create_directories(base);
     try {
+        manual_readd_preserves_creation_metadata(base + "/data");
         run(base + "/data");
         return 0;
     } catch (const std::exception& error) {
