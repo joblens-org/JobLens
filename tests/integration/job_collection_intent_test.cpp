@@ -49,7 +49,7 @@ void check(bool condition, const std::string& message)
 bool has_active(const JobRegistry& registry, uint64_t internal_id)
 {
     const auto record = registry.inventoryRecord(internal_id);
-    return record.has_value() && record->state != std::string(kStateClosing);
+    return record.has_value() && record->state != RecordState::Closing;
 }
 
 std::string fresh_dir(const std::string& base, const std::string& name)
@@ -1419,7 +1419,7 @@ void closing_keeps_the_runtime_holders_until_the_archive(const std::string& base
     check(!has_active(registry, id), "a closing instance leaves the active map");
 
     const auto closing = registry.inventoryRecord(id);
-    check(closing.has_value() && closing->state == "closing",
+    check(closing.has_value() && closing->state == RecordState::Closing,
           "the record must stay closing until the drain acknowledges");
     check(registry.actualCollection(id).collectors ==
               std::vector<std::string>{"cpumem_collector"},

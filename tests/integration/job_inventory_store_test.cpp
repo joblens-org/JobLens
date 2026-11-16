@@ -84,7 +84,7 @@ JobRegistryOptions isolated(const std::string& path)
 bool has_active(const JobRegistry& registry, uint64_t internal_id)
 {
     const auto record = registry.inventoryRecord(internal_id);
-    return record.has_value() && record->state != std::string(kStateClosing);
+    return record.has_value() && record->state != RecordState::Closing;
 }
 
 std::optional<JobRecord> record_by_identity(const JobRegistry& registry,
@@ -448,7 +448,7 @@ void stale_generation_is_not_replayed(const std::string& base)
         JobRegistry registry(isolated(path));
         const auto record = registry.inventoryRecord(internal_id);
         check(record.has_value(), "the record must still be restored");
-        check(record->state == "active",
+        check(record->state == RecordState::Active,
               "a stale generation is not a lifecycle state: the record stays Open");
         check(!record->verified,
               "a stale execution generation must be restored as unverified");
@@ -465,7 +465,7 @@ void stale_generation_is_not_replayed(const std::string& base)
         check(recovered.ok && recovered.internal_id == internal_id,
               "the same generation must resolve to the restored record");
         const auto active = registry.inventoryRecord(internal_id);
-        check(active.has_value() && active->state == "active",
+        check(active.has_value() && active->state == RecordState::Active,
               "a valid observation must reactivate a suspect record");
     }
 }
@@ -596,9 +596,9 @@ void closing_state_is_durable_and_not_resurrected(const std::string& base)
         JobRegistry registry(isolated(path));
         const auto record = registry.inventoryRecord(internal_id);
         check(record.has_value(), "the closing record must be restored");
-        check(record->state == "closing",
+        check(record->state == RecordState::Closing,
               "the restored record must carry the durable closing state, got " +
-                  record->state);
+                  std::string(to_string(record->state)));
         check(!has_active(registry, internal_id),
               "a restored closing instance must not be an active job");
         check(!registry.findJob(internal_id).has_value(),
@@ -637,7 +637,7 @@ void restored_suspect_instances_are_not_replayed(const std::string& base)
     {
         JobRegistry registry(isolated(path));
         const auto restored = registry.inventoryRecord(internal_id);
-        check(restored.has_value() && restored->state == "active" &&
+        check(restored.has_value() && restored->state == RecordState::Active &&
                   !restored->verified,
               "the stale generation must be restored Open and unverified");
 
@@ -1200,7 +1200,7 @@ void archived_instances_leave_no_active_row(const std::string& base)
         // own pass proves the boundary and the archive releases the identity.
         check(registry.retireInstance(id), "retirement must be accepted");
         check(registry.inventoryRecord(id).has_value() &&
-                  registry.inventoryRecord(id)->state == "closing",
+                  registry.inventoryRecord(id)->state == RecordState::Closing,
               "the accepted retirement must stay Closing until the runtime drains");
         test_runtime(registry).reconcile(id);
         check(!registry.inventoryRecord(id).has_value(),
@@ -1371,7 +1371,7 @@ void closing_write_failure_keeps_the_instance(const std::string& base)
     check(removed_events == 0,
           "a failed closing sync must not deliver Removed");
     const auto record = registry.inventoryRecord(created.internal_id);
-    check(record.has_value() && record->state == kStateActive,
+    check(record.has_value() && record->state == RecordState::Active,
           "a failed closing sync must leave the instance active");
     check(registry.findJob(created.internal_id).has_value(),
           "the instance must remain readable after the refused retirement");
@@ -1447,7 +1447,7 @@ void ambiguous_closing_state_is_not_reverted(const std::string& base)
         check(registry.storeHealth().recovery_required,
               "the ambiguous closing write must latch recovery");
         const auto record = registry.inventoryRecord(id);
-        check(record.has_value() && record->state == kStateActive,
+        check(record.has_value() && record->state == RecordState::Active,
               "memory keeps the pre-failure state until recovery");
         check(!registry.deinit(),
               "a shutdown with an unrecovered store must report failure");
@@ -1455,7 +1455,7 @@ void ambiguous_closing_state_is_not_reverted(const std::string& base)
     {
         JobRegistry reopened(isolated(path));
         const auto record = reopened.inventoryRecord(id);
-        check(record.has_value() && record->state == "closing",
+        check(record.has_value() && record->state == RecordState::Closing,
               "the closing fact that landed must survive; the shutdown checkpoint "
               "must not rewrite the stale active row");
         check(!has_active(reopened, id), "a closing instance is never active");
@@ -1508,7 +1508,7 @@ void cleanup_failure_keeps_the_closing_reservation(const std::string& base)
     install_deferred_drain(registry);
     check(registry.retireInstance(id), "the retirement must be accepted");
     const auto closing = registry.inventoryRecord(id);
-    check(closing.has_value() && closing->state == "closing",
+    check(closing.has_value() && closing->state == RecordState::Closing,
           "the accepted retirement is durable Closing before any cleanup");
     check(test_runtime(registry).reconcile(id),
           "the runtime must accept the Closing record");
@@ -1518,7 +1518,7 @@ void cleanup_failure_keeps_the_closing_reservation(const std::string& base)
     check(record_visible_during_cleanup,
           "the cleanup must run while the durable record still exists");
     check(registry.inventoryRecord(id).has_value() &&
-              registry.inventoryRecord(id)->state == "closing",
+              registry.inventoryRecord(id)->state == RecordState::Closing,
           "a failed cleanup keeps the durable closing reservation");
     check(!has_active(registry, id), "a closing reservation is not an active instance");
 
@@ -1577,7 +1577,7 @@ void ambiguous_closing_retry_restores_the_drain(const std::string& base)
           "the ambiguous closing write must latch recovery");
     check(removed_events == 0, "a failed closing sync must not deliver Removed");
     const auto active = registry.inventoryRecord(id);
-    check(active.has_value() && active->state == kStateActive,
+    check(active.has_value() && active->state == RecordState::Active,
           "memory keeps the active view until recovery");
 
     registry.clearStoreFaultsForTest();
@@ -1637,7 +1637,7 @@ void cleanup_failure_after_ack_is_retryable(const std::string& base)
     check(removed_events == 1, "one Removed starts the drain");
     check(!first_ack, "the ack must report the failed cleanup");
     const auto closing = registry.inventoryRecord(id);
-    check(closing.has_value() && closing->state == kStateClosing,
+    check(closing.has_value() && closing->state == RecordState::Closing,
           "a cleanup failure after the ack keeps the closing reservation");
     check(!has_active(registry, id), "a closing reservation is not an active instance");
     check(registry.retireInstance(id),
@@ -1854,7 +1854,7 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
         // The closing transition is itself a record mutation, so the durable
         // image the archive write copies carries the revision after that bump.
         const auto closing_row = registry.inventoryRecord(id);
-        check(closing_row.has_value() && closing_row->state == kStateClosing,
+        check(closing_row.has_value() && closing_row->state == RecordState::Closing,
               "the closing reservation must be durable before the archive");
         archived_revision = closing_row->revision;
         check(archived_revision == before_archive->revision + 1,
@@ -1952,7 +1952,7 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
           "the fenced history row must keep the observed facts, not a guess");
     check(history.value("revision", uint64_t{0}) == archived_revision,
           "the fenced history row must keep the archived record revision");
-    check(history.value("state", std::string{}) == kStateClosing,
+    check(history.value("state", std::string{}) == to_string(RecordState::Closing),
           "the fenced history row must keep the closing state");
     check(history.contains("selection"),
           "the fenced history row must keep the audit selection");
@@ -2094,7 +2094,7 @@ void restored_closing_archives_with_effective_fallback(const std::string& base)
     {
         JobRegistry registry(isolated(path));
         const auto record = registry.inventoryRecord(id);
-        check(record.has_value() && record->state == "closing",
+        check(record.has_value() && record->state == RecordState::Closing,
               "the closing record must be restored");
         check(registry.cleanupClosingJobs(),
               "the closing cleanup must finalize the restored closing");

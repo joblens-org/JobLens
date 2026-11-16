@@ -110,7 +110,7 @@ public:
         std::optional<JobRecord> record;
         if (!registry_.runtimeRecord(internal_id, record)) return false;
         if (!record) return false;
-        if (record->state == kStateClosing) return beginDrain(internal_id);
+        if (record->state == RecordState::Closing) return beginDrain(internal_id);
 
         Job desired = record->job;
         desired.CollectorNames = record->selection.effectiveCollectors();

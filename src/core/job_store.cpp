@@ -207,7 +207,7 @@ nlohmann::json record_json(const JobRecord& record) {
     // ordered by the record's single revision.
     out["selection"] = selection_to_json(record.selection);
     out["revision"]       = record.revision;
-    out["state"]          = record.state;
+    out["state"]          = to_string(record.state);
     out["first_seen_us"]  = record.first_seen_us;
     out["last_seen_us"]   = record.last_seen_us;
     // Who owns the facts. The logical identity is not stored: it is derived
@@ -264,7 +264,12 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id,
     ExecutionEvidence& execution = record.job.execution;
 
     record.revision       = j.value("revision", uint64_t{1});
-    record.state          = j.value("state", std::string{kStateActive});
+    const auto state_text = j.value("state", std::string{"active"});
+    const auto state = record_state_from_string(state_text);
+    if (!state) {
+        throw std::runtime_error("record has an unknown state '" + state_text + "'");
+    }
+    record.state = *state;
     record.first_seen_us  = j.value("first_seen_us", int64_t{0});
     record.last_seen_us   = j.value("last_seen_us", int64_t{0});
     if (record.revision == 0) record.revision = 1;
@@ -595,7 +600,7 @@ std::vector<JobRecord> JobStore::loadAll() {
 
     size_t closing_restored = 0, incomplete = 0;
     for (const auto& record : restored) {
-        if (record.state == kStateClosing) ++closing_restored;
+        if (record.state == RecordState::Closing) ++closing_restored;
         incomplete += record.index_key.empty() ? 1 : 0;
     }
     if (closing_restored > 0) {
@@ -1403,7 +1408,7 @@ bool JobStore::apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& bat
                 end_time = static_cast<int64_t>(unhex64(op.history_key_suffix));
             }
             auto history = record_json(*op.record);
-            history["state"] = kStateClosing;
+            history["state"] = to_string(RecordState::Closing);
             history["end_time_us"] = end_time;
             // The fact snapshot of what the collection runtime really had
             // attached when the registry accepted the retirement, and how it

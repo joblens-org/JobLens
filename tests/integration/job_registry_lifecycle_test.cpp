@@ -354,8 +354,10 @@ void run(const std::string& base)
               "auto policy: without a manual override the defaults are effective");
         check(binding.automatic_source == "defaults",
               "auto policy: the revision must identify the defaults source");
-        check(registry.findJob(created.internal_id)->CollectorNames.size() == 2,
+        check(registry.selectionRecord(created.internal_id).effectiveCollectors().size() == 2,
               "auto policy: the derived snapshot must follow the selection");
+        check(registry.inventoryRecord(created.internal_id)->job.CollectorNames.empty(),
+              "the record image must not carry the dispatch list");
 
         // A manual override keeps winning over the automatic decision.
                 registry.setCollectorValidator([](const std::string& name) {
@@ -416,7 +418,7 @@ void run(const std::string& base)
         check(binding.automatic.has_value() && binding.effectiveCollectors().size() == 2,
               "incomplete generation: the completed generation must trigger the "
               "automatic selection");
-        check(registry.findJob(created.internal_id)->CollectorNames.size() == 2,
+        check(registry.selectionRecord(created.internal_id).effectiveCollectors().size() == 2,
               "incomplete generation: the derived snapshot must follow the late selection");
 
         check(registry.deinit(), "incomplete generation: deinit");

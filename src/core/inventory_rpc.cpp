@@ -273,7 +273,7 @@ uint64_t inventory_snapshot_revision(const std::vector<JobRecord>& records)
         mix(record->job.JobID);
         mix(record->revision);
         mix(record->index_key.empty() ? 0u : 2u);
-        mix(record->state == "closing" ? 3u : (record->verified ? 5u : 4u));
+        mix(record->state == RecordState::Closing ? 3u : (record->verified ? 5u : 4u));
     }
     // Stay inside the signed 63-bit range so JavaScript consumers keep the
     // exact value; the revision is an opaque token, not a counter.
@@ -305,7 +305,7 @@ nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& rec
     out["internal_job_id"] = format_internal_id(record.job.JobID);
     out["schema_version"] = kRpcSchemaVersion;
     out["record_revision"] = record.revision;
-    out["state"] = record.state;
+    out["state"] = to_string(record.state);
     out["source"] = inventory_source(record);
     out["quarantined"] = false;
     out["identity_complete"] = !record.index_key.empty();
@@ -815,7 +815,7 @@ nlohmann::json inventory_status_payload(JobRegistry& registry)
     for (const auto& record : registry.inventoryRecords()) {
         if (is_reserved_internal_id(record.job.JobID)) continue;
         if (!record.verified) ++suspect;
-        else if (record.state == "closing") ++closing;
+        else if (record.state == RecordState::Closing) ++closing;
         else ++active;
     }
     body["instances"] = nlohmann::json{
@@ -1014,7 +1014,10 @@ void registerInventoryRpc(JobRegistry& registry) {
                     continue;
                 if (!native_filter.empty() && record.job.NativeJobID != native_filter)
                     continue;
-                if (!state_filter.empty() && record.state != state_filter) continue;
+                if (!state_filter.empty() &&
+                    (!record_state_from_string(state_filter) ||
+                     *record_state_from_string(state_filter) != record.state))
+                    continue;
                 matching.push_back(std::move(record));
             }
             sort_records(matching);
@@ -1329,7 +1332,7 @@ void registerInventoryRpc(JobRegistry& registry) {
             out["cluster_name"] = record.job.cluster_name;
             out["cluster_tag"] = record.job.clusterTag;
             out["step_id"] = step_id_text(registry, record);
-            out["state"] = record.state;
+            out["state"] = to_string(record.state);
             out["quarantined"] = false;
             out["mode"] = target["mode"];
             out["record_revision"] = target["record_revision"];

@@ -394,7 +394,7 @@ void check(bool condition, const std::string& message) {
 static bool has_active(const JobRegistry& registry, uint64_t internal_id)
 {
     const auto record = registry.inventoryRecord(internal_id);
-    return record.has_value() && record->state != std::string(kStateClosing);
+    return record.has_value() && record->state != RecordState::Closing;
 }
 std::string hex_id(uint64_t id) {
     std::ostringstream out;
@@ -807,7 +807,7 @@ void run(const std::string& base) {
         std::condition_variable cv_;
         std::vector<uint64_t> completed_;
     };
-    auto record_of = [](uint64_t id, const std::string& state,
+    auto record_of = [](uint64_t id, RecordState state,
                         std::vector<std::string> manual) {
         JobRecord record;
         record.job.JobID = id;
@@ -866,7 +866,7 @@ void run(const std::string& base) {
 
     run_regression("closing-drain", [&] {
         // Regression 1: an Open record selecting two event collectors.
-        close_source.set({record_of(7001, kStateActive, {"ev_a", "ev_b"})});
+        close_source.set({record_of(7001, RecordState::Active, {"ev_a", "ev_b"})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(close_added.load() == 2, "both event collectors must attach");
         // Suspend only the background scheduling of the two real lanes; the lane
@@ -882,7 +882,7 @@ void run(const std::string& base) {
         // Persist Closing and reconcile. The ordinary selection pass must not detach
         // these bindings: the single accounting path owns the removal, and neither
         // lane has produced its accepted tail yet.
-        close_source.set({record_of(7001, kStateClosing, {})});
+        close_source.set({record_of(7001, RecordState::Closing, {})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(close_sink.count(7001) == 0,
               "a Closing record must not complete while both lanes still owe a tail");
@@ -928,7 +928,7 @@ void run(const std::string& base) {
         // Regression 2: Open -> persistent stop -> reselect while the stopped
         // attachment's tail is still pending. The old close must never consume the
         // reselected attachment's snapshot, token or membership.
-        JobRecord epoch = record_of(7002, kStateActive, {"ev_c"});
+        JobRecord epoch = record_of(7002, RecordState::Active, {"ev_c"});
         epoch.job.NativeJobID = "epoch-1";
         close_source.set({epoch});
         CollectorSchedulerTestAccess::reconcile(scheduler);
@@ -942,7 +942,7 @@ void run(const std::string& base) {
         CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_c");
         const int removed_before_reselect = close_removed.load();
 
-        close_source.set({record_of(7002, kStateActive, std::vector<std::string>{})});
+        close_source.set({record_of(7002, RecordState::Active, std::vector<std::string>{})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(CollectorSchedulerTestAccess::memberCount(scheduler, "ev_c") == 0,
               "the persistent stop must detach the membership");
@@ -954,7 +954,7 @@ void run(const std::string& base) {
 
         // Reselect before the lane ran. The reattach is deferred: it must not
         // install a newer snapshot/token that the old close would then see.
-        JobRecord reselected = record_of(7002, kStateActive, {"ev_c"});
+        JobRecord reselected = record_of(7002, RecordState::Active, {"ev_c"});
         reselected.job.NativeJobID = "epoch-2";
         close_source.set({reselected});
         CollectorSchedulerTestAccess::reconcile(scheduler);
@@ -1021,7 +1021,7 @@ void run(const std::string& base) {
         // non-recursive mutex on the same thread. The failed start must release
         // its partial init, report no actual holder, and let the next reconcile
         // retry init.
-        close_source.set({record_of(9001, kStateActive, {"throwing"})});
+        close_source.set({record_of(9001, RecordState::Active, {"throwing"})});
         // This call is where the pre-fix scheduler self-deadlocks. The sentinel
         // makes the bounded runner timeout name the hang instead of reporting
         // an empty log.
@@ -1070,7 +1070,7 @@ void run(const std::string& base) {
         // holds membership. If the record becomes Closing before that tail is
         // drained, the Closing boundary must adopt that obligation: the count
         // is attached holders + that lane's existing pending close.
-        close_source.set({record_of(7101, kStateActive, {"ev_d", "ev_e"})});
+        close_source.set({record_of(7101, RecordState::Active, {"ev_d", "ev_e"})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(CollectorSchedulerTestAccess::memberCount(scheduler, "ev_d") == 1 &&
                   CollectorSchedulerTestAccess::memberCount(scheduler, "ev_e") == 1,
@@ -1079,14 +1079,14 @@ void run(const std::string& base) {
         CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_e");
 
         // Manual stop of ev_d while the record is still Open.
-        close_source.set({record_of(7101, kStateActive, {"ev_e"})});
+        close_source.set({record_of(7101, RecordState::Active, {"ev_e"})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_d") == 1 &&
                   CollectorSchedulerTestAccess::memberCount(scheduler, "ev_d") == 0,
               "the stopped lane must owe a tail and hold no membership");
 
         // The record becomes Closing while that tail is still pending.
-        close_source.set({record_of(7101, kStateClosing, {})});
+        close_source.set({record_of(7101, RecordState::Closing, {})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_d") == 1 &&
                   CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_e") == 1,
@@ -1118,7 +1118,7 @@ void run(const std::string& base) {
     run_regression("late-closing-both-stopped", [&] {
         // Both lanes manually stopped before Closing: no membership remains, but
         // both tails are still owed. The Closing boundary must count them.
-        close_source.set({record_of(7102, kStateActive, {"ev_f", "ev_g"})});
+        close_source.set({record_of(7102, RecordState::Active, {"ev_f", "ev_g"})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(CollectorSchedulerTestAccess::memberCount(scheduler, "ev_f") == 1 &&
                   CollectorSchedulerTestAccess::memberCount(scheduler, "ev_g") == 1,
@@ -1126,9 +1126,9 @@ void run(const std::string& base) {
         CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_f");
         CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_g");
 
-        close_source.set({record_of(7102, kStateActive, {"ev_g"})});
+        close_source.set({record_of(7102, RecordState::Active, {"ev_g"})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
-        close_source.set({record_of(7102, kStateActive, std::vector<std::string>{})});
+        close_source.set({record_of(7102, RecordState::Active, std::vector<std::string>{})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_f") == 1 &&
                   CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_g") == 1,
@@ -1137,7 +1137,7 @@ void run(const std::string& base) {
                   CollectorSchedulerTestAccess::memberCount(scheduler, "ev_g") == 0,
               "neither stopped lane may hold membership");
 
-        close_source.set({record_of(7102, kStateClosing, {})});
+        close_source.set({record_of(7102, RecordState::Closing, {})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(close_sink.count(7102) == 0,
               "a Closing record with two adopted tails must not complete immediately");
@@ -1168,7 +1168,7 @@ void run(const std::string& base) {
         std::atomic<int> planned_added{0}, planned_removed{0};
         CollectorSchedulerTestAccess::addPlannedEvent(scheduler, "ev_yield", plan,
                                                       bump(planned_added), bump(planned_removed));
-        close_source.set({record_of(7201, kStateActive, {"ev_yield"})});
+        close_source.set({record_of(7201, RecordState::Active, {"ev_yield"})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(CollectorSchedulerTestAccess::memberCount(scheduler, "ev_yield") == 1,
               "the yielding lane must attach");
@@ -1176,7 +1176,7 @@ void run(const std::string& base) {
 
         // The record turns Closing while the lane still owes more than one
         // round of tail records.
-        close_source.set({record_of(7201, kStateClosing, {})});
+        close_source.set({record_of(7201, RecordState::Closing, {})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_yield") == 1,
               "the Closing boundary must defer the close to the lane");
@@ -1230,10 +1230,10 @@ void run(const std::string& base) {
             plan->job_id = id;
             std::atomic<int> removed{0};
             CollectorSchedulerTestAccess::addPlannedEvent(scheduler, name, plan, {}, bump(removed));
-            close_source.set({record_of(id, kStateActive, {name})});
+            close_source.set({record_of(id, RecordState::Active, {name})});
             CollectorSchedulerTestAccess::reconcile(scheduler);
             CollectorSchedulerTestAccess::pauseLane(scheduler, name);
-            close_source.set({record_of(id, kStateClosing, {})});
+            close_source.set({record_of(id, RecordState::Closing, {})});
             CollectorSchedulerTestAccess::reconcile(scheduler);
             CollectorSchedulerTestAccess::stageReadiness(scheduler, name);
             check(CollectorSchedulerTestAccess::drainLane(scheduler, name) == WorkResult::Yield,
@@ -1269,10 +1269,10 @@ void run(const std::string& base) {
         plan->job_id = 7206;
         std::atomic<int> removed{0};
         CollectorSchedulerTestAccess::addPlannedEvent(scheduler, "ev_failed_stop", plan, {}, bump(removed));
-        close_source.set({record_of(7206, kStateActive, {"ev_failed_stop"})});
+        close_source.set({record_of(7206, RecordState::Active, {"ev_failed_stop"})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_failed_stop");
-        close_source.set({record_of(7206, kStateClosing, {})});
+        close_source.set({record_of(7206, RecordState::Closing, {})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         CollectorSchedulerTestAccess::stageReadiness(scheduler, "ev_failed_stop");
         CollectorSchedulerTestAccess::drainLane(scheduler, "ev_failed_stop");
@@ -1295,10 +1295,10 @@ void run(const std::string& base) {
         plan->more_plan = {true, true, true, false};
         plan->failure = "throw";
         CollectorSchedulerTestAccess::addPlannedEvent(scheduler, "ev_failed_signal", plan);
-        close_source.set({record_of(7207, kStateActive, {"ev_failed_signal"})});
+        close_source.set({record_of(7207, RecordState::Active, {"ev_failed_signal"})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_failed_signal");
-        close_source.set({record_of(7207, kStateClosing, {})});
+        close_source.set({record_of(7207, RecordState::Closing, {})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         CollectorSchedulerTestAccess::stageReadiness(scheduler, "ev_failed_signal");
         CollectorSchedulerTestAccess::drainLane(scheduler, "ev_failed_signal");
@@ -1330,7 +1330,7 @@ void run(const std::string& base) {
         plan->more_plan = {true, true};
         plan->failure = "throw";
         CollectorSchedulerTestAccess::addPlannedEvent(scheduler, "ev_failed_manual", plan);
-        close_source.set({record_of(7208, kStateActive, {"ev_failed_manual"})});
+        close_source.set({record_of(7208, RecordState::Active, {"ev_failed_manual"})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_failed_manual");
         CollectorSchedulerTestAccess::stageReadiness(scheduler, "ev_failed_manual");
@@ -1340,7 +1340,7 @@ void run(const std::string& base) {
         check(CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_failed_manual") == 1 &&
                   CollectorSchedulerTestAccess::snapshotCount(scheduler, "ev_failed_manual") == 1,
               "manual stop must retain the failed epoch obligation and snapshot");
-        close_source.set({record_of(7208, kStateClosing, {})});
+        close_source.set({record_of(7208, RecordState::Closing, {})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(close_sink.count(7208) == 0, "retirement must adopt the failed manual-stop tail");
         close_source.set({});
@@ -1351,10 +1351,10 @@ void run(const std::string& base) {
         auto plan = std::make_shared<CollectorSchedulerTestAccess::EventDrainPlan>();
         plan->block_first = true;
         CollectorSchedulerTestAccess::addPlannedEvent(scheduler, "ev_shutdown_proof", plan);
-        close_source.set({record_of(7299, kStateActive, {"ev_shutdown_proof"})});
+        close_source.set({record_of(7299, RecordState::Active, {"ev_shutdown_proof"})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_shutdown_proof");
-        close_source.set({record_of(7299, kStateClosing, {})});
+        close_source.set({record_of(7299, RecordState::Closing, {})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         CollectorSchedulerTestAccess::stageReadiness(scheduler, "ev_shutdown_proof");
         std::thread worker([&] {
@@ -1383,7 +1383,7 @@ void run(const std::string& base) {
         std::atomic<int> cont_added{0}, cont_removed{0};
         CollectorSchedulerTestAccess::addPlannedEvent(scheduler, "ev_cont", plan,
                                                       bump(cont_added), bump(cont_removed));
-        close_source.set({record_of(7202, kStateActive, {"ev_cont"})});
+        close_source.set({record_of(7202, RecordState::Active, {"ev_cont"})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(CollectorSchedulerTestAccess::memberCount(scheduler, "ev_cont") == 1,
               "the continuing lane must attach");
@@ -1399,7 +1399,7 @@ void run(const std::string& base) {
         // The close arrives between the two rounds, while the drain is still
         // unfinished. The deferred state must survive the intervening
         // reconcile: the next round continues without new readiness.
-        close_source.set({record_of(7202, kStateClosing, {})});
+        close_source.set({record_of(7202, RecordState::Closing, {})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_cont") == 1,
               "the mid-drain Closing must defer the close");
@@ -1496,7 +1496,7 @@ void run(const std::string& base) {
             }
             check(archive.retireInstance(id), "the real retirement must be accepted");
             const auto record = archive.inventoryRecord(id);
-            check(record.has_value() && record->state == kStateClosing,
+            check(record.has_value() && record->state == RecordState::Closing,
                   "the real durable record must stay Closing until the drain completes");
             CollectorSchedulerTestAccess::reconcile(scheduler);
         };
@@ -1544,7 +1544,7 @@ void run(const std::string& base) {
         CollectorSchedulerTestAccess::drainLane(scheduler, "ri_ev_c");
         CollectorSchedulerTestAccess::drainLane(scheduler, "ri_ev_d");
         const auto failed = archive.inventoryRecord(8102);
-        check(failed.has_value() && failed->state == kStateClosing,
+        check(failed.has_value() && failed->state == RecordState::Closing,
               "a failed checked cleanup must keep the Closing record");
         active_rows = raw_keys_from_store_copy(live_db, base + "-archive-copy-6",
                                                "j:" + hex_id(8102));
@@ -1603,7 +1603,7 @@ void run(const std::string& base) {
     StaticSource injected;
     JobRecord injected_record;
     injected_record.job.JobID = 777;
-    injected_record.state = kStateActive;
+    injected_record.state = RecordState::Active;
     injected_record.revision = 1;
     injected_record.job.JobID = 777;
     injected_record.job.jobtype = JobType::Sys;

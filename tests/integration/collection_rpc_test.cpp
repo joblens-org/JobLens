@@ -65,7 +65,7 @@ void check(bool condition, const std::string& message)
 bool has_active(const JobRegistry& registry, uint64_t internal_id)
 {
     const auto record = registry.inventoryRecord(internal_id);
-    return record.has_value() && record->state != std::string(kStateClosing);
+    return record.has_value() && record->state != RecordState::Closing;
 }
 
 using json = nlohmann::json;

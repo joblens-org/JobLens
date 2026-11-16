@@ -574,7 +574,7 @@ void run(const std::string& base)
     std::string value;
     check(db->Get(leveldb::ReadOptions{}, "j:000000000000012f", &value).ok(),
           "durable Closing row must survive deinit");
-    check(nlohmann::json::parse(value).at("state") == kStateClosing,
+    check(nlohmann::json::parse(value).at("state") == to_string(RecordState::Closing),
           "surviving durable row must remain Closing");
     std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions{}));
     it->Seek("h:000000000000012f:");

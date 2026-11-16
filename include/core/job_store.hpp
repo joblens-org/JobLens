@@ -178,20 +178,37 @@ enum class StoreFaultMode {
 // JobRecord — the one durable representation
 // ---------------------------------------------------------------------------
 
-// Durable lifecycle state persisted with the record. "closing" is written
-// before the collector drain starts, so an interrupted retirement can never
-// resurrect as active. Unverified liveness is NOT a lifecycle state: a restored
-// record is Open unless it is Closing, and an unreadable process is "unknown",
-// never dead.
-inline constexpr const char* kStateActive = "active";
-inline constexpr const char* kStateClosing = "closing";
+// Durable lifecycle state persisted with the record. Closing is written before
+// the collector drain starts, so an interrupted retirement can never resurrect
+// as active. Unverified liveness is NOT a lifecycle state: a restored record is
+// Active unless it is Closing, and an unreadable process is "unknown", never
+// dead.
+enum class RecordState {
+    Active,
+    Closing,
+};
+
+inline const char* to_string(RecordState state)
+{
+    return state == RecordState::Closing ? "closing" : "active";
+}
+
+// Strict wire/row parse: an unknown value is a corrupt row, never Active.
+inline std::optional<RecordState> record_state_from_string(const std::string& raw)
+{
+    if (raw == "active") return RecordState::Active;
+    if (raw == "closing") return RecordState::Closing;
+    return std::nullopt;
+}
 
 struct JobRecord {
-    // The one core object: facts + identity. Management state below is the
+    // The one core object: facts + evidence. Management state below is the
     // only thing the record adds. `job.JobID` is the storage key; there is no
-    // second internal id.
+    // second internal id. A record image never carries intent:
+    // job.CollectorNames must stay empty — the dispatch projection is built
+    // from `selection` when the runtime asks for it.
     Job job;
-    std::string state = kStateActive;    // active | closing
+    RecordState state = RecordState::Active;
     FactSource source = FactSource::Manual;
     // Derived cache of the record's durable i: key. The store must release that
     // entry during recovery and owns no adapter to derive it there, so the

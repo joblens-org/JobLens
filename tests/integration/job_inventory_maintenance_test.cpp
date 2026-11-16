@@ -1256,7 +1256,7 @@ void run_a25(const std::string& base)
             restart_options.test_static_inventory = true;
             JobRegistry registry(restart_options);
             const auto record = registry.inventoryRecord(closing_id);
-            check(record.has_value() && record->state == "closing",
+            check(record.has_value() && record->state == RecordState::Closing,
                   "the interrupted closing was not restored");
             check(registry.cleanupClosingJobs(),
                   "the restart closing cleanup did not archive the record");
@@ -1349,7 +1349,7 @@ void run_legacy(const std::string& base)
     check(registry.findJob(id).has_value(),
           "legacy: a live manual registration was retired");
     check(registry.inventoryRecord(id).has_value() &&
-              registry.inventoryRecord(id)->state == "active",
+              registry.inventoryRecord(id)->state == RecordState::Active,
           "legacy: a live registration must stay active");
 
     probes.set_process(4321, LivenessState::Dead);
@@ -1422,7 +1422,7 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
 
         const auto restored = find_native(registry, "810.0");
         check(restored.has_value(), "RESTORE-UNKNOWN: the record was not restored");
-        check(restored->state == kStateActive && !restored->verified,
+        check(restored->state == RecordState::Active && !restored->verified,
               "RESTORE-UNKNOWN: an unverifiable execution must stay Open but "
               "carry the unverified (suspect) evidence, not a lifecycle state");
         check(std::any_of(restored->job.execution.members.begin(),

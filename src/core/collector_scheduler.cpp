@@ -1009,7 +1009,7 @@ bool CollectorScheduler::beginDrain(uint64_t internal_id) {
     std::vector<uint64_t> completed;
     {
         std::lock_guard lg(m_);
-        if (record->state != kStateClosing) {
+        if (record->state != RecordState::Closing) {
             // The durable state is authoritative: a drain for a record that is
             // not Closing is refused rather than guessed.
             return false;
@@ -1106,7 +1106,7 @@ void CollectorScheduler::reconcileOnce() {
         std::set<uint64_t> closing_ids;
         for (const auto& record : records) {
             if (record.job.JobID == 0) continue;
-            if (record.state == kStateClosing) {
+            if (record.state == RecordState::Closing) {
                 closing_ids.insert(record.job.JobID);
                 closing_jobs.push_back(record.job);
                 continue;
@@ -1181,7 +1181,7 @@ void CollectorScheduler::reconcileOnce() {
             std::map<uint64_t, std::pair<Job, std::string>> next;
             for (const auto& record : records) {
                 if (record.job.JobID == 0) continue;
-                if (record.state == kStateClosing) continue;
+                if (record.state == RecordState::Closing) continue;
                 Job projection = record.job;
                 projection.CollectorNames = record.selection.effectiveCollectors();
                 const auto key = dump_job(projection).dump();
@@ -1215,7 +1215,7 @@ void CollectorScheduler::reconcileOnce() {
 
         // The runtime reports the revision it really converged to.
         for (const auto& record : records) {
-            if (record.state == kStateClosing) continue;
+            if (record.state == RecordState::Closing) continue;
             if (attach_errors_.count(record.job.JobID) != 0) continue;
             if (attach_tokens_.count(record.job.JobID) == 0) continue;
             attach_revisions_[record.job.JobID] = record.revision;

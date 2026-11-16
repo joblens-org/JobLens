@@ -842,7 +842,7 @@ void JobRegistry::repairMissingInitialDecisions() {
 void JobRegistry::refreshUncoveredRecords() {
     for (const auto& record : ownRecords()) {
         if (record.job.JobID == kSystemSentinelJobId) continue;
-        if (record.state == kStateClosing) continue;   // the drain owns it
+        if (record.state == RecordState::Closing) continue;   // the drain owns it
         // Discovery owns its execution facts.  A discovery record whose
         // generation never completed must not be re-read here: this refresh
         // replaces the saved member identities with bare PIDs, which would
@@ -989,7 +989,7 @@ void JobRegistry::evaluateRetirements(
 
     for (const auto& record : records) {
         if (record.job.JobID == 0) continue;
-        if (record.state == kStateClosing) continue;
+        if (record.state == RecordState::Closing) continue;
 
         int absences = 0;
         {
@@ -1989,9 +1989,10 @@ bool JobRegistry::createManualJob(const Job& job) {
     if (!record.job.CollectorNames.empty()) {
         record.selection.manual = record.job.CollectorNames;
     }
+    // Intent is the selection; the record image carries no dispatch list.
+    record.job.CollectorNames.clear();
     record.revision = std::max<uint64_t>(record.revision, 1);
     record.source = FactSource::Manual;
-    if (record.state.empty()) record.state = kStateActive;
     if (record.first_seen_us == 0) record.first_seen_us = now_us();
     if (record.last_seen_us == 0) record.last_seen_us = record.first_seen_us;
     // Manual registrations carry their identity only inside the typed facts:
@@ -2423,7 +2424,7 @@ bool JobRegistry::retireInstance(uint64_t jobID) {
 
     // The closing fact must be durable before anything destructive starts: a
     // failed write leaves the instance active and accepted, with no drain.
-    if (record->state != kStateClosing) {
+    if (record->state != RecordState::Closing) {
         // Capture the runtime's actual attachment BEFORE the drain begins (and
         // before any fault can interrupt the sequence): after the drain, or
         // after a restart, the fact of "was this ever collected" is gone. This
@@ -2441,14 +2442,14 @@ bool JobRegistry::retireInstance(uint64_t jobID) {
             std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
             std::shared_lock rl(records_mtx_);
             const auto it = records_.find(jobID);
-            if (it == records_.end() || it->second.state == kStateClosing) {
+            if (it == records_.end() || it->second.state == RecordState::Closing) {
                 // Already archived by a concurrent finalize, or already
                 // Closing: nothing durable left to mark.
                 closing_persisted = true;
             } else {
                 JobRecord closing = it->second;
                 rl.unlock();
-                closing.state = kStateClosing;
+                closing.state = RecordState::Closing;
                 // The ONE revision orders memory and disk alike: the same
                 // commit writes the row and advances the record.
                 ++closing.revision;
@@ -2525,7 +2526,7 @@ bool JobRegistry::cleanupThenArchive(uint64_t jobID) {
     // archived this instance (or a newer generation may own the id again).
     const auto current = ownRecord(jobID);
     if (!current) return true;   // already archived: the goal is reached
-    if (current->state != kStateClosing) return false;
+    if (current->state != RecordState::Closing) return false;
 
     // A live runtime's accepted tail requires its explicit completion. A
     // locally captured retirement also covers the window before the runtime
@@ -2626,7 +2627,7 @@ bool JobRegistry::finalizeClosingRemoval(uint64_t jobID, bool allow_recovery) {
     }
     const auto record = ownRecord(jobID);
     if (!record) return true;   // already archived (duplicate ack): idempotent
-    if (record->state != kStateClosing) return false;
+    if (record->state != RecordState::Closing) return false;
     return cleanupThenArchive(jobID);
 }
 
@@ -2638,7 +2639,7 @@ bool JobRegistry::cleanupClosingJobs() {
     bool all_archived = true;
     if (!store_) return true;
     for (const auto& record : ownRecords()) {
-        if (record.state != kStateClosing) continue;
+        if (record.state != RecordState::Closing) continue;
         // Shutdown sweep: no implicit recovery. A store whose last write is
         // uncertain must not retry a write here; the record stays closing and
         // the next explicit command or a reopen resolves it.
@@ -2663,7 +2664,7 @@ void JobRegistry::reconcileClosingRemovals() {
     if (!store_) return;
     ICollectionRuntime* runtime = collectionRuntime();
     for (const auto& record : ownRecords()) {
-        if (record.state != kStateClosing) continue;
+        if (record.state != RecordState::Closing) continue;
         bool drained = false;
         {
             std::lock_guard<std::mutex> lock(drain_mtx_);
@@ -2726,7 +2727,7 @@ std::optional<Job> JobRegistry::findJob(uint64_t jobID) {
     // retirement, so reads never mutate the registry.
     if (jobID == kSystemSentinelJobId) return sentinel_job_;
     auto record = ownRecord(jobID);
-    if (!record || record->state == kStateClosing) return std::nullopt;
+    if (!record || record->state == RecordState::Closing) return std::nullopt;
     return record->job;
 }
 
@@ -2760,7 +2761,7 @@ void JobRegistry::admitRestoredOwners() {
     // it happens to observe again.
     for (const auto& record : ownRecords()) {
         if (record.job.JobID == kSystemSentinelJobId) continue;
-        if (record.state != kStateActive) continue;
+        if (record.state != RecordState::Active) continue;
         if (!record.verified) continue;
         ensure_kernel_owner(record.job);
     }
@@ -2795,7 +2796,7 @@ std::vector<JobRecord> JobRegistry::ownFindActive(
     std::shared_lock lg(records_mtx_);
     std::vector<JobRecord> out;
     for (const auto& entry : records_) {
-        if (entry.second.state == kStateClosing) continue;
+        if (entry.second.state == RecordState::Closing) continue;
         if (!pred(entry.second.job)) continue;
         out.push_back(entry.second);
     }
@@ -2805,14 +2806,14 @@ std::vector<JobRecord> JobRegistry::ownFindActive(
 bool JobRegistry::ownHasActive(uint64_t id) const {
     std::shared_lock lg(records_mtx_);
     const auto it = records_.find(id);
-    return it != records_.end() && it->second.state != kStateClosing;
+    return it != records_.end() && it->second.state != RecordState::Closing;
 }
 
 size_t JobRegistry::ownClosingCount() const {
     std::shared_lock lg(records_mtx_);
     size_t count = 0;
     for (const auto& entry : records_) {
-        if (entry.second.state == kStateClosing) ++count;
+        if (entry.second.state == RecordState::Closing) ++count;
     }
     return count;
 }
@@ -2907,7 +2908,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     const std::vector<ProcessIdentity>& processes = members_of(job);
     const bool members_complete = members_authoritative_of(job);
 
-    if (stored.state == kStateClosing) {
+    if (stored.state == RecordState::Closing) {
         // A retiring instance must never be resurrected into the active set by
         // a late observation: the drain owns it until it is archived.
         result.disposition = UpsertDisposition::Conflict;
@@ -2981,6 +2982,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     // execution from here on, never a manual row that merely lacks one.
     updated.source = FactSource::Discovery;
     updated.job = merged;
+    updated.job.CollectorNames.clear();   // intent lives in selection
     // The record's evidence copy is NOT taken wholesale from the incoming
     // Job: a partially-known member list must never erase stored members
     // (that is what the branches below decide). merged still carries the
@@ -3078,7 +3080,7 @@ CollectionOutcome JobRegistry::executeSelectionMutations(
             }
             // Closing discovered in-transaction retains the stale-revision
             // distinction from a target absent at caller validation time.
-            if (record->state == kStateClosing) {
+            if (record->state == RecordState::Closing) {
                 return selection_failure(CollectionError::StaleRevision, "instance_closing");
             }
             if (mutation.expected_revision.has_value() &&
@@ -3113,7 +3115,6 @@ CollectionOutcome JobRegistry::executeSelectionMutations(
             if (changed) {
                 record->selection = next;
                 ++record->revision;
-                record->job.CollectorNames = next.effectiveCollectors();
                 writes.push_back(*record);
             }
             target.revision = record->revision;
@@ -3153,7 +3154,7 @@ void JobRegistry::validateRestoredExecutions(std::vector<JobRecord>& rows) {
     // not survive stays active but unverified, never retired on a guess.
     const std::string boot_id = read_boot_id();
     for (auto& record : rows) {
-        if (record.state == kStateClosing) continue;   // the drain owns it
+        if (record.state == RecordState::Closing) continue;   // the drain owns it
         ExecutionEvidence& execution = record.job.execution;
         record.verified = true;
 
@@ -3205,7 +3206,7 @@ void JobRegistry::validateRestoredExecutions(std::vector<JobRecord>& rows) {
 // holds after a restart.
 bool JobRegistry::missing_initial_decision(const JobRecord& record) const
 {
-    if (record.state != kStateActive) return false;
+    if (record.state != RecordState::Active) return false;
     if (!execution_complete(record.job.execution)) return false;
     if (record.index_key.empty()) return false;
     return !ownSelection(record.job.JobID).automatic.has_value();
@@ -3362,6 +3363,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         JobRecord created;
         created.job = job;
         created.job.JobID = allocated;
+        created.job.CollectorNames.clear();   // intent lives in selection
         normalizeRestoredFacts(created.job);
         projectRecordFacts(created.job);
         created.source = FactSource::Discovery;
@@ -3373,7 +3375,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         // producer-side diagnostics and are not copied.
         created.job.execution.read_order = job.execution.read_order;
         created.revision = 1;
-        created.state = kStateActive;
+        created.state = RecordState::Active;
         created.first_seen_us = observed_at;
         created.last_seen_us = observed_at;
         created.job.execution.members = normalized_processes(
@@ -3472,7 +3474,7 @@ void JobRegistry::evaluateAutoPolicies(const std::vector<uint64_t>& internal_ids
 
     for (const uint64_t internal_id : internal_ids) {
         const auto record = ownRecord(internal_id);
-        if (!record || record->state != kStateActive) continue;   // retired meanwhile
+        if (!record || record->state != RecordState::Active) continue;   // retired meanwhile
         auto decision = autoSelectionFor(record->job, record->job.subtype_name);
         if (!decision) continue;   // no enabled policy for this adapter
         out.push_back(AutoSelection{internal_id, std::move(decision->collectors),
@@ -3875,7 +3877,7 @@ bool JobRegistry::refreshJobFacts(uint64_t jobID) {
         record = it->second;
     }
     record.job = job;
-    record.job.JobID = jobID;   // CollectorNames stay intent-owned, untouched
+    record.job.JobID = jobID;   // the record image carries no dispatch list
     record.last_seen_us = now_us();
     if (record.revision == 0) {
         record.revision = 1;
@@ -3969,7 +3971,7 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
         const bool suspect = !record.verified ||
                              suspect_ids.count(record.job.JobID) != 0;
         if (suspect) ++suspect_count;
-        else if (record.state == kStateActive) ++active_count;
+        else if (record.state == RecordState::Active) ++active_count;
     }
     if (active_count >= closing_present) active_count -= closing_present;
     else active_count = 0;
