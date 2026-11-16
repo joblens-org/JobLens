@@ -3037,164 +3037,123 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     return result;
 }
 
-// The selection command transaction (moved from the store): the records are
-// read under records_mtx_, the revision CAS is checked there, and every
-// changed row is written in ONE unsynced batch. A write failure commits and
-// publishes nothing.
-bool JobRegistry::executeSelectionMutations(
-    const std::vector<SelectionMutation>& mutations,
-    std::vector<SelectionMutationResult>& out, std::string& error) {
-    out.clear();
-    error.clear();
-    if (!store_ || !store_->ready()) {
-        error = "store_unavailable";
-        return false;
-    }
-    if (store_->recoveryRequired()) {
-        // The stored row may already carry a write memory did not publish.
-        // Refusing is the only answer that cannot diverge further.
-        error = "recovery_required";
-        return false;
-    }
-    if (mutations.empty()) {
-        error = "no_targets";
-        return false;
-    }
+namespace {
 
-    // The whole read-transform-write runs under the record transaction lock:
-    // the revision guard is evaluated against the same image that is written,
-    // so no caller can pass a stale revision between a check and a commit.
-    // records_mtx_ is taken to read and (after the commit) to publish.
-    std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
+CollectionOutcome selection_failure(CollectionError error, const std::string& message)
+{
+    CollectionOutcome outcome;
+    outcome.error = error;
+    outcome.message = message;
+    return outcome;
+}
 
-    struct PendingWrite {
-        JobRecord record;
-    };
-    std::vector<SelectionMutationResult> planned;
-    std::vector<PendingWrite> writes;
-    std::set<uint64_t> seen;
-    planned.reserve(mutations.size());
+} // namespace
 
-    for (const auto& mutation : mutations) {
-        if (!seen.insert(mutation.internal_id).second) {
-            error = "duplicate_target";
-            return false;
+CollectionOutcome JobRegistry::executeSelectionMutations(
+    const std::vector<SelectionMutation>& mutations) {
+    CollectionOutcome outcome;
+    {
+        // Checks and writes share the same transaction boundary, including a
+        // recovery latch another writer may have set since caller validation.
+        std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
+        if (!store_ || !store_->ready()) {
+            return selection_failure(CollectionError::StoreUnavailable, "store_unavailable");
         }
+        if (store_->recoveryRequired()) {
+            return selection_failure(CollectionError::StoreUnavailable, "recovery_required");
+        }
+        if (mutations.empty()) {
+            return selection_failure(CollectionError::StoreUnavailable, "no_targets");
+        }
+        std::vector<JobRecord> writes;
+        std::set<uint64_t> seen;
+        outcome.targets.reserve(mutations.size());
 
-        JobRecord record;
-        {
-            std::shared_lock lg(records_mtx_);
-            const auto it = records_.find(mutation.internal_id);
-            if (it == records_.end()) {
-                error = "not_found";
-                return false;
+        for (const auto& mutation : mutations) {
+            if (!seen.insert(mutation.job_id).second) {
+                return selection_failure(CollectionError::StoreUnavailable, "duplicate_target");
             }
-            record = it->second;
-        }
-        if (record.state == kStateClosing) {
-            error = "instance_closing";
-            return false;
-        }
-        if (mutation.expected_revision.has_value() &&
-            record.revision != *mutation.expected_revision) {
-            error = "stale_revision";
-            return false;
-        }
+            auto record = ownRecord(mutation.job_id);
+            if (!record) {
+                return selection_failure(CollectionError::NotFound, "not_found");
+            }
+            // Closing discovered in-transaction retains the stale-revision
+            // distinction from a target absent at caller validation time.
+            if (record->state == kStateClosing) {
+                return selection_failure(CollectionError::StaleRevision, "instance_closing");
+            }
+            if (mutation.expected_revision.has_value() &&
+                record->revision != *mutation.expected_revision) {
+                return selection_failure(CollectionError::StaleRevision, "stale_revision");
+            }
 
-        const CollectionSelection current = record.selection;
-        const auto before = current.effectiveCollectors();
-        CollectionSelection next = current;
-        bool intent_changed = false;
-        bool stored_changed = false;
-        bool skipped_manual_override = false;
-
-        switch (mutation.operation) {
-            case SelectionOperation::SetManual:
-                if (!current.manual.has_value() ||
-                    *current.manual != mutation.collectors) {
+            const auto& current = record->selection;
+            CollectionSelection next = current;
+            switch (mutation.operation) {
+                case SelectionOperation::SetManual:
                     next.manual = mutation.collectors;
-                    intent_changed = true;
-                    stored_changed = true;
-                }
-                break;
-            case SelectionOperation::ResetAuto:
-                if (current.manual.has_value()) {
+                    break;
+                case SelectionOperation::ResetAuto:
                     next.manual.reset();
-                    intent_changed = true;
-                    stored_changed = true;
-                }
-                break;
-            case SelectionOperation::SetAuto:
-                if (current.automatic != mutation.collectors ||
-                    current.automatic_source != mutation.automatic_source) {
+                    break;
+                case SelectionOperation::SetAuto:
                     next.automatic = mutation.collectors;
                     next.automatic_source = mutation.automatic_source;
-                    stored_changed = true;
-                    if (current.manual.has_value()) {
-                        // Manual precedence, including an empty manual stop:
-                        // record the decision for a later reset_auto without
-                        // moving the client-visible intent or the runtime.
-                        skipped_manual_override = true;
-                    } else {
-                        intent_changed = true;
-                    }
-                }
-                break;
+                    break;
+            }
+            const bool changed = !(next == current);
+            CollectionTargetOutcome target;
+            target.internal_id = mutation.job_id;
+            target.instance_id = format_internal_id(mutation.job_id);
+            target.changed = (current.manual != next.manual) ||
+                             (!next.manual.has_value() && changed);
+            outcome.unchanged += !changed;
+            // Only changed automatic bookkeeping hidden by manual precedence
+            // is a skip; an exact repeat remains an accepted unchanged command.
+            outcome.skipped_manual_override += changed && !target.changed;
+            if (changed) {
+                record->selection = next;
+                ++record->revision;
+                record->job.CollectorNames = next.effectiveCollectors();
+                writes.push_back(*record);
+            }
+            target.revision = record->revision;
+            target.selection = std::move(next);
+            outcome.targets.push_back(std::move(target));
         }
 
-        SelectionMutationResult result;
-        result.internal_id = mutation.internal_id;
-        result.intent_changed = intent_changed;
-        result.stored_changed = stored_changed;
-        result.skipped_manual_override = skipped_manual_override;
-        result.runtime_changed = before != next.effectiveCollectors();
-        // ONE revision orders every record mutation, bookkeeping included: an
-        // automatic decision recorded under a manual override still advances
-        // the record. It does not detach anything (runtime_changed stays false).
-        result.revision = stored_changed ? record.revision + 1 : record.revision;
-        if (stored_changed) {
-            record.selection = next;
-            record.revision = result.revision;
-            record.job.CollectorNames = next.effectiveCollectors();
-            writes.push_back(PendingWrite{std::move(record)});
-            result.selection = std::move(next);
-        } else {
-            result.selection = current;
-        }
-        planned.push_back(std::move(result));
-    }
-
-    if (!writes.empty()) {
-        std::vector<JobStore::WriteOp> ops;
-        std::vector<uint64_t> touched;
-        ops.reserve(writes.size());
-        touched.reserve(writes.size());
-        for (const auto& write : writes) {
-            ops.push_back(put_record_op(write.record));
-            touched.push_back(write.record.job.JobID);
-        }
-        // Intent is hot path: unsynced, checkpointed by maintenance/shutdown.
-        if (!store_->commit(std::move(ops), /*durable=*/false, touched,
-                            "mutate selection", error)) {
-            // A reported failure publishes nothing: the in-memory records and
-            // the caller-visible outcome stay at their previous values.
-            error = "store_write_failed";
-            return false;
-        }
-        // Publish after the batch landed: every planned row becomes
-        // authoritative at once (all-or-nothing). The transaction lock held
-        // here guarantees no other mutation moved these rows in between.
-        std::unique_lock lg(records_mtx_);
-        for (const auto& write : writes) {
-            const auto it = records_.find(write.record.job.JobID);
-            if (it != records_.end()) it->second = write.record;
+        if (!writes.empty()) {
+            std::vector<JobStore::WriteOp> ops;
+            std::vector<uint64_t> touched;
+            ops.reserve(writes.size());
+            touched.reserve(writes.size());
+            for (const auto& record : writes) {
+                ops.push_back(put_record_op(record));
+                touched.push_back(record.job.JobID);
+            }
+            std::string error;
+            if (!store_->commit(std::move(ops), /*durable=*/false, touched,
+                                "mutate selection", error)) {
+                // The batch may have landed. Leave recovery fencing intact and
+                // return no planned revision or selection as accepted.
+                return selection_failure(CollectionError::StoreUnavailable, "store_write_failed");
+            }
+            std::unique_lock lg(records_mtx_);
+            for (auto& record : writes) {
+                const auto it = records_.find(record.job.JobID);
+                if (it != records_.end()) it->second = std::move(record);
+            }
         }
     }
 
-    // The results carry the authoritative revision and selection; the map is
-    // already up to date.
-    out = std::move(planned);
-    return true;
+    // Even a valid no-op must be retryable after a failed runtime attachment.
+    // No callback or actual-state sampling runs under the registry locks.
+    wake_runtime();
+    for (auto& target : outcome.targets) {
+        target.actual = actualCollection(target.internal_id);
+    }
+    outcome.ok = true;
+    return outcome;
 }
 
 void JobRegistry::validateRestoredExecutions(std::vector<JobRecord>& rows) {
@@ -3619,16 +3578,6 @@ CollectionOutcome reentrant_refusal(const char* what)
     return outcome;
 }
 
-CollectionError selection_error_from_store(const std::string& error)
-{
-    if (error == "not_found") return CollectionError::NotFound;
-    // A closing instance cannot accept a new selection; report it like a
-    // stale revision (the caller must re-read the instance, not retry blindly).
-    if (error == "instance_closing" || error == "stale_revision")
-        return CollectionError::StaleRevision;
-    return CollectionError::StoreUnavailable;
-}
-
 }  // namespace
 
 void JobRegistry::setCollectorValidator(
@@ -3724,7 +3673,7 @@ CollectionOutcome JobRegistry::mutateSelection(const CollectionRequest& request,
             return outcome;
         }
         SelectionMutation mutation;
-        mutation.internal_id = id;
+        mutation.job_id = id;
         mutation.operation = manual ? SelectionOperation::SetManual
                                     : SelectionOperation::ResetAuto;
         mutation.collectors = names;
@@ -3732,38 +3681,10 @@ CollectionOutcome JobRegistry::mutateSelection(const CollectionRequest& request,
         mutations.push_back(std::move(mutation));
     }
 
-    std::vector<SelectionMutationResult> results;
-    std::string error;
-    if (!executeSelectionMutations(mutations, results, error)) {
-        outcome.error = selection_error_from_store(error);
-        outcome.message = "binding transaction rejected: " + error;
-        return outcome;
+    outcome = executeSelectionMutations(mutations);
+    if (!outcome.ok) {
+        outcome.message = "binding transaction rejected: " + outcome.message;
     }
-
-    outcome.targets.reserve(results.size());
-    for (const auto& result : results) {
-        CollectionTargetOutcome target;
-        target.internal_id = result.internal_id;
-        target.instance_id = format_internal_id(result.internal_id);
-        target.selection = result.selection;
-        target.revision = result.revision;
-        target.changed = result.intent_changed;
-        if (!result.intent_changed && !result.stored_changed &&
-            !result.skipped_manual_override) {
-            ++outcome.unchanged;
-        }
-        outcome.skipped_manual_override += result.skipped_manual_override ? 1 : 0;
-        outcome.targets.push_back(std::move(target));
-    }
-
-    // The command is committed. Convergence belongs to the runtime; this only
-    // wakes it. The reported state is sampled afterwards and may honestly
-    // still show the previous attachment.
-    wake_runtime();
-    for (auto& target : outcome.targets) {
-        target.actual = actualCollection(target.internal_id);
-    }
-    outcome.ok = true;
     return outcome;
 }
 
@@ -3795,7 +3716,8 @@ CollectionOutcome JobRegistry::applyAutoPolicy(
         return outcome;
     }
     std::vector<SelectionMutation> mutations;
-    std::vector<CollectionTargetOutcome> planned;
+    mutations.reserve(selections.size());
+    outcome.targets.reserve(selections.size());
     for (const auto& selection : selections) {
         CollectionTargetOutcome target;
         target.internal_id = selection.internal_id;
@@ -3808,7 +3730,7 @@ CollectionOutcome JobRegistry::applyAutoPolicy(
             target.selection = ownSelection(selection.internal_id);
             target.actual.error = "no verified inventory instance";
             target.skipped = true;
-            planned.push_back(std::move(target));
+            outcome.targets.push_back(std::move(target));
             continue;
         }
 
@@ -3822,58 +3744,45 @@ CollectionOutcome JobRegistry::applyAutoPolicy(
             target.selection = ownSelection(selection.internal_id);
             target.actual.error = "unknown automatic collector name: " + bad_name;
             target.skipped = true;
-            planned.push_back(std::move(target));
+            outcome.targets.push_back(std::move(target));
             continue;
         }
 
         SelectionMutation mutation;
-        mutation.internal_id = selection.internal_id;
+        mutation.job_id = selection.internal_id;
         mutation.operation = SelectionOperation::SetAuto;
         mutation.collectors = names;
         mutation.automatic_source = selection.policy_revision;
         mutations.push_back(std::move(mutation));
-        planned.push_back(std::move(target));
+        outcome.targets.push_back(std::move(target));
     }
 
     if (!mutations.empty()) {
-        std::vector<SelectionMutationResult> results;
-        std::string error;
-        if (!executeSelectionMutations(mutations, results, error)) {
-            outcome.error = selection_error_from_store(error);
-            outcome.message = "automatic policy transaction rejected: " + error;
-            for (auto& target : planned) {
-                // Attribution survives a batch-wide failure: every item says
-                // the intent write did not land.
+        auto accepted = executeSelectionMutations(mutations);
+        if (!accepted.ok) {
+            outcome.error = accepted.error;
+            outcome.message = "automatic policy transaction rejected: " + accepted.message;
+            for (auto& target : outcome.targets) {
+                // Preserve validation attribution without claiming the write
+                // did not land: it may require recovery before any retry.
                 if (target.actual.error.empty()) {
-                    target.actual.error = "intent write failed: " + error;
+                    target.actual.error = "intent write failed: " + accepted.message;
                 }
             }
-            outcome.targets = std::move(planned);
             return outcome;
         }
 
-        std::map<uint64_t, const SelectionMutationResult*> by_id;
-        for (const auto& result : results) by_id[result.internal_id] = &result;
-        for (auto& target : planned) {
-            const auto it = by_id.find(target.internal_id);
-            if (it == by_id.end()) continue;
-            const auto& result = *it->second;
-            target.selection = result.selection;
-            target.revision = result.revision;
-            target.changed = result.intent_changed;
-            if (!result.intent_changed && !result.stored_changed &&
-                !result.skipped_manual_override) {
-                ++outcome.unchanged;
-            }
-            outcome.skipped_manual_override += result.skipped_manual_override ? 1 : 0;
+        outcome.unchanged = accepted.unchanged;
+        outcome.skipped_manual_override = accepted.skipped_manual_override;
+        auto result = accepted.targets.begin();
+        for (auto& target : outcome.targets) {
+            // Mutations preserve input order with invalid entries removed, so
+            // one linear merge keeps skipped errors intact without an ID map.
+            if (!target.skipped) target = std::move(*result++);
         }
-
-        wake_runtime();
-        for (auto& target : planned) target.actual = actualCollection(target.internal_id);
     }
 
     outcome.ok = true;
-    outcome.targets = std::move(planned);
     return outcome;
 }
 

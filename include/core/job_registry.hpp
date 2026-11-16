@@ -507,14 +507,26 @@ private:
     // facts a caller set explicitly are never overwritten). Returns an empty
     // selector when no adapter owns the Job — incomplete, never a guess.
     NativeSelector legacySelectorOf(Job& job) const;
-    // Atomic selection command batch (moved from the store): reads the
-    // records under records_mtx_, checks the revision CAS there, transforms
-    // into pending images and writes every changed row in ONE unsynced
-    // batch; a write failure commits and publishes nothing. `out` is aligned
-    // with `mutations` and carries the authoritative revision/selection.
-    bool executeSelectionMutations(const std::vector<SelectionMutation>& mutations,
-                                   std::vector<SelectionMutationResult>& out,
-                                   std::string& error);
+    enum class SelectionOperation {
+        SetManual,   // replace the manual selection; [] is a persistent stop
+        ResetAuto,   // clear manual, keep the automatic selection
+        SetAuto,     // record an automatic decision; manual always wins
+    };
+    struct SelectionMutation {
+        uint64_t job_id = 0;
+        SelectionOperation operation = SelectionOperation::SetManual;
+        // SetManual: manual names. SetAuto: automatic names. ResetAuto: empty.
+        std::vector<std::string> collectors;
+        std::string automatic_source;                // SetAuto only
+        std::optional<uint64_t> expected_revision;   // checked in-transaction
+    };
+    // Re-read, Closing/CAS checks, transform, one unsynced batch and publication
+    // share mutation_mtx_. Failed writes publish and report no accepted state
+    // (disk may have landed; recovery owns that uncertainty). Success wakes and
+    // samples the runtime only after releasing the registry locks, even for a
+    // valid no-op. Targets remain aligned with mutations.
+    CollectionOutcome executeSelectionMutations(
+        const std::vector<SelectionMutation>& mutations);
     // Restore validation (moved from the store): positive identity checks with
     // the admission probe; adjustments are memory-only, the next durable write
     // of a row persists whatever is current.

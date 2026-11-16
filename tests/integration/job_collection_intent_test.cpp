@@ -126,6 +126,346 @@ bool same(const std::vector<std::string>& lhs, const std::vector<std::string>& r
 {
     return lhs == rhs;
 }
+
+void selection_equality_distinguishes_absence_empty_and_source()
+{
+    const CollectionSelection absent;
+    CollectionSelection empty_automatic;
+    empty_automatic.automatic = std::vector<std::string>{};
+    CollectionSelection empty_manual;
+    empty_manual.manual = std::vector<std::string>{};
+    check(absent == CollectionSelection{}, "equal absent selections must compare equal");
+    check(!(absent == empty_automatic) && !(empty_automatic == absent),
+          "automatic nullopt and an explicit empty automatic decision must differ");
+    check(!(absent == empty_manual) && !(empty_manual == absent),
+          "manual nullopt and an explicit empty stop must differ");
+    check(empty_automatic == CollectionSelection{std::vector<std::string>{}, "", std::nullopt},
+          "equal present-empty automatic decisions must compare equal");
+    check(empty_manual == CollectionSelection{std::nullopt, "", std::vector<std::string>{}},
+          "equal present-empty manual stops must compare equal");
+    const CollectionSelection selected{std::vector<std::string>{"cpumem_collector"},
+                                       "rules-v1", std::vector<std::string>{"disk_collector"}};
+    check(selected == CollectionSelection{std::vector<std::string>{"cpumem_collector"},
+                                          "rules-v1", std::vector<std::string>{"disk_collector"}},
+          "equality must compare all fields by value");
+    auto other = selected;
+    other.automatic_source = "rules-v2";
+    check(!(selected == other), "automatic source participates even under a manual override");
+    other = selected;
+    other.automatic = std::vector<std::string>{"disk_collector"};
+    check(!(selected == other), "automatic collectors participate under a manual override");
+    other = selected;
+    other.manual = std::vector<std::string>{"cpumem_collector"};
+    check(!(selected == other), "manual collectors participate in equality");
+}
+
+void mode_changes_with_identical_collectors_advance_revision(const std::string& base)
+{
+    JobRegistry registry(isolated(fresh_dir(base, "selection-mode-only")));
+    registry.setCollectorValidator(nullptr);
+    const auto created = registry.upsertObservedJob(condor_observation("180.0"));
+    check(created.ok, "mode-change fixture must register");
+    const auto automatic = registry.applyAutoPolicy(
+        {{created.internal_id, {"cpumem_collector"}, "rules-v1"}});
+    check(automatic.ok, "the initial automatic decision must be accepted");
+    const auto revision = automatic.targets.front().revision;
+
+    install_collection_runtime(registry, {});
+    const auto before = registry.storeHealth();
+    const auto manual = registry.setCollectors(
+        set_request({created.internal_id}, {"cpumem_collector"}));
+    check(manual.ok && manual.targets.size() == 1 && manual.targets.front().changed,
+          "auto [A] to manual [A] changes intent even with identical collectors");
+    check(manual.targets.front().selection.mode() == CollectionMode::Manual &&
+              manual.targets.front().selection.effectiveCollectors() ==
+                  std::vector<std::string>{"cpumem_collector"} &&
+              manual.targets.front().revision == revision + 1,
+          "the manual mode change must advance the record revision exactly once");
+
+    const auto reset = registry.resetAuto(reset_request({created.internal_id}));
+    check(reset.ok && reset.targets.size() == 1 && reset.targets.front().changed,
+          "manual [A] to auto [A] changes intent even with identical collectors");
+    check(reset.targets.front().selection.mode() == CollectionMode::Auto &&
+              reset.targets.front().selection.effectiveCollectors() ==
+                  std::vector<std::string>{"cpumem_collector"} &&
+              reset.targets.front().revision == revision + 2,
+          "resetting the mode must advance the same record revision exactly once");
+    check(manual.unchanged == 0 && reset.unchanged == 0 &&
+              manual.skipped_manual_override == 0 && reset.skipped_manual_override == 0,
+          "mode changes are neither unchanged nor manual-override skips");
+    check(registry.storeHealth().durable_commits == before.durable_commits + 2 &&
+              registry.storeHealth().sync_commits == before.sync_commits &&
+              test_runtime(registry).wakes() == 2,
+          "each accepted mode change writes unsynced and wakes despite the same effective set");
+}
+
+void automatic_source_changes_and_noops_preserve_outcomes(const std::string& base)
+{
+    for (const bool manual_override : {false, true}) {
+        JobRegistry registry(isolated(fresh_dir(
+            base, manual_override ? "selection-source-manual" : "selection-source-auto")));
+        registry.setCollectorValidator(nullptr);
+        const auto created = registry.upsertObservedJob(condor_observation("181.0"));
+        check(created.ok, "source-change fixture must register");
+        const auto initial = registry.applyAutoPolicy(
+            {{created.internal_id, {"cpumem_collector"}, "rules-v1"}});
+        check(initial.ok, "the initial automatic decision must be accepted");
+        if (manual_override) {
+            check(registry.setCollectors(
+                      set_request({created.internal_id}, {"cpumem_collector"})).ok,
+                  "the manual override must be accepted");
+        }
+        const auto revision = record_revision(registry, created.internal_id);
+        const auto before = registry.storeHealth();
+        int applies = 0;
+        bool healthy = false;
+        install_collection_runtime(registry, [&](const Job& job,
+                                                std::vector<std::string>& applied,
+                                                std::string& error) {
+            ++applies;
+            if (!healthy) {
+                error = "attachment unavailable";
+                return false;
+            }
+            applied = job.CollectorNames;
+            return true;
+        });
+
+        const std::vector<AutoSelection> decision{
+            {created.internal_id, {"cpumem_collector"}, "rules-v2"}};
+        const auto changed = registry.applyAutoPolicy(decision);
+        check(changed.ok && changed.targets.size() == 1 &&
+                  changed.targets.front().revision == revision + 1 &&
+                  changed.targets.front().changed == !manual_override,
+              "source-only changes advance the revision but respect manual precedence");
+        check(changed.unchanged == 0 && changed.skipped_invalid == 0 &&
+                  changed.skipped_manual_override == (manual_override ? 1U : 0U),
+              "only changed automatic bookkeeping under manual counts as an override skip");
+        const auto selection = registry.selectionRecord(created.internal_id);
+        check(selection.automatic_source == "rules-v2" &&
+                  selection.effectiveCollectors() ==
+                      std::vector<std::string>{"cpumem_collector"} &&
+                  selection.mode() == (manual_override ? CollectionMode::Manual
+                                                      : CollectionMode::Auto),
+              "the source must update without changing the effective set or mode");
+        check(applies == 0 && test_runtime(registry).wakes() == 1,
+              "source-only commands wake but never run collectors on the command stack");
+        test_runtime(registry).reconcile(created.internal_id);
+        check(applies == 1 && registry.actualCollection(created.internal_id).error ==
+                                  "attachment unavailable",
+              "the runtime must expose the failed attachment before the no-op retry");
+
+        const auto repeated = registry.applyAutoPolicy(decision);
+        check(repeated.ok && repeated.targets.size() == 1 && repeated.unchanged == 1 &&
+                  repeated.skipped_manual_override == 0 && repeated.skipped_invalid == 0 &&
+                  !repeated.targets.front().changed &&
+                  repeated.targets.front().revision == revision + 1,
+              "an exact automatic repeat is unchanged, not a false manual-override skip");
+        check(repeated.targets.front().actual.error == "attachment unavailable" &&
+                  applies == 1 && test_runtime(registry).wakes() == 2,
+              "a valid automatic no-op must wake for retry and sample actual failure honestly");
+        check(registry.storeHealth().durable_commits == before.durable_commits + 1 &&
+                  registry.storeHealth().sync_commits == before.sync_commits,
+              "source changes write once unsynced; exact repeats must not write");
+        healthy = true;
+        test_runtime(registry).reconcile(created.internal_id);
+        check(applies == 2 && registry.actualCollection(created.internal_id).error.empty() &&
+                  registry.actualCollection(created.internal_id).collectors ==
+                      std::vector<std::string>{"cpumem_collector"},
+              "the runtime must be able to converge after the automatic no-op retry");
+    }
+}
+
+void automatic_all_skipped_and_duplicates_do_not_write_or_wake(const std::string& base)
+{
+    JobRegistry registry(isolated(fresh_dir(base, "selection-auto-rejections")));
+    registry.setCollectorValidator([](const std::string& name) {
+        return name == "cpumem_collector";
+    });
+    const auto created = registry.upsertObservedJob(condor_observation("182.0"));
+    check(created.ok, "automatic-rejection fixture must register");
+    check(registry.applyAutoPolicy(
+              {{created.internal_id, {"cpumem_collector"}, "rules-v1"}}).ok,
+          "the previous valid automatic decision must be accepted");
+    install_collection_runtime(registry, {});
+    test_runtime(registry).reconcile(created.internal_id);
+    const auto revision = record_revision(registry, created.internal_id);
+    const auto before = registry.storeHealth();
+
+    const auto skipped = registry.applyAutoPolicy({
+        {987654, {"cpumem_collector"}, "rules-v2"},
+        {created.internal_id, {"invalid_collector"}, "rules-v2"}});
+    check(skipped.ok && skipped.skipped_invalid == 2 && skipped.unchanged == 0 &&
+              skipped.skipped_manual_override == 0 && skipped.targets.size() == 2,
+          "all invalid automatic decisions are skipped, not unchanged or committed");
+    check(skipped.targets[0].internal_id == 987654 && skipped.targets[0].skipped &&
+              skipped.targets[0].actual.error == "no verified inventory instance" &&
+              skipped.targets[1].internal_id == created.internal_id &&
+              skipped.targets[1].skipped && skipped.targets[1].actual.error ==
+                  "unknown automatic collector name: invalid_collector",
+          "all-skipped outcomes keep input order and per-target errors");
+    for (const auto& target : skipped.targets) {
+        check(target.revision == 0 && !target.changed && !target.actual.tracked,
+              "a skipped automatic result must not claim acceptance or an attachment");
+    }
+    const auto duplicate = registry.applyAutoPolicy({
+        {created.internal_id, {}, "rules-v2"},
+        {created.internal_id, {"invalid_collector"}, "rules-v3"}});
+    check(!duplicate.ok && duplicate.error == CollectionError::InvalidRequest &&
+              duplicate.targets.empty(),
+          "automatic duplicate targets reject the whole batch before any write");
+    check(record_revision(registry, created.internal_id) == revision &&
+              registry.selectionRecord(created.internal_id).automatic_source == "rules-v1" &&
+              registry.storeHealth().durable_commits == before.durable_commits &&
+              test_runtime(registry).wakes() == 0,
+          "all-skipped and duplicate batches preserve previous intent without write or wake");
+}
+
+void failed_automatic_batches_never_report_planned_acceptance(const std::string& base)
+{
+    for (const auto fault : {StoreFaultMode::FailBeforeWrite, StoreFaultMode::FailAfterWrite}) {
+        JobRegistry registry(isolated(fresh_dir(
+            base, fault == StoreFaultMode::FailBeforeWrite ? "selection-auto-fail-before"
+                                                         : "selection-auto-fail-after")));
+        registry.setCollectorValidator([](const std::string& name) {
+            return name == "cpumem_collector" || name == "disk_collector";
+        });
+        const auto first = registry.upsertObservedJob(condor_observation("183.0"));
+        const auto second = registry.upsertObservedJob(condor_observation("184.0"));
+        check(first.ok && second.ok, "automatic failure fixtures must register");
+        check(registry.applyAutoPolicy({
+                  {first.internal_id, {"cpumem_collector"}, "rules-v1"},
+                  {second.internal_id, {"cpumem_collector"}, "rules-v1"}}).ok,
+              "the previous automatic decisions must be accepted");
+        const auto first_revision = record_revision(registry, first.internal_id);
+        const auto second_revision = record_revision(registry, second.internal_id);
+        install_collection_runtime(registry, {});
+        const std::vector<AutoSelection> decisions{
+            {first.internal_id, {"disk_collector"}, "rules-v2"},
+            {987654, {"cpumem_collector"}, "rules-v2"},
+            {second.internal_id, {"disk_collector"}, "rules-v2"}};
+        registry.injectStoreFaultForTest(fault);
+        const auto failed = registry.applyAutoPolicy(decisions);
+        check(!failed.ok && failed.error == CollectionError::StoreUnavailable &&
+                  failed.targets.size() == 3 && failed.skipped_invalid == 1,
+              "failed automatic batches must retain aligned target attribution");
+        check(failed.unchanged == 0 && failed.skipped_manual_override == 0 &&
+                  failed.targets[0].internal_id == first.internal_id &&
+                  failed.targets[1].internal_id == 987654 &&
+                  failed.targets[2].internal_id == second.internal_id &&
+                  failed.targets[1].skipped && failed.targets[1].actual.error ==
+                      "no verified inventory instance",
+              "a failed batch must not erase earlier per-target validation errors");
+        for (const auto index : {0U, 2U}) {
+            const auto& target = failed.targets[index];
+            check(!target.changed && !target.skipped && target.revision == 0 &&
+                      !target.selection.automatic.has_value() &&
+                      target.actual.error == "intent write failed: store_write_failed",
+                  "a failed write must not expose the planned revision or selection as accepted");
+        }
+        check(record_revision(registry, first.internal_id) == first_revision &&
+                  record_revision(registry, second.internal_id) == second_revision &&
+                  registry.selectionRecord(first.internal_id).automatic_source == "rules-v1" &&
+                  registry.selectionRecord(second.internal_id).automatic_source == "rules-v1" &&
+                  test_runtime(registry).wakes() == 0,
+              "failed automatic batches publish no rows and do not wake the runtime");
+        check(registry.storeHealth().recovery_required,
+              "an uncertain automatic write must preserve recovery fencing");
+        const auto retry = registry.applyAutoPolicy(decisions);
+        check(retry.ok && retry.targets[0].revision == first_revision + 1 &&
+                  retry.targets[2].revision == second_revision + 1 &&
+                  !registry.storeHealth().recovery_required,
+              "retry must recover durable rows before transforming them, without a double bump");
+        check(retry.unchanged == (fault == StoreFaultMode::FailAfterWrite ? 2U : 0U),
+              "retry must distinguish a landed batch from one that never reached disk");
+    }
+}
+
+void mixed_automatic_results_preserve_input_order_and_skip_errors(const std::string& base)
+{
+    JobRegistry registry(isolated(fresh_dir(base, "selection-auto-mixed")));
+    registry.setCollectorValidator([](const std::string& name) {
+        return name == "cpumem_collector" || name == "disk_collector";
+    });
+    const auto changed = registry.upsertObservedJob(condor_observation("185.0"));
+    const auto invalid = registry.upsertObservedJob(condor_observation("186.0"));
+    const auto unchanged = registry.upsertObservedJob(condor_observation("187.0"));
+    const auto covered = registry.upsertObservedJob(condor_observation("188.0"));
+    check(changed.ok && invalid.ok && unchanged.ok && covered.ok,
+          "mixed automatic fixtures must register");
+    const std::vector<uint64_t> ids{changed.internal_id, invalid.internal_id,
+                                  unchanged.internal_id, covered.internal_id};
+    std::vector<AutoSelection> initial;
+    for (const auto id : ids) initial.push_back({id, {"cpumem_collector"}, "rules-v1"});
+    check(registry.applyAutoPolicy(initial).ok, "the previous automatic decisions must land");
+    check(registry.setCollectors(set_request({covered.internal_id}, {"cpumem_collector"})).ok,
+          "the last target must have an effective manual override");
+    const auto changed_revision = record_revision(registry, changed.internal_id);
+    const auto invalid_revision = record_revision(registry, invalid.internal_id);
+    const auto unchanged_revision = record_revision(registry, unchanged.internal_id);
+    const auto covered_revision = record_revision(registry, covered.internal_id);
+    install_collection_runtime(registry, {});
+    for (const auto id : ids) test_runtime(registry).reconcile(id);
+    const auto before = registry.storeHealth();
+
+    const auto outcome = registry.applyAutoPolicy({
+        {changed.internal_id, {"disk_collector"}, "rules-v2"},
+        {invalid.internal_id, {"invalid_collector"}, "rules-v2"},
+        {987654, {"cpumem_collector"}, "rules-v2"},
+        {unchanged.internal_id, {"cpumem_collector"}, "rules-v1"},
+        {covered.internal_id, {"disk_collector"}, "rules-v2"}});
+    check(outcome.ok && outcome.targets.size() == 5 && outcome.unchanged == 1 &&
+              outcome.skipped_invalid == 2 && outcome.skipped_manual_override == 1,
+          "mixed automatic results must distinguish unchanged, invalid and manual-covered rows");
+    const std::vector<uint64_t> expected_order{changed.internal_id, invalid.internal_id,
+                                             987654, unchanged.internal_id, covered.internal_id};
+    for (size_t index = 0; index < expected_order.size(); ++index) {
+        check(outcome.targets[index].internal_id == expected_order[index] &&
+                  outcome.targets[index].instance_id == format_internal_id(expected_order[index]),
+              "automatic outcomes must remain aligned to the original input order");
+    }
+    check(outcome.targets[0].changed && outcome.targets[0].revision == changed_revision + 1 &&
+              !outcome.targets[0].skipped && outcome.targets[0].selection.automatic ==
+                  std::vector<std::string>{"disk_collector"},
+          "the changed valid automatic decision must report its accepted selection and revision");
+    check(outcome.targets[1].skipped && outcome.targets[1].actual.error ==
+              "unknown automatic collector name: invalid_collector" &&
+              outcome.targets[2].skipped && outcome.targets[2].actual.error ==
+                  "no verified inventory instance",
+          "a successful valid batch must not overwrite skipped per-target validation errors");
+    for (const auto index : {1U, 2U}) {
+        check(outcome.targets[index].revision == 0 && !outcome.targets[index].changed &&
+                  !outcome.targets[index].actual.tracked,
+              "invalid entries must not claim commitment or sample a pre-existing attachment");
+    }
+    check(outcome.targets[1].selection.automatic ==
+              std::vector<std::string>{"cpumem_collector"} &&
+              outcome.targets[1].selection.automatic_source == "rules-v1" &&
+              record_revision(registry, invalid.internal_id) == invalid_revision,
+          "the invalid automatic decision must preserve the previous intent without acceptance");
+    check(!outcome.targets[3].changed && !outcome.targets[3].skipped &&
+              outcome.targets[3].revision == unchanged_revision &&
+              outcome.targets[3].selection.automatic_source == "rules-v1",
+          "the unchanged valid target must keep its accepted revision and decision");
+    check(!outcome.targets[4].changed && !outcome.targets[4].skipped &&
+              outcome.targets[4].revision == covered_revision + 1 &&
+              outcome.targets[4].selection.automatic_source == "rules-v2" &&
+              outcome.targets[4].selection.automatic == std::vector<std::string>{"disk_collector"} &&
+              outcome.targets[4].selection.manual == std::vector<std::string>{"cpumem_collector"},
+          "manual-covered bookkeeping must commit without changing the effective intent");
+    for (const auto index : {0U, 3U, 4U}) {
+        check(outcome.targets[index].actual.tracked &&
+                  outcome.targets[index].actual.collectors ==
+                      std::vector<std::string>{"cpumem_collector"} &&
+                  outcome.targets[index].actual.error.empty(),
+              "valid targets must sample the actual old attachment after accepting the batch");
+    }
+    check(registry.storeHealth().durable_commits == before.durable_commits + 1 &&
+              registry.storeHealth().sync_commits == before.sync_commits &&
+              test_runtime(registry).wakes() == 1,
+          "all changed valid rows must share one unsynced batch and one runtime wake");
+}
+
 void manual_selection_wins_over_observations_and_policy(const std::string& base)
 {
     const auto path = fresh_dir(base, "a05");
@@ -1095,6 +1435,12 @@ int main(int argc, char** argv)
     try {
         const std::string base = argc > 1 ? argv[1] : "/tmp/joblens-collection-intent-test";
         std::filesystem::create_directories(base);
+        selection_equality_distinguishes_absence_empty_and_source();
+        mode_changes_with_identical_collectors_advance_revision(base);
+        automatic_source_changes_and_noops_preserve_outcomes(base);
+        automatic_all_skipped_and_duplicates_do_not_write_or_wake(base);
+        failed_automatic_batches_never_report_planned_acceptance(base);
+        mixed_automatic_results_preserve_input_order_and_skip_errors(base);
         manual_selection_wins_over_observations_and_policy(base);
         persistent_stop_survives_rescan_and_reset_restores_auto(base);
         duplicate_requests_stale_revisions_and_invalid_targets(base);
@@ -1109,7 +1455,9 @@ int main(int argc, char** argv)
         ambiguous_intent_write_latches_until_verified(base);
         ambiguous_intent_write_survives_the_shutdown_checkpoint(base);
         closing_keeps_the_runtime_holders_until_the_archive(base);
-        std::cout << "PASS collection intent: manual over discovery and "
+        std::cout << "PASS collection intent: selection field equality, mode/source-only "
+                     "changes, input-order automatic skips, no-op wakes, failed automatic "
+                     "batch recovery, manual over discovery and "
                      "policy, persistent stop and reset_auto, "
                      "duplicate/stale/invalid request atomicity, durable "
                      "intent across restart and generation change, "

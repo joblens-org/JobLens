@@ -99,6 +99,12 @@ struct CollectionSelection {
     std::string automatic_source;
     std::optional<std::vector<std::string>> manual;
 
+    bool operator==(const CollectionSelection& other) const
+    {
+        return automatic == other.automatic &&
+               automatic_source == other.automatic_source && manual == other.manual;
+    }
+
     bool stopped() const { return manual.has_value() && manual->empty(); }
     // manual wins over automatic, the explicit empty stop included.
     std::vector<std::string> effectiveCollectors() const;
@@ -112,42 +118,6 @@ struct CollectionSelection {
 // and deduplicated. Shared by the row codec (parse_record) and the registry's
 // merge path so both write the same j: image.
 std::vector<ProcessIdentity> normalized_processes(std::vector<ProcessIdentity> processes);
-
-// A control-plane selection command. The registry re-reads the record inside
-// the same record lock that serializes the commit, so the transform, the
-// revision guard and the write are one atomic step; a caller-side
-// read-modify-write window does not exist.
-enum class SelectionOperation {
-    SetManual,   // replace the manual selection; [] is a persistent stop
-    ResetAuto,   // clear the manual override, keep the automatic selection
-    SetAuto,     // record an automatic decision; manual always wins
-};
-
-struct SelectionMutation {
-    uint64_t internal_id = 0;
-    SelectionOperation operation = SelectionOperation::SetManual;
-    // SetManual: manual names. SetAuto: automatic names. ResetAuto: empty.
-    std::vector<std::string> collectors;
-    std::string automatic_source;                // SetAuto only
-    std::optional<uint64_t> expected_revision;   // CAS guard, checked in-transaction
-};
-
-struct SelectionMutationResult {
-    uint64_t internal_id = 0;
-    // The record revision after the command: the accepted revision a caller may
-    // report. This is an acceptance stamp, not proof the runtime applied it.
-    uint64_t revision = 0;
-    CollectionSelection selection;
-    // The client-visible desired selection changed.
-    bool intent_changed = false;
-    // The effective collector set changed, so the runtime must be reconciled.
-    // An automatic decision under a manual override changes bookkeeping only.
-    bool runtime_changed = false;
-    // A row was written even though the client-visible intent did not move
-    // (automatic bookkeeping under a manual override).
-    bool stored_changed = false;
-    bool skipped_manual_override = false;
-};
 
 struct StoreHealth {
     bool db_running = false;
