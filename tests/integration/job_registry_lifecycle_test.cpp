@@ -66,9 +66,9 @@ struct JobRegistryNamespaceTestAccess {
         return false;
     }
     static std::optional<JobRecord> durableByIdentity(JobRegistry& registry,
-                                                       const JobIdentity& identity)
+                                                       const SchedulerKey& key)
     {
-        return registry.store_->readRowByIdentity(identity);
+        return registry.store_->readRowByIdentity(key);
     }
     static JobRecord select(JobRegistry& registry, const Job& job)
     {
@@ -407,8 +407,8 @@ void run(const std::string& base)
 
         // The observation that completes the generation selects automatically.
         auto completed = observation;
-        completed.identity.manager.start_ticks = 910000;
-        completed.identity.members.front().start_ticks = 910000;
+        completed.execution.manager.start_ticks = 910000;
+        completed.execution.members.front().start_ticks = 910000;
         const auto updated = registry.upsertObservedJob(completed);
         check(updated.ok && updated.disposition == UpsertDisposition::Updated,
               "incomplete generation: the completing observation must update the record");
@@ -1356,15 +1356,15 @@ void run(const std::string& base)
             const auto old_identity = canonicalize(old_selector);
             const auto new_identity = canonicalize(selector);
             check(old_identity && new_identity, "adoption occupied: valid test identities");
-            const auto old_index = registry.inventoryRecordByIdentity(*old_identity);
-            const auto owner_index = registry.inventoryRecordByIdentity(*new_identity);
+            const auto old_index = registry.inventoryRecordByKey(*old_identity);
+            const auto owner_index = registry.inventoryRecordByKey(*new_identity);
             check(old_index && owner_index && old_index->job.JobID == target.job.JobID &&
                       owner_index->job.JobID == owner.internal_id,
                   "adoption occupied: both index owners remain unchanged");
             registry.deinit();
             JobRegistry reopened(options);
-            const auto old_reopened = reopened.inventoryRecordByIdentity(*old_identity);
-            const auto owner_reopened = reopened.inventoryRecordByIdentity(*new_identity);
+            const auto old_reopened = reopened.inventoryRecordByKey(*old_identity);
+            const auto owner_reopened = reopened.inventoryRecordByKey(*new_identity);
             check(old_reopened && owner_reopened &&
                       old_reopened->job.JobID == target.job.JobID &&
                       owner_reopened->job.JobID == owner.internal_id,
@@ -1401,9 +1401,9 @@ void run(const std::string& base)
             const auto old_identity = canonicalize(old_selector);
             const auto new_identity = canonicalize(selector);
             check(old_identity && new_identity &&
-                      !registry.inventoryRecordByIdentity(*old_identity) &&
-                      registry.inventoryRecordByIdentity(*new_identity) &&
-                      registry.inventoryRecordByIdentity(*new_identity)->job.JobID == id,
+                      !registry.inventoryRecordByKey(*old_identity) &&
+                      registry.inventoryRecordByKey(*new_identity) &&
+                      registry.inventoryRecordByKey(*new_identity)->job.JobID == id,
                   "adoption observed: in-memory identity index changes owner key");
             ProcessIdentity generation{4913, 9913, "boot"};
             auto observation = discovered_job(selector, generation,
@@ -1413,9 +1413,9 @@ void run(const std::string& base)
                   "adoption observed: complete observation must reuse adopted ID");
             registry.deinit();
             JobRegistry reopened(options);
-            const auto restored = reopened.inventoryRecordByIdentity(*new_identity);
+            const auto restored = reopened.inventoryRecordByKey(*new_identity);
             check(restored && restored->job.JobID == id &&
-                      !reopened.inventoryRecordByIdentity(*old_identity),
+                      !reopened.inventoryRecordByKey(*old_identity),
                   "adoption observed: durable identity index survives restart");
             reopened.deinit();
         }
@@ -1449,8 +1449,8 @@ void run(const std::string& base)
             check(retried.value("status", "") == "success" && retried["JobID"] == id,
                   "adoption recovery: retry resolves original ID");
             const auto identity = canonicalize(selector);
-            check(identity && registry.inventoryRecordByIdentity(*identity) &&
-                      registry.inventoryRecordByIdentity(*identity)->job.JobID == id &&
+            check(identity && registry.inventoryRecordByKey(*identity) &&
+                      registry.inventoryRecordByKey(*identity)->job.JobID == id &&
                       registry.inventoryRecords().size() == 1,
                   "adoption recovery: row and index resolve together");
             registry.deinit();
@@ -1511,7 +1511,7 @@ void run(const std::string& base)
             const auto new_identity = canonicalize(new_selector);
             check(old_identity && new_identity, "checkpoint adoption: valid identities");
             const auto durable = JobRegistryNamespaceTestAccess::durableByIdentity(reopened, *new_identity);
-            check(durable && durable->job.identity.logical_complete() && logical_equal(durable->job.identity, *new_identity) &&
+            check(durable && durable->index_key == new_identity->index_key() &&
                       durable->job.clusterTag == "schedd@submit" &&
                       !JobRegistryNamespaceTestAccess::durableByIdentity(reopened, *old_identity),
                   "checkpoint adoption: durable row and identity index must agree after restart");

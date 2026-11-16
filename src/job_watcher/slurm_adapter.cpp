@@ -90,7 +90,7 @@ Job SlurmSchedulerAdapter::decodeFacts(const nlohmann::json& row) const
     return job;
 }
 
-NativeSelector SlurmSchedulerAdapter::legacySelector(Job& job) const
+NativeSelector SlurmSchedulerAdapter::legacySelector(const Job& job) const
 {
     NativeSelector selector;
     selector.adapter = name();
@@ -101,8 +101,6 @@ NativeSelector SlurmSchedulerAdapter::legacySelector(Job& job) const
         // The typed facts are the namespace source; the common field is
         // their render (kept as a fallback for facts built before one existed).
         selector.cluster_name = attr->cluster_name;
-        if (selector.native_job_id.empty())
-            selector.native_job_id = std::to_string(attr->job_id);
         if (attr->step_id != 0) {
             if (const auto name = slurm_step_name(attr->step_id)) {
                 selector.step_id = *name;
@@ -112,15 +110,12 @@ NativeSelector SlurmSchedulerAdapter::legacySelector(Job& job) const
         }
     }
     if (selector.cluster_name.empty()) selector.cluster_name = job.cluster_name;
+    // The original native string wins over the typed number: a zero-valued
+    // field must not shadow the render.
     if (selector.native_job_id.empty()) selector.native_job_id = job.NativeJobID;
+    if (selector.native_job_id.empty() && attr != nullptr)
+        selector.native_job_id = std::to_string(attr->job_id);
 
-    // The selector folds onto the record: derived fields backfill only the
-    // Job's empty ones.
-    job.subtype = JobSubType::Slurm;
-    job.subtype_name = name();
-    if (job.cluster_name.empty()) job.cluster_name = selector.cluster_name;
-    if (job.NativeJobID.empty()) job.NativeJobID = selector.native_job_id;
-    if (!selector.step_id.empty()) job.identity.step_id = selector.step_id;
     return selector;
 }
 
@@ -139,31 +134,7 @@ void SlurmSchedulerAdapter::projectFacts(Job& job) const
     // discovery may carry a display value there.
 }
 
-void SlurmSchedulerAdapter::applyIdentityToFacts(Job& job,
-                                                 const NativeSelector& selector,
-                                                 const JobIdentity& identity) const
-{
-    apply_identity_projection(job, selector, identity);
-    job.subtype = JobSubType::Slurm;
-    if (!std::holds_alternative<SlurmJobAttr>(job.sub_attr))
-        job.sub_attr = SlurmJobAttr{};
-    auto& attr = std::get<SlurmJobAttr>(job.sub_attr);
-
-    // The typed facts are the single namespace source; fold the resolved
-    // selector's cluster into them (facts win), then render the common
-    // field from the facts (clusterTag is not a Slurm component).
-    if (attr.cluster_name.empty() && !selector.cluster_name.empty())
-        attr.cluster_name = selector.cluster_name;
-    job.cluster_name = attr.cluster_name;
-    if (!selector.step_id.empty()) {
-        if (const auto numeric = slurm_step_value(selector.step_id)) {
-            attr.step_id = *numeric;
-        }
-    }
-    projectFacts(job);
-}
-
-NativeSelector SlurmSchedulerAdapter::registrationSelector(Job& job) const
+NativeSelector SlurmSchedulerAdapter::registrationSelector(const Job& job) const
 {
     NativeSelector selector = legacySelector(job);
     if (selector.cluster_name.empty())

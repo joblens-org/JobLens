@@ -95,7 +95,7 @@ Job CondorSchedulerAdapter::decodeFacts(const nlohmann::json& row) const
     return job;
 }
 
-NativeSelector CondorSchedulerAdapter::legacySelector(Job& job) const
+NativeSelector CondorSchedulerAdapter::legacySelector(const Job& job) const
 {
     NativeSelector selector;
     selector.adapter = name();
@@ -107,21 +107,16 @@ NativeSelector CondorSchedulerAdapter::legacySelector(Job& job) const
         // their render (kept as a fallback for facts built before one existed).
         selector.cluster_name = attr->collector_host;
         selector.cluster_tag = attr->scheduler_name;
-        if (selector.native_job_id.empty())
-            selector.native_job_id =
-                fmt::format("{}.{}", attr->cluster_id, attr->proc_id);
     }
     if (selector.cluster_name.empty()) selector.cluster_name = job.cluster_name;
     if (selector.cluster_tag.empty()) selector.cluster_tag = job.clusterTag;
+    // The original native string wins over the typed ids: a row that carries
+    // only a render still names its job, and a zero-initialized typed field
+    // must not shadow it.
     if (selector.native_job_id.empty()) selector.native_job_id = job.NativeJobID;
+    if (selector.native_job_id.empty() && attr != nullptr)
+        selector.native_job_id = fmt::format("{}.{}", attr->cluster_id, attr->proc_id);
 
-    // The selector folds onto the record: its derived fields backfill the
-    // Job's empty ones (non-empty facts win — the adapter derived FROM them).
-    job.subtype = JobSubType::Condor;
-    job.subtype_name = name();
-    if (job.cluster_name.empty()) job.cluster_name = selector.cluster_name;
-    if (job.clusterTag.empty()) job.clusterTag = selector.cluster_tag;
-    if (job.NativeJobID.empty()) job.NativeJobID = selector.native_job_id;
     return selector;
 }
 
@@ -140,38 +135,8 @@ void CondorSchedulerAdapter::projectFacts(Job& job) const
     if (job.clusterTag.empty()) job.clusterTag = attr->scheduler_name;
 }
 
-void CondorSchedulerAdapter::applyIdentityToFacts(Job& job,
-                                                  const NativeSelector& selector,
-                                                  const JobIdentity& identity) const
-{
-    apply_identity_projection(job, selector, identity);
-    job.subtype = JobSubType::Condor;
-    if (!std::holds_alternative<CondorJobAttr>(job.sub_attr))
-        job.sub_attr = CondorJobAttr{};
-    auto& attr = std::get<CondorJobAttr>(job.sub_attr);
 
-    // The typed facts are the single namespace source; the resolved
-    // selector's namespace folds into them (facts win), then the common
-    // fields render from the facts.
-    if (attr.collector_host.empty() && !selector.cluster_name.empty())
-        attr.collector_host = selector.cluster_name;
-    if (attr.scheduler_name.empty() && !selector.cluster_tag.empty())
-        attr.scheduler_name = selector.cluster_tag;
-    renderNamespace(job);
-
-    const auto dot = identity.canonical_native.find('.');
-    if (dot != std::string::npos) {
-        try {
-            attr.cluster_id = std::stoull(identity.canonical_native.substr(0, dot));
-            attr.proc_id = std::stoull(identity.canonical_native.substr(dot + 1));
-        } catch (const std::exception&) {
-            // Canonical validation already guaranteed decimal parts.
-        }
-    }
-    projectFacts(job);
-}
-
-NativeSelector CondorSchedulerAdapter::registrationSelector(Job& job) const
+NativeSelector CondorSchedulerAdapter::registrationSelector(const Job& job) const
 {
     NativeSelector selector = legacySelector(job);
     // A manual registration carries no discovery environment; fall back to

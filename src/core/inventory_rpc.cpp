@@ -272,8 +272,8 @@ uint64_t inventory_snapshot_revision(const std::vector<JobRecord>& records)
     for (const auto* record : ordered) {
         mix(record->job.JobID);
         mix(record->revision);
-        mix(record->job.identity.logical_complete() ? 2u : 0u);
-        mix(record->state == "closing" ? 3u : (record->job.identity.verified ? 5u : 4u));
+        mix(record->index_key.empty() ? 0u : 2u);
+        mix(record->state == "closing" ? 3u : (record->verified ? 5u : 4u));
     }
     // Stay inside the signed 63-bit range so JavaScript consumers keep the
     // exact value; the revision is an opaque token, not a counter.
@@ -287,9 +287,12 @@ std::string inventory_source(const JobRecord& record)
 
 // Step claim as the RPC surface reports it: the value or empty, never a
 // bare nullopt (the optional itself is store-internal, 0-vs-missing rule).
-std::string step_id_text(const JobRecord& record)
+std::string step_id_text(const JobRegistry& registry, const JobRecord& record)
 {
-    return record.job.identity.step_id;
+    // The step is a scheduler fact: the adapter owning the facts rebuilds it.
+    if (const auto* adapter = registry.adapterNamed(record.job.subtype_name))
+        return adapter->legacySelector(record.job).step_id;
+    return {};
 }
 
 nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& record)
@@ -305,14 +308,14 @@ nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& rec
     out["state"] = record.state;
     out["source"] = inventory_source(record);
     out["quarantined"] = false;
-    out["identity_complete"] = record.job.identity.logical_complete();
+    out["identity_complete"] = !record.index_key.empty();
     // Selector fields are projections of the Job: the typed facts are the
     // single source of truth, no second copy rides the record.
     out["scheduler_type"] = record.job.subtype_name;
     out["cluster_name"] = record.job.cluster_name;
     out["cluster_tag"] = record.job.clusterTag;
     out["native_job_id"] = record.job.NativeJobID;
-    out["step_id"] = step_id_text(record);
+    out["step_id"] = step_id_text(registry, record);
     out["first_seen_us"] = record.first_seen_us;
     out["last_seen_us"] = record.last_seen_us;
     out["generation"] = manager_to_json(manager_of(record.job));
@@ -404,12 +407,16 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
     const auto selector_facts = registry.selectorFactsOf(selector);
     for (auto& record : registry.inventoryRecords()) {
         if (is_reserved_internal_id(record.job.JobID)) continue;
-        if (!record.job.identity.logical_complete()) continue;
-        if (record.job.identity.adapter != identity->adapter) continue;
-        if (record.job.identity.canonical_native != identity->canonical_native) continue;
+        if (record.index_key.empty()) continue;
+        const auto* adapter = registry.adapterNamed(record.job.subtype_name);
+        if (adapter == nullptr) continue;
+        const auto record_key = adapter->keyOf(record.job);
+        if (!record_key) continue;
+        if (record_key->adapter != identity->adapter) continue;
+        if (record_key->canonical_native != identity->canonical_native) continue;
         if (!namespace_facts_compatible(selector_facts, registry.namespaceFactsOf(record.job)))
             continue;
-        if (!identity->step_id.empty() && record.job.identity.step_id != identity->step_id) continue;
+        if (!identity->step_id.empty() && record_key->step_id != identity->step_id) continue;
         matches.push_back(std::move(record));
     }
     sort_records(matches);
@@ -807,7 +814,7 @@ nlohmann::json inventory_status_payload(JobRegistry& registry)
     uint64_t closing = 0;
     for (const auto& record : registry.inventoryRecords()) {
         if (is_reserved_internal_id(record.job.JobID)) continue;
-        if (!record.job.identity.verified) ++suspect;
+        if (!record.verified) ++suspect;
         else if (record.state == "closing") ++closing;
         else ++active;
     }
@@ -1321,7 +1328,7 @@ void registerInventoryRpc(JobRegistry& registry) {
             out["scheduler_type"] = record.job.subtype_name;
             out["cluster_name"] = record.job.cluster_name;
             out["cluster_tag"] = record.job.clusterTag;
-            out["step_id"] = step_id_text(record);
+            out["step_id"] = step_id_text(registry, record);
             out["state"] = record.state;
             out["quarantined"] = false;
             out["mode"] = target["mode"];

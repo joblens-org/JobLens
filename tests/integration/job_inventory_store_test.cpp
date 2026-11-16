@@ -88,11 +88,11 @@ bool has_active(const JobRegistry& registry, uint64_t internal_id)
 }
 
 std::optional<JobRecord> record_by_identity(const JobRegistry& registry,
-                                            const JobIdentity& identity)
+                                            const SchedulerKey& key)
 {
-    const std::string key = identity.key();
+    const std::string index_key = key.index_key();
     for (const auto& record : registry.inventoryRecords()) {
-        if (record.job.identity.logical_complete() && record.job.identity.key() == key) return record;
+        if (!record.index_key.empty() && record.index_key == index_key) return record;
     }
     return std::nullopt;
 }
@@ -233,8 +233,8 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
     {
         const auto record = registry.inventoryRecord(created.internal_id);
         check(record.has_value(), "inventory record must be readable");
-        check(record->job.identity.logical_complete(), "canonicalizable identity must be complete");
-        check(record->job.identity.key() == canonicalize(selector_of(observation))->key(),
+        check(!record->index_key.empty(), "canonicalizable identity must be complete");
+        check(record->index_key == canonicalize(selector_of(observation))->index_key(),
               "record must carry the canonical identity");
         check(record->job.NativeJobID == "172.0",
               "original native string must be preserved");
@@ -273,7 +273,7 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
     auto updated_source = observation;
     auto& attr = std::get<CondorJobAttr>(updated_source.sub_attr);
     attr.owner = "bob";
-    updated_source.identity.members.push_back(ProcessIdentity{4343, 910000, "boot-aaa"});
+    updated_source.execution.members.push_back(ProcessIdentity{4343, 910000, "boot-aaa"});
 
     const auto updated = registry.upsertObservedJob(updated_source);
     check(updated.ok && updated.disposition == UpsertDisposition::Updated,
@@ -409,8 +409,8 @@ void conflicting_live_execution_is_not_merged(const std::string& base)
     generation.boot_id = "boot-bbb";
     generation.pid = 5252;
     generation.start_ticks = 990000;
-    conflicting.identity.manager = generation;
-    conflicting.identity.members = {ProcessIdentity{5252, 990000, "boot-bbb"}};
+    conflicting.execution.manager = generation;
+    conflicting.execution.members = {ProcessIdentity{5252, 990000, "boot-bbb"}};
     const auto conflict = registry.upsertObservedJob(conflicting);
     check(!conflict.ok && conflict.error == "execution_generation_conflict",
           "a different live generation must not merge into the old record");
@@ -436,8 +436,8 @@ void stale_generation_is_not_replayed(const std::string& base)
     {
         JobRegistry registry(isolated(path));
         auto observation = condor_observation("172.0");
-        observation.identity.manager = ProcessIdentity{manager_pid, 123456, "boot-does-not-exist"};
-        observation.identity.members = {
+        observation.execution.manager = ProcessIdentity{manager_pid, 123456, "boot-does-not-exist"};
+        observation.execution.members = {
             ProcessIdentity{manager_pid, 123456, "boot-does-not-exist"}};
         const auto created = registry.upsertObservedJob(observation);
         check(created.ok, "registration with a generation must succeed");
@@ -450,7 +450,7 @@ void stale_generation_is_not_replayed(const std::string& base)
         check(record.has_value(), "the record must still be restored");
         check(record->state == "active",
               "a stale generation is not a lifecycle state: the record stays Open");
-        check(!record->job.identity.verified,
+        check(!record->verified,
               "a stale execution generation must be restored as unverified");
         const auto job = registry.findJob(internal_id);
         check(job.has_value() && pids_of(*job).empty(),
@@ -459,8 +459,8 @@ void stale_generation_is_not_replayed(const std::string& base)
         // The same generation observed again recovers the record; a different
         // generation is a conflict, not a revival (covered by ).
         auto same = condor_observation("172.0");
-        same.identity.manager = ProcessIdentity{manager_pid, 123456, "boot-does-not-exist"};
-        same.identity.members = {ProcessIdentity{manager_pid, 123456, "boot-does-not-exist"}};
+        same.execution.manager = ProcessIdentity{manager_pid, 123456, "boot-does-not-exist"};
+        same.execution.members = {ProcessIdentity{manager_pid, 123456, "boot-does-not-exist"}};
         const auto recovered = registry.upsertObservedJob(same);
         check(recovered.ok && recovered.internal_id == internal_id,
               "the same generation must resolve to the restored record");
@@ -626,8 +626,8 @@ void restored_suspect_instances_are_not_replayed(const std::string& base)
     {
         JobRegistry registry(isolated(path));
         auto observation = condor_observation("172.0");
-        observation.identity.manager = ProcessIdentity{manager_pid, 123456, "boot-does-not-exist"};
-        observation.identity.members = {
+        observation.execution.manager = ProcessIdentity{manager_pid, 123456, "boot-does-not-exist"};
+        observation.execution.members = {
             ProcessIdentity{manager_pid, 123456, "boot-does-not-exist"}};
         const auto created = registry.upsertObservedJob(observation);
         check(created.ok, "registration must succeed");
@@ -638,7 +638,7 @@ void restored_suspect_instances_are_not_replayed(const std::string& base)
         JobRegistry registry(isolated(path));
         const auto restored = registry.inventoryRecord(internal_id);
         check(restored.has_value() && restored->state == "active" &&
-                  !restored->job.identity.verified,
+                  !restored->verified,
               "the stale generation must be restored Open and unverified");
 
         size_t added = 0;
@@ -807,7 +807,7 @@ void conflicting_fresh_candidates_are_rejected(const std::string& base)
 
     Job first = condor_observation("903.0");
     Job second = condor_observation("903.0");
-    second.identity.manager =
+    second.execution.manager =
         ProcessIdentity{8888, 777777, "boot-aaa"};
 
     const auto created = registry.upsertObservedJob(first);
@@ -818,7 +818,7 @@ void conflicting_fresh_candidates_are_rejected(const std::string& base)
           "a different manager triple for the same identity must conflict");
     const auto stored = registry.inventoryRecord(created.internal_id);
     check(stored.has_value(), "the first candidate must stay readable");
-    check(stored->job.identity.manager.pid == 4242,
+    check(stored->job.execution.manager.pid == 4242,
           "the conflicting candidate must not overwrite the stored generation");
     check(registry.inventoryRecords().size() == 1, "only one instance may exist");
 }
@@ -886,8 +886,8 @@ void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string
     // A partially-known membership with an empty list must not erase members:
     // the source could not read everything, so "no members" is not proven.
     auto partial = condor_observation("172.0");
-    partial.identity.members.clear();
-    partial.identity.members_authoritative = false;
+    partial.execution.members.clear();
+    partial.execution.members_authoritative = false;
     const auto kept = registry.upsertObservedJob(partial);
     check(kept.ok && kept.disposition == UpsertDisposition::Unchanged,
           "a non-authoritative empty list must change nothing");
@@ -897,15 +897,15 @@ void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string
     // An authoritative empty list is positive evidence: the stored members
     // are replaced by the confirmed empty set.
     auto confirmed_empty = condor_observation("172.0");
-    confirmed_empty.identity.members.clear();
-    confirmed_empty.identity.members_authoritative = true;
+    confirmed_empty.execution.members.clear();
+    confirmed_empty.execution.members_authoritative = true;
     const auto cleared = registry.upsertObservedJob(confirmed_empty);
     check(cleared.ok && cleared.disposition == UpsertDisposition::Updated,
           "a confirmed empty membership must be applied to facts");
     check(pids_of(*registry.findJob(created.internal_id)).empty(),
           "a confirmed empty membership must clear stale member pids");
     const auto record = registry.inventoryRecord(created.internal_id);
-    check(record.has_value() && record->job.identity.members.empty(),
+    check(record.has_value() && record->job.execution.members.empty(),
           "the stored process evidence must follow the confirmed empty set");
 }
 
@@ -980,7 +980,7 @@ void max_internal_id_is_never_reissued(const std::string& base)
     // already-issued MAX may not be handed out again.
     {
         const auto path = fresh_dir(base, "a26a");
-        write_raw_db(path, {{"m:schema_version", "4"},
+        write_raw_db(path, {{"m:schema_version", "5"},
                             {"c:job_id", std::to_string(kMax - 1)}});
         {
             JobRegistry registry(isolated(path));
@@ -1001,7 +1001,7 @@ void max_internal_id_is_never_reissued(const std::string& base)
     // exhausted rather than reissued.
     {
         const auto path = fresh_dir(base, "a26b");
-        write_raw_db(path, {{"m:schema_version", "4"},
+        write_raw_db(path, {{"m:schema_version", "5"},
                             {"c:job_id", std::to_string(kMax)}});
         JobRegistry registry(isolated(path));
         check(registry.getNextJobID() == 0,
@@ -1013,7 +1013,7 @@ void max_internal_id_is_never_reissued(const std::string& base)
     // transaction; the exhaustion then survives the restart.
     {
         const auto path = fresh_dir(base, "a26c");
-        write_raw_db(path, {{"m:schema_version", "4"},
+        write_raw_db(path, {{"m:schema_version", "5"},
                             {"c:job_id", std::to_string(kMax)},
                             {"m:job_id_exhausted", "false"}});
         {
@@ -1034,7 +1034,7 @@ void max_internal_id_is_never_reissued(const std::string& base)
     // still holds MAX.
     {
         const auto path = fresh_dir(base, "a26d");
-        write_raw_db(path, {{"m:schema_version", "4"},
+        write_raw_db(path, {{"m:schema_version", "5"},
                             {"c:job_id", std::to_string(kMax)},
                             {"m:job_id_exhausted", "true"}});
         JobRegistry registry(isolated(path));
@@ -1046,7 +1046,7 @@ void max_internal_id_is_never_reissued(const std::string& base)
     {
         const auto path = fresh_dir(base, "a26e");
         write_raw_db(path, {
-            {"m:schema_version", "4"},
+            {"m:schema_version", "5"},
             {"j:" + hex64(kMax),
              legacy_condor_record("172.0", "htcondor01", "schedd-a", {}, 4100).dump()},
             {"c:job_id", std::to_string(kMax - 1)},
@@ -1105,7 +1105,7 @@ void runtime_state_survives_later_durable_writes(const std::string& base)
     // (2) Changed facts must not pretend the new evidence is already applied,
     // and must not drop the holders that are really attached.
     auto changed = condor_observation("172.0");
-    changed.identity.members.push_back(ProcessIdentity{5151, 424242, "boot-aaa"});
+    changed.execution.members.push_back(ProcessIdentity{5151, 424242, "boot-aaa"});
     const auto updated = registry.upsertObservedJob(changed);
     check(updated.ok && updated.disposition == UpsertDisposition::Updated,
           "a changed observation must be an update");
@@ -1265,12 +1265,12 @@ void sequential_merges_keep_single_upsert_semantics(const std::string& base)
 
     Job fresh = condor_observation("603.0");
     Job changed = condor_observation("601.0");
-    changed.identity.members.push_back(ProcessIdentity{5151, 424242, "boot-aaa"});
+    changed.execution.members.push_back(ProcessIdentity{5151, 424242, "boot-aaa"});
     Job conflict = condor_observation("602.0");
-    conflict.identity.manager =
+    conflict.execution.manager =
         ProcessIdentity{7777, 888888, "boot-aaa"};
     Job duplicate = condor_observation("603.0");
-    duplicate.identity.members.push_back(ProcessIdentity{5252, 424242, "boot-aaa"});
+    duplicate.execution.members.push_back(ProcessIdentity{5252, 424242, "boot-aaa"});
 
     const auto created = registry.upsertObservedJob(fresh);
     const auto merged = registry.upsertObservedJob(changed);
@@ -1322,7 +1322,7 @@ void selection_intent_lives_in_the_record_row(const std::string& base)
     }
 
     check(raw_keys_with_prefix(path, "b:").empty(),
-          "schema 4 must not write a separate binding row");
+          "schema 5 must not write a separate binding row");
     const auto rows = read_raw_db(path);
     bool found_intent = false;
     for (const auto& [key, value] : rows) {
@@ -1387,7 +1387,7 @@ void closing_write_failure_keeps_the_instance(const std::string& base)
 void schema_marker_must_be_canonical(const std::string& base)
 {
     const std::vector<std::string> markers = {
-        "3garbage", "4294967299", "2", "5", " 3", "3 ", "03", "-3", "", "0x3",
+        "3garbage", "4294967299", "2", "4", " 3", "3 ", "03", "-3", "", "0x3",
     };
     for (size_t index = 0; index < markers.size(); ++index) {
         const auto marker = markers[index];
@@ -1959,10 +1959,10 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
     const auto stored_selection = history.value("selection", nlohmann::json::object());
     check(stored_selection.is_object(),
           "the archived selection must be an object, not a dropped field");
-    const auto stored_identity = history.value("identity", nlohmann::json::object());
-    check(stored_identity.is_object() &&
-              stored_identity.value("native_job_id", std::string{}) == "907.0",
-          "the fenced history row must keep the archived identity");
+    check(history.value("native_job_id", std::string{}) == "907.0",
+          "the fenced history row must keep the archived facts");
+    check(history.contains("index_key"),
+          "the fenced history row must keep the derived identity key");
     const auto stored_applied = history.value("applied_collectors", nlohmann::json::array());
     check(stored_applied.is_array() && stored_applied.size() == 1 &&
               stored_applied[0] == "disk_collector",

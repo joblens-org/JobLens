@@ -264,12 +264,14 @@ void serialization_round_trip()
     check(restored.native_job_id == selector.native_job_id,
           "original native string survives the round trip");
 
-    const auto identity = canonicalize(slurm("7", "batch"));
-    check(identity.has_value(), "slurm step selector canonicalizes");
-    const JobIdentity identity_back =
-        nlohmann::json(*identity).get<JobIdentity>();
-    check(logical_equal(identity_back, *identity),
-          "JobIdentity round trip is lossless");
+    const auto key = canonicalize(slurm("7", "batch"));
+    check(key.has_value(), "slurm step selector canonicalizes");
+    check(key->key() == canonicalize(slurm("007", "batch"))->key(),
+          "the derived key is normalization-invariant");
+    check(key->key() != canonicalize(slurm("7", "1"))->key(),
+          "the derived key separates steps");
+    check(key->index_key() == canonicalize(slurm("7", "batch"))->index_key(),
+          "the durable index key is stable across derivations");
 
     // Open-world names: an unregistered adapter deserializes verbatim (never
     // guessed, never dropped — records of an uninstalled adapter stay

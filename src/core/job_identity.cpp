@@ -184,7 +184,7 @@ std::optional<uint32_t> slurm_step_value(const std::string& step_id)
 // Canonical identity
 // ---------------------------------------------------------------------------
 
-std::string JobIdentity::key() const
+std::string SchedulerKey::key() const
 {
     std::string joined;
     joined.reserve(adapter.size() + cluster_namespace.size() +
@@ -201,7 +201,23 @@ std::string JobIdentity::key() const
     return joined;
 }
 
-bool logical_equal(const JobIdentity& lhs, const JobIdentity& rhs)
+std::string SchedulerKey::index_key() const
+{
+    std::string key;
+    key.reserve(cluster_namespace.size() + canonical_native.size() + 32);
+    key += adapter;
+    key += '|';
+    key += std::to_string(cluster_namespace.size());
+    key += ':';
+    key += cluster_namespace;
+    key += '|';
+    key += canonical_native;
+    key += '|';
+    key += step_id;
+    return key;
+}
+
+bool operator==(const SchedulerKey& lhs, const SchedulerKey& rhs)
 {
     return lhs.adapter == rhs.adapter &&
            lhs.cluster_namespace == rhs.cluster_namespace &&
@@ -209,16 +225,9 @@ bool logical_equal(const JobIdentity& lhs, const JobIdentity& rhs)
            lhs.step_id == rhs.step_id;
 }
 
-void set_logical(JobIdentity& target, const JobIdentity& logical)
-{
-    target.adapter = logical.adapter;
-    target.cluster_namespace = logical.cluster_namespace;
-    target.native_job_id = logical.native_job_id;
-    target.canonical_native = logical.canonical_native;
-    target.step_id = logical.step_id;
-}
+bool operator!=(const SchedulerKey& lhs, const SchedulerKey& rhs) { return !(lhs == rhs); }
 
-std::optional<JobIdentity> canonicalize(const NativeSelector& selector)
+std::optional<SchedulerKey> canonicalize(const NativeSelector& selector)
 {
     if (selector.adapter.empty()) return std::nullopt;
     if (selector.cluster_name.empty()) return std::nullopt;
@@ -231,7 +240,7 @@ std::optional<JobIdentity> canonicalize(const NativeSelector& selector)
     const auto parts = (*rule)(selector);
     if (!parts) return std::nullopt;
 
-    JobIdentity identity;
+    SchedulerKey identity;
     identity.adapter = selector.adapter;
     identity.native_job_id = selector.native_job_id; // preserved verbatim
     identity.cluster_namespace = parts->cluster_namespace;
@@ -286,27 +295,4 @@ void from_json(const nlohmann::json& in, NativeSelector& selector)
     selector.step_id = in.value("step_id", "");
 }
 
-void to_json(nlohmann::json& out, const JobIdentity& identity)
-{
-    out = nlohmann::json::object();
-    out["adapter"] = identity.adapter;
-    out["scheduler_type"] = identity.adapter;
-    out["cluster_namespace"] = identity.cluster_namespace;
-    out["native_job_id"] = identity.native_job_id;
-    out["canonical_native"] = identity.canonical_native;
-    out["step_id"] = identity.step_id;
-}
 
-void from_json(const nlohmann::json& in, JobIdentity& identity)
-{
-    std::string name;
-    if (in.contains("adapter") && in.at("adapter").is_string())
-        name = in.at("adapter").get<std::string>();
-    else
-        name = in.at("scheduler_type").get<std::string>();
-    identity.adapter = normalize_adapter_name(name);
-    identity.cluster_namespace = in.at("cluster_namespace").get<std::string>();
-    identity.native_job_id = in.at("native_job_id").get<std::string>();
-    identity.canonical_native = in.at("canonical_native").get<std::string>();
-    identity.step_id = in.value("step_id", "");
-}

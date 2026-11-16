@@ -27,7 +27,7 @@
 // collectors are actually attached is owned by the collection runtime and is
 // never persisted here.
 //
-// LevelDB namespaces (schema 4):
+// LevelDB namespaces (schema 5):
 //   j:  active JobRecords, including the desired selection
 //   h:  archived history (final record + applied-collector snapshot)
 //   c:  durable allocator high-water mark
@@ -62,10 +62,6 @@
 #include "core/job_identity.hpp"
 #include "core/liveness.hpp"
 
-// Canonical key of the durable identity index entry (`i:` layout). Shared by
-// the store (row maintenance) and the registry (its in-memory index mirror).
-std::string identity_index_key(const JobIdentity& identity);
-
 class JobStore;
 struct JobRecord;
 
@@ -76,6 +72,14 @@ struct JobRecord;
 enum class CollectionMode {
     Auto,
     Manual,
+};
+
+// Who owns the record's facts. Discovery observations carry execution evidence
+// and are re-observed; a manual registration has no source behind it. This is
+// provenance, not a lifecycle state.
+enum class FactSource {
+    Manual,
+    Discovery,
 };
 
 inline const char* to_string(CollectionMode mode)
@@ -188,6 +192,11 @@ struct JobRecord {
     // second internal id.
     Job job;
     std::string state = kStateActive;    // active | closing
+    FactSource source = FactSource::Manual;
+    // Derived cache of the record's durable i: key. The store must release that
+    // entry during recovery and owns no adapter to derive it there, so the
+    // registry stores the one string. Empty = the facts do not name a job.
+    std::string index_key;
     // The ONE record revision. Every durable mutation of this record advances
     // it: facts, automatic bookkeeping and manual selection commands alike. A
     // CAS reads and compares this same value inside the write transaction.
@@ -196,6 +205,9 @@ struct JobRecord {
     int64_t last_seen_us = 0;
     // --- desired selection (the runtime's actual state is not stored) -----
     CollectionSelection selection;
+    // Last liveness verdict. Not a lifecycle state, not persisted: rebuilt by
+    // the load pass and by the heartbeat's absence evaluation.
+    bool verified = true;
 };
 
 // ---------------------------------------------------------------------------
@@ -267,7 +279,7 @@ public:
     // publishing anything, and the durable index is the documented repair
     // source. nullopt when no entry exists or the row it names is gone (a
     // stale entry the next create's PutIdentity overwrites).
-    std::optional<JobRecord> readRowByIdentity(const JobIdentity& identity);
+    std::optional<JobRecord> readRowByIdentity(const SchedulerKey& key);
 
     // --- internal id allocation ------------------------------------------
     uint64_t nextJobId();   // ready-checked; 0 when the store is not ready
@@ -312,7 +324,7 @@ public:
         } kind = PutRecord;
         uint64_t internal_id = 0;
         std::optional<JobRecord> record;              // PutRecord / PutHistory
-        std::optional<JobIdentity> identity;    // i: operations
+        std::optional<SchedulerKey> key;              // i: operations
         // PutHistory: hex end-time suffix of the h: key; empty = stamped by
         // the store at commit time (the value's end_time_us always matches).
         std::string history_key_suffix;
@@ -428,7 +440,7 @@ private:    // Injected by the registry; see setRowProvider.
     void record_store_success();
     // Reads the durable `i:` owner of one identity. Returns false on a read
     // error; owner == 0 means "no parsable owner" (a stale entry).
-    bool identity_owner_locked(const JobIdentity& identity, uint64_t& owner,
+    bool identity_owner_locked(const SchedulerKey& key, uint64_t& owner,
                                std::string& error);
     // Serializes job_db transactions.
     mutable std::mutex db_mtx_;

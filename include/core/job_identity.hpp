@@ -124,52 +124,48 @@ bool operator==(const ProcessIdentity& lhs, const ProcessIdentity& rhs);
 bool operator!=(const ProcessIdentity& lhs, const ProcessIdentity& rhs);
 
 // ---------------------------------------------------------------------------
-// JobIdentity — the only identity type
+// SchedulerKey — the derived logical identity. ExecutionEvidence — the observed run.
 // ---------------------------------------------------------------------------
 //
-// Logical part: which scheduled job. Execution part: which local run of it,
-// anchored on the manager process (Condor starter / Slurm slurmstepd). A slot
-// name, a cgroup path or a bare PID never proves execution identity alone:
-// they are reused, which is why the manager triple is mandatory and the cgroup
-// is not part of identity at all.
-struct JobIdentity {
-    // --- logical identity: which scheduled job -----------------------------
+// Which scheduled job this is, derived from the facts by the adapter's native
+// id rule. It names the record for deduplication and the identity index, but it
+// is never stored: the facts that produced it are the single copy.
+struct SchedulerKey {
     std::string adapter;             // adapter registry name (never empty)
     std::string cluster_namespace;   // cluster_name plus tag when applicable
     std::string native_job_id;       // original native string, preserved
     std::string canonical_native;    // numeric-normalized form used for keys
     std::string step_id;             // normalized Slurm step, or empty
 
-    // --- execution identity: which local run -------------------------------
-    ProcessIdentity manager;                 // boot_id + pid + start_ticks
-    std::vector<ProcessIdentity> members;
-    bool members_authoritative = false;
-
-    // --- observation state -------------------------------------------------
-    bool observed = false;   // discovery owns the execution facts
-    bool verified = true;    // last liveness check (not a lifecycle state)
-    uint64_t read_order = 0; // process-monotonic read order, assigned before reading
-    int64_t read_at_us = 0;  // source read time
-    std::string incomplete_reason;
-
-    bool logical_complete() const
+    bool complete() const
     {
         return !adapter.empty() && !cluster_namespace.empty() &&
                !native_job_id.empty() && !canonical_native.empty();
     }
-    bool execution_complete() const { return manager.complete(); }
-
-    // Total-order key covering type, namespace, native identity and step.
-    // Equal keys mean the same logical scheduler identity.
+    // Total-order key: equal keys mean the same logical scheduler identity.
     std::string key() const;
+    // Durable i: index key (length-prefixed namespace, step-aware).
+    std::string index_key() const;
 };
 
-// Logical equality only. Execution identity is compared through `manager`.
-bool logical_equal(const JobIdentity& lhs, const JobIdentity& rhs);
+bool operator==(const SchedulerKey& lhs, const SchedulerKey& rhs);
+bool operator!=(const SchedulerKey& lhs, const SchedulerKey& rhs);
 
-// Copies the logical part onto an existing identity, leaving execution evidence
-// (manager / members / observation state) untouched.
-void set_logical(JobIdentity& target, const JobIdentity& logical);
+// Which local run produced the facts: the adapter's manager process plus the
+// member set. Evidence, not identity — it is rebuilt from a read and never the
+// thing that names the job. A bare pid is not evidence: the triple defeats PID
+// reuse.
+struct ExecutionEvidence {
+    ProcessIdentity manager;                 // boot_id + pid + start_ticks
+    std::vector<ProcessIdentity> members;
+    bool members_authoritative = false;
+    uint64_t read_order = 0;                 // assigned before the read
+};
+
+inline bool execution_complete(const ExecutionEvidence& evidence)
+{
+    return evidence.manager.complete();
+}
 
 // ---------------------------------------------------------------------------
 // Native-id rule helpers (used by the built-in adapters' rules)
@@ -240,7 +236,10 @@ private:
 // No rule, an empty adapter name, a missing cluster namespace or an
 // unparsable native id yields nullopt: an incomplete observation, never a
 // guess. Only the logical part is filled; execution evidence stays default.
-std::optional<JobIdentity> canonicalize(const NativeSelector& selector);
+std::optional<SchedulerKey> canonicalize(const NativeSelector& selector);
+
+void to_json(nlohmann::json& out, const NativeSelector& selector);
+void from_json(const nlohmann::json& in, NativeSelector& selector);
 
 // Serialization round trips preserve the original native string, the
 // normalized step and every namespace field. The adapter name is written
@@ -248,10 +247,4 @@ std::optional<JobIdentity> canonicalize(const NativeSelector& selector);
 // name, byte-identical to what to_string(SchedulerType) produced, so old
 // readers and persisted rows keep working); deserialization accepts either.
 //
-// JobIdentity serialization covers the LOGICAL part only: execution evidence
-// is persisted under its own keys by the store codec so the frozen row layout
-// stays readable.
-void to_json(nlohmann::json& out, const NativeSelector& selector);
-void from_json(const nlohmann::json& in, NativeSelector& selector);
-void to_json(nlohmann::json& out, const JobIdentity& identity);
-void from_json(const nlohmann::json& in, JobIdentity& identity);
+// SchedulerKey is derived on demand and never serialized.

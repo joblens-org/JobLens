@@ -823,8 +823,8 @@ void run_inventory_cases(JobRegistry& registry, const Fixture& ids)
               "native_identity_selectors must be advertised");
         check(response["job_scope"] == "current_local_instances",
               "job_scope must document the snapshot semantics");
-        check(response["db_schema_version"] == 4,
-              "db_schema_version must be the contract field name (schema 4)");
+        check(response["db_schema_version"] == 5,
+              "db_schema_version must be the contract field name (schema 5)");
         check(response["inventory_ready"] == true, "a migrated store must be ready");
     }
     // --- status without a maintenance provider ----------------------
@@ -834,7 +834,7 @@ void run_inventory_cases(JobRegistry& registry, const Fixture& ids)
         check(response["inventory_enabled"] == true, "inventory must be enabled");
         check(response["sources"]["state"] == "not_configured",
               "without a provider the sources state must be not_configured: " + response.dump());
-        check(response["db_schema_version"] == 4, "status must expose db_schema_version");
+        check(response["db_schema_version"] == 5, "status must expose db_schema_version");
         check(response["store"]["migration_complete"] == true,
               "store migration state must be reported");
         check(response["instances"]["active"].get<size_t>() >= size_t{8},
@@ -861,7 +861,7 @@ void run_inventory_cases(JobRegistry& registry, const Fixture& ids)
         check(merged["store"]["migration_complete"] == true &&
                   merged["store"]["running"] == true,
               "store facts must not be overridden by the provider payload: " + merged.dump());
-        check(merged["db_schema_version"] == 4,
+        check(merged["db_schema_version"] == 5,
               "db_schema_version must come from store metadata");
         set_inventory_status_provider({});
         const auto cleared = rpc("JobRegistry/inventory_status");

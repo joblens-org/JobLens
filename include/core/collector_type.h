@@ -220,9 +220,8 @@ struct SubAttrMatcher {
     }
 };
 
-// One identity block per Job: logical identity (which scheduled job) plus
-// execution identity (which local run). The watcher fills it while parsing;
-// the store persists the compatible projection under the frozen row keys.
+// The facts of one scheduled job. The execution evidence block proves which
+// local run produced them; the job itself is named by the facts.
 struct Job {
     uint64_t                              JobID{};
     std::string                           NativeJobID{};   // 调度器原生作业ID字符串，用于查询（Condor: cluster_id.proc_id, Slurm: job_id.step_id）
@@ -264,9 +263,9 @@ struct Job {
     // restore/更新路径拿到了组值、等待落库一次（write-once + 至多一次回填重写）。
     bool                                    group_need_persist{false};
 
-    // The one identity block. Manual registrations leave the manager empty and
-    // bind `members`; discovery observations fill both.
-    JobIdentity                             identity;
+    // Execution evidence: which local run produced these facts. Not identity:
+    // the facts name the job, and this block only proves the processes.
+    ExecutionEvidence                       execution;
 
     static constexpr auto reflection() {
         return std::make_tuple(
@@ -280,19 +279,6 @@ struct Job {
         );
     }
 };
-
-// The generic identity -> record projection shared by every adapter. The
-// adapter calls it before deriving its scheduler-specific fields; open-world
-// jobs without an adapter call it directly.
-inline void apply_identity_projection(Job& job, const NativeSelector& selector,
-                                      const JobIdentity& identity)
-{
-    job.NativeJobID = identity.native_job_id;
-    if (!selector.cluster_name.empty()) job.cluster_name = selector.cluster_name;
-    if (!selector.cluster_tag.empty()) job.clusterTag = selector.cluster_tag;
-    if (job.jobtype != JobType::Job && job.jobtype != JobType::Sys)
-        job.jobtype = JobType::Job;
-}
 
 // Facts structs are exposed to Lua through their reflected member names, the
 // same schema JSON uses. Job keeps its own reflection().
@@ -316,8 +302,7 @@ inline sol::object to_lua(sol::state_view lua, const T& value)
 
 inline NativeSelector selector_of(const Job& job) {
     NativeSelector selector;
-    selector.adapter = job.identity.adapter.empty() ? job.subtype_name
-                                                    : job.identity.adapter;
+    selector.adapter = job.subtype_name;
     if (selector.adapter.empty()) {
         if (const char* name = adapter_name_for(job.subtype))
             selector.adapter = name;
@@ -325,24 +310,23 @@ inline NativeSelector selector_of(const Job& job) {
     selector.cluster_name = job.cluster_name;
     selector.cluster_tag = job.clusterTag;
     selector.native_job_id = job.NativeJobID;
-    selector.step_id = job.identity.step_id;
     return selector;
 }
 
 inline const ProcessIdentity& manager_of(const Job& job) {
-    return job.identity.manager;
+    return job.execution.manager;
 }
 
 inline const std::vector<ProcessIdentity>& members_of(const Job& job) {
-    return job.identity.members;
+    return job.execution.members;
 }
 
 // The collector-facing pid projection of the one process set. There is no
 // separate bare pid list on the Job: the evidence is authoritative.
 inline std::vector<pid_t> pids_of(const Job& job) {
     std::vector<pid_t> pids;
-    pids.reserve(job.identity.members.size());
-    for (const auto& member : job.identity.members) pids.push_back(member.pid);
+    pids.reserve(job.execution.members.size());
+    for (const auto& member : job.execution.members) pids.push_back(member.pid);
     return pids;
 }
 
@@ -354,9 +338,9 @@ inline void set_pids(Job& job, std::vector<pid_t> pids) {
     kept.reserve(pids.size());
     for (const pid_t pid : pids) {
         const auto existing = std::find_if(
-            job.identity.members.begin(), job.identity.members.end(),
+            job.execution.members.begin(), job.execution.members.end(),
             [pid](const ProcessIdentity& member) { return member.pid == pid; });
-        if (existing != job.identity.members.end()) kept.push_back(*existing);
+        if (existing != job.execution.members.end()) kept.push_back(*existing);
         else kept.push_back(ProcessIdentity{pid, 0, std::string{}});
     }
     std::sort(kept.begin(), kept.end(),
@@ -368,25 +352,13 @@ inline void set_pids(Job& job, std::vector<pid_t> pids) {
                                return lhs.pid == rhs.pid;
                            }),
                kept.end());
-    job.identity.members = std::move(kept);
+    job.execution.members = std::move(kept);
 }
 
 // True only when the source read the execution scope successfully: an empty
 // member list without this flag is "unknown", not "confirmed empty".
 inline bool members_authoritative_of(const Job& job) {
-    return job.identity.members_authoritative;
-}
-
-inline int64_t read_at_us_of(const Job& job) {
-    return job.identity.read_at_us;
-}
-
-// Publishes the identity-derived projections on the Job. The identity is the
-// source; these fields exist only for the wire/collector contract.
-inline void project_identity(Job& job) {
-    if (!job.identity.adapter.empty()) job.subtype_name = job.identity.adapter;
-    if (!job.identity.native_job_id.empty())
-        job.NativeJobID = job.identity.native_job_id;
+    return job.execution.members_authoritative;
 }
 
 // Job 级匹配：开放世界名字（subtype_name）先于字段匹配——新调度器的作业

@@ -299,23 +299,24 @@ Job make_condor_job(const std::string& native,
     attributes.owner = "alice";
     attributes.collector_host = cluster;
     job.sub_attr = attributes;
-    JobIdentity& identity_block = job.identity;
-    identity_block.adapter = "condor";
-    identity_block.manager.boot_id = "boot-aaa";
-    identity_block.manager.pid = manager_pid;
-    identity_block.manager.start_ticks = manager_ticks;
+    job.execution.manager.boot_id = "boot-aaa";
+    job.execution.manager.pid = manager_pid;
+    job.execution.manager.start_ticks = manager_ticks;
     for (const pid_t member : members) {
-        identity_block.members.push_back(ProcessIdentity{member, manager_ticks, "boot-aaa"});
+        job.execution.members.push_back(ProcessIdentity{member, manager_ticks, "boot-aaa"});
     }
-    CondorJobWatcher::finalize_discovery(job);
-    return job;
+    auto finalized = CondorJobWatcher::finalize_discovery(std::move(job));
+    return finalized ? *finalized : Job{};
 }
 
 Job make_unresolved_job(const std::string& native, pid_t manager_pid)
 {
+    // The namespace fact is what names the job: clear both its typed copy and
+    // the rendered projection, and do not run the watcher's finalize (which
+    // would drop the observation instead of publishing it).
     Job job = make_condor_job(native, manager_pid, 900000);
     job.cluster_name.clear();
-    CondorJobWatcher::finalize_discovery(job);
+    std::get<CondorJobAttr>(job.sub_attr).collector_host.clear();
     return job;
 }
 
@@ -329,7 +330,8 @@ ScanResult scan_with(std::vector<Job> jobs, bool complete = true,
     result.finished_at_ms = 11;
     result.jobs = std::move(jobs);
     for (const auto& job : result.jobs) {
-        if (CondorJobWatcher::discovery_ready(job)) ++result.counts.complete;
+        if (execution_complete(job.execution) && canonicalize(selector_of(job)).has_value())
+            ++result.counts.complete;
         else ++result.counts.incomplete;
     }
     result.counts.candidates = result.jobs.size();
@@ -384,7 +386,7 @@ std::optional<JobRecord> find_native(JobRegistry& registry, const std::string& n
     selector.native_job_id = native;
     const auto identity = canonicalize(selector);
     if (!identity) return std::nullopt;
-    return registry.inventoryRecordByIdentity(*identity);
+    return registry.inventoryRecordByKey(*identity);
 }
 
 nlohmann::json heartbeat_status()
@@ -639,7 +641,7 @@ void run_a08(const std::string& base)
     check(registry.reconcileInventoryNow(), "the revival pass did not run");
     const auto revived_record = find_native(registry, "101.0");
     check(revived_record.has_value() &&
-              revived_record->job.identity.manager.pid == 5102,
+              revived_record->job.execution.manager.pid == 5102,
           "a new generation was rejected after retirement");
     check(count_records(registry) == 2, "duplicate entry for one generation");
 
@@ -758,7 +760,7 @@ void run_a10(const std::string& base)
     probes.set_cgroup("/cg/slot-4", {6001}, true);
     const auto record = find_native(registry, "300.0");
     check(record.has_value(), "record missing");
-    check(record->job.identity.members.empty(),
+    check(record->job.execution.members.empty(),
           "fixture should have an empty PID list");
 
     source.set_scan([&]() { return scan_with({}); });
@@ -826,7 +828,7 @@ void run_a11(const std::string& base)
     // An unresolved namespace cannot be indexed, is counted as incomplete and
     // is retried once the namespace resolves.
     const Job unresolved = make_unresolved_job("401.0", 5501);
-    check(!CondorJobWatcher::discovery_ready(unresolved), "fixture should be incomplete");
+    check(!canonicalize(selector_of(unresolved)).has_value(), "fixture should be incomplete");
     scan_jobs = {unresolved};
     registry.reconcileInventoryNow();
     check(!find_native(registry, "401.0").has_value(),
@@ -860,7 +862,7 @@ void run_a11(const std::string& base)
     check(count_records(registry) == 3, "namespaces merged");
     check(find_native(registry, "400.0", "htcondor02", "schedd-b").has_value(),
           "second namespace record missing");
-    check(find_native(registry, "400.0")->job.identity.manager.pid == 5500,
+    check(find_native(registry, "400.0")->job.execution.manager.pid == 5500,
           "wrong record was updated");
 
     registry.deinit();
@@ -1029,7 +1031,7 @@ void run_a14(const std::string& base)
     const auto still_new = find_native(registry, "700.1");
     check(still_new.has_value() && still_new->job.JobID == new_record->job.JobID,
           "old acknowledgement removed the new identity index");
-    check(still_new->job.identity.manager.start_ticks == 1616,
+    check(still_new->job.execution.manager.start_ticks == 1616,
           "new generation was replaced by stale state");
 
     // A stale discovery for the retired generation still cannot resurrect it.
@@ -1073,9 +1075,9 @@ void run_a23(const std::string& base)
         const auto records = registry.inventoryRecords();
         for (const auto& record : records) {
             (void)registry.inventoryRecord(record.job.JobID);
-            if (record.job.identity.logical_complete()) {
-                const auto by_identity = registry.inventoryRecordByIdentity(record.job.identity);
-                check(by_identity.has_value() && by_identity->job.JobID == record.job.JobID,
+            if (const auto key = registry.keyOf(record.job)) {
+                const auto by_key = registry.inventoryRecordByKey(*key);
+                check(by_key.has_value() && by_key->job.JobID == record.job.JobID,
                       "identity lookup disagrees with the snapshot");
             }
         }
@@ -1102,10 +1104,11 @@ void run_a23(const std::string& base)
             if (records.size() > 5u) throw std::runtime_error("duplicate records appeared");
             for (const auto& record : records) {
                 check(record.job.JobID != 0, "the system sentinel leaked into inventory");
-                if (!record.job.identity.logical_complete()) continue;
-                const auto by_identity = registry.inventoryRecordByIdentity(record.job.identity);
-                check(by_identity.has_value(), "snapshot references a missing identity");
-                check(by_identity->job.JobID == record.job.JobID,
+                const auto key = registry.keyOf(record.job);
+                if (!key) continue;
+                const auto by_key = registry.inventoryRecordByKey(*key);
+                check(by_key.has_value(), "snapshot references a missing identity");
+                check(by_key->job.JobID == record.job.JobID,
                       "snapshot and identity index disagree");
             }
             (void)heartbeat_status();
@@ -1336,7 +1339,7 @@ void run_legacy(const std::string& base)
     const auto records = registry.inventoryRecords();
     check(records.size() == 1, "legacy: the registration created no inventory record");
     const uint64_t id = records.front().job.JobID;
-    check(!records.front().job.identity.manager.complete(),
+    check(!records.front().job.execution.manager.complete(),
           "legacy: a manual registration must not invent an execution generation");
 
     check(heartbeat_status()["configured_types"].empty(),
@@ -1381,9 +1384,9 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
     // The restore path validates against the CURRENT boot, so the fixture
     // must carry the real one; the member models a live child under an alive
     // manager with its own start time.
-    job.identity.manager.boot_id = boot;
-    job.identity.members.clear();
-    job.identity.members.push_back(ProcessIdentity{child_pid, 191919, boot});
+    job.execution.manager.boot_id = boot;
+    job.execution.members.clear();
+    job.execution.members.push_back(ProcessIdentity{child_pid, 191919, boot});
     CondorJobWatcher::finalize_discovery(job);
 
     {
@@ -1419,11 +1422,11 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
 
         const auto restored = find_native(registry, "810.0");
         check(restored.has_value(), "RESTORE-UNKNOWN: the record was not restored");
-        check(restored->state == kStateActive && !restored->job.identity.verified,
+        check(restored->state == kStateActive && !restored->verified,
               "RESTORE-UNKNOWN: an unverifiable execution must stay Open but "
               "carry the unverified (suspect) evidence, not a lifecycle state");
-        check(std::any_of(restored->job.identity.members.begin(),
-                          restored->job.identity.members.end(),
+        check(std::any_of(restored->job.execution.members.begin(),
+                          restored->job.execution.members.end(),
                           [&](const ProcessIdentity& member) {
                               return member.pid == child_pid && member.complete();
                           }),
@@ -1443,8 +1446,8 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
     JobRegistry registry(heartbeat_options(path, source, probes));
     const auto restored = find_native(registry, "810.0");
     check(restored.has_value(), "RESTORE-UNKNOWN: the heartbeat restore lost the record");
-    check(std::any_of(restored->job.identity.members.begin(),
-                      restored->job.identity.members.end(),
+    check(std::any_of(restored->job.execution.members.begin(),
+                      restored->job.execution.members.end(),
                       [&](const ProcessIdentity& member) { return member.pid == child_pid; }),
           "RESTORE-UNKNOWN: the heartbeat restore dropped the child evidence");
 
@@ -1456,8 +1459,8 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
     const auto after = find_native(registry, "810.0");
     check(after.has_value(),
           "RESTORE-UNKNOWN: the instance was retired although its saved child is alive");
-    check(std::any_of(after->job.identity.members.begin(),
-                      after->job.identity.members.end(),
+    check(std::any_of(after->job.execution.members.begin(),
+                      after->job.execution.members.end(),
                       [&](const ProcessIdentity& member) { return member.pid == child_pid; }),
           "RESTORE-UNKNOWN: the child evidence was dropped before the verdict");
     check(registry.findJob(after->job.JobID).has_value(),
@@ -1516,7 +1519,7 @@ void run_retire_explicit(const std::string& base)
           "RETIRE-EXPLICIT: the revival pass did not run");
     const auto revived_record = find_native(registry, "310.0");
     check(revived_record.has_value() &&
-              revived_record->job.identity.manager.pid == 5401,
+              revived_record->job.execution.manager.pid == 5401,
           "RETIRE-EXPLICIT: a new generation was refused after the explicit "
           "retirement");
     check(count_records(registry) == 1, "RETIRE-EXPLICIT: unexpected record count");

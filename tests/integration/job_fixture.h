@@ -27,7 +27,6 @@ inline Job discovered_job(NativeSelector selector, ProcessIdentity manager,
                           std::int64_t read_at_us = 0)
 {
     Job job;
-    job.identity.adapter = selector.adapter;
     job.subtype_name = selector.adapter;
     job.NativeJobID = selector.native_job_id;
     // A discovery source hands over typed facts (the single namespace
@@ -51,15 +50,17 @@ inline Job discovered_job(NativeSelector selector, ProcessIdentity manager,
         } catch (const std::exception&) {
             attr.job_id = 0;
         }
+        if (!selector.step_id.empty()) {
+            if (const auto numeric = slurm_step_value(selector.step_id)) attr.step_id = *numeric;
+        }
         job.sub_attr = std::move(attr);
     }
     job.cluster_name = selector.cluster_name;
     job.clusterTag = selector.cluster_tag;
     job.jobtype = JobType::Job;
-    job.identity.manager = std::move(manager);
-    job.identity.members = std::move(members);
-    job.identity.members_authoritative = members_complete;
-    job.identity.step_id = selector.step_id;
-    job.identity.read_at_us = read_at_us;
+    job.execution.manager = std::move(manager);
+    job.execution.members = std::move(members);
+    job.execution.members_authoritative = members_complete;
+    (void)read_at_us;
     return job;
 }

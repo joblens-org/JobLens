@@ -52,7 +52,7 @@ const std::string KEY_PREFIX_COUNTER  = "c:";
 const std::string KEY_PREFIX_META     = "m:";
 const std::string KEY_PREFIX_IDENTITY = "i:";
 
-constexpr uint32_t kInventorySchemaVersion = 4;
+constexpr uint32_t kInventorySchemaVersion = 5;
 
 // The schema marker is a canonical decimal: ASCII digits only, no sign, no
 // whitespace, no leading zero, no trailing junk, and it must fit the field.
@@ -210,21 +210,14 @@ nlohmann::json record_json(const JobRecord& record) {
     out["state"]          = record.state;
     out["first_seen_us"]  = record.first_seen_us;
     out["last_seen_us"]   = record.last_seen_us;
-    out["members_authoritative"] = record.job.identity.members_authoritative;
-    out["execution_observed"] = record.job.identity.observed;
-    if (!record.job.identity.adapter.empty()) out["adapter"] = record.job.identity.adapter;
-    // The selector is a projection of the Job (selector_of): the row keeps
-    // the frozen schema-4 shape, and readers fold the projection back onto
-    // the Job's own fields on restore.
-    const NativeSelector row_selector = selector_of(record.job);
-    if (row_selector.adapter.empty()) {
-        out["selector"] = nullptr;
-    } else {
-        out["selector"] = row_selector;
-    }
-    if (record.job.identity.logical_complete()) out["identity"] = record.job.identity;
-    else                                        out["identity"] = nullptr;
-    out["generation"]     = manager_to_json(record.job.identity.manager);
+    // Who owns the facts. The logical identity is not stored: it is derived
+    // from the facts by the adapter's native-id rule.
+    out["source"] = record.source == FactSource::Discovery ? "discovery" : "manual";
+    if (!record.index_key.empty()) out["index_key"] = record.index_key;
+    if (!record.job.subtype_name.empty()) out["adapter"] = record.job.subtype_name;
+    // Execution evidence: the local run that produced the facts, rebuilt from
+    // a read on the next observation.
+    out["generation"]     = manager_to_json(record.job.execution.manager);
     out["members"]        = nlohmann::json::array();
     for (const auto& member : members_of(record.job)) {
         out["members"].push_back(process_to_json(member));
@@ -268,17 +261,12 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id,
     JobRecord record;
     record.job = decoder ? decoder(j) : decode_legacy_job(j);
     record.job.JobID = internal_id;
-    JobIdentity& identity = record.job.identity;
+    ExecutionEvidence& execution = record.job.execution;
 
     record.revision       = j.value("revision", uint64_t{1});
     record.state          = j.value("state", std::string{kStateActive});
     record.first_seen_us  = j.value("first_seen_us", int64_t{0});
     record.last_seen_us   = j.value("last_seen_us", int64_t{0});
-    // Legacy fold: rows written before the adapter name moved onto the Job
-    // carry it only under "adapter" — hydrate the identity so every reader
-    // sees one copy.
-    if (identity.adapter.empty())
-        identity.adapter = j.value("adapter", std::string{});
     if (record.revision == 0) record.revision = 1;
 
     // Schema 4 stores the desired selection in the same row, ordered by the
@@ -290,65 +278,32 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id,
     }
     record.selection = selection_from_json(j["selection"]);
 
-    if (j.contains("selector") && j["selector"].is_object() &&
-        j["selector"].value("scheduler_type", std::string{"unknown"}) != "unknown") {
-        // Legacy rows carry "scheduler_type": "unknown" for "no selector";
-        // the selector round trip itself accepts either key (adapter wins).
-        // The row's selector is a projection of the Job: fold its fields
-        // back onto the Job (backfill only — facts already in the row win).
-        try {
-            const auto selector = j["selector"].get<NativeSelector>();
-            if (identity.adapter.empty() && !selector.adapter.empty())
-                identity.adapter = selector.adapter;
-            if (record.job.cluster_name.empty())
-                record.job.cluster_name = selector.cluster_name;
-            if (record.job.clusterTag.empty())
-                record.job.clusterTag = selector.cluster_tag;
-            if (record.job.NativeJobID.empty())
-                record.job.NativeJobID = selector.native_job_id;
-            if (identity.step_id.empty() && !selector.step_id.empty())
-                identity.step_id = selector.step_id;
-        } catch (const std::exception& error) {
-            spdlog::warn("JobStore: invalid stored selector for job {}: {}",
-                         internal_id, error.what());
-        }
-    }
-    if (j.contains("identity") && j["identity"].is_object()) {
-        try {
-            identity = j["identity"].get<JobIdentity>();
-        } catch (const std::exception& error) {
-            spdlog::warn("JobStore: invalid stored identity for job {}: {}",
-                         internal_id, error.what());
-        }
-    }
+    if (record.job.subtype_name.empty())
+        record.job.subtype_name = j.value("adapter", std::string{});
+    record.index_key = j.value("index_key", std::string{});
     if (j.contains("generation") && j["generation"].is_object()) {
-        identity.manager = manager_from_json(j["generation"]);
+        execution.manager = manager_from_json(j["generation"]);
     }
-    identity.members_authoritative = j.value("members_authoritative", false);
-    // Provenance is stored explicitly.  A row written before the field existed
-    // is classified from its own evidence: a populated manager triple means a
-    // discovery observation produced it, a completely empty one is the manual
-    // shape (manual registration never invents a manager).
-    const bool has_execution_flag = j.contains("execution_observed");
-    identity.observed = has_execution_flag
-                            ? j.value("execution_observed", false)
-                            : !(identity.manager.boot_id.empty() &&
-                                identity.manager.pid == 0 &&
-                                identity.manager.start_ticks == 0);
     const auto members_it = j.contains("members") ? j.find("members") : j.find("processes");
     if (members_it != j.end() && members_it->is_array()) {
         for (const auto& process : *members_it) {
-            if (process.is_object()) identity.members.push_back(process_from_json(process));
+            if (process.is_object()) execution.members.push_back(process_from_json(process));
         }
-        identity.members = normalized_processes(std::move(identity.members));
+        execution.members = normalized_processes(std::move(execution.members));
     }
-    // subtype_name is a projection of identity.adapter. Do not clear a row's
-    // stored name when the identity object is absent/incomplete.
-    if (!identity.adapter.empty())
-        record.job.subtype_name = identity.adapter;
-    // The row's native id is the rendered projection of the logical key.
-    if (record.job.NativeJobID.empty())
-        record.job.NativeJobID = identity.native_job_id;
+    // Provenance is stored explicitly. A row written before the field existed
+    // is classified from its own evidence: a populated manager triple means a
+    // discovery observation produced it, a completely empty one is the manual
+    // shape (manual registration never invents a manager).
+    const auto source = j.value("source", std::string{});
+    if (source == "discovery") {
+        record.source = FactSource::Discovery;
+    } else if (source == "manual") {
+        record.source = FactSource::Manual;
+    } else {
+        record.source = execution.manager.complete() ? FactSource::Discovery
+                                                     : FactSource::Manual;
+    }
     return record;
 }
 
@@ -399,19 +354,6 @@ std::vector<ProcessIdentity> normalized_processes(std::vector<ProcessIdentity> p
 // Unambiguous identity index key. Canonical components are validated
 // (scheduler name, digits/dot native id, normalized step), so the only
 // free-form part is the cluster namespace and it is length-prefixed.
-std::string identity_index_key(const JobIdentity& identity) {    std::string key;
-    key.reserve(identity.cluster_namespace.size() + identity.canonical_native.size() + 32);
-    key += identity.adapter;
-    key += '|';
-    key += std::to_string(identity.cluster_namespace.size());
-    key += ':';
-    key += identity.cluster_namespace;
-    key += '|';
-    key += identity.canonical_native;
-    key += '|';
-    key += identity.step_id;
-    return key;
-}
 
 // ---------------------------------------------------------------------------
 // Selection value types
@@ -654,7 +596,7 @@ std::vector<JobRecord> JobStore::loadAll() {
     size_t closing_restored = 0, incomplete = 0;
     for (const auto& record : restored) {
         if (record.state == kStateClosing) ++closing_restored;
-        incomplete += record.job.identity.logical_complete() ? 0 : 1;
+        incomplete += record.index_key.empty() ? 1 : 0;
     }
     if (closing_restored > 0) {
         spdlog::warn("JobStore: restored {} interrupted closing record(s); they will be "
@@ -1007,12 +949,12 @@ bool JobStore::read_archive_fence_locked(uint64_t internal_id, ArchiveFence& fen
                       "recovery: {}", internal_id, exc.what());
         return false;
     }
-    if (!archived.job.identity.logical_complete()) return true;
+    if (archived.index_key.empty()) return true;
 
     // The archive released the identity index only while this instance owned
     // it. Read the owner back instead of deleting blind: a newer execution may
     // own the same identity by now.
-    const std::string index_key = key_identity(identity_index_key(archived.job.identity));
+    const std::string index_key = key_identity(archived.index_key);
     std::string value;
     const auto index_status = db_->Get(leveldb::ReadOptions(), index_key, &value);
     if (!index_status.ok() && !index_status.IsNotFound()) {
@@ -1310,13 +1252,13 @@ uint64_t JobStore::nextJobId() {
 // Durable identity resolution (the ambiguous-create repair read)
 // ---------------------------------------------------------------------------
 
-std::optional<JobRecord> JobStore::readRowByIdentity(const JobIdentity& identity) {
+std::optional<JobRecord> JobStore::readRowByIdentity(const SchedulerKey& key) {
     if (!store_ready()) return std::nullopt;
     std::lock_guard<std::mutex> db_lock(db_mtx_);
     if (!db_) return std::nullopt;
 
     std::string value;
-    const auto index_key = key_identity(identity_index_key(identity));
+    const auto index_key = key_identity(key.index_key());
     auto status = db_->Get(leveldb::ReadOptions(), index_key, &value);
     if (status.IsNotFound()) return std::nullopt;
     if (!status.ok()) {
@@ -1358,13 +1300,13 @@ std::optional<JobRecord> JobStore::readRowByIdentity(const JobIdentity& identity
 // The write primitive
 // ---------------------------------------------------------------------------
 
-bool JobStore::identity_owner_locked(const JobIdentity& identity, uint64_t& owner,
+bool JobStore::identity_owner_locked(const SchedulerKey& key, uint64_t& owner,
                                      std::string& error) {
     // Callers hold db_mtx_.
     owner = 0;
     std::string value;
     const auto status = db_->Get(leveldb::ReadOptions(),
-                                 key_identity(identity_index_key(identity)), &value);
+                                 key_identity(key.index_key()), &value);
     if (status.IsNotFound()) return true;
     if (!status.ok()) {
         error = "store_error";
@@ -1397,7 +1339,7 @@ bool JobStore::apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& bat
             return true;
         }
         case WriteOp::PutIdentity: {
-            if (!op.identity) {
+            if (!op.key) {
                 error = "invalid_op";
                 return false;
             }
@@ -1405,7 +1347,7 @@ bool JobStore::apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& bat
             // row still exists. An entry whose row is gone (interrupted
             // archive, unparsable value) is stale and overwritten here.
             uint64_t owner = 0;
-            if (!identity_owner_locked(*op.identity, owner, error)) return false;
+            if (!identity_owner_locked(*op.key, owner, error)) return false;
             if (owner != 0 && owner != op.internal_id) {
                 std::string raw;
                 const auto row = db_->Get(leveldb::ReadOptions(), key_job(owner), &raw);
@@ -1425,8 +1367,8 @@ bool JobStore::apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& bat
                 spdlog::warn("JobStore: overwriting a stale identity index entry that "
                              "named JobID {}", owner);
             }
-            const JobIdentity& identity = *op.identity;
-            batch.Put(key_identity(identity_index_key(identity)), nlohmann::json{
+            const SchedulerKey& identity = *op.key;
+            batch.Put(key_identity(identity.index_key()), nlohmann::json{
                 {"internal_id", op.internal_id},
                 {"scheduler_type", identity.adapter},
                 {"cluster_namespace", identity.cluster_namespace},
@@ -1438,16 +1380,16 @@ bool JobStore::apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& bat
             return true;
         }
         case WriteOp::DeleteIdentity: {
-            if (!op.identity) {
+            if (!op.key) {
                 error = "invalid_op";
                 return false;
             }
             // Release only an entry this instance still owns on disk: a newer
             // execution may have claimed the identity by now.
             uint64_t owner = 0;
-            if (!identity_owner_locked(*op.identity, owner, error)) return false;
+            if (!identity_owner_locked(*op.key, owner, error)) return false;
             if (owner == op.internal_id) {
-                batch.Delete(key_identity(identity_index_key(*op.identity)));
+                batch.Delete(key_identity(op.key->index_key()));
             }
             return true;
         }

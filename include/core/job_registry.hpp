@@ -229,8 +229,7 @@ public:
     // of re-evaluating the policy.
     UpsertResult upsertObservedJob(const Job& job, const InitialDecision* admission = nullptr);
     std::optional<JobRecord> inventoryRecord(uint64_t jobID) const;
-    std::optional<JobRecord> inventoryRecordByIdentity(
-        const JobIdentity& identity) const;
+    std::optional<JobRecord> inventoryRecordByKey(const SchedulerKey& key) const;
     std::vector<JobRecord> inventoryRecords() const;
     CollectionSelection selectionRecord(uint64_t jobID) const;
     // Optional collector-name gate. Unset accepts every non-empty name.
@@ -320,6 +319,10 @@ public:
     // configured adapter keep the generic two-component form carried by the
     // common fields themselves.
 
+    // The record's derived logical identity: the adapter owning the facts
+    // rebuilds the selector and the native-id rule canonicalizes it. nullopt
+    // means the facts do not name a job — never a guess.
+    std::optional<SchedulerKey> keyOf(const Job& job) const;
     // The structured namespace facts of one Job / one addressing selector.
     NamespaceFacts namespaceFactsOf(const Job& job) const;
     NamespaceFacts selectorFactsOf(const NativeSelector& selector) const;
@@ -460,7 +463,7 @@ private:
         const std::function<bool(const Job&)>& pred) const;
     bool ownHasActive(uint64_t id) const;
     size_t ownClosingCount() const;
-    std::optional<JobRecord> ownRecordByIdentity(const JobIdentity& identity) const;
+    std::optional<JobRecord> ownRecordByKey(const SchedulerKey& key) const;
     CollectionSelection ownSelection(uint64_t id) const;
     void publishRecord(JobRecord record);
     void eraseRecord(uint64_t id);
@@ -483,16 +486,8 @@ private:
     // register/merge semantics of a repeated identity live here so every
     // caller gets the same result.
     UpsertResult mergeDiscoveredJob(const JobRecord& stored, const Job& job,
-                                  const NativeSelector& selector,
-                                  const JobIdentity& identity,
-                                  uint64_t internal_id, int64_t observed_at,
-                                  JobRecord& updated_out);
-    // Adapter-owned identity->facts derivation (was the store's injected
-    // applier): the generic parts apply here, the scheduler typed-attr
-    // derivation dispatches through adapters_ by identity.adapter. Without
-    // adapters the observed facts are stored verbatim.
-    void applyIdentityToFacts(Job& facts, const NativeSelector& selector,
-                              const JobIdentity& identity) const;
+                                  const SchedulerKey& key, uint64_t internal_id,
+                                  int64_t observed_at, JobRecord& updated_out);
     // Resolves the adapter that owns one Job's scheduler facts: the Job's
     // subtype_name first (the one copy of the adapter name), the subtype
     // enum as a fallback for pre-name legacy rows. nullptr when no
@@ -509,12 +504,6 @@ private:
     mutable std::mutex namespace_adapter_mtx_;
     mutable std::map<std::string, std::unique_ptr<ISchedulerAdapter>>
         namespace_adapters_;
-    // Legacy selector reconstruction, shared by manual registration and the
-    // refreshJobFacts repair: the adapter owning the facts rebuilds the
-    // selector and folds its derived fields onto the Job (backfill only —
-    // facts a caller set explicitly are never overwritten). Returns an empty
-    // selector when no adapter owns the Job — incomplete, never a guess.
-    NativeSelector legacySelectorOf(Job& job) const;
     // The typed-facts duplicate screen. The adapter owns which of its facts
     // identify a scheduled job; an adapter-less row keeps the generic subtype
     // screen only.
@@ -653,7 +642,7 @@ private:
                              const std::map<std::string, bool>& source_complete);
     bool retireIfConfirmed(const JobRecord& record, const std::string& reason);
     void rememberEnded(const JobRecord& record);
-    bool isObsolete(const JobIdentity& identity, const ProcessIdentity& gen);
+    bool isObsolete(const SchedulerKey& key, const ProcessIdentity& gen);
     void publishStatusProvider();
     void retractStatusProvider();
     void noteHeartbeatError(const std::string& error);

@@ -78,11 +78,10 @@ public:
 
     // ---- typed facts / record projection ---------------------------------
     Job decodeFacts(const nlohmann::json& row) const override;
-    NativeSelector legacySelector(Job& job) const override;
+    NativeSelector legacySelector(const Job& job) const override;
     void projectFacts(Job& job) const override;
-    void applyIdentityToFacts(Job& job, const NativeSelector& selector,
-                              const JobIdentity& identity) const override;
-    NativeSelector registrationSelector(Job& job) const override;
+
+    NativeSelector registrationSelector(const Job& job) const override;
     void applyRequestFacts(Job& job, const nlohmann::json& request) const override;
     SubAttrMatcher duplicateMatcher(const Job& job) const override;
     void refreshLegacyFacts(Job& job) const override;

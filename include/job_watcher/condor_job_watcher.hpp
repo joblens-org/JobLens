@@ -77,8 +77,9 @@ public:
     // resolvable + generation complete); the watcher decides when *its*
     // discovery is finished. Each scheduler holds its own copy so the rules
     // may diverge later.
-    static bool discovery_ready(const Job& job);
-    static void finalize_discovery(Job& job, std::vector<std::string> source_reasons = {});
+    static std::optional<Job> finalize_discovery(Job job,
+                                                 std::vector<std::string> source_reasons = {},
+                                                 std::vector<std::string>* notes = nullptr);
 
     // Discovery inputs (paths, namespaces) may be re-resolved between passes.
     void set_discovery_environment(const DiscoveryEnvironment& environment);
@@ -123,8 +124,9 @@ private:
     // sources the scan path reads (starter environ, _CONDOR_JOB_AD file, slot
     // cgroup), through the injectable discovery roots. `preferred_member_pid`
     // (exec-hint path) is probed for the job ad before the other members.
-    Job observe_starter(const DiscoveryEnvironment& env, const std::string& boot_id,
-                        pid_t starter_pid, pid_t preferred_member_pid = 0);
+    std::optional<Job> observe_starter(const DiscoveryEnvironment& env, const std::string& boot_id,
+                        pid_t starter_pid, pid_t preferred_member_pid = 0,
+                        std::vector<std::string>* drop_notes = nullptr);
 
     // Member pids of one starter: cgroup members when the cgroup is readable,
     // otherwise the starter's live children in /proc (the classic layout where
@@ -182,40 +184,31 @@ inline CondorJobWatcher::CondorJobWatcher(DiscoveryOptions options)
 // Watcher-owned discovery semantics
 // ---------------------------------------------------------------------------
 
-inline bool CondorJobWatcher::discovery_ready(const Job& job)
-{
-    if (!job.identity.execution_complete()) return false;
-    // A finalized discovery records every missing piece (identity, generation
-    // AND source reasons — e.g. an unreadable job ad) in incomplete_reason;
-    // any of them disqualifies admission. Jobs that never went through
-    // finalize_discovery still get the honest recomputation.
-    if (!job.identity.incomplete_reason.empty()) return false;
-    return canonicalize(selector_of(job)).has_value();
-}
-
-inline void CondorJobWatcher::finalize_discovery(Job& job,
-                                                 std::vector<std::string> source_reasons)
+inline std::optional<Job> CondorJobWatcher::finalize_discovery(
+    Job job, std::vector<std::string> source_reasons, std::vector<std::string>* notes)
 {
     std::vector<std::string> reasons = std::move(source_reasons);
-
     if (!canonicalize(selector_of(job))) {
         reasons.push_back(
             "logical identity unresolved: scheduler type, cluster namespace or native job id missing");
     }
-
-    if (!job.identity.execution_complete()) {
+    if (!execution_complete(job.execution)) {
         reasons.push_back(
             "execution generation unresolved: manager pid, manager start ticks or boot id missing");
     }
-
-    std::string joined;
-    for (const auto& reason : reasons) {
-        if (!joined.empty()) joined += "; ";
-        joined += reason;
+    if (!reasons.empty()) {
+        // An incomplete discovery is not published. The registry never sees a
+        // half-read job, and the reason stays with the watcher that knows it.
+        std::string joined;
+        for (const auto& reason : reasons) {
+            if (!joined.empty()) joined += "; ";
+            joined += reason;
+        }
+        spdlog::warn("CondorJobWatcher: discovery dropped as incomplete: {}", joined);
+        if (notes != nullptr) notes->push_back("discovery dropped as incomplete: " + joined);
+        return std::nullopt;
     }
-    job.identity.incomplete_reason = joined;
-    // subtype_name is the published projection of identity.adapter.
-    job.subtype_name = job.identity.adapter;
+    return job;
 }
 
 inline bool CondorJobWatcher::start(const DiscoverySink& sink)
@@ -347,7 +340,11 @@ inline ScanResult CondorJobWatcher::scan()
     // idempotency point, so the accumulator (a second merge model) is gone.
     result.jobs.reserve(starters.size());
     for (pid_t starter : starters) {
-        result.jobs.push_back(observe_starter(env, boot_id, starter));
+        if (auto job = observe_starter(env, boot_id, starter, 0, &result.notes)) {
+            result.jobs.push_back(std::move(*job));
+        } else {
+            ++result.counts.incomplete;
+        }
     }
     return finish_scan(std::move(result));
 }
@@ -531,37 +528,26 @@ inline void CondorJobWatcher::handle_exec_event(uint32_t pid, uint32_t ppid)
     }
     if (!discovered) return;   // not a JobLens execution, or it already exited
 
-    if (CondorJobWatcher::discovery_ready(*discovered)) {
-        UpsertResult result;
-        try {
-            result = sink(*discovered);
-        } catch (const std::exception& error) {
-            spdlog::error("CondorJobWatcher: registration sink failed: {}", error.what());
-            requestRescan();
-            return;
-        }
-        // A facts/metadata failure asks the maintenance pass to look again; a
-        // post-commit failure is repaired from record state.
-        if (!result.ok && result.retry_registration()) requestRescan();
+    UpsertResult result;
+    try {
+        result = sink(*discovered);
+    } catch (const std::exception& error) {
+        spdlog::error("CondorJobWatcher: registration sink failed: {}", error.what());
+        requestRescan();
         return;
     }
-
-    // The scheduler metadata is not written yet (the ad/spool appears a moment
-    // after exec). One coalesced rescan request converges it in tens of ms
-    // without any per-pid state on this thread.
-    requestRescan();
+    // A facts/metadata failure asks the maintenance pass to look again; a
+    // post-commit failure is repaired from record state.
+    if (!result.ok && result.retry_registration()) requestRescan();
 }
 
 inline ScanResult CondorJobWatcher::finish_scan(ScanResult result)
 {
     result.finished_at_ms = scan_clock_now(options_.clock);
     result.complete = result.error.empty();
-    result.counts.complete = 0;
-    result.counts.incomplete = 0;
-    for (const auto& job : result.jobs) {
-        if (CondorJobWatcher::discovery_ready(job)) ++result.counts.complete;
-        else ++result.counts.incomplete;
-    }
+    // Only finalized jobs are published; the incomplete ones were counted by
+    // the producers.
+    result.counts.complete = result.jobs.size();
 
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -667,25 +653,25 @@ inline bool CondorJobWatcher::enumerate_starters_from_cgroup(
     return true;
 }
 
-inline Job CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,
+inline std::optional<Job> CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,
                                              const std::string& boot_id,
                                              pid_t starter_pid,
-                                             pid_t preferred_member_pid)
+                                             pid_t preferred_member_pid,
+                                             std::vector<std::string>* drop_notes)
 {
     // The Job is the registration unit: typed facts (filled here, where the
     // sources are parsed) plus the execution evidence group. No second
     // envelope — the registry derives selector/identity on admission.
     Job job;
-    JobIdentity& identity = job.identity;
+    ExecutionEvidence& execution = job.execution;
     std::vector<std::string> notes;
     // Assigned before the first read so the store can reject an older pass
     // overwriting newer facts.
-    identity.read_order = next_discovery_read_order();
+    execution.read_order = next_discovery_read_order();
     std::vector<std::string> reasons;
-    job.identity.adapter = name_;
+    job.subtype_name = name_;
     job.jobtype = JobType::Job;
     job.subtype = JobSubType::Condor;
-    identity.read_at_us = scan_clock_now(options_.clock) * 1000;
 
     std::string cluster_name = env.cluster_name;
     if (cluster_name.empty()) cluster_name = Utils::get_condor_collector_host();
@@ -694,9 +680,9 @@ inline Job CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,
     job.cluster_name = cluster_name;
 
     const auto manager = read_process_identity(env.proc_root, boot_id, starter_pid);
-    identity.manager.boot_id = manager.boot_id;
-    identity.manager.pid = starter_pid;
-    identity.manager.start_ticks = manager.start_ticks;
+    execution.manager.boot_id = manager.boot_id;
+    execution.manager.pid = starter_pid;
+    execution.manager.start_ticks = manager.start_ticks;
 
     std::string cgroup_path =
         read_proc_cgroup_path(env.proc_root, starter_pid, env.cgroup_root);
@@ -721,13 +707,13 @@ inline Job CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,
     // members; the typed attribute and the generation evidence must agree with
     // whatever survived.
     attributes.slots_cgroup_path = cgroup_path;
-    identity.members_authoritative = membership_known;
+    execution.members_authoritative = membership_known;
     for (pid_t member_pid : member_pids) {
         if (member_pid == starter_pid) continue;
         const auto member =
             read_process_identity(env.proc_root, boot_id, member_pid);
-        if (!member.complete()) identity.members_authoritative = false;
-        identity.members.push_back(member);
+        if (!member.complete()) execution.members_authoritative = false;
+        execution.members.push_back(member);
     }
     if (member_pids.empty() && membership_known)
         notes.push_back("cgroup " + cgroup_path +
@@ -795,8 +781,7 @@ inline Job CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,
     }
 
     job.sub_attr = attributes;
-    finalize_discovery(job, std::move(reasons));
-    return job;
+    return finalize_discovery(std::move(job), std::move(reasons), drop_notes);
 }
 
 inline bool CondorJobWatcher::init_event_source()

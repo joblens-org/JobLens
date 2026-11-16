@@ -201,23 +201,3 @@ CgroupMembershipProbe make_cgroup_membership_probe()
     };
 }
 
-// an owned instance.
-ExecutionVerdict verify_execution(const JobIdentity& identity,
-                                  const std::string& current_boot_id,
-                                  const ProcessLivenessProbe& probe)
-{
-    if (!identity.execution_complete()) {
-        return identity.observed ? ExecutionVerdict::Unknown
-                                 : ExecutionVerdict::Verified;   // manual: nothing to verify
-    }
-    if (!current_boot_id.empty() && identity.manager.boot_id != current_boot_id)
-        return ExecutionVerdict::Stale;   // another boot cannot host this execution
-    const LivenessResult result =
-        verify_process_identity(identity.manager, current_boot_id, probe);
-    switch (result.state) {
-        case LivenessState::Alive: return ExecutionVerdict::Verified;
-        case LivenessState::Dead: return ExecutionVerdict::Stale;
-        case LivenessState::Unknown: break;
-    }
-    return ExecutionVerdict::Unknown;
-}

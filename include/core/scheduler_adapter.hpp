@@ -129,7 +129,7 @@ public:
     // identity -> incomplete selector, never a guess). The adapter also folds
     // the derived common fields back onto the Job (fill-empty only), so the
     // record projection is produced in one place.
-    virtual NativeSelector legacySelector(Job& job) const = 0;
+    virtual NativeSelector legacySelector(const Job& job) const = 0;
 
     // Publishes the record-visible fields from the typed facts: subtype,
     // subtype_name, NativeJobID and the common namespace fields. Fill-empty
@@ -139,21 +139,10 @@ public:
         (void)job;
     }
 
-    // Applies a resolved identity to the typed facts (derives the typed attr
-    // fields the schema defines from the canonical form). The store calls it
-    // through the registry-injected applier on upsert; it is idempotent for
-    // facts a watcher already filled from its parsed sources.
-    // Default: nothing to derive — open-world (JSON) facts are kept verbatim.
-    virtual void applyIdentityToFacts(Job& facts, const NativeSelector& selector,
-                                      const JobIdentity& identity) const
-    {
-        (void)facts; (void)selector; (void)identity;
-    }
-
     // The selectors a manual registration request is resolved by, derived
     // from the typed facts the adapter just parsed. Empty = no scheduler
     // identity (generic/manual registration).
-    virtual NativeSelector registrationSelector(Job& job) const
+    virtual NativeSelector registrationSelector(const Job& job) const
     {
         (void)job;
         return {};
@@ -220,6 +209,14 @@ public:
     virtual void renderNamespace(Job& job) const
     {
         (void)job;
+    }
+
+    // The record's derived logical identity. The adapter owns the native-id
+    // rule, so it also owns how its facts become a key; nullopt means the
+    // facts do not name a job.
+    virtual std::optional<SchedulerKey> keyOf(const Job& job) const
+    {
+        return canonicalize(legacySelector(job));
     }
 
     virtual AdapterTraits traits() const = 0;
