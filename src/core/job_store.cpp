@@ -133,9 +133,9 @@ std::string generate_db_uuid() {
 // read_boot_id() lives in core/liveness so the store, the probes and the
 // admission boundary cannot disagree about the current boot.
 
-// A generation is only replayable on POSITIVE evidence: the same boot and the
+// An execution identity is only replayable on POSITIVE evidence: the same boot and the
 // same manager start time read back from the current process.  A populated
-// generation proves nothing by itself (a numeric PID is recycled), and a
+// execution identity proves nothing by itself (a numeric PID is recycled), and a
 // readable-but-different start time is positive proof of reuse.
 //
 // The third answer matters: when /proc/<pid>/stat cannot be read the process
@@ -143,30 +143,28 @@ std::string generate_db_uuid() {
 // "unknown") nor verified (never claim a complete execution we did not check).
 //
 // Provenance decides what "nothing to verify" means.  A manual/legacy row owns
-// no generation and its bound members are the evidence; a discovery row that
+// no manager identity and its bound members are the evidence; a discovery row that
 // never produced a complete manager identity has an UNVERIFIED execution, not a
-// verified one — an incomplete discovery generation must never be replayed as
+// verified one — an incomplete discovery execution must never be replayed as
 
 // ---------------------------------------------------------------------------
 // Serialization
 // ---------------------------------------------------------------------------
 
-nlohmann::json generation_to_json(const ExecutionGeneration& generation) {
+nlohmann::json manager_to_json(const ProcessIdentity& manager) {
     return nlohmann::json{
-        {"boot_id", generation.boot_id},
-        {"manager_pid", generation.manager_pid},
-        {"manager_start_ticks", generation.manager_start_ticks},
-        {"cgroup_identity", generation.cgroup_identity},
+        {"boot_id", manager.boot_id},
+        {"manager_pid", manager.pid},
+        {"manager_start_ticks", manager.start_ticks},
     };
 }
 
-ExecutionGeneration generation_from_json(const nlohmann::json& in) {
-    ExecutionGeneration generation;
-    generation.boot_id = in.value("boot_id", std::string{});
-    generation.manager_pid = in.value("manager_pid", pid_t{0});
-    generation.manager_start_ticks = in.value("manager_start_ticks", uint64_t{0});
-    generation.cgroup_identity = in.value("cgroup_identity", std::string{});
-    return generation;
+ProcessIdentity manager_from_json(const nlohmann::json& in) {
+    ProcessIdentity manager;
+    manager.boot_id = in.value("boot_id", std::string{});
+    manager.pid = in.value("manager_pid", pid_t{0});
+    manager.start_ticks = in.value("manager_start_ticks", uint64_t{0});
+    return manager;
 }
 
 nlohmann::json process_to_json(const ProcessIdentity& process) {
@@ -190,7 +188,6 @@ void write_job_fields(nlohmann::json& out, const Job& job) {
     out["subtype"]       = static_cast<int>(job.subtype);
     if (!job.subtype_name.empty()) out["subtype_name"] = job.subtype_name;
     out["pids"]          = job.JobPIDs;
-    out["collectors"]    = job.CollectorNames;
     out["native_job_id"] = job.NativeJobID;
     out["cluster_name"]  = job.cluster_name;
     out["clusterTag"]    = job.clusterTag;
@@ -211,12 +208,11 @@ nlohmann::json record_json(const JobRecord& record) {
     out["selection"] = selection_to_json(record.selection);
     out["revision"]       = record.revision;
     out["state"]          = record.state;
-    out["quarantined"]    = record.quarantined;
     out["first_seen_us"]  = record.first_seen_us;
     out["last_seen_us"]   = record.last_seen_us;
-    out["members_authoritative"] = members_authoritative_of(record.job);
-    out["execution_observed"] = record.execution_observed;
-    if (!record.job.subtype_name.empty()) out["adapter"] = record.job.subtype_name;
+    out["members_authoritative"] = record.job.identity.members_authoritative;
+    out["execution_observed"] = record.job.identity.observed;
+    if (!record.job.identity.adapter.empty()) out["adapter"] = record.job.identity.adapter;
     // The selector is a projection of the Job (selector_of): the row keeps
     // the frozen schema-4 shape, and readers fold the projection back onto
     // the Job's own fields on restore.
@@ -226,9 +222,9 @@ nlohmann::json record_json(const JobRecord& record) {
     } else {
         out["selector"] = row_selector;
     }
-    if (record.identity_complete) out["identity"] = record.identity;
-    else                          out["identity"] = nullptr;
-    out["generation"]     = generation_to_json(generation_of(record.job));
+    if (record.job.identity.logical_complete()) out["identity"] = record.job.identity;
+    else                                        out["identity"] = nullptr;
+    out["generation"]     = manager_to_json(record.job.identity.manager);
     out["members"]        = nlohmann::json::array();
     for (const auto& member : members_of(record.job)) {
         out["members"].push_back(process_to_json(member));
@@ -243,7 +239,6 @@ Job decode_legacy_job(const std::string& json_str) {
     job.subtype       = static_cast<JobSubType>(j.value("subtype", 0));
     job.subtype_name  = j.value("subtype_name", "");
     job.JobPIDs       = j.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>();
-    job.CollectorNames = j.value("collectors", nlohmann::json::array()).get<std::vector<std::string>>();
     job.NativeJobID   = j.value("native_job_id", "");
     job.cluster_name  = j.value("cluster_name", "");
     job.clusterTag    = j.value("clusterTag", "");
@@ -278,23 +273,18 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
     JobRecord record;
     record.job = decode_legacy_job(raw);
     record.job.JobID = internal_id;
-    record.internal_id = internal_id;
-    // The execution group is the one copy of the evidence; the row's
-    // generation/members/members_authoritative keys hydrate it below.
-    JobExecution& execution = ensure_execution(record.job);
+    JobIdentity& identity = record.job.identity;
 
     const auto j = nlohmann::json::parse(raw);
     record.revision       = j.value("revision", uint64_t{1});
     record.state          = j.value("state", std::string{kStateActive});
-    record.quarantined    = j.value("quarantined", false);
     record.first_seen_us  = j.value("first_seen_us", int64_t{0});
     record.last_seen_us   = j.value("last_seen_us", int64_t{0});
-    execution.members_authoritative = j.value("members_authoritative", false);
     // Legacy fold: rows written before the adapter name moved onto the Job
-    // carry it only under "adapter" — hydrate subtype_name so every reader
+    // carry it only under "adapter" — hydrate the identity so every reader
     // sees one copy.
-    if (record.job.subtype_name.empty())
-        record.job.subtype_name = j.value("adapter", std::string{});
+    if (identity.adapter.empty())
+        identity.adapter = j.value("adapter", std::string{});
     if (record.revision == 0) record.revision = 1;
 
     // Schema 4 stores the desired selection in the same row, ordered by the
@@ -314,18 +304,16 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
         // back onto the Job (backfill only — facts already in the row win).
         try {
             const auto selector = j["selector"].get<NativeSelector>();
-            if (record.job.subtype_name.empty() && !selector.adapter.empty())
-                record.job.subtype_name = selector.adapter;
+            if (identity.adapter.empty() && !selector.adapter.empty())
+                identity.adapter = selector.adapter;
             if (record.job.cluster_name.empty())
                 record.job.cluster_name = selector.cluster_name;
             if (record.job.clusterTag.empty())
                 record.job.clusterTag = selector.cluster_tag;
             if (record.job.NativeJobID.empty())
                 record.job.NativeJobID = selector.native_job_id;
-            // Step presence rides the selector's verbatim copy: the row layout
-            // is unchanged and the Job stays the single source of truth.
-            if (!selector.step_id.empty())
-                execution.step_id = selector.step_id;
+            if (identity.step_id.empty() && !selector.step_id.empty())
+                identity.step_id = selector.step_id;
         } catch (const std::exception& error) {
             spdlog::warn("JobStore: invalid stored selector for job {}: {}",
                          internal_id, error.what());
@@ -333,33 +321,40 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
     }
     if (j.contains("identity") && j["identity"].is_object()) {
         try {
-            record.identity = j["identity"].get<CanonicalIdentity>();
-            record.identity_complete = true;
+            identity = j["identity"].get<JobIdentity>();
         } catch (const std::exception& error) {
             spdlog::warn("JobStore: invalid stored identity for job {}: {}",
                          internal_id, error.what());
         }
     }
     if (j.contains("generation") && j["generation"].is_object()) {
-        execution.generation = generation_from_json(j["generation"]);
+        identity.manager = manager_from_json(j["generation"]);
     }
+    identity.members_authoritative = j.value("members_authoritative", false);
     // Provenance is stored explicitly.  A row written before the field existed
-    // is classified from its own evidence: any generation field means a
+    // is classified from its own evidence: a populated manager triple means a
     // discovery observation produced it, a completely empty one is the manual
-    // shape (manual registration never invents a generation).
+    // shape (manual registration never invents a manager).
     const bool has_execution_flag = j.contains("execution_observed");
-    record.execution_observed = has_execution_flag
-                                    ? j.value("execution_observed", false)
-                                    : !(execution.generation.boot_id.empty() &&
-                                        execution.generation.manager_pid == 0 &&
-                                        execution.generation.manager_start_ticks == 0);
+    identity.observed = has_execution_flag
+                            ? j.value("execution_observed", false)
+                            : !(identity.manager.boot_id.empty() &&
+                                identity.manager.pid == 0 &&
+                                identity.manager.start_ticks == 0);
     const auto members_it = j.contains("members") ? j.find("members") : j.find("processes");
     if (members_it != j.end() && members_it->is_array()) {
         for (const auto& process : *members_it) {
-            if (process.is_object()) execution.members.push_back(process_from_json(process));
+            if (process.is_object()) identity.members.push_back(process_from_json(process));
         }
-        execution.members = normalized_processes(std::move(execution.members));
+        identity.members = normalized_processes(std::move(identity.members));
     }
+    // subtype_name is a projection of identity.adapter. Do not clear a row's
+    // stored name when the identity object is absent/incomplete.
+    if (!identity.adapter.empty())
+        record.job.subtype_name = identity.adapter;
+    // The row's native id is the rendered projection of the logical key.
+    if (record.job.NativeJobID.empty())
+        record.job.NativeJobID = identity.native_job_id;
     return record;
 }
 
@@ -410,7 +405,7 @@ std::vector<ProcessIdentity> normalized_processes(std::vector<ProcessIdentity> p
 // Unambiguous identity index key. Canonical components are validated
 // (scheduler name, digits/dot native id, normalized step), so the only
 // free-form part is the cluster namespace and it is length-prefixed.
-std::string identity_index_key(const CanonicalIdentity& identity) {    std::string key;
+std::string identity_index_key(const JobIdentity& identity) {    std::string key;
     key.reserve(identity.cluster_namespace.size() + identity.canonical_native.size() + 32);
     key += identity.adapter;
     key += '|';
@@ -662,18 +657,17 @@ std::vector<JobRecord> JobStore::loadAll() {
         }
     }
 
-    size_t closing_restored = 0, incomplete = 0, quarantined = 0;
+    size_t closing_restored = 0, incomplete = 0;
     for (const auto& record : restored) {
         if (record.state == kStateClosing) ++closing_restored;
-        incomplete += record.identity_complete ? 0 : 1;
-        quarantined += record.quarantined ? 1 : 0;
+        incomplete += record.job.identity.logical_complete() ? 0 : 1;
     }
     if (closing_restored > 0) {
         spdlog::warn("JobStore: restored {} interrupted closing record(s); they will be "
                      "archived by the closing cleanup", closing_restored);
     }
-    spdlog::info("JobStore: loaded {} inventory record(s) ({} incomplete, {} quarantined)",
-                 restored.size(), incomplete, quarantined);
+    spdlog::info("JobStore: loaded {} inventory record(s) ({} incomplete)",
+                 restored.size(), incomplete);
     return restored;
 }
 
@@ -722,7 +716,7 @@ bool JobStore::flushDirty(const char* reason) {
 
     leveldb::WriteBatch batch;
     for (const auto& snapshot : snapshots)
-        batch.Put(key_job(snapshot.internal_id), record_json(snapshot).dump());
+        batch.Put(key_job(snapshot.job.JobID), record_json(snapshot).dump());
 
     leveldb::Status status;
     {
@@ -895,11 +889,11 @@ bool JobStore::recover_pending_locked(std::vector<JobRecord>& adopted,
         leveldb::WriteBatch batch;
         uint64_t fence_entries = 0;
         for (const auto& row : adopted) {
-            batch.Put(key_job(row.internal_id), record_json(row).dump());
+            batch.Put(key_job(row.job.JobID), record_json(row).dump());
             ++fence_entries;
         }
         for (const auto& row : extra_rows) {
-            batch.Put(key_job(row.internal_id), record_json(row).dump());
+            batch.Put(key_job(row.job.JobID), record_json(row).dump());
             ++fence_entries;
         }
         for (const auto& id : removed) {
@@ -1019,12 +1013,12 @@ bool JobStore::read_archive_fence_locked(uint64_t internal_id, ArchiveFence& fen
                       "recovery: {}", internal_id, exc.what());
         return false;
     }
-    if (!archived.identity_complete) return true;
+    if (!archived.job.identity.logical_complete()) return true;
 
     // The archive released the identity index only while this instance owned
     // it. Read the owner back instead of deleting blind: a newer execution may
     // own the same identity by now.
-    const std::string index_key = key_identity(identity_index_key(archived.identity));
+    const std::string index_key = key_identity(identity_index_key(archived.job.identity));
     std::string value;
     const auto index_status = db_->Get(leveldb::ReadOptions(), index_key, &value);
     if (!index_status.ok() && !index_status.IsNotFound()) {
@@ -1322,7 +1316,7 @@ uint64_t JobStore::nextJobId() {
 // Durable identity resolution (the ambiguous-create repair read)
 // ---------------------------------------------------------------------------
 
-std::optional<JobRecord> JobStore::readRowByIdentity(const CanonicalIdentity& identity) {
+std::optional<JobRecord> JobStore::readRowByIdentity(const JobIdentity& identity) {
     if (!store_ready()) return std::nullopt;
     std::lock_guard<std::mutex> db_lock(db_mtx_);
     if (!db_) return std::nullopt;
@@ -1370,7 +1364,7 @@ std::optional<JobRecord> JobStore::readRowByIdentity(const CanonicalIdentity& id
 // The write primitive
 // ---------------------------------------------------------------------------
 
-bool JobStore::identity_owner_locked(const CanonicalIdentity& identity, uint64_t& owner,
+bool JobStore::identity_owner_locked(const JobIdentity& identity, uint64_t& owner,
                                      std::string& error) {
     // Callers hold db_mtx_.
     owner = 0;
@@ -1437,7 +1431,7 @@ bool JobStore::apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& bat
                 spdlog::warn("JobStore: overwriting a stale identity index entry that "
                              "named JobID {}", owner);
             }
-            const CanonicalIdentity& identity = *op.identity;
+            const JobIdentity& identity = *op.identity;
             batch.Put(key_identity(identity_index_key(identity)), nlohmann::json{
                 {"internal_id", op.internal_id},
                 {"scheduler_type", identity.adapter},

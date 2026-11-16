@@ -66,7 +66,7 @@ struct JobRegistryNamespaceTestAccess {
         return false;
     }
     static std::optional<JobRecord> durableByIdentity(JobRegistry& registry,
-                                                       const CanonicalIdentity& identity)
+                                                       const JobIdentity& identity)
     {
         return registry.store_->readRowByIdentity(identity);
     }
@@ -88,7 +88,7 @@ struct JobRegistryNamespaceTestAccess {
         auto second = registry.manualUpdateTarget(b, std::nullopt);
         if (first.kind != JobRegistry::ManualTarget::Kind::Update ||
             second.kind != JobRegistry::ManualTarget::Kind::Update ||
-            first.record.internal_id != second.record.internal_id)
+            first.record.job.JobID != second.record.job.JobID)
             throw std::runtime_error("namespace race: both claims must preselect the same row");
         auto first_result = registry.updateManualInstance(first.record, a, nlohmann::json::object());
         auto second_result = registry.updateManualInstance(second.record, b, nlohmann::json::object());
@@ -311,7 +311,7 @@ void run(const std::string& base)
 
         const auto job = make_common_job();
         check(registry.addJob(job), "legacy registration must succeed");
-        const uint64_t id = registry.inventoryRecords().front().internal_id;
+        const uint64_t id = registry.inventoryRecords().front().job.JobID;
         check(registry.retireInstance(id), "retire the instance");
         check(!registry.inventoryRecord(id).has_value(),
               "retirement without subscribers archives immediately");
@@ -333,10 +333,10 @@ void run(const std::string& base)
         selector.adapter = "condor";
         selector.cluster_name = "htcondor01";
         selector.native_job_id = "700.0";
-        ExecutionGeneration generation;
+        ProcessIdentity generation;
         generation.boot_id = "boot";
-        generation.manager_pid = 4242;
-        generation.manager_start_ticks = 900000;
+        generation.pid = 4242;
+        generation.start_ticks = 900000;
         Job observation = discovered_job(selector, generation,
                                          {ProcessIdentity{4242, 900000, "boot"}}, true);
         observation.subtype = JobSubType::Condor;
@@ -388,10 +388,10 @@ void run(const std::string& base)
         selector.adapter = "condor";
         selector.cluster_name = "htcondor01";
         selector.native_job_id = "710.0";
-        ExecutionGeneration generation;
+        ProcessIdentity generation;
         generation.boot_id = "boot";
-        generation.manager_pid = 4343;
-        generation.manager_start_ticks = 0;  // unknown: not verified
+        generation.pid = 4343;
+        generation.start_ticks = 0;  // unknown: not verified
         Job observation = discovered_job(selector, generation,
                                          {ProcessIdentity{4343, 0, "boot"}}, true);
         observation.subtype = JobSubType::Condor;
@@ -407,8 +407,8 @@ void run(const std::string& base)
 
         // The observation that completes the generation selects automatically.
         auto completed = observation;
-        completed.execution->generation.manager_start_ticks = 910000;
-        completed.execution->members.front().start_ticks = 910000;
+        completed.identity.manager.start_ticks = 910000;
+        completed.identity.members.front().start_ticks = 910000;
         const auto updated = registry.upsertObservedJob(completed);
         check(updated.ok && updated.disposition == UpsertDisposition::Updated,
               "incomplete generation: the completing observation must update the record");
@@ -546,10 +546,10 @@ void run(const std::string& base)
         selector.adapter = "condor";
         selector.cluster_name = "htcondor01";
         selector.native_job_id = "720.0";
-        ExecutionGeneration generation;
+        ProcessIdentity generation;
         generation.boot_id = "boot";
-        generation.manager_pid = 4545;
-        generation.manager_start_ticks = 920000;
+        generation.pid = 4545;
+        generation.start_ticks = 920000;
         Job job = discovered_job(selector, generation, {ProcessIdentity{4545, 920000, "boot"}},
                                  true);
         job.subtype = JobSubType::Condor;
@@ -598,10 +598,10 @@ void run(const std::string& base)
         selector.adapter = "condor";
         selector.cluster_name = "htcondor01";
         selector.native_job_id = "730.0";
-        ExecutionGeneration generation;
+        ProcessIdentity generation;
         generation.boot_id = "boot";
-        generation.manager_pid = 4646;
-        generation.manager_start_ticks = 930000;
+        generation.pid = 4646;
+        generation.start_ticks = 930000;
         Job job = discovered_job(selector, generation, {ProcessIdentity{4646, 930000, "boot"}},
                                  true);
         job.subtype = JobSubType::Condor;
@@ -654,10 +654,10 @@ void run(const std::string& base)
             selector.adapter = "condor";
             selector.cluster_name = "htcondor01";
             selector.native_job_id = "740.0";
-            ExecutionGeneration generation;
+            ProcessIdentity generation;
             generation.boot_id = "boot";
-            generation.manager_pid = 4747;
-            generation.manager_start_ticks = 940000;
+            generation.pid = 4747;
+            generation.start_ticks = 940000;
             Job observation = discovered_job(
                 selector, generation, {ProcessIdentity{4747, 940000, "boot"}}, true);
             observation.subtype = JobSubType::Condor;
@@ -744,7 +744,7 @@ void run(const std::string& base)
             std::get<CondorJobAttr>(manual.sub_attr).proc_id = 0;
             manual.CollectorNames = {"cpumem_collector"};
             check(registry.addJob(manual), "upsert: the manual create must succeed");
-            const uint64_t created_id = registry.inventoryRecords().front().internal_id;
+            const uint64_t created_id = registry.inventoryRecords().front().job.JobID;
             const uint64_t revision_before =
                 registry.inventoryRecord(created_id)->revision;
 
@@ -810,8 +810,8 @@ void run(const std::string& base)
                 }
                 throw std::runtime_error(std::string("schedd: no row for ") + schedd);
             };
-            const uint64_t id_a = row_of("schedd-a").internal_id;
-            const uint64_t id_b = row_of("schedd-b").internal_id;
+            const uint64_t id_a = row_of("schedd-a").job.JobID;
+            const uint64_t id_b = row_of("schedd-b").job.JobID;
             check(std::get<CondorJobAttr>(row_of("schedd-b").job.sub_attr).scheduler_name ==
                       "schedd-b",
                   "schedd: the created row must keep the claimed scheduler attribution");
@@ -890,7 +890,7 @@ void run(const std::string& base)
             const auto tolerated =
                 registry.upsertJob(claim_legacy, nlohmann::json::object(), std::nullopt);
             check(tolerated["status"] == "success" &&
-                      tolerated["JobID"] == legacy_row.internal_id,
+                      tolerated["JobID"] == legacy_row.job.JobID,
                   "schedd: a claim on an unknown schedd must tolerate and update the "
                   "legacy row: " + tolerated.dump());
             check(registry.inventoryRecords().size() == 3,
@@ -915,10 +915,10 @@ void run(const std::string& base)
             selector.cluster_name = "htcondor01";
             selector.cluster_tag = "schedd-a";
             selector.native_job_id = "172.0";
-            ExecutionGeneration generation;
+            ProcessIdentity generation;
             generation.boot_id = "boot";
-            generation.manager_pid = 4747;
-            generation.manager_start_ticks = 940000;
+            generation.pid = 4747;
+            generation.start_ticks = 940000;
             Job observation = discovered_job(
                 selector, generation, {ProcessIdentity{4747, 940000, "boot"}}, true);
             observation.subtype = JobSubType::Condor;
@@ -991,7 +991,7 @@ void run(const std::string& base)
             selector.cluster_name = "a";
             selector.cluster_tag = "b@c";
             selector.native_job_id = "902.0";
-            ExecutionGeneration generation{"boot", 4747, 940000, ""};
+            ProcessIdentity generation{4747, 940000, "boot"};
             Job first = discovered_job(selector, generation,
                                        {ProcessIdentity{4747, 940000, "boot"}}, true);
             check(registry.upsertObservedJob(first).ok,
@@ -1041,7 +1041,7 @@ void run(const std::string& base)
             const auto rows = registry.inventoryRecords();
             uint64_t second_id = 0;
             for (const auto& row : rows)
-                if (row.job.cluster_name == "pool-b") second_id = row.internal_id;
+                if (row.job.cluster_name == "pool-b") second_id = row.job.JobID;
             check(second_id != 0, "namespace: second pool row exists");
             NativeSelector selector;
             selector.adapter = "condor";
@@ -1116,7 +1116,7 @@ void run(const std::string& base)
             check(!registry.addJob(b), "namespace: identical slurm create deduplicates");
             uint64_t id_b = 0;
             for (const auto& row : registry.inventoryRecords())
-                if (row.job.cluster_name == "cluster-b") id_b = row.internal_id;
+                if (row.job.cluster_name == "cluster-b") id_b = row.job.JobID;
             NativeSelector selector{"slurm", "cluster-b", "", "904", ""};
             b.CollectorNames = {"io_collector"};
             const auto updated = registry.upsertJob(b, nlohmann::json::object(), selector);
@@ -1189,7 +1189,7 @@ void run(const std::string& base)
                 attr.scheduler_name = job.clusterTag;
                 job.CollectorNames = {"cpumem_collector"};
                 check(registry.addJob(job), "namespace: restart fixture creates");
-                saved = registry.inventoryRecords().front().internal_id;
+                saved = registry.inventoryRecords().front().job.JobID;
                 registry.deinit();
             }
             {
@@ -1226,7 +1226,7 @@ void run(const std::string& base)
             std::get<CondorJobAttr>(legacy.sub_attr).cluster_id = 908;
             legacy.CollectorNames = {"cpumem_collector"};
             check(registry.addJob(legacy), "namespace race: legacy row creates");
-            const auto id = registry.inventoryRecords().front().internal_id;
+            const auto id = registry.inventoryRecords().front().job.JobID;
             Job a = legacy;
             std::get<CondorJobAttr>(a.sub_attr).scheduler_name = "schedd-a@submit";
             Job b = legacy;
@@ -1258,7 +1258,7 @@ void run(const std::string& base)
             check(registry.addJob(other), "namespace race: selector-only fixture creates");
             uint64_t other_id = 0;
             for (const auto& candidate : registry.inventoryRecords())
-                if (candidate.job.NativeJobID == "909.0") other_id = candidate.internal_id;
+                if (candidate.job.NativeJobID == "909.0") other_id = candidate.job.JobID;
             NativeSelector selector{"condor", "pool-a", "schedd-a@submit", "909.0", ""};
             const auto selected = registry.upsertJob(other, nlohmann::json::object(), selector);
             const auto selected_row = registry.inventoryRecord(other_id);
@@ -1322,13 +1322,13 @@ void run(const std::string& base)
             check(registry.addJob(legacy), "adoption occupied: legacy create");
             const auto target = JobRegistryNamespaceTestAccess::select(registry, legacy);
             NativeSelector selector{"condor", "pool", "schedd@submit", "912.0", ""};
-            ExecutionGeneration generation{"boot", 4912, 9912, ""};
+            ProcessIdentity generation{4912, 9912, "boot"};
             auto observation = discovered_job(selector, generation,
                                                {ProcessIdentity{4912, 9912, "boot"}}, true);
             const auto owner = registry.upsertObservedJob(observation);
-            check(owner.ok && owner.internal_id != target.internal_id,
+            check(owner.ok && owner.internal_id != target.job.JobID,
                   "adoption occupied: other owner creates");
-            const auto old_before = registry.inventoryRecord(target.internal_id);
+            const auto old_before = registry.inventoryRecord(target.job.JobID);
             const auto owner_before = registry.inventoryRecord(owner.internal_id);
             const auto owner_selection = registry.selectionRecord(owner.internal_id);
             Job claim = legacy;
@@ -1338,7 +1338,7 @@ void run(const std::string& base)
             const auto rejected = JobRegistryNamespaceTestAccess::update(registry, target, claim);
             check(rejected.value("status", "") == "error",
                   "adoption occupied: stale update must reject occupied key");
-            const auto old = registry.inventoryRecord(target.internal_id);
+            const auto old = registry.inventoryRecord(target.job.JobID);
             const auto held = registry.inventoryRecord(owner.internal_id);
             check(old && held && old_before && owner_before &&
                       old->revision == old_before->revision && held->revision == owner_before->revision &&
@@ -1346,7 +1346,7 @@ void run(const std::string& base)
                       held->job.clusterTag == "schedd@submit" &&
                       registry.inventoryRecords().size() == 2,
                   "adoption occupied: both rows remain unchanged");
-            check(registry.selectionRecord(target.internal_id).manual ==
+            check(registry.selectionRecord(target.job.JobID).manual ==
                       std::optional<std::vector<std::string>>(
                           std::vector<std::string>{"cpumem_collector"}),
                   "adoption occupied: rejected collectors remain unchanged");
@@ -1358,16 +1358,16 @@ void run(const std::string& base)
             check(old_identity && new_identity, "adoption occupied: valid test identities");
             const auto old_index = registry.inventoryRecordByIdentity(*old_identity);
             const auto owner_index = registry.inventoryRecordByIdentity(*new_identity);
-            check(old_index && owner_index && old_index->internal_id == target.internal_id &&
-                      owner_index->internal_id == owner.internal_id,
+            check(old_index && owner_index && old_index->job.JobID == target.job.JobID &&
+                      owner_index->job.JobID == owner.internal_id,
                   "adoption occupied: both index owners remain unchanged");
             registry.deinit();
             JobRegistry reopened(options);
             const auto old_reopened = reopened.inventoryRecordByIdentity(*old_identity);
             const auto owner_reopened = reopened.inventoryRecordByIdentity(*new_identity);
             check(old_reopened && owner_reopened &&
-                      old_reopened->internal_id == target.internal_id &&
-                      owner_reopened->internal_id == owner.internal_id,
+                      old_reopened->job.JobID == target.job.JobID &&
+                      owner_reopened->job.JobID == owner.internal_id,
                   "adoption occupied: durable index owners survive restart");
             reopened.deinit();
         }
@@ -1387,7 +1387,7 @@ void run(const std::string& base)
             std::get<CondorJobAttr>(legacy.sub_attr).cluster_id = 913;
             legacy.CollectorNames = {"cpumem_collector"};
             check(registry.addJob(legacy), "adoption observed: legacy create");
-            const auto id = registry.inventoryRecords().front().internal_id;
+            const auto id = registry.inventoryRecords().front().job.JobID;
             NativeSelector selector{"condor", "pool", "schedd@submit", "913.0", ""};
             Job claim = legacy;
             claim.CollectorNames.clear();
@@ -1403,9 +1403,9 @@ void run(const std::string& base)
             check(old_identity && new_identity &&
                       !registry.inventoryRecordByIdentity(*old_identity) &&
                       registry.inventoryRecordByIdentity(*new_identity) &&
-                      registry.inventoryRecordByIdentity(*new_identity)->internal_id == id,
+                      registry.inventoryRecordByIdentity(*new_identity)->job.JobID == id,
                   "adoption observed: in-memory identity index changes owner key");
-            ExecutionGeneration generation{"boot", 4913, 9913, ""};
+            ProcessIdentity generation{4913, 9913, "boot"};
             auto observation = discovered_job(selector, generation,
                                                {ProcessIdentity{4913, 9913, "boot"}}, true);
             const auto result = registry.upsertObservedJob(observation);
@@ -1414,7 +1414,7 @@ void run(const std::string& base)
             registry.deinit();
             JobRegistry reopened(options);
             const auto restored = reopened.inventoryRecordByIdentity(*new_identity);
-            check(restored && restored->internal_id == id &&
+            check(restored && restored->job.JobID == id &&
                       !reopened.inventoryRecordByIdentity(*old_identity),
                   "adoption observed: durable identity index survives restart");
             reopened.deinit();
@@ -1437,7 +1437,7 @@ void run(const std::string& base)
             std::get<CondorJobAttr>(legacy.sub_attr).cluster_id = 914;
             legacy.CollectorNames = {"cpumem_collector"};
             check(registry.addJob(legacy), "adoption recovery: legacy create");
-            const auto id = registry.inventoryRecords().front().internal_id;
+            const auto id = registry.inventoryRecords().front().job.JobID;
             Job claim = legacy;
             claim.CollectorNames.clear();
             NativeSelector selector{"condor", "pool", "schedd@submit", "914.0", ""};
@@ -1450,7 +1450,7 @@ void run(const std::string& base)
                   "adoption recovery: retry resolves original ID");
             const auto identity = canonicalize(selector);
             check(identity && registry.inventoryRecordByIdentity(*identity) &&
-                      registry.inventoryRecordByIdentity(*identity)->internal_id == id &&
+                      registry.inventoryRecordByIdentity(*identity)->job.JobID == id &&
                       registry.inventoryRecords().size() == 1,
                   "adoption recovery: row and index resolve together");
             registry.deinit();
@@ -1468,7 +1468,7 @@ void run(const std::string& base)
             JobRegistry registry(options);
             NativeSelector old_selector{"condor", "pool", "", "915.0", ""};
             NativeSelector new_selector{"condor", "pool", "schedd@submit", "915.0", ""};
-            ExecutionGeneration generation{"boot", 4915, 9915, ""};
+            ProcessIdentity generation{4915, 9915, "boot"};
             auto old_job = discovered_job(old_selector, generation,
                                           {ProcessIdentity{4915, 9915, "boot"}}, true);
             old_job.subtype = JobSubType::Condor;
@@ -1511,7 +1511,7 @@ void run(const std::string& base)
             const auto new_identity = canonicalize(new_selector);
             check(old_identity && new_identity, "checkpoint adoption: valid identities");
             const auto durable = JobRegistryNamespaceTestAccess::durableByIdentity(reopened, *new_identity);
-            check(durable && durable->identity_complete && durable->identity == *new_identity &&
+            check(durable && durable->job.identity.logical_complete() && logical_equal(durable->job.identity, *new_identity) &&
                       durable->job.clusterTag == "schedd@submit" &&
                       !JobRegistryNamespaceTestAccess::durableByIdentity(reopened, *old_identity),
                   "checkpoint adoption: durable row and identity index must agree after restart");

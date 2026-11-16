@@ -92,7 +92,7 @@ public:
     // Delegates to the shared identity derivation (moved from the store's
     // apply_identity_to_facts; idempotent for watcher-filled facts).
     void applyIdentityToFacts(Job& job, const NativeSelector& selector,
-                              const CanonicalIdentity& identity) const override
+                              const JobIdentity& identity) const override
     {
         apply_identity(job, selector, identity);
     }
@@ -135,7 +135,7 @@ public:
 
 private:
     static void apply_identity(Job& job, const NativeSelector& selector,
-                               const CanonicalIdentity& identity)
+                               const JobIdentity& identity)
     {
         job.NativeJobID = identity.native_job_id;
         if (job.jobtype != JobType::Job && job.jobtype != JobType::Sys) {

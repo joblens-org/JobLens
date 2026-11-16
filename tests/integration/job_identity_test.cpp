@@ -223,17 +223,17 @@ void slurm_steps_and_pid_reuse()
           "same PID across reboots is not the same process");
     check(!ProcessIdentity{4242, 0, ""}.complete(), "partial process identity");
 
-    // Execution generations distinguish manager restarts on one node.
-    const ExecutionGeneration generation{"boot-1", 900, 777, "/slurm/step_7"};
-    check(generation.complete(), "complete generation evidence");
-    check(generation == ExecutionGeneration{"boot-1", 900, 777, ""},
-          "cgroup identity is corroborating, not defining");
-    check(generation != ExecutionGeneration{"boot-1", 900, 778, "/slurm/step_7"},
-          "a restarted manager is a new execution generation");
-    check(generation != ExecutionGeneration{"boot-2", 900, 777, "/slurm/step_7"},
-          "a reboot is a new execution generation");
-    check(!ExecutionGeneration{"boot-1", 0, 0, ""}.complete(),
-          "generation without manager identity is incomplete");
+    // The manager triple distinguishes executions of one logical job.
+    const ProcessIdentity manager{900, 777, "boot-1"};
+    check(manager.complete(), "complete manager identity");
+    check(manager == ProcessIdentity{900, 777, "boot-1"},
+          "the same manager triple is the same execution");
+    check(manager != ProcessIdentity{900, 778, "boot-1"},
+          "a restarted manager is a new execution");
+    check(manager != ProcessIdentity{900, 777, "boot-2"},
+          "a reboot is a new execution");
+    check(!ProcessIdentity{0, 0, ""}.complete(),
+          "manager identity without pid/start ticks/boot is incomplete");
 }
 
 // Serialization round trips ---------------------------------------------------
@@ -266,10 +266,10 @@ void serialization_round_trip()
 
     const auto identity = canonicalize(slurm("7", "batch"));
     check(identity.has_value(), "slurm step selector canonicalizes");
-    const CanonicalIdentity identity_back =
-        nlohmann::json(*identity).get<CanonicalIdentity>();
-    check(identity_back == *identity,
-          "CanonicalIdentity round trip is lossless");
+    const JobIdentity identity_back =
+        nlohmann::json(*identity).get<JobIdentity>();
+    check(logical_equal(identity_back, *identity),
+          "JobIdentity round trip is lossless");
 
     // Open-world names: an unregistered adapter deserializes verbatim (never
     // guessed, never dropped — records of an uninstalled adapter stay

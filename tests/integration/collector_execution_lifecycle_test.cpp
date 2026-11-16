@@ -452,10 +452,10 @@ void run(const std::string& base)
         selector.adapter = "condor";
         selector.cluster_name = "htcondor01";
         selector.native_job_id = native;
-        ExecutionGeneration generation;
+        ProcessIdentity generation;
         generation.boot_id = "test-boot";
-        generation.manager_pid = getpid();
-        generation.manager_start_ticks = 1;
+        generation.pid = getpid();
+        generation.start_ticks = 1;
         Job job = discovered_job(selector, generation,
                                  {ProcessIdentity{getpid(), 1, "test-boot"}}, true);
         job.subtype = JobSubType::Condor;

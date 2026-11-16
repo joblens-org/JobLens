@@ -182,12 +182,12 @@ constexpr uint32_t kRpcSchemaVersion = 2;
 // the RPC only needs generation/process projections for inventory views)
 // ---------------------------------------------------------------------------
 
-nlohmann::json generation_to_json(const ExecutionGeneration& generation) {
+nlohmann::json manager_to_json(const ProcessIdentity& manager) {
     return nlohmann::json{
-        {"boot_id", generation.boot_id},
-        {"manager_pid", generation.manager_pid},
-        {"manager_start_ticks", generation.manager_start_ticks},
-        {"cgroup_identity", generation.cgroup_identity},
+        {"boot_id", manager.boot_id},
+        {"manager_pid", manager.pid},
+        {"manager_start_ticks", manager.start_ticks},
+        {"cgroup_identity", std::string{}},
     };
 }
 
@@ -288,7 +288,7 @@ uint64_t inventory_snapshot_revision(const std::vector<JobRecord>& records)
     for (const auto& record : records) ordered.push_back(&record);
     std::sort(ordered.begin(), ordered.end(),
               [](const JobRecord* lhs, const JobRecord* rhs) {
-                  return lhs->internal_id < rhs->internal_id;
+                  return lhs->job.JobID < rhs->job.JobID;
               });
 
     uint64_t hash = 0xcbf29ce484222325ULL;
@@ -299,11 +299,10 @@ uint64_t inventory_snapshot_revision(const std::vector<JobRecord>& records)
         }
     };
     for (const auto* record : ordered) {
-        mix(record->internal_id);
+        mix(record->job.JobID);
         mix(record->revision);
-        mix(record->quarantined ? 1u : 0u);
-        mix(record->identity_complete ? 2u : 0u);
-        mix(record->state == "closing" ? 3u : (record->execution_verified ? 5u : 4u));
+        mix(record->job.identity.logical_complete() ? 2u : 0u);
+        mix(record->state == "closing" ? 3u : (record->job.identity.verified ? 5u : 4u));
     }
     // Stay inside the signed 63-bit range so JavaScript consumers keep the
     // exact value; the revision is an opaque token, not a counter.
@@ -319,8 +318,7 @@ std::string inventory_source(const JobRecord& record)
 // bare nullopt (the optional itself is store-internal, 0-vs-missing rule).
 std::string step_id_text(const JobRecord& record)
 {
-    const auto& execution = record.job.execution;
-    return execution && execution->step_id ? *execution->step_id : std::string{};
+    return record.job.identity.step_id;
 }
 
 nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& record)
@@ -328,15 +326,15 @@ nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& rec
     nlohmann::json out;
     // Deprecated key kept for old readers; the value is the internal id as a
     // decimal string (same as internal_job_id).
-    out["instance_id"] = format_internal_id(record.internal_id);
+    out["instance_id"] = format_internal_id(record.job.JobID);
     // New APIs carry internal ids as decimal strings (JavaScript uint64 safety).
-    out["internal_job_id"] = format_internal_id(record.internal_id);
+    out["internal_job_id"] = format_internal_id(record.job.JobID);
     out["schema_version"] = kRpcSchemaVersion;
     out["record_revision"] = record.revision;
     out["state"] = record.state;
     out["source"] = inventory_source(record);
-    out["quarantined"] = record.quarantined;
-    out["identity_complete"] = record.identity_complete;
+    out["quarantined"] = false;
+    out["identity_complete"] = record.job.identity.logical_complete();
     // Selector fields are projections of the Job: the typed facts are the
     // single source of truth, no second copy rides the record.
     out["scheduler_type"] = record.job.subtype_name;
@@ -346,12 +344,12 @@ nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& rec
     out["step_id"] = step_id_text(record);
     out["first_seen_us"] = record.first_seen_us;
     out["last_seen_us"] = record.last_seen_us;
-    out["generation"] = generation_to_json(generation_of(record.job));
+    out["generation"] = manager_to_json(manager_of(record.job));
     out["processes"] = nlohmann::json::array();
     for (const auto& process : members_of(record.job)) {
         out["processes"].push_back(process_to_json(process));
     }
-    if (const auto job = registry.findJob(record.internal_id)) {
+    if (const auto job = registry.findJob(record.job.JobID)) {
         out["attributes"] = std::visit(
             [](const auto& attr) { return nlohmann::json(attr); }, job->sub_attr);
     } else {
@@ -365,7 +363,7 @@ std::vector<std::string> instance_ids_of(const std::vector<JobRecord>& records)
     std::vector<std::string> ids;
     ids.reserve(records.size());
     // Deprecated key spelling: the value is the internal id, decimal string.
-    for (const auto& record : records) ids.push_back(format_internal_id(record.internal_id));
+    for (const auto& record : records) ids.push_back(format_internal_id(record.job.JobID));
     return ids;
 }
 
@@ -373,7 +371,7 @@ void sort_records(std::vector<JobRecord>& records)
 {
     std::sort(records.begin(), records.end(),
               [](const JobRecord& lhs, const JobRecord& rhs) {
-                  return lhs.internal_id < rhs.internal_id;
+                  return lhs.job.JobID < rhs.job.JobID;
               });
 }
 
@@ -434,13 +432,13 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
     // canonical namespace).
     const auto selector_facts = registry.selectorFactsOf(selector);
     for (auto& record : registry.inventoryRecords()) {
-        if (is_reserved_internal_id(record.internal_id)) continue;
-        if (!record.identity_complete) continue;
-        if (record.identity.adapter != identity->adapter) continue;
-        if (record.identity.canonical_native != identity->canonical_native) continue;
+        if (is_reserved_internal_id(record.job.JobID)) continue;
+        if (!record.job.identity.logical_complete()) continue;
+        if (record.job.identity.adapter != identity->adapter) continue;
+        if (record.job.identity.canonical_native != identity->canonical_native) continue;
         if (!namespace_facts_compatible(selector_facts, registry.namespaceFactsOf(record.job)))
             continue;
-        if (!identity->step_id.empty() && record.identity.step_id != identity->step_id) continue;
+        if (!identity->step_id.empty() && record.job.identity.step_id != identity->step_id) continue;
         matches.push_back(std::move(record));
     }
     sort_records(matches);
@@ -477,9 +475,9 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
     }
 
     for (const auto& record : matches) {
-        if (!registry.findJob(record.internal_id).has_value()) {
+        if (!registry.findJob(record.job.JobID).has_value()) {
             result.code = "generation_closing";
-            result.message = "instance " + format_internal_id(record.internal_id) +
+            result.message = "instance " + format_internal_id(record.job.JobID) +
                              " is closing and rejects new binding mutations";
             result.records.clear();
             return result;
@@ -505,9 +503,9 @@ TargetResolution resolve_instance_handle_by_id(JobRegistry& registry, uint64_t i
                          format_internal_id(internal_id) + "'";
         return result;
     }
-    if (!registry.findJob(record->internal_id).has_value()) {
+    if (!registry.findJob(record->job.JobID).has_value()) {
         result.code = "generation_closing";
-        result.message = "instance " + format_internal_id(record->internal_id) +
+        result.message = "instance " + format_internal_id(record->job.JobID) +
                          " is closing and rejects new binding mutations";
         return result;
     }
@@ -527,8 +525,8 @@ nlohmann::json collection_target_json(JobRegistry& registry, const JobRecord& re
 
     nlohmann::json out;
     // Deprecated key kept for old readers; same value as internal_job_id.
-    out["instance_id"] = format_internal_id(record.internal_id);
-    out["internal_job_id"] = format_internal_id(record.internal_id);
+    out["instance_id"] = format_internal_id(record.job.JobID);
+    out["internal_job_id"] = format_internal_id(record.job.JobID);
     out["native_job_id"] = record.job.NativeJobID;
     // Accepted: the durable record revision the command committed.
     out["record_revision"] = revision;
@@ -854,8 +852,8 @@ nlohmann::json inventory_status_payload(JobRegistry& registry)
     uint64_t suspect = 0;
     uint64_t closing = 0;
     for (const auto& record : registry.inventoryRecords()) {
-        if (is_reserved_internal_id(record.internal_id)) continue;
-        if (!record.execution_verified) ++suspect;
+        if (is_reserved_internal_id(record.job.JobID)) continue;
+        if (!record.job.identity.verified) ++suspect;
         else if (record.state == "closing") ++closing;
         else ++active;
     }
@@ -1049,7 +1047,7 @@ void registerInventoryRpc(JobRegistry& registry) {
 
             std::vector<JobRecord> matching;
             for (auto& record : registry.inventoryRecords()) {
-                if (is_reserved_internal_id(record.internal_id)) continue;
+                if (is_reserved_internal_id(record.job.JobID)) continue;
                 if (!scheduler_filter.empty() &&
                     record.job.subtype_name != scheduler_filter)
                     continue;
@@ -1091,13 +1089,13 @@ void registerInventoryRpc(JobRegistry& registry) {
             uint64_t last_emitted = after;
             bool more = false;
             for (const auto& record : matching) {
-                if (record.internal_id <= after) continue;
+                if (record.job.JobID <= after) continue;
                 if (emitted == limit) {
                     more = true;
                     break;
                 }
                 records.push_back(inventory_record_json(registry, record));
-                last_emitted = record.internal_id;
+                last_emitted = record.job.JobID;
                 ++emitted;
             }
 
@@ -1299,7 +1297,7 @@ void registerInventoryRpc(JobRegistry& registry) {
             request.collectors = collectors;
             request.expected_revision = expected_revision;
             for (const auto& record : resolution.records)
-                request.targets.push_back(record.internal_id);
+                request.targets.push_back(record.job.JobID);
 
             const auto outcome = operation == "set" ? registry.setCollectors(request)
                                                     : registry.resetAuto(request);
@@ -1356,10 +1354,10 @@ void registerInventoryRpc(JobRegistry& registry) {
                 return error_payload(resolution.code, resolution.message);
 
             const auto& record = resolution.records.front();
-            const auto selection = registry.selectionRecord(record.internal_id);
+            const auto selection = registry.selectionRecord(record.job.JobID);
             auto target = collection_target_json(registry, record, selection,
                                                  record.revision, false,
-                                                 registry.actualCollection(record.internal_id));
+                                                 registry.actualCollection(record.job.JobID));
 
             nlohmann::json out;
             out["status"] = "ok";
@@ -1371,7 +1369,7 @@ void registerInventoryRpc(JobRegistry& registry) {
             out["cluster_tag"] = record.job.clusterTag;
             out["step_id"] = step_id_text(record);
             out["state"] = record.state;
-            out["quarantined"] = record.quarantined;
+            out["quarantined"] = false;
             out["mode"] = target["mode"];
             out["record_revision"] = target["record_revision"];
             out["desired_collectors"] = target["desired_collectors"];

@@ -232,7 +232,7 @@ inline std::optional<std::uint64_t> read_proc_start_ticks(const std::string& pro
 }
 
 // Boot identity for the host that owns `proc_root`. Empty when unavailable, in
-// which case no ProcessIdentity/ExecutionGeneration is complete.
+// which case no ProcessIdentity/manager identity is complete.
 inline std::string read_boot_id(const std::string& proc_root)
 {
     // The boot id of one root never changes while the process runs; the

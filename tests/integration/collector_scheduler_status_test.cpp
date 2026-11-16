@@ -773,7 +773,7 @@ void run(const std::string& base) {
                            std::optional<JobRecord>& out) const override {
             std::lock_guard lock(mutex_);
             for (const auto& record : records_) {
-                if (record.internal_id != internal_id) continue;
+                if (record.job.JobID != internal_id) continue;
                 out = record;
                 return true;
             }
@@ -810,7 +810,7 @@ void run(const std::string& base) {
     auto record_of = [](uint64_t id, const std::string& state,
                         std::vector<std::string> manual) {
         JobRecord record;
-        record.internal_id = id;
+        record.job.JobID = id;
         record.state = state;
         record.revision = 1;
         record.job.JobID = id;
@@ -1590,7 +1590,7 @@ void run(const std::string& base) {
         bool runtimeRecord(uint64_t internal_id,
                            std::optional<JobRecord>& out) const override {
             for (const auto& record : records) {
-                if (record.internal_id == internal_id) {
+                if (record.job.JobID == internal_id) {
                     out = record;
                     return true;
                 }
@@ -1602,7 +1602,7 @@ void run(const std::string& base) {
 
     StaticSource injected;
     JobRecord injected_record;
-    injected_record.internal_id = 777;
+    injected_record.job.JobID = 777;
     injected_record.state = kStateActive;
     injected_record.revision = 1;
     injected_record.job.JobID = 777;

@@ -230,7 +230,7 @@ public:
         std::string policy_revision;
     };
     // Identity-resolving idempotent upsert. Incomplete identities and
-    // conflicting live generations are rejected explicitly and never indexed.
+    // conflicting live executions are rejected explicitly and never indexed.
     // An upsert never fires lifecycle callbacks or starts collection: runtime
     // application is binding-driven. `admission` (internal) carries a
     // pre-evaluated admission decision: when it holds an initial collector
@@ -239,7 +239,7 @@ public:
     UpsertResult upsertObservedJob(const Job& job, const InitialDecision* admission = nullptr);
     std::optional<JobRecord> inventoryRecord(uint64_t jobID) const;
     std::optional<JobRecord> inventoryRecordByIdentity(
-        const CanonicalIdentity& identity) const;
+        const JobIdentity& identity) const;
     std::vector<JobRecord> inventoryRecords() const;
     CollectionSelection selectionRecord(uint64_t jobID) const;
     // Optional collector-name gate. Unset accepts every non-empty name.
@@ -464,7 +464,7 @@ private:
         const std::function<bool(const Job&)>& pred) const;
     bool ownHasActive(uint64_t id) const;
     size_t ownClosingCount() const;
-    std::optional<JobRecord> ownRecordByIdentity(const CanonicalIdentity& identity) const;
+    std::optional<JobRecord> ownRecordByIdentity(const JobIdentity& identity) const;
     CollectionSelection ownSelection(uint64_t id) const;
     void publishRecord(JobRecord record);
     void eraseRecord(uint64_t id);
@@ -476,7 +476,7 @@ private:
     // caller gets the same result.
     UpsertResult mergeDiscoveredJob(const JobRecord& stored, const Job& job,
                                   const NativeSelector& selector,
-                                  const CanonicalIdentity& identity,
+                                  const JobIdentity& identity,
                                   uint64_t internal_id, int64_t observed_at,
                                   JobRecord& updated_out);
     // Adapter-owned identity->facts derivation (was the store's injected
@@ -484,7 +484,7 @@ private:
     // derivation dispatches through adapters_ by identity.adapter. Without
     // adapters the observed facts are stored verbatim.
     void applyIdentityToFacts(Job& facts, const NativeSelector& selector,
-                              const CanonicalIdentity& identity) const;
+                              const JobIdentity& identity) const;
     // Resolves the adapter that owns one Job's scheduler facts: the Job's
     // subtype_name first (the one copy of the adapter name), the subtype
     // enum as a fallback for pre-name legacy rows. nullptr when no
@@ -538,7 +538,7 @@ private:
     // no observation queue and no drain step, so a discovered job is durable
     // before the watcher continues with the next event.
     struct AbsenceEntry {
-        ExecutionGeneration generation;
+        ProcessIdentity manager;
         int complete_absences = 0;
         std::int64_t last_seen_ms = 0;
     };
@@ -546,8 +546,8 @@ private:
     std::condition_variable hb_cv_;
     std::map<uint64_t, AbsenceEntry> absences_;
     std::set<uint64_t> suspect_ids_;
-    std::map<std::string, ExecutionGeneration> ended_generations_;
-    std::vector<std::pair<uint64_t, ExecutionGeneration>> closing_generations_;
+    std::map<std::string, ProcessIdentity> ended_executions_;
+    std::vector<std::pair<uint64_t, ProcessIdentity>> closing_executions_;
     bool hb_admitted_ = false;     // false after stopInventoryDiscovery()
     bool hb_running_ = false;      // worker thread alive
     bool hb_stopping_ = false;
@@ -630,7 +630,7 @@ private:
                              const std::map<std::string, bool>& source_complete);
     bool retireIfConfirmed(const JobRecord& record, const std::string& reason);
     void rememberEnded(const JobRecord& record);
-    bool isObsolete(const CanonicalIdentity& identity, const ExecutionGeneration& gen);
+    bool isObsolete(const JobIdentity& identity, const ProcessIdentity& gen);
     void publishStatusProvider();
     void retractStatusProvider();
     void noteHeartbeatError(const std::string& error);

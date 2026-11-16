@@ -42,7 +42,7 @@ struct UpsertResult {
     uint64_t revision = 0;
     // True when this upsert completed the execution generation of a record
     // that was stored unverified: its first-complete-registration trigger.
-    bool generation_became_complete = false;
+    bool execution_became_complete = false;
     // Typed reason. `error` is the stable wire string derived from
     // it; callers must branch on the code, never parse the string.
     RegistrationError code = RegistrationError::None;

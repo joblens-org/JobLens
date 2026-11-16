@@ -22,11 +22,12 @@
 #include <utility>
 #include <vector>
 
-inline Job discovered_job(NativeSelector selector, ExecutionGeneration generation,
+inline Job discovered_job(NativeSelector selector, ProcessIdentity manager,
                           std::vector<ProcessIdentity> members, bool members_complete,
                           std::int64_t read_at_us = 0)
 {
     Job job;
+    job.identity.adapter = selector.adapter;
     job.subtype_name = selector.adapter;
     job.NativeJobID = selector.native_job_id;
     // A discovery source hands over typed facts (the single namespace
@@ -55,12 +56,10 @@ inline Job discovered_job(NativeSelector selector, ExecutionGeneration generatio
     job.cluster_name = selector.cluster_name;
     job.clusterTag = selector.cluster_tag;
     job.jobtype = JobType::Job;
-    JobExecution execution;
-    execution.generation = std::move(generation);
-    execution.members = std::move(members);
-    execution.members_authoritative = members_complete;
-    if (!selector.step_id.empty()) execution.step_id = selector.step_id;
-    execution.read_at_us = read_at_us;
-    job.execution = std::move(execution);
+    job.identity.manager = std::move(manager);
+    job.identity.members = std::move(members);
+    job.identity.members_authoritative = members_complete;
+    job.identity.step_id = selector.step_id;
+    job.identity.read_at_us = read_at_us;
     return job;
 }

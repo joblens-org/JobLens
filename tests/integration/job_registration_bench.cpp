@@ -639,9 +639,8 @@ int main(int argc, char** argv)
             // The policy sees the stored projection, whose PIDs come from the
             // store (discovery leaves them empty).
             probe_job->JobPIDs.clear();
-            if (execution.execution)
-                for (const auto& member : execution.execution->members)
-                    probe_job->JobPIDs.push_back(member.pid);
+            for (const auto& member : execution.identity.members)
+                probe_job->JobPIDs.push_back(member.pid);
         }
         executions.push_back(std::move(execution));
     }

@@ -184,7 +184,7 @@ std::optional<uint32_t> slurm_step_value(const std::string& step_id)
 // Canonical identity
 // ---------------------------------------------------------------------------
 
-std::string CanonicalIdentity::key() const
+std::string JobIdentity::key() const
 {
     std::string joined;
     joined.reserve(adapter.size() + cluster_namespace.size() +
@@ -201,7 +201,7 @@ std::string CanonicalIdentity::key() const
     return joined;
 }
 
-bool operator==(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs)
+bool logical_equal(const JobIdentity& lhs, const JobIdentity& rhs)
 {
     return lhs.adapter == rhs.adapter &&
            lhs.cluster_namespace == rhs.cluster_namespace &&
@@ -209,12 +209,16 @@ bool operator==(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs)
            lhs.step_id == rhs.step_id;
 }
 
-bool operator!=(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs)
+void set_logical(JobIdentity& target, const JobIdentity& logical)
 {
-    return !(lhs == rhs);
+    target.adapter = logical.adapter;
+    target.cluster_namespace = logical.cluster_namespace;
+    target.native_job_id = logical.native_job_id;
+    target.canonical_native = logical.canonical_native;
+    target.step_id = logical.step_id;
 }
 
-std::optional<CanonicalIdentity> canonicalize(const NativeSelector& selector)
+std::optional<JobIdentity> canonicalize(const NativeSelector& selector)
 {
     if (selector.adapter.empty()) return std::nullopt;
     if (selector.cluster_name.empty()) return std::nullopt;
@@ -227,7 +231,7 @@ std::optional<CanonicalIdentity> canonicalize(const NativeSelector& selector)
     const auto parts = (*rule)(selector);
     if (!parts) return std::nullopt;
 
-    CanonicalIdentity identity;
+    JobIdentity identity;
     identity.adapter = selector.adapter;
     identity.native_job_id = selector.native_job_id; // preserved verbatim
     identity.cluster_namespace = parts->cluster_namespace;
@@ -246,13 +250,7 @@ bool operator==(const ProcessIdentity& lhs, const ProcessIdentity& rhs)
            lhs.boot_id == rhs.boot_id;
 }
 
-bool operator==(const ExecutionGeneration& lhs, const ExecutionGeneration& rhs)
-{
-    return lhs.boot_id == rhs.boot_id && lhs.manager_pid == rhs.manager_pid &&
-           lhs.manager_start_ticks == rhs.manager_start_ticks;
-}
-
-bool operator!=(const ExecutionGeneration& lhs, const ExecutionGeneration& rhs)
+bool operator!=(const ProcessIdentity& lhs, const ProcessIdentity& rhs)
 {
     return !(lhs == rhs);
 }
@@ -288,7 +286,7 @@ void from_json(const nlohmann::json& in, NativeSelector& selector)
     selector.step_id = in.value("step_id", "");
 }
 
-void to_json(nlohmann::json& out, const CanonicalIdentity& identity)
+void to_json(nlohmann::json& out, const JobIdentity& identity)
 {
     out = nlohmann::json::object();
     out["adapter"] = identity.adapter;
@@ -299,7 +297,7 @@ void to_json(nlohmann::json& out, const CanonicalIdentity& identity)
     out["step_id"] = identity.step_id;
 }
 
-void from_json(const nlohmann::json& in, CanonicalIdentity& identity)
+void from_json(const nlohmann::json& in, JobIdentity& identity)
 {
     std::string name;
     if (in.contains("adapter") && in.at("adapter").is_string())

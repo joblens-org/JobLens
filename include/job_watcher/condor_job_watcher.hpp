@@ -184,12 +184,12 @@ inline CondorJobWatcher::CondorJobWatcher(DiscoveryOptions options)
 
 inline bool CondorJobWatcher::discovery_ready(const Job& job)
 {
-    if (!job.execution || !job.execution->generation.complete()) return false;
+    if (!job.identity.execution_complete()) return false;
     // A finalized discovery records every missing piece (identity, generation
     // AND source reasons — e.g. an unreadable job ad) in incomplete_reason;
     // any of them disqualifies admission. Jobs that never went through
     // finalize_discovery still get the honest recomputation.
-    if (!job.execution->incomplete_reason.empty()) return false;
+    if (!job.identity.incomplete_reason.empty()) return false;
     return canonicalize(selector_of(job)).has_value();
 }
 
@@ -203,7 +203,7 @@ inline void CondorJobWatcher::finalize_discovery(Job& job,
             "logical identity unresolved: scheduler type, cluster namespace or native job id missing");
     }
 
-    if (!job.execution || !job.execution->generation.complete()) {
+    if (!job.identity.execution_complete()) {
         reasons.push_back(
             "execution generation unresolved: manager pid, manager start ticks or boot id missing");
     }
@@ -213,9 +213,9 @@ inline void CondorJobWatcher::finalize_discovery(Job& job,
         if (!joined.empty()) joined += "; ";
         joined += reason;
     }
-    // ensure_execution (never optional::emplace) so an already-built evidence
-    // group survives the finalization.
-    ensure_execution(job).incomplete_reason = joined;
+    job.identity.incomplete_reason = joined;
+    // subtype_name is the published projection of identity.adapter.
+    job.subtype_name = job.identity.adapter;
 }
 
 inline bool CondorJobWatcher::start(const DiscoverySink& sink)
@@ -676,15 +676,16 @@ inline Job CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,
     // sources are parsed) plus the execution evidence group. No second
     // envelope — the registry derives selector/identity on admission.
     Job job;
-    JobExecution& execution = job.execution.emplace();
+    JobIdentity& identity = job.identity;
+    std::vector<std::string> notes;
     // Assigned before the first read so the store can reject an older pass
     // overwriting newer facts.
-    execution.read_order = next_discovery_read_order();
+    identity.read_order = next_discovery_read_order();
     std::vector<std::string> reasons;
-    job.subtype_name = name_;
+    job.identity.adapter = name_;
     job.jobtype = JobType::Job;
     job.subtype = JobSubType::Condor;
-    execution.read_at_us = scan_clock_now(options_.clock) * 1000;
+    identity.read_at_us = scan_clock_now(options_.clock) * 1000;
 
     std::string cluster_name = env.cluster_name;
     if (cluster_name.empty()) cluster_name = Utils::get_condor_collector_host();
@@ -693,14 +694,14 @@ inline Job CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,
     job.cluster_name = cluster_name;
 
     const auto manager = read_process_identity(env.proc_root, boot_id, starter_pid);
-    execution.generation.boot_id = manager.boot_id;
-    execution.generation.manager_pid = starter_pid;
-    execution.generation.manager_start_ticks = manager.start_ticks;
+    identity.manager.boot_id = manager.boot_id;
+    identity.manager.pid = starter_pid;
+    identity.manager.start_ticks = manager.start_ticks;
 
     std::string cgroup_path =
         read_proc_cgroup_path(env.proc_root, starter_pid, env.cgroup_root);
     if (cgroup_path.empty()) {
-        execution.notes.push_back(fmt::format(
+        notes.push_back(fmt::format(
             "cgroup path unavailable for starter pid {}", starter_pid));
     }
 
@@ -714,23 +715,22 @@ inline Job CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,
     // membership must be known before the ad resolution can fall back to it.
     bool membership_known = false;
     const auto member_pids =
-        collect_member_pids(env, cgroup_path, execution.notes, starter_pid,
+        collect_member_pids(env, cgroup_path, notes, starter_pid,
                             membership_known);
     // The cgroup may have been discarded as daemon-shared while collecting
     // members; the typed attribute and the generation evidence must agree with
     // whatever survived.
-    execution.generation.cgroup_identity = cgroup_path;
     attributes.slots_cgroup_path = cgroup_path;
-    execution.members_authoritative = membership_known;
+    identity.members_authoritative = membership_known;
     for (pid_t member_pid : member_pids) {
         if (member_pid == starter_pid) continue;
         const auto member =
             read_process_identity(env.proc_root, boot_id, member_pid);
-        if (!member.complete()) execution.members_authoritative = false;
-        execution.members.push_back(member);
+        if (!member.complete()) identity.members_authoritative = false;
+        identity.members.push_back(member);
     }
     if (member_pids.empty() && membership_known)
-        execution.notes.push_back("cgroup " + cgroup_path +
+        notes.push_back("cgroup " + cgroup_path +
                                   " has no member processes");
 
     // Job ad resolution: the starter's own _CONDOR_JOB_AD first, then the job
@@ -755,7 +755,7 @@ inline Job CondorJobWatcher::observe_starter(const DiscoveryEnvironment& env,
             if (read_proc_env(env.proc_root, candidate, "_CONDOR_JOB_AD", ad_path,
                               candidate_error) &&
                 !ad_path.empty()) {
-                execution.notes.push_back(fmt::format(
+                notes.push_back(fmt::format(
                     "_CONDOR_JOB_AD read from job process {} (starter has none)", candidate));
                 break;
             }

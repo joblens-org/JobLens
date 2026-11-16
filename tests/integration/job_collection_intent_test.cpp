@@ -84,11 +84,10 @@ Job condor_observation(const std::string& native,
                        pid_t manager_pid = 4242,
                        uint64_t start_ticks = 900000)
 {
-    ExecutionGeneration generation;
+    ProcessIdentity generation;
     generation.boot_id = boot_id;
-    generation.manager_pid = manager_pid;
-    generation.manager_start_ticks = start_ticks;
-    generation.cgroup_identity = "/sys/fs/cgroup/htcondor/slot1";
+    generation.pid = manager_pid;
+    generation.start_ticks = start_ticks;
     Job observation = discovered_job(condor_selector(native), generation,
                                      {ProcessIdentity{manager_pid, start_ticks, boot_id}}, true);
 
@@ -416,7 +415,7 @@ void durable_intent_survives_restart_and_generation_change(const std::string& ba
 
         const auto record = registry.inventoryRecord(internal_id);
         check(record.has_value(), "restart must restore the inventory record");
-        check(format_internal_id(record->internal_id) == instance_id,
+        check(format_internal_id(record->job.JobID) == instance_id,
               "restart must keep the same instance handle (the internal id)");
 
         const auto same_generation = registry.upsertObservedJob(condor_observation("172.0"));

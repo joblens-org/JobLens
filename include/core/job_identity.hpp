@@ -13,17 +13,14 @@
  * limitations under the License. */
 // Identity foundation for the job inventory.
 //
-// Layers kept strictly apart:
-//   * internal storage key  - uint64 JobID allocated by this Agent DB,
-//                             0 reserved for the system sentinel
-//   * logical scheduler identity - NativeSelector/CanonicalIdentity here
-//   * local execution identity   - ExecutionGeneration (+ ProcessIdentity)
-//   * external instance handle   - the internal ID as a decimal string
-//                             (format_internal_id)
+// ONE identity type, two parts:
+//   * logical identity  - which scheduled job (adapter / namespace / native / step)
+//   * execution identity - which local run of it (manager process + members)
 //
-// A native scheduler number, a caller hash or a bare PID is never an internal
-// ID and never a complete identity. Incomplete identities fail explicitly and
-// must stay out of committed identity indexes.
+// The internal storage id (uint64 JobID, 0 reserved) and the external decimal
+// handle (format_internal_id) are addressing, not identity. A native scheduler
+// number, a caller hash or a bare PID is never a complete identity; incomplete
+// identities fail explicitly and stay out of committed identity indexes.
 #pragma once
 
 #include <cstdint>
@@ -32,6 +29,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -98,7 +96,7 @@ std::optional<std::string> slurm_step_name(uint32_t numeric_step);
 std::optional<uint32_t> slurm_step_value(const std::string& step_id);
 
 // ---------------------------------------------------------------------------
-// Native selector and canonical logical identity
+// Native selector (query side) and process identity (evidence leaf)
 // ---------------------------------------------------------------------------
 
 struct NativeSelector {
@@ -113,20 +111,65 @@ struct NativeSelector {
     std::string step_id;
 };
 
-struct CanonicalIdentity {
+// A numeric PID alone is insufficient: the same number maps to different
+// processes across forks and reboots. Equality uses the full triple.
+struct ProcessIdentity {
+    pid_t pid = 0;
+    uint64_t start_ticks = 0;  // /proc/<pid>/stat field 22
+    std::string boot_id;       // /proc/sys/kernel/random/boot_id
+
+    bool complete() const { return pid > 0 && start_ticks > 0 && !boot_id.empty(); }
+};
+bool operator==(const ProcessIdentity& lhs, const ProcessIdentity& rhs);
+bool operator!=(const ProcessIdentity& lhs, const ProcessIdentity& rhs);
+
+// ---------------------------------------------------------------------------
+// JobIdentity — the only identity type
+// ---------------------------------------------------------------------------
+//
+// Logical part: which scheduled job. Execution part: which local run of it,
+// anchored on the manager process (Condor starter / Slurm slurmstepd). A slot
+// name, a cgroup path or a bare PID never proves execution identity alone:
+// they are reused, which is why the manager triple is mandatory and the cgroup
+// is not part of identity at all.
+struct JobIdentity {
+    // --- logical identity: which scheduled job -----------------------------
     std::string adapter;             // adapter registry name (never empty)
-    std::string cluster_namespace;  // cluster_name plus tag when applicable
-    std::string native_job_id;      // original native string, preserved
-    std::string canonical_native;   // numeric-normalized form used for keys
-    std::string step_id;            // normalized Slurm step, or empty
+    std::string cluster_namespace;   // cluster_name plus tag when applicable
+    std::string native_job_id;       // original native string, preserved
+    std::string canonical_native;    // numeric-normalized form used for keys
+    std::string step_id;             // normalized Slurm step, or empty
+
+    // --- execution identity: which local run -------------------------------
+    ProcessIdentity manager;                 // boot_id + pid + start_ticks
+    std::vector<ProcessIdentity> members;
+    bool members_authoritative = false;
+
+    // --- observation state -------------------------------------------------
+    bool observed = false;   // discovery owns the execution facts
+    bool verified = true;    // last liveness check (not a lifecycle state)
+    uint64_t read_order = 0; // process-monotonic read order, assigned before reading
+    int64_t read_at_us = 0;  // source read time
+    std::string incomplete_reason;
+
+    bool logical_complete() const
+    {
+        return !adapter.empty() && !cluster_namespace.empty() &&
+               !native_job_id.empty() && !canonical_native.empty();
+    }
+    bool execution_complete() const { return manager.complete(); }
 
     // Total-order key covering type, namespace, native identity and step.
     // Equal keys mean the same logical scheduler identity.
     std::string key() const;
 };
 
-bool operator==(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs);
-bool operator!=(const CanonicalIdentity& lhs, const CanonicalIdentity& rhs);
+// Logical equality only. Execution identity is compared through `manager`.
+bool logical_equal(const JobIdentity& lhs, const JobIdentity& rhs);
+
+// Copies the logical part onto an existing identity, leaving execution evidence
+// (manager / members / observation state) untouched.
+void set_logical(JobIdentity& target, const JobIdentity& logical);
 
 // ---------------------------------------------------------------------------
 // Native-id rule helpers (used by the built-in adapters' rules)
@@ -196,48 +239,19 @@ private:
 // Validates and completes a selector through the adapter's registered rule.
 // No rule, an empty adapter name, a missing cluster namespace or an
 // unparsable native id yields nullopt: an incomplete observation, never a
-// guess. The generic parts (key assembly, verbatim native preservation) live
-// here; everything scheduler-specific lives in the rule.
-std::optional<CanonicalIdentity> canonicalize(const NativeSelector& selector);
+// guess. Only the logical part is filled; execution evidence stays default.
+std::optional<JobIdentity> canonicalize(const NativeSelector& selector);
 
 // Serialization round trips preserve the original native string, the
 // normalized step and every namespace field. The adapter name is written
 // under BOTH "adapter" and the legacy "scheduler_type" key (same lowercase
 // name, byte-identical to what to_string(SchedulerType) produced, so old
 // readers and persisted rows keep working); deserialization accepts either.
+//
+// JobIdentity serialization covers the LOGICAL part only: execution evidence
+// is persisted under its own keys by the store codec so the frozen row layout
+// stays readable.
 void to_json(nlohmann::json& out, const NativeSelector& selector);
 void from_json(const nlohmann::json& in, NativeSelector& selector);
-void to_json(nlohmann::json& out, const CanonicalIdentity& identity);
-void from_json(const nlohmann::json& in, CanonicalIdentity& identity);
-
-// ---------------------------------------------------------------------------
-// Process and execution-generation identity
-// ---------------------------------------------------------------------------
-// A numeric PID alone is insufficient: the same number maps to different
-// processes across forks and reboots. Equality uses the full triple.
-struct ProcessIdentity {
-    pid_t pid = 0;
-    uint64_t start_ticks = 0;  // /proc/<pid>/stat field 22
-    std::string boot_id;       // /proc/sys/kernel/random/boot_id
-
-    bool complete() const { return pid > 0 && start_ticks > 0 && !boot_id.empty(); }
-};
-bool operator==(const ProcessIdentity& lhs, const ProcessIdentity& rhs);
-
-// Evidence that two observations belong to the same local execution of one
-// logical job. Neither a slot name nor a cgroup path alone proves generation
-// equality (Condor slots and cgroups are reused), which is why manager
-// identity is mandatory and the cgroup is only corroborating evidence.
-struct ExecutionGeneration {
-    std::string boot_id;
-    pid_t manager_pid = 0;
-    uint64_t manager_start_ticks = 0;
-    std::string cgroup_identity;  // optional; empty = unavailable
-
-    bool complete() const
-    {
-        return manager_pid > 0 && manager_start_ticks > 0 && !boot_id.empty();
-    }
-};
-bool operator==(const ExecutionGeneration& lhs, const ExecutionGeneration& rhs);
-bool operator!=(const ExecutionGeneration& lhs, const ExecutionGeneration& rhs);
+void to_json(nlohmann::json& out, const JobIdentity& identity);
+void from_json(const nlohmann::json& in, JobIdentity& identity);

@@ -123,7 +123,7 @@ public:
     // facts a watcher already filled from its parsed sources.
     // Default: nothing to derive — open-world (JSON) facts are kept verbatim.
     virtual void applyIdentityToFacts(Job& facts, const NativeSelector& selector,
-                                      const CanonicalIdentity& identity) const
+                                      const JobIdentity& identity) const
     {
         (void)facts; (void)selector; (void)identity;
     }

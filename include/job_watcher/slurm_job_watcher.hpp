@@ -170,12 +170,12 @@ inline SlurmJobWatcher::SlurmJobWatcher(DiscoveryOptions options)
 
 inline bool SlurmJobWatcher::discovery_ready(const Job& job)
 {
-    if (!job.execution || !job.execution->generation.complete()) return false;
+    if (!job.identity.execution_complete()) return false;
     // A finalized discovery records every missing piece (identity, generation
     // AND source reasons — e.g. an unresolved step) in incomplete_reason; any
     // of them disqualifies admission. Jobs that never went through
     // finalize_discovery still get the honest recomputation.
-    if (!job.execution->incomplete_reason.empty()) return false;
+    if (!job.identity.incomplete_reason.empty()) return false;
     return canonicalize(selector_of(job)).has_value();
 }
 
@@ -189,7 +189,7 @@ inline void SlurmJobWatcher::finalize_discovery(Job& job,
             "logical identity unresolved: scheduler type, cluster namespace or native job id missing");
     }
 
-    if (!job.execution || !job.execution->generation.complete()) {
+    if (!job.identity.execution_complete()) {
         reasons.push_back(
             "execution generation unresolved: manager pid, manager start ticks or boot id missing");
     }
@@ -199,9 +199,9 @@ inline void SlurmJobWatcher::finalize_discovery(Job& job,
         if (!joined.empty()) joined += "; ";
         joined += reason;
     }
-    // ensure_execution (never optional::emplace) so an already-built evidence
-    // group survives the finalization.
-    ensure_execution(job).incomplete_reason = joined;
+    job.identity.incomplete_reason = joined;
+    // subtype_name is the published projection of identity.adapter.
+    job.subtype_name = job.identity.adapter;
 }
 
 inline bool SlurmJobWatcher::start(const DiscoverySink& sink)
@@ -595,20 +595,21 @@ inline Job SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& env,
     // sources are parsed) plus the execution evidence group. No second
     // envelope — the registry derives selector/identity on admission.
     Job job;
-    JobExecution& execution = job.execution.emplace();
+    JobIdentity& identity = job.identity;
+    std::vector<std::string> notes;
     // Assigned before the first read so the store can reject an older pass
     // overwriting newer facts.
-    execution.read_order = next_discovery_read_order();
+    identity.read_order = next_discovery_read_order();
     std::vector<std::string> reasons;
-    job.subtype_name = name_;
+    job.identity.adapter = name_;
     job.jobtype = JobType::Job;
     job.subtype = JobSubType::Slurm;
-    execution.read_at_us = scan_clock_now(options_.clock) * 1000;
+    identity.read_at_us = scan_clock_now(options_.clock) * 1000;
 
     const auto manager = read_process_identity(env.proc_root, boot_id, stepd_pid);
-    execution.generation.boot_id = manager.boot_id;
-    execution.generation.manager_pid = stepd_pid;
-    execution.generation.manager_start_ticks = manager.start_ticks;
+    identity.manager.boot_id = manager.boot_id;
+    identity.manager.pid = stepd_pid;
+    identity.manager.start_ticks = manager.start_ticks;
 
     // Typed attrs the scan fills from the members' environment; the identity
     // derivations join once the env pass below agrees.
@@ -634,7 +635,7 @@ inline Job SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& env,
         std::string env_error;
         if (!read_proc_env_values(env.proc_root, member_pid, kEnvKeys,
                                   env_values, env_error)) {
-            execution.notes.push_back(fmt::format(
+            notes.push_back(fmt::format(
                 "child pid {} environment unreadable: {}", member_pid, env_error));
             continue;
         }
@@ -650,7 +651,7 @@ inline Job SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& env,
             continue;
         }
         if (job_id && *job_id != *candidate_job) {
-            execution.notes.push_back(fmt::format(
+            notes.push_back(fmt::format(
                 "slurmstepd {} children disagree on SLURM_JOB_ID; using {}",
                 stepd_pid, *job_id));
             continue;
@@ -667,7 +668,7 @@ inline Job SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& env,
             continue;
         }
         if (step_id && *step_id != *candidate_step) {
-            execution.notes.push_back(fmt::format(
+            notes.push_back(fmt::format(
                 "slurmstepd {} children disagree on SLURM_STEP_ID; using {}",
                 stepd_pid, SlurmJob::step_id_name(*step_id)));
             continue;
@@ -704,7 +705,7 @@ inline Job SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& env,
             "slurmstepd {} step identity unresolved (SLURM_STEP_ID missing or unparsable)",
             stepd_pid));
     } else {
-        execution.step_id = SlurmJob::step_id_name(*step_id);
+        identity.step_id = SlurmJob::step_id_name(*step_id);
         attributes.step_id = *step_id;
     }
     if (job.cluster_name.empty())
@@ -724,10 +725,9 @@ inline Job SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& env,
         cgroup_path =
             read_proc_cgroup_path(env.proc_root, member_pids.front(), env.cgroup_root);
         if (!cgroup_path.empty())
-            execution.notes.push_back(fmt::format(
+            notes.push_back(fmt::format(
                 "stepd cgroup unknown; used member pid {} cgroup", member_pids.front()));
     }
-    execution.generation.cgroup_identity = cgroup_path;
     attributes.cgroup_path = cgroup_path;
 
     std::vector<pid_t> effective_members = member_pids;
@@ -742,18 +742,18 @@ inline Job SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& env,
                 }
             }
         } else {
-            execution.members_authoritative = false;
-            execution.notes.push_back("step cgroup membership unreadable: " + cgroup_error);
+            identity.members_authoritative = false;
+            notes.push_back("step cgroup membership unreadable: " + cgroup_error);
         }
     } else if (!member_pids.empty()) {
         // Members are known from children only; the cgroup may hold more.
-        execution.members_authoritative = false;
+        identity.members_authoritative = false;
     }
     for (pid_t member_pid : effective_members) {
         if (member_pid == stepd_pid) continue;
         const auto member = read_process_identity(env.proc_root, boot_id, member_pid);
-        if (!member.complete()) execution.members_authoritative = false;
-        execution.members.push_back(member);
+        if (!member.complete()) identity.members_authoritative = false;
+        identity.members.push_back(member);
     }
 
     job.sub_attr = attributes;
@@ -767,13 +767,14 @@ inline Job SlurmJobWatcher::observe_spool_entry(const DiscoveryEnvironment& env,
     // Spool entries never become collectable instances: no process evidence,
     // no step identity. The Job carries the reason explicitly.
     Job job;
-    JobExecution& execution = job.execution.emplace();
-    execution.read_order = next_discovery_read_order();
+    JobIdentity& identity = job.identity;
+    std::vector<std::string> notes;
+    identity.read_order = next_discovery_read_order();
     std::vector<std::string> reasons;
-    job.subtype_name = name_;
+    job.identity.adapter = name_;
     job.jobtype = JobType::Job;
     job.subtype = JobSubType::Slurm;
-    execution.read_at_us = scan_clock_now(options_.clock) * 1000;
+    identity.read_at_us = scan_clock_now(options_.clock) * 1000;
     job.cluster_name = env.cluster_name;
 
     const bool has_prefix = dir_name.size() > 3 && dir_name.compare(0, 3, "job") == 0;
@@ -787,7 +788,7 @@ inline Job SlurmJobWatcher::observe_spool_entry(const DiscoveryEnvironment& env,
         reasons.push_back("slurm cluster namespace unresolved (SLURM_CLUSTER_NAME unavailable)");
     reasons.push_back("no live slurmstepd observed for spool directory '" + dir_name +
                       "' in '" + env.slurm_spool_dir + "'");
-    execution.notes.push_back(
+    notes.push_back(
         "spool entry only proves the job directory exists; no step or process evidence");
 
     finalize_discovery(job, std::move(reasons));

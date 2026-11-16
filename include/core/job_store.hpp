@@ -64,7 +64,7 @@
 
 // Canonical key of the durable identity index entry (`i:` layout). Shared by
 // the store (row maintenance) and the registry (its in-memory index mirror).
-std::string identity_index_key(const CanonicalIdentity& identity);
+std::string identity_index_key(const JobIdentity& identity);
 
 class JobStore;
 struct JobRecord;
@@ -213,39 +213,15 @@ inline constexpr const char* kStateActive = "active";
 inline constexpr const char* kStateClosing = "closing";
 
 struct JobRecord {
-    // --- the Job as collectors see it (projection source) ---------------
-    // job.execution carries the one copy of the execution evidence
-    // (generation / members / members_authoritative) every record owns;
-    // manual registrations emplace the group when they bind their PIDs.
-    // The Job is also the one copy of the selector facts (subtype_name,
-    // cluster namespace, native id, execution->step_id): the wire selector
-    // is a projection (selector_of) derived on demand — persisted rows write
-    // that projection under "selector" so the frozen schema 4 layout is
-    // unchanged, and readers fold it back onto the Job on restore.
+    // The one core object: facts + identity. Management state below is the
+    // only thing the record adds. `job.JobID` is the storage key; there is no
+    // second internal id.
     Job job;
-    // --- execution evidence ---------------------------------------------
-    CanonicalIdentity identity;          // valid only when identity_complete
-    bool identity_complete = false;
-    bool quarantined = false;
-    // Which path owns the execution facts.  A discovery observation EXPECTS a
-    // manager generation, so an incomplete one is an unverified execution, not
-    // a manual registration.  A manual/legacy row owns no generation and its
-    // bound member identities are its only execution evidence.  Set by the
-    // registry's upsert create/merge paths (true) and manual registration
-    // (false); never inferred from a member count.
-    bool execution_observed = false;
-    // --- JobLens management state ----------------------------------------
-    uint64_t internal_id = 0;
     std::string state = kStateActive;    // active | closing
     // The ONE record revision. Every durable mutation of this record advances
     // it: facts, automatic bookkeeping and manual selection commands alike. A
     // CAS reads and compares this same value inside the write transaction.
     uint64_t revision = 0;
-    // Liveness evidence from the last restore/observation. False means the
-    // execution could not be verified (unreadable process, incomplete discovery
-    // identity). It is NOT a lifecycle state: the record stays Open, admission
-    // is refused, and absence never authorizes retirement or PID deletion.
-    bool execution_verified = true;
     int64_t first_seen_us = 0;
     int64_t last_seen_us = 0;
     // --- desired selection (the runtime's actual state is not stored) -----
@@ -315,7 +291,7 @@ public:
     // publishing anything, and the durable index is the documented repair
     // source. nullopt when no entry exists or the row it names is gone (a
     // stale entry the next create's PutIdentity overwrites).
-    std::optional<JobRecord> readRowByIdentity(const CanonicalIdentity& identity);
+    std::optional<JobRecord> readRowByIdentity(const JobIdentity& identity);
 
     // --- internal id allocation ------------------------------------------
     uint64_t nextJobId();   // ready-checked; 0 when the store is not ready
@@ -360,7 +336,7 @@ public:
         } kind = PutRecord;
         uint64_t internal_id = 0;
         std::optional<JobRecord> record;              // PutRecord / PutHistory
-        std::optional<CanonicalIdentity> identity;    // i: operations
+        std::optional<JobIdentity> identity;    // i: operations
         // PutHistory: hex end-time suffix of the h: key; empty = stamped by
         // the store at commit time (the value's end_time_us always matches).
         std::string history_key_suffix;
@@ -476,7 +452,7 @@ private:    // Injected by the registry; see setRowProvider.
     void record_store_success();
     // Reads the durable `i:` owner of one identity. Returns false on a read
     // error; owner == 0 means "no parsable owner" (a stale entry).
-    bool identity_owner_locked(const CanonicalIdentity& identity, uint64_t& owner,
+    bool identity_owner_locked(const JobIdentity& identity, uint64_t& owner,
                                std::string& error);
     // Serializes job_db transactions.
     mutable std::mutex db_mtx_;

@@ -298,13 +298,13 @@ Job make_condor_job(const std::string& native,
     attributes.owner = "alice";
     attributes.collector_host = cluster;
     job.sub_attr = attributes;
-    JobExecution& execution = job.execution.emplace();
-    execution.generation.boot_id = "boot-aaa";
-    execution.generation.manager_pid = manager_pid;
-    execution.generation.manager_start_ticks = manager_ticks;
-    execution.generation.cgroup_identity = cgroup;
+    JobIdentity& identity_block = job.identity;
+    identity_block.adapter = "condor";
+    identity_block.manager.boot_id = "boot-aaa";
+    identity_block.manager.pid = manager_pid;
+    identity_block.manager.start_ticks = manager_ticks;
     for (const pid_t member : members) {
-        execution.members.push_back(ProcessIdentity{member, manager_ticks, "boot-aaa"});
+        identity_block.members.push_back(ProcessIdentity{member, manager_ticks, "boot-aaa"});
     }
     CondorJobWatcher::finalize_discovery(job);
     return job;
@@ -367,7 +367,7 @@ std::size_t count_records(JobRegistry& registry)
     const auto records = registry.inventoryRecords();
     std::size_t count = 0;
     for (const auto& record : records) {
-        if (record.internal_id != 0) ++count;
+        if (record.job.JobID != 0) ++count;
     }
     return count;
 }
@@ -610,7 +610,7 @@ void run_a08(const std::string& base)
     check(wait_until([&]() {
               auto record = find_native(registry, "101.0");
               return record.has_value() &&
-                     record->internal_id == before->internal_id;
+                     record->job.JobID == before->job.JobID;
           }, 3000),
           "duplicate hint changed the internal id");
     check(count_records(registry) == 2, "duplicate hints duplicated records");
@@ -638,7 +638,7 @@ void run_a08(const std::string& base)
     check(registry.reconcileInventoryNow(), "the revival pass did not run");
     const auto revived_record = find_native(registry, "101.0");
     check(revived_record.has_value() &&
-              revived_record->job.execution->generation.manager_pid == 5102,
+              revived_record->job.identity.manager.pid == 5102,
           "a new generation was rejected after retirement");
     check(count_records(registry) == 2, "duplicate entry for one generation");
 
@@ -757,7 +757,7 @@ void run_a10(const std::string& base)
     probes.set_cgroup("/cg/slot-4", {6001}, true);
     const auto record = find_native(registry, "300.0");
     check(record.has_value(), "record missing");
-    check(record->job.execution->members.empty(),
+    check(record->job.identity.members.empty(),
           "fixture should have an empty PID list");
 
     source.set_scan([&]() { return scan_with({}); });
@@ -859,7 +859,7 @@ void run_a11(const std::string& base)
     check(count_records(registry) == 3, "namespaces merged");
     check(find_native(registry, "400.0", "htcondor02", "schedd-b").has_value(),
           "second namespace record missing");
-    check(find_native(registry, "400.0")->job.execution->generation.manager_pid == 5500,
+    check(find_native(registry, "400.0")->job.identity.manager.pid == 5500,
           "wrong record was updated");
 
     registry.deinit();
@@ -997,13 +997,13 @@ void run_a14(const std::string& base)
           "retirement did not enter the closing state");
     // The runtime's own pass is what dispatches the drain/Removed; the
     // heartbeat only committed the Closing intent.
-    test_runtime(registry).reconcile(old_record->internal_id);
+    test_runtime(registry).reconcile(old_record->job.JobID);
     {
         std::lock_guard<std::mutex> lock(observer_mutex);
-        check(removed.size() == 1 && removed.front() == old_record->internal_id,
+        check(removed.size() == 1 && removed.front() == old_record->job.JobID,
               "the closing retirement was not published to observers");
     }
-    check(registry.inventoryRecord(old_record->internal_id).has_value(),
+    check(registry.inventoryRecord(old_record->job.JobID).has_value(),
           "closing instance disappeared before acknowledgement");
 
     // A new job reuses the same PID and cgroup path while the old record is
@@ -1015,20 +1015,20 @@ void run_a14(const std::string& base)
 
     const auto new_record = find_native(registry, "700.1");
     check(new_record.has_value(), "new instance was not registered");
-    check(new_record->internal_id != old_record->internal_id,
+    check(new_record->job.JobID != old_record->job.JobID,
           "new instance reused the retired internal id");
 
     // The collector drain acknowledges the removal: this is the real
     // production ack path, and it must never touch the new ownership.
-    check(test_runtime(registry).completeDrain(old_record->internal_id),
+    check(test_runtime(registry).completeDrain(old_record->job.JobID),
           "the drain acknowledgement failed");
     check(registry.closingJobCount() == 0, "old closing record was not finalized");
-    check(registry.inventoryRecord(new_record->internal_id).has_value(),
+    check(registry.inventoryRecord(new_record->job.JobID).has_value(),
           "old acknowledgement deleted the new instance");
     const auto still_new = find_native(registry, "700.1");
-    check(still_new.has_value() && still_new->internal_id == new_record->internal_id,
+    check(still_new.has_value() && still_new->job.JobID == new_record->job.JobID,
           "old acknowledgement removed the new identity index");
-    check(still_new->job.execution->generation.manager_start_ticks == 1616,
+    check(still_new->job.identity.manager.start_ticks == 1616,
           "new generation was replaced by stale state");
 
     // A stale discovery for the retired generation still cannot resurrect it.
@@ -1071,10 +1071,10 @@ void run_a23(const std::string& base)
     for (int index = 0; index < 100; ++index) {
         const auto records = registry.inventoryRecords();
         for (const auto& record : records) {
-            (void)registry.inventoryRecord(record.internal_id);
-            if (record.identity_complete) {
-                const auto by_identity = registry.inventoryRecordByIdentity(record.identity);
-                check(by_identity.has_value() && by_identity->internal_id == record.internal_id,
+            (void)registry.inventoryRecord(record.job.JobID);
+            if (record.job.identity.logical_complete()) {
+                const auto by_identity = registry.inventoryRecordByIdentity(record.job.identity);
+                check(by_identity.has_value() && by_identity->job.JobID == record.job.JobID,
                       "identity lookup disagrees with the snapshot");
             }
         }
@@ -1100,11 +1100,11 @@ void run_a23(const std::string& base)
             const auto records = registry.inventoryRecords();
             if (records.size() > 5u) throw std::runtime_error("duplicate records appeared");
             for (const auto& record : records) {
-                check(record.internal_id != 0, "the system sentinel leaked into inventory");
-                if (!record.identity_complete) continue;
-                const auto by_identity = registry.inventoryRecordByIdentity(record.identity);
+                check(record.job.JobID != 0, "the system sentinel leaked into inventory");
+                if (!record.job.identity.logical_complete()) continue;
+                const auto by_identity = registry.inventoryRecordByIdentity(record.job.identity);
                 check(by_identity.has_value(), "snapshot references a missing identity");
-                check(by_identity->internal_id == record.internal_id,
+                check(by_identity->job.JobID == record.job.JobID,
                       "snapshot and identity index disagree");
             }
             (void)heartbeat_status();
@@ -1119,7 +1119,7 @@ void run_a23(const std::string& base)
 
     const auto final_records = registry.inventoryRecords();
     for (const auto& record : final_records) {
-        check(record.internal_id != 0, "sentinel present in the final snapshot");
+        check(record.job.JobID != 0, "sentinel present in the final snapshot");
     }
     check(count_records(registry) == 2, "mutation loop lost an instance");
     registry.deinit();
@@ -1226,7 +1226,7 @@ void run_a25(const std::string& base)
 
             const auto created = find_native(registry, "900.0");
             check(created.has_value(), "the observation was not registered");
-            closing_id = created->internal_id;
+            closing_id = created->job.JobID;
 
             source.set_scan([&]() { return scan_with({}); });
             probes.set_process(6100, LivenessState::Dead);
@@ -1334,8 +1334,8 @@ void run_legacy(const std::string& base)
 
     const auto records = registry.inventoryRecords();
     check(records.size() == 1, "legacy: the registration created no inventory record");
-    const uint64_t id = records.front().internal_id;
-    check(!records.front().job.execution->generation.complete(),
+    const uint64_t id = records.front().job.JobID;
+    check(!records.front().job.identity.manager.complete(),
           "legacy: a manual registration must not invent an execution generation");
 
     check(heartbeat_status()["configured_types"].empty(),
@@ -1380,9 +1380,9 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
     // The restore path validates against the CURRENT boot, so the fixture
     // must carry the real one; the member models a live child under an alive
     // manager with its own start time.
-    job.execution->generation.boot_id = boot;
-    job.execution->members.clear();
-    job.execution->members.push_back(ProcessIdentity{child_pid, 191919, boot});
+    job.identity.manager.boot_id = boot;
+    job.identity.members.clear();
+    job.identity.members.push_back(ProcessIdentity{child_pid, 191919, boot});
     CondorJobWatcher::finalize_discovery(job);
 
     {
@@ -1418,14 +1418,14 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
 
         const auto restored = find_native(registry, "810.0");
         check(restored.has_value(), "RESTORE-UNKNOWN: the record was not restored");
-        check(restored->state == kStateActive && !restored->execution_verified,
+        check(restored->state == kStateActive && !restored->job.identity.verified,
               "RESTORE-UNKNOWN: an unverifiable execution must stay Open but "
               "carry the unverified (suspect) evidence, not a lifecycle state");
         check(std::find(restored->job.JobPIDs.begin(), restored->job.JobPIDs.end(),
                         child_pid) != restored->job.JobPIDs.end(),
               "RESTORE-UNKNOWN: restore deleted the saved child PID");
-        check(std::any_of(restored->job.execution->members.begin(),
-                          restored->job.execution->members.end(),
+        check(std::any_of(restored->job.identity.members.begin(),
+                          restored->job.identity.members.end(),
                           [&](const ProcessIdentity& member) {
                               return member.pid == child_pid && member.complete();
                           }),
@@ -1460,7 +1460,7 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
     check(std::find(after->job.JobPIDs.begin(), after->job.JobPIDs.end(), child_pid) !=
               after->job.JobPIDs.end(),
           "RESTORE-UNKNOWN: the child evidence was dropped before the verdict");
-    check(registry.findJob(after->internal_id).has_value(),
+    check(registry.findJob(after->job.JobID).has_value(),
           "RESTORE-UNKNOWN: the live instance disappeared from the active set");
     check(registry.deinit(), "RESTORE-UNKNOWN: shutdown failed");
 
@@ -1485,7 +1485,7 @@ void run_retire_explicit(const std::string& base)
 
     const auto active = find_native(registry, "310.0");
     check(active.has_value(), "RETIRE-EXPLICIT: the live instance was not inventoried");
-    const std::uint64_t retired_id = active->internal_id;
+    const std::uint64_t retired_id = active->job.JobID;
 
     // Explicit retirement while every process is still alive: no evidence
     // path runs, so the command itself must mark the ended generation.
@@ -1516,7 +1516,7 @@ void run_retire_explicit(const std::string& base)
           "RETIRE-EXPLICIT: the revival pass did not run");
     const auto revived_record = find_native(registry, "310.0");
     check(revived_record.has_value() &&
-              revived_record->job.execution->generation.manager_pid == 5401,
+              revived_record->job.identity.manager.pid == 5401,
           "RETIRE-EXPLICIT: a new generation was refused after the explicit "
           "retirement");
     check(count_records(registry) == 1, "RETIRE-EXPLICIT: unexpected record count");
@@ -1617,7 +1617,7 @@ void run_admit(const std::string& base)
 
         const auto record = find_native(registry, "330.0");
         check(record.has_value(), "ADMIT: S1off x S3default must register the job");
-        const auto binding = registry.selectionRecord(record->internal_id);
+        const auto binding = registry.selectionRecord(record->job.JobID);
         check(binding.mode() == CollectionMode::Auto &&
                   binding.automatic.has_value() &&
                   binding.automatic->size() == 1 &&
@@ -1678,7 +1678,7 @@ void run_admit(const std::string& base)
 
         const auto record = find_native(registry, "350.0");
         check(record.has_value(), "ADMIT: an accepting rule must register the job");
-        const auto binding = registry.selectionRecord(record->internal_id);
+        const auto binding = registry.selectionRecord(record->job.JobID);
         check(binding.automatic.has_value() && binding.automatic->size() == 1 &&
                   binding.automatic->front() == "CPUMemCollector",
               "ADMIT: the rule's list must become the initial automatic selection");
@@ -1711,7 +1711,7 @@ void run_admit(const std::string& base)
         const auto record = find_native(registry, "355.0");
         check(record.has_value(),
               "ADMIT: a bare accept must register the job");
-        const auto binding = registry.selectionRecord(record->internal_id);
+        const auto binding = registry.selectionRecord(record->job.JobID);
         check(binding.automatic.has_value() && binding.automatic->size() == 1 &&
                   binding.automatic->front() == "CPUMemCollector",
               "ADMIT: a bare accept must fall back to the configured defaults");
@@ -1798,13 +1798,13 @@ void run_stop_pin(const std::string& base)
 
     const auto record = find_native(registry, "360.0");
     check(record.has_value(), "STOP-PIN: the job must register");
-    const auto initial = registry.selectionRecord(record->internal_id);
+    const auto initial = registry.selectionRecord(record->job.JobID);
     check(initial.automatic.has_value() && initial.automatic->size() == 1,
           "STOP-PIN: the automatic selection must start armed");
 
     // The stop: an explicit manual empty selection.
     CollectionRequest stop;
-    stop.targets = {record->internal_id};
+    stop.targets = {record->job.JobID};
     stop.collectors = std::vector<std::string>{};
     check(registry.setCollectors(stop).ok, "STOP-PIN: the stop must commit");
 
@@ -1817,13 +1817,13 @@ void run_stop_pin(const std::string& base)
     probes.set_process(5902, LivenessState::Alive, 555);
     for (int pass = 0; pass < 3; ++pass) {
         check(registry.reconcileInventoryNow(), "STOP-PIN: the pass must run");
-        const auto binding = registry.selectionRecord(record->internal_id);
+        const auto binding = registry.selectionRecord(record->job.JobID);
         check(binding.mode() == CollectionMode::Manual && binding.manual.has_value() &&
                   binding.manual->empty(),
               "STOP-PIN: the manual stop must survive the observation merge");
         check(binding.effectiveCollectors().empty(),
               "STOP-PIN: applied/desired collectors must stay empty after scans");
-        check(registry.actualCollection(record->internal_id).collectors.empty(),
+        check(registry.actualCollection(record->job.JobID).collectors.empty(),
               "STOP-PIN: nothing may actually attach after a stop");
     }
 

@@ -320,21 +320,9 @@ struct SubAttrMatcher {
     }
 };
 
-// Execution evidence a discovery source actually observed. It is a
-// value group on the Job, not another transport envelope: the watcher fills it
-// while parsing, the store persists the compatible projection and compares
-// generations by boot/PID/start only.
-struct JobExecution {
-    ExecutionGeneration generation;            // boot_id / manager_pid / manager_start_ticks
-    std::vector<ProcessIdentity> members;
-    bool members_authoritative = false;
-    std::optional<std::string> step_id;        // nullopt != "0"
-    int64_t read_at_us = 0;                    // source read time, for persistence/diagnostics
-    uint64_t read_order = 0;                   // process-monotonic read order, assigned before reading
-    std::string incomplete_reason;             // required source information missing
-    std::vector<std::string> notes;
-};
-
+// One identity block per Job: logical identity (which scheduled job) plus
+// execution identity (which local run). The watcher fills it while parsing;
+// the store persists the compatible projection under the frozen row keys.
 struct Job {
     uint64_t                              JobID{};
     std::string                           NativeJobID{};   // 调度器原生作业ID字符串，用于查询（Condor: cluster_id.proc_id, Slurm: job_id.step_id）
@@ -346,13 +334,13 @@ struct Job {
     std::string                           cluster_name{};  // 渲染：集群名（Condor=COLLECTOR_HOST, Slurm=SLURM_CLUSTER_NAME）
     JobType                                 jobtype{JobType::Unknown};
     JobSubType                              subtype{JobSubType::Unknown};
-    // Adapter name for open-world schedulers ("" for the built-ins, whose
-    // JobSubType carries the same information). Persisted next to the numeric
-    // subtype; readers accept either.
+    // Projection of identity.adapter. Persisted next to the numeric subtype
+    // for the frozen row layout; identity is the source.
     std::string                             subtype_name;
     std::vector<pid_t>                        JobPIDs;
-    // std::chrono::system_clock::time_point   JobCreateTime{std::chrono::system_clock::now()};
-    // std::unordered_map<std::string, void*>  JobInfo; //目前没有启用
+    // Runtime/ingress projection of the record's selection. Never persisted:
+    // the durable source is JobRecord::selection, and the collection runtime
+    // fills this when it builds the collector-facing view.
     std::vector<std::string>                CollectorNames;
 
     SubAttr                                 sub_attr;
@@ -377,10 +365,9 @@ struct Job {
     // restore/更新路径拿到了组值、等待落库一次（write-once + 至多一次回填重写）。
     bool                                    group_need_persist{false};
 
-    // What the source observed about this execution. Unset for legacy/manual
-    // registrations and for records restored from a schema-2 row that carried
-    // no execution evidence.
-    std::optional<JobExecution>             execution;
+    // The one identity block. Manual registrations leave the manager empty and
+    // bind `members`; discovery observations fill both.
+    JobIdentity                             identity;
 
     static constexpr auto reflection() {
         return std::make_tuple(
@@ -391,32 +378,23 @@ struct Job {
             std::make_pair("jobtype", &Job::jobtype),
             std::make_pair("subtype", &Job::subtype),
             std::make_pair("JobPIDs", &Job::JobPIDs),
-            std::make_pair("CollectorNames", &Job::CollectorNames),
             std::make_pair("sub_attr", &Job::sub_attr)
         );
     }
 };
 
 // ---------------------------------------------------------------------------
-// Execution evidence projection
+// Identity projection accessors
 //
 // The Job is the single source of truth; these accessors are the only way the
-// store derives the identity selector, generation and members it persists, so
-// no caller keeps a second copy of the same evidence.
+// store derives the selector and execution evidence it persists, so no caller
+// keeps a second copy of the same evidence.
 // ---------------------------------------------------------------------------
-
-// Engages the execution group without destroying an existing one (unlike
-// optional::emplace, which always reconstructs). Discovery, manual
-// registration and restore all funnel through this.
-inline JobExecution& ensure_execution(Job& job)
-{
-    if (!job.execution) job.execution.emplace();
-    return *job.execution;
-}
 
 inline NativeSelector selector_of(const Job& job) {
     NativeSelector selector;
-    selector.adapter = job.subtype_name;
+    selector.adapter = job.identity.adapter.empty() ? job.subtype_name
+                                                    : job.identity.adapter;
     if (selector.adapter.empty()) {
         switch (job.subtype) {
             case JobSubType::Condor: selector.adapter = "condor"; break;
@@ -427,27 +405,34 @@ inline NativeSelector selector_of(const Job& job) {
     selector.cluster_name = job.cluster_name;
     selector.cluster_tag = job.clusterTag;
     selector.native_job_id = job.NativeJobID;
-    if (job.execution && job.execution->step_id) selector.step_id = *job.execution->step_id;
+    selector.step_id = job.identity.step_id;
     return selector;
 }
 
-inline ExecutionGeneration generation_of(const Job& job) {
-    return job.execution ? job.execution->generation : ExecutionGeneration{};
+inline const ProcessIdentity& manager_of(const Job& job) {
+    return job.identity.manager;
 }
 
 inline const std::vector<ProcessIdentity>& members_of(const Job& job) {
-    static const std::vector<ProcessIdentity> kNoEvidence;
-    return job.execution ? job.execution->members : kNoEvidence;
+    return job.identity.members;
 }
 
 // True only when the source read the execution scope successfully: an empty
 // member list without this flag is "unknown", not "confirmed empty".
 inline bool members_authoritative_of(const Job& job) {
-    return job.execution && job.execution->members_authoritative;
+    return job.identity.members_authoritative;
 }
 
 inline int64_t read_at_us_of(const Job& job) {
-    return job.execution ? job.execution->read_at_us : 0;
+    return job.identity.read_at_us;
+}
+
+// Publishes the identity-derived projections on the Job. The identity is the
+// source; these fields exist only for the wire/collector contract.
+inline void project_identity(Job& job) {
+    if (!job.identity.adapter.empty()) job.subtype_name = job.identity.adapter;
+    if (!job.identity.native_job_id.empty())
+        job.NativeJobID = job.identity.native_job_id;
 }
 
 // Job 级匹配：开放世界名字（subtype_name）先于字段匹配——新调度器的作业

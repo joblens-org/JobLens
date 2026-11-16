@@ -1105,15 +1105,15 @@ void CollectorScheduler::reconcileOnce() {
         std::vector<Job> closing_jobs;
         std::set<uint64_t> closing_ids;
         for (const auto& record : records) {
-            if (record.internal_id == 0) continue;
+            if (record.job.JobID == 0) continue;
             if (record.state == kStateClosing) {
-                closing_ids.insert(record.internal_id);
+                closing_ids.insert(record.job.JobID);
                 closing_jobs.push_back(record.job);
                 continue;
             }
             Job desired = record.job;
             desired.CollectorNames = record.selection.effectiveCollectors();
-            open_jobs.emplace(record.internal_id, std::move(desired));
+            open_jobs.emplace(record.job.JobID, std::move(desired));
         }
 
         // Closing records are removed through the single accounting path
@@ -1180,17 +1180,17 @@ void CollectorScheduler::reconcileOnce() {
         {
             std::map<uint64_t, std::pair<Job, std::string>> next;
             for (const auto& record : records) {
-                if (record.internal_id == 0) continue;
+                if (record.job.JobID == 0) continue;
                 if (record.state == kStateClosing) continue;
                 Job projection = record.job;
                 projection.CollectorNames = record.selection.effectiveCollectors();
                 const auto key = dump_job(projection).dump();
-                const auto previous = system_projection_.find(record.internal_id);
+                const auto previous = system_projection_.find(record.job.JobID);
                 if (previous == system_projection_.end())
                     notifySystemCollectors(projection, JobEvent::Added);
                 else if (previous->second.second != key)
                     notifySystemCollectors(projection, JobEvent::Updated);
-                next.emplace(record.internal_id, std::make_pair(std::move(projection), key));
+                next.emplace(record.job.JobID, std::make_pair(std::move(projection), key));
             }
             for (const auto& [id, previous] : system_projection_) {
                 if (next.count(id) == 0)
@@ -1216,9 +1216,9 @@ void CollectorScheduler::reconcileOnce() {
         // The runtime reports the revision it really converged to.
         for (const auto& record : records) {
             if (record.state == kStateClosing) continue;
-            if (attach_errors_.count(record.internal_id) != 0) continue;
-            if (attach_tokens_.count(record.internal_id) == 0) continue;
-            attach_revisions_[record.internal_id] = record.revision;
+            if (attach_errors_.count(record.job.JobID) != 0) continue;
+            if (attach_tokens_.count(record.job.JobID) == 0) continue;
+            attach_revisions_[record.job.JobID] = record.revision;
         }
 
         // Release the token of an instance the runtime no longer holds. Facts

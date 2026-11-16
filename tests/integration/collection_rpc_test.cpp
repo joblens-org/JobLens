@@ -130,11 +130,10 @@ NativeSelector slurm_selector(const std::string& native, const std::string& step
 
 Job condor_observation(const NativeSelector& selector, pid_t manager_pid)
 {
-    ExecutionGeneration generation;
+    ProcessIdentity generation;
     generation.boot_id = "boot-collection-rpc";
-    generation.manager_pid = manager_pid;
-    generation.manager_start_ticks = 900000 + uint64_t(manager_pid);
-    generation.cgroup_identity = "/sys/fs/cgroup/htcondor/slot1";
+    generation.pid = manager_pid;
+    generation.start_ticks = 900000 + uint64_t(manager_pid);
     Job observation = discovered_job(
         selector, generation,
         {ProcessIdentity{manager_pid, 900000 + uint64_t(manager_pid), "boot-collection-rpc"}},
@@ -156,11 +155,10 @@ Job condor_observation(const NativeSelector& selector, pid_t manager_pid)
 
 Job slurm_observation(const NativeSelector& selector, pid_t manager_pid)
 {
-    ExecutionGeneration generation;
+    ProcessIdentity generation;
     generation.boot_id = "boot-collection-rpc";
-    generation.manager_pid = manager_pid;
-    generation.manager_start_ticks = 910000 + uint64_t(manager_pid);
-    generation.cgroup_identity = "/sys/fs/cgroup/slurm/step";
+    generation.pid = manager_pid;
+    generation.start_ticks = 910000 + uint64_t(manager_pid);
     Job observation = discovered_job(
         selector, generation,
         {ProcessIdentity{manager_pid, 910000 + uint64_t(manager_pid), "boot-collection-rpc"}},

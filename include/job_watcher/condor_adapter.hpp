@@ -92,7 +92,7 @@ public:
     // fields derive from the canonical form so they can never disagree with
     // the identity index. Moved from the store's apply_identity_to_facts.
     void applyIdentityToFacts(Job& job, const NativeSelector& selector,
-                              const CanonicalIdentity& identity) const override
+                              const JobIdentity& identity) const override
     {
         job.subtype = JobSubType::Condor;
         if (job.jobtype != JobType::Job && job.jobtype != JobType::Sys) {
