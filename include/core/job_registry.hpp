@@ -37,8 +37,6 @@
 #include "core/collector_type.h"
 #include "core/job_identity.hpp"
 #include "job_lifecycle_event.h"
-#include "ebpf/trace_condor_starter.h"
-#include "common/ebpf_common.hpp"
 #include "core/job_discovery.hpp"
 #include "core/job_store.hpp"
 #include "core/collection_runtime.hpp"
@@ -46,9 +44,6 @@
 #include "core/job_auto_policy.hpp"
 #include "core/liveness.hpp"
 #include "core/scheduler_adapter.hpp"
-
-#include "job_watcher/condor_adapter.hpp"
-#include "job_watcher/slurm_adapter.hpp"
 
 // ---------------------------------------------------------------------------
 // Collection selection control (registry-owned)
@@ -214,11 +209,6 @@ public:
     // 获取下一个全局唯一递增的JobID（durable 预留；失败返回 0）
     uint64_t getNextJobID();
 
-    // 统一删除接口，通过 JSON 请求解析删除条件
-    // 支持通过 JobID 或 sub_attr 匹配删除
-    // 返回删除的作业数量
-    size_t delJobByRequest(const nlohmann::json& req);
-
     // --- Inventory store facade --------------------------------------------
     // Admission outcome for one observation (capture_all=false): whether the
     // observation may register, and — when the gate pre-evaluated the type's
@@ -287,8 +277,6 @@ public:
     // persist them. Used by the heartbeat for records no discovery source
     // covers (manual registrations); reads never do this for themselves.
     bool refreshJobFacts(uint64_t jobID);
-    // Lifecycle state is a heartbeat decision, not a read side effect.
-    void setInstanceState(uint64_t jobID, const std::string& state);
     // Liveness evidence from the last scan. Not a lifecycle state: an
     // unverified instance stays Open but must not be admitted to the kernel.
     void setExecutionVerified(uint64_t jobID, bool verified);
@@ -438,9 +426,8 @@ private:
     // fill-empty merge (JobPIDs ignored), response in the add response shape.
     nlohmann::json updateManualInstance(const JobRecord& target, const Job& job,
                                         const nlohmann::json& request);
-    // Guards the sentinel job and the active-reader set.
-    mutable std::shared_mutex mtx_;
-    Job sentinel_job_;   // system JobID 0 (in-memory only, never stored)
+    // System JobID 0: in-memory only, never stored, never mutated.
+    Job sentinel_job_;
 
     // The single durable representation. Everything below reads state through
     // it; the registry never duplicates a JobRecord field.
@@ -477,6 +464,18 @@ private:
     CollectionSelection ownSelection(uint64_t id) const;
     void publishRecord(JobRecord record);
     void eraseRecord(uint64_t id);
+    void eraseRecordLocked(uint64_t id);   // caller holds records_mtx_ exclusively
+
+    // One record transaction: the single durable write path for record state.
+    //
+    // A caller builds one atomic JobStore batch together with the memory images
+    // that batch produces, then commits. Publication runs only after the store
+    // accepted the batch, so a failed write can never leave the registry
+    // claiming a state the store refused. The caller holds mutation_mtx_ across
+    // build -> commit -> publish; records_mtx_ is taken only inside commit, so
+    // the collection runtime keeps reading the previous image while the store
+    // writes.
+    class RecordTxn;
     void applyRecovered(const std::vector<JobRecord>& adopted,
                         const std::vector<uint64_t>& removed);
     // Merge decision for one discovered Job against the current record image
@@ -579,7 +578,6 @@ private:
     // Set by requestRescan() to cut the maintenance wait short (cooldown still
     // limits how often a forced scan actually runs).
     bool hb_wake_ = false;
-    bool rescan_flag_ = false;
     bool degraded_ = false;
     bool incomplete_drain_ = false;
     bool status_published_ = false;

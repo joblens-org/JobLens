@@ -212,6 +212,22 @@ JobStore::WriteOp put_record_op(const JobRecord& record) {
     return op;
 }
 
+JobStore::WriteOp delete_record_op(uint64_t internal_id) {
+    JobStore::WriteOp op;
+    op.kind = JobStore::WriteOp::DeleteRecord;
+    op.internal_id = internal_id;
+    return op;
+}
+
+JobStore::WriteOp identity_op(JobStore::WriteOp::Kind kind, uint64_t internal_id,
+                              JobIdentity identity) {
+    JobStore::WriteOp op;
+    op.kind = kind;
+    op.internal_id = internal_id;
+    op.identity = std::move(identity);
+    return op;
+}
+
 // Screen native fields here; adapters screen structured namespaces below.
 
 // The surviving rows of the typed-facts duplicate screen, shared by the
@@ -232,6 +248,170 @@ std::vector<JobRecord> scheduler_screened_duplicates(
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// RecordTxn — the one durable write path for record state
+// ---------------------------------------------------------------------------
+// Every record mutation is one atomic JobStore batch plus the memory image
+// that batch produces, and the two never separate: the caller builds the image
+// it wants, commit() writes both, and a refused write publishes nothing.
+// Callers hold mutation_mtx_ across build -> commit, so a decided revision
+// cannot move before its batch lands.
+class JobRegistry::RecordTxn {
+public:
+    RecordTxn(JobRegistry& registry, const char* reason, bool durable = true)
+        : registry_(registry), reason_(reason), durable_(durable)
+    {
+    }
+
+    // PutRecord plus its memory image (insert-or-assign).
+    RecordTxn& put(JobRecord record)
+    {
+        ops_.push_back(put_record_op(record));
+        assign_.push_back(std::move(record));
+        return *this;
+    }
+
+    // PutRecord plus the record's i: entry, published together. The identity
+    // may be incomplete on the manual-registration path, so the index entry is
+    // written only when it is. A create from a canonical identity writes the
+    // entry unconditionally with indexPut().
+    RecordTxn& putIndexed(JobRecord record)
+    {
+        const uint64_t internal_id = record.job.JobID;
+        const bool complete = record.job.identity.logical_complete();
+        JobIdentity identity = record.job.identity;
+        put(std::move(record));
+        if (complete) {
+            index_put_.emplace_back(identity_index_key(identity), internal_id);
+            ops_.push_back(
+                identity_op(JobStore::WriteOp::PutIdentity, internal_id, std::move(identity)));
+        }
+        return *this;
+    }
+
+    // PutRecord whose image replaces an existing map entry only: a row that is
+    // archived while this batch commits must not be resurrected by publication.
+    RecordTxn& replace(JobRecord record)
+    {
+        ops_.push_back(put_record_op(record));
+        replace_.push_back(std::move(record));
+        return *this;
+    }
+
+    // DeleteRecord, the record's i: release when its identity is complete, and
+    // removal of its memory image.
+    RecordTxn& erase(const JobRecord& record)
+    {
+        const uint64_t internal_id = record.job.JobID;
+        ops_.push_back(delete_record_op(internal_id));
+        if (record.job.identity.logical_complete()) {
+            ops_.push_back(identity_op(JobStore::WriteOp::DeleteIdentity, internal_id,
+                                       record.job.identity));
+        }
+        erased_.push_back(internal_id);
+        return *this;
+    }
+
+    // i: maintenance that carries no record image of its own.
+    RecordTxn& indexPut(const JobIdentity& identity, uint64_t internal_id)
+    {
+        index_put_.emplace_back(identity_index_key(identity), internal_id);
+        ops_.push_back(identity_op(JobStore::WriteOp::PutIdentity, internal_id, identity));
+        return *this;
+    }
+
+    RecordTxn& indexRelease(const JobIdentity& identity, uint64_t internal_id)
+    {
+        index_release_.emplace_back(identity_index_key(identity), internal_id);
+        ops_.push_back(identity_op(JobStore::WriteOp::DeleteIdentity, internal_id, identity));
+        return *this;
+    }
+
+    // h: archive row of a deleting batch.
+    RecordTxn& history(const JobRecord& record, std::vector<std::string> applied,
+                       const std::string& provenance)
+    {
+        JobStore::WriteOp op;
+        op.kind = JobStore::WriteOp::PutHistory;
+        op.internal_id = record.job.JobID;
+        op.record = record;
+        op.applied_collectors = std::move(applied);
+        op.history_provenance = provenance;
+        ops_.push_back(std::move(op));
+        return *this;
+    }
+
+    // c: allocator high-water mark riding a create.
+    RecordTxn& reserveCounter(uint64_t durable_counter, bool exhausted)
+    {
+        JobStore::WriteOp op;
+        op.kind = JobStore::WriteOp::ReserveCounter;
+        op.durable_counter = durable_counter;
+        op.counter_exhausted = exhausted;
+        ops_.push_back(std::move(op));
+        return *this;
+    }
+
+    // Names a row whose previous image this batch overwrites (the recovery
+    // fence). A create passes none: it published no image to revert.
+    RecordTxn& touch(uint64_t internal_id)
+    {
+        touched_.push_back(internal_id);
+        return *this;
+    }
+
+    // Commit the batch and publish the images it wrote. False publishes
+    // nothing and leaves the store's error in error().
+    bool commit()
+    {
+        if (!registry_.store_->commit(std::move(ops_), durable_, touched_, reason_, error_)) {
+            return false;
+        }
+        publish();
+        return true;
+    }
+
+    const std::string& error() const { return error_; }
+
+private:
+    // One critical section: no reader can observe a half-published batch.
+    void publish()
+    {
+        if (assign_.empty() && replace_.empty() && erased_.empty() && index_put_.empty() &&
+            index_release_.empty()) {
+            return;
+        }
+        std::unique_lock lg(registry_.records_mtx_);
+        for (auto& record : assign_)
+            registry_.records_[record.job.JobID] = std::move(record);
+        for (auto& record : replace_) {
+            const auto it = registry_.records_.find(record.job.JobID);
+            if (it != registry_.records_.end()) it->second = std::move(record);
+        }
+        for (const auto& entry : index_release_) {
+            const auto it = registry_.identity_index_.find(entry.first);
+            if (it != registry_.identity_index_.end() && it->second == entry.second)
+                registry_.identity_index_.erase(it);
+        }
+        for (const auto& entry : index_put_)
+            registry_.identity_index_[entry.first] = entry.second;
+        for (const auto internal_id : erased_)
+            registry_.eraseRecordLocked(internal_id);
+    }
+
+    JobRegistry& registry_;
+    const char* reason_;
+    bool durable_;
+    std::vector<JobStore::WriteOp> ops_;
+    std::vector<uint64_t> touched_;
+    std::vector<JobRecord> assign_;
+    std::vector<JobRecord> replace_;
+    std::vector<uint64_t> erased_;
+    std::vector<std::pair<std::string, uint64_t>> index_put_;
+    std::vector<std::pair<std::string, uint64_t>> index_release_;
+    std::string error_;
+};
 
 // Adapter-owned legacy decode dispatch: the Job's subtype_name (or the
 // subtype enum for pre-name rows) names the owning adapter; without one the
@@ -1855,32 +2035,14 @@ bool JobRegistry::createManualJob(const Job& job) {
                 }
             }
         }
-        std::vector<JobStore::WriteOp> ops;
-        ops.push_back(put_record_op(record));
-        if (record.job.identity.logical_complete()) {
-            JobStore::WriteOp index;
-            index.kind = JobStore::WriteOp::PutIdentity;
-            index.internal_id = record.job.JobID;
-            index.identity = record.job.identity;
-            ops.push_back(std::move(index));
-        }
         // A registration that published nothing needs no recovery fence: the
         // identity lookup repairs an ambiguous landing.
-        std::vector<uint64_t> touched;
-        std::string error;
-        if (!store_->commit(std::move(ops), /*durable=*/true, touched, "register job",
-                            error)) {
+        RecordTxn txn(*this, "register job");
+        txn.putIndexed(std::move(record));
+        if (!txn.commit()) {
             spdlog::error("JobRegistry: durable registration failed, JobID {} rejected ({})",
-                          job_copy.JobID, error);
+                          job_copy.JobID, txn.error());
             return false;
-        }
-        {
-            std::unique_lock lg(records_mtx_);
-            const uint64_t registered_id = record.job.JobID;
-            records_[registered_id] = std::move(record);
-            if (records_[registered_id].job.identity.logical_complete())
-                identity_index_[identity_index_key(records_[registered_id].job.identity)] =
-                    registered_id;
         }
     }
     spdlog::info("JobRegistry: persisted manual registration of JobID {}", job_copy.JobID);
@@ -2146,41 +2308,23 @@ nlohmann::json JobRegistry::updateManualInstance(const JobRecord& target, const 
             }
             record.last_seen_us = now_us();
             ++record.revision;
-            std::vector<JobStore::WriteOp> ops{put_record_op(record)};
+            // The identity adopted above is the one this batch indexes when it
+            // moved; the record image itself goes out with put().
+            const JobIdentity adopted_identity = record.job.identity;
+            RecordTxn txn(*this, "manual upsert facts", /*durable=*/!index_changed);
+            txn.touch(internal_id);
+            txn.put(std::move(record));
             if (index_changed) {
-                if (previously_indexed) {
-                    JobStore::WriteOp release;
-                    release.kind = JobStore::WriteOp::DeleteIdentity;
-                    release.internal_id = internal_id;
-                    release.identity = previous_identity;
-                    ops.push_back(std::move(release));
-                }
-                JobStore::WriteOp acquire;
-                acquire.kind = JobStore::WriteOp::PutIdentity;
-                acquire.internal_id = internal_id;
-                acquire.identity = record.job.identity;
-                ops.push_back(std::move(acquire));
+                if (previously_indexed) txn.indexRelease(previous_identity, internal_id);
+                txn.indexPut(adopted_identity, internal_id);
             }
-            std::vector<uint64_t> touched{internal_id};
-            std::string error;
-            if (!store_->commit(std::move(ops), /*durable=*/!index_changed, touched,
-                                "manual upsert facts", error)) {
+            if (!txn.commit()) {
                 nlohmann::json out;
                 out["status"] = "error";
-                if (error == "identity_conflict") out["code"] = error;
-                out["msg"] = "facts update failed: " + error;
+                if (txn.error() == "identity_conflict") out["code"] = txn.error();
+                out["msg"] = "facts update failed: " + txn.error();
                 return out;
             }
-            std::unique_lock lg(records_mtx_);
-            if (index_changed) {
-                if (previously_indexed) {
-                    const auto old = identity_index_.find(identity_index_key(previous_identity));
-                    if (old != identity_index_.end() && old->second == internal_id)
-                        identity_index_.erase(old);
-                }
-                identity_index_[identity_index_key(record.job.identity)] = internal_id;
-            }
-            records_[internal_id] = std::move(record);
         }
     }
 
@@ -2313,16 +2457,10 @@ bool JobRegistry::retireInstance(uint64_t jobID) {
                 // The ONE revision orders memory and disk alike: the same
                 // commit writes the row and advances the record.
                 ++closing.revision;
-                std::vector<JobStore::WriteOp> ops{put_record_op(closing)};
-                std::vector<uint64_t> touched{jobID};
-                std::string error;
-                if (store_->commit(std::move(ops), /*durable=*/true, touched,
-                                   "persist record state", error)) {
-                    std::unique_lock wl(records_mtx_);
-                    const auto current = records_.find(jobID);
-                    if (current != records_.end()) current->second = std::move(closing);
-                    closing_persisted = true;
-                }
+                RecordTxn txn(*this, "persist record state");
+                txn.touch(jobID);
+                txn.replace(std::move(closing));
+                closing_persisted = txn.commit();
             }
         }
         if (!closing_persisted) {
@@ -2459,41 +2597,20 @@ bool JobRegistry::cleanupThenArchive(uint64_t jobID) {
     // pure delete whose ambiguous outcome is confirmed by the row's absence.
     {
         std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
-        std::vector<JobStore::WriteOp> ops;
-        JobStore::WriteOp delete_row;
-        delete_row.kind = JobStore::WriteOp::DeleteRecord;
-        delete_row.internal_id = jobID;
-        ops.push_back(std::move(delete_row));
-        if (current->job.identity.logical_complete()) {
-            // DeleteIdentity releases the entry only while this instance
-            // still owns it on disk; a newer execution keeps its index row.
-            JobStore::WriteOp release;
-            release.kind = JobStore::WriteOp::DeleteIdentity;
-            release.internal_id = jobID;
-            release.identity = current->job.identity;
-            ops.push_back(std::move(release));
-        }
-        const char* reason = "discard job";
-        if (!applied.empty()) {
-            JobStore::WriteOp history;
-            history.kind = JobStore::WriteOp::PutHistory;
-            history.internal_id = jobID;
-            history.record = *current;
-            history.applied_collectors = applied;
-            history.history_provenance = provenance;
-            ops.push_back(std::move(history));
-            reason = "archive job";
-        }
-        std::vector<uint64_t> touched{jobID};
-        std::string error;
-        if (!store_->commit(std::move(ops), /*durable=*/true, touched, reason, error)) {
+        // The i: release rides the delete: it releases the entry only while
+        // this instance still owns it on disk, so a newer execution keeps its
+        // index row.
+        RecordTxn txn(*this, applied.empty() ? "discard job" : "archive job");
+        txn.touch(jobID);
+        txn.erase(*current);
+        if (!applied.empty()) txn.history(*current, applied, provenance);
+        if (!txn.commit()) {
             spdlog::error("JobRegistry: durable {} failed for closing JobID {} ({}), "
                           "keeping it pending (kernel ownership already released)",
-                          applied.empty() ? "discard" : "archive", jobID, error);
+                          applied.empty() ? "discard" : "archive", jobID, txn.error());
             return false;
         }
     }
-    eraseRecord(jobID);
     {
         std::lock_guard<std::mutex> applied_lock(retire_applied_mtx_);
         retire_applied_.erase(jobID);
@@ -2592,73 +2709,6 @@ size_t JobRegistry::delJob(const SubAttrMatcher& matcher) {
 
     spdlog::info("JobRegistry: removed {} jobs by sub_attr matcher", matched.size());
     return matched.size();
-}
-
-size_t JobRegistry::delJobByRequest(const nlohmann::json& req) {
-    // 优先检查 JobID，如果存在则按 JobID 删除
-    if (req.contains("JobID")) {
-        uint64_t jobID = req["JobID"].get<uint64_t>();
-        if (findJob(jobID).has_value()) {
-            delJob(jobID);
-            return 1;
-        }
-        return 0;
-    }
-
-    // 检查 matcher 字段，解析 sub_attr 匹配条件
-    if (req.contains("matcher")) {
-        const auto& matcher_json = req["matcher"];
-        SubAttrMatcher matcher;
-
-        // 解析 subtype
-        if (matcher_json.contains("subtype")) {
-            std::string subtype_str = matcher_json["subtype"].get<std::string>();
-            if (subtype_str == "Condor") {
-                matcher.subtype = JobSubType::Condor;
-            } else if (subtype_str == "Slurm") {
-                matcher.subtype = JobSubType::Slurm;
-            } else if (subtype_str == "Common") {
-                matcher.subtype = JobSubType::Common;
-            }
-        }
-
-        // 解析 Condor 匹配字段
-        if (matcher_json.contains("condor_cluster_id")) {
-            matcher.condor_cluster_id = matcher_json["condor_cluster_id"].get<size_t>();
-        }
-        if (matcher_json.contains("condor_proc_id")) {
-            matcher.condor_proc_id = matcher_json["condor_proc_id"].get<size_t>();
-        }
-        if (matcher_json.contains("condor_owner")) {
-            matcher.condor_owner = matcher_json["condor_owner"].get<std::string>();
-        }
-        if (matcher_json.contains("condor_starter_pid")) {
-            matcher.condor_starter_pid = matcher_json["condor_starter_pid"].get<pid_t>();
-        }
-
-        // 解析 Slurm 匹配字段
-        if (matcher_json.contains("slurm_job_id")) {
-            matcher.slurm_job_id = matcher_json["slurm_job_id"].get<size_t>();
-        }
-        if (matcher_json.contains("slurm_step_id")) {
-            matcher.slurm_step_id = matcher_json["slurm_step_id"].get<uint32_t>();
-        }
-        if (matcher_json.contains("slurm_user")) {
-            matcher.slurm_user = matcher_json["slurm_user"].get<std::string>();
-        }
-        if (matcher_json.contains("slurm_job_name")) {
-            matcher.slurm_job_name = matcher_json["slurm_job_name"].get<std::string>();
-        }
-        if (matcher_json.contains("slurm_stepd_pid")) {
-            matcher.slurm_stepd_pid = matcher_json["slurm_stepd_pid"].get<pid_t>();
-        }
-
-        return delJob(matcher);
-    }
-
-    // 既没有 JobID 也没有 matcher，返回 0
-    spdlog::warn("JobRegistry::delJobByRequest: request must contain 'JobID' or 'matcher' field");
-    return 0;
 }
 
 inline void JobRegistry::update_job(Job& job){
@@ -2801,6 +2851,10 @@ void JobRegistry::publishRecord(JobRecord record) {
 
 void JobRegistry::eraseRecord(uint64_t id) {
     std::unique_lock lg(records_mtx_);
+    eraseRecordLocked(id);
+}
+
+void JobRegistry::eraseRecordLocked(uint64_t id) {
     const auto it = records_.find(id);
     if (it == records_.end()) return;
     if (it->second.job.identity.logical_complete()) {
@@ -3091,25 +3145,15 @@ CollectionOutcome JobRegistry::executeSelectionMutations(
         }
 
         if (!writes.empty()) {
-            std::vector<JobStore::WriteOp> ops;
-            std::vector<uint64_t> touched;
-            ops.reserve(writes.size());
-            touched.reserve(writes.size());
-            for (const auto& record : writes) {
-                ops.push_back(put_record_op(record));
-                touched.push_back(record.job.JobID);
+            RecordTxn txn(*this, "mutate selection", /*durable=*/false);
+            for (auto& record : writes) {
+                txn.touch(record.job.JobID);
+                txn.replace(std::move(record));
             }
-            std::string error;
-            if (!store_->commit(std::move(ops), /*durable=*/false, touched,
-                                "mutate selection", error)) {
+            if (!txn.commit()) {
                 // The batch may have landed. Leave recovery fencing intact and
                 // return no planned revision or selection as accepted.
                 return selection_failure(CollectionError::StoreUnavailable, "store_write_failed");
-            }
-            std::unique_lock lg(records_mtx_);
-            for (auto& record : writes) {
-                const auto it = records_.find(record.job.JobID);
-                if (it != records_.end()) it->second = std::move(record);
             }
         }
     }
@@ -3313,20 +3357,17 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
             // Updated: one unsynced batch; the row joins the dirty set. A
             // failed or ambiguous write publishes nothing (the latch fences
             // the row).
-            std::vector<JobStore::WriteOp> ops{put_record_op(updated)};
-            std::vector<uint64_t> touched{internal_id};
-            std::string error;
-            if (!store_->commit(std::move(ops), /*durable=*/false, touched,
-                                "update inventory facts", error)) {
+            RecordTxn txn(*this, "update inventory facts", /*durable=*/false);
+            txn.touch(internal_id);
+            txn.put(std::move(updated));
+            if (!txn.commit()) {
                 result.ok = false;
                 result.code = RegistrationError::StoreWriteFailed;
                 result.error = "store_write_failed";
-                result.message = error;
+                result.message = txn.error();
                 return result;
             }
-            std::unique_lock lg(records_mtx_);
-            records_[internal_id] = std::move(updated);
-            record = records_[internal_id];
+            if (const auto published = ownRecord(internal_id)) record = *published;
         }
     } else {
         // Create a new inventory record. Nothing is activated and no caller
@@ -3381,34 +3422,18 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
             }
         }
 
-        std::vector<JobStore::WriteOp> ops;
-        JobStore::WriteOp counter;
-        counter.kind = JobStore::WriteOp::ReserveCounter;
-        counter.durable_counter = durable_counter;
-        counter.counter_exhausted = durable_exhausted;
-        ops.push_back(std::move(counter));
-        ops.push_back(put_record_op(created));
-        JobStore::WriteOp index;
-        index.kind = JobStore::WriteOp::PutIdentity;
-        index.internal_id = allocated;
-        index.identity = *identity;
-        ops.push_back(std::move(index));
         // A create has no published memory image to revert: identity
         // lookup repairs an ambiguous create, so it does not fence
         // recovery.
-        std::vector<uint64_t> touched;
-        std::string error;
-        if (!store_->commit(std::move(ops), /*durable=*/false, touched,
-                            "create inventory record", error)) {
+        RecordTxn txn(*this, "create inventory record", /*durable=*/false);
+        txn.reserveCounter(durable_counter, durable_exhausted);
+        txn.put(std::move(created));
+        txn.indexPut(*identity, allocated);
+        if (!txn.commit()) {
             result.code = RegistrationError::StoreWriteFailed;
             result.error = "store_write_failed";
-            result.message = error;
+            result.message = txn.error();
             return result;
-        }
-        {
-            std::unique_lock lg(records_mtx_);
-            records_[allocated] = std::move(created);
-            identity_index_[index_key] = allocated;
         }
 
         result.ok = true;
@@ -3860,13 +3885,6 @@ bool JobRegistry::runtimeRecord(uint64_t internal_id,
     return true;
 }
 
-void JobRegistry::setInstanceState(uint64_t jobID, const std::string& state) {
-    // In-memory only: the durable Closing transition goes through the store.
-    std::unique_lock lg(records_mtx_);
-    const auto it = records_.find(jobID);
-    if (it != records_.end()) it->second.state = state;
-}
-
 void JobRegistry::setExecutionVerified(uint64_t jobID, bool verified) {
     // Liveness evidence only. It never changes the lifecycle state and never
     // authorizes retirement; it gates kernel admission. Runtime state: not
@@ -3927,19 +3945,10 @@ bool JobRegistry::refreshJobFacts(uint64_t jobID) {
     // A durable record mutation advances the one record revision. This is the
     // same counter the selection CAS compares.
     ++record.revision;
-    std::vector<JobStore::WriteOp> ops{put_record_op(record)};
-    std::vector<uint64_t> touched{jobID};
-    std::string error;
-    if (!store_->commit(std::move(ops), /*durable=*/true, touched, "update job facts",
-                        error)) {
-        return false;
-    }
-    {
-        std::unique_lock lg(records_mtx_);
-        const auto it = records_.find(jobID);
-        if (it != records_.end()) it->second = std::move(record);
-    }
-    return true;
+    RecordTxn txn(*this, "update job facts");
+    txn.touch(jobID);
+    txn.replace(std::move(record));
+    return txn.commit();
 }
 
 void JobRegistry::regRPCHandle() {
@@ -3969,9 +3978,6 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     std::uint64_t admission_errors = 0;
     std::uint64_t retirements = 0;
     std::uint64_t passes = 0;
-    std::size_t exec_ingest_depth = 0;
-    std::size_t policy_pending = 0;
-    std::uint64_t policy_deferred_total = 0;
     std::int64_t last_scan_start_ms = 0;
     std::int64_t last_scan_success_ms = 0;
     bool last_scan_complete = false;
@@ -4001,14 +4007,6 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
         degraded = degraded_;
         last_error = hb_last_error_;
     }
-    // Deprecated: inventory has no exec ingest worker or observation hint
-    // queue. The keys stay for status compatibility and are always zero; a
-    // fake queue is not reported.
-    (void)exec_ingest_depth;
-    // The deferred-policy FIFO was removed with the experimental budget: the
-    // keys stay for status compatibility and always report zero.
-    (void)policy_pending;
-    (void)policy_deferred_total;
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         for (const auto& started : source_started_) {
@@ -4026,7 +4024,6 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     std::size_t active_count = 0;
     std::size_t suspect_count = 0;
     std::size_t incomplete_count = 0;
-    std::size_t quarantined_count = 0;
     for (const auto& record : records) {
         if (record.job.JobID == 0) continue;   // system sentinel is never inventory
         if (!record.job.identity.logical_complete()) ++incomplete_count;
@@ -4076,15 +4073,16 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     out["suspect_count"] = suspect_count;
     out["closing_count"] = closing_records;
     out["incomplete_count"] = incomplete_count;
-    out["quarantined_count"] = quarantined_count;
+    out["quarantined_count"] = 0;   // no quarantine tier: nothing is withheld
     out["events_received"] = events_received;
     out["events_dropped"] = 0;   // no ingest queue: nothing is dropped
     out["queue_depth"] = 0;   // no ingest queue
-    out["exec_ingest_depth"] = exec_ingest_depth;
-    out["policy_pending"] = policy_pending;
-    out["policy_deferred_total"] = policy_deferred_total;
-    // Deprecated: the per-batch policy budget experiment was removed; policy
-    // is evaluated synchronously and only timed for diagnostics.
+    // Removed subsystems whose status keys stay for wire compatibility: the
+    // exec ingest worker, the observation hint queue and the per-batch policy
+    // budget. They report zero because they no longer exist.
+    out["exec_ingest_depth"] = 0;
+    out["policy_pending"] = 0;
+    out["policy_deferred_total"] = 0;
     out["auto_policy_budget_us"] = 0;
     out["rescan_requests"] = rescan_requests;
     out["obsolete_hints"] = obsolete_hints;
