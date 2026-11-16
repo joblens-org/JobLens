@@ -27,9 +27,6 @@
 #include <type_traits>
 
 #include "common/config.hpp"
-#include "common/condor_job.hpp"
-#include "common/slurm_job.hpp"
-#include "common/utils.hpp"
 #include "core/collector_registry.hpp"
 #include "core/scheduler_adapter.hpp"
 #include "core/inventory_config.hpp"
@@ -93,54 +90,28 @@ std::string json2JobOpt(const nlohmann::json& obj, Job& job, const JobRegistry& 
         throw std::runtime_error("invalid job type: " + type);
     }
     
-    if (subtype.compare("condor") == 0){
-        job.subtype = JobSubType::Condor;
-        auto sub = obj.value("sub_attr", nlohmann::json::object());
-        auto cid = sub.value("cluster_id", nlohmann::json(0u)).get<size_t>();
-        auto proc = sub.value("proc_id", nlohmann::json(0u)).get<size_t>();
-        if (!obj.contains("sub_attr")) {
-            spdlog::info("JobRegistry: condor job sub_attr not provided, using defaults cluster_id={}, proc_id={}", cid, proc);
-        }
-        job.sub_attr = CondorJobAttr{
-            .auto_update_child = obj.value("auto_update_child", true),
-            .cluster_id = cid,
-            .proc_id = proc,
-            .scheduler_host = sub.value("scheduler_host", ""),
-            .scheduler_name = sub.value("scheduler_name", ""),
-            .owner = sub.value("owner", ""),
-            .collector_host = sub.value("collector_host", ""),
-        };
-        job.NativeJobID = fmt::format("{}.{}", cid, proc);
-    }else if (subtype.compare("slurm") == 0){
-        job.subtype = JobSubType::Slurm;
-        auto sub = obj.value("sub_attr", nlohmann::json::object());
-        auto jid = sub.value("job_id", nlohmann::json(0u)).get<size_t>();
-        auto sid = sub.value("step_id", nlohmann::json(0u)).get<uint32_t>();
-        if (!obj.contains("sub_attr")) {
-            spdlog::info("JobRegistry: slurm job sub_attr not provided, using defaults job_id={}, step_id={}", jid, sid);
-        }
-        job.sub_attr = SlurmJobAttr{
-            .auto_update_child = obj.value("auto_update_child", true),
-            .job_id = jid,
-            .step_id = sid,
-            .cluster_name = sub.value("cluster_name", ""),
-            .user = sub.value("user", ""),
-        };
-        job.NativeJobID = fmt::format("{}", jid);
-    }else if (subtype.compare("common") == 0){
+    const ISchedulerAdapter* adapter = nullptr;
+    if (subtype.compare("common") == 0){
         job.subtype = JobSubType::Common;
         job.sub_attr = CommonJobAttr{
             .auto_update_child = obj.value("auto_update_child", true)
         };
     }else{
-        // 开放世界：任何其它 subtype 名字即 adapter 名，typed facts 以 JSON
-        // 原样入库（该 adapter 的 encodeFacts/decodeFacts 是唯一解释者）。
-        if (!normalize_adapter_name(subtype).empty()) {
-            job.subtype_name = normalize_adapter_name(subtype);
+        const std::string adapter_name = normalize_adapter_name(subtype);
+        if (adapter_name.empty())
+            throw std::runtime_error("invalid job subtype: " + subtype);
+        adapter = registry.adapterNamed(adapter_name);
+        if (adapter != nullptr) {
+            // The adapter owns the request -> typed facts projection (and the
+            // native id / namespace render that follows it).
+            job.subtype_name = adapter->name();
+            adapter->applyRequestFacts(job, obj);
+        } else {
+            // 开放世界：任何其它 subtype 名字即 adapter 名，typed facts 以 JSON
+            // 原样入库（该 adapter 的 decodeFacts 是唯一解释者）。
+            job.subtype_name = adapter_name;
             job.sub_attr = obj.value("sub_attr", nlohmann::json::object());
             job.NativeJobID = obj.value("NativeJobID", "");
-        } else {
-            throw std::runtime_error("invalid job subtype: " + subtype);
         }
     }
 
@@ -152,12 +123,12 @@ std::string json2JobOpt(const nlohmann::json& obj, Job& job, const JobRegistry& 
     // there verbatim.
     const std::string request_cluster_name = obj.value("cluster_name", std::string{});
     const std::string request_cluster_tag = obj.value("cluster_tag", std::string{});
-    if (job.subtype == JobSubType::Condor || job.subtype == JobSubType::Slurm) {
-        if (!registry.adoptNamespaceAliases(job, request_cluster_name, request_cluster_tag)) {
+    if (adapter != nullptr) {
+        if (!adapter->adoptNamespaceAliases(job, request_cluster_name, request_cluster_tag)) {
             throw NamespaceConflictError(
                 "cluster_name/cluster_tag contradict the sub_attr facts");
         }
-        registry.renderNamespaceOf(job);
+        adapter->projectFacts(job);
     } else {
         job.cluster_name = request_cluster_name;
         job.clusterTag = request_cluster_tag;
@@ -555,37 +526,20 @@ nlohmann::json collection_target_json(JobRegistry& registry, const JobRecord& re
 }
 
 // Legacy add identity. The supplied JobID is never consulted; only the
-// typed sub_attr facts (already holding any injected request aliases) plus
-// the local scheduler configuration the discovery sources use.
-std::optional<NativeSelector> legacy_add_selector(const Job& job)
+// adapter-owned projection from the typed facts, plus the local scheduler
+// configuration the discovery sources use. The adapter also folds the derived
+// fields back onto the Job (fill-empty only).
+std::optional<NativeSelector> legacy_add_selector(Job& job, const JobRegistry& registry)
 {
-    NativeSelector selector;
-    if (job.subtype == JobSubType::Condor) {
-        selector.adapter = kAdapterCondor;
-        selector.native_job_id = job.NativeJobID;
-        if (const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr)) {
-            selector.native_job_id = fmt::format("{}.{}", attr->cluster_id, attr->proc_id);
-            selector.cluster_name = attr->collector_host;
-            selector.cluster_tag = attr->scheduler_name;
-        }
-        if (selector.cluster_name.empty())
-            selector.cluster_name = Utils::get_condor_collector_host();
-    } else if (job.subtype == JobSubType::Slurm) {
-        selector.adapter = kAdapterSlurm;
-        selector.native_job_id = job.NativeJobID;
-        if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr))
-            selector.cluster_name = attr->cluster_name;
-        if (selector.cluster_name.empty()) selector.cluster_name = SlurmJob::get_cluster_name();
-        if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr)) {
-            if (attr->step_id != 0) {
-                if (const auto name = slurm_step_name(attr->step_id)) selector.step_id = *name;
-                else selector.step_id = std::to_string(attr->step_id);
-            }
-        }
-    } else {
+    const std::string name = job.subtype_name.empty()
+                                 ? std::string(adapter_name_for(job.subtype) ? adapter_name_for(job.subtype) : "")
+                                 : job.subtype_name;
+    const ISchedulerAdapter* adapter = registry.adapterNamed(name);
+    if (adapter == nullptr) {
         // Generic/manual registration has no scheduler identity to resolve.
         return std::nullopt;
     }
+    NativeSelector selector = adapter->registrationSelector(job);
     if (selector.cluster_name.empty() || selector.native_job_id.empty()) return std::nullopt;
     return selector;
 }
@@ -903,7 +857,7 @@ void registerInventoryRpc(JobRegistry& registry) {
                     // resolution) routes a request naming a live inventoried
                     // instance to UPDATE; a legacy JobID is only a hint and
                     // never allocates or overrides the internal id.
-                    j = registry.upsertJob(job, req, legacy_add_selector(job));
+                    j = registry.upsertJob(job, req, legacy_add_selector(job, registry));
                 }else if(opt.compare("remove") == 0){
                     // Remove stops collection for resolved live jobs and
                     // keeps the inventory fact instead of forgetting the

@@ -19,8 +19,10 @@
 // decoding, identity validation and capability traits. Nothing in the store,
 // the registry or the RPC surface names a scheduler.
 //
-// Adding a scheduler type = implement ISchedulerAdapter in a self-contained
-// header/TU + one REGISTER_SCHEDULER_ADAPTER line + one inventory.types entry.
+// Adding a scheduler type = declare its facts and its projections in a
+// self-contained adapter header/TU, add one line to the closed-variant
+// manifest in collector_type.h, add one REGISTER_SCHEDULER_ADAPTER line and
+// one inventory.types entry.
 #pragma once
 
 #include <functional>
@@ -32,8 +34,16 @@
 
 #include <nlohmann/json.hpp>
 
-#include "core/collector_type.h"
-#include "core/job_discovery.hpp"
+#include "core/job_identity.hpp"
+
+// The adapter contract is declared before the Job aggregate exists: scheduler
+// facts are part of Job, and their declarations live in the adapters. Only
+// references and by-value declarations appear here; every definition lives in
+// the adapter translation unit, after collector_type.h.
+struct Job;
+struct SubAttrMatcher;
+struct DiscoveryOptions;
+class IDiscoverySource;
 
 // Tri-state automatic-addition policy for one scheduler type (the resolved
 // form of the auto_collect/use_rules pair and the legacy auto_add_<type>job
@@ -111,11 +121,23 @@ public:
     // Per-type discovery options derived from the resolved settings.
     virtual DiscoveryOptions discoveryOptions(const InventoryTypeSettings& settings) const = 0;
 
-    // Legacy (schema < 2) decode: typed facts from a stored JSON row.
+    // Legacy (schema < 2) decode: typed facts from a stored JSON row. The
+    // adapter owns the whole record projection: common fields, pids, typed
+    // facts and the native-id/namespace render.
     virtual Job decodeFacts(const nlohmann::json& row) const = 0;
     // Best-effort selector reconstruction for a legacy row (no scheduler
-    // identity -> incomplete selector, never a guess).
-    virtual NativeSelector legacySelector(const Job& job) const = 0;
+    // identity -> incomplete selector, never a guess). The adapter also folds
+    // the derived common fields back onto the Job (fill-empty only), so the
+    // record projection is produced in one place.
+    virtual NativeSelector legacySelector(Job& job) const = 0;
+
+    // Publishes the record-visible fields from the typed facts: subtype,
+    // subtype_name, NativeJobID and the common namespace fields. Fill-empty
+    // only; a watcher-provided value is never overwritten.
+    virtual void projectFacts(Job& job) const
+    {
+        (void)job;
+    }
 
     // Applies a resolved identity to the typed facts (derives the typed attr
     // fields the schema defines from the canonical form). The store calls it
@@ -127,6 +149,36 @@ public:
     {
         (void)facts; (void)selector; (void)identity;
     }
+
+    // The selectors a manual registration request is resolved by, derived
+    // from the typed facts the adapter just parsed. Empty = no scheduler
+    // identity (generic/manual registration).
+    virtual NativeSelector registrationSelector(Job& job) const
+    {
+        (void)job;
+        return {};
+    }
+
+    // Parses the scheduler-specific part of a manual registration request
+    // into the typed facts and their record projection. The caller owns the
+    // common request fields (type, JobID, pids, collectors).
+    virtual void applyRequestFacts(Job& job, const nlohmann::json& request) const
+    {
+        (void)job; (void)request;
+    }
+
+    // The typed-facts duplicate screen. Default: no typed fields; callers
+    // still get the subtype the adapter was registered under.
+    virtual SubAttrMatcher duplicateMatcher(const Job& job) const;
+
+    // Legacy/manual fact refresh from the host (/proc, scheduler metadata).
+    // Discovery rows are refreshed by their source; only rows without a
+    // source reach this.
+    virtual void refreshLegacyFacts(Job& job) const
+    {
+        (void)job;
+    }
+
 
     // The execution cgroup of one job as told by its typed facts, used by
     // kernel attribution (empty = none; the kernel_attribution trait gates
@@ -148,10 +200,7 @@ public:
     // has nothing to fold and rendering is a no-op.
 
     // The namespace facts of one job of this adapter, from its typed facts.
-    virtual NamespaceFacts namespaceFacts(const Job& job) const
-    {
-        return {job.cluster_name, job.clusterTag};
-    }
+    virtual NamespaceFacts namespaceFacts(const Job& job) const;
     // The namespace facts of a selector addressing jobs of this adapter.
     virtual NamespaceFacts selectorNamespaceFacts(const NativeSelector& selector) const
     {

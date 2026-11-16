@@ -206,6 +206,12 @@ class JobStore {
 public:
     struct Options {
         std::string db_path;                 // empty: job_registry_config.job_db_path
+        // Scheduler-owned row projection. The store parses the row envelope
+        // (revision/selection/identity), but the Job fields and typed facts
+        // are decoded by the adapter that owns them. Empty keeps the generic
+        // open-world/Common decoder (tests and inventory-only builds).
+        using RowDecoder = std::function<Job(const nlohmann::json&)>;
+        RowDecoder row_decoder;
         // NOTE: process-identity verification no longer lives here. The registry
         // owns the probe (admission and restore validation share it) and the
         // record map; this class only executes persistence.

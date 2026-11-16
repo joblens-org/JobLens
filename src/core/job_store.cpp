@@ -232,8 +232,7 @@ nlohmann::json record_json(const JobRecord& record) {
     return out;
 }
 
-Job decode_legacy_job(const std::string& json_str) {
-    auto j = nlohmann::json::parse(json_str);
+Job decode_legacy_job(const nlohmann::json& j) {
     Job job;
     job.jobtype       = static_cast<JobType>(j.value("jobtype", 0));
     job.subtype       = static_cast<JobSubType>(j.value("subtype", 0));
@@ -243,39 +242,34 @@ Job decode_legacy_job(const std::string& json_str) {
     job.cluster_name  = j.value("cluster_name", "");
     job.clusterTag    = j.value("clusterTag", "");
 
-    if (job.subtype == JobSubType::Condor) {
-        if (j.contains("sub_attr")) {
-            job.sub_attr = j["sub_attr"].get<CondorJobAttr>();
-        } else {
-            job.sub_attr = CondorJobAttr{};
-        }
-    } else if (job.subtype == JobSubType::Slurm) {
-        if (j.contains("sub_attr")) {
-            job.sub_attr = j["sub_attr"].get<SlurmJobAttr>();
-        } else {
-            job.sub_attr = SlurmJobAttr{};
-        }
-    } else if (!job.subtype_name.empty()) {
+    if (!job.subtype_name.empty()) {
         // Open-world scheduler: the adapter owns the facts schema; the JSON
         // object is carried verbatim (the adapter's decodeFacts is the only
         // interpreter).
         job.sub_attr = j.contains("sub_attr") && j["sub_attr"].is_object()
                            ? j["sub_attr"]
                            : nlohmann::json::object();
-    } else {
+    } else if (job.subtype == JobSubType::Common || job.subtype == JobSubType::Unknown) {
         job.sub_attr = CommonJobAttr{.auto_update_child = true};
+    } else {
+        // A typed row without an adapter decoder: keep its stored facts as the
+        // open-world value instead of guessing a scheduler schema.
+        job.sub_attr = j.contains("sub_attr") && j["sub_attr"].is_object()
+                           ? j["sub_attr"]
+                           : nlohmann::json::object();
     }
 
     return job;
 }
 
-JobRecord parse_record(const std::string& raw, uint64_t internal_id) {
+JobRecord parse_record(const std::string& raw, uint64_t internal_id,
+                       const JobStore::Options::RowDecoder& decoder) {
+    const auto j = nlohmann::json::parse(raw);
     JobRecord record;
-    record.job = decode_legacy_job(raw);
+    record.job = decoder ? decoder(j) : decode_legacy_job(j);
     record.job.JobID = internal_id;
     JobIdentity& identity = record.job.identity;
 
-    const auto j = nlohmann::json::parse(raw);
     record.revision       = j.value("revision", uint64_t{1});
     record.state          = j.value("state", std::string{kStateActive});
     record.first_seen_us  = j.value("first_seen_us", int64_t{0});
@@ -643,7 +637,7 @@ std::vector<JobRecord> JobStore::loadAll() {
             }
             if (jobID == kSystemSentinelJobId) continue;
             try {
-                auto record = parse_record(it->value().ToString(), jobID);
+                auto record = parse_record(it->value().ToString(), jobID, options_.row_decoder);
                 restored.push_back(std::move(record));
             } catch (const std::exception& error) {
                 ++corrupt_records_;
@@ -1006,7 +1000,7 @@ bool JobStore::read_archive_fence_locked(uint64_t internal_id, ArchiveFence& fen
     fence.internal_id = internal_id;
     JobRecord archived;
     try {
-        archived = parse_record(fence.history_value, internal_id);
+        archived = parse_record(fence.history_value, internal_id, options_.row_decoder);
     } catch (const std::exception& exc) {
         error = "recovery_parse_failed";
         spdlog::error("JobStore: cannot parse the history row of JobID {} during "
@@ -1072,7 +1066,7 @@ bool JobStore::adopt_durable_locked(uint64_t internal_id, std::optional<ArchiveF
 
     JobRecord record;
     try {
-        record = parse_record(raw, internal_id);
+        record = parse_record(raw, internal_id, options_.row_decoder);
     } catch (const std::exception& exc) {
         error = "recovery_parse_failed";
         spdlog::error("JobStore: cannot parse the durable row of JobID {} during "
@@ -1352,7 +1346,7 @@ std::optional<JobRecord> JobStore::readRowByIdentity(const JobIdentity& identity
         return std::nullopt;
     }
     try {
-        auto record = parse_record(raw, internal_id);
+        auto record = parse_record(raw, internal_id, options_.row_decoder);
         return record;
     } catch (const std::exception& error) {
         spdlog::warn("JobStore: unreadable record {}: {}", internal_id, error.what());

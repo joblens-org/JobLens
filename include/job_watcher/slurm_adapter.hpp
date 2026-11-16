@@ -12,173 +12,86 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 // SlurmSchedulerAdapter — the Slurm inventory adapter. Owns the discovery
-// watcher and every Slurm-specific fact encoding; registered under the name
-// "slurm".
+// watcher, the Slurm typed facts and every projection between those facts and
+// the Job/JobRecord fields; registered under the name "slurm".
 #pragma once
 
+#include <sys/types.h>
+
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+
+#include <nlohmann/json.hpp>
+
 #include "core/scheduler_adapter.hpp"
-#include "job_watcher/slurm_job_watcher.hpp"
+#include "core/sub_attr_reflect.hpp"
+
+struct SlurmJobAttr {
+    bool     auto_update_child{};
+    pid_t    stepd_pid{};          // slurmstepd进程PID
+    size_t   job_id{};             // Slurm Job ID
+    uint32_t step_id{};            // Slurm Step ID
+    std::string cluster_name{};    // 集群名称
+    std::string cgroup_path{};     // cgroup路径
+    std::string user{};            // 作业用户
+    std::string job_name{};        // 作业名称
+    std::string partition{};       // 分区/队列名称
+    std::string acct_group{};      // SLURM_JOB_ACCOUNT
+    std::string unix_group{};      // SLURM_JOB_GID resolved through NSS
+    int64_t unix_gid{-1};          // -1 = unavailable
+
+    static constexpr std::array field_names{
+        "auto_update_child", "stepd_pid", "job_id", "step_id",
+        "cluster_name", "cgroup_path", "user", "job_name", "partition",
+        "acct_group", "unix_group", "unix_gid"};
+    static constexpr std::array optional_fields{"acct_group", "unix_group", "unix_gid"};
+
+    static constexpr bool is_optional(std::string_view name)
+    {
+        for (const char* candidate : optional_fields)
+            if (name == candidate) return true;
+        return false;
+    }
+};
+
+static_assert(joblens::facts::valid_schema<SlurmJobAttr>(),
+              "SlurmJobAttr::field_names must cover every reflected member");
 
 class SlurmSchedulerAdapter final : public ISchedulerAdapter {
 public:
-    explicit SlurmSchedulerAdapter(const InventoryTypeSettings& settings)
-        : watcher_(discoveryOptions(settings)) {}
+    explicit SlurmSchedulerAdapter(const InventoryTypeSettings& settings);
+    ~SlurmSchedulerAdapter() override;
 
-    const std::string& name() const override { return name_; }
-    std::string configSection() const override { return "slurm_job_watcher"; }
-    IDiscoverySource& source() override { return watcher_; }
-    AdapterTraits traits() const override
-    {
-        AdapterTraits traits;
-        traits.cgroup_scoped_membership = true;
-        traits.kernel_attribution = true;
-        return traits;
-    }
+    const std::string& name() const override;
+    std::string configSection() const override;
+    IDiscoverySource& source() override;
+    AdapterTraits traits() const override;
 
-    DiscoveryOptions discoveryOptions(const InventoryTypeSettings& settings) const override
-    {
-        DiscoveryOptions options;
-        options.enable_event_source = true;
-        options.scan_interval_ms = 0;
-        if (!settings.cluster_name.empty())
-            options.discovery.cluster_name = settings.cluster_name;
-        return options;
-    }
+    DiscoveryOptions discoveryOptions(const InventoryTypeSettings& settings) const override;
 
-    // Typed facts for a discovered Job are filled by the watcher itself where
-    // it parses its sources (no encodeFacts detour through neutral fields).
-    // This adapter only decodes legacy rows and derives identity fields.
-
-    Job decodeFacts(const nlohmann::json& row) const override
-    {
-        Job job;
-        job.jobtype = static_cast<JobType>(row.value("jobtype", 0));
-        job.subtype = static_cast<JobSubType>(row.value("subtype", 0));
-        job.NativeJobID = row.value("native_job_id", "");
-        job.cluster_name = row.value("cluster_name", "");
-        job.clusterTag = row.value("clusterTag", "");
-        if (job.subtype == JobSubType::Slurm) {
-            job.sub_attr = row.contains("sub_attr")
-                               ? row["sub_attr"].get<SlurmJobAttr>()
-                               : SlurmJobAttr{};
-        }
-        return job;
-    }
-
-    NativeSelector legacySelector(const Job& job) const override
-    {
-        NativeSelector selector;
-        if (job.subtype != JobSubType::Slurm) return selector;
-        selector.adapter = name_;
-        // The typed facts are the namespace source; the common field is
-        // their render (kept as a fallback for facts built before one existed).
-        if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr)) {
-            selector.cluster_name = attr->cluster_name;
-            if (selector.native_job_id.empty())
-                selector.native_job_id = std::to_string(attr->job_id);
-            if (attr->step_id != 0) {
-                if (const auto name = slurm_step_name(attr->step_id)) {
-                    selector.step_id = *name;
-                } else {
-                    selector.step_id = std::to_string(attr->step_id);
-                }
-            }
-        }
-        if (selector.cluster_name.empty()) selector.cluster_name = job.cluster_name;
-        if (selector.native_job_id.empty()) selector.native_job_id = job.NativeJobID;
-        return selector;
-    }
-
-    // Delegates to the shared identity derivation (moved from the store's
-    // apply_identity_to_facts; idempotent for watcher-filled facts).
+    // ---- typed facts / record projection ---------------------------------
+    Job decodeFacts(const nlohmann::json& row) const override;
+    NativeSelector legacySelector(Job& job) const override;
+    void projectFacts(Job& job) const override;
     void applyIdentityToFacts(Job& job, const NativeSelector& selector,
-                              const JobIdentity& identity) const override
-    {
-        apply_identity(job, selector, identity);
-    }
+                              const JobIdentity& identity) const override;
+    NativeSelector registrationSelector(Job& job) const override;
+    void applyRequestFacts(Job& job, const nlohmann::json& request) const override;
+    SubAttrMatcher duplicateMatcher(const Job& job) const override;
+    void refreshLegacyFacts(Job& job) const override;
 
     // ---- structured namespace: the cluster name only ----------------------
-    NamespaceFacts namespaceFacts(const Job& job) const override
-    {
-        const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr);
-        return {attr ? attr->cluster_name : std::string{}};
-    }
-    NamespaceFacts selectorNamespaceFacts(const NativeSelector& selector) const override
-    {
-        return {selector.cluster_name};
-    }
+    NamespaceFacts namespaceFacts(const Job& job) const override;
+    NamespaceFacts selectorNamespaceFacts(const NativeSelector& selector) const override;
     bool adoptNamespaceAliases(Job& job, const std::string& cluster_name,
-                               const std::string& cluster_tag) const override
-    {
-        (void)cluster_tag;  // Slurm has no schedd-tag namespace component
-        auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr);
-        if (attr == nullptr) return true;
-        if (!cluster_name.empty() && !attr->cluster_name.empty()
-                && cluster_name != attr->cluster_name) return false;
-        if (attr->cluster_name.empty()) attr->cluster_name = cluster_name;
-        return true;
-    }
-    void renderNamespace(Job& job) const override
-    {
-        if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr)) {
-            job.cluster_name = attr->cluster_name;
-            // clusterTag is not a Slurm namespace component and stays as-is:
-            // discovery may carry a display value there.
-        }
-    }
-
-    std::string cgroupPathOf(const Job& job) const override
-    {
-        const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr);
-        return attr ? attr->cgroup_path : std::string{};
-    }
+                               const std::string& cluster_tag) const override;
+    void renderNamespace(Job& job) const override;
+    std::string cgroupPathOf(const Job& job) const override;
 
 private:
-    static void apply_identity(Job& job, const NativeSelector& selector,
-                               const JobIdentity& identity)
-    {
-        job.NativeJobID = identity.native_job_id;
-        if (job.jobtype != JobType::Job && job.jobtype != JobType::Sys) {
-            job.jobtype = JobType::Job;
-        }
-        job.subtype = JobSubType::Slurm;
-        if (!std::holds_alternative<SlurmJobAttr>(job.sub_attr)) {
-            job.sub_attr = SlurmJobAttr{};
-        }
-        auto& attr = std::get<SlurmJobAttr>(job.sub_attr);
-        // The typed facts are the single namespace source; fold the resolved
-        // selector's cluster into them (facts win), then render the common
-        // field from the facts (clusterTag is not a Slurm component).
-        if (attr.cluster_name.empty() && !selector.cluster_name.empty())
-            attr.cluster_name = selector.cluster_name;
-        job.cluster_name = attr.cluster_name;
-        if (!selector.step_id.empty()) {
-            if (const auto numeric = slurm_step_value(selector.step_id)) {
-                attr.step_id = *numeric;
-            }
-        }
-    }
-
-    std::string name_{"slurm"};
-    SlurmJobWatcher watcher_;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
-
-// The adapter owns its native-id rule, registered alongside it: Slurm
-// native ids are the logical job number without a step; a step refines the
-// identity (normalized, special names preserved).
-REGISTER_NATIVE_ID_RULE("slurm", [](const NativeSelector& selector)
-    -> std::optional<CanonicalParts> {
-    auto job_number = strip_leading_zeros(selector.native_job_id);
-    if (!job_number) return std::nullopt;
-    CanonicalParts parts;
-    if (!selector.step_id.empty()) {
-        auto step = normalize_slurm_step_id(selector.step_id);
-        if (!step) return std::nullopt;
-        parts.step_id = *step;
-    }
-    parts.cluster_namespace = selector.cluster_name;
-    parts.canonical_native = *job_number;
-    return parts;
-})
-
-REGISTER_SCHEDULER_ADAPTER("slurm", SlurmSchedulerAdapter)

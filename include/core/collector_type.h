@@ -13,7 +13,9 @@
  * limitations under the License. */
 #pragma once
 #include <string>
+#include <string_view>
 #include <vector>
+#include <array>
 #include <chrono>
 #include <optional>
 #include <unordered_map>
@@ -85,161 +87,49 @@ inline const char* to_string(CollectorScope scope) {
     }
 }
 
-struct CondorJobAttr{
-    bool auto_update_child{};
-    pid_t starter_pid{};
-    size_t cluster_id{};   //将会逐步将condor中的jobid切换到这里
-    size_t proc_id{};
-    std::string scheduler_host{}; 
-    std::string scheduler_name{};
-    std::string slots_cgroup_path{};
-    std::string owner{};
-    std::string job_ad_path{};
-    std::string collector_host{};  // COLLECTOR_HOST 值，用于查询
-    // 组归属（上游标准属性，见 doc 与 group_probe_stats）：
-    std::string acct_group{};      // AcctGroup：计费组，完整三段（实验.子组.队列等级）
-    std::string unix_group{};      // PrimaryUnixGroup：作业主动声明的主 Unix 组；未声明为空
+// Scheduler facts are declared next to their adapter. This header only
+// assembles the closed variant and the generic helpers; it does not know a
+// scheduler's fields. The facts structs themselves carry the schema (see
+// sub_attr_reflect.hpp).
+#include "job_watcher/condor_adapter.hpp"
+#include "job_watcher/slurm_adapter.hpp"
+#include "core/sub_attr_reflect.hpp"
 
-    static constexpr auto reflection() {
-        return std::make_tuple(
-            std::make_pair("auto_update_child", &CondorJobAttr::auto_update_child),
-            std::make_pair("starter_pid", &CondorJobAttr::starter_pid),
-            std::make_pair("cluster_id", &CondorJobAttr::cluster_id),
-            std::make_pair("proc_id", &CondorJobAttr::proc_id),
-            std::make_pair("scheduler_host", &CondorJobAttr::scheduler_host),
-            std::make_pair("scheduler_name", &CondorJobAttr::scheduler_name),
-            std::make_pair("slots_cgroup_path", &CondorJobAttr::slots_cgroup_path),
-            std::make_pair("owner", &CondorJobAttr::owner),
-            std::make_pair("job_ad_path", &CondorJobAttr::job_ad_path),
-            std::make_pair("collector_host", &CondorJobAttr::collector_host),
-            std::make_pair("acct_group", &CondorJobAttr::acct_group),
-            std::make_pair("unix_group", &CondorJobAttr::unix_group)
-        );
-    }
-};
-
-// 手写容错序列化（取代 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE）：
-// - from_json 全字段 `contains() && !is_null()` 判断后取值，旧记录缺字段 → 默认值，不抛异常
-//   （宏生成的 from_json 用 j.at()，新增字段会让旧记录恢复时抛 type_error）。
-// - to_json 写全部字段；scheduler_name 自此进入持久化（旧宏漏写，属声明过的行为变化）。
-// - 字段清单必须与 reflection() 保持一致（group_fields_test 锁定）。
-inline void to_json(nlohmann::json& j, const CondorJobAttr& t) {
-    j = nlohmann::json{
-        {"auto_update_child", t.auto_update_child},
-        {"starter_pid", t.starter_pid},
-        {"cluster_id", t.cluster_id},
-        {"proc_id", t.proc_id},
-        {"scheduler_host", t.scheduler_host},
-        {"scheduler_name", t.scheduler_name},
-        {"slots_cgroup_path", t.slots_cgroup_path},
-        {"owner", t.owner},
-        {"job_ad_path", t.job_ad_path},
-        {"collector_host", t.collector_host},
-        {"acct_group", t.acct_group},
-        {"unix_group", t.unix_group},
-    };
-}
-inline void from_json(const nlohmann::json& j, CondorJobAttr& t) {
-    auto rd_bool = [&](const char* k, bool& out) { if (j.contains(k) && !j[k].is_null()) j[k].get_to(out); };
-    auto rd_i64  = [&](const char* k, auto& out) { if (j.contains(k) && !j[k].is_null() && j[k].is_number_integer()) j[k].get_to(out); };
-    auto rd_str  = [&](const char* k, std::string& out) { if (j.contains(k) && !j[k].is_null() && j[k].is_string()) j[k].get_to(out); };
-    rd_bool("auto_update_child", t.auto_update_child);
-    rd_i64("starter_pid", t.starter_pid);
-    rd_i64("cluster_id", t.cluster_id);
-    rd_i64("proc_id", t.proc_id);
-    rd_str("scheduler_host", t.scheduler_host);
-    rd_str("scheduler_name", t.scheduler_name);
-    rd_str("slots_cgroup_path", t.slots_cgroup_path);
-    rd_str("owner", t.owner);
-    rd_str("job_ad_path", t.job_ad_path);
-    rd_str("collector_host", t.collector_host);
-    rd_str("acct_group", t.acct_group);
-    rd_str("unix_group", t.unix_group);
-}
-
-struct CommonJobAttr{
+struct CommonJobAttr {
     bool auto_update_child{}; //当为true时，每次采集时自动更新有没有子进程
-    static constexpr auto reflection() {
-        return std::make_tuple(
-            std::make_pair("auto_update_child", &CommonJobAttr::auto_update_child)
-        );
-    }
-};
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(CommonJobAttr, auto_update_child)
 
-struct SlurmJobAttr{
-    bool auto_update_child{};
-    pid_t stepd_pid{};              // slurmstepd进程PID
-    size_t job_id{};                // Slurm Job ID
-    uint32_t step_id{};             // Slurm Step ID
-    std::string cluster_name{};        // 集群名称
-    std::string cgroup_path{};      // cgroup路径
-    std::string user{};             // 作业用户
-    std::string job_name{};         // 作业名称
-    std::string partition{};        // 分区/队列名称
-    // 组归属（上游标准属性，见 doc 与 group_probe_stats）：
-    std::string acct_group{};       // SLURM_JOB_ACCOUNT：计费账户（与 Condor AcctGroup 同语义）
-    std::string unix_group{};       // gid 经 getgrgid_r 解析的主 Unix 组名；解析失败为空
-    int64_t unix_gid{-1};           // SLURM_JOB_GID；-1 = 未知（int64：gid_t 为 uint32，大 gid 不溢出、不与哨兵混淆）
-
-    static constexpr auto reflection() {
-        return std::make_tuple(
-            std::make_pair("auto_update_child", &SlurmJobAttr::auto_update_child),
-            std::make_pair("stepd_pid", &SlurmJobAttr::stepd_pid),
-            std::make_pair("job_id", &SlurmJobAttr::job_id),
-            std::make_pair("step_id", &SlurmJobAttr::step_id),
-            std::make_pair("cluster_name", &SlurmJobAttr::cluster_name),
-            std::make_pair("cgroup_path", &SlurmJobAttr::cgroup_path),
-            std::make_pair("user", &SlurmJobAttr::user),
-            std::make_pair("job_name", &SlurmJobAttr::job_name),
-            std::make_pair("partition", &SlurmJobAttr::partition),
-            std::make_pair("acct_group", &SlurmJobAttr::acct_group),
-            std::make_pair("unix_group", &SlurmJobAttr::unix_group),
-            std::make_pair("unix_gid", &SlurmJobAttr::unix_gid)
-        );
-    }
+    static constexpr std::array field_names{"auto_update_child"};
+    static constexpr std::array<const char*, 0> optional_fields{};
+    static constexpr bool is_optional(std::string_view) { return false; }
 };
 
-// 手写容错序列化（取代 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE），理由与字段清单约束同 CondorJobAttr。
-inline void to_json(nlohmann::json& j, const SlurmJobAttr& t) {
-    j = nlohmann::json{
-        {"auto_update_child", t.auto_update_child},
-        {"stepd_pid", t.stepd_pid},
-        {"job_id", t.job_id},
-        {"step_id", t.step_id},
-        {"cgroup_path", t.cgroup_path},
-        {"user", t.user},
-        {"job_name", t.job_name},
-        {"partition", t.partition},
-        {"cluster_name", t.cluster_name},
-        {"acct_group", t.acct_group},
-        {"unix_group", t.unix_group},
-        {"unix_gid", t.unix_gid},
-    };
-}
-inline void from_json(const nlohmann::json& j, SlurmJobAttr& t) {
-    auto rd_bool = [&](const char* k, bool& out) { if (j.contains(k) && !j[k].is_null()) j[k].get_to(out); };
-    auto rd_i64  = [&](const char* k, auto& out) { if (j.contains(k) && !j[k].is_null() && j[k].is_number_integer()) j[k].get_to(out); };
-    auto rd_str  = [&](const char* k, std::string& out) { if (j.contains(k) && !j[k].is_null() && j[k].is_string()) j[k].get_to(out); };
-    rd_bool("auto_update_child", t.auto_update_child);
-    rd_i64("stepd_pid", t.stepd_pid);
-    rd_i64("job_id", t.job_id);
-    rd_i64("step_id", t.step_id);
-    rd_str("cgroup_path", t.cgroup_path);
-    rd_str("user", t.user);
-    rd_str("job_name", t.job_name);
-    rd_str("partition", t.partition);
-    rd_str("cluster_name", t.cluster_name);
-    rd_str("acct_group", t.acct_group);
-    rd_str("unix_group", t.unix_group);
-    rd_i64("unix_gid", t.unix_gid);
-}
+static_assert(joblens::facts::valid_schema<CommonJobAttr>(),
+              "CommonJobAttr::field_names must cover every reflected member");
 
 using SubAttr = std::variant<CondorJobAttr, CommonJobAttr, SlurmJobAttr, nlohmann::json>;
 // The json alternative is the open-world facts channel: a scheduler
 // whose adapter registered after the built-ins carries its typed facts as a
 // JSON object the adapter owns (schema, keys, evolution). Built-in attrs
 // stay strongly typed so existing collectors and matchers are untouched.
+
+// The closed variant's manifest: one line per typed adapter. This is the only
+// place a new typed scheduler is named in core; its facts struct and its
+// adapter registration live together in the adapter header.
+#define JOBLENS_SUB_ATTR_TABLE(X)     \
+    X(condor, CondorJobAttr, Condor)  \
+    X(slurm, SlurmJobAttr, Slurm)
+
+inline const char* adapter_name_for(JobSubType subtype)
+{
+#define JOBLENS_SUB_ATTR_CASE(name, type, subtype_token) \
+    case JobSubType::subtype_token: return #name;
+    switch (subtype) {
+        JOBLENS_SUB_ATTR_TABLE(JOBLENS_SUB_ATTR_CASE)
+        default: return nullptr;
+    }
+#undef JOBLENS_SUB_ATTR_CASE
+}
+
 
 // SubAttr 匹配器，用于通过 sub_attr 字段匹配作业
 struct SubAttrMatcher {
@@ -305,13 +195,23 @@ struct SubAttrMatcher {
                 // CommonJobAttr 目前没有特殊字段需要匹配
                 spdlog::debug("SubAttrMatcher: matching CommonJobAttr is not implemented, returning false");
                 return false;
-            } else {
+            } else if constexpr (std::is_same_v<T, nlohmann::json>) {
                 // Open-world JSON facts: field-level subset match. Without
                 // json_fields the match is by presence (callers combine it
                 // with subtype_name at the Job level).
                 if (!json_fields.has_value()) return true;
                 for (auto it = json_fields->begin(); it != json_fields->end(); ++it) {
                     if (!a.contains(it.key()) || a.at(it.key()) != it.value()) return false;
+                }
+                return true;
+            } else {
+                // A future typed adapter: match through the JSON projection
+                // its generated to_json already produces. No core edit is
+                // needed when a new facts type joins the variant.
+                const nlohmann::json facts = a;
+                if (!json_fields.has_value()) return true;
+                for (auto it = json_fields->begin(); it != json_fields->end(); ++it) {
+                    if (!facts.contains(it.key()) || facts.at(it.key()) != it.value()) return false;
                 }
                 return true;
             }
@@ -383,6 +283,31 @@ struct Job {
     }
 };
 
+// The generic identity -> record projection shared by every adapter. The
+// adapter calls it before deriving its scheduler-specific fields; open-world
+// jobs without an adapter call it directly.
+inline void apply_identity_projection(Job& job, const NativeSelector& selector,
+                                      const JobIdentity& identity)
+{
+    job.NativeJobID = identity.native_job_id;
+    if (!selector.cluster_name.empty()) job.cluster_name = selector.cluster_name;
+    if (!selector.cluster_tag.empty()) job.clusterTag = selector.cluster_tag;
+    if (job.jobtype != JobType::Job && job.jobtype != JobType::Sys)
+        job.jobtype = JobType::Job;
+}
+
+// Facts structs are exposed to Lua through their reflected member names, the
+// same schema JSON uses. Job keeps its own reflection().
+template <typename T, std::enable_if_t<joblens::facts::is_facts_v<T>, int> = 0>
+inline sol::object to_lua(sol::state_view lua, const T& value)
+{
+    sol::table tbl = lua.create_table();
+    joblens::facts::each(value, [&](const char* name, const auto& field, std::size_t) {
+        tbl[name] = to_lua(lua, field);
+    });
+    return tbl;
+}
+
 // ---------------------------------------------------------------------------
 // Identity projection accessors
 //
@@ -396,11 +321,8 @@ inline NativeSelector selector_of(const Job& job) {
     selector.adapter = job.identity.adapter.empty() ? job.subtype_name
                                                     : job.identity.adapter;
     if (selector.adapter.empty()) {
-        switch (job.subtype) {
-            case JobSubType::Condor: selector.adapter = "condor"; break;
-            case JobSubType::Slurm:  selector.adapter = "slurm";  break;
-            default: break;
-        }
+        if (const char* name = adapter_name_for(job.subtype))
+            selector.adapter = name;
     }
     selector.cluster_name = job.cluster_name;
     selector.cluster_tag = job.clusterTag;

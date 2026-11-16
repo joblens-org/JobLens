@@ -48,6 +48,7 @@
 #include "core/inventory_config.hpp"
 #include "core/inventory_status_provider.hpp"
 #include "core/job_registry.hpp"
+#include "job_watcher/condor_job_watcher.hpp"
 #include "collection_runtime_fixture.hpp"
 
 #include <spdlog/spdlog.h>

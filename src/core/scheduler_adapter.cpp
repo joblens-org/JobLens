@@ -13,6 +13,19 @@
  * limitations under the License. */
 // SchedulerAdapterRegistry implementation (see scheduler_adapter.hpp).
 #include "core/scheduler_adapter.hpp"
+#include "core/collector_type.h"
+
+SubAttrMatcher ISchedulerAdapter::duplicateMatcher(const Job& job) const
+{
+    SubAttrMatcher matcher;
+    matcher.subtype = job.subtype;
+    return matcher;
+}
+
+NamespaceFacts ISchedulerAdapter::namespaceFacts(const Job& job) const
+{
+    return {job.cluster_name, job.clusterTag};
+}
 
 bool namespace_facts_compatible(const NamespaceFacts& left, const NamespaceFacts& right)
 {

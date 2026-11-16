@@ -39,6 +39,7 @@
 #include "job_lifecycle_event.h"
 #include "ebpf/trace_condor_starter.h"
 #include "common/ebpf_common.hpp"
+#include "core/job_discovery.hpp"
 #include "core/job_store.hpp"
 #include "core/collection_runtime.hpp"
 #include "core/kernel_attribution.hpp"
@@ -334,12 +335,16 @@ public:
     // The structured namespace facts of one Job / one addressing selector.
     NamespaceFacts namespaceFactsOf(const Job& job) const;
     NamespaceFacts selectorFactsOf(const NativeSelector& selector) const;
+    // The adapter that interprets a scheduler name, configured or lazily
+    // built for facts interpretation only. nullptr for an unknown name.
+    const ISchedulerAdapter* adapterNamed(const std::string& name) const;
     // Folds request-level aliases into the typed facts (facts win); false =
     // the aliases contradict known facts.
     bool adoptNamespaceAliases(Job& job, const std::string& cluster_name,
                                const std::string& cluster_tag) const;
-    // Renders the query-side common fields from the typed facts.
-    void renderNamespaceOf(Job& job) const;
+    // Publishes every record-visible field the adapter derives from the typed
+    // facts (subtype, subtype_name, native id, namespace). Fill-empty only.
+    void projectRecordFacts(Job& job) const;
     // Normalizes a Job restored from the store: legacy rows may carry
     // namespace facts only in the common fields — adopt them into the typed
     // facts (facts win), then render back.
@@ -365,6 +370,10 @@ private:
     // then start sources, the first authoritative pass, the status providers
     // and the maintenance worker.
     void openStore(const JobRegistryOptions& options);
+    // Adapter-owned row projection for JobStore: the adapter that owns the
+    // facts decodes the Job fields; open-world/Common rows keep the generic
+    // decoder. Runs during restore, before the RPC surface opens.
+    Job decodeStoredJob(const nlohmann::json& row) const;
     void restoreExistingRecords();
     void installCollectorValidator();
     void resetHeartbeatState();
@@ -507,6 +516,10 @@ private:
     // facts a caller set explicitly are never overwritten). Returns an empty
     // selector when no adapter owns the Job — incomplete, never a guess.
     NativeSelector legacySelectorOf(Job& job) const;
+    // The typed-facts duplicate screen. The adapter owns which of its facts
+    // identify a scheduled job; an adapter-less row keeps the generic subtype
+    // screen only.
+    SubAttrMatcher duplicateMatcherOf(const Job& job) const;
     enum class SelectionOperation {
         SetManual,   // replace the manual selection; [] is a persistent stop
         ResetAuto,   // clear manual, keep the automatic selection

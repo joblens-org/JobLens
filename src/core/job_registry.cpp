@@ -42,8 +42,6 @@
 #include "core/inventory_rpc.hpp"
 #include "core/collector_registry.hpp"
 #include "common/utils.hpp"
-#include "common/condor_job.hpp"
-#include "common/slurm_job.hpp"
 #include "common/common_job.hpp"
 #include "common/local_rpc.hpp"
 #include "core/group_probe_stats.hpp"
@@ -114,39 +112,6 @@ bool merge_flag(bool& target, bool source) {
     return true;
 }
 
-bool merge_condor_attr(CondorJobAttr& target, const CondorJobAttr& source) {
-    bool changed = false;
-    changed |= merge_scalar(target.starter_pid, source.starter_pid);
-    changed |= merge_scalar(target.cluster_id, source.cluster_id);
-    changed |= merge_scalar(target.proc_id, source.proc_id);
-    changed |= merge_text(target.scheduler_host, source.scheduler_host);
-    changed |= merge_text(target.scheduler_name, source.scheduler_name);
-    changed |= merge_text(target.slots_cgroup_path, source.slots_cgroup_path);
-    changed |= merge_text(target.owner, source.owner);
-    changed |= merge_text(target.job_ad_path, source.job_ad_path);
-    changed |= merge_text(target.collector_host, source.collector_host);
-    changed |= merge_flag(target.auto_update_child, source.auto_update_child);
-    return changed;
-}
-
-bool merge_slurm_attr(SlurmJobAttr& target, const SlurmJobAttr& source) {
-    bool changed = false;
-    changed |= merge_scalar(target.stepd_pid, source.stepd_pid);
-    changed |= merge_scalar(target.job_id, source.job_id);
-    changed |= merge_scalar(target.step_id, source.step_id);
-    changed |= merge_text(target.cluster_name, source.cluster_name);
-    changed |= merge_text(target.cgroup_path, source.cgroup_path);
-    changed |= merge_text(target.user, source.user);
-    changed |= merge_text(target.job_name, source.job_name);
-    changed |= merge_text(target.partition, source.partition);
-    changed |= merge_flag(target.auto_update_child, source.auto_update_child);
-    return changed;
-}
-
-bool merge_common_attr(CommonJobAttr& target, const CommonJobAttr& source) {
-    return merge_flag(target.auto_update_child, source.auto_update_child);
-}
-
 // Merge observation facts into the stored facts. Empty/default observation
 // fields never erase known facts; CollectorNames is never taken from an
 // observation because selection is intent, not a discovery fact.
@@ -185,57 +150,38 @@ bool merge_job_facts(Job& target, const Job& observed, bool replace_members) {
 
     std::visit([&changed, &target](const auto& source) {
         using T = std::decay_t<decltype(source)>;
-        if constexpr (std::is_same_v<T, CondorJobAttr>) {
-            if (auto* current = std::get_if<CondorJobAttr>(&target.sub_attr)) {
-                changed |= merge_condor_attr(*current, source);
-            } else {
-                target.sub_attr = source;
-                changed = true;
-            }
-        } else if constexpr (std::is_same_v<T, SlurmJobAttr>) {
-            if (auto* current = std::get_if<SlurmJobAttr>(&target.sub_attr)) {
-                changed |= merge_slurm_attr(*current, source);
-            } else {
-                target.sub_attr = source;
-                changed = true;
-            }
-        } else {
+        if constexpr (std::is_same_v<T, nlohmann::json>) {
+            // Open-world facts keep their historical behavior: a Common
+            // target merges the JSON's generic fields, anything else is
+            // replaced wholesale.
             if (auto* current = std::get_if<CommonJobAttr>(&target.sub_attr)) {
-                changed |= merge_common_attr(*current, source);
+                changed |= joblens::facts::merge_from(*current,
+                                                      source.template get<CommonJobAttr>());
             } else {
                 target.sub_attr = source;
                 changed = true;
             }
+        } else if (auto* current = std::get_if<T>(&target.sub_attr)) {
+            changed |= joblens::facts::merge_from(*current, source);
+        } else {
+            target.sub_attr = source;
+            changed = true;
         }
     }, observed.sub_attr);
 
     return changed;
 }
 
-// Same-facts predicate for the merge idempotency gate (was a JSON
-// fingerprint: two full serializations per observation). Compares exactly the
-// field set the fingerprint serialized: typed identity facts, the pid
-// projection, the execution evidence and the typed attributes.
-template <typename T>
-bool reflected_equal(const T& a, const T& b)
-{
-    bool same = true;
-    std::apply([&](const auto&... pairs) {
-        ((same = same && (a.*(pairs.second)) == (b.*(pairs.second))), ...);
-    }, T::reflection());
-    return same;
-}
-
 bool sub_attr_equal(const SubAttr& a, const SubAttr& b)
 {
     if (a.index() != b.index()) return false;
-    if (std::holds_alternative<nlohmann::json>(a))
-        return std::get<nlohmann::json>(a) == std::get<nlohmann::json>(b);
-    if (std::holds_alternative<CondorJobAttr>(a))
-        return reflected_equal(std::get<CondorJobAttr>(a), std::get<CondorJobAttr>(b));
-    if (std::holds_alternative<SlurmJobAttr>(a))
-        return reflected_equal(std::get<SlurmJobAttr>(a), std::get<SlurmJobAttr>(b));
-    return reflected_equal(std::get<CommonJobAttr>(a), std::get<CommonJobAttr>(b));
+    return std::visit([&](const auto& value) -> bool {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, nlohmann::json>)
+            return value == std::get<T>(b);
+        else
+            return joblens::facts::equal(value, std::get<T>(b));
+    }, a);
 }
 
 bool same_discovered_facts(const Job& a, const Job& b)
@@ -267,20 +213,6 @@ JobStore::WriteOp put_record_op(const JobRecord& record) {
 }
 
 // Screen native fields here; adapters screen structured namespaces below.
-SubAttrMatcher native_duplicate_matcher(const Job& job) {
-    SubAttrMatcher matcher;
-    matcher.subtype = job.subtype;
-    if (const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr)) {
-        matcher.subtype = JobSubType::Condor;
-        matcher.condor_cluster_id = attr->cluster_id;
-        matcher.condor_proc_id = attr->proc_id;
-    } else if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr)) {
-        matcher.subtype = JobSubType::Slurm;
-        matcher.slurm_job_id = attr->job_id;
-        matcher.slurm_step_id = attr->step_id;
-    }
-    return matcher;
-}
 
 // The surviving rows of the typed-facts duplicate screen, shared by the
 // CREATE dedup and the UPDATE fallback: sub_attr match plus the
@@ -308,16 +240,22 @@ ISchedulerAdapter* JobRegistry::adapterOf(const Job& job) const {
     const std::string* wanted = &job.subtype_name;
     std::string enum_fallback;
     if (wanted->empty()) {
-        switch (job.subtype) {
-            case JobSubType::Condor: enum_fallback = kAdapterCondor; break;
-            case JobSubType::Slurm:  enum_fallback = kAdapterSlurm;  break;
-            default: return nullptr;
-        }
+        const char* name = adapter_name_for(job.subtype);
+        if (name == nullptr) return nullptr;
+        enum_fallback = name;
         wanted = &enum_fallback;
     }
     for (const auto& adapter : adapters_)
         if (adapter->name() == *wanted) return adapter.get();
     return nullptr;
+}
+
+SubAttrMatcher JobRegistry::duplicateMatcherOf(const Job& job) const {
+    if (const auto* adapter = namespaceAdapterOf(job))
+        return adapter->duplicateMatcher(job);
+    SubAttrMatcher matcher;
+    matcher.subtype = job.subtype;
+    return matcher;
 }
 
 NamespaceFacts JobRegistry::namespaceFactsOf(const Job& job) const {
@@ -332,6 +270,10 @@ NamespaceFacts JobRegistry::selectorFactsOf(const NativeSelector& selector) cons
     return {selector.cluster_name, selector.cluster_tag};
 }
 
+const ISchedulerAdapter* JobRegistry::adapterNamed(const std::string& name) const {
+    return namespaceAdapterNamed(name);
+}
+
 bool JobRegistry::adoptNamespaceAliases(Job& job, const std::string& cluster_name,
                                         const std::string& cluster_tag) const {
     if (const auto* adapter = namespaceAdapterOf(job))
@@ -344,8 +286,8 @@ bool JobRegistry::adoptNamespaceAliases(Job& job, const std::string& cluster_nam
     return true;
 }
 
-void JobRegistry::renderNamespaceOf(Job& job) const {
-    if (const auto* adapter = namespaceAdapterOf(job)) adapter->renderNamespace(job);
+void JobRegistry::projectRecordFacts(Job& job) const {
+    if (const auto* adapter = namespaceAdapterOf(job)) adapter->projectFacts(job);
 }
 
 void JobRegistry::normalizeRestoredFacts(Job& job) const {
@@ -378,31 +320,21 @@ ISchedulerAdapter* JobRegistry::namespaceAdapterOf(const Job& job) const {
     const std::string* wanted = &job.subtype_name;
     std::string enum_fallback;
     if (wanted->empty()) {
-        switch (job.subtype) {
-            case JobSubType::Condor: enum_fallback = kAdapterCondor; break;
-            case JobSubType::Slurm:  enum_fallback = kAdapterSlurm;  break;
-            default: return nullptr;
-        }
+        const char* name = adapter_name_for(job.subtype);
+        if (name == nullptr) return nullptr;
+        enum_fallback = name;
         wanted = &enum_fallback;
     }
     return namespaceAdapterNamed(*wanted);
 }
 
 NativeSelector JobRegistry::legacySelectorOf(Job& job) const {
+    // The adapter owns both sides: typed facts -> selector, and the derived
+    // record fields folded back onto the Job. An adapter-less row keeps an
+    // empty selector — incomplete, never a guess.
     const auto* adapter = adapterOf(job);
     if (!adapter) return {};
-    NativeSelector selector = adapter->legacySelector(job);
-    // The selector folds onto the Job: its derived fields backfill the Job's
-    // empty ones (non-empty facts win — the adapter derived FROM them), and
-    // a step claim materializes into the execution group. attr-numeric step
-    // 0 never reaches here as a claim (0-vs-missing rule holds at the
-    // adapter boundary).
-    job.subtype_name = selector.adapter;
-    if (job.cluster_name.empty()) job.cluster_name = selector.cluster_name;
-    if (job.clusterTag.empty()) job.clusterTag = selector.cluster_tag;
-    if (job.NativeJobID.empty()) job.NativeJobID = selector.native_job_id;
-    if (!selector.step_id.empty()) job.identity.step_id = selector.step_id;
-    return selector;
+    return adapter->legacySelector(job);
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +417,11 @@ void JobRegistry::openStore(const JobRegistryOptions& options)
 {
     JobStore::Options store_options;
     store_options.db_path = options.db_path;
+    // Row projection belongs to the adapter that owns the facts. The store
+    // keeps parsing the envelope; it never names a scheduler.
+    store_options.row_decoder = [this](const nlohmann::json& row) {
+        return decodeStoredJob(row);
+    };
     store_ = std::make_unique<JobStore>(store_options);
     store_->setRowProvider([this](uint64_t id) -> std::optional<JobRecord> {
         std::shared_lock lg(records_mtx_);
@@ -499,6 +436,43 @@ void JobRegistry::openStore(const JobRegistryOptions& options)
     } else {
         spdlog::warn("JobRegistry: job db not running");
     }
+}
+
+Job JobRegistry::decodeStoredJob(const nlohmann::json& row) const
+{
+    Job skeleton;
+    skeleton.subtype = static_cast<JobSubType>(row.value("subtype", 0));
+    skeleton.subtype_name = row.value("subtype_name", "");
+    // Legacy rows written before subtype_name moved onto the Job carry the
+    // adapter only under "adapter"; use it for decoder selection too.
+    if (skeleton.subtype_name.empty())
+        skeleton.subtype_name = row.value("adapter", "");
+    if (const auto* adapter = namespaceAdapterOf(skeleton))
+        return adapter->decodeFacts(row);
+
+    // Open-world / Common rows: the facts channel is JSON, or the generic
+    // common attributes. A typed row with no adapter keeps its stored facts
+    // as JSON rather than guessing a scheduler schema.
+    Job job;
+    job.jobtype = static_cast<JobType>(row.value("jobtype", 0));
+    job.subtype = skeleton.subtype;
+    job.subtype_name = skeleton.subtype_name;
+    job.JobPIDs = row.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>();
+    job.NativeJobID = row.value("native_job_id", "");
+    job.cluster_name = row.value("cluster_name", "");
+    job.clusterTag = row.value("clusterTag", "");
+    if (!job.subtype_name.empty()) {
+        job.sub_attr = row.contains("sub_attr") && row["sub_attr"].is_object()
+                           ? row["sub_attr"]
+                           : nlohmann::json::object();
+    } else if (job.subtype == JobSubType::Common || job.subtype == JobSubType::Unknown) {
+        job.sub_attr = CommonJobAttr{.auto_update_child = true};
+    } else {
+        job.sub_attr = row.contains("sub_attr") && row["sub_attr"].is_object()
+                           ? row["sub_attr"]
+                           : nlohmann::json::object();
+    }
+    return job;
 }
 
 void JobRegistry::restoreExistingRecords()
@@ -1803,7 +1777,7 @@ bool JobRegistry::createManualJob(const Job& job) {
     // cluster_id/proc_id under another schedd names a different job and is
     // allowed to create; an identity-bearing row counts as a duplicate only
     // when its scheduler attribution agrees with the request.
-    const SubAttrMatcher matcher = native_duplicate_matcher(job_copy);
+    const SubAttrMatcher matcher = duplicateMatcherOf(job_copy);
     const auto duplicates = scheduler_screened_duplicates(
         *this, job_copy, ownFindActive(
                       [&matcher](const Job& existing) { return matches_job(matcher, existing); }));
@@ -1943,7 +1917,7 @@ JobRegistry::ManualTarget JobRegistry::manualUpdateTarget(
         identity = canonicalize(*selector);
     }
     const auto request_facts = namespaceFactsOf(job);
-    const SubAttrMatcher matcher = native_duplicate_matcher(job);
+    const SubAttrMatcher matcher = duplicateMatcherOf(job);
     for (const auto& record : ownRecords()) {
         if (record.job.JobID == kSystemSentinelJobId) continue;
         const bool canonical_match = identity && record.job.identity.logical_complete() &&
@@ -2039,7 +2013,7 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
             // proven compatible above), then the common fields render.
             adoptNamespaceAliases(claimed_job, identity_selector->cluster_name,
                                   identity_selector->cluster_tag);
-            renderNamespaceOf(claimed_job);
+            projectRecordFacts(claimed_job);
         }
         return updateManualInstance(target.record, claimed_job, request);
     }
@@ -2051,7 +2025,7 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
     if (identity_selector) {
         adoptNamespaceAliases(create_job, identity_selector->cluster_name,
                               identity_selector->cluster_tag);
-        renderNamespaceOf(create_job);
+        projectRecordFacts(create_job);
     }
     if (!createManualJob(create_job)) {
         nlohmann::json out;
@@ -2110,7 +2084,7 @@ nlohmann::json JobRegistry::updateManualInstance(const JobRecord& target, const 
         // never wipe a fact the merge did not see.
         normalizeRestoredFacts(record.job);
         if (merge_job_facts(record.job, facts, /*replace_members=*/false)) {
-            renderNamespaceOf(record.job);  // the typed facts are the source
+            projectRecordFacts(record.job);  // the typed facts are the source
             bool index_changed = false;
             if (previous_namespace != namespaceFactsOf(record.job)) {
                 // Interpretation goes through the adapter even when the
@@ -2688,19 +2662,15 @@ size_t JobRegistry::delJobByRequest(const nlohmann::json& req) {
 }
 
 inline void JobRegistry::update_job(Job& job){
-    if(job.subtype == JobSubType::Condor){
-        CondorJob::update_job_info(job);
-        if (!CondorJob::update_job_pids(job)) {
-            CommonJob::update_job_child_process(job);
-        }
+    // The adapter owns the scheduler-specific /proc refresh. Common rows have
+    // no adapter; their only refresh is the generic child-process update.
+    if (const auto* adapter = namespaceAdapterOf(job)) {
+        adapter->refreshLegacyFacts(job);
+        return;
     }
-    if(job.subtype == JobSubType::Slurm){
-        SlurmJob::update_job_info(job);
-        CommonJob::update_job_child_process(job);
-    }
-    if(job.subtype == JobSubType::Common){
-        if (std::get<CommonJobAttr>(job.sub_attr).auto_update_child){
-            auto old_pids = job.JobPIDs;
+    if (job.subtype == JobSubType::Common) {
+        if (const auto* attr = std::get_if<CommonJobAttr>(&job.sub_attr);
+            attr != nullptr && attr->auto_update_child) {
             CommonJob::update_job_child_process(job);
         }
     }
@@ -2880,14 +2850,12 @@ void JobRegistry::applyIdentityToFacts(Job& job, const NativeSelector& selector,
     // it does not depend on which discovery types are configured. Without a
     // registered adapter (open-world scheduler) the observed facts are
     // stored verbatim — no branch, no misfiling into a built-in schema.
-    job.NativeJobID = identity.native_job_id;
-    if (!selector.cluster_name.empty()) job.cluster_name = selector.cluster_name;
-    if (!selector.cluster_tag.empty()) job.clusterTag = selector.cluster_tag;
-    if (job.jobtype != JobType::Job && job.jobtype != JobType::Sys) {
-        job.jobtype = JobType::Job;
-    }
+    // Scheduler-specific derivation is adapter-owned. The generic projection
+    // is the fallback for open-world facts with no registered adapter.
     if (const auto* adapter = namespaceAdapterNamed(identity.adapter))
         adapter->applyIdentityToFacts(job, selector, identity);
+    else
+        apply_identity_projection(job, selector, identity);
     project_identity(job);
 }
 
@@ -2969,7 +2937,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
 
     Job merged = stored.job;
     merge_job_facts(merged, observed_job, authoritative_members);
-    renderNamespaceOf(merged);  // the typed facts are the namespace source
+    projectRecordFacts(merged);  // the typed facts are the record source
     merged.JobID = internal_id;
 
     JobRecord updated = stored;
