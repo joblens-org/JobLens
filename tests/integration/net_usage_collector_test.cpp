@@ -270,7 +270,7 @@ static void run(bool namespace_race) {
     NetUsageCollector collector;
     if (namespace_race) {
         init_collector(collector, {{"summary", "false"}, {"use_netlink", "false"}});
-        Job job; job.JobPIDs = {getpid()};
+        Job job; set_pids(job, {getpid()});
         const auto before = collector.sample_job(job);
         require(before.size() == 1 && before[0].connections.size() == 4,
                 "namespace race fixture is missing connections");
@@ -278,19 +278,23 @@ static void run(bool namespace_race) {
         // The stable parent's sockets must still be found via another reader.
         switch_namespace_path = "/proc/" + std::to_string(child) + "/ns/net";
         switch_command_fd = commands[1]; switch_ack_fd = acknowledgements[0];
-        job.JobPIDs = {child, getpid()};
+        set_pids(job, {child, getpid()});
         const auto after = collector.sample_job(job);
         require(switch_namespace_path.empty(), "namespace switch hook did not run");
-        require(after.size() == 2 && after[1].pid == getpid() && after[1].connections.size() == 4,
+        // The process set is ordered by pid, not by the order the test added
+        // it: look the stable parent up instead of indexing.
+        const auto stable = std::find_if(
+            after.begin(), after.end(), [](const NetInfo& info) { return info.pid == getpid(); });
+        require(after.size() == 2 && stable != after.end() && stable->connections.size() == 4,
                 "namespace change in first reader lost stable process connections");
-        for (auto inode : inodes) findConnection(after[1], inode);
+        for (auto inode : inodes) findConnection(*stable, inode);
         collector.deinit();
         require(openFdCount() == initial_fds, "namespace race leaked FDs");
         return;
     }
     init_collector(collector, {{"summary", "true"}, {"use_netlink", "true"}});
     checkWriters(collector, true);
-    Job job; job.JobID = 17; job.JobPIDs = {getpid(), child};
+    Job job; job.JobID = 17; set_pids(job, {getpid(), child});
     mark("NET_BEGIN shared");
     auto first = collector.sample_job(job);
     mark("NET_END shared");
@@ -330,7 +334,7 @@ static void run(bool namespace_race) {
             "namespace lookup failure lost process output");
 
     require(write(commands[1], "c", 1) == 1 && read(acknowledgements[0], buffer, 1) == 1, "child close failed");
-    job.JobPIDs = {child};
+    set_pids(job, {child});
     mark("NET_BEGIN empty");
     const auto empty = collector.sample_job(job);
     mark("NET_END empty");
@@ -340,7 +344,7 @@ static void run(bool namespace_race) {
     require(openFdCount() == initial_fds, "netlink FD leaked after deinit");
     init_collector(collector, {{"summary", "false"}, {"use_netlink", "false"}});
     checkWriters(collector, false);
-    job.JobPIDs = {getpid()};
+    set_pids(job, {getpid()});
     mark("NET_BEGIN without_netlink");
     const auto without_netlink = collector.sample_job(job);
     mark("NET_END without_netlink");

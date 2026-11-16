@@ -161,11 +161,11 @@ inline std::vector<pid_t> collect_process_tree(const std::vector<pid_t>& seed_pi
  * @return true 如果更新后列表非空
  */
 inline bool update_job_child_process(Job& job) {
-    if (job.JobPIDs.empty()) return false;
+    if (pids_of(job).empty()) return false;
     
-    job.JobPIDs = collect_process_tree(job.JobPIDs);
-    spdlog::debug("update_job_child_process: JobPIDs: {}",fmt::join(job.JobPIDs, ", "));
-    return !job.JobPIDs.empty();
+    set_pids(job, collect_process_tree(pids_of(job)));
+    spdlog::debug("update_job_child_process: JobPIDs: {}",fmt::join(pids_of(job), ", "));
+    return !pids_of(job).empty();
 }
 
 } // namespace CommonJob

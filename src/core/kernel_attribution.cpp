@@ -129,14 +129,14 @@ void KernelAttribution::activate(uint64_t internal_id, const Job& job)
                          internal_id, cgid);
         }
     }
-    for (pid_t pid : job.JobPIDs) {
+    for (pid_t pid : pids_of(job)) {
         if (!tracker_->set_pid_job(static_cast<uint32_t>(pid), internal_id)) {
             spdlog::warn("KernelAttribution: pid2job seed write failed job_id={} pid={}",
                          internal_id, pid);
         }
     }
     spdlog::debug("KernelAttribution: activated job_id={} seed_pids={} has_cgroup={}",
-                  internal_id, job.JobPIDs.size(), cgid != 0);
+                  internal_id, pids_of(job).size(), cgid != 0);
 }
 
 void KernelAttribution::deactivate(uint64_t internal_id, const Job& job)
@@ -157,11 +157,11 @@ void KernelAttribution::deactivate(uint64_t internal_id, const Job& job)
         spdlog::debug("KernelAttribution: cgroup2job removed job_id={} cgroup_id={}",
                       internal_id, cgid);
     }
-    for (pid_t pid : job.JobPIDs) {
+    for (pid_t pid : pids_of(job)) {
         tracker_->del_pid_job(static_cast<uint32_t>(pid));
     }
     spdlog::debug("KernelAttribution: deactivated job_id={} cleared_pids={} had_cgroup={}",
-                  internal_id, job.JobPIDs.size(), cgid != 0);
+                  internal_id, pids_of(job).size(), cgid != 0);
 }
 
 void KernelAttribution::reconcile(const Job& job)
@@ -174,7 +174,7 @@ void KernelAttribution::reconcile(const Job& job)
 
     const uint64_t cgid = resolveCgroupId(job);
     if (cgid != 0) tracker_->set_cgroup_job(cgid, job.JobID);
-    for (pid_t pid : job.JobPIDs) {
+    for (pid_t pid : pids_of(job)) {
         tracker_->set_pid_job(static_cast<uint32_t>(pid), job.JobID);
     }
 }

@@ -199,7 +199,7 @@ std::vector<IOUsageInfo> IOUsageCollector::sample_job(const Job &job)
         // pid2job 由 JobRegistry + 内核 fork/exit hook 维护; 此处仅触发一次无阻塞 fetch。
         ring_buffer__consume(bpf_rb_);
     }
-    for (int pid : job.JobPIDs) {
+    for (int pid : pids_of(job)) {
         // 提高鲁棒性
         if (! Utils::is_process_running(pid)){
             continue;

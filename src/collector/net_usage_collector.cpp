@@ -540,14 +540,14 @@ std::vector<NetInfo> NetUsageCollector::sample_job(const Job& job) {
     std::vector<NetInfo> all;
     Connection summary_conn;
     summary_conn.summary = true;
-    all.reserve(job.JobPIDs.size());
+    all.reserve(pids_of(job).size());
     // These snapshots deliberately live for just this collect(Job) call. They
     // cannot leak stale PID/FD ownership or samples into a later Job or cycle.
     std::vector<ProcessSockets> processes;
-    processes.reserve(job.JobPIDs.size());
+    processes.reserve(pids_of(job).size());
     std::vector<NamespaceSockets> namespaces;
     std::unordered_map<std::string, size_t> namespace_indices;
-    for (pid_t pid : job.JobPIDs) {
+    for (pid_t pid : pids_of(job)) {
         if (!Utils::is_process_running(pid)) continue;
         auto inode_to_fd = BuildInodeToFdMap(pid);
         if (!inode_to_fd) continue;

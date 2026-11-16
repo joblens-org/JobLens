@@ -379,7 +379,7 @@ PowerSnapshot PowerCollector::compute_energy(
         auto jobs = JobRegistry::instance().snapshot();
         for (const auto& job : jobs) {
             job_native_ids[job.JobID] = job.NativeJobID;
-            for (pid_t p : job.JobPIDs) {
+            for (pid_t p : pids_of(job)) {
                 pid2job[p] = job.JobID;
             }
         }

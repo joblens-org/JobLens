@@ -276,7 +276,7 @@ std::vector<BasicInfo> BasicInfoCollector::sample_job(const Job& job) {
     auto now = std::chrono::steady_clock::now();
     
     // 逐个进程采集
-    for (int pid : job.JobPIDs) {
+    for (int pid : pids_of(job)) {
         if (pid <= 0) continue;
         
         struct taskstats stats;

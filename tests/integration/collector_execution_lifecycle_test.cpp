@@ -303,7 +303,7 @@ Job make_job(uint64_t id, std::vector<std::string> collectors)
     job.NativeJobID = std::to_string(id);
     job.jobtype = JobType::Job;
     job.subtype = JobSubType::Common;
-    job.JobPIDs = {getpid()};
+    set_pids(job, {getpid()});
     job.CollectorNames = std::move(collectors);
     CommonJobAttr attr;
     attr.auto_update_child = false;

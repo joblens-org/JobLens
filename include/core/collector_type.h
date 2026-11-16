@@ -237,7 +237,6 @@ struct Job {
     // Projection of identity.adapter. Persisted next to the numeric subtype
     // for the frozen row layout; identity is the source.
     std::string                             subtype_name;
-    std::vector<pid_t>                        JobPIDs;
     // Runtime/ingress projection of the record's selection. Never persisted:
     // the durable source is JobRecord::selection, and the collection runtime
     // fills this when it builds the collector-facing view.
@@ -277,7 +276,6 @@ struct Job {
             std::make_pair("cluster_name", &Job::cluster_name),
             std::make_pair("jobtype", &Job::jobtype),
             std::make_pair("subtype", &Job::subtype),
-            std::make_pair("JobPIDs", &Job::JobPIDs),
             std::make_pair("sub_attr", &Job::sub_attr)
         );
     }
@@ -337,6 +335,40 @@ inline const ProcessIdentity& manager_of(const Job& job) {
 
 inline const std::vector<ProcessIdentity>& members_of(const Job& job) {
     return job.identity.members;
+}
+
+// The collector-facing pid projection of the one process set. There is no
+// separate bare pid list on the Job: the evidence is authoritative.
+inline std::vector<pid_t> pids_of(const Job& job) {
+    std::vector<pid_t> pids;
+    pids.reserve(job.identity.members.size());
+    for (const auto& member : job.identity.members) pids.push_back(member.pid);
+    return pids;
+}
+
+// Replaces the process set while keeping the binding (start ticks, boot id) of
+// every process that stays. A pid the set did not hold yet is recorded
+// unbound: the next observation or the manual binding fills it in.
+inline void set_pids(Job& job, std::vector<pid_t> pids) {
+    std::vector<ProcessIdentity> kept;
+    kept.reserve(pids.size());
+    for (const pid_t pid : pids) {
+        const auto existing = std::find_if(
+            job.identity.members.begin(), job.identity.members.end(),
+            [pid](const ProcessIdentity& member) { return member.pid == pid; });
+        if (existing != job.identity.members.end()) kept.push_back(*existing);
+        else kept.push_back(ProcessIdentity{pid, 0, std::string{}});
+    }
+    std::sort(kept.begin(), kept.end(),
+              [](const ProcessIdentity& lhs, const ProcessIdentity& rhs) {
+                  return lhs.pid < rhs.pid;
+              });
+    kept.erase(std::unique(kept.begin(), kept.end(),
+                           [](const ProcessIdentity& lhs, const ProcessIdentity& rhs) {
+                               return lhs.pid == rhs.pid;
+                           }),
+               kept.end());
+    job.identity.members = std::move(kept);
 }
 
 // True only when the source read the execution scope successfully: an empty
@@ -399,6 +431,20 @@ inline JobGroupView getGroups(const Job& job) {
     return v;
 }
 
+// The Lua view of a Job: the reflected fact fields plus the pid projection,
+// which has no member of its own. The field name stays "JobPIDs" because rules
+// read it.
+inline sol::object to_lua(sol::state_view lua, const Job& job) {
+    sol::table tbl = lua.create_table();
+    constexpr auto fields = Job::reflection();
+    std::apply([&](const auto&... pair) {
+        ((tbl[pair.first] = to_lua(lua, job.*(pair.second))), ...);
+    }, fields);
+    const std::vector<pid_t> pids = pids_of(job);
+    tbl["JobPIDs"] = to_lua(lua, pids);
+    return tbl;
+}
+
 inline nlohmann::json dump_job(const Job& job) {
     nlohmann::json j;
     j["JobID"] = job.JobID;
@@ -407,10 +453,7 @@ inline nlohmann::json dump_job(const Job& job) {
     j["cluster_name"] = job.cluster_name;
     j["jobtype"] = to_string(job.jobtype);
     j["subtype"] = to_string(job.subtype);
-    j["JobPIDs"] = nlohmann::json::array();
-    for (const auto& pid : job.JobPIDs) {
-        j["JobPIDs"].push_back(pid);
-    }
+    j["JobPIDs"] = pids_of(job);
     j["CollectorNames"] = nlohmann::json::array();
     for (const auto& name : job.CollectorNames) {
         j["CollectorNames"].push_back(name);
@@ -429,7 +472,7 @@ inline nlohmann::json job_to_json(const Job& job) {
         {"cluster_name",  job.cluster_name},
         {"jobtype",       to_string(job.jobtype)},
         {"subtype",       to_string(job.subtype)},
-        {"JobPIDs",       job.JobPIDs},              // 无需再包一层 nlohmann::json(...)
+        {"JobPIDs",       pids_of(job)},
     };
     // 处理 sub_attr
     std::visit([&j](const auto& obj) {

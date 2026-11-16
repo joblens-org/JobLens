@@ -228,7 +228,7 @@ int main() {
         require(init_collector(collector, {}), "collector init failed");
         Job job;
         job.JobID = 7;
-        job.JobPIDs = {getpid(), child.pid};
+        set_pids(job, {getpid(), child.pid});
         std::string expected_name;
         for (const auto* phase : {"first", "second"}) {
             const auto before_cores = core_queries;
@@ -279,7 +279,7 @@ int main() {
         require(init_collector(reuse_collector, {}), "reuse collector init failed");
         Job reuse_job;
         reuse_job.JobID = 8;
-        reuse_job.JobPIDs = {reused_child.pid};
+        set_pids(reuse_job, {reused_child.pid});
 
         write_fake_stat(stat_path(reused_child.pid), make_stat_line(reused_child.pid, "ps", 3, 15, 111));
         mark("CPUMEM_BEGIN reuse_old");
@@ -328,10 +328,10 @@ int main() {
             require(init_collector(multi, {}), "multi-job collector init failed");
             Job jobA;
             jobA.JobID = 11;
-            jobA.JobPIDs = {workerA.pid};
+            set_pids(jobA, {workerA.pid});
             Job jobB;
             jobB.JobID = 12;
-            jobB.JobPIDs = {workerB.pid};
+            set_pids(jobB, {workerB.pid});
 
             const unsigned long long t0 = 1000000000ULL;
             const unsigned long long tick = 500ULL * static_cast<unsigned long long>(cores);  // 5s @ HZ=100
@@ -378,7 +378,7 @@ int main() {
             require(init_collector(pruner, {}), "prune collector init failed");
             Job prune_job;
             prune_job.JobID = 21;
-            prune_job.JobPIDs = {worker.pid};
+            set_pids(prune_job, {worker.pid});
             (void)pruner.sample_job(prune_job);
             require(CPUMemCollectorTestAccess::has(pruner, worker.pid), "active pid baseline missing");
 

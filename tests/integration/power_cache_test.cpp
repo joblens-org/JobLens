@@ -182,7 +182,7 @@ static void run(bpf_object* object, const Job& first, const Job& second) {
     map_reads = consumed_entries = 0;
     runtimes.clear();
     write_rapl(interval_energy_uj);
-    seed(first.JobPIDs[0], second.JobPIDs[0]);
+    seed(pids_of(first)[0], pids_of(second)[0]);
     PowerCollector collector;
     PowerCollectorTestAccess::setup(collector, object);
     // The first Job refreshes the cache and accounts the consumed interval once.
@@ -202,7 +202,7 @@ static void run(bpf_object* object, const Job& first, const Job& second) {
     // After the cache expires a new interval is consumed and accounted once more.
     PowerCollectorTestAccess::expire(collector);
     write_rapl(2 * interval_energy_uj);
-    seed(first.JobPIDs[0], second.JobPIDs[0]);
+    seed(pids_of(first)[0], pids_of(second)[0]);
     const auto next = collector.sample_job(first);
     require(map_reads == 2 && consumed_entries == 4 && runtimes.empty(),
             "accounted sample prevented the next cache refresh");
@@ -217,7 +217,7 @@ static void run_empty(bpf_object* object, const Job& first, const Job& second, b
     runtimes.clear();
     write_rapl(interval_energy_uj);
     if (no_cores) {
-        seed(first.JobPIDs[0], second.JobPIDs[0]);
+        seed(pids_of(first)[0], pids_of(second)[0]);
         PowerCollectorTestAccess::set_cores(collector, 0);
     }
     const auto previous = PowerCollectorTestAccess::job_totals(collector);
@@ -228,7 +228,7 @@ static void run_empty(bpf_object* object, const Job& first, const Job& second, b
     PowerCollectorTestAccess::set_cores(collector, 2);
     PowerCollectorTestAccess::expire(collector);
     write_rapl(2 * interval_energy_uj);
-    seed(first.JobPIDs[0], second.JobPIDs[0]);
+    seed(pids_of(first)[0], pids_of(second)[0]);
     const auto next = collector.sample_job(first);
     expect_total(collector, next, initial_total + interval_kwh);
     std::cout << "PASS Power " << (no_cores ? "zero denominator" : "empty tasks")
@@ -261,7 +261,7 @@ int main(int argc, char** argv) {
             Job job;
             job.JobID = id;
             job.NativeJobID = "fixture-" + std::to_string(id);
-            job.JobPIDs = {pid};
+            set_pids(job, {pid});
             job.jobtype = JobType::Sys;
             job.subtype = JobSubType::Common;
             job.sub_attr = CommonJobAttr{.auto_update_child = false};

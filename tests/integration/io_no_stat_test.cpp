@@ -20,7 +20,7 @@ void run_legacy_without_metadata() {
     NullSourceRegistrar registrar;
     CollectorInitContext context(CollectorScope::Job, registrar);
     require(collector.init(nlohmann::json::object(), context), "legacy collector init failed");
-    Job job{}; job.JobID = 7; job.JobPIDs = {getpid()};
+    Job job{}; job.JobID = 7; set_pids(job, {getpid()});
 
     metadata_calls = 0;
     const auto result = collector.sample_job(job);

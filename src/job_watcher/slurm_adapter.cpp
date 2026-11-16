@@ -79,7 +79,7 @@ Job SlurmSchedulerAdapter::decodeFacts(const nlohmann::json& row) const
     job.jobtype = static_cast<JobType>(row.value("jobtype", 0));
     job.subtype = static_cast<JobSubType>(row.value("subtype", 0));
     job.subtype_name = row.value("subtype_name", name());
-    job.JobPIDs = row.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>();
+    set_pids(job, row.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>());
     job.NativeJobID = row.value("native_job_id", "");
     job.cluster_name = row.value("cluster_name", "");
     job.clusterTag = row.value("clusterTag", "");

@@ -1326,7 +1326,7 @@ void run_legacy(const std::string& base)
     Job job;
     job.jobtype = JobType::Job;
     job.subtype = JobSubType::Common;
-    job.JobPIDs = {4321};
+    set_pids(job, {4321});
     job.CollectorNames = {"cpumem_collector"};
     CommonJobAttr attr;
     attr.auto_update_child = false;
@@ -1422,9 +1422,6 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
         check(restored->state == kStateActive && !restored->job.identity.verified,
               "RESTORE-UNKNOWN: an unverifiable execution must stay Open but "
               "carry the unverified (suspect) evidence, not a lifecycle state");
-        check(std::find(restored->job.JobPIDs.begin(), restored->job.JobPIDs.end(),
-                        child_pid) != restored->job.JobPIDs.end(),
-              "RESTORE-UNKNOWN: restore deleted the saved child PID");
         check(std::any_of(restored->job.identity.members.begin(),
                           restored->job.identity.members.end(),
                           [&](const ProcessIdentity& member) {
@@ -1446,8 +1443,9 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
     JobRegistry registry(heartbeat_options(path, source, probes));
     const auto restored = find_native(registry, "810.0");
     check(restored.has_value(), "RESTORE-UNKNOWN: the heartbeat restore lost the record");
-    check(std::find(restored->job.JobPIDs.begin(), restored->job.JobPIDs.end(),
-                    child_pid) != restored->job.JobPIDs.end(),
+    check(std::any_of(restored->job.identity.members.begin(),
+                      restored->job.identity.members.end(),
+                      [&](const ProcessIdentity& member) { return member.pid == child_pid; }),
           "RESTORE-UNKNOWN: the heartbeat restore dropped the child evidence");
 
     probes.set_process(manager_pid, LivenessState::Dead, 181818);
@@ -1458,8 +1456,9 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
     const auto after = find_native(registry, "810.0");
     check(after.has_value(),
           "RESTORE-UNKNOWN: the instance was retired although its saved child is alive");
-    check(std::find(after->job.JobPIDs.begin(), after->job.JobPIDs.end(), child_pid) !=
-              after->job.JobPIDs.end(),
+    check(std::any_of(after->job.identity.members.begin(),
+                      after->job.identity.members.end(),
+                      [&](const ProcessIdentity& member) { return member.pid == child_pid; }),
           "RESTORE-UNKNOWN: the child evidence was dropped before the verdict");
     check(registry.findJob(after->job.JobID).has_value(),
           "RESTORE-UNKNOWN: the live instance disappeared from the active set");

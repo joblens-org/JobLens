@@ -118,7 +118,7 @@ Job job_for(uint64_t id, const std::vector<std::string>& collectors) {
     job.jobtype = JobType::Sys;
     job.subtype = JobSubType::Common;
     job.sub_attr = CommonJobAttr{.auto_update_child = false};
-    job.JobPIDs = {getpid()};
+    set_pids(job, {getpid()});
     job.CollectorNames = collectors;
     return job;
 }

@@ -473,16 +473,17 @@ std::vector<CPUMemInfo> CPUMemCollector::sample_job(const Job& job) {
         // /proc/stat 每 Job 读一次；增量基线按 PID 缓存，保证与 Δproc 覆盖同一采样区间
         sample.total = read_system_cpu();
     }
-    infos.reserve(job.JobPIDs.size() + (summary ? 1 : 0));
+    const auto pids = pids_of(job);
+    infos.reserve(pids.size() + (summary ? 1 : 0));
     // PSS 成本按进程数线性增长（实测单进程约 0.5-1.3ms），超过阈值时本样本整体跳过：
     // 只对前 N 个进程求和会静默低估作业内存，全有或全无才能保证口径可解释。
     const bool pss_over_cap = pss_mode != PssMode::Disabled && pss_max_processes > 0 &&
-                              job.JobPIDs.size() > static_cast<size_t>(pss_max_processes);
+                              pids.size() > static_cast<size_t>(pss_max_processes);
     if (pss_over_cap) {
         spdlog::debug("CPUMemCollector: job {} has {} pids > pss_max_processes={}, skipping PSS",
-                      job.JobID, job.JobPIDs.size(), pss_max_processes);
+                      job.JobID, pids.size(), pss_max_processes);
     }
-    for (int pid : job.JobPIDs) {
+    for (int pid : pids) {
         if (! Utils::is_process_running(pid)){
             continue;
         }

@@ -131,7 +131,7 @@ Job make_common_job()
     Job job;
     job.jobtype = JobType::Job;
     job.subtype = JobSubType::Common;
-    job.JobPIDs = {getpid()};
+    set_pids(job, {getpid()});
     job.CollectorNames = {"cpumem_collector"};
     CommonJobAttr attr;
     attr.auto_update_child = false;

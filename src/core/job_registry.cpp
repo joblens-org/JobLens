@@ -135,15 +135,15 @@ bool merge_job_facts(Job& target, const Job& observed, bool replace_members) {
     changed |= merge_text(target.cluster_name, observed.cluster_name);
     changed |= merge_text(target.clusterTag, observed.clusterTag);
 
-    std::vector<pid_t> observed_pids = observed.JobPIDs;
+    std::vector<pid_t> observed_pids = pids_of(observed);
     std::sort(observed_pids.begin(), observed_pids.end());
     observed_pids.erase(std::unique(observed_pids.begin(), observed_pids.end()),
                         observed_pids.end());
     // Authoritative replacement (possibly empty), or a non-empty merge list;
     // a partial member set never erases stored members.
     if (replace_members || !observed_pids.empty()) {
-        if (observed_pids != target.JobPIDs) {
-            target.JobPIDs = std::move(observed_pids);
+        if (observed_pids != pids_of(target)) {
+            set_pids(target, std::move(observed_pids));
             changed = true;
         }
     }
@@ -191,12 +191,6 @@ bool same_discovered_facts(const Job& a, const Job& b)
         a.clusterTag != b.clusterTag) {
         return false;
     }
-    auto sorted_pids = [](std::vector<pid_t> pids) {
-        std::sort(pids.begin(), pids.end());
-        pids.erase(std::unique(pids.begin(), pids.end()), pids.end());
-        return pids;
-    };
-    if (sorted_pids(a.JobPIDs) != sorted_pids(b.JobPIDs)) return false;
     if (members_of(a) != members_of(b)) return false;
     if (!sub_attr_equal(a.sub_attr, b.sub_attr)) return false;
     const auto& ga = manager_of(a);
@@ -526,7 +520,7 @@ JobRegistry::JobRegistry() : JobRegistry(JobRegistryOptions{}) {}
 JobRegistry::JobRegistry(const JobRegistryOptions& options) {
     Job fake_job;
     fake_job.JobID = 0;
-    fake_job.JobPIDs = {1};
+    set_pids(fake_job, {1});
     fake_job.jobtype = JobType::Sys;
     fake_job.subtype = JobSubType::Common;
     fake_job.sub_attr = CommonJobAttr{
@@ -637,7 +631,7 @@ Job JobRegistry::decodeStoredJob(const nlohmann::json& row) const
     job.jobtype = static_cast<JobType>(row.value("jobtype", 0));
     job.subtype = skeleton.subtype;
     job.subtype_name = skeleton.subtype_name;
-    job.JobPIDs = row.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>();
+    set_pids(job, row.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>());
     job.NativeJobID = row.value("native_job_id", "");
     job.cluster_name = row.value("cluster_name", "");
     job.clusterTag = row.value("clusterTag", "");
@@ -1029,7 +1023,7 @@ void JobRegistry::evaluateRetirements(
             std::vector<ProcessIdentity> pids = members_of(record.job);
             if (pids.empty()) {
                 if (const auto job = findJob(record.job.JobID)) {
-                    for (const auto pid : job->JobPIDs)
+                    for (const auto pid : pids_of(*job))
                         pids.push_back(ProcessIdentity{pid, 0, ""});
                 }
             }
@@ -1796,11 +1790,18 @@ void JobRegistry::attributionJobAddPid(uint64_t internal_id, pid_t pid) {
     std::unique_lock lg(records_mtx_);
     const auto it = records_.find(internal_id);
     if (it == records_.end()) return;
-    auto& pids = it->second.job.JobPIDs;
-    if (std::find(pids.begin(), pids.end(), pid) == pids.end()) {
-        pids.push_back(pid);
+    auto& members = it->second.job.identity.members;
+    const bool known = std::any_of(
+        members.begin(), members.end(),
+        [pid](const ProcessIdentity& member) { return member.pid == pid; });
+    if (!known) {
+        members.push_back(ProcessIdentity{pid, 0, std::string{}});
+        std::sort(members.begin(), members.end(),
+                  [](const ProcessIdentity& lhs, const ProcessIdentity& rhs) {
+                      return lhs.pid < rhs.pid;
+                  });
         spdlog::trace("JobRegistry: kernel FORK added pid={} to job_id={} (now {} pids)",
-                      pid, internal_id, pids.size());
+                      pid, internal_id, members.size());
     }
 }
 
@@ -1808,20 +1809,16 @@ void JobRegistry::attributionJobRemovePid(uint64_t internal_id, pid_t pid) {
     std::unique_lock lg(records_mtx_);
     const auto it = records_.find(internal_id);
     if (it == records_.end()) return;
-    auto& pids = it->second.job.JobPIDs;
-    const auto before = pids.size();
-    pids.erase(std::remove(pids.begin(), pids.end(), pid), pids.end());
-    if (!it->second.job.identity.members.empty()) {
-        auto& members = it->second.job.identity.members;
-        members.erase(std::remove_if(members.begin(), members.end(),
-                                      [pid](const ProcessIdentity& member) {
-                                          return member.pid == pid;
-                                      }),
-                       members.end());
-    }
-    if (pids.size() != before) {
+    auto& members = it->second.job.identity.members;
+    const auto before = members.size();
+    members.erase(std::remove_if(members.begin(), members.end(),
+                                 [pid](const ProcessIdentity& member) {
+                                     return member.pid == pid;
+                                 }),
+                  members.end());
+    if (members.size() != before) {
         spdlog::trace("JobRegistry: kernel EXIT removed pid={} from job_id={} (now {} pids)",
-                      pid, internal_id, pids.size());
+                      pid, internal_id, members.size());
     }
 }
 
@@ -1930,7 +1927,7 @@ void JobRegistry::remove_job_from_kernel(const Job& job, bool& ok, std::string& 
 
 bool JobRegistry::createManualJob(const Job& job) {
     spdlog::info("JobRegistry: addJob entry JobID={}, native_id={}, collectors={}, PIDs={}",
-                 job.JobID, job.NativeJobID, job.CollectorNames.size(), job.JobPIDs.size());
+                 job.JobID, job.NativeJobID, job.CollectorNames.size(), pids_of(job).size());
     // 错误检查
     if (job.CollectorNames.empty()) {
         spdlog::warn("JobRegistry: job with JobID {} has empty CollectorNames", job.JobID);
@@ -2007,9 +2004,10 @@ bool JobRegistry::createManualJob(const Job& job) {
         // leaves the identity incomplete, which is reported as incomplete
         // ownership rather than guessed.
         const std::string boot_id = read_boot_id();
+        const std::vector<pid_t> requested_pids = pids_of(record.job);
         JobIdentity& execution = record.job.identity;
         execution.members.clear();
-        for (const auto pid : record.job.JobPIDs) {
+        for (const auto pid : requested_pids) {
             const auto ticks = read_process_start_ticks(pid);
             execution.members.push_back(ProcessIdentity{
                 pid, ticks.value_or(0), ticks.has_value() ? boot_id : std::string{}});
@@ -2214,7 +2212,7 @@ nlohmann::json JobRegistry::updateManualInstance(const JobRecord& target, const 
     // (never trusted from a manual re-add).
     {
         Job facts = job;
-        facts.JobPIDs.clear();
+        facts.identity.members.clear();
         facts.CollectorNames.clear();
         std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
         JobRecord record;
@@ -2982,11 +2980,13 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     applyIdentityToFacts(observed_job, selector, identity);
     const bool authoritative_members = members_complete;
     if (!processes.empty()) {
-        observed_job.JobPIDs.clear();
-        for (const auto& process : processes) observed_job.JobPIDs.push_back(process.pid);
+        std::vector<pid_t> observed_pids;
+        observed_pids.reserve(processes.size());
+        for (const auto& process : processes) observed_pids.push_back(process.pid);
+        set_pids(observed_job, std::move(observed_pids));
     } else if (members_complete) {
         // Read succeeded, no members: an authoritative empty set.
-        observed_job.JobPIDs.clear();
+        observed_job.identity.members.clear();
     }
 
     Job merged = stored.job;
@@ -3022,10 +3022,8 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
         updated_identity.members = normalized_processes(processes);
     } else if (members_complete) {
         updated_identity.members.clear();
-    } else if (!observed_job.JobPIDs.empty()) {
-        updated_identity.members.clear();
-        for (const auto pid : observed_job.JobPIDs)
-            updated_identity.members.push_back(ProcessIdentity{pid, 0, ""});
+    } else if (!members_of(observed_job).empty()) {
+        updated_identity.members = normalized_processes(members_of(observed_job));
     }
 
     // A record whose liveness could not be verified is re-admitted by positive
@@ -3176,7 +3174,6 @@ void JobRegistry::validateRestoredExecutions(std::vector<JobRecord>& rows) {
         switch (verify_execution(record.job.identity, boot_id, process_probe_)) {
             case ExecutionVerdict::Stale:
                 record.job.identity.verified = false;
-                record.job.JobPIDs.clear();
                 execution.members.clear();
                 spdlog::warn("JobRegistry: restored JobID {} has a stale execution "
                              "generation; liveness unknown", record.job.JobID);
@@ -3212,11 +3209,6 @@ void JobRegistry::validateRestoredExecutions(std::vector<JobRecord>& rows) {
                     spdlog::warn("JobRegistry: restored JobID {} dropped {} "
                                  "reused/gone member process identity(ies)",
                                  record.job.JobID, dropped);
-                }
-                if (!execution.members.empty()) {
-                    record.job.JobPIDs.clear();
-                    for (const auto& member : execution.members)
-                        record.job.JobPIDs.push_back(member.pid);
                 }
                 if (execution.members.empty() && dropped != 0)
                     record.job.identity.verified = false;
@@ -3393,14 +3385,6 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         created.job = job;
         created.job.JobID = allocated;
         applyIdentityToFacts(created.job, selector, *identity);
-        created.job.JobPIDs.clear();
-        for (const auto& process : processes)
-            created.job.JobPIDs.push_back(process.pid);
-        std::sort(created.job.JobPIDs.begin(), created.job.JobPIDs.end());
-        created.job.JobPIDs.erase(
-            std::unique(created.job.JobPIDs.begin(), created.job.JobPIDs.end()),
-            created.job.JobPIDs.end());
-
         created.job.identity = *identity;
         created.job.identity.observed = true;   // created by a discovery observation
         created.job.identity.manager = manager;
@@ -3414,13 +3398,8 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         created.state = kStateActive;
         created.first_seen_us = observed_at;
         created.last_seen_us = observed_at;
-        if (!processes.empty()) {
-            created.job.identity.members = normalized_processes(processes);
-        } else {
-            for (const auto pid : created.job.JobPIDs) {
-                created.job.identity.members.push_back(ProcessIdentity{pid, 0, ""});
-            }
-        }
+        created.job.identity.members = normalized_processes(
+            processes.empty() ? members_of(created.job) : processes);
 
         // A create has no published memory image to revert: identity
         // lookup repairs an ambiguous create, so it does not fence
@@ -3920,16 +3899,6 @@ bool JobRegistry::refreshJobFacts(uint64_t jobID) {
     record.job = job;
     record.job.JobID = jobID;   // CollectorNames stay intent-owned, untouched
     record.last_seen_us = now_us();
-    // Records without a validated execution generation keep their member list
-    // as the only liveness evidence. Only replace it while the refresh still
-    // sees processes: an empty result is itself the termination evidence the
-    // retirement pass has to evaluate.
-    if (!manager_of(record.job).complete() && !job.JobPIDs.empty()) {
-        JobIdentity& execution = record.job.identity;
-        execution.members.clear();
-        for (const auto pid : job.JobPIDs)
-            execution.members.push_back(ProcessIdentity{pid, 0, ""});
-    }
     if (record.revision == 0) {
         record.revision = 1;
         record.first_seen_us = now_us();

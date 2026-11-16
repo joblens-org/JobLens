@@ -636,11 +636,6 @@ int main(int argc, char** argv)
         samples.total.push_back(elapsed_us(t0, t4));
         if (!probe_job) {
             probe_job = execution;
-            // The policy sees the stored projection, whose PIDs come from the
-            // store (discovery leaves them empty).
-            probe_job->JobPIDs.clear();
-            for (const auto& member : execution.identity.members)
-                probe_job->JobPIDs.push_back(member.pid);
         }
         executions.push_back(std::move(execution));
     }

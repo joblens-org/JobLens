@@ -174,7 +174,7 @@ struct TestResolver final : JobBindingResolver {
         job.JobID = 101;
         job.jobtype = JobType::Job;
         job.subtype = JobSubType::Common;
-        job.JobPIDs = {1010};
+        set_pids(job, {1010});
         return job;
     }
 };
@@ -185,7 +185,7 @@ Job make_job(uint64_t id)
     job.JobID = id;
     job.jobtype = JobType::Job;
     job.subtype = JobSubType::Common;
-    job.JobPIDs = {static_cast<pid_t>(id + 1000)};
+    set_pids(job, {static_cast<pid_t>(id + 1000)});
     return job;
 }
 

@@ -34,7 +34,7 @@ void __YOUR_COLLECTOR_NAME__Collector::deinit() noexcept {
 std::vector<__YOUR_COLLECTOR_NAME__Data>
 __YOUR_COLLECTOR_NAME__Collector::sample_job(const Job& job) {
     std::vector<__YOUR_COLLECTOR_NAME__Data> ret;
-    for (int pid : job.JobPIDs) {
+    for (int pid : pids_of(job)) {
         __YOUR_COLLECTOR_NAME__Data d;
         d.pid = pid;
         // TODO: 填入业务逻辑，读 /proc/pid/xxx 等

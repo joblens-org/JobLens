@@ -245,7 +245,7 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
         check(job.has_value(), "registered inventory must be findable");
         check(job->CollectorNames.empty(),
               "an observation upsert must not activate collection");
-        check(job->JobPIDs.size() == 1 && job->JobPIDs.front() == 4242,
+        check(pids_of(*job).size() == 1 && pids_of(*job).front() == 4242,
               "observed processes must become facts");
     }
     {
@@ -290,7 +290,7 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
         check(job.has_value(), "updated inventory must stay findable");
         check(std::get<CondorJobAttr>(job->sub_attr).owner == "bob",
               "attribute changes must merge into facts");
-        check(job->JobPIDs.size() == 2, "new processes must merge into facts");
+        check(pids_of(*job).size() == 2, "new processes must merge into facts");
         check(job->CollectorNames.empty(),
               "fact updates must not activate collection either");
     }
@@ -453,7 +453,7 @@ void stale_generation_is_not_replayed(const std::string& base)
         check(!record->job.identity.verified,
               "a stale execution generation must be restored as unverified");
         const auto job = registry.findJob(internal_id);
-        check(job.has_value() && job->JobPIDs.empty(),
+        check(job.has_value() && pids_of(*job).empty(),
               "stale PIDs must not be replayed into the registry");
 
         // The same generation observed again recovers the record; a different
@@ -880,7 +880,7 @@ void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string
     const auto created = registry.upsertObservedJob(condor_observation("172.0"));
     check(created.ok && created.disposition == UpsertDisposition::Created,
           "baseline registration must succeed");
-    check(registry.findJob(created.internal_id)->JobPIDs.size() == 1,
+    check(pids_of(*registry.findJob(created.internal_id)).size() == 1,
           "the fixture must register one member pid");
 
     // A partially-known membership with an empty list must not erase members:
@@ -891,7 +891,7 @@ void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string
     const auto kept = registry.upsertObservedJob(partial);
     check(kept.ok && kept.disposition == UpsertDisposition::Unchanged,
           "a non-authoritative empty list must change nothing");
-    check(registry.findJob(created.internal_id)->JobPIDs.size() == 1,
+    check(pids_of(*registry.findJob(created.internal_id)).size() == 1,
           "a non-authoritative empty list must not erase members");
 
     // An authoritative empty list is positive evidence: the stored members
@@ -902,7 +902,7 @@ void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string
     const auto cleared = registry.upsertObservedJob(confirmed_empty);
     check(cleared.ok && cleared.disposition == UpsertDisposition::Updated,
           "a confirmed empty membership must be applied to facts");
-    check(registry.findJob(created.internal_id)->JobPIDs.empty(),
+    check(pids_of(*registry.findJob(created.internal_id)).empty(),
           "a confirmed empty membership must clear stale member pids");
     const auto record = registry.inventoryRecord(created.internal_id);
     check(record.has_value() && record->job.identity.members.empty(),

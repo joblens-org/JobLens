@@ -656,7 +656,7 @@ void run(const std::string& base) {
         bump(sys_added), bump(sys_updated), bump(sys_removed));
 
     Job life_job = CollectorSchedulerTestAccess::makeJob(456, {"lifecycle"});
-    life_job.JobPIDs = {getpid()};
+    set_pids(life_job, {getpid()});
     life_job.jobtype = JobType::Sys;
     life_job.subtype = JobSubType::Common;
     life_job.sub_attr = CommonJobAttr{.auto_update_child = false};
@@ -1457,7 +1457,7 @@ void run(const std::string& base) {
 
         auto archive_job = [](uint64_t id) {
             Job job = CollectorSchedulerTestAccess::makeJob(id, {"ri_ev_a"});
-            job.JobPIDs = {getpid()};
+            set_pids(job, {getpid()});
             job.jobtype = JobType::Job;
             job.subtype = JobSubType::Condor;
             CondorJobAttr attr{};

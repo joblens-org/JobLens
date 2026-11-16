@@ -50,15 +50,15 @@ inline bool update_job_pids(Job& job){
     auto& condor_attr = std::get<CondorJobAttr>(job.sub_attr);
 
     if(condor_attr.starter_pid == 0){
-        if (job.JobPIDs.empty()) {
+        if (pids_of(job).empty()) {
             spdlog::debug("CondorJob: cannot initialize starter_pid, JobPIDs is empty");
             return false;
         }
         //初始化相关内容
-        if(job.JobPIDs.size()>1){
+        if(pids_of(job).size()>1){
             spdlog::warn("CondorJob: multi pids, use first");
         }
-        condor_attr.starter_pid = get_ppid_of(job.JobPIDs[0]);
+        condor_attr.starter_pid = get_ppid_of(pids_of(job)[0]);
     }
 
     if (condor_attr.starter_pid <= 0) {
@@ -67,11 +67,11 @@ inline bool update_job_pids(Job& job){
     }
 
     if (condor_attr.slots_cgroup_path.empty()) {
-        if (job.JobPIDs.empty()) {
+        if (pids_of(job).empty()) {
             spdlog::debug("CondorJob: cannot discover cgroup path, JobPIDs is empty");
             return false;
         }
-        condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(job.JobPIDs[0]);
+        condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(pids_of(job)[0]);
     }
 
     if (condor_attr.slots_cgroup_path.empty()) {
@@ -91,7 +91,7 @@ inline bool update_job_pids(Job& job){
         return false;
     }
 
-    job.JobPIDs = std::move(pid_slots_cgroup);
+    set_pids(job, std::move(pid_slots_cgroup));
     spdlog::trace("CondorJob: updated JobPIDs from cgroup {}", condor_attr.slots_cgroup_path);
     return true;
 }
@@ -430,12 +430,12 @@ inline bool probe_groups(Job& job) {
 
 inline void update_job_info(Job& job){
     auto& condor_attr = std::get<CondorJobAttr>(job.sub_attr);
-    const bool has_job_pid = !job.JobPIDs.empty();
+    const bool has_job_pid = !pids_of(job).empty();
 
     // 确保 starter_pid 已知 (其他字段依赖它)
     if (condor_attr.starter_pid == 0) {
         if (has_job_pid) {
-            condor_attr.starter_pid = get_ppid_of(job.JobPIDs[0]);
+            condor_attr.starter_pid = get_ppid_of(pids_of(job)[0]);
         } else {
             spdlog::debug("CondorJob: cannot initialize starter_pid in update_job_info, JobPIDs is empty");
         }
@@ -452,7 +452,7 @@ inline void update_job_info(Job& job){
 
     if (condor_attr.slots_cgroup_path.empty()) {
         if (has_job_pid) {
-            condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(job.JobPIDs[0]);
+            condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(pids_of(job)[0]);
         } else {
             spdlog::debug("CondorJob: cannot discover cgroup path in update_job_info, JobPIDs is empty");
         }

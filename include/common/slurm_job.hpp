@@ -56,16 +56,16 @@ inline void update_job_pids(Job& job){
     auto& slurm_attr = std::get<SlurmJobAttr>(job.sub_attr);
     if(slurm_attr.stepd_pid == 0){
         //初始化相关内容
-        if(job.JobPIDs.size() > 1){
+        if(pids_of(job).size() > 1){
             spdlog::warn("SlurmJob: multi pids, use first");
         }
-        slurm_attr.stepd_pid = get_ppid_of(job.JobPIDs[0]);
-        slurm_attr.cgroup_path = v2_cgroup_absolute_path(job.JobPIDs[0]);
+        slurm_attr.stepd_pid = get_ppid_of(pids_of(job)[0]);
+        slurm_attr.cgroup_path = v2_cgroup_absolute_path(pids_of(job)[0]);
     }   
     auto pid_cgroup = get_pids_in_cgroup(slurm_attr.cgroup_path);
     // 移除stepd_pid本身
     std::remove(pid_cgroup.begin(), pid_cgroup.end(), slurm_attr.stepd_pid);
-    job.JobPIDs = std::move(pid_cgroup);
+    set_pids(job, std::move(pid_cgroup));
 }
 
 /* 获取Slurm Job ID */
@@ -405,10 +405,10 @@ inline bool probe_groups(Job& job) {
 
 
 inline void update_job_info(Job& job){
-    if (job.JobPIDs.empty()) return;
+    if (pids_of(job).empty()) return;
 
     auto& slurm_attr = std::get<SlurmJobAttr>(job.sub_attr);
-    pid_t representative_pid = job.JobPIDs[0]; // 以第一个PID为代表
+    pid_t representative_pid = pids_of(job)[0]; // 以第一个PID为代表
 
     // 标识性字段：只在首次未设置时填充
     if (slurm_attr.job_id == 0) {
@@ -438,7 +438,7 @@ inline void update_job_info(Job& job){
     }
     // stepd_pid 取 JobPIDs 中最小的 PID (slurmstepd 通常为父进程, PID 最小)
     if (slurm_attr.stepd_pid == 0) {
-        slurm_attr.stepd_pid = *std::min_element(job.JobPIDs.begin(), job.JobPIDs.end());
+        slurm_attr.stepd_pid = *std::min_element(pids_of(job).begin(), pids_of(job).end());
     }
 
     // 组字段：env 探测未完成时补（有界重试）；组名解析独立完成态，按周期重试。

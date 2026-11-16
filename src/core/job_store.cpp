@@ -187,7 +187,7 @@ void write_job_fields(nlohmann::json& out, const Job& job) {
     out["jobtype"]       = static_cast<int>(job.jobtype);
     out["subtype"]       = static_cast<int>(job.subtype);
     if (!job.subtype_name.empty()) out["subtype_name"] = job.subtype_name;
-    out["pids"]          = job.JobPIDs;
+    out["pids"]          = pids_of(job);
     out["native_job_id"] = job.NativeJobID;
     out["cluster_name"]  = job.cluster_name;
     out["clusterTag"]    = job.clusterTag;
@@ -237,7 +237,7 @@ Job decode_legacy_job(const nlohmann::json& j) {
     job.jobtype       = static_cast<JobType>(j.value("jobtype", 0));
     job.subtype       = static_cast<JobSubType>(j.value("subtype", 0));
     job.subtype_name  = j.value("subtype_name", "");
-    job.JobPIDs       = j.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>();
+    set_pids(job, j.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>());
     job.NativeJobID   = j.value("native_job_id", "");
     job.cluster_name  = j.value("cluster_name", "");
     job.clusterTag    = j.value("clusterTag", "");

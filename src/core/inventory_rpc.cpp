@@ -69,12 +69,12 @@ std::string json2JobOpt(const nlohmann::json& obj, Job& job, const JobRegistry& 
             "invalid JobID: expected a uint64 number or decimal string");
     }
     job.JobID = legacy_id.value;
-    job.JobPIDs = obj.value("JobPIDs", nlohmann::json::array()).get<std::vector<pid_t>>();
+    set_pids(job, obj.value("JobPIDs", nlohmann::json::array()).get<std::vector<pid_t>>());
     job.CollectorNames = obj.value("Lens", nlohmann::json::array()).get<std::vector<std::string>>();
-    if (job.JobPIDs.size() == 0) {
+    if (pids_of(job).size() == 0) {
         spdlog::warn("JobRegistry: job ID {} has empty PID list", job.JobID);
     }
-    for (auto pid: job.JobPIDs) {
+    for (auto pid: pids_of(job)) {
         if (pid < 0) {
             spdlog::warn("JobRegistry: invalid PID {} in job ID {}", pid, job.JobID);
         }
@@ -136,7 +136,7 @@ std::string json2JobOpt(const nlohmann::json& obj, Job& job, const JobRegistry& 
 
     spdlog::info("JobRegistry: json2JobOpt parsed opt={}, type={}, subtype={}, JobID={}, "
                  "PIDs_count={}, Lens_count={}, nativeID={}",
-                 opt, type, subtype, job.JobID, job.JobPIDs.size(),
+                 opt, type, subtype, job.JobID, pids_of(job).size(),
                  job.CollectorNames.size(), job.NativeJobID);
     
     return opt;

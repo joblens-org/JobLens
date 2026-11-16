@@ -270,7 +270,7 @@ void GPUUsageCollector::match_processes(
 
     for (unsigned int i = 0; i < count; ++i) {
         pid_t pid = static_cast<pid_t>(infos[i].pid);
-        if (std::find(job.JobPIDs.begin(), job.JobPIDs.end(), pid) == job.JobPIDs.end()) {
+        if (std::find(pids_of(job).begin(), pids_of(job).end(), pid) == pids_of(job).end()) {
             continue;
         }
 

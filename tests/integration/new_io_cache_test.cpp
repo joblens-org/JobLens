@@ -126,7 +126,7 @@ static void run(const char* path, bool details) {
     require(!bpf_map_update_elem(totals, &job_id, &av, BPF_ANY), "初始化总量失败");
     NewIOUsageCollector collector;
     NewIOUsageCollectorTestAccess::setup(collector, object.get(), details);
-    Job job; job.JobID = 7; job.JobPIDs = {getpid()};
+    Job job; job.JobID = 7; set_pids(job, {getpid()});
     liveness_calls.clear();
     metadata_calls = 0;
     const auto first = collector.sample_job(job);
@@ -258,7 +258,7 @@ static void run_failure_retry(const char* path) {
     observed_map_fd = bpf_object__find_map_fd_by_name(object.get(), "job_fd_stat");
     require(observed_map_fd >= 0, "retry map missing");
     const auto pid = static_cast<uint32_t>(getpid());
-    Job job; job.JobID = 7; job.JobPIDs = {getpid()};
+    Job job; job.JobID = 7; set_pids(job, {getpid()});
     NewIOUsageCollector collector;
     NewIOUsageCollectorTestAccess::setup(collector, object.get(), true);
 
