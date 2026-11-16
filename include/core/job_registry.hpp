@@ -142,7 +142,7 @@ struct JobRegistryOptions {
     // consulted and automatic selection stays disabled.
     std::vector<std::pair<std::string, IDiscoverySource*>> test_sources;
     // With this flag the heartbeat runs without reading Config (test wiring;
-    // combine with test_sources, or leave it empty for legacy-only upkeep).
+    // combine with test_sources, or leave it empty for manual-only upkeep).
     bool test_heartbeat = false;
     // Test-only escape hatch: construct a purely static inventory registry
     // (no heartbeat, no discovery sources, no maintenance pass — only the
@@ -182,13 +182,13 @@ public:
     // Manual CRUD upsert: one entry point for the manual add and update
     // routes (orthogonal to the automatic paths — never routed through the
     // admission gate). Routing, in order: an identity selector naming a live
-    // inventoried instance (the legacy-add resolution, kept in the RPC layer)
+    // inventoried instance (the add-route resolution, kept in the RPC layer)
     // takes the UPDATE branch; an active record with matching typed
     // sub_attr but no resolvable identity routes to UPDATE by internal id;
     // anything else takes the CREATE branch. UPDATE merges the requested
     // collectors into the existing manual selection (union, never a
-    // wholesale replace) and fills empty facts only; CREATE is the legacy
-    // addJob semantics verbatim (empty collectors still rejected there).
+    // wholesale replace) and fills empty facts only; CREATE is the plain
+    // addJob semantics (empty collectors still rejected there).
     // Returns the command response JSON (status success/error plus the
     // instance payload).
     nlohmann::json upsertJob(const Job& job, const nlohmann::json& request,
@@ -284,8 +284,7 @@ public:
                        std::optional<JobRecord>& out) const override;
     // Re-read process/attribute facts for one stored job from the host and
     // persist them. Used by the heartbeat for records no discovery source
-    // covers (legacy/manual registrations); reads never do this for
-    // themselves.
+    // covers (manual registrations); reads never do this for themselves.
     bool refreshJobFacts(uint64_t jobID);
     // Lifecycle state is a heartbeat decision, not a read side effect.
     void setInstanceState(uint64_t jobID, const std::string& state);
@@ -407,15 +406,16 @@ private:
                               std::vector<AutoSelection>& out);
     void regRPCHandle();
     // --- Manual CRUD upsert internals ----------------------------------------
-    // The CREATE branch: the legacy manual registration body verbatim.
+    // The CREATE branch: the manual registration body verbatim.
     bool createManualJob(const Job& job);
     // UPDATE-branch routing: the identity selector first (namespace rules),
     // then the typed sub_attr matcher, which discriminates by the
     // subtype's scheduler (schedd) attribution — an identity-less row keeps
-    // the legacy tolerance, an identity-bearing row joins only when its
-    // scheduler attribution agrees, and more than one surviving duplicate is
-    // reported through `ambiguous`, never guessed. A closing identity target
-    // is reported through `closing`; no target falls through to CREATE.
+    // the unknown-attribution tolerance, an identity-bearing row joins only
+    // when its scheduler attribution agrees, and more than one surviving
+    // duplicate is reported through `ambiguous`, never guessed. A closing
+    // identity target is reported through `closing`; no target falls through
+    // to CREATE.
     struct ManualTarget {
         enum class Kind { None, Closing, Ambiguous, Update };
         Kind kind = Kind::None;
@@ -426,7 +426,7 @@ private:
     ManualTarget manualUpdateTarget(const Job& job,
                                     const std::optional<NativeSelector>& selector);
     // UPDATE mechanics: collectors union into the manual selection, facts
-    // fill-empty merge (JobPIDs ignored), response in the legacy add shape.
+    // fill-empty merge (JobPIDs ignored), response in the add response shape.
     nlohmann::json updateManualInstance(const JobRecord& target, const Job& job,
                                         const nlohmann::json& request);
     // Guards the sentinel job and the active-reader set.
@@ -619,7 +619,10 @@ private:
     std::optional<InitialDecision> admissionDecision(const Job& job);
     void requestRescan(const std::string& reason);
     bool rescanRequested() const;
-    void refreshLegacyRecords();
+    // Refreshes the records whose execution facts no discovery source owns:
+    // manual registrations, whose bound members are their only evidence. The
+    // discovery path owns everything else.
+    void refreshUncoveredRecords();
     // Re-evaluates the automatic decision for live instances that never got a
     // durable one. Bounded per pass so the heartbeat keeps its cadence.
     void repairMissingInitialDecisions();

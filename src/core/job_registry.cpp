@@ -683,14 +683,14 @@ void JobRegistry::repairMissingInitialDecisions() {
     }
 }
 
-void JobRegistry::refreshLegacyRecords() {
+void JobRegistry::refreshUncoveredRecords() {
     for (const auto& record : ownRecords()) {
         if (record.internal_id == kSystemSentinelJobId) continue;
         if (record.state == kStateClosing) continue;   // the drain owns it
         // Discovery owns its execution facts.  A discovery record whose
-        // generation never completed must not be re-read as a legacy row: the
-        // legacy refresh replaces the saved member identities with bare PIDs,
-        // which would erase the only evidence the record has.
+        // generation never completed must not be re-read here: this refresh
+        // replaces the saved member identities with bare PIDs, which would
+        // erase the only evidence the record has.
         if (record.execution_observed) continue;
         if (generation_of(record.job).complete()) continue;    // nothing to refresh
         if (members_of(record.job).empty()) continue;          // no liveness evidence yet
@@ -868,7 +868,7 @@ void JobRegistry::evaluateRetirements(
         // and never retired.
         setExecutionVerified(record.internal_id, absences == 0);
 
-        // Records without a validated execution generation (legacy/manual
+        // Records without a validated execution generation (manual
         // registrations, unresolved observations) have no manager to probe.
         // The refreshed member list is their only evidence: live or unreadable
         // pids keep the record, an all-dead list retires it.
@@ -894,7 +894,7 @@ void JobRegistry::evaluateRetirements(
                 }
             }
             if (!any_live)
-                retireIfConfirmed(record, "no live process for a legacy/manual registration");
+                retireIfConfirmed(record, "no live process for a manually registered instance");
             continue;
         }
 
@@ -1027,7 +1027,8 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
             complete = complete && result.complete;
             // Coverage is keyed by adapter name; a record of one adapter is
             // only absence-eligible when that adapter's source covered its
-            // inputs (records with no adapter — manual/legacy — never are).
+            // inputs (records with no adapter — manual registrations — never
+            // are).
             const auto inserted =
                 source_complete.emplace(name, result.complete);
             if (!inserted.second)
@@ -1049,9 +1050,9 @@ bool JobRegistry::runPass(bool do_scan, bool wait) {
     // Exec events and the sources' own scans never reach this pass: they
     // register synchronously on their producing threads through on_job.
 
-    // Records no discovery source owns (legacy/manual registrations, or types
-    // whose inventory source was removed) are refreshed here; reads never do.
-    if (do_scan) refreshLegacyRecords();
+    // Records no discovery source owns (manual registrations) are refreshed
+    // here; reads never do.
+    if (do_scan) refreshUncoveredRecords();
 
     // Missing initial decisions are a record-driven obligation: repair them on
     // every pass, even when no new observation arrived.
@@ -1356,7 +1357,7 @@ JobRegistry::armInventory(const JobRegistryOptions& options)
     cgroup_probe_ = make_cgroup_membership_probe();
 
     // Kernel attribution capability gate: only adapters with the trait
-    // register into pid2job/cgroup2job; legacy/manual rows (unknown adapter)
+    // register into pid2job/cgroup2job; manual rows (unknown adapter)
     // keep participating. Installed before the initial pass can activate
     // anything.
     if (attribution_) {
@@ -1767,7 +1768,7 @@ void JobRegistry::remove_job_from_kernel(const Job& job, bool& ok, std::string& 
 }
 
 // ---------------------------------------------------------------------------
-// Registration (the manual/legacy path — deliberately separate from the
+// Registration (the manual path — deliberately separate from the
 // discovery upsert: manual input has no execution evidence to merge)
 // ---------------------------------------------------------------------------
 
@@ -1819,7 +1820,7 @@ bool JobRegistry::createManualJob(const Job& job) {
     JobRecord record;
     record.job = job_copy;
     record.internal_id = job_copy.JobID;
-    // A legacy register IS a manual selection: the caller explicitly asked
+    // A manual registration IS a manual selection: the caller explicitly asked
     // for these collectors, so it can never be reported as an automatic
     // origin.
     if (!record.job.CollectorNames.empty()) {
@@ -1831,7 +1832,7 @@ bool JobRegistry::createManualJob(const Job& job) {
     if (record.first_seen_us == 0) record.first_seen_us = now_us();
     if (record.last_seen_us == 0) record.last_seen_us = record.first_seen_us;
     if (record.job.subtype_name.empty()) {
-        // Legacy registrations carry their identity only inside the typed
+        // Manual registrations carry their identity only inside the typed
         // facts; the adapter owning those facts reconstructs the selector and
         // folds it onto the Job. No configured adapter owns the record: the
         // selector stays empty — incomplete, never a guess.
@@ -2042,7 +2043,7 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
         return updateManualInstance(target.record, claimed_job, request);
     }
 
-    // CREATE branch: the legacy manual registration, verbatim. An empty
+    // CREATE branch: the manual registration, verbatim. An empty
     // collector list is a CREATE-only rejection — an UPDATE with no
     // collectors is a pure facts update and stays valid.
     Job create_job = job;
@@ -2235,7 +2236,7 @@ nlohmann::json JobRegistry::updateManualInstance(const JobRecord& target, const 
         selection_outcome = outcome.targets.front();
     }
 
-    // Response in the legacy-add shape.
+    // Response in the add response shape.
     const auto record = ownRecord(internal_id);
     const auto selection = record ? record->selection : ownSelection(internal_id);
     const auto actual = actualCollection(internal_id);
@@ -3518,7 +3519,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         // automatic-policy evaluation below never run under a registry lock.
 
     if (result.disposition == UpsertDisposition::Created) {
-        // Kernel attribution is initialized here, exactly like the legacy
+        // Kernel attribution is initialized here, exactly like manual
         // registration: eBPF attribution and the cgroup map must not wait for
         // the reconcile pass, and the cgroup-id cache must exist for the
         // later removal.
@@ -4059,8 +4060,9 @@ bool JobRegistry::refreshJobFacts(uint64_t jobID) {
     if (record.revision == 0) {
         record.revision = 1;
         record.first_seen_us = now_us();
-        // Legacy repair routes through the adapter owning the facts; without
-        // one the selector stays empty — incomplete, never a guess.
+        // Identity repair for a registry-bound row routes through the adapter
+        // owning the facts; without one the selector stays empty — incomplete,
+        // never a guess.
         const NativeSelector selector = legacySelectorOf(record.job);
         if (const auto identity = canonicalize(selector)) {
             record.identity = *identity;
