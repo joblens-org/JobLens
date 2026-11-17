@@ -962,7 +962,6 @@ std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const
     // (apply_auto_policy), so no decision is pre-evaluated here.
     if (inventory_capture_all_) {
         InitialDecision blanket;
-        blanket.register_job = true;
         return blanket;
     }
 
@@ -1014,7 +1013,6 @@ std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const
         // Defaults mode: the (possibly empty) configured list is the initial
         // selection; an empty list registers the job with no collectors.
         InitialDecision default_decision;
-        default_decision.register_job = true;
         default_decision.initial_collectors = decision.collectors;
         default_decision.policy_revision = revision;
         return default_decision;
@@ -1030,7 +1028,6 @@ std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const
         return std::nullopt;
     }
     InitialDecision accepted;
-    accepted.register_job = true;
     accepted.initial_collectors = decision.collectors;
     accepted.policy_revision = revision;
     return accepted;
@@ -1433,14 +1430,8 @@ void JobRegistry::heartbeatLoop() {
                 // pass consumes it, and this loop wakes every 100 ms. Re-read
                 // no facts here: that would turn one coalesced request into
                 // ~10 full refreshes. Bookkeeping and closing retries only.
-                executed = runPass(false, false, /*refresh_facts=*/false);
+                runPass(false, false, /*refresh_facts=*/false);
             }
-        } else {
-            // Idle retry tick: nothing was asked of the sources and no
-            // registration arrived, so re-read no facts. Closing retries and
-            // the bookkeeping still run; the next due or requested pass owns
-            // the reads.
-            executed = runPass(false, false, /*refresh_facts=*/false);
         }
         lock.lock();
         // A pass already in flight (an explicit reconcile, for example) owns
@@ -1819,8 +1810,7 @@ bool JobRegistry::applyAutoSelection(uint64_t internal_id,
     // not committed even though the batch reported ok.
     for (const auto& target : outcome.targets) {
         if (target.internal_id != internal_id) continue;
-        return !target.skipped && target.revision > 0 &&
-               target.actual.error.rfind("intent write failed", 0) != 0;
+        return !target.skipped && target.revision > 0;
     }
     return false;   // no target: the selection was skipped, not committed
 }

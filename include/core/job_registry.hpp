@@ -203,13 +203,13 @@ public:
     uint64_t getNextJobID();
 
     // --- Inventory store facade --------------------------------------------
-    // Admission outcome for one observation (capture_all=false): whether the
-    // observation may register, and — when the gate pre-evaluated the type's
-    // automatic selection — the initial collector list to apply instead of
-    // re-running the policy after registration (no double Lua). A nullopt
-    // decision from the gate drops the observation before any store work.
+    // Admission outcome for one observation (capture_all=false). A present
+    // decision means the observation may register; the optional initial
+    // collector list is the gate's pre-evaluated automatic selection, applied
+    // instead of re-running the policy after registration (no double Lua).
+    // A nullopt decision from the gate drops the observation before any store
+    // work.
     struct InitialDecision {
-        bool register_job = false;
         std::optional<std::vector<std::string>> initial_collectors;
         std::string policy_revision;
     };

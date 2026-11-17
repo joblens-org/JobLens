@@ -25,27 +25,11 @@ public:
     // 执行所有规则评估（首个接受者胜出；error 非空 = 整次评估无判定）
     template<typename RuleArg>
     RuleOutcome evaluate_all(const RuleArg& arg) {
-        auto result = rule_engine_.evaluate_all<RuleArg>(arg);
-        current_passed_rules_ = {};  // 清空旧的通过规则列表（如果需要保留，可以修改逻辑）
-        current_collectors_ = result.collectors;
-        return result;
+        return rule_engine_.evaluate_all<RuleArg>(arg);
     }
 
     // 规则数（已加载的 .lua 文件数）
     std::size_t rule_count() const;
-
-    std::string failed_rule() const {
-        // 返回第一个未通过的规则名称
-        return "";
-    }
-
-    std::vector<std::string> passed_rules() const {
-        return current_passed_rules_;
-    }
-
-    std::vector<std::string> get_collectors() const {
-        return current_collectors_;
-    }
 
     std::string name() const {
         return name_;
@@ -57,9 +41,6 @@ private:
     std::string rules_prefix_;
     RuleEngine rule_engine_;
     DirectoryWatcher dir_watcher_;
-
-    std::vector<std::string> current_passed_rules_;
-    std::vector<std::string> current_collectors_;
     
     void register_rpc_methods();
     bool add_rule(const std::string& rule_filename, const std::string& lua_code);
