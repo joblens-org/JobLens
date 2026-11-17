@@ -31,6 +31,9 @@ public:
         return result;
     }
 
+    // 规则数（已加载的 .lua 文件数）
+    std::size_t rule_count() const;
+
     std::string failed_rule() const {
         // 返回第一个未通过的规则名称
         return "";

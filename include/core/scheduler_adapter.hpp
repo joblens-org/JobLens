@@ -25,16 +25,20 @@
 // one inventory.types entry.
 #pragma once
 
+#include <sys/types.h>
+
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "core/job_identity.hpp"
+#include "core/liveness.hpp"
 
 // The adapter contract is declared before the Job aggregate exists: scheduler
 // facts are part of Job, and their declarations live in the adapters. Only
@@ -79,6 +83,8 @@ struct InventoryTypeSettings {
     AutoAdd auto_add = AutoAdd::Off;
     bool auto_add_explicit = false;
     std::string rules_dir;
+    // Derived, never configured: the rule file prefix is the adapter name, so
+    // a shared rules directory cannot feed one type's rules into another.
     std::string rules_prefix;
     // Legacy auto_add_* folding: collectors added to every job of this type
     // when automatic collection is on and use_rules is false.
@@ -102,6 +108,21 @@ struct AdapterTraits {
 // fields (cluster_name/clusterTag) render from them are adapter implementation
 // details — the virtuals below own every bit of that mapping.
 using NamespaceFacts = std::vector<std::string>;
+
+// What one fact-refresh read saw, in the terms the retirement decision uses.
+// The registry owns the decision; the adapter only reports evidence:
+//   * manager                — liveness of the execution manager (Unknown is
+//                              never death evidence);
+//   * cgroup_empty_confirmed — the job cgroup was read and listed no process
+//                              (positive evidence, not missing data);
+//   * any_member_live        — at least one member process answered Alive;
+//   * member_inconclusive    — at least one member could not be judged.
+struct RefreshResult {
+    LivenessState manager = LivenessState::Unknown;
+    bool cgroup_empty_confirmed = false;
+    bool any_member_live = false;
+    bool member_inconclusive = false;
+};
 
 // Component-wise compatibility: a component where both sides hold a known,
 // different value conflicts; an unknown component (either side empty) proves
@@ -168,6 +189,29 @@ public:
         (void)job;
     }
 
+    // ---- per-record fact refresh -------------------------------------------
+    //
+    // The framework supervisor that launched this job process: Condor's
+    // condor_starter, Slurm's slurmstepd. nullopt = not a job process of this
+    // adapter (or its identity cannot be read), never a guess.
+    virtual std::optional<ProcessIdentity> managerOfPid(pid_t job_pid) const
+    {
+        (void)job_pid;
+        return std::nullopt;
+    }
+
+    // The single execution-evidence reader for one record: refreshes the
+    // execution group (manager, member triples, members_authoritative,
+    // read_order) IN PLACE and reports what the caller's probes saw. The
+    // record's scheduler metadata is the creation snapshot and is never
+    // rewritten here. The registry calls this for every active record,
+    // whatever its FactSource; the probes are passed in because tests inject
+    // fakes and production builds the `/proc` ones. No persistence, no registry
+    // lock, no registry state. read_order is assigned before the first read (an
+    // observation that reads later keeps its own, newer order).
+    virtual RefreshResult refreshFacts(Job& job,
+                                       const ProcessLivenessProbe& process_probe,
+                                       const CgroupMembershipProbe& cgroup_probe) const;
 
     // The execution cgroup of one job as told by its typed facts, used by
     // kernel attribution (empty = none; the kernel_attribution trait gates
@@ -220,6 +264,41 @@ public:
     }
 
     virtual AdapterTraits traits() const = 0;
+
+protected:
+    // Liveness evidence for one job from the caller's probes, applying the
+    // same rule the retirement pass uses: manager liveness from its complete
+    // identity, "cgroup empty" only from a readable job cgroup, member
+    // liveness/inconclusiveness from the cgroup members and the recorded
+    // member identities. Shared by the default refreshFacts and by adapters
+    // that read their own facts.
+    RefreshResult probeExecutionEvidence(const Job& job,
+                                         const ProcessLivenessProbe& process_probe,
+                                         const CgroupMembershipProbe& cgroup_probe) const;
+
+    // The first recorded member pid (0 when the record carries none): the
+    // anchor a targeted per-job read starts from.
+    static pid_t firstMemberPid(const Job& job);
+
+    // Replaces the record's member evidence with one membership read.
+    // `authoritative` means the read covered the whole execution scope, so an
+    // empty list really clears the members; a partial read that found nothing
+    // is no evidence at all and keeps the recorded identities.
+    static void applyMemberEvidence(Job& job, const std::string& proc_root,
+                                    const std::vector<pid_t>& member_pids,
+                                    bool authoritative);
+
+    // The adapter-independent fallback of refreshFacts: reads one execution's
+    // membership from the manager's own scope (the recorded cgroup, else
+    // /proc/<manager>/cgroup, else the manager's children — never the process
+    // table), applies it as member evidence and reports what the caller's
+    // probes saw. Only `execution` is written: the record's creation metadata
+    // stays the snapshot it was created with.
+    RefreshResult refreshManagerMembership(Job& job, const std::string& proc_root,
+                                           const std::string& cgroup_root,
+                                           const std::string& recorded_cgroup_path,
+                                           const ProcessLivenessProbe& process_probe,
+                                           const CgroupMembershipProbe& cgroup_probe) const;
 };
 
 // Self-registration registry (same convention as collectors/writers).

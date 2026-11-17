@@ -238,9 +238,10 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
         resolved.settings[name].inventory = true;
     }
 
-    // Per-adapter sections resolve by convention: <name>_job_watcher. The
-    // defaults follow the same convention (prefix <name>_job_, rules under
-    // config/rules/<name>_jobs), so a new scheduler needs no resolver edit.
+    // Per-adapter sections resolve by convention: <name>_job_watcher. The rule
+    // file prefix is the adapter name itself (condor*, slurm*): a deterministic
+    // convention keeps a shared rules directory from feeding one type's rules
+    // into another. Rules live under config/rules/<name>_jobs by default.
     for (auto& [name, settings] : resolved.settings) {
         const std::string section = section_of(name);
         const std::string prefix = section + ".";
@@ -252,7 +253,7 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
                          "'{}' is registered; the settings stay inert",
                          section, name);
 
-        settings.rules_prefix = name + "_job_";
+        settings.rules_prefix = name;
         settings.rules_dir = Utils::JobLensRootDir() + "../config/rules/" + name + "_jobs";
         if (node != nullptr) {
             if (const auto* auto_collect = member(*node, "auto_collect")) {
@@ -289,8 +290,11 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
             }
             settings.cluster_name =
                 scalar_field(*node, "cluster_name", section, std::string{});
-            settings.rules_prefix = scalar_field(*node, "rules_prefix", section,
-                                                 settings.rules_prefix);
+            if (member(*node, "rules_prefix") != nullptr) {
+                spdlog::warn("inventory configuration: {}.rules_prefix is ignored; the rule "
+                             "file prefix is the adapter name ('{}')",
+                             section, name);
+            }
             // Per-type rules_dir wins over the legacy shared one; otherwise
             // the per-type convention default stays in place.
             settings.rules_dir = scalar_field(

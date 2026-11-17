@@ -24,6 +24,7 @@
 #include "core/collector_type.h"
 #include "job_watcher/slurm_job_watcher.hpp"
 #include "common/common_job.hpp"
+#include "common/procfs.hpp"
 #include "common/slurm_job.hpp"
 
 struct SlurmSchedulerAdapter::Impl {
@@ -179,6 +180,73 @@ void SlurmSchedulerAdapter::refreshLegacyFacts(Job& job) const
 {
     SlurmJob::update_job_info(job);
     CommonJob::update_job_child_process(job);
+}
+
+std::optional<ProcessIdentity> SlurmSchedulerAdapter::managerOfPid(pid_t job_pid) const
+{
+    if (job_pid <= 0) return std::nullopt;
+    const DiscoveryEnvironment env = impl_->watcher.discovery_environment();
+    const auto parent = read_proc_ppid(env.proc_root, job_pid);
+    if (!parent || *parent <= 0) return std::nullopt;
+
+    // The per-job manager is the step daemon, not slurmd (one per node, shared
+    // by every job): the parent must be a slurmstepd, which also keeps a
+    // recycled pid from fabricating an execution.
+    std::string cmdline;
+    std::string error;
+    if (!read_proc_cmdline(env.proc_root, *parent, cmdline, error)) return std::nullopt;
+    if (cmdline.find("slurmstepd") == std::string::npos) return std::nullopt;
+
+    const ProcessIdentity manager =
+        read_process_identity(env.proc_root, read_boot_id(env.proc_root), *parent);
+    if (!manager.complete()) return std::nullopt;  // a partial identity is no manager
+    return manager;
+}
+
+RefreshResult SlurmSchedulerAdapter::refreshFacts(
+    Job& job, const ProcessLivenessProbe& process_probe,
+    const CgroupMembershipProbe& cgroup_probe) const
+{
+    const DiscoveryEnvironment env = impl_->watcher.discovery_environment();
+    ExecutionEvidence& execution = job.execution;
+    // Assigned before the first read so the store can reject an older pass
+    // overwriting newer facts.
+    execution.read_order = next_discovery_read_order();
+
+    const pid_t member_hint = firstMemberPid(job);
+    if (!execution.manager.complete() && member_hint > 0) {
+        if (const auto manager = managerOfPid(member_hint)) execution.manager = *manager;
+    }
+
+    // Targeted refresh through the watcher. It seeds the member map with the
+    // one hinted pid and merges the step cgroup, so this stays O(job): the
+    // scan's whole-process-table parent map is never rebuilt per record.
+    if (execution.manager.complete() && member_hint > 0) {
+        if (auto observed =
+                impl_->watcher.observeForHint(member_hint, execution.manager.pid)) {
+            // Execution evidence only. NativeJobID, cluster, typed attrs and
+            // the record's JobID/selection/state are the creation snapshot and
+            // are never rewritten by a refresh.
+            execution.manager = observed->execution.manager;
+            execution.members = observed->execution.members;
+            execution.members_authoritative = observed->execution.members_authoritative;
+            execution.read_order = observed->execution.read_order;
+            return probeExecutionEvidence(job, process_probe, cgroup_probe);
+        }
+    }
+
+    // No targeted read: the stepd is gone or the record has no member pid to
+    // anchor on. Without a manager there is no execution scope to read, so the
+    // recorded member identities are the only evidence; with one, keep the
+    // membership current from the step cgroup or the stepd's own children —
+    // never a process-table scan.
+    if (!execution.manager.complete())
+        return probeExecutionEvidence(job, process_probe, cgroup_probe);
+    const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr);
+    return refreshManagerMembership(
+        job, env.proc_root, env.cgroup_root,
+        attr != nullptr ? attr->cgroup_path : std::string{},
+        process_probe, cgroup_probe);
 }
 
 std::string SlurmSchedulerAdapter::cgroupPathOf(const Job& job) const

@@ -25,6 +25,7 @@
 #include "job_watcher/condor_job_watcher.hpp"
 #include "common/condor_job.hpp"
 #include "common/common_job.hpp"
+#include "common/procfs.hpp"
 #include "common/utils.hpp"
 
 struct CondorSchedulerAdapter::Impl {
@@ -188,6 +189,75 @@ void CondorSchedulerAdapter::refreshLegacyFacts(Job& job) const
     CondorJob::update_job_info(job);
     if (!CondorJob::update_job_pids(job))
         CommonJob::update_job_child_process(job);
+}
+
+std::optional<ProcessIdentity> CondorSchedulerAdapter::managerOfPid(pid_t job_pid) const
+{
+    if (job_pid <= 0) return std::nullopt;
+    const DiscoveryEnvironment env = impl_->watcher.discovery_environment();
+    const auto parent = read_proc_ppid(env.proc_root, job_pid);
+    if (!parent || *parent <= 0) return std::nullopt;
+
+    // A recycled pid must not fabricate an execution: the parent has to be a
+    // condor_starter, the same check the exec-hint path applies.
+    std::string cmdline;
+    std::string error;
+    if (!read_proc_cmdline(env.proc_root, *parent, cmdline, error)) return std::nullopt;
+    if (cmdline.find("condor_starter") == std::string::npos) return std::nullopt;
+
+    const ProcessIdentity manager =
+        read_process_identity(env.proc_root, read_boot_id(env.proc_root), *parent);
+    if (!manager.complete()) return std::nullopt;  // a partial identity is no manager
+    return manager;
+}
+
+RefreshResult CondorSchedulerAdapter::refreshFacts(
+    Job& job, const ProcessLivenessProbe& process_probe,
+    const CgroupMembershipProbe& cgroup_probe) const
+{
+    const DiscoveryEnvironment env = impl_->watcher.discovery_environment();
+    ExecutionEvidence& execution = job.execution;
+    // Assigned before the first read so the store can reject an older pass
+    // overwriting newer facts.
+    execution.read_order = next_discovery_read_order();
+
+    // The manager is the execution generation. A record that never carried a
+    // complete one (a manual row, an interrupted discovery) recovers it from
+    // any member pid it still knows.
+    const pid_t member_hint = firstMemberPid(job);
+    if (!execution.manager.complete() && member_hint > 0) {
+        if (const auto manager = managerOfPid(member_hint)) execution.manager = *manager;
+    }
+
+    // Targeted refresh through the watcher: this one execution's job ad and
+    // membership, the same reader an exec hint uses (no new order is invented
+    // here — the observation's own, newer read_order is adopted).
+    if (execution.manager.complete() && member_hint > 0) {
+        if (auto observed =
+                impl_->watcher.observeForHint(member_hint, execution.manager.pid)) {
+            // Execution evidence only. NativeJobID, cluster, typed attrs and
+            // the record's JobID/selection/state are the creation snapshot and
+            // are never rewritten by a refresh.
+            execution.manager = observed->execution.manager;
+            execution.members = observed->execution.members;
+            execution.members_authoritative = observed->execution.members_authoritative;
+            execution.read_order = observed->execution.read_order;
+            return probeExecutionEvidence(job, process_probe, cgroup_probe);
+        }
+    }
+
+    // No targeted read: the manager is gone, its ad is unreadable, or the
+    // record has no member pid to anchor on. Without a manager there is no
+    // execution scope to read, so the recorded member identities are the only
+    // evidence; with one, keep the membership current with a single cheap
+    // cgroup/children read (never the process table).
+    if (!execution.manager.complete())
+        return probeExecutionEvidence(job, process_probe, cgroup_probe);
+    const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr);
+    return refreshManagerMembership(
+        job, env.proc_root, env.cgroup_root,
+        attr != nullptr ? attr->slots_cgroup_path : std::string{},
+        process_probe, cgroup_probe);
 }
 
 std::string CondorSchedulerAdapter::cgroupPathOf(const Job& job) const

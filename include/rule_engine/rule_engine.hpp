@@ -96,7 +96,11 @@ public:
     bool load_rule(const std::string& filepath);
     
     // 加载目录下所有规则文件
-    int load_rules_from_directory(const std::string& dir_path);
+    // `required_prefix` (empty = no filter) keeps a directory shared by several
+    // adapter types from feeding one type's rules into another: only files
+    // whose basename starts with it are loaded.
+    int load_rules_from_directory(const std::string& dir_path,
+                                  const std::string& required_prefix = {});
 
     // 更新目录下的所有规则文件
     int update_rules();
@@ -212,6 +216,9 @@ public:
     
     // 打印所有规则信息
     nlohmann::json list_rules() const;
+
+    // 已加载的规则文件数
+    std::size_t rule_count() const { return rules.size(); }
 
     // 检测规则代码合法性
     bool validate_rule_code(const std::string& lua_code);

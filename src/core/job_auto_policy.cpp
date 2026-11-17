@@ -35,6 +35,23 @@ AutoCollectorPolicy AutoCollectorPolicy::rules(std::string rules_dir, std::strin
     return policy;
 }
 
+std::size_t AutoCollectorPolicy::load(std::string& error)
+{
+    error.clear();
+    if (mode_ != Mode::Rules || !rules_) return 0;
+    try {
+        std::lock_guard<std::mutex> lock(rules_->mutex);
+        if (!rules_->manager) {
+            rules_->manager =
+                std::make_unique<RulesManager>("AutoCollectorPolicy", rules_dir_, rules_prefix_);
+        }
+        return rules_->manager->rule_count();
+    } catch (const std::exception& failure) {
+        error = std::string("rule engine start failed: ") + failure.what();
+        return 0;
+    }
+}
+
 AutoCollectorPolicy::Decision AutoCollectorPolicy::select(const Job& job,
                                                           std::string& policy_revision,
                                                           std::string& error) const

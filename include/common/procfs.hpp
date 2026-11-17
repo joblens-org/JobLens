@@ -219,6 +219,38 @@ inline std::optional<pid_t> read_proc_ppid(const std::string& proc_root, pid_t p
     }
 }
 
+// Direct children of `pid`, from the kernel's per-task "children" file
+// (<proc_root>/<pid>/task/<tid>/children). One small file per task of that
+// single process: the cheap, manager-scoped alternative to walking the whole
+// process table when a job has no readable cgroup. Unreadable roots/tasks
+// simply contribute nothing; the result is deduplicated and ascending.
+inline std::vector<pid_t> read_proc_children(const std::string& proc_root, pid_t pid)
+{
+    std::vector<pid_t> children;
+    if (pid <= 0) return children;
+
+    std::error_code ec;
+    std::filesystem::directory_iterator iterator(
+        std::filesystem::path(proc_root) / std::to_string(pid) / "task", ec);
+    if (ec) return children;
+
+    for (const auto& entry : iterator) {
+        std::error_code type_ec;
+        if (!entry.is_directory(type_ec) || type_ec) continue;
+        std::string content;
+        std::string error;
+        if (!procfs_detail::read_file(entry.path() / "children", content, error)) continue;
+        std::istringstream stream(content);
+        pid_t child = 0;
+        while (stream >> child) {
+            if (std::find(children.begin(), children.end(), child) == children.end())
+                children.push_back(child);
+        }
+    }
+    std::sort(children.begin(), children.end());
+    return children;
+}
+
 inline std::optional<std::uint64_t> read_proc_start_ticks(const std::string& proc_root,
                                                           pid_t pid)
 {
@@ -347,4 +379,61 @@ inline ProcessIdentity read_process_identity(const std::string& proc_root,
     if (const auto ticks = read_proc_start_ticks(proc_root, pid))
         identity.start_ticks = *ticks;
     return identity;
+}
+
+// One execution's membership, read cheaply and O(job): the recorded cgroup
+// when it is readable and job-scoped, otherwise the manager's direct children
+// (read_proc_children), never the process table.
+struct JobMembershipRead {
+    std::string cgroup_path;     // job-scoped cgroup; empty when none applies
+    std::vector<pid_t> members;  // member pids, manager excluded, ascending
+    // A readable job-scoped cgroup answered: the list is the whole execution
+    // scope (an empty list included). false = a partial children-only read.
+    bool authoritative = false;
+};
+
+// `recorded_cgroup_path` is the adapter's persisted fact; empty means "derive
+// it from the manager's own /proc/<pid>/cgroup". A cgroup that also lists the
+// manager's parent is the shared daemon tree (a node without per-job
+// cgroups), not an execution scope: it is discarded and the children are used
+// instead, exactly like the discovery readers treat it.
+inline JobMembershipRead read_job_membership(const std::string& proc_root,
+                                             const std::string& cgroup_root,
+                                             pid_t manager_pid,
+                                             const std::string& recorded_cgroup_path)
+{
+    JobMembershipRead read;
+    if (manager_pid <= 0) return read;
+
+    std::string cgroup_path = recorded_cgroup_path;
+    if (cgroup_path.empty())
+        cgroup_path = read_proc_cgroup_path(proc_root, manager_pid, cgroup_root);
+
+    if (!cgroup_path.empty()) {
+        std::vector<pid_t> cgroup_members;
+        std::string error;
+        if (read_cgroup_members(cgroup_path, cgroup_members, error)) {
+            const auto parent = read_proc_ppid(proc_root, manager_pid);
+            const bool shared_with_daemons =
+                parent && *parent > 0 &&
+                std::find(cgroup_members.begin(), cgroup_members.end(), *parent) !=
+                    cgroup_members.end();
+            if (!shared_with_daemons) {
+                read.cgroup_path = cgroup_path;
+                read.authoritative = true;
+                for (const pid_t pid : cgroup_members) {
+                    if (pid != manager_pid) read.members.push_back(pid);
+                }
+                std::sort(read.members.begin(), read.members.end());
+                return read;
+            }
+            cgroup_path.clear();  // the daemon tree is not this job's scope
+        }
+    }
+
+    read.cgroup_path = cgroup_path;
+    read.members = read_proc_children(proc_root, manager_pid);
+    read.members.erase(std::remove(read.members.begin(), read.members.end(), manager_pid),
+                       read.members.end());
+    return read;
 }

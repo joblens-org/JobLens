@@ -23,10 +23,12 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -60,6 +62,15 @@ public:
     bool start(const DiscoverySink& sink) override;
     void stop() override;
     ScanResult scan() override;
+    // Cheap: the live slurmstepd processes of this pass only, from the same
+    // process-table enumeration as scan() and without reading any step
+    // environment or member set. The pass also refreshes the children index
+    // observe() uses, so one pass serves every manager it reports.
+    ManagerSet enumerateManagers() override;
+    // O(job): reads exactly this stepd's children and step cgroup. Members come
+    // from the index of the pass that reported the manager, or from a targeted
+    // /proc/<stepd>/task/*/children read — never a process-table pass.
+    std::optional<Job> observe(const ProcessIdentity& manager) override;
     SourceHealth health() const override;
     void requestRescan() override;
     std::optional<Job> observeForHint(pid_t hint_pid, pid_t hint_ppid = 0) override;
@@ -125,6 +136,13 @@ private:
                             const std::string& dir_name,
                             std::vector<std::string>* drop_notes = nullptr);
 
+    // Direct children of one manager, read from
+    // /proc/<pid>/task/<tid>/children. The targeted fallback for observe()
+    // when the pass index does not cover this manager (a fresh adapter, or a
+    // stepd that appeared after the last pass) — one to a few file reads
+    // instead of a process-table pass.
+    static std::vector<pid_t> read_manager_children(const std::string& proc_root, pid_t pid);
+
     bool init_event_source();
     // Idempotent counterpart of init_event_source().
     void deinit_event_source();
@@ -147,6 +165,15 @@ private:
     mutable std::mutex state_mutex_;
     SourceHealth health_;
     std::mutex scan_mutex_;
+
+    // Children of every live process, captured by the last scan()/
+    // enumerateManagers() pass so observe() can build one manager's Job without
+    // a second process-table read. Guarded by scan_mutex_;
+    // child_index_root_ stamps the proc root it was read from, so a re-resolved
+    // environment invalidates it without taking scan_mutex_ there.
+    std::map<pid_t, std::vector<pid_t>> child_index_;
+    std::string child_index_root_;
+    bool child_index_valid_ = false;
 
     std::vector<bpf_link*> bpf_links_;
     bpf_object* bpf_obj_{nullptr};
@@ -301,6 +328,12 @@ inline ScanResult SlurmJobWatcher::scan()
     }
     result.counts.skipped = unreadable_entries;
 
+    // The same pass supplies observe() with every manager's children, so a
+    // later observe() never re-reads the process table.
+    child_index_ = children;
+    child_index_root_ = env.proc_root;
+    child_index_valid_ = true;
+
     // One discovered Job per stepd/spool entry, built directly (the store is
     // the identity idempotency point, so no second merge model).
     std::set<std::string> live_native_job_ids;
@@ -355,6 +388,122 @@ inline ScanResult SlurmJobWatcher::scan()
 
     result.counts.candidates = stepds.size() + spool_candidates;
     return finish_scan(std::move(result));
+}
+
+inline ManagerSet SlurmJobWatcher::enumerateManagers()
+{
+    // Serialized against scan(): both enumerate from the same roots and both
+    // refresh the children index observe() reads.
+    std::lock_guard<std::mutex> scan_lock(scan_mutex_);
+    ManagerSet set;
+    // Same prologue as scan(), because this pass now drives the heartbeat: it
+    // consumes a pending rescan request and records when the pass started.
+    // It never claims a full-scan health state — coverage is ManagerSet::complete.
+    const std::int64_t started_at_ms = scan_clock_now(options_.clock);
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        health_.last_scan_start_ms = started_at_ms;
+        health_.rescan_requested = false;
+    }
+
+    const auto env = discovery_environment();
+    std::string error;
+    if (!ensure_readable_directory(env.proc_root, error)) {
+        set.error = "slurm discovery: " + error;
+        return set;
+    }
+
+    const std::string boot_id = read_boot_id(env.proc_root);
+
+    // One process-table pass: stepd candidates and their children together, so
+    // the following observe() calls need no process-table read at all.
+    std::map<pid_t, std::vector<pid_t>> children;
+    std::vector<pid_t> stepds;
+    for (pid_t pid : list_proc_pids(env.proc_root)) {
+        std::string cmdline;
+        std::string cmdline_error;
+        if (!read_proc_cmdline(env.proc_root, pid, cmdline, cmdline_error)) continue;
+        if (cmdline.find("slurmstepd") != std::string::npos) stepds.push_back(pid);
+        if (const auto ppid = read_proc_ppid(env.proc_root, pid)) children[*ppid].push_back(pid);
+    }
+
+    // The stepds are live managers whether or not the spool source can be
+    // consulted: fill them before the spool probe so a spool failure only marks
+    // the pass incomplete instead of dropping the processes it found.
+    set.managers.reserve(stepds.size());
+    for (pid_t stepd : stepds) {
+        set.managers.push_back(read_process_identity(env.proc_root, boot_id, stepd));
+    }
+
+    // Keep the index even when the spool probe below fails: these children
+    // came from a complete process-table pass and are what observe() needs.
+    child_index_ = std::move(children);
+    child_index_root_ = env.proc_root;
+    child_index_valid_ = true;
+
+    // The spool source can only corroborate presence, but it is part of the
+    // pass's coverage: an unreadable configured spool root makes the pass
+    // incomplete exactly as it does for scan(). The entries themselves add no
+    // manager evidence, so they are never listed here.
+    if (!env.slurm_spool_dir.empty()) {
+        std::string spool_error;
+        if (!ensure_readable_directory(env.slurm_spool_dir, spool_error)) {
+            set.error = "slurm discovery: spool root " + spool_error;
+            return set;
+        }
+        std::error_code ec;
+        std::filesystem::directory_iterator probe(env.slurm_spool_dir, ec);
+        if (ec) {
+            set.error = "slurm discovery: cannot enumerate spool root '" +
+                        env.slurm_spool_dir + "': " + ec.message();
+            return set;
+        }
+    }
+
+    set.complete = true;
+    return set;
+}
+
+inline std::optional<Job> SlurmJobWatcher::observe(const ProcessIdentity& manager)
+{
+    if (!manager.complete()) return std::nullopt;
+    const auto env = discovery_environment();
+    const std::string boot_id = read_boot_id(env.proc_root);
+    // A reboot or a different proc root invalidates every saved identity.
+    if (boot_id != manager.boot_id) return std::nullopt;
+
+    // The pid must still be a slurmstepd: a manager identity can outlive the
+    // process by a pass, and a recycled pid must never seed a Job. The triple
+    // is re-verified against the built Job below.
+    std::string cmdline;
+    std::string cmdline_error;
+    if (!read_proc_cmdline(env.proc_root, manager.pid, cmdline, cmdline_error) ||
+        cmdline.find("slurmstepd") == std::string::npos) {
+        return std::nullopt;
+    }
+
+    // Members come from the index of the pass that reported this manager; a
+    // manager that appeared afterwards falls back to the stepd's own
+    // /proc/<pid>/task/*/children, never to a process-table pass.
+    std::map<pid_t, std::vector<pid_t>> children;
+    bool found_in_index = false;
+    {
+        std::lock_guard<std::mutex> lock(scan_mutex_);
+        if (child_index_valid_ && child_index_root_ == env.proc_root) {
+            const auto found = child_index_.find(manager.pid);
+            if (found != child_index_.end()) {
+                children[manager.pid] = found->second;
+                found_in_index = true;
+            }
+        }
+    }
+    if (!found_in_index)
+        children[manager.pid] = read_manager_children(env.proc_root, manager.pid);
+
+    auto job = observe_stepd(env, boot_id, manager.pid, children);
+    if (!job) return std::nullopt;
+    if (job->execution.manager != manager) return std::nullopt;
+    return job;
 }
 
 inline SourceHealth SlurmJobWatcher::health() const
@@ -703,10 +852,9 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
     attributes.cluster_name = job.cluster_name;
 
     // Member processes: stepd children plus step-cgroup members, so a child
-    // created before registration is still attributed. The member list is
-    // authoritative (members_authoritative stays true) only when the step
-    // cgroup was actually readable: a failed read must never be reported as a
-    // confirmed member set, an empty list included.
+    // created before registration is still attributed. Only a successfully read
+    // step cgroup makes the set authoritative; a failed read is never reported
+    // as a confirmed member set.
     std::string cgroup_path =
         read_proc_cgroup_path(env.proc_root, stepd_pid, env.cgroup_root);
     if (cgroup_path.empty() && !member_pids.empty()) {
@@ -721,8 +869,14 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
     std::vector<pid_t> effective_members = member_pids;
     std::vector<pid_t> cgroup_members;
     std::string cgroup_error;
+    // Members start as the stepd's children, which may be incomplete (a child
+    // created after this read, or an unreadable stepd). A readable step cgroup
+    // answers for the whole scope — an empty list included — and is the only
+    // thing that makes the set authoritative; an unreadable cgroup leaves it
+    // partial, and an incomplete member identity below clears it again.
     if (!cgroup_path.empty()) {
         if (read_cgroup_members(cgroup_path, cgroup_members, cgroup_error)) {
+            execution.members_authoritative = true;
             for (pid_t cgroup_pid : cgroup_members) {
                 if (std::find(effective_members.begin(), effective_members.end(),
                               cgroup_pid) == effective_members.end()) {
@@ -733,9 +887,6 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
             execution.members_authoritative = false;
             notes.push_back("step cgroup membership unreadable: " + cgroup_error);
         }
-    } else if (!member_pids.empty()) {
-        // Members are known from children only; the cgroup may hold more.
-        execution.members_authoritative = false;
     }
     for (pid_t member_pid : effective_members) {
         if (member_pid == stepd_pid) continue;
@@ -746,6 +897,36 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
 
     job.sub_attr = attributes;
     return finalize_discovery(std::move(job), std::move(reasons), drop_notes);
+}
+
+inline std::vector<pid_t> SlurmJobWatcher::read_manager_children(const std::string& proc_root,
+                                                                 pid_t pid)
+{
+    // /proc/<pid>/task/<tid>/children lists the tasks a thread forked; the
+    // union over the stepd's threads is its child set. A handful of small
+    // files, never a process-table pass.
+    std::vector<pid_t> children;
+    const std::filesystem::path task_dir =
+        std::filesystem::path(proc_root) / std::to_string(pid) / "task";
+    std::error_code ec;
+    std::filesystem::directory_iterator iterator(task_dir, ec);
+    const std::filesystem::directory_iterator end;
+    while (!ec && iterator != end) {
+        std::ifstream file(iterator->path() / "children");
+        if (file) {
+            std::string line;
+            std::getline(file, line);
+            std::istringstream values(line);
+            long value = 0;
+            while (values >> value) {
+                if (value > 0) children.push_back(static_cast<pid_t>(value));
+            }
+        }
+        iterator.increment(ec);
+    }
+    std::sort(children.begin(), children.end());
+    children.erase(std::unique(children.begin(), children.end()), children.end());
+    return children;
 }
 
 inline Job SlurmJobWatcher::observe_spool_entry(const DiscoveryEnvironment& env,

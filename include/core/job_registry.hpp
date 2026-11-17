@@ -267,10 +267,6 @@ public:
     bool runtimeRecords(std::vector<JobRecord>& out) const override;
     bool runtimeRecord(uint64_t internal_id,
                        std::optional<JobRecord>& out) const override;
-    // Re-read local members for records with no discovery source (manual
-    // registrations). Only member evidence is written back; scheduler metadata
-    // remains the creation snapshot. Reads never trigger this refresh.
-    bool refreshJobFacts(uint64_t jobID);
     // Liveness evidence from the last scan. Not a lifecycle state: an
     // unverified instance stays Open but must not be admitted to the kernel.
     void setExecutionVerified(uint64_t jobID, bool verified);
@@ -392,12 +388,6 @@ private:
         std::string policy_revision;
     };
     std::optional<AutoDecision> autoSelectionFor(const Job& job, const std::string& adapter);
-    // Evaluates the automatic policy for a set of live instances. Synchronous
-    // by design: a slow rule set costs latency and is warned about, it is never
-    // deferred to another thread, so the decision always reflects the current
-    // observation.
-    void evaluateAutoPolicies(const std::vector<uint64_t>& internal_ids,
-                              std::vector<AutoSelection>& out);
     void regRPCHandle();
     // --- Manual CRUD upsert internals ----------------------------------------
     // The CREATE branch: the manual registration body verbatim.
@@ -475,11 +465,18 @@ private:
     class RecordTxn;
     void applyRecovered(const std::vector<JobRecord>& adopted,
                         const std::vector<uint64_t>& removed);
+    // How one merge treats provenance and the liveness verdict. Observation: a
+    // discovery observation — the record's source becomes Discovery and the
+    // positive read re-verifies it. Refresh: the periodic eager update of an
+    // existing record — execution evidence moves, provenance and the liveness
+    // verdict stay with their owners.
+    enum class MergeKind { Observation, Refresh };
     // Execution refresh against an existing creation metadata snapshot.
     // Pure decision: no durable write and no publication.
     UpsertResult mergeDiscoveredJob(const JobRecord& stored, const Job& job,
                                   const SchedulerKey& key, uint64_t internal_id,
-                                  int64_t observed_at, JobRecord& updated_out);
+                                  int64_t observed_at, JobRecord& updated_out,
+                                  MergeKind kind = MergeKind::Observation);
     // Resolves the adapter that owns one Job's scheduler facts: the Job's
     // subtype_name first (the one copy of the adapter name), the subtype
     // enum as a fallback for pre-name legacy rows. nullptr when no
@@ -546,6 +543,11 @@ private:
         ProcessIdentity manager;
         int complete_absences = 0;
         std::int64_t last_seen_ms = 0;
+        // Monotonic observation sequence of the last accepted observation. It
+        // tells a later pass whether the record was observed after that pass
+        // began, which wall-clock milliseconds cannot (coarse clock, short
+        // passes).
+        std::uint64_t last_seen_seq = 0;
     };
     mutable std::mutex hb_mtx_;
     std::condition_variable hb_cv_;
@@ -577,9 +579,22 @@ private:
     std::uint64_t hb_dropped_observations_ = 0;
     std::uint64_t hb_rejected_observations_ = 0;
     std::uint64_t hb_admission_errors_ = 0;
+    std::uint64_t hb_decision_repairs_ = 0;
+    std::uint64_t hb_decision_failures_ = 0;
+    // Eager refreshes this stack could not apply (store write failure or a
+    // refused generation/identity merge). Observability only: a record that
+    // failed to refresh is retried next pass.
+    std::uint64_t hb_refresh_failures_ = 0;
     std::uint64_t hb_retirements_ = 0;
     std::uint64_t hb_passes_ = 0;
     std::uint64_t hb_stop_errors_ = 0;
+    // Bumped by every noteHeartbeatError(); a pass uses it to tell whether an
+    // error was raised while it was running (and therefore must stay visible
+    // instead of being cleared by its own "scan complete" branch).
+    std::uint64_t hb_error_epoch_ = 0;
+    // Bumped by every accepted observation. A pass captures it before scanning
+    // so registrations that land during the pass are not read as absences.
+    std::uint64_t observation_seq_ = 0;
     std::vector<std::pair<std::string, bool>> source_started_;  // name, started
     std::vector<std::string> source_start_notes_;
     // Serializes passes (worker vs on-demand reconciles). Never held while
@@ -613,8 +628,44 @@ private:
     // Heartbeat internals.
     void startHeartbeat();
     void heartbeatLoop();
-    bool runPass(bool do_scan, bool wait);
-    void processObservation(const Job& job, std::set<uint64_t>& observed);
+    bool runPass(bool do_scan, bool wait, bool refresh_facts = true);
+    // Registers the observation of a manager the pass did not track. Runs the
+    // creation admission gate (only for unknown identities), the
+    // obsolete-generation screen and the store upsert; `observed` receives the
+    // record id and `created` receives it only for the CREATE disposition (a
+    // fresh record already carries the observe() image and is skipped by this
+    // pass' update). The result is the caller's acceptance signal: only an
+    // accepted observation may mark the manager as tracked (an identity
+    // conflict must keep it unknown so the next pass retries it).
+    UpsertResult processObservation(const Job& job, std::set<uint64_t>& observed,
+                                    std::set<uint64_t>& created);
+    // Liveness evidence for a record with no scheduler adapter (Common /
+    // open-world manual rows): the manager identity when it has one and the
+    // recorded member identities, both through the injected probes. There is
+    // no cgroup scope to read without an adapter.
+    RefreshResult probeRecordEvidence(const Job& job) const;
+    // Result of the one eager refresh of a record: the evidence the retirement
+    // rule consumes, plus whether any member identity survived the merge (a
+    // record with no member evidence at all is "retry later", not "all dead").
+    struct RefreshedEvidence {
+        RefreshResult evidence;
+        bool has_member_evidence = false;
+    };
+    // Applies one refreshed image to the current record under mutation_mtx_:
+    // the execution-evidence merge, the single durable batch and the runtime
+    // wake. Metadata and identity are never rewritten (the record is a creation
+    // snapshot). Nullopt means the record moved on (archived, closing, newer
+    // facts, refused merge) and the evidence must not be used for retirement.
+    std::optional<RefreshedEvidence> applyRefreshedRecord(const JobRecord& snapshot,
+                                                          Job refreshed,
+                                                          RefreshResult evidence);
+    // The merge keeps the stored member set when a refresh produced an empty,
+    // non-authoritative read (a failed legacy/host read, not a confirmed empty
+    // scope). The retirement evidence must describe those same survivors:
+    // probing only the refreshed image would read "all dead" and retire an
+    // execution whose child is still alive.
+    void probeSurvivingMembers(const Job& stored, const Job& refreshed,
+                               RefreshResult& evidence) const;
     // Registration admission gate (inventory.capture_all=false). Returns
     // nullopt to drop the observation (counted by the caller-visible
     // hb_dropped_/hb_rejected_ counters); otherwise the register decision
@@ -623,15 +674,18 @@ private:
     std::optional<InitialDecision> admissionDecision(const Job& job);
     void requestRescan(const std::string& reason);
     bool rescanRequested() const;
-    // Refreshes the records whose execution facts no discovery source owns:
-    // manual registrations, whose bound members are their only evidence. The
-    // discovery path owns everything else.
-    void refreshUncoveredRecords();
     // Re-evaluates the automatic decision for live instances that never got a
     // durable one. Bounded per pass so the heartbeat keeps its cadence.
     void repairMissingInitialDecisions();
+    // Absence accounting plus the retirement verdict. `scan_seq` is the
+    // observation sequence captured before this pass began: a registration
+    // accepted on another thread during the pass carries a greater sequence
+    // and therefore counts as observed. `refreshed` carries this pass' evidence
+    // per record; the duplicate probes are gone.
     void evaluateRetirements(const std::set<uint64_t>& observed_ids,
-                             const std::map<std::string, bool>& source_complete);
+                             const std::map<std::string, bool>& source_complete,
+                             const std::map<uint64_t, RefreshedEvidence>& refreshed,
+                             std::uint64_t scan_seq);
     bool retireIfConfirmed(const JobRecord& record, const std::string& reason);
     void rememberEnded(const JobRecord& record);
     bool isObsolete(const SchedulerKey& key, const ProcessIdentity& gen);

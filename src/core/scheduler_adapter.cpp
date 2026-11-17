@@ -14,6 +14,7 @@
 // SchedulerAdapterRegistry implementation (see scheduler_adapter.hpp).
 #include "core/scheduler_adapter.hpp"
 #include "core/collector_type.h"
+#include "common/procfs.hpp"
 
 SubAttrMatcher ISchedulerAdapter::duplicateMatcher(const Job& job) const
 {
@@ -25,6 +26,117 @@ SubAttrMatcher ISchedulerAdapter::duplicateMatcher(const Job& job) const
 NamespaceFacts ISchedulerAdapter::namespaceFacts(const Job& job) const
 {
     return {job.cluster_name, job.clusterTag};
+}
+
+pid_t ISchedulerAdapter::firstMemberPid(const Job& job)
+{
+    for (const auto& member : members_of(job)) {
+        if (member.pid > 0) return member.pid;
+    }
+    return 0;
+}
+
+RefreshResult ISchedulerAdapter::probeExecutionEvidence(
+    const Job& job, const ProcessLivenessProbe& process_probe,
+    const CgroupMembershipProbe& cgroup_probe) const
+{
+    RefreshResult result;
+
+    // A record without a complete manager identity has no generation to probe:
+    // its member list is the only evidence (exactly like the retirement pass).
+    const ProcessIdentity& manager = manager_of(job);
+    if (manager.complete()) {
+        const LivenessResult liveness =
+            process_probe ? process_probe(manager) : LivenessResult{};
+        result.manager = liveness.state;
+    }
+
+    // The cgroup is the execution scope: "read and empty" is positive evidence,
+    // "unreadable" is none. Members are probed by bare pid, because the cgroup
+    // names numbers, not saved identities.
+    const std::string cgroup_path = cgroupPathOf(job);
+    if (!cgroup_path.empty() && cgroup_probe) {
+        const CgroupMembership membership = cgroup_probe(cgroup_path);
+        if (membership.readable) {
+            if (membership.members.empty()) result.cgroup_empty_confirmed = true;
+            for (const pid_t pid : membership.members) {
+                const LivenessResult member = process_probe
+                                                  ? process_probe(ProcessIdentity{pid, 0, {}})
+                                                  : LivenessResult{};
+                if (member.state == LivenessState::Alive) {
+                    result.any_member_live = true;
+                    break;
+                }
+                if (member.state == LivenessState::Unknown) result.member_inconclusive = true;
+            }
+        }
+    }
+
+    if (!result.any_member_live) {
+        for (const auto& member : members_of(job)) {
+            const LivenessResult liveness =
+                process_probe ? process_probe(member) : LivenessResult{};
+            if (liveness.state == LivenessState::Alive) {
+                result.any_member_live = true;
+                break;
+            }
+            // An unreadable member (or one with an unvalidated identity) might
+            // be alive: it is never death evidence.
+            if (liveness.state == LivenessState::Unknown) result.member_inconclusive = true;
+        }
+    }
+    return result;
+}
+
+void ISchedulerAdapter::applyMemberEvidence(Job& job, const std::string& proc_root,
+                                            const std::vector<pid_t>& member_pids,
+                                            bool authoritative)
+{
+    if (!authoritative && member_pids.empty()) return;  // no evidence, not absence
+
+    const std::string boot_id = read_boot_id(proc_root);
+    ExecutionEvidence& execution = job.execution;
+    execution.members.clear();
+    execution.members.reserve(member_pids.size());
+    execution.members_authoritative = authoritative;
+    for (const pid_t pid : member_pids) {
+        const ProcessIdentity member = read_process_identity(proc_root, boot_id, pid);
+        if (!member.complete()) execution.members_authoritative = false;
+        execution.members.push_back(member);
+    }
+}
+
+RefreshResult ISchedulerAdapter::refreshFacts(Job& job,
+                                              const ProcessLivenessProbe& process_probe,
+                                              const CgroupMembershipProbe& cgroup_probe) const
+{
+    // Generic/manual rows carry no scheduler reader of their own: the probes
+    // over the recorded evidence are the fact source.
+    return probeExecutionEvidence(job, process_probe, cgroup_probe);
+}
+
+RefreshResult ISchedulerAdapter::refreshManagerMembership(
+    Job& job, const std::string& proc_root, const std::string& cgroup_root,
+    const std::string& recorded_cgroup_path,
+    const ProcessLivenessProbe& process_probe,
+    const CgroupMembershipProbe& cgroup_probe) const
+{
+    const ProcessIdentity& manager = manager_of(job);
+    if (!manager.complete()) return probeExecutionEvidence(job, process_probe, cgroup_probe);
+
+    const JobMembershipRead membership = read_job_membership(
+        proc_root, cgroup_root, manager.pid, recorded_cgroup_path);
+    applyMemberEvidence(job, proc_root, membership.members, membership.authoritative);
+
+    RefreshResult evidence = probeExecutionEvidence(job, process_probe, cgroup_probe);
+    // A job-scoped cgroup that was read and listed no process is positive
+    // termination evidence even when the record never carried its path: the
+    // read proves the execution scope is empty, which is what the retirement
+    // rule needs. A shared daemon tree is discarded by read_job_membership and
+    // never reaches this branch.
+    if (membership.authoritative && membership.members.empty())
+        evidence.cgroup_empty_confirmed = true;
+    return evidence;
 }
 
 bool namespace_facts_compatible(const NamespaceFacts& left, const NamespaceFacts& right)

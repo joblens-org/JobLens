@@ -58,6 +58,12 @@ public:
     bool start(const DiscoverySink& sink) override;
     void stop() override;
     ScanResult scan() override;
+    // Cheap: the starters of this pass only, read through the same tier-1/tier-2
+    // enumeration as scan() but without reading any job ad or member set.
+    ManagerSet enumerateManagers() override;
+    // O(job): reads exactly the manager's own starter (ad, slot cgroup,
+    // members). Used for managers the discovery pass does not track yet.
+    std::optional<Job> observe(const ProcessIdentity& manager) override;
     SourceHealth health() const override;
     void requestRescan() override;
     std::optional<Job> observeForHint(pid_t hint_pid, pid_t hint_ppid = 0) override;
@@ -119,6 +125,18 @@ private:
                                         const std::string& subtree_root,
                                         std::size_t& slot_dirs,
                                         std::vector<pid_t>& starters) const;
+
+    // One starter enumeration pass, shared by scan() and enumerateManagers():
+    // the configured slot cgroup subtree first (tier 1), the full process
+    // table otherwise (tier 2), with the scan's fallback rules. `notes`
+    // receives the same diagnostics scan() reports.
+    struct StarterEnumeration {
+        std::vector<pid_t> starters;
+        std::size_t candidates = 0;  // slot directories or process entries
+        std::size_t skipped = 0;     // unreadable process entries (tier 2 only)
+    };
+    StarterEnumeration enumerate_starters(const DiscoveryEnvironment& env,
+                                          std::vector<std::string>& notes) const;
 
     // Builds one discovered Job from a condor_starter candidate using the same
     // sources the scan path reads (starter environ, _CONDOR_JOB_AD file, slot
@@ -297,49 +315,14 @@ inline ScanResult CondorJobWatcher::scan()
 
     // Tier 1: enumerate starters from the slot cgroup subtree when one is
     // configured. Tier 2 (fallback): the full process-table scan.
-    std::vector<pid_t> starters;
-    std::size_t unreadable_entries = 0;
-    bool enumerated_from_cgroup = false;
-    if (!options_.starter_cgroup_subtree.empty()) {
-        const std::string subtree_root =
-            (std::filesystem::path(env.cgroup_root) / options_.starter_cgroup_subtree)
-                .lexically_normal()
-                .string();
-        std::size_t slot_dirs = 0;
-        if (enumerate_starters_from_cgroup(env, subtree_root, slot_dirs, starters)) {
-            enumerated_from_cgroup = true;
-            result.counts.candidates = slot_dirs;
-            result.notes.push_back(fmt::format(
-                "starters enumerated from cgroup subtree {}", subtree_root));
-        } else {
-            result.notes.push_back(fmt::format(
-                "cgroup subtree unavailable/empty ({}); fell back to process-table scan",
-                subtree_root));
-        }
-    }
-    if (!enumerated_from_cgroup) {
-        for (pid_t pid : list_proc_pids(env.proc_root)) {
-            std::string cmdline;
-            std::string cmdline_error;
-            if (!read_proc_cmdline(env.proc_root, pid, cmdline, cmdline_error)) {
-                ++unreadable_entries;
-                continue;
-            }
-            if (cmdline.find("condor_starter") != std::string::npos) starters.push_back(pid);
-        }
-        result.counts.candidates = starters.size();
-        result.counts.skipped = unreadable_entries;
-        if (unreadable_entries > 0) {
-            result.notes.push_back(fmt::format(
-                "{} process entries unreadable (permission denied or exited mid-scan); "
-                "they cannot be attributed to condor", unreadable_entries));
-        }
-    }
+    const StarterEnumeration enumeration = enumerate_starters(env, result.notes);
+    result.counts.candidates = enumeration.candidates;
+    result.counts.skipped = enumeration.skipped;
 
     // One discovered Job per manager, built directly: the store is the identity
     // idempotency point, so the accumulator (a second merge model) is gone.
-    result.jobs.reserve(starters.size());
-    for (pid_t starter : starters) {
+    result.jobs.reserve(enumeration.starters.size());
+    for (pid_t starter : enumeration.starters) {
         if (auto job = observe_starter(env, boot_id, starter, 0, &result.notes)) {
             result.jobs.push_back(std::move(*job));
         } else {
@@ -347,6 +330,67 @@ inline ScanResult CondorJobWatcher::scan()
         }
     }
     return finish_scan(std::move(result));
+}
+
+inline ManagerSet CondorJobWatcher::enumerateManagers()
+{
+    // Serialized against scan() with the same mutex: both enumerate from the
+    // same roots and the caller may hold either one.
+    std::lock_guard<std::mutex> scan_lock(scan_mutex_);
+    ManagerSet set;
+    // Same prologue as scan(), because this pass now drives the heartbeat: it
+    // consumes a pending rescan request and records when the pass started.
+    // It never claims a full-scan health state — coverage is ManagerSet::complete.
+    const std::int64_t started_at_ms = scan_clock_now(options_.clock);
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        health_.last_scan_start_ms = started_at_ms;
+        health_.rescan_requested = false;
+    }
+
+    const auto env = discovery_environment();
+    std::string error;
+    if (!ensure_readable_directory(env.proc_root, error)) {
+        set.error = "condor discovery: " + error;
+        return set;
+    }
+
+    const std::string boot_id = read_boot_id(env.proc_root);
+    std::vector<std::string> notes;
+    const StarterEnumeration enumeration = enumerate_starters(env, notes);
+    // No ad, no cgroup membership, no member read: identity only. A starter
+    // that exited mid-pass keeps its pid with incomplete ticks/boot id; the
+    // caller's observe() then reports it as unobservable.
+    set.managers.reserve(enumeration.starters.size());
+    for (pid_t starter : enumeration.starters) {
+        set.managers.push_back(read_process_identity(env.proc_root, boot_id, starter));
+    }
+    // Same coverage rule as scan(): an I/O/configuration failure is the only
+    // thing that makes a pass incomplete; unreadable starters are partial
+    // entries, counted by the caller's observe().
+    set.complete = true;
+    spdlog::debug("CondorJobWatcher: manager enumeration managers={} note={}",
+                  set.managers.size(),
+                  notes.empty() ? std::string("none") : notes.front());
+    return set;
+}
+
+inline std::optional<Job> CondorJobWatcher::observe(const ProcessIdentity& manager)
+{
+    if (!manager.complete()) return std::nullopt;
+    const auto env = discovery_environment();
+    const std::string boot_id = read_boot_id(env.proc_root);
+    // A reboot or a different proc root invalidates every saved identity.
+    if (boot_id != manager.boot_id) return std::nullopt;
+
+    // Exactly this starter: its own environ, ad and slot cgroup. No process
+    // table pass, no other manager's files.
+    auto job = observe_starter(env, boot_id, manager.pid, 0, nullptr);
+    if (!job) return std::nullopt;
+    // The starter that produced the Job must be the identity the caller asked
+    // for: a recycled pid (different start ticks) is not this execution.
+    if (job->execution.manager != manager) return std::nullopt;
+    return job;
 }
 
 inline SourceHealth CondorJobWatcher::health() const
@@ -598,23 +642,67 @@ inline std::vector<pid_t> CondorJobWatcher::collect_member_pids(
         members.clear();
     }
 
-    // No readable cgroup: fall back to the starter's live children so member
+    // No readable cgroup: fall back to the starter's own children so member
     // PIDs (and the job ad that usually lives on them) survive without cgroup
-    // v2. The enumeration cannot prove completeness, so consumers must treat
-    // the member list as partial (members_complete == false).
+    // v2. The read is per manager (/proc/<starter>/task/*/children), never a
+    // process-table pass: the unified update chain refreshes one record at a
+    // time, so a table pass here would be O(records x processes). The
+    // enumeration cannot prove completeness, so consumers must treat the member
+    // list as partial (membership_known == false); an empty read stays empty and
+    // is never widened into a table walk.
     if (!cgroup_path.empty())
         notes.push_back("cgroup membership unreadable: " + members_error);
-    for (pid_t pid : list_proc_pids(env.proc_root)) {
-        if (pid == starter_pid) continue;
-        const auto ppid = read_proc_ppid(env.proc_root, pid);
-        if (ppid && *ppid == starter_pid) members.push_back(pid);
-    }
-    std::sort(members.begin(), members.end());
+    members = read_proc_children(env.proc_root, starter_pid);
+    members.erase(std::remove(members.begin(), members.end(), starter_pid), members.end());
     if (!members.empty())
         notes.push_back(fmt::format(
             "cgroup unavailable; {} member pid(s) resolved from the starter's children",
             members.size()));
     return members;
+}
+
+inline CondorJobWatcher::StarterEnumeration CondorJobWatcher::enumerate_starters(
+    const DiscoveryEnvironment& env, std::vector<std::string>& notes) const
+{
+    StarterEnumeration enumeration;
+    // Tier 1: the slot cgroup subtree, when one is configured.
+    if (!options_.starter_cgroup_subtree.empty()) {
+        const std::string subtree_root =
+            (std::filesystem::path(env.cgroup_root) / options_.starter_cgroup_subtree)
+                .lexically_normal()
+                .string();
+        std::size_t slot_dirs = 0;
+        if (enumerate_starters_from_cgroup(env, subtree_root, slot_dirs,
+                                           enumeration.starters)) {
+            enumeration.candidates = slot_dirs;
+            notes.push_back(fmt::format(
+                "starters enumerated from cgroup subtree {}", subtree_root));
+            return enumeration;
+        }
+        notes.push_back(fmt::format(
+            "cgroup subtree unavailable/empty ({}); fell back to process-table scan",
+            subtree_root));
+    }
+
+    // Tier 2: the full process table. The cmdline holds the starter name; the
+    // unreadable entries are counted but never attributed.
+    for (pid_t pid : list_proc_pids(env.proc_root)) {
+        std::string cmdline;
+        std::string cmdline_error;
+        if (!read_proc_cmdline(env.proc_root, pid, cmdline, cmdline_error)) {
+            ++enumeration.skipped;
+            continue;
+        }
+        if (cmdline.find("condor_starter") != std::string::npos)
+            enumeration.starters.push_back(pid);
+    }
+    enumeration.candidates = enumeration.starters.size();
+    if (enumeration.skipped > 0) {
+        notes.push_back(fmt::format(
+            "{} process entries unreadable (permission denied or exited mid-scan); "
+            "they cannot be attributed to condor", enumeration.skipped));
+    }
+    return enumeration;
 }
 
 inline bool CondorJobWatcher::enumerate_starters_from_cgroup(

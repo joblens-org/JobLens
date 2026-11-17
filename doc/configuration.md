@@ -673,10 +673,9 @@ condor_job_watcher:
     - cpumem_collector
     - net_collector
     - io_collector
-  rules_prefix: condor_job_     # Prefix for Lua rule files (default: condor_job_)
 ```
 
-> **Note**: The `rules_dir` for Lua rules is read from `job_registry_config.rules_dir`, not from this section. Its default is `{JobLensRootDir}/../config/rules/condor_jobs` when `auto_add` is `rule` for Condor.
+> **Note**: The rule file prefix is the adapter name (`condor`): only `.lua` files whose basename starts with it are loaded, and `rules_prefix` is deprecated and ignored. Rules are loaded at **startup** (`auto_add: rule` arms the engine). `rules_dir` resolves from this section first, then the deprecated `job_registry_config.rules_dir`, then the default `{JobLensRootDir}/../config/rules/condor_jobs`. An empty directory or no prefix match logs a startup warning and selects no collectors for the type.
 
 | Key | Type | Default | Description | Source Reference |
 |-----|------|---------|-------------|------------------|
@@ -684,7 +683,8 @@ condor_job_watcher:
 | `auto_add_collectors` | string[] | none | The default collector list: armed verbatim for `auto_add: default`, and the fallback for an `auto_add: rule` accept that names no collectors | `condor_job_watcher.hpp:28` |
 | `auto_collect` | bool | `false` | Legacy mapping source: folds into `auto_add` when `auto_add` is absent | `inventory_config.cpp` |
 | `use_rules` | bool | `false` | Legacy mapping source: `auto_collect: true` + `use_rules: true` maps to `auto_add: rule` | `condor_job_watcher.hpp:29` |
-| `rules_prefix` | string | `"condor_job_"` | Prefix for rule files loaded by the rule engine | `condor_job_watcher.hpp:34` |
+| `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` | Rule directory; several types may share it safely thanks to the prefix | `inventory_config.cpp` |
+| `rules_prefix` | — | deprecated | The matching prefix is always the adapter name; a configured value is ignored with a warning | `inventory_config.cpp` |
 
 ### `slurm_job_watcher`
 
@@ -697,10 +697,9 @@ slurm_job_watcher:
     - cpumem_collector
     - net_collector
     - io_collector
-  rules_prefix: slurm_job_
 ```
 
-> **Note**: The `rules_dir` for Lua rules is read from `job_registry_config.rules_dir`, not from this section. Its default is `{JobLensRootDir}/../config/rules/slurm_jobs` when `auto_add` is `rule` for Slurm.
+> **Note**: The rule file prefix is the adapter name (`slurm`); `rules_prefix` is deprecated and ignored, and rules load at startup with `auto_add: rule`. `rules_dir` resolves from this section first, then the deprecated `job_registry_config.rules_dir`, then the default `{JobLensRootDir}/../config/rules/slurm_jobs`.
 
 | Key | Type | Default | Description | Source Reference |
 |-----|------|---------|-------------|------------------|
@@ -708,7 +707,8 @@ slurm_job_watcher:
 | `auto_add_collectors` | string[] | none | The default collector list: armed verbatim for `auto_add: default`, and the fallback for an `auto_add: rule` accept that names no collectors | `slurm_job_watcher.hpp:29` |
 | `auto_collect` | bool | `false` | Legacy mapping source: folds into `auto_add` when `auto_add` is absent | `inventory_config.cpp` |
 | `use_rules` | bool | `false` | Legacy mapping source: `auto_collect: true` + `use_rules: true` maps to `auto_add: rule` | `slurm_job_watcher.hpp:30` |
-| `rules_prefix` | string | `"slurm_job_"` | Prefix for rule files loaded by the rule engine | `slurm_job_watcher.hpp:35` |
+| `rules_dir` | string | `{JobLensRootDir}/../config/rules/slurm_jobs` | Rule directory | `inventory_config.cpp` |
+| `rules_prefix` | — | deprecated | The matching prefix is always the adapter name; a configured value is ignored with a warning | `inventory_config.cpp` |
 
 ---
 

@@ -616,10 +616,9 @@ condor_job_watcher:
     - cpumem_collector
     - net_collector
     - io_collector
-  rules_prefix: condor_job_     # Lua 规则文件前缀（默认：condor_job_）
 ```
 
-> **说明**：Lua 规则的 `rules_dir` 从 `job_registry_config.rules_dir` 读取，不在此节中。当 Condor 的 `auto_add` 为 `rule` 时，默认值为 `{JobLensRootDir}/../config/rules/condor_jobs`。
+> **说明**：规则文件的匹配前缀就是 adapter 名（Condor 为 `condor`），只有文件名以它开头的 `.lua` 才会被该类型加载；`rules_prefix` 键已废弃并被忽略。规则在**启动时**加载（`auto_add: rule` 才会武装规则引擎）。`rules_dir` 优先读本节，缺省时回退到已废弃的 `job_registry_config.rules_dir`，再缺省为 `{JobLensRootDir}/../config/rules/condor_jobs`。目录为空或没有匹配前缀的文件时，启动日志会给出 warning，该类型不会选任何采集器。
 
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
@@ -627,7 +626,8 @@ condor_job_watcher:
 | `auto_add_collectors` | string[] | 无 | 默认收集器列表：`auto_add: default` 时逐字武装；`auto_add: rule` 的裸接受以它回退 |
 | `auto_collect` | bool | `false` | 旧键映射来源：`auto_add` 缺省时折算入 `auto_add` |
 | `use_rules` | bool | `false` | 旧键映射来源：`auto_collect: true` + `use_rules: true` 折算为 `auto_add: rule` |
-| `rules_prefix` | string | `"condor_job_"` | 规则引擎加载的规则文件前缀 |
+| `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` | 规则目录；支持多个类型共享，前缀保证互不串味 |
+| `rules_prefix` | — | 已废弃 | 匹配前缀固定为 adapter 名，配置值被忽略并告警 |
 
 ### `slurm_job_watcher`
 
@@ -640,10 +640,9 @@ slurm_job_watcher:
     - cpumem_collector
     - net_collector
     - io_collector
-  rules_prefix: slurm_job_
 ```
 
-> **说明**：Lua 规则的 `rules_dir` 从 `job_registry_config.rules_dir` 读取，不在此节中。当 Slurm 的 `auto_add` 为 `rule` 时，默认值为 `{JobLensRootDir}/../config/rules/slurm_jobs`。
+> **说明**：规则文件的匹配前缀就是 adapter 名（Slurm 为 `slurm`），`rules_prefix` 键已废弃并被忽略；规则在启动时随 `auto_add: rule` 一起加载。`rules_dir` 优先读本节，缺省时回退到已废弃的 `job_registry_config.rules_dir`，再缺省为 `{JobLensRootDir}/../config/rules/slurm_jobs`。
 
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
@@ -651,7 +650,8 @@ slurm_job_watcher:
 | `auto_add_collectors` | string[] | 无 | 默认收集器列表：`auto_add: default` 时逐字武装；`auto_add: rule` 的裸接受以它回退 |
 | `auto_collect` | bool | `false` | 旧键映射来源：`auto_add` 缺省时折算入 `auto_add` |
 | `use_rules` | bool | `false` | 旧键映射来源：`auto_collect: true` + `use_rules: true` 折算为 `auto_add: rule` |
-| `rules_prefix` | string | `"slurm_job_"` | 规则引擎加载的规则文件前缀 |
+| `rules_dir` | string | `{JobLensRootDir}/../config/rules/slurm_jobs` | 规则目录 |
+| `rules_prefix` | — | 已废弃 | 匹配前缀固定为 adapter 名，配置值被忽略并告警 |
 
 ---
 

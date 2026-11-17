@@ -30,11 +30,16 @@
  */
 #include "core/job_identity.hpp"
 #include "core/job_discovery.hpp"
+#include "core/liveness.hpp"
+#include "core/scheduler_adapter.hpp"
 #include "common/procfs.hpp"
+#include "job_watcher/condor_adapter.hpp"
 #include "job_watcher/condor_job_watcher.hpp"
+#include "job_watcher/slurm_adapter.hpp"
 #include "job_watcher/slurm_job_watcher.hpp"
 #include "common/config.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -113,6 +118,16 @@ void make_cgroup(const fs::path& cgroup_root, const std::string& relative,
     std::string content;
     for (pid_t pid : pids) content += std::to_string(pid) + "\n";
     write_file(cgroup_root / fs::path(relative).relative_path() / "cgroup.procs", content);
+}
+
+// The kernel's per-task children file: without a job-scoped cgroup this is the
+// only membership source the adapters may read (never a process-table pass).
+void make_children(const fs::path& proc_root, pid_t pid, const std::vector<pid_t>& children)
+{
+    std::string content;
+    for (pid_t child : children) content += std::to_string(child) + " ";
+    write_file(proc_root / std::to_string(pid) / "task" / std::to_string(pid) / "children",
+               content);
 }
 
 // Fixture layout mirrors real discovery inputs:
@@ -247,6 +262,33 @@ std::vector<pid_t> member_pids(const Job& job)
     std::vector<pid_t> pids;
     for (const auto& member : job.execution.members) pids.push_back(member.pid);
     return pids;
+}
+
+// Managers of the published jobs, in the scan's order.
+std::vector<ProcessIdentity> scanned_managers(const ScanResult& result)
+{
+    std::vector<ProcessIdentity> managers;
+    managers.reserve(result.jobs.size());
+    for (const auto& job : result.jobs) managers.push_back(job.execution.manager);
+    return managers;
+}
+
+// Deterministic comparison order: the enumeration's order is not part of the
+// contract, the (pid, start ticks, boot id) set is.
+void sort_managers(std::vector<ProcessIdentity>& managers)
+{
+    std::sort(managers.begin(), managers.end(),
+              [](const ProcessIdentity& lhs, const ProcessIdentity& rhs) {
+                  if (lhs.pid != rhs.pid) return lhs.pid < rhs.pid;
+                  if (lhs.start_ticks != rhs.start_ticks)
+                      return lhs.start_ticks < rhs.start_ticks;
+                  return lhs.boot_id < rhs.boot_id;
+              });
+}
+
+bool contains_manager(const ManagerSet& set, const ProcessIdentity& manager)
+{
+    return std::find(set.managers.begin(), set.managers.end(), manager) != set.managers.end();
 }
 
 bool contains(const std::string& haystack, const std::string& needle)
@@ -413,6 +455,8 @@ void slurm_scan_finds_fixture_job(const Fixture& fixture)
     const auto members = member_pids(*job);
     check(members.size() == 2 && members[0] == 5110 && members[1] == 5111,
           "members are the step processes without slurmstepd");
+    check(job->execution.members_authoritative,
+          "a readable step cgroup must make the member set authoritative");
     check(slurm_attr.user == "alice" && slurm_attr.job_name == "demo" &&
               slurm_attr.partition == "debug",
           "scheduler metadata must come from the members' environment");
@@ -612,6 +656,215 @@ void lifecycle_is_safe(const Fixture& fixture)
 }
 
 // ---------------------------------------------------------------------------
+// Adapter fact refresh: the per-record reader the unified update chain uses.
+// managerOfPid names the framework supervisor of one job pid; refreshFacts
+// refreshes one record in place (facts + execution evidence) and reports what
+// the CALLER's probes saw, so the registry keeps deciding retirement.
+// ---------------------------------------------------------------------------
+
+// One Condor record as the registry holds it: typed facts, a member identity
+// and no manager yet — refreshFacts must recover the manager from the member.
+Job condor_refresh_record(const Fixture& fixture)
+{
+    Job job;
+    job.subtype = JobSubType::Condor;
+    job.subtype_name = "condor";
+    job.NativeJobID = "76226337.0";
+    job.cluster_name = "htcondor-fixture";
+    CondorJobAttr attr;
+    attr.slots_cgroup_path = (fixture.cgroup / "htcondor" / "slot1").string();
+    job.sub_attr = attr;
+    job.execution.members = {ProcessIdentity{4110, 7010, "boot-fixture-0001"}};
+    return job;
+}
+
+// A process probe that records what it was asked and reports the fixture
+// manager as gone: the adapter must consume the answer, not re-probe.
+ProcessLivenessProbe recording_probe(std::vector<pid_t>& asked, pid_t dead_pid)
+{
+    return [&asked, dead_pid](const ProcessIdentity& identity) -> LivenessResult {
+        asked.push_back(identity.pid);
+        if (identity.pid == dead_pid)
+            return LivenessResult{LivenessState::Dead, "fixture: manager ended"};
+        return LivenessResult{LivenessState::Alive, "fixture: process live"};
+    };
+}
+
+void condor_adapter_refresh_evidence(const Fixture& fixture)
+{
+    CondorSchedulerAdapter adapter(InventoryTypeSettings{});
+    auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
+    check(watcher != nullptr,
+          "the condor adapter must expose its watcher through source()");
+    watcher->set_discovery_environment(fixture_options(fixture).discovery);
+
+    // managerOfPid: the starter that launched the job process.
+    const auto manager = adapter.managerOfPid(4110);
+    check(manager.has_value(), "a condor job process must resolve its starter");
+    check(manager->pid == 4101 && manager->start_ticks == 7001,
+          "the manager identity must be the parent's pid and start ticks");
+    check(manager->boot_id == "boot-fixture-0001",
+          "the manager identity must carry the fixture boot id");
+    check(manager->complete(), "a resolved manager must be a complete identity");
+    check(!adapter.managerOfPid(4101).has_value(),
+          "a pid whose parent is not a condor_starter must not resolve");
+    check(!adapter.managerOfPid(9999).has_value(), "an absent pid must not resolve");
+
+    Job job = condor_refresh_record(fixture);
+    std::vector<pid_t> asked;
+    const ProcessLivenessProbe process_probe = recording_probe(asked, 4101);
+    const RefreshResult result =
+        adapter.refreshFacts(job, process_probe, make_cgroup_membership_probe());
+
+    check(job.execution.read_order > 0, "refreshFacts must assign a read order");
+    check(job.execution.manager.pid == 4101 && job.execution.manager.start_ticks == 7001 &&
+              job.execution.manager.boot_id == "boot-fixture-0001",
+          "refreshFacts must resolve the manager from a member pid");
+    check(job.execution.manager.complete(),
+          "a refresh whose manager is resolvable must leave a complete generation");
+    check(job.NativeJobID == "76226337.0",
+          "a targeted refresh must keep the record's native id, got " + job.NativeJobID);
+    check(job.clusterTag.empty() && job.cluster_name == "htcondor-fixture",
+          "a refresh must not rewrite the record's creation namespace, got '" +
+              job.clusterTag + "'");
+    const auto members = member_pids(job);
+    check(members.size() == 2 && members[0] == 4110 && members[1] == 4111,
+          "refreshFacts must refresh the member set from the slot cgroup");
+    check(job.execution.members[0].start_ticks == 7010 &&
+              job.execution.members[0].boot_id == "boot-fixture-0001",
+          "member evidence must carry the full process triple");
+    check(job.execution.members_authoritative,
+          "a readable slot cgroup makes the member list authoritative");
+
+    check(result.manager == LivenessState::Dead,
+          "the injected process probe must decide manager liveness");
+    check(!asked.empty() && asked.front() == 4101,
+          "the injected probe must be asked about the manager first");
+    check(result.any_member_live, "a live member process must be reported");
+    check(!result.member_inconclusive,
+          "the fixture probe answers every member, so none is inconclusive");
+    check(!result.cgroup_empty_confirmed,
+          "a non-empty execution cgroup is not confirmed empty");
+
+    // The cgroup probe is the caller's too: a readable but empty cgroup is the
+    // positive termination evidence the retirement rule needs.
+    const CgroupMembershipProbe empty_cgroup = [](const std::string&) {
+        CgroupMembership membership;
+        membership.readable = true;
+        return membership;
+    };
+    const RefreshResult empty = adapter.refreshFacts(job, process_probe, empty_cgroup);
+    check(empty.cgroup_empty_confirmed,
+          "a readable empty execution cgroup must be reported as confirmed empty");
+
+    // A record with no resolvable manager and no cgroup path reports an
+    // Unknown manager: unresolved is never death evidence.
+    Job orphan;
+    orphan.subtype = JobSubType::Condor;
+    orphan.subtype_name = "condor";
+    orphan.sub_attr = CondorJobAttr{};
+    orphan.execution.members = {ProcessIdentity{9999, 0, {}}};
+    const RefreshResult unresolved =
+        adapter.refreshFacts(orphan, process_probe, make_cgroup_membership_probe());
+    check(unresolved.manager == LivenessState::Unknown,
+          "a record without a manager identity must report Unknown, not Dead");
+    check(!unresolved.cgroup_empty_confirmed,
+          "a record without a cgroup path cannot confirm an empty cgroup");
+}
+
+void slurm_adapter_refresh_evidence(const Fixture& fixture)
+{
+    SlurmSchedulerAdapter adapter(InventoryTypeSettings{});
+    auto* watcher = dynamic_cast<SlurmJobWatcher*>(&adapter.source());
+    check(watcher != nullptr, "the slurm adapter must expose its watcher through source()");
+    watcher->set_discovery_environment(fixture_options(fixture, "").discovery);
+
+    // The per-job manager is slurmstepd, never slurmd.
+    const auto manager = adapter.managerOfPid(5110);
+    check(manager.has_value(), "a slurm job process must resolve its step daemon");
+    check(manager->pid == 5101 && manager->start_ticks == 8001,
+          "the manager identity must be the stepd's pid and start ticks");
+    check(manager->boot_id == "boot-fixture-0001",
+          "the manager identity must carry the fixture boot id");
+    check(!adapter.managerOfPid(5101).has_value(),
+          "a pid whose parent is not a slurmstepd must not resolve");
+
+    Job job;
+    job.subtype = JobSubType::Slurm;
+    job.subtype_name = "slurm";
+    job.NativeJobID = "9002";
+    SlurmJobAttr attr;
+    attr.job_id = 9002;
+    attr.step_id = 3;
+    attr.cluster_name = "slurm-fixture";
+    attr.cgroup_path = (fixture.cgroup / "slurm" / "job_9002" / "step_3").string();
+    job.sub_attr = attr;
+    job.execution.members = {ProcessIdentity{5110, 8010, "boot-fixture-0001"}};
+
+    std::vector<pid_t> asked;
+    const ProcessLivenessProbe process_probe = recording_probe(asked, 5101);
+    const RefreshResult result =
+        adapter.refreshFacts(job, process_probe, make_cgroup_membership_probe());
+
+    check(job.execution.read_order > 0,
+          "the slurm refresh must assign a read order");
+    check(job.execution.manager.pid == 5101 && job.execution.manager.complete(),
+          "the slurm refresh must resolve the stepd from a member pid");
+    check(job.NativeJobID == "9002" && std::get<SlurmJobAttr>(job.sub_attr).step_id == 3,
+          "the targeted refresh must keep job and step identity");
+    const auto members = member_pids(job);
+    check(members.size() == 2 && members[0] == 5110 && members[1] == 5111,
+          "the step cgroup members must be the refreshed member set");
+    check(result.manager == LivenessState::Dead,
+          "the injected probe must decide the stepd's liveness");
+    check(result.any_member_live, "a live step member must be reported");
+}
+
+// Without a readable cgroup the refresh reads the manager's own children file
+// (/proc/<pid>/task/<tid>/children) instead of walking the process table: one
+// execution with an unreadable ad still keeps a correct member set.
+// Registered last: it extends the shared fixture with its own processes.
+void condor_refresh_without_cgroup_reads_children(const Fixture& fixture)
+{
+    make_process(fixture.proc, 4601, "condor_starter", 1, 7301, {}, "/");
+    make_process(fixture.proc, 4610, "sleep", 4601, 7310, {{}}, "/");
+    // The kernel's per-task children file is the only membership source here.
+    write_file(fixture.proc / "4601" / "task" / "4601" / "children", "4610\n");
+
+    CondorSchedulerAdapter adapter(InventoryTypeSettings{});
+    auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
+    check(watcher != nullptr, "the condor adapter must expose its watcher");
+    watcher->set_discovery_environment(fixture_options(fixture).discovery);
+
+    Job job;
+    job.subtype = JobSubType::Condor;
+    job.subtype_name = "condor";
+    // A recorded cgroup that cannot be read: the refresh must fall back to the
+    // manager's children rather than the process table.
+    CondorJobAttr attr;
+    attr.slots_cgroup_path = (fixture.root / "no-such-cgroup").string();
+    job.sub_attr = attr;
+    job.execution.members = {ProcessIdentity{4610, 7310, "boot-fixture-0001"}};
+
+    std::vector<pid_t> asked;
+    const RefreshResult result = adapter.refreshFacts(
+        job, recording_probe(asked, 4601), make_cgroup_membership_probe());
+
+    check(job.execution.manager.pid == 4601 && job.execution.manager.start_ticks == 7301,
+          "the manager must be resolved from the member's parent");
+    const auto members = member_pids(job);
+    check(members.size() == 1 && members[0] == 4610,
+          "the manager's children must be the refreshed member set");
+    check(!job.execution.members_authoritative,
+          "a children-only read cannot claim an authoritative member list");
+    check(result.manager == LivenessState::Dead,
+          "the caller's probe must decide the manager's liveness");
+    check(!result.cgroup_empty_confirmed,
+          "an unreadable cgroup is never reported as confirmed empty");
+}
+
+
+// ---------------------------------------------------------------------------
 // Regression: the classic HTCondor layout where _CONDOR_JOB_AD lives on the
 // job child process, not on the starter (the old exec-event watcher read it
 // there). The scan path and the exec-hint path must both still find it.
@@ -655,9 +908,11 @@ void condor_without_cgroup_still_resolves_members(const Fixture& fixture)
 {
     // Starter with the ad in its own environment but no usable cgroup
     // ("0::/" resolves to no execution cgroup). Members must still be
-    // discovered through the starter's children, flagged as partial. The
-    // cgroup-subtree tier cannot see this starter (no slot directory lists
-    // it), so this case pins the full process-table path: subtree off.
+    // discovered through the starter's own children file
+    // (/proc/<pid>/task/<tid>/children), flagged as partial — a per-manager
+    // read, never a process-table pass. The cgroup-subtree tier cannot see this
+    // starter (no slot directory lists it), so the case pins the subtree-off
+    // path.
     const auto ad = fixture.ads / "76226341.0.ad";
     write_file(ad,
                "GlobalJobId = \"scheduler@schedd07.fixture#76226341.0#1775723895\"\n"
@@ -668,6 +923,8 @@ void condor_without_cgroup_still_resolves_members(const Fixture& fixture)
                  {{"_CONDOR_JOB_AD", ad.string()}}, "/");
     make_process(fixture.proc, 4510, "sleep", 4501, 7210, {{}}, "/");
     make_process(fixture.proc, 4511, "sleep", 4501, 7211, {{}}, "/");
+    // No cgroup: the children file is the only membership evidence available.
+    make_children(fixture.proc, 4501, {4510, 4511});
 
     auto options = fixture_options(fixture);
     options.starter_cgroup_subtree.clear();   // this layout predates slot cgroups
@@ -739,6 +996,266 @@ void condor_cgroup_subtree_without_starters_falls_back(const Fixture& fixture)
 }
 
 
+// ---------------------------------------------------------------------------
+// Unified discovery: enumerateManagers() / observe()
+//
+// A discovery pass enumerates the managers cheaply and observes only the ones
+// it does not track yet. The manager set must be exactly the set the scan saw,
+// and observing one manager must reproduce that manager's Job without reading
+// any other execution.
+// ---------------------------------------------------------------------------
+
+void condor_enumerate_managers_covers_scan(const Fixture& fixture)
+{
+    std::int64_t now_ms = kFakeNowMs;
+    auto options = fixture_options(fixture);
+    options.clock = [&now_ms] { return now_ms; };
+    CondorJobWatcher watcher(options);
+    const auto scanned = watcher.scan();
+    check(scanned.ok(), "the scan must succeed: " + scanned.error);
+    const auto enumerated = watcher.enumerateManagers();
+    check(enumerated.error.empty(), "manager enumeration must succeed: " + enumerated.error);
+    check(enumerated.complete == scanned.complete,
+          "the manager pass must report the same coverage as the scan");
+    for (const auto& job : scanned.jobs) {
+        check(contains_manager(enumerated, job.execution.manager),
+              "every published job's manager must be enumerated");
+    }
+
+    // An enumeration is a pass: it consumes the pending rescan request and
+    // records its own start time, while leaving the full-scan health state to
+    // scan(). Without this the heartbeat would see rescanRequested() forever and
+    // force a full scan on every tick.
+    const auto state_before = watcher.health().state;
+    now_ms += 1000;
+    watcher.requestRescan();
+    check(watcher.health().rescan_requested,
+          "a rescan request must be visible before the pass");
+    const auto refreshed = watcher.enumerateManagers();
+    const auto health_after = watcher.health();
+    check(refreshed.error.empty(), "the second enumeration must succeed: " + refreshed.error);
+    check(!health_after.rescan_requested,
+          "enumerateManagers() must consume the pending rescan request");
+    check(health_after.last_scan_start_ms == now_ms,
+          "an enumeration must record its own pass start time");
+    check(health_after.state == state_before,
+          "an enumeration must not claim a full-scan health state");
+}
+
+void slurm_enumerate_managers_covers_scan(const Fixture& fixture)
+{
+    std::int64_t now_ms = kFakeNowMs;
+    auto options = fixture_options(fixture, "");
+    options.discovery.slurm_spool_dir = fixture.slurmd.string();
+    options.clock = [&now_ms] { return now_ms; };
+    SlurmJobWatcher watcher(options);
+    const auto scanned = watcher.scan();
+    check(scanned.ok(), "the scan must succeed: " + scanned.error);
+    const auto enumerated = watcher.enumerateManagers();
+    check(enumerated.error.empty(), "manager enumeration must succeed: " + enumerated.error);
+    check(enumerated.complete == scanned.complete,
+          "the manager pass must report the same coverage as the scan");
+    for (const auto& job : scanned.jobs) {
+        check(contains_manager(enumerated, job.execution.manager),
+              "every published job's manager must be enumerated");
+    }
+
+    // Same contract as Condor: the enumeration pass consumes the rescan
+    // request and stamps its start time without touching the health state.
+    const auto state_before = watcher.health().state;
+    now_ms += 1000;
+    watcher.requestRescan();
+    check(watcher.health().rescan_requested,
+          "a rescan request must be visible before the pass");
+    const auto refreshed = watcher.enumerateManagers();
+    const auto health_after = watcher.health();
+    check(refreshed.error.empty(), "the second enumeration must succeed: " + refreshed.error);
+    check(!health_after.rescan_requested,
+          "enumerateManagers() must consume the pending rescan request");
+    check(health_after.last_scan_start_ms == now_ms,
+          "an enumeration must record its own pass start time");
+    check(health_after.state == state_before,
+          "an enumeration must not claim a full-scan health state");
+}
+
+void condor_enumerate_managers_matches_scan(const Fixture& /*shared*/)
+{
+    // A closed-set comparison needs every manager to publish a Job. The shared
+    // fixture deliberately keeps two of its three starters incomplete (missing
+    // ad, ad without GlobalJobId), so this case uses its own tree: same layout,
+    // with a readable ad for each starter.
+    Fixture fixture;
+    make_fixture(fixture, "/tmp/job_watcher_scan_managers");
+    write_file(fixture.missing_ad,
+               "GlobalJobId = \"scheduler@schedd07.fixture#76226338.0#1775723895\"\n"
+               "Owner = \"bob\"\n");
+    write_file(fixture.ad_without_global_job_id,
+               "GlobalJobId = \"scheduler@schedd07.fixture#76226339.0#1775723895\"\n"
+               "Owner = \"carol\"\n");
+
+    CondorJobWatcher watcher(fixture_options(fixture));
+    const auto scanned = watcher.scan();
+    check(scanned.ok(), "the scan must succeed: " + scanned.error);
+    check(scanned.jobs.size() == 3,
+          "all three starters must publish now, got " + std::to_string(scanned.jobs.size()));
+
+    const auto enumerated = watcher.enumerateManagers();
+    check(enumerated.error.empty(), "manager enumeration must succeed: " + enumerated.error);
+    check(enumerated.complete == scanned.complete,
+          "the manager pass must report the same coverage as the scan");
+
+    auto scanned_set = scanned_managers(scanned);
+    auto enumerated_set = enumerated.managers;
+    sort_managers(scanned_set);
+    sort_managers(enumerated_set);
+    check(enumerated_set.size() == scanned_set.size(),
+          "one manager per published job, got " + std::to_string(enumerated_set.size()) +
+              " for " + std::to_string(scanned_set.size()) + " jobs");
+    for (std::size_t index = 0; index < enumerated_set.size(); ++index) {
+        check(enumerated_set[index] == scanned_set[index],
+              "the enumerated manager set must equal the scan's manager set");
+        check(enumerated_set[index].complete(),
+              "an enumerated manager must carry the full identity triple");
+    }
+
+    // observe() must reproduce that manager's Job: same native identity, same
+    // manager, same member set.
+    const auto* scanned_job = find_complete(scanned, "76226337.0");
+    check(scanned_job != nullptr, "the fixture Condor job must be a complete discovery");
+    const auto observed = watcher.observe(scanned_job->execution.manager);
+    check(observed.has_value(), "observing a live manager must return its Job");
+    check(observed->NativeJobID == scanned_job->NativeJobID,
+          "observe() must name the same native job, got " + observed->NativeJobID);
+    check(observed->execution.manager == scanned_job->execution.manager,
+          "observe() must keep the manager identity triple");
+    check(member_pids(*observed) == member_pids(*scanned_job),
+          "observe() must reproduce the manager's member set");
+
+    // A manager the pass never reported is not observable: a stale start-tick
+    // value and an unknown pid must both yield nullopt, never a Job.
+    ProcessIdentity stale = scanned_job->execution.manager;
+    stale.start_ticks += 1;
+    check(!watcher.observe(stale).has_value(),
+          "a manager with mismatching start ticks must not be observed");
+    ProcessIdentity unknown;
+    unknown.pid = 999999;
+    unknown.start_ticks = 1;
+    unknown.boot_id = scanned_job->execution.manager.boot_id;
+    check(!watcher.observe(unknown).has_value(),
+          "an unknown manager must not be observed");
+}
+
+void slurm_enumerate_managers_matches_scan(const Fixture& /*shared*/)
+{
+    // Same closed-set requirement as the Condor case: give the fixture's second
+    // stepd an attributable member so both managers publish.
+    Fixture fixture;
+    make_fixture(fixture, "/tmp/job_watcher_scan_slurm_managers");
+    make_process(fixture.proc, 5210, "sleep", 5201, 8110,
+                 {{"SLURM_JOB_ID", "9003"},
+                  {"SLURM_STEP_ID", "1"},
+                  {"SLURM_CLUSTER_NAME", "slurm-fixture"}},
+                 "/slurm/job_9003/step_1");
+    make_cgroup(fixture.cgroup, "/slurm/job_9003/step_1", {5201, 5210});
+
+    auto options = fixture_options(fixture, "");
+    options.discovery.slurm_spool_dir = fixture.slurmd.string();
+    SlurmJobWatcher watcher(options);
+    const auto scanned = watcher.scan();
+    check(scanned.ok(), "the scan must succeed: " + scanned.error);
+    check(scanned.jobs.size() == 2,
+          "both stepds must publish now, got " + std::to_string(scanned.jobs.size()));
+
+    const auto enumerated = watcher.enumerateManagers();
+    check(enumerated.error.empty(), "manager enumeration must succeed: " + enumerated.error);
+    check(enumerated.complete == scanned.complete,
+          "the manager pass must report the same coverage as the scan");
+
+    auto scanned_set = scanned_managers(scanned);
+    auto enumerated_set = enumerated.managers;
+    sort_managers(scanned_set);
+    sort_managers(enumerated_set);
+    check(enumerated_set.size() == scanned_set.size(),
+          "one manager per published job, got " + std::to_string(enumerated_set.size()));
+    for (std::size_t index = 0; index < enumerated_set.size(); ++index) {
+        check(enumerated_set[index] == scanned_set[index],
+              "the enumerated manager set must equal the scan's manager set");
+        check(enumerated_set[index].complete(),
+              "an enumerated manager must carry the full identity triple");
+    }
+
+    // One observe() per manager, each reproducing its own Job.
+    for (const auto& manager : enumerated.managers) {
+        const auto observed = watcher.observe(manager);
+        check(observed.has_value(), "observing a live stepd must return its Job");
+        bool matched = false;
+        for (const auto& job : scanned.jobs) {
+            if (job.execution.manager != manager) continue;
+            matched = true;
+            check(observed->NativeJobID == job.NativeJobID,
+                  "observe() must name the same native job");
+            check(member_pids(*observed) == member_pids(job),
+                  "observe() must reproduce the stepd's member set");
+        }
+        check(matched, "every enumerated manager must own a published job");
+    }
+
+    // A stale or unknown manager must yield nullopt, never a Job.
+    ProcessIdentity stale = enumerated.managers.front();
+    stale.start_ticks += 1;
+    check(!watcher.observe(stale).has_value(),
+          "a manager with mismatching start ticks must not be observed");
+    ProcessIdentity unknown;
+    unknown.pid = 999999;
+    unknown.start_ticks = 1;
+    unknown.boot_id = enumerated.managers.front().boot_id;
+    check(!watcher.observe(unknown).has_value(),
+          "an unknown manager must not be observed");
+}
+
+void slurm_empty_cgroup_stays_authoritative(const Fixture& /*shared*/)
+{
+    // A readable step cgroup answers for the execution scope even when it lists
+    // no process: an empty member set is positive evidence ("nothing runs in
+    // this scope"), unlike an unreadable cgroup, which stays partial. This is
+    // what lets the unified update chain clear members on an authoritative
+    // empty list.
+    Fixture fixture;
+    make_fixture(fixture, "/tmp/job_watcher_scan_empty_cgroup");
+    make_process(fixture.proc, 5301, "slurmstepd", 1, 8201, {{"SLURM_VERSION", "24.05"}},
+                 "/slurm/job_9004/step_2");
+    make_process(fixture.proc, 5310, "sleep", 5301, 8210,
+                 {{"SLURM_JOB_ID", "9004"},
+                  {"SLURM_STEP_ID", "2"},
+                  {"SLURM_CLUSTER_NAME", "slurm-fixture"}},
+                 "/slurm/job_9004/step_2");
+    make_children(fixture.proc, 5301, {5310});
+    // Readable and empty: no process in the step scope.
+    make_cgroup(fixture.cgroup, "/slurm/job_9004/step_2", {});
+
+    auto options = fixture_options(fixture, "");
+    SlurmJobWatcher watcher(options);
+    const auto result = watcher.scan();
+    check(result.ok(), "the scan must succeed: " + result.error);
+    const auto* job = find_complete(result, "9004");
+    check(job != nullptr, "the stepd must still publish from its children");
+    check(job->execution.members_authoritative,
+          "a readable empty step cgroup must stay authoritative (an empty set is evidence)");
+    const auto members = member_pids(*job);
+    check(members.size() == 1 && members[0] == 5310,
+          "the children list still supplies the member pid");
+
+    // The unreadable counterpart must stay partial: the same execution with the
+    // cgroup file removed cannot claim a confirmed member set.
+    fs::remove(fixture.cgroup / "slurm" / "job_9004" / "step_2" / "cgroup.procs");
+    const auto unreadable = watcher.scan();
+    check(unreadable.ok(), "the scan must survive an unreadable cgroup: " + unreadable.error);
+    const auto* partial = find_complete(unreadable, "9004");
+    check(partial != nullptr, "the stepd must still publish from its children");
+    check(!partial->execution.members_authoritative,
+          "an unreadable step cgroup must not claim an authoritative member set");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -766,6 +1283,8 @@ int main(int argc, char** argv)
             {"observe_hint_targets_one_execution", observe_hint_targets_one_execution},
             {"polymorphic_source_interface", polymorphic_source_interface},
             {"lifecycle_is_safe", lifecycle_is_safe},
+            {"condor_adapter_refresh_evidence", condor_adapter_refresh_evidence},
+            {"slurm_adapter_refresh_evidence", slurm_adapter_refresh_evidence},
             // Regressions appended last: they extend the shared fixture with
             // extra processes and would change the counts the cases above
             // assert.
@@ -776,6 +1295,17 @@ int main(int argc, char** argv)
              condor_cgroup_subtree_missing_falls_back},
             {"condor_cgroup_subtree_without_starters_falls_back",
              condor_cgroup_subtree_without_starters_falls_back},
+            // Unified discovery (enumerateManagers/observe), appended last for
+            // the same fixture-mutation reason.
+            {"condor_enumerate_managers_covers_scan", condor_enumerate_managers_covers_scan},
+            {"slurm_enumerate_managers_covers_scan", slurm_enumerate_managers_covers_scan},
+            {"condor_enumerate_managers_matches_scan", condor_enumerate_managers_matches_scan},
+            {"slurm_enumerate_managers_matches_scan", slurm_enumerate_managers_matches_scan},
+            {"slurm_empty_cgroup_stays_authoritative", slurm_empty_cgroup_stays_authoritative},
+            // Fact refresh without a readable cgroup, appended last: it adds
+            // its own starter/child pair to the shared fixture.
+            {"condor_refresh_without_cgroup_reads_children",
+             condor_refresh_without_cgroup_reads_children},
         };
 
         for (const auto& test : tests) {

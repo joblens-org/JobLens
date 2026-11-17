@@ -604,6 +604,47 @@ void run(const std::string& base)
         const auto none = broken.select(job, revision, error);
         check(!none.accepted && none.collectors.empty(),
               "auto policy: a rules policy with no rules selects nothing");
+
+        // Startup load: only files whose basename starts with the adapter name
+        // belong to that engine, and load() does the work now instead of
+        // deferring it to the first select().
+        std::filesystem::create_directories(rules_root / "prefix_split");
+        {
+            std::ofstream condor_rule(rules_root / "prefix_split" / "condor_accept.lua");
+            condor_rule << "local rule = {}\n"
+                           "rule.name = \"condor_accept\"\n"
+                           "rule.priority = 10\n"
+                           "function rule.condition(job)\n"
+                           "    return true, \"cpumem_collector\"\n"
+                           "end\n"
+                           "return rule\n";
+            std::ofstream slurm_rule(rules_root / "prefix_split" / "slurm_accept.lua");
+            slurm_rule << "local rule = {}\n"
+                          "rule.name = \"slurm_accept\"\n"
+                          "rule.priority = 10\n"
+                          "function rule.condition(job)\n"
+                          "    return true, \"io_collector\"\n"
+                          "end\n"
+                          "return rule\n";
+        }
+        auto split = AutoCollectorPolicy::rules(
+            (rules_root / "prefix_split").string(), "condor");
+        std::string load_error;
+        check(split.load(load_error) == 1 && load_error.empty(),
+              "auto policy: startup load must count only files matching the adapter prefix");
+        const auto split_selected = split.select(job, revision, error);
+        check(error.empty() && split_selected.accepted &&
+                  split_selected.collectors.size() == 1 &&
+                  split_selected.collectors.front() == "cpumem_collector",
+              "auto policy: a foreign prefix must not feed this engine");
+
+        auto empty = AutoCollectorPolicy::rules(
+            (rules_root / "empty_rules").string(), "condor");
+        check(empty.load(load_error) == 0 && load_error.empty(),
+              "auto policy: an empty rules directory loads zero rules without error");
+        const auto empty_selected = empty.select(job, revision, error);
+        check(error.empty() && !empty_selected.accepted,
+              "auto policy: zero rules means no rule accepts (no error)");
     }
 
     // /facts durable but the initial intent write failed. The result

@@ -16,6 +16,8 @@
 // This header is the boundary between the scheduler discovery adapters
 // (CondorJobWatcher, SlurmJobWatcher) and the registry heartbeat:
 //
+//   * enumerateManagers() - cheap pass: the live per-job managers only
+//   * observe(manager)    - O(job) targeted pass for one known manager
 //   * scan()      - one synchronous source pass, returns ScanResult
 //   * health()    - SourceHealth of that source (initializing/healthy/degraded)
 //   * observeForHint(pid) - O(job) targeted pass for one exec-event pid
@@ -43,6 +45,7 @@
 #include "core/job_identity.hpp"
 #include "core/registration_contract.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -129,6 +132,26 @@ struct ScanResult {
     std::int64_t finished_at_ms = 0;
 
     bool ok() const { return error.empty(); }
+};
+
+// ---------------------------------------------------------------------------
+// Manager enumeration
+// ---------------------------------------------------------------------------
+
+// One discovery pass' manager inputs: the processes that supervise exactly one
+// execution of this scheduler (Condor: condor_starter; Slurm: slurmstepd).
+// Deliberately carries no Job: reading ads, environments and member sets is the
+// per-manager observe() step, so a pass can decide what is new before paying
+// for any of it.
+struct ManagerSet {
+    std::vector<ProcessIdentity> managers;
+    // True when the pass covered its inputs without an I/O or configuration
+    // error — the same semantics as ScanResult::complete. An individually
+    // unreadable manager (start ticks or boot id missing) is a partial entry,
+    // not an incomplete pass. Consumers must never read absence out of a
+    // ManagerSet with complete=false.
+    bool complete = false;
+    std::string error;
 };
 
 // ---------------------------------------------------------------------------
@@ -222,6 +245,52 @@ public:
     virtual void stop() = 0;
     // One synchronous authoritative source pass.
     virtual ScanResult scan() = 0;
+
+    // Cheap manager enumeration for the discovery pass: one entry per live
+    // per-job manager, with no job ad and no member reads. Called every pass;
+    // the caller then pays observe() only for managers it does not track.
+    //
+    // The default below is a compatibility bridge for sources that implement
+    // scan() only: it derives the set from a full scan. Production watchers
+    // MUST override it with a cheap implementation — otherwise every pass pays
+    // a complete scan plus one targeted read per unknown manager.
+    virtual ManagerSet enumerateManagers()
+    {
+        ManagerSet set;
+        const ScanResult scanned = scan();
+        set.complete = scanned.complete;
+        set.error = scanned.error;
+        // Deduplicated by the full triple: one manager can only appear once in
+        // a source pass, but the derived view must not depend on that.
+        for (const auto& job : scanned.jobs) {
+            const ProcessIdentity& manager = job.execution.manager;
+            if (!manager.complete()) continue;
+            if (std::find(set.managers.begin(), set.managers.end(), manager) ==
+                set.managers.end()) {
+                set.managers.push_back(manager);
+            }
+        }
+        return set;
+    }
+
+    // The complete Job for one known manager: identity plus initial facts and
+    // execution evidence, built without touching any other execution. Called
+    // only for managers the caller does not already track.
+    //
+    // The default derives it from scan() for compatibility; production
+    // watchers MUST override it so M new managers cost O(M x job), never O(M x
+    // process-table). nullopt means "cannot be observed" (process gone, PID
+    // reused, discovery incomplete), never a guessed Job.
+    virtual std::optional<Job> observe(const ProcessIdentity& manager)
+    {
+        if (!manager.complete()) return std::nullopt;
+        const ScanResult scanned = scan();
+        for (const auto& job : scanned.jobs) {
+            if (job.execution.manager == manager) return job;
+        }
+        return std::nullopt;
+    }
+
     virtual SourceHealth health() const = 0;
     // Ask for an out-of-band authoritative pass; consumed by the owner.
     virtual void requestRescan() = 0;

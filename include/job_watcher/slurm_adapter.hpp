@@ -21,6 +21,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -81,6 +82,12 @@ public:
     void applyRequestFacts(Job& job, const nlohmann::json& request) const override;
     SubAttrMatcher duplicateMatcher(const Job& job) const override;
     void refreshLegacyFacts(Job& job) const override;
+
+    // ---- per-record fact refresh (slurmstepd is the manager) --------------
+    std::optional<ProcessIdentity> managerOfPid(pid_t job_pid) const override;
+    RefreshResult refreshFacts(Job& job,
+                               const ProcessLivenessProbe& process_probe,
+                               const CgroupMembershipProbe& cgroup_probe) const override;
 
     // ---- structured namespace: the cluster name only ----------------------
     NamespaceFacts namespaceFacts(const Job& job) const override;

@@ -314,20 +314,24 @@ void stable_metadata_is_a_creation_snapshot(const std::string& base)
     }
 }
 
-// The manual-only host refresh may use temporary metadata to locate members,
-// but must never write those guesses back into the immutable creation image.
+// The unified update chain may use temporary metadata to locate members, but
+// must never write those guesses back into the immutable creation image.
 void host_refresh_preserves_creation_metadata(const std::string& base)
 {
-    JobRegistry registry(isolated(fresh_dir(base, "frozen-host-refresh")));
+    JobRegistryOptions options;
+    options.db_path = fresh_dir(base, "frozen-host-refresh");
+    options.enable_pid_tracker = false;
+    options.register_rpc = false;
+    // The member refresh is part of the maintenance pass now; no discovery
+    // source is wired, so the pass re-reads the records themselves.
+    options.test_heartbeat = true;
+    JobRegistry registry(options);
     registry.setCollectorValidator(nullptr);
     Job manual;
     manual.jobtype = JobType::Job;
-    manual.subtype = JobSubType::Slurm;
+    manual.subtype = JobSubType::Common;
     manual.NativeJobID = "manual-without-native-id";
-    manual.sub_attr = SlurmJobAttr{};
-    auto& attr = std::get<SlurmJobAttr>(manual.sub_attr);
-    attr.cluster_name = "hpc";
-    attr.job_name = "creation-name";
+    manual.sub_attr = CommonJobAttr{.auto_update_child = true};
     set_pids(manual, {getpid()});
     manual.CollectorNames = {"cpumem_collector"};
     check(registry.addJob(manual), "the manual-only refresh fixture must register");
@@ -358,17 +362,17 @@ void host_refresh_preserves_creation_metadata(const std::string& base)
             while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
         }
     } child{child_pid, release[1]};
-    check(registry.refreshJobFacts(initial.job.JobID), "the host member refresh must succeed");
+    check(registry.reconcileInventoryNow(), "the host member refresh pass must run");
     const auto refreshed = registry.inventoryRecord(initial.job.JobID);
     check(refreshed && refreshed->job.NativeJobID == "manual-without-native-id" &&
-              std::get<SlurmJobAttr>(refreshed->job.sub_attr).job_id == 0 &&
-              std::get<SlurmJobAttr>(refreshed->job.sub_attr).job_name == "creation-name" &&
+              std::get<CommonJobAttr>(refreshed->job.sub_attr).auto_update_child &&
               refreshed->index_key == initial.index_key,
           "host refresh must not persist metadata guesses or alter identity");
     const auto refreshed_pids = pids_of(refreshed->job);
     check(std::find(refreshed_pids.begin(), refreshed_pids.end(), child.pid) !=
               refreshed_pids.end(),
           "host refresh must discover and persist the newly created member");
+    check(registry.deinit(), "the host refresh fixture must checkpoint");
 }
 
 void upsert_is_idempotent_and_activates_nothing(const std::string& base)
