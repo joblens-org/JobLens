@@ -11,11 +11,9 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Job/collection RPC surface, split out of the registry facade.
-// Everything here reads state through the public JobRegistry API, so no
-// registry lock is held while a mutation or provider call runs.
+// Shared helpers for the resource-oriented job RPC surface.
 
-#include "core/job_rpc.hpp"
+#include "core/rpc/rpc_common.hpp"
 
 #include <spdlog/spdlog.h>
 #include <fmt/core.h>
@@ -27,16 +25,16 @@
 #include <type_traits>
 
 #include "common/config.hpp"
-#include "core/collector_registry.hpp"
-#include "core/scheduler_adapter.hpp"
-#include "core/maintenance_config.hpp"
-#include "core/status_provider.hpp"
 #include "common/local_rpc.hpp"
-
-#if __has_include("core/status_provider.hpp")
+#include "core/collector_registry.hpp"
+#include "core/job_identity.hpp"
+#include "core/maintenance_config.hpp"
+#include "core/scheduler_adapter.hpp"
 #include "core/status_provider.hpp"
+
 #define JOBLENS_HAS_STATUS_PROVIDER 1
-#endif
+
+namespace joblens::rpc {
 
 std::pair<std::string, std::string>
 split_two(std::string s, char sep = '.') {
@@ -46,15 +44,9 @@ split_two(std::string s, char sep = '.') {
            : std::pair{s.substr(0, p), s.substr(p + 1)};
 }
 
-namespace {
-
 // The request-level namespace aliases (cluster_name/cluster_tag) contradicted
 // the typed sub_attr facts: an explicit rejection, distinct from a malformed
 // request so the RPC surface can carry the documented error code.
-struct NamespaceConflictError : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
-
 void parseJobRequest(const nlohmann::json& obj, Job& job, const JobRegistry& registry) {
     // Internal IDs parse explicitly as uint64: a JSON number or a decimal
     // string, never a 32-bit default. Absent keeps the legacy auto-allocate
@@ -138,9 +130,6 @@ void parseJobRequest(const nlohmann::json& obj, Job& job, const JobRegistry& reg
                  job.CollectorNames.size(), job.NativeJobID);
 }
 
-}  // namespace
-
-namespace {
 
 constexpr uint32_t kRpcSchemaVersion = 2;
 
@@ -332,7 +321,7 @@ nlohmann::json job_record_json(JobRegistry& registry, const JobRecord& record)
     return out;
 }
 
-std::vector<std::string> instance_ids_of(const std::vector<JobRecord>& records)
+std::vector<std::string> job_ids_of(const std::vector<JobRecord>& records)
 {
     std::vector<std::string> ids;
     ids.reserve(records.size());
@@ -348,16 +337,6 @@ void sort_records(std::vector<JobRecord>& records)
                   return lhs.job.JobID < rhs.job.JobID;
               });
 }
-
-// Resolution outcome of collection selectors. Empty `code` means success;
-// on ambiguity `records` carries the candidate instances.
-struct TargetResolution {
-    std::vector<JobRecord> records;
-    std::string code;
-    std::string message;
-
-    bool ok() const { return code.empty(); }
-};
 
 std::string optional_string(const nlohmann::json& node, const char* key)
 {
@@ -825,527 +804,4 @@ nlohmann::json joblens_status_payload(JobRegistry& registry)
     return body;
 }
 
-
-}  // namespace
-
-void registerJobRpc(JobRegistry& registry) {
-    // --- jobs ---------------------------------------------------------------
-    // The manual add/update path is one identity-resolved upsert. A legacy
-    // JobID is only a hint; a request that names a live record updates its
-    // manual selection, otherwise it creates a new record.
-    RPCServer::instance().register_method("jobs/upsert",
-        [&registry](const nlohmann::json& req) -> nlohmann::json {
-            nlohmann::json j;
-            try {
-                if (!req.is_object())
-                    return error_payload("invalid_request",
-                                         "request body must be a JSON object");
-                Job job;
-                parseJobRequest(req, job, registry);
-                j = registry.upsertJob(job, req, legacy_add_selector(job, registry));
-            } catch (const NamespaceConflictError& e) {
-                j["status"] = "error";
-                j["code"] = "namespace_conflict";
-                j["msg"] = fmt::format("failed to upsert job: {}", e.what());
-            } catch (const std::exception& e) {
-                j["status"] = "error";
-                j["code"] = "invalid_request";
-                j["msg"] = fmt::format("failed to upsert job: {}", e.what());
-            }
-            return j;
-        }
-    );
-
-    // Stop collection, retain the job record.
-    RPCServer::instance().register_method("jobs/stop",
-        [&registry](const nlohmann::json& req) -> nlohmann::json {
-            if (!req.is_object())
-                return error_payload("invalid_request",
-                                     "request body must be a JSON object");
-            return remove_jobs(registry, req, /*erase=*/false);
-        }
-    );
-
-    // Delete/retire the job record for real.
-    RPCServer::instance().register_method("jobs/erase",
-        [&registry](const nlohmann::json& req) -> nlohmann::json {
-            if (!req.is_object())
-                return error_payload("invalid_request",
-                                     "request body must be a JSON object");
-            return remove_jobs(registry, req, /*erase=*/true);
-        }
-    );
-
-    RPCServer::instance().register_method("jobs/get",
-        [&registry](const nlohmann::json& req) -> nlohmann::json {
-            if (!req.is_object())
-                return error_payload("invalid_request",
-                                     "request body must be a JSON object");
-            std::string internal_job_id;
-            try {
-                if (req.contains("internal_job_id") && !req["internal_job_id"].is_null())
-                    internal_job_id = optional_string(req, "internal_job_id");
-                else
-                    internal_job_id = optional_string(req, "instance_id");
-            } catch (const std::exception& error) {
-                return error_payload("invalid_request", error.what());
-            }
-            if (internal_job_id.empty())
-                return error_payload("invalid_request",
-                                     "internal_job_id is required");
-            const auto internal_id = parse_internal_id(internal_job_id);
-            if (!internal_id || is_reserved_internal_id(*internal_id))
-                return error_payload(
-                    "not_found",
-                    "no current job record with internal_job_id '" + internal_job_id + "'");
-            const auto record = registry.jobRecord(*internal_id);
-            if (!record)
-                return error_payload(
-                    "not_found",
-                    "no current job record with internal_job_id '" + internal_job_id + "'");
-            auto out = job_record_json(registry, *record);
-            out["status"] = "ok";
-            return out;
-        }
-    );
-
-    RPCServer::instance().register_method("jobs/count",
-        [&registry](const nlohmann::json& req) -> nlohmann::json {
-            (void)req;
-            uint64_t count = 0;
-            for (const auto& record : registry.jobRecords()) {
-                if (is_reserved_internal_id(record.job.JobID)) continue;
-                if (record.state == RecordState::Active) ++count;
-            }
-            return nlohmann::json{{"status", "ok"}, {"job_count", count}};
-        }
-    );
-
-    // pid tracker diagnostics are not a job resource.
-    RPCServer::instance().register_method("diagnostics/pid_tracker",
-        [&registry](const nlohmann::json& req) -> nlohmann::json {
-            (void)req;
-            nlohmann::json j;
-            j["status"] = "ok";
-            j["running"] = registry.attributionRunning();
-            j["pushed_events"] = registry.attributionPushedEvents();
-            j["dropped_events"] = registry.attributionDroppedEvents();
-            return j;
-        }
-    );
-
-    // -----------------------------------------------------------------------
-    // Job read surface
-    // -----------------------------------------------------------------------
-    RPCServer::instance().register_method("jobs/list",
-        [&registry](const nlohmann::json& req) -> nlohmann::json {
-            if (auto not_ready = store_not_ready_payload(registry.storeHealth()))
-                return *not_ready;
-            const json& params = req.is_object() ? req : nlohmann::json::object();
-
-            uint64_t limit = 100;
-            if (params.contains("limit") && !params["limit"].is_null()) {
-                const auto& node = params["limit"];
-                if (!node.is_number_unsigned() && !node.is_number_integer()) {
-                    return error_payload("invalid_request", "limit must be an integer between 1 and 1000");
-                }
-                const auto raw = node.get<int64_t>();
-                if (raw < 1 || raw > 1000) {
-                    return error_payload("invalid_request", "limit must be between 1 and 1000");
-                }
-                limit = static_cast<uint64_t>(raw);
-            }
-
-            std::string scheduler_filter;
-            if (params.contains("scheduler_type") && !params["scheduler_type"].is_null()) {
-                if (!params["scheduler_type"].is_string())
-                    return error_payload("invalid_request", "scheduler_type must be a string");
-                scheduler_filter = normalize_adapter_name(
-                    params["scheduler_type"].get<std::string>());
-                // Open world, validated against the registered adapters: an
-                // unknown name is a caller error, not an empty result.
-                if (!SchedulerAdapterRegistry::instance().known(scheduler_filter))
-                    return error_payload(
-                        "invalid_request",
-                        fmt::format("unknown scheduler_type '{}' (registered: {})",
-                                    scheduler_filter,
-                                    fmt::join(SchedulerAdapterRegistry::instance().names(),
-                                              ", ")));
-            }
-            std::string native_filter;
-            if (params.contains("native_job_id") && !params["native_job_id"].is_null()) {
-                if (!params["native_job_id"].is_string())
-                    return error_payload("invalid_request", "native_job_id must be a string");
-                native_filter = params["native_job_id"].get<std::string>();
-            }
-            std::string state_filter;
-            if (params.contains("state") && !params["state"].is_null()) {
-                if (!params["state"].is_string())
-                    return error_payload("invalid_request", "state must be a string");
-                state_filter = params["state"].get<std::string>();
-                if (state_filter != "active" && state_filter != "suspect" &&
-                    state_filter != "closing")
-                    return error_payload("invalid_request",
-                                         "state must be one of active, suspect, closing");
-            }
-            std::string cursor;
-            if (params.contains("cursor") && !params["cursor"].is_null()) {
-                if (!params["cursor"].is_string())
-                    return error_payload("invalid_request", "cursor must be a string");
-                cursor = params["cursor"].get<std::string>();
-            }
-
-            std::vector<JobRecord> matching;
-            for (auto& record : registry.jobRecords()) {
-                if (is_reserved_internal_id(record.job.JobID)) continue;
-                if (!scheduler_filter.empty() &&
-                    record.job.subtype_name != scheduler_filter)
-                    continue;
-                if (!native_filter.empty() && record.job.NativeJobID != native_filter)
-                    continue;
-                if (!state_filter.empty() &&
-                    (!record_state_from_string(state_filter) ||
-                     *record_state_from_string(state_filter) != record.state))
-                    continue;
-                matching.push_back(std::move(record));
-            }
-            sort_records(matching);
-
-            const uint64_t snapshot_revision = jobs_snapshot_revision(matching);
-            const std::string filter_fingerprint =
-                scheduler_filter + "|" + native_filter + "|" + state_filter;
-
-            uint64_t after = 0;
-            if (!cursor.empty()) {
-                const auto decoded = base64url_decode(cursor);
-                if (!decoded) return error_payload("invalid_request", "cursor is not a valid page token");
-                nlohmann::json token;
-                try {
-                    token = nlohmann::json::parse(*decoded);
-                } catch (const std::exception&) {
-                    return error_payload("invalid_request", "cursor is not a valid page token");
-                }
-                const auto cursor_revision = token.value("r", uint64_t{0});
-                if (token.value("f", std::string{}) != filter_fingerprint ||
-                    cursor_revision != snapshot_revision) {
-                    return error_payload(
-                        "cursor_invalidated",
-                        fmt::format("job snapshot {} no longer matches cursor snapshot {}; "
-                                    "restart from the first page",
-                                    snapshot_revision, cursor_revision));
-                }
-                after = token.value("k", uint64_t{0});
-            }
-
-            nlohmann::json records = nlohmann::json::array();
-            uint64_t emitted = 0;
-            uint64_t last_emitted = after;
-            bool more = false;
-            for (const auto& record : matching) {
-                if (record.job.JobID <= after) continue;
-                if (emitted == limit) {
-                    more = true;
-                    break;
-                }
-                records.push_back(job_record_json(registry, record));
-                last_emitted = record.job.JobID;
-                ++emitted;
-            }
-
-            nlohmann::json out;
-            out["status"] = "ok";
-            out["snapshot_revision"] = snapshot_revision;
-            out["records"] = std::move(records);
-            if (more) {
-                nlohmann::json token{
-                    {"v", 1},
-                    {"r", snapshot_revision},
-                    {"k", last_emitted},
-                    {"f", filter_fingerprint},
-                };
-                out["next_cursor"] = base64url_encode(token.dump());
-            } else {
-                out["next_cursor"] = nullptr;
-            }
-            return out;
-        }
-    );
-
-    RPCServer::instance().register_method("joblens/status",
-        [&registry](const nlohmann::json& req) -> nlohmann::json {
-            (void)req;
-            return joblens_status_payload(registry);
-        }
-    );
-
-    RPCServer::instance().register_method("joblens/capabilities",
-        [&registry](const nlohmann::json& req) -> nlohmann::json {
-            (void)req;
-            const auto health = registry.storeHealth();
-            nlohmann::json out;
-            out["status"] = "ok";
-            out["api_version"] = 2;
-            out["collection_control_version"] = 1;
-            out["native_identity_selectors"] = true;
-            out["job_scope"] = "current_local_instances";
-            // Contract field name shared with the trigger Pydantic model.
-            out["db_schema_version"] = health.schema_version;
-            out["ready"] = health.db_running && health.migration_complete;
-            return out;
-        }
-    );
-
-    // -----------------------------------------------------------------------
-    // Collection control surface
-    // -----------------------------------------------------------------------
-    auto collection_command = [&registry](const nlohmann::json& req) -> nlohmann::json {
-            if (!req.is_object())
-                return error_payload("invalid_request", "request body must be a JSON object");
-            if (auto not_ready = store_not_ready_payload(registry.storeHealth()))
-                return *not_ready;
-
-            const auto selector_error = [](const std::string& message) {
-                return error_payload("invalid_request", message);
-            };
-
-            std::string scope = "instance";
-            if (req.contains("scope") && !req["scope"].is_null()) {
-                if (!req["scope"].is_string())
-                    return selector_error("scope must be 'instance' or 'job'");
-                scope = req["scope"].get<std::string>();
-                if (scope != "instance" && scope != "job")
-                    return selector_error("scope must be 'instance' or 'job'");
-            }
-
-            std::string operation;
-            if (!req.contains("operation") || !req["operation"].is_string())
-                return selector_error("operation must be 'set' or 'reset_auto'");
-            operation = req["operation"].get<std::string>();
-            if (operation != "set" && operation != "reset_auto")
-                return selector_error("operation must be 'set' or 'reset_auto'");
-
-            bool ensure_registered = false;
-            if (req.contains("ensure_registered") && !req["ensure_registered"].is_null()) {
-                if (!req["ensure_registered"].is_boolean())
-                    return selector_error("ensure_registered must be a boolean");
-                ensure_registered = req["ensure_registered"].get<bool>();
-            }
-
-            if (!req.contains("selector") || !req["selector"].is_object())
-                return selector_error("selector is required");
-            const auto& selector = req["selector"];
-
-            const bool has_internal_id =
-                selector.contains("internal_job_id") &&
-                !selector["internal_job_id"].is_null();
-            std::vector<std::string> native_fields;
-            for (const char* name : {"scheduler_type", "adapter", "cluster_name",
-                                     "cluster_tag", "native_job_id", "step_id"}) {
-                if (selector.contains(name) && !selector[name].is_null())
-                    native_fields.emplace_back(name);
-            }
-            if (selector.contains("instance_id") && !selector["instance_id"].is_null())
-                return selector_error(
-                    "instance_id is retired; address the instance by "
-                    "internal_job_id (decimal string) or native identity fields");
-            if (has_internal_id && !native_fields.empty())
-                return selector_error("selector must use exactly one form: an instance "
-                                      "handle (internal_job_id) or native "
-                                      "identity fields, not both");
-            if (!has_internal_id && native_fields.empty())
-                return selector_error("selector is required: an instance handle "
-                                      "(internal_job_id) or native identity "
-                                      "fields");
-            if (has_internal_id && scope != "instance")
-                return selector_error("instance handle selectors only support "
-                                      "scope=instance");
-
-            NativeSelector native_selector;
-            std::optional<uint64_t> internal_handle;
-            try {
-                if (has_internal_id) {
-                    const auto raw = optional_string(selector, "internal_job_id");
-                    internal_handle = parse_internal_id(raw);
-                    if (!internal_handle)
-                        return selector_error(
-                            "internal_job_id must be a decimal internal id string (got '" +
-                            raw + "')");
-                }
-                if (!has_internal_id) {
-                    native_selector.cluster_tag = optional_string(selector, "cluster_tag");
-                    native_selector.step_id = optional_string(selector, "step_id");
-                    native_selector.native_job_id = optional_string(selector, "native_job_id");
-                    native_selector.cluster_name = optional_string(selector, "cluster_name");
-                    // "adapter" is the preferred key; the legacy
-                    // "scheduler_type" spelling keeps old callers working.
-                    std::string adapter_name;
-                    if (selector.contains("adapter") && !selector["adapter"].is_null())
-                        adapter_name = optional_string(selector, "adapter");
-                    else
-                        adapter_name = optional_string(selector, "scheduler_type");
-                    adapter_name = normalize_adapter_name(adapter_name);
-                    if (!SchedulerAdapterRegistry::instance().known(adapter_name))
-                        return selector_error(
-                            fmt::format("unknown scheduler_type '{}' (registered: {})",
-                                        adapter_name,
-                                        fmt::join(SchedulerAdapterRegistry::instance()
-                                                      .names(),
-                                                  ", ")));
-                    native_selector.adapter = adapter_name;
-                }
-            } catch (const std::exception& error) {
-                return selector_error(error.what());
-            }
-
-            std::optional<std::vector<std::string>> collectors;
-            if (operation == "set") {
-                if (!req.contains("collectors") || req["collectors"].is_null())
-                    return selector_error(
-                        "operation=set requires an explicit collectors array; [] stops collection");
-                if (!req["collectors"].is_array())
-                    return selector_error("collectors must be an array of collector names");
-                std::vector<std::string> names;
-                for (const auto& item : req["collectors"]) {
-                    if (!item.is_string())
-                        return selector_error("collectors must be an array of collector names");
-                    const auto name = item.get<std::string>();
-                    if (name.empty())
-                        return selector_error("collectors must not contain empty names");
-                    names.push_back(name);
-                }
-                collectors = names;
-            } else if (req.contains("collectors") && !req["collectors"].is_null()) {
-                return selector_error("operation=reset_auto must omit collectors");
-            }
-
-            std::optional<uint64_t> expected_revision;
-            if (req.contains("expected_revision") && !req["expected_revision"].is_null()) {
-                if (scope != "instance")
-                    return selector_error(
-                        "expected_revision is only accepted for a single-instance request "
-                        "(scope=instance)");
-                const auto& node = req["expected_revision"];
-                if (!node.is_number_unsigned() && !node.is_number_integer())
-                    return selector_error("expected_revision must be a non-negative integer");
-                const auto raw = node.get<int64_t>();
-                if (raw < 0)
-                    return selector_error("expected_revision must be a non-negative integer");
-                expected_revision = static_cast<uint64_t>(raw);
-            }
-
-            const auto resolution =
-                has_internal_id
-                    ? resolve_instance_handle_by_id(registry, *internal_handle)
-                    : resolve_native_target(registry, native_selector, scope,
-                                            ensure_registered);
-            if (!resolution.ok()) {
-                if (resolution.code == "ambiguous_selector")
-                    return error_payload(resolution.code, resolution.message,
-                                         instance_ids_of(resolution.records));
-                return error_payload(resolution.code, resolution.message);
-            }
-
-            CollectionRequest request;
-            request.collectors = collectors;
-            request.expected_revision = expected_revision;
-            for (const auto& record : resolution.records)
-                request.targets.push_back(record.job.JobID);
-
-            const auto outcome = operation == "set" ? registry.setCollectors(request)
-                                                    : registry.resetAuto(request);
-            if (!outcome.ok) {
-                return error_payload(to_string(outcome.error), outcome.message);
-            }
-
-            nlohmann::json targets = nlohmann::json::array();
-            for (const auto& target : outcome.targets) {
-                const auto record = registry.jobRecord(target.internal_id);
-                if (!record) continue;
-                targets.push_back(collection_target_json(
-                    registry, *record, target.selection, target.revision, target.changed,
-                    target.actual));
-            }
-            nlohmann::json out;
-            out["status"] = "accepted";
-            out["operation"] = operation;
-            out["scope"] = scope;
-            out["targets"] = std::move(targets);
-            return out;
-    };
-
-    RPCServer::instance().register_method("jobs/collection/set", collection_command);
-    RPCServer::instance().register_method("jobs/collection/reset",
-        [collection_command](const nlohmann::json& req) -> nlohmann::json {
-            nlohmann::json reset = req.is_object() ? req : nlohmann::json::object();
-            reset["operation"] = "reset_auto";
-            return collection_command(reset);
-        }
-    );
-
-    RPCServer::instance().register_method("jobs/collection/get",
-        [&registry](const nlohmann::json& req) -> nlohmann::json {
-            if (!req.is_object())
-                return error_payload("invalid_request", "request body must be a JSON object");
-            if (auto not_ready = store_not_ready_payload(registry.storeHealth()))
-                return *not_ready;
-            // internal_job_id is the addressing field; instance_id is the
-            // deprecated spelling kept for readers echoing an old response —
-            // both carry the same decimal-string value now.
-            std::string internal_job_id;
-            try {
-                if (req.contains("internal_job_id") && !req["internal_job_id"].is_null())
-                    internal_job_id = optional_string(req, "internal_job_id");
-                else
-                    internal_job_id = optional_string(req, "instance_id");
-            } catch (const std::exception& error) {
-                return error_payload("invalid_request", error.what());
-            }
-            if (internal_job_id.empty())
-                return error_payload("invalid_request", "internal_job_id is required");
-            const auto internal_id = parse_internal_id(internal_job_id);
-            if (!internal_id)
-                return error_payload(
-                    "invalid_request",
-                    "internal_job_id must be a decimal internal id string (got '" +
-                        internal_job_id + "')");
-
-            const auto resolution = resolve_instance_handle_by_id(registry, *internal_id);
-            if (!resolution.ok())
-                return error_payload(resolution.code, resolution.message);
-
-            const auto& record = resolution.records.front();
-            const auto selection = registry.selectionRecord(record.job.JobID);
-            auto target = collection_target_json(registry, record, selection,
-                                                 record.revision, false,
-                                                 registry.actualCollection(record.job.JobID));
-
-            nlohmann::json out;
-            out["status"] = "ok";
-            out["instance_id"] = target["instance_id"];
-            out["internal_job_id"] = target["internal_job_id"];
-            out["native_job_id"] = target["native_job_id"];
-            out["scheduler_type"] = record.job.subtype_name;
-            out["cluster_name"] = record.job.cluster_name;
-            out["cluster_tag"] = record.job.clusterTag;
-            out["step_id"] = step_id_text(registry, record);
-            out["state"] = to_string(record.state);
-            out["quarantined"] = false;
-            out["mode"] = target["mode"];
-            out["record_revision"] = target["record_revision"];
-            out["desired_collectors"] = target["desired_collectors"];
-            out["applied_collectors"] = target["applied_collectors"];
-            out["applied_attach_token"] = target["applied_attach_token"];
-            out["draining"] = target["draining"];
-            out["in_pipeline"] = target["in_pipeline"];
-            out["automatic_collectors"] = selection.automatic.has_value()
-                                              ? nlohmann::json(*selection.automatic)
-                                              : nlohmann::json(nullptr);
-            out["automatic_source"] = selection.automatic_source;
-            out["manual_collectors"] = selection.manual.has_value()
-                                           ? nlohmann::json(*selection.manual)
-                                           : nlohmann::json(nullptr);
-            out["errors"] = nlohmann::json::array();
-            return out;
-        }
-    );
-}
+}  // namespace joblens::rpc

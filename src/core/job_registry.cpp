@@ -14,7 +14,7 @@
 // job_registry.cpp — the registry facade.
 //
 // Durable state lives in JobStore (JobRecord); kernel attribution lives in
-// KernelAttribution; the RPC surface lives in job_rpc.cpp. This file
+// KernelAttribution; the RPC surface lives in core/rpc/. This file
 // keeps the CollectorScheduler-facing seams: lifecycle callbacks, the
 // collection applier, retirement/drain flow and the automatic-selection
 // trigger.
@@ -39,7 +39,7 @@
 
 #include "core/reentrancy_gate.hpp"
 #include "core/maintenance_config.hpp"
-#include "core/job_rpc.hpp"
+#include "core/rpc/register_all.hpp"
 #include "core/collector_registry.hpp"
 #include "common/utils.hpp"
 #include "common/common_job.hpp"
@@ -2275,7 +2275,8 @@ JobRegistry::ManualTarget JobRegistry::manualUpdateTarget(
 }
 
 nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& request,
-                                      std::optional<NativeSelector> identity_selector) {
+                                      std::optional<NativeSelector> identity_selector,
+                                      bool create_only) {
     std::string recovery_error;
     if (!recoverStoreIfNeeded(recovery_error)) {
         nlohmann::json out;
@@ -2292,6 +2293,29 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
                     {"message", "selector contradicts structured job facts"}};
         }
     }
+    const auto already_exists = [](uint64_t internal_id, uint64_t revision) {
+        nlohmann::json out;
+        out["status"] = "error";
+        out["code"] = "already_exists";
+        out["message"] = "job instance " + format_internal_id(internal_id) +
+                         " already exists";
+        out["internal_job_id"] = format_internal_id(internal_id);
+        out["instance_id"] = format_internal_id(internal_id);
+        out["record_revision"] = revision;
+        return out;
+    };
+
+    if (create_only && job.JobID != 0) {
+        if (const auto existing = ownRecord(job.JobID)) {
+            if (existing->state == RecordState::Closing) {
+                return {{"status", "error"}, {"code", "generation_closing"},
+                        {"message", "instance " + format_internal_id(job.JobID) +
+                                        " is closing and rejects new binding mutations"}};
+            }
+            return already_exists(job.JobID, existing->revision);
+        }
+    }
+
     const ManualTarget target = manualUpdateTarget(job, identity_selector);
     if (target.kind == ManualTarget::Kind::Closing) {
         nlohmann::json out;
@@ -2310,6 +2334,7 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
         return out;
     }
     if (target.kind == ManualTarget::Kind::Update) {
+        if (create_only) return already_exists(target.record.job.JobID, target.record.revision);
         Job claimed_job = job;
         if (identity_selector) {
             // The selector's namespace folds into the typed facts (already

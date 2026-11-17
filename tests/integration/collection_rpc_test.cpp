@@ -672,6 +672,23 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
         check(hint_id.has_value() && !has_active(registry, *hint_id),
               "the JobID hint must never become an internal id");
     }
+    // --- strict create is not an upsert ------------------------------
+    {
+        auto create = add;
+        create["sub_attr"]["cluster_id"] = 987;
+        const auto created = rpc("jobs/create", create);
+        check(created["status"] == "success" &&
+                  created["internal_job_id"].is_string(),
+              "jobs/create must return the created identity: " + created.dump());
+        check(created["record_revision"].get<uint64_t>() >= 1,
+              "jobs/create must return the created revision: " + created.dump());
+
+        const auto conflict = rpc("jobs/create", create);
+        check(conflict["code"] == "already_exists",
+              "jobs/create must reject an existing identity: " + conflict.dump());
+        check(conflict["internal_job_id"] == created["internal_job_id"],
+              "already_exists must report the existing instance: " + conflict.dump());
+    }
     // --- duplicate observation is not a failure ----------------------
     {
         const auto response = rpc("jobs/upsert", add);

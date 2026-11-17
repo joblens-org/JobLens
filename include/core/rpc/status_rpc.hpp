@@ -11,11 +11,10 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Job/collection RPC registration. Implemented in job_rpc.cpp;
-// reads state only through the public JobRegistry API.
 #pragma once
 
 #include "core/job_registry.hpp"
 
-// Registers the job list/get, collection, status and capabilities RPC methods.
-void registerJobRpc(JobRegistry& registry);
+namespace joblens::rpc {
+void registerStatusRpc(JobRegistry& registry);
+}  // namespace joblens::rpc

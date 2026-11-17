@@ -181,7 +181,8 @@ public:
     // adopted on UPDATE. No match takes CREATE, which rejects empty collectors.
     // This path is independent of the automatic admission gate.
     nlohmann::json upsertJob(const Job& job, const nlohmann::json& request,
-                             std::optional<NativeSelector> identity_selector = std::nullopt);
+                             std::optional<NativeSelector> identity_selector = std::nullopt,
+                             bool create_only = false);
     // Thin alias for the CREATE branch — the historical manual registration
     // entry.
     bool addJob(const Job& job);

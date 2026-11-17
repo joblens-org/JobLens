@@ -1088,6 +1088,36 @@ def test_v2_job_upsert_omits_legacy_opt_field(install_core) -> None:
     assert payload["sub_attr"] == {"cluster_id": 172, "proc_id": 0}
 
 
+def test_v2_job_create_is_strict_and_forwards_jobs_create(install_core) -> None:
+    fake = install_core(response={"status": "success", "internal_job_id": "42"})
+
+    response = _app().test_client().post(
+        "/joblens/v2/jobs",
+        json={"type": "job.condor", "JobPIDs": [1235], "Lens": ["cpumem_collector"]},
+    )
+
+    assert response.status_code == 200
+    assert fake.calls[0][0] == "jobs/create"
+    assert "opt" not in fake.calls[0][1]
+
+
+def test_v2_job_create_conflict_maps_to_409(install_core) -> None:
+    install_core(response={
+        "status": "error",
+        "code": "already_exists",
+        "message": "job instance 42 already exists",
+        "internal_job_id": "42",
+    })
+
+    response = _app().test_client().post(
+        "/joblens/v2/jobs",
+        json={"type": "job.condor", "JobPIDs": [1235], "Lens": ["cpumem_collector"]},
+    )
+
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "already_exists"
+
+
 def test_v2_job_erase_and_stop_are_distinct(install_core) -> None:
     fake = install_core(response={"status": "success", "mode": "stop"})
     client = _app().test_client()

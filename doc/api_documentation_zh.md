@@ -683,6 +683,7 @@ v1/v2 共用同一套 Trigger 适配层与 Core 方法。旧版 `/joblens/capabi
 | `GET` | `/joblens/v2/jobs` | 分页作业记录；`limit`/`cursor`/过滤参数同 `/joblens/jobs/list` |
 | `GET` | `/joblens/v2/jobs/count` | 活跃作业记录数 |
 | `GET` | `/joblens/v2/jobs/<internal_job_id>` | 单个作业记录 |
+| `POST` | `/joblens/v2/jobs` | 严格创建（`jobs/create`）；身份或 ID 已存在返回 409 |
 | `PUT` | `/joblens/v2/jobs` | 按身份 upsert（`jobs/upsert`）；请求体不带 `opt` |
 | `DELETE` | `/joblens/v2/jobs/<internal_job_id>` | 退役/删除（`jobs/erase`） |
 | `POST` | `/joblens/v2/jobs/<internal_job_id>/stop` | 停止采集、保留记录（`jobs/stop`） |

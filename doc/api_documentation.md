@@ -693,6 +693,7 @@ keeps `inventory_enabled`.
 | `GET` | `/joblens/v2/jobs` | Paginated job records; same `limit`/`cursor`/filters as `/joblens/jobs/list` |
 | `GET` | `/joblens/v2/jobs/count` | Active job-record count |
 | `GET` | `/joblens/v2/jobs/<internal_job_id>` | One job record |
+| `POST` | `/joblens/v2/jobs` | Strict create (`jobs/create`); an existing identity or ID returns 409 |
 | `PUT` | `/joblens/v2/jobs` | Identity-resolved upsert (`jobs/upsert`); body has no `opt` field |
 | `DELETE` | `/joblens/v2/jobs/<internal_job_id>` | Erase/retire (`jobs/erase`) |
 | `POST` | `/joblens/v2/jobs/<internal_job_id>/stop` | Stop collection, retain the record (`jobs/stop`) |

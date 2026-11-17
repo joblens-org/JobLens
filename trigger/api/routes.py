@@ -84,6 +84,7 @@ _COLLECTION_ERROR_STATUS = {
     # 409 ambiguous selector / stale revision / closing generation / changed snapshot
     'ambiguous_selector': 409,
     'ambiguous': 409,
+    'already_exists': 409,
     'stale_revision': 409,
     'revision_conflict': 409,
     'generation_closing': 409,
@@ -207,6 +208,20 @@ def _with_legacy_field_aliases(payload):
     for record in payload.get('records') or []:
         if isinstance(record, dict) and 'record_revision' in record:
             record.setdefault('facts_revision', record['record_revision'])
+    return payload
+
+
+def _v2_job_payload(data):
+    """Validate a v2 job body and apply the v1-compatible defaults."""
+    req = JobUpsertRequest.model_validate(data)
+    payload = req.model_dump(exclude_none=True)
+    if not payload.get('Lens'):
+        payload['Lens'] = ['cpumem_collector', 'io_collector', 'net_collector']
+    if 'sub_attr' not in payload:
+        if payload['type'] == 'job.condor':
+            payload['sub_attr'] = {'cluster_id': 0, 'proc_id': 0}
+        elif payload['type'] == 'job.slurm':
+            payload['sub_attr'] = {'job_id': payload.get('JobID', 0), 'step_id': 0}
     return payload
 
 
@@ -732,6 +747,18 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             'jobs/get', {'internal_job_id': str(job_id)}, JobDetailResponse
         )
 
+    @app.route('/joblens/v2/jobs', methods=['POST'])
+    def create_job_v2():
+        """严格创建作业；同一身份或内部 ID 已存在时返回 409。"""
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return _invalid_request('request body must be a JSON object')
+        try:
+            payload = _v2_job_payload(data)
+        except ValidationError as e:
+            return _invalid_request(_format_validation_error(e))
+        return forward_core_rpc('jobs/create', payload, JobDetailResponse)
+
     @app.route('/joblens/v2/jobs', methods=['PUT'])
     def upsert_job_v2():
         """按原生身份 upsert 作业（有则更新 selection，无则创建）。"""
@@ -739,18 +766,9 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         if not isinstance(data, dict):
             return _invalid_request('request body must be a JSON object')
         try:
-            req = JobUpsertRequest.model_validate(data)
+            payload = _v2_job_payload(data)
         except ValidationError as e:
             return _invalid_request(_format_validation_error(e))
-
-        payload = req.model_dump(exclude_none=True)
-        if not payload.get('Lens'):
-            payload['Lens'] = ['cpumem_collector', 'io_collector', 'net_collector']
-        if 'sub_attr' not in payload:
-            if payload['type'] == 'job.condor':
-                payload['sub_attr'] = {'cluster_id': 0, 'proc_id': 0}
-            elif payload['type'] == 'job.slurm':
-                payload['sub_attr'] = {'job_id': payload.get('JobID', 0), 'step_id': 0}
         return forward_core_rpc('jobs/upsert', payload, JobDetailResponse)
 
     @app.route('/joblens/v2/jobs/<int:job_id>', methods=['DELETE'])
