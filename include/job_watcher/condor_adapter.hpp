@@ -85,7 +85,6 @@ public:
     NativeSelector registrationSelector(const Job& job) const override;
     void applyRequestFacts(Job& job, const nlohmann::json& request) const override;
     SubAttrMatcher duplicateMatcher(const Job& job) const override;
-    void refreshLegacyFacts(Job& job) const override;
 
     // ---- per-record fact refresh (condor_starter is the manager) ----------
     std::optional<ProcessIdentity> managerOfPid(pid_t job_pid) const override;

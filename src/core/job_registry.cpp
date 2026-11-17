@@ -344,23 +344,6 @@ private:
     std::string error_;
 };
 
-// Adapter-owned legacy decode dispatch: the Job's subtype_name (or the
-// subtype enum for pre-name rows) names the owning adapter; without one the
-// caller keeps an incomplete selector, never a guess.
-ISchedulerAdapter* JobRegistry::adapterOf(const Job& job) const {
-    const std::string* wanted = &job.subtype_name;
-    std::string enum_fallback;
-    if (wanted->empty()) {
-        const char* name = adapter_name_for(job.subtype);
-        if (name == nullptr) return nullptr;
-        enum_fallback = name;
-        wanted = &enum_fallback;
-    }
-    for (const auto& adapter : adapters_)
-        if (adapter->name() == *wanted) return adapter.get();
-    return nullptr;
-}
-
 SubAttrMatcher JobRegistry::duplicateMatcherOf(const Job& job) const {
     if (const auto* adapter = namespaceAdapterOf(job))
         return adapter->duplicateMatcher(job);
@@ -1689,12 +1672,12 @@ void JobRegistry::startDiscoverySources(InventoryWiring wiring)
             note = std::string("start failed: ") + error.what();
         }
         if (!started && note.empty())
-            note = "event source unavailable (scan-only)";
+            note = "event source unavailable; the manager pass drives discovery";
         source_started_.emplace_back(name, started);
         source_start_notes_.push_back(std::move(note));
         if (!started && wiring == InventoryWiring::Production)
-            spdlog::warn("JobRegistry: source '{}' has no event source, continuing with "
-                         "scans only: {}",
+            spdlog::warn("JobRegistry: source '{}' has no event source; discovery "
+                         "continues through the manager pass: {}",
                          name, source_start_notes_.back());
     }
 }
@@ -2772,12 +2755,9 @@ size_t JobRegistry::delJob(const SubAttrMatcher& matcher) {
 }
 
 inline void JobRegistry::update_job(Job& job){
-    // The adapter owns the scheduler-specific /proc refresh. Common rows have
-    // no adapter; their only refresh is the generic child-process update.
-    if (const auto* adapter = namespaceAdapterOf(job)) {
-        adapter->refreshLegacyFacts(job);
-        return;
-    }
+    // A row an adapter answers for is refreshed by that adapter's refreshFacts;
+    // only Common/open-world rows reach here, and their only fact source is the
+    // generic child-process update.
     if (job.subtype == JobSubType::Common) {
         if (const auto* attr = std::get_if<CommonJobAttr>(&job.sub_attr);
             attr != nullptr && attr->auto_update_child) {
@@ -2909,11 +2889,6 @@ void JobRegistry::publishRecord(JobRecord record) {
     if (!records_[id].index_key.empty()) {
         identity_index_[records_[id].index_key] = id;
     }
-}
-
-void JobRegistry::eraseRecord(uint64_t id) {
-    std::unique_lock lg(records_mtx_);
-    eraseRecordLocked(id);
 }
 
 void JobRegistry::eraseRecordLocked(uint64_t id) {

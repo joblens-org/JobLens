@@ -13,20 +13,22 @@
  * limitations under the License. */
 /* Discovery-adapter acceptance:
  *
- *   * scan() finds fixture jobs and returns complete observations with the
- *     correct native identity fields, manager generation, cgroup and members.
- *   * Missing/unreadable ads and unbacked spool entries yield *incomplete*
- *     observations with reasons: never a crash, never a guessed identity.
+ *   * one authoritative pass (enumerateManagers) names the live managers and
+ *     owns source health; observe(manager) publishes only finalized
+ *     observations with the correct native identity fields, manager
+ *     generation, cgroup and members.
+ *   * Missing/unreadable ads yield *no* published observation: never a crash,
+ *     never a guessed identity.
  *   * start() installs the sink before any thread exists, stop() is idempotent
  *     and joined, stop()-start()-stop() is safe.
- *   * SourceHealth goes initializing -> healthy on a successful scan and
+ *   * SourceHealth goes initializing -> healthy on a successful pass and
  *     -> degraded on an injected failure, then recovers.
  *
  * Everything runs against a fixture tree under a temporary root: the discovery
  * roots are injectable, so this needs no root, no eBPF and no live scheduler.
  * The eBPF event source is unavailable on an unprivileged host, which the
- * adapters report as an explicit source note; the process-table scan is the
- * part under test.
+ * adapters report as an explicit source note; the process-table manager pass is
+ * the part under test.
  */
 #include "core/job_identity.hpp"
 #include "core/job_discovery.hpp"
@@ -248,11 +250,42 @@ DiscoveryOptions fixture_options(const Fixture& fixture,
     return options;
 }
 
-// A scan publishes only finalized observations, so a native id is enough.
-const Job* find_complete(const ScanResult& result, const std::string& native_job_id)
+// The result of one authoritative pass: the enumerated managers plus the Job
+// of every manager this test could observe. The registry observes only the
+// managers it does not track yet; observing all of them here is the same read
+// path.
+struct PassSummary {
+    ManagerSet set;
+    std::vector<Job> jobs;
+    std::size_t unobservable = 0;
+};
+
+PassSummary run_pass(IDiscoverySource& source)
 {
-    for (const auto& job : result.jobs) {
+    PassSummary summary;
+    summary.set = source.enumerateManagers();
+    summary.jobs.reserve(summary.set.managers.size());
+    for (const auto& manager : summary.set.managers) {
+        auto job = source.observe(manager);
+        if (job) summary.jobs.push_back(std::move(*job));
+        else ++summary.unobservable;
+    }
+    return summary;
+}
+
+// A published observation is finalized, so a native id is enough to find it.
+const Job* find_complete(const std::vector<Job>& jobs, const std::string& native_job_id)
+{
+    for (const auto& job : jobs) {
         if (job.NativeJobID == native_job_id) return &job;
+    }
+    return nullptr;
+}
+
+const ProcessIdentity* manager_for(const ManagerSet& set, pid_t pid)
+{
+    for (const auto& manager : set.managers) {
+        if (manager.pid == pid) return &manager;
     }
     return nullptr;
 }
@@ -264,12 +297,12 @@ std::vector<pid_t> member_pids(const Job& job)
     return pids;
 }
 
-// Managers of the published jobs, in the scan's order.
-std::vector<ProcessIdentity> scanned_managers(const ScanResult& result)
+// Managers of the published jobs, in observation order.
+std::vector<ProcessIdentity> observed_managers(const std::vector<Job>& jobs)
 {
     std::vector<ProcessIdentity> managers;
-    managers.reserve(result.jobs.size());
-    for (const auto& job : result.jobs) managers.push_back(job.execution.manager);
+    managers.reserve(jobs.size());
+    for (const auto& job : jobs) managers.push_back(job.execution.manager);
     return managers;
 }
 
@@ -286,27 +319,14 @@ void sort_managers(std::vector<ProcessIdentity>& managers)
               });
 }
 
-bool contains_manager(const ManagerSet& set, const ProcessIdentity& manager)
-{
-    return std::find(set.managers.begin(), set.managers.end(), manager) != set.managers.end();
-}
-
 bool contains(const std::string& haystack, const std::string& needle)
 {
     return haystack.find(needle) != std::string::npos;
 }
 
-bool has_source_note(const ScanResult& result)
-{
-    for (const auto& note : result.notes) {
-        if (contains(note, "eBPF")) return true;
-    }
-    return false;
-}
-
 // A DiscoverySink carrying only the registration callback (the fixture has
 // no eBPF, so no exec hints can arrive).
-DiscoverySink scan_sink(JobSink on_job)
+DiscoverySink discovery_sink(JobSink on_job)
 {
     DiscoverySink sink;
     sink.on_job = std::move(on_job);
@@ -318,38 +338,36 @@ DiscoverySink scan_sink(JobSink on_job)
 // Tests
 // ---------------------------------------------------------------------------
 
-void condor_scan_finds_fixture_job(const Fixture& fixture)
+void condor_pass_finds_fixture_job(const Fixture& fixture)
 {
     CondorJobWatcher watcher(fixture_options(fixture));
     check(watcher.health().state == SourceState::Initializing,
           "a fresh adapter starts in SourceState::Initializing");
     check(!watcher.polling(), "constructing a discovery adapter must not start polling");
 
-    const auto result = watcher.scan();
-    check(result.ok(), "condor scan must succeed on the fixture: " + result.error);
-    check(result.complete, "condor scan must report complete source coverage");
-    check(result.counts.candidates == 3, "three slot cgroups enumerated as candidates, got " +
-                                             std::to_string(result.counts.candidates));
-    check(result.counts.complete == 1 && result.counts.incomplete == 2,
-          "one complete and two incomplete condor observations, got complete=" +
-              std::to_string(result.counts.complete) + " incomplete=" +
-              std::to_string(result.counts.incomplete));
-    bool saw_subtree_note = false;
-    for (const auto& note : result.notes) {
-        if (contains(note, "starters enumerated from cgroup subtree")) saw_subtree_note = true;
-    }
-    check(saw_subtree_note,
-          "the cgroup-subtree enumeration tier must engage and say so in the notes");
-    check(has_source_note(result),
+    const auto pass = run_pass(watcher);
+    check(pass.set.error.empty(), "condor pass must succeed on the fixture: " + pass.set.error);
+    check(pass.set.complete, "condor pass must report complete source coverage");
+    check(pass.set.managers.size() == 3,
+          "three slot cgroups must name three managers, got " +
+              std::to_string(pass.set.managers.size()));
+    check(pass.jobs.size() == 1 && pass.unobservable == 2,
+          "one complete and two unobservable condor managers, got jobs=" +
+              std::to_string(pass.jobs.size()) + " unobservable=" +
+              std::to_string(pass.unobservable));
+    const std::string note = watcher.health().last_note;
+    check(contains(note, "starters enumerated from cgroup subtree"),
+          "the cgroup-subtree enumeration tier must engage and say so in the health notes");
+    check(contains(note, "eBPF"),
           "an unavailable/disabled eBPF event source must be reported as an explicit note");
-    // Every discovered Job carries a process-monotonic read order, assigned
+    // Every observed Job carries a process-monotonic read order, assigned
     // before the builder reads, so the store can reject an older pass
 
-    for (const auto& discovered : result.jobs)
+    for (const auto& discovered : pass.jobs)
         check(discovered.execution.read_order > 0,
               "a discovered Job must carry a read order");
 
-    const auto* job = find_complete(result, "76226337.0");
+    const auto* job = find_complete(pass.jobs, "76226337.0");
     check(job != nullptr, "the fixture Condor job must be a complete discovery");
     check(job->subtype_name == "condor", "scheduler type must be condor");
     const auto identity = canonicalize(selector_of(*job));
@@ -377,35 +395,34 @@ void condor_scan_finds_fixture_job(const Fixture& fixture)
           "schedd host must come from the job ad");
 
     const auto health = watcher.health();
-    check(health.state == SourceState::Healthy, "a successful scan makes the source healthy");
+    check(health.state == SourceState::Healthy, "a successful pass makes the source healthy");
     check(health.last_scan_success_ms == kFakeNowMs,
-          "health must record the successful scan timestamp");
-    check(health.consecutive_failures == 0, "a successful scan resets the failure count");
-    check(!health.polling, "scan() alone must not start a poll thread");
+          "health must record the successful pass timestamp");
+    check(health.consecutive_failures == 0, "a successful pass resets the failure count");
+    check(!health.polling, "the manager pass alone must not start a poll thread");
 }
 
-void condor_incomplete_observations_are_explicit(const Fixture& fixture)
+void condor_incomplete_observations_are_not_published(const Fixture& fixture)
 {
     CondorJobWatcher watcher(fixture_options(fixture));
-    const auto result = watcher.scan();
+    const auto pass = run_pass(watcher);
+    check(pass.set.error.empty(), "condor pass must succeed: " + pass.set.error);
 
-    // Incomplete discoveries are never published: the scan carries their
-    // reasons as notes and counts them, so the registry cannot see a half-read
-    // job.
-    bool saw_unreadable_ad = false;
-    bool saw_missing_global_job_id = false;
-    for (const auto& note : result.notes) {
-        if (contains(note, "unreadable") && contains(note, "missing.ad"))
-            saw_unreadable_ad = true;
-        if (contains(note, "no GlobalJobId")) saw_missing_global_job_id = true;
-    }
-    check(saw_unreadable_ad, "a missing ad file must produce an 'unreadable ad' reason");
-    check(saw_missing_global_job_id,
-          "an ad without GlobalJobId must produce its own reason");
-    check(result.counts.incomplete >= 2,
-          "incomplete discoveries must be counted, got " +
-              std::to_string(result.counts.incomplete));
-    for (const auto& discovered : result.jobs) {
+    // Incomplete discoveries are never published, so the registry cannot see a
+    // half-read job. The two starters with an unusable ad are enumerated (they
+    // are live managers) but observe() answers nullopt for them.
+    check(pass.unobservable == 2,
+          "both starters with an unusable ad must stay unpublished, got " +
+              std::to_string(pass.unobservable));
+    const auto* missing_ad = manager_for(pass.set, 4201);
+    check(missing_ad != nullptr, "the starter with the missing ad must be enumerated");
+    check(!watcher.observe(*missing_ad).has_value(),
+          "a missing ad file must not publish a Job");
+    const auto* unnamed_ad = manager_for(pass.set, 4301);
+    check(unnamed_ad != nullptr, "the starter with the nameless ad must be enumerated");
+    check(!watcher.observe(*unnamed_ad).has_value(),
+          "an ad without GlobalJobId must not publish a Job");
+    for (const auto& discovered : pass.jobs) {
         check(!discovered.NativeJobID.empty(),
               "no native job id may be synthesized for an unreadable ad");
         check(execution_complete(discovered.execution),
@@ -413,25 +430,24 @@ void condor_incomplete_observations_are_explicit(const Fixture& fixture)
     }
 }
 
-void slurm_scan_finds_fixture_job(const Fixture& fixture)
+void slurm_pass_finds_fixture_job(const Fixture& fixture)
 {
     auto options = fixture_options(fixture, "");
     options.discovery.slurm_spool_dir = fixture.slurmd.string();
     SlurmJobWatcher watcher(options);
 
-    const auto result = watcher.scan();
-    check(result.ok(), "slurm scan must succeed on the fixture: " + result.error);
-    check(result.complete, "slurm scan must report complete source coverage");
-    check(result.counts.candidates == 4,
-          "two slurmstepd processes plus two spool entries, got " +
-              std::to_string(result.counts.candidates));
-    check(result.counts.complete == 1 && result.counts.incomplete == 2,
-          "one complete and two incomplete slurm observations, got complete=" +
-              std::to_string(result.counts.complete) + " incomplete=" +
-              std::to_string(result.counts.incomplete));
-    check(result.counts.skipped >= 1, "a non job<id> spool entry must be counted as skipped");
+    const auto pass = run_pass(watcher);
+    check(pass.set.error.empty(), "slurm pass must succeed on the fixture: " + pass.set.error);
+    check(pass.set.complete, "slurm pass must report complete source coverage");
+    check(pass.set.managers.size() == 2,
+          "two slurmstepd processes must name two managers, got " +
+              std::to_string(pass.set.managers.size()));
+    check(pass.jobs.size() == 1 && pass.unobservable == 1,
+          "one complete and one unobservable slurm manager, got jobs=" +
+              std::to_string(pass.jobs.size()) + " unobservable=" +
+              std::to_string(pass.unobservable));
 
-    const auto* job = find_complete(result, "9002");
+    const auto* job = find_complete(pass.jobs, "9002");
     check(job != nullptr, "the fixture Slurm job must be a complete discovery");
     check(job->subtype_name == "slurm", "scheduler type must be slurm");
     const auto& slurm_step_attr = std::get<SlurmJobAttr>(job->sub_attr);
@@ -461,21 +477,51 @@ void slurm_scan_finds_fixture_job(const Fixture& fixture)
               slurm_attr.partition == "debug",
           "scheduler metadata must come from the members' environment");
 
-    bool saw_unattributable_stepd = false;
-    bool saw_spool_entry = false;
-    for (const auto& note : result.notes) {
-        if (contains(note, "no attributable job members"))
-            saw_unattributable_stepd = true;
-        if (contains(note, "no live slurmstepd")) saw_spool_entry = true;
-    }
-    check(saw_unattributable_stepd,
-          "a slurmstepd without attributable members must be an incomplete discovery");
-    check(saw_spool_entry,
-          "a spool directory without a live stepd must be observed as incomplete");
-    for (const auto& discovered : result.jobs) {
+    // A slurmstepd without attributable members is enumerated (it is live) but
+    // never published, so the registry cannot see a half-read job.
+    const auto* unattributable = manager_for(pass.set, 5201);
+    check(unattributable != nullptr, "the unattributable stepd must be enumerated");
+    check(!watcher.observe(*unattributable).has_value(),
+          "a slurmstepd without attributable members must not publish a Job");
+    for (const auto& discovered : pass.jobs) {
         check(execution_complete(discovered.execution),
               "a published slurm discovery must carry complete execution evidence");
     }
+}
+
+// The spool source no longer produces observations; it only participates in
+// the pass coverage. An unreadable configured spool root must degrade the
+// source, and spool entries must never become managers.
+void slurm_spool_root_is_pass_coverage(const Fixture& fixture)
+{
+    auto options = fixture_options(fixture, "");
+    options.discovery.slurm_spool_dir = (fixture.root / "missing-spool").string();
+    SlurmJobWatcher watcher(options);
+
+    const auto failed = watcher.enumerateManagers();
+    check(!failed.complete,
+          "an unreadable configured spool root must make the pass incomplete");
+    check(contains(failed.error, "spool"),
+          "the pass error must name the spool root: " + failed.error);
+    check(failed.managers.size() == 2,
+          "the live stepds are still enumerated, got " +
+              std::to_string(failed.managers.size()));
+    auto health = watcher.health();
+    check(health.state == SourceState::Degraded,
+          "an incomplete pass degrades the source");
+    check(health.consecutive_failures == 1, "the failure count must advance");
+
+    options.discovery.slurm_spool_dir = fixture.slurmd.string();
+    watcher.set_discovery_environment(options.discovery);
+    const auto recovered = watcher.enumerateManagers();
+    check(recovered.error.empty() && recovered.complete,
+          "the pass recovers once the spool root is readable: " + recovered.error);
+    check(recovered.managers.size() == 2,
+          "spool entries must not become managers, got " +
+              std::to_string(recovered.managers.size()));
+    health = watcher.health();
+    check(health.state == SourceState::Healthy,
+          "a readable spool root restores healthy state");
 }
 
 
@@ -486,26 +532,27 @@ void health_degrades_and_recovers(const Fixture& fixture)
     CondorJobWatcher watcher(options);
     check(watcher.health().state == SourceState::Initializing, "starts initializing");
 
-    const auto failed = watcher.scan();
-    check(!failed.ok(), "scan against a missing proc root must fail");
-    check(!failed.complete, "a failed scan is never complete");
-    check(failed.jobs.empty(), "a failed scan must not invent discoveries");
-    check(contains(failed.error, "missing-proc"), "the scan error must name the missing root");
+    const auto failed = watcher.enumerateManagers();
+    check(!failed.error.empty(), "a pass against a missing proc root must fail");
+    check(!failed.complete, "a failed pass is never complete");
+    check(failed.managers.empty(), "a failed pass must not invent managers");
+    check(contains(failed.error, "missing-proc"), "the pass error must name the missing root");
 
     auto health = watcher.health();
-    check(health.state == SourceState::Degraded, "a failed scan degrades the source");
+    check(health.state == SourceState::Degraded, "a failed pass degrades the source");
     check(contains(health.last_error, "missing-proc"), "health must keep the failure text");
     check(health.consecutive_failures == 1, "the failure count must advance");
     check(health.last_scan_success_ms == 0, "a failure must not look like a success");
 
     watcher.set_discovery_environment(fixture_options(fixture).discovery);
-    const auto recovered = watcher.scan();
-    check(recovered.ok() && recovered.complete, "the scan recovers once the root is readable");
+    const auto recovered = watcher.enumerateManagers();
+    check(recovered.error.empty() && recovered.complete,
+          "the pass recovers once the root is readable: " + recovered.error);
     health = watcher.health();
-    check(health.state == SourceState::Healthy, "a successful scan restores healthy state");
+    check(health.state == SourceState::Healthy, "a successful pass restores healthy state");
     check(health.consecutive_failures == 0, "recovery resets the failure count");
     check(health.last_scan_success_ms == kFakeNowMs, "recovery records the success timestamp");
-    check(!health.last_error.empty(), "the last error stays readable after recovery");
+    check(health.last_error.empty(), "a successful pass clears the last error");
 }
 
 void rescan_request_is_consumed(const Fixture& fixture)
@@ -513,8 +560,8 @@ void rescan_request_is_consumed(const Fixture& fixture)
     CondorJobWatcher watcher(fixture_options(fixture));
     watcher.request_rescan();
     check(watcher.health().rescan_requested, "a rescan request must be visible in health");
-    watcher.scan();
-    check(!watcher.health().rescan_requested, "a scan satisfies the pending rescan request");
+    watcher.enumerateManagers();
+    check(!watcher.health().rescan_requested, "a pass satisfies the pending rescan request");
 }
 
 void construction_does_nothing_until_start(const Fixture& fixture)
@@ -527,9 +574,12 @@ void construction_does_nothing_until_start(const Fixture& fixture)
     check(watcher.health().state == SourceState::Initializing,
           "a fresh adapter is initializing until a pass ran");
 
-    // A scan before start() works and stays usable for a scan-only owner.
-    const auto early = watcher.scan();
-    check(early.ok(), "scan() must work without start() (scan-only owner)");
+    // A pass before start() works: the registry heartbeat owns the timing.
+    const auto early = watcher.enumerateManagers();
+    check(early.error.empty() && early.complete,
+          "the manager pass must work without start(): " + early.error);
+    check(watcher.health().state == SourceState::Healthy,
+          "a pass records its health without start()");
 }
 
 void observe_hint_targets_one_execution(const Fixture& fixture)
@@ -545,7 +595,7 @@ void observe_hint_targets_one_execution(const Fixture& fixture)
     check(member_pids(*targeted).size() == 2,
           "the targeted discovery keeps the cgroup member list");
 
-    // Unresolvable hints fall back to the caller (full scan).
+    // Unresolvable hints yield nullopt; discovery then waits for the next pass.
     check(!condor.observeForHint(9999).has_value(), "a dead pid must not resolve");
     check(!condor.observeForHint(4101).has_value(),
           "a pid whose parent is not a starter must not resolve");
@@ -578,78 +628,60 @@ void polymorphic_source_interface(const Fixture& fixture)
         source->requestRescan();
         check(source->health().rescan_requested,
               "the interface must expose the rescan request");
-        const ScanResult result = source->scan();
+        const ManagerSet pass = source->enumerateManagers();
         check(source->health().rescan_requested == false,
-              "an interface scan satisfies the rescan request");
-        check(result.complete, "the interface scan must complete against the fixture");
+              "an interface pass satisfies the rescan request");
+        check(pass.error.empty() && pass.complete,
+              "the interface pass must complete against the fixture: " + pass.error);
         check(source->health().state == SourceState::Healthy,
-              "the interface health must recover");
+              "the interface health must record the pass");
     }
 
-    // A started scan-only source has nothing to poll; the sink stays installed.
+    // Without an event source there is nothing to poll; the sink stays installed.
     check(!sources[0]->start(DiscoverySink{}),
-          "start() without an event source and interval must report nothing to poll");
+          "start() without an event source must report nothing to poll");
 }
 
 void lifecycle_is_safe(const Fixture& fixture)
 {
-    auto options = fixture_options(fixture);
-    options.scan_interval_ms = 20;
-    CondorJobWatcher watcher(options);
+    CondorJobWatcher watcher(fixture_options(fixture));
 
     std::atomic<int> delivered{0};
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
     check(delivered.load() == 0,
           "no callback may run before start(): the sink is a start() argument");
 
-    check(watcher.start(scan_sink([&delivered](const Job&) { delivered.fetch_add(1); return UpsertResult{}; })),
-          "start() must run with a scan interval even without eBPF");
-    check(watcher.polling(), "start() must report polling");
-    check(watcher.thread_joinable(), "start() must own a joinable poll thread");
-    check(watcher.health().polling, "health must report the running poll thread");
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (delivered.load() == 0 && std::chrono::steady_clock::now() < deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    check(delivered.load() > 0, "the poll thread must deliver scanned observations to the sink");
+    // The fixture has no event source, so there is nothing to poll: start()
+    // refuses the thread and discovery stays with the registry pass.
+    check(!watcher.start(discovery_sink(
+              [&delivered](const Job&) { delivered.fetch_add(1); return UpsertResult{}; })),
+          "start() without an event source must report nothing to poll");
+    check(!watcher.polling(), "a refused start() must not report polling");
+    check(!watcher.thread_joinable(), "a refused start() must not own a thread");
+    check(!watcher.health().polling, "health must not report polling after a refused start");
 
     watcher.stop();
-    check(!watcher.polling(), "stop() must clear polling");
-    check(!watcher.thread_joinable(), "stop() must join and release the thread");
-
+    check(!watcher.polling() && !watcher.thread_joinable(),
+          "stop() after a refused start() is safe");
     watcher.stop();  // idempotent
     check(!watcher.thread_joinable(), "a second stop() must stay a no-op");
 
-    check(watcher.start(scan_sink([&delivered](const Job&) { delivered.fetch_add(1); return UpsertResult{}; })),
-          "start() after stop() must work");
-    check(watcher.polling(), "restart must poll again");
-    watcher.stop();
-    check(!watcher.polling() && !watcher.thread_joinable(), "stop()-start()-stop() is safe");
-
-    // The adapter stays usable for scans after its thread is gone.
-    const auto after_stop = watcher.scan();
-    check(after_stop.ok(), "scan() must still work after stop()");
-
-    // Nothing to poll: no event source and no interval.
-    CondorJobWatcher idle(fixture_options(fixture));
-    check(!idle.start(scan_sink([](const Job&) { return UpsertResult{}; })),
-          "start() must refuse to spin a thread with no event source and no interval");
-    check(!idle.polling(), "a refused start() must not report polling");
-    idle.stop();
-    check(!idle.thread_joinable(), "stop() after a refused start() is safe");
+    // The adapter stays usable for the authoritative pass after start()/stop().
+    const auto pass = run_pass(watcher);
+    check(pass.set.error.empty() && pass.set.complete,
+          "the adapter must serve a pass after stop(): " + pass.set.error);
+    check(pass.jobs.size() == 1 && pass.unobservable == 2,
+          "the pass must still publish the fixture job, got jobs=" +
+              std::to_string(pass.jobs.size()));
+    check(delivered.load() == 0,
+          "the exec-event sink must not receive manager-pass discoveries");
 
     // Same lifecycle for the Slurm adapter.
-    auto slurm_options = fixture_options(fixture, "");
-    slurm_options.scan_interval_ms = 20;
-    SlurmJobWatcher slurm(slurm_options);
-    std::atomic<int> slurm_delivered{0};
-    check(slurm.start(scan_sink([&slurm_delivered](const Job&) { slurm_delivered.fetch_add(1); return UpsertResult{}; })),
-          "the Slurm adapter must start its scan thread");
-    check(slurm.polling() && slurm.thread_joinable(), "the Slurm adapter owns a joined thread");
-    const auto slurm_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (slurm_delivered.load() == 0 && std::chrono::steady_clock::now() < slurm_deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    check(slurm_delivered.load() > 0, "the Slurm poll thread must deliver observations");
+    SlurmJobWatcher slurm(fixture_options(fixture, ""));
+    check(!slurm.start(discovery_sink([](const Job&) { return UpsertResult{}; })),
+          "the Slurm adapter must refuse a thread without an event source");
+    check(!slurm.polling() && !slurm.thread_joinable(),
+          "a refused Slurm start() must own no thread");
     slurm.stop();
     slurm.stop();
     check(!slurm.polling() && !slurm.thread_joinable(), "Slurm stop() is idempotent and joined");
@@ -867,7 +899,7 @@ void condor_refresh_without_cgroup_reads_children(const Fixture& fixture)
 // ---------------------------------------------------------------------------
 // Regression: the classic HTCondor layout where _CONDOR_JOB_AD lives on the
 // job child process, not on the starter (the old exec-event watcher read it
-// there). The scan path and the exec-hint path must both still find it.
+// there). The manager pass and the exec-hint path must both still find it.
 // ---------------------------------------------------------------------------
 
 void condor_ad_on_member_process_is_found(const Fixture& fixture)
@@ -886,11 +918,11 @@ void condor_ad_on_member_process_is_found(const Fixture& fixture)
     make_cgroup(fixture.cgroup, "/htcondor/slot4", {4401, 4410});
 
     CondorJobWatcher watcher(fixture_options(fixture));
-    const auto result = watcher.scan();
-    check(result.ok(), "the scan must succeed: " + result.error);
-    const auto* job = find_complete(result, "76226340.0");
+    const auto pass = run_pass(watcher);
+    check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
+    const auto* job = find_complete(pass.jobs, "76226340.0");
     check(job != nullptr,
-          "an ad that lives on the job process must be discovered by the scan");
+          "an ad that lives on the job process must be discovered by the pass");
     check(std::get<CondorJobAttr>(job->sub_attr).owner == "carol",
           "the ad metadata must come from the member's ad");
 
@@ -929,9 +961,9 @@ void condor_without_cgroup_still_resolves_members(const Fixture& fixture)
     auto options = fixture_options(fixture);
     options.starter_cgroup_subtree.clear();   // this layout predates slot cgroups
     CondorJobWatcher watcher(options);
-    const auto result = watcher.scan();
-    check(result.ok(), "the scan must succeed: " + result.error);
-    const auto* job = find_complete(result, "76226341.0");
+    const auto pass = run_pass(watcher);
+    check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
+    const auto* job = find_complete(pass.jobs, "76226341.0");
     check(job != nullptr, "an execution without a cgroup must still be identified");
     const auto members = member_pids(*job);
     check(members.size() == 2,
@@ -954,18 +986,16 @@ void condor_cgroup_subtree_missing_falls_back(const Fixture& fixture)
     auto options = fixture_options(fixture);
     options.starter_cgroup_subtree = "no-such-subtree";
     CondorJobWatcher watcher(options);
-    const auto result = watcher.scan();
-    check(result.ok(), "the scan must succeed despite the missing subtree: " + result.error);
-    check(result.complete, "a missing subtree must fall back to a complete pass");
-    bool saw_fallback_note = false;
-    for (const auto& note : result.notes) {
-        if (contains(note, "fell back to process-table scan")) saw_fallback_note = true;
-    }
-    check(saw_fallback_note, "the fallback must be visible in the notes");
-    check(result.counts.candidates == 5,
-          "the fallback scan must still find every starter, got " +
-              std::to_string(result.counts.candidates));
-    check(find_complete(result, "76226337.0") != nullptr,
+    const auto pass = run_pass(watcher);
+    check(pass.set.error.empty(),
+          "the pass must succeed despite the missing subtree: " + pass.set.error);
+    check(pass.set.complete, "a missing subtree must fall back to a complete pass");
+    check(contains(watcher.health().last_note, "fell back to process-table scan"),
+          "the fallback must be visible in the health notes");
+    check(pass.set.managers.size() == 5,
+          "the fallback pass must still find every starter, got " +
+              std::to_string(pass.set.managers.size()));
+    check(find_complete(pass.jobs, "76226337.0") != nullptr,
           "the fixture job must still be discovered through the fallback");
 }
 
@@ -980,18 +1010,15 @@ void condor_cgroup_subtree_without_starters_falls_back(const Fixture& fixture)
     auto options = fixture_options(fixture);
     options.starter_cgroup_subtree = "htcondor-empty";
     CondorJobWatcher watcher(options);
-    const auto result = watcher.scan();
-    check(result.ok() && result.complete,
-          "a starter-less subtree must fall back to a complete pass: " + result.error);
-    bool saw_fallback_note = false;
-    for (const auto& note : result.notes) {
-        if (contains(note, "fell back to process-table scan")) saw_fallback_note = true;
-    }
-    check(saw_fallback_note, "the starter-less subtree must fall back visibly");
-    check(result.counts.candidates == 5,
-          "the fallback scan must still find every starter, got " +
-              std::to_string(result.counts.candidates));
-    check(find_complete(result, "76226337.0") != nullptr,
+    const auto pass = run_pass(watcher);
+    check(pass.set.error.empty() && pass.set.complete,
+          "a starter-less subtree must fall back to a complete pass: " + pass.set.error);
+    check(contains(watcher.health().last_note, "fell back to process-table scan"),
+          "the starter-less subtree must fall back visibly");
+    check(pass.set.managers.size() == 5,
+          "the fallback pass must still find every starter, got " +
+              std::to_string(pass.set.managers.size()));
+    check(find_complete(pass.jobs, "76226337.0") != nullptr,
           "the fixture job must still be discovered through the fallback");
 }
 
@@ -999,86 +1026,86 @@ void condor_cgroup_subtree_without_starters_falls_back(const Fixture& fixture)
 // ---------------------------------------------------------------------------
 // Unified discovery: enumerateManagers() / observe()
 //
-// A discovery pass enumerates the managers cheaply and observes only the ones
-// it does not track yet. The manager set must be exactly the set the scan saw,
-// and observing one manager must reproduce that manager's Job without reading
-// any other execution.
+// The pass enumerates the managers cheaply and observes only the ones the
+// registry does not track yet. observe() must reproduce a manager's Job
+// without reading any other execution.
 // ---------------------------------------------------------------------------
 
-void condor_enumerate_managers_covers_scan(const Fixture& fixture)
+void condor_pass_owns_health(const Fixture& fixture)
 {
     std::int64_t now_ms = kFakeNowMs;
     auto options = fixture_options(fixture);
     options.clock = [&now_ms] { return now_ms; };
     CondorJobWatcher watcher(options);
-    const auto scanned = watcher.scan();
-    check(scanned.ok(), "the scan must succeed: " + scanned.error);
-    const auto enumerated = watcher.enumerateManagers();
-    check(enumerated.error.empty(), "manager enumeration must succeed: " + enumerated.error);
-    check(enumerated.complete == scanned.complete,
-          "the manager pass must report the same coverage as the scan");
-    for (const auto& job : scanned.jobs) {
-        check(contains_manager(enumerated, job.execution.manager),
-              "every published job's manager must be enumerated");
-    }
 
-    // An enumeration is a pass: it consumes the pending rescan request and
-    // records its own start time, while leaving the full-scan health state to
-    // scan(). Without this the heartbeat would see rescanRequested() forever and
-    // force a full scan on every tick.
-    const auto state_before = watcher.health().state;
+    const auto first = watcher.enumerateManagers();
+    check(first.error.empty() && first.complete,
+          "the pass must succeed: " + first.error);
+    // The configured slot subtree names four managers: slot1..slot3 plus the
+    // slot4 starter added by the ad-on-member regression. The cgroup-less
+    // starter has no slot directory and is invisible to this tier.
+    check(first.managers.size() == 4,
+          "the cgroup-subtree tier must name four managers, got " +
+              std::to_string(first.managers.size()));
+    auto health = watcher.health();
+    check(health.state == SourceState::Healthy, "a complete pass makes the source healthy");
+    check(health.last_scan_start_ms == kFakeNowMs, "the pass records its start time");
+    check(health.last_scan_success_ms == kFakeNowMs, "a successful pass records its end time");
+    check(health.consecutive_failures == 0, "a successful pass resets the failure count");
+
+    // The pass consumes a pending rescan request and stamps the new times.
+    // Without this the heartbeat would see rescanRequested() forever and force
+    // a pass on every tick.
     now_ms += 1000;
     watcher.requestRescan();
     check(watcher.health().rescan_requested,
           "a rescan request must be visible before the pass");
-    const auto refreshed = watcher.enumerateManagers();
-    const auto health_after = watcher.health();
-    check(refreshed.error.empty(), "the second enumeration must succeed: " + refreshed.error);
-    check(!health_after.rescan_requested,
-          "enumerateManagers() must consume the pending rescan request");
-    check(health_after.last_scan_start_ms == now_ms,
-          "an enumeration must record its own pass start time");
-    check(health_after.state == state_before,
-          "an enumeration must not claim a full-scan health state");
+    const auto second = watcher.enumerateManagers();
+    check(second.error.empty() && second.complete,
+          "the second pass must succeed: " + second.error);
+    health = watcher.health();
+    check(!health.rescan_requested, "the pass consumes the pending rescan request");
+    check(health.last_scan_start_ms == now_ms, "a pass records its own start time");
+    check(health.last_scan_success_ms == now_ms, "a successful pass records its end time");
+    check(health.state == SourceState::Healthy,
+          "a successful pass keeps the source healthy");
 }
 
-void slurm_enumerate_managers_covers_scan(const Fixture& fixture)
+void slurm_pass_owns_health(const Fixture& fixture)
 {
     std::int64_t now_ms = kFakeNowMs;
     auto options = fixture_options(fixture, "");
     options.discovery.slurm_spool_dir = fixture.slurmd.string();
     options.clock = [&now_ms] { return now_ms; };
     SlurmJobWatcher watcher(options);
-    const auto scanned = watcher.scan();
-    check(scanned.ok(), "the scan must succeed: " + scanned.error);
-    const auto enumerated = watcher.enumerateManagers();
-    check(enumerated.error.empty(), "manager enumeration must succeed: " + enumerated.error);
-    check(enumerated.complete == scanned.complete,
-          "the manager pass must report the same coverage as the scan");
-    for (const auto& job : scanned.jobs) {
-        check(contains_manager(enumerated, job.execution.manager),
-              "every published job's manager must be enumerated");
-    }
 
-    // Same contract as Condor: the enumeration pass consumes the rescan
-    // request and stamps its start time without touching the health state.
-    const auto state_before = watcher.health().state;
+    const auto first = watcher.enumerateManagers();
+    check(first.error.empty() && first.complete,
+          "the pass must succeed: " + first.error);
+    check(first.managers.size() == 2,
+          "the two fixture stepds must name two managers, got " +
+              std::to_string(first.managers.size()));
+    auto health = watcher.health();
+    check(health.state == SourceState::Healthy, "a complete pass makes the source healthy");
+    check(health.last_scan_start_ms == kFakeNowMs, "the pass records its start time");
+    check(health.last_scan_success_ms == kFakeNowMs, "a successful pass records its end time");
+
     now_ms += 1000;
     watcher.requestRescan();
     check(watcher.health().rescan_requested,
           "a rescan request must be visible before the pass");
-    const auto refreshed = watcher.enumerateManagers();
-    const auto health_after = watcher.health();
-    check(refreshed.error.empty(), "the second enumeration must succeed: " + refreshed.error);
-    check(!health_after.rescan_requested,
-          "enumerateManagers() must consume the pending rescan request");
-    check(health_after.last_scan_start_ms == now_ms,
-          "an enumeration must record its own pass start time");
-    check(health_after.state == state_before,
-          "an enumeration must not claim a full-scan health state");
+    const auto second = watcher.enumerateManagers();
+    check(second.error.empty() && second.complete,
+          "the second pass must succeed: " + second.error);
+    health = watcher.health();
+    check(!health.rescan_requested, "the pass consumes the pending rescan request");
+    check(health.last_scan_start_ms == now_ms, "a pass records its own start time");
+    check(health.last_scan_success_ms == now_ms, "a successful pass records its end time");
+    check(health.state == SourceState::Healthy,
+          "a successful pass keeps the source healthy");
 }
 
-void condor_enumerate_managers_matches_scan(const Fixture& /*shared*/)
+void condor_observe_matches_enumerated_managers(const Fixture& /*shared*/)
 {
     // A closed-set comparison needs every manager to publish a Job. The shared
     // fixture deliberately keeps two of its three starters incomplete (missing
@@ -1094,58 +1121,53 @@ void condor_enumerate_managers_matches_scan(const Fixture& /*shared*/)
                "Owner = \"carol\"\n");
 
     CondorJobWatcher watcher(fixture_options(fixture));
-    const auto scanned = watcher.scan();
-    check(scanned.ok(), "the scan must succeed: " + scanned.error);
-    check(scanned.jobs.size() == 3,
-          "all three starters must publish now, got " + std::to_string(scanned.jobs.size()));
+    const auto pass = run_pass(watcher);
+    check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
+    check(pass.jobs.size() == 3,
+          "all three starters must publish now, got " + std::to_string(pass.jobs.size()));
 
-    const auto enumerated = watcher.enumerateManagers();
-    check(enumerated.error.empty(), "manager enumeration must succeed: " + enumerated.error);
-    check(enumerated.complete == scanned.complete,
-          "the manager pass must report the same coverage as the scan");
-
-    auto scanned_set = scanned_managers(scanned);
-    auto enumerated_set = enumerated.managers;
-    sort_managers(scanned_set);
+    auto observed_set = observed_managers(pass.jobs);
+    auto enumerated_set = pass.set.managers;
+    sort_managers(observed_set);
     sort_managers(enumerated_set);
-    check(enumerated_set.size() == scanned_set.size(),
+    check(enumerated_set.size() == observed_set.size(),
           "one manager per published job, got " + std::to_string(enumerated_set.size()) +
-              " for " + std::to_string(scanned_set.size()) + " jobs");
+              " for " + std::to_string(observed_set.size()) + " jobs");
     for (std::size_t index = 0; index < enumerated_set.size(); ++index) {
-        check(enumerated_set[index] == scanned_set[index],
-              "the enumerated manager set must equal the scan's manager set");
+        check(enumerated_set[index] == observed_set[index],
+              "the enumerated manager set must equal the observed manager set");
         check(enumerated_set[index].complete(),
               "an enumerated manager must carry the full identity triple");
     }
 
     // observe() must reproduce that manager's Job: same native identity, same
     // manager, same member set.
-    const auto* scanned_job = find_complete(scanned, "76226337.0");
-    check(scanned_job != nullptr, "the fixture Condor job must be a complete discovery");
-    const auto observed = watcher.observe(scanned_job->execution.manager);
+    const auto* published_job = find_complete(pass.jobs, "76226337.0");
+    check(published_job != nullptr, "the fixture Condor job must be a complete discovery");
+    const auto observed = watcher.observe(published_job->execution.manager);
     check(observed.has_value(), "observing a live manager must return its Job");
-    check(observed->NativeJobID == scanned_job->NativeJobID,
+    check(observed->NativeJobID == published_job->NativeJobID,
           "observe() must name the same native job, got " + observed->NativeJobID);
-    check(observed->execution.manager == scanned_job->execution.manager,
+    check(observed->execution.manager == published_job->execution.manager,
           "observe() must keep the manager identity triple");
-    check(member_pids(*observed) == member_pids(*scanned_job),
+    check(member_pids(*observed) == member_pids(*published_job),
           "observe() must reproduce the manager's member set");
 
     // A manager the pass never reported is not observable: a stale start-tick
     // value and an unknown pid must both yield nullopt, never a Job.
-    ProcessIdentity stale = scanned_job->execution.manager;
+    ProcessIdentity stale = published_job->execution.manager;
     stale.start_ticks += 1;
     check(!watcher.observe(stale).has_value(),
           "a manager with mismatching start ticks must not be observed");
     ProcessIdentity unknown;
     unknown.pid = 999999;
     unknown.start_ticks = 1;
-    unknown.boot_id = scanned_job->execution.manager.boot_id;
+    unknown.boot_id = published_job->execution.manager.boot_id;
     check(!watcher.observe(unknown).has_value(),
           "an unknown manager must not be observed");
 }
 
-void slurm_enumerate_managers_matches_scan(const Fixture& /*shared*/)
+void slurm_observe_matches_enumerated_managers(const Fixture& /*shared*/)
 {
     // Same closed-set requirement as the Condor case: give the fixture's second
     // stepd an attributable member so both managers publish.
@@ -1161,35 +1183,30 @@ void slurm_enumerate_managers_matches_scan(const Fixture& /*shared*/)
     auto options = fixture_options(fixture, "");
     options.discovery.slurm_spool_dir = fixture.slurmd.string();
     SlurmJobWatcher watcher(options);
-    const auto scanned = watcher.scan();
-    check(scanned.ok(), "the scan must succeed: " + scanned.error);
-    check(scanned.jobs.size() == 2,
-          "both stepds must publish now, got " + std::to_string(scanned.jobs.size()));
+    const auto pass = run_pass(watcher);
+    check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
+    check(pass.jobs.size() == 2,
+          "both stepds must publish now, got " + std::to_string(pass.jobs.size()));
 
-    const auto enumerated = watcher.enumerateManagers();
-    check(enumerated.error.empty(), "manager enumeration must succeed: " + enumerated.error);
-    check(enumerated.complete == scanned.complete,
-          "the manager pass must report the same coverage as the scan");
-
-    auto scanned_set = scanned_managers(scanned);
-    auto enumerated_set = enumerated.managers;
-    sort_managers(scanned_set);
+    auto observed_set = observed_managers(pass.jobs);
+    auto enumerated_set = pass.set.managers;
+    sort_managers(observed_set);
     sort_managers(enumerated_set);
-    check(enumerated_set.size() == scanned_set.size(),
+    check(enumerated_set.size() == observed_set.size(),
           "one manager per published job, got " + std::to_string(enumerated_set.size()));
     for (std::size_t index = 0; index < enumerated_set.size(); ++index) {
-        check(enumerated_set[index] == scanned_set[index],
-              "the enumerated manager set must equal the scan's manager set");
+        check(enumerated_set[index] == observed_set[index],
+              "the enumerated manager set must equal the observed manager set");
         check(enumerated_set[index].complete(),
               "an enumerated manager must carry the full identity triple");
     }
 
     // One observe() per manager, each reproducing its own Job.
-    for (const auto& manager : enumerated.managers) {
+    for (const auto& manager : pass.set.managers) {
         const auto observed = watcher.observe(manager);
         check(observed.has_value(), "observing a live stepd must return its Job");
         bool matched = false;
-        for (const auto& job : scanned.jobs) {
+        for (const auto& job : pass.jobs) {
             if (job.execution.manager != manager) continue;
             matched = true;
             check(observed->NativeJobID == job.NativeJobID,
@@ -1201,16 +1218,51 @@ void slurm_enumerate_managers_matches_scan(const Fixture& /*shared*/)
     }
 
     // A stale or unknown manager must yield nullopt, never a Job.
-    ProcessIdentity stale = enumerated.managers.front();
+    ProcessIdentity stale = pass.set.managers.front();
     stale.start_ticks += 1;
     check(!watcher.observe(stale).has_value(),
           "a manager with mismatching start ticks must not be observed");
     ProcessIdentity unknown;
     unknown.pid = 999999;
     unknown.start_ticks = 1;
-    unknown.boot_id = enumerated.managers.front().boot_id;
+    unknown.boot_id = pass.set.managers.front().boot_id;
     check(!watcher.observe(unknown).has_value(),
           "an unknown manager must not be observed");
+}
+
+void condor_daemon_shared_cgroup_falls_back(const Fixture& /*shared*/)
+{
+    // A node without per-job cgroups puts a starter in the service cgroup
+    // together with every daemon (and with the starter's own parent). That
+    // cgroup must never be attributed to the job: the typed cgroup path is
+    // cleared and membership comes from the starter's children.
+    Fixture fixture;
+    make_fixture(fixture, "/tmp/job_watcher_scan_shared_cgroup");
+    const auto ad = fixture.ads / "76226342.0.ad";
+    write_file(ad,
+               "GlobalJobId = \"scheduler@schedd07.fixture#76226342.0#1775723895\"\n"
+               "Owner = \"erin\"\n");
+    make_process(fixture.proc, 4700, "condor_master", 1, 7400, {}, "/htcondor/shared");
+    make_process(fixture.proc, 4701, "condor_starter", 4700, 7401,
+                 {{"_CONDOR_JOB_AD", ad.string()}}, "/htcondor/shared");
+    make_process(fixture.proc, 4710, "sleep", 4701, 7410, {{}}, "/htcondor/shared");
+    make_cgroup(fixture.cgroup, "/htcondor/shared", {4700, 4701, 4710});
+    make_children(fixture.proc, 4701, {4710});
+
+    auto options = fixture_options(fixture);
+    options.starter_cgroup_subtree.clear();  // the service cgroup is not a slot dir
+    CondorJobWatcher watcher(options);
+    const auto pass = run_pass(watcher);
+    check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
+    const auto* job = find_complete(pass.jobs, "76226342.0");
+    check(job != nullptr, "the starter in the daemon cgroup must still publish");
+    check(std::get<CondorJobAttr>(job->sub_attr).slots_cgroup_path.empty(),
+          "a daemon-shared cgroup must not be recorded as the job's cgroup");
+    const auto members = member_pids(*job);
+    check(members.size() == 1 && members[0] == 4710,
+          "members must come from the starter's children, not the daemon tree");
+    check(!job->execution.members_authoritative,
+          "a children-only read is partial evidence");
 }
 
 void slurm_empty_cgroup_stays_authoritative(const Fixture& /*shared*/)
@@ -1235,9 +1287,9 @@ void slurm_empty_cgroup_stays_authoritative(const Fixture& /*shared*/)
 
     auto options = fixture_options(fixture, "");
     SlurmJobWatcher watcher(options);
-    const auto result = watcher.scan();
-    check(result.ok(), "the scan must succeed: " + result.error);
-    const auto* job = find_complete(result, "9004");
+    const auto pass = run_pass(watcher);
+    check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
+    const auto* job = find_complete(pass.jobs, "9004");
     check(job != nullptr, "the stepd must still publish from its children");
     check(job->execution.members_authoritative,
           "a readable empty step cgroup must stay authoritative (an empty set is evidence)");
@@ -1248,9 +1300,10 @@ void slurm_empty_cgroup_stays_authoritative(const Fixture& /*shared*/)
     // The unreadable counterpart must stay partial: the same execution with the
     // cgroup file removed cannot claim a confirmed member set.
     fs::remove(fixture.cgroup / "slurm" / "job_9004" / "step_2" / "cgroup.procs");
-    const auto unreadable = watcher.scan();
-    check(unreadable.ok(), "the scan must survive an unreadable cgroup: " + unreadable.error);
-    const auto* partial = find_complete(unreadable, "9004");
+    const auto unreadable = run_pass(watcher);
+    check(unreadable.set.error.empty(),
+          "the pass must survive an unreadable cgroup: " + unreadable.set.error);
+    const auto* partial = find_complete(unreadable.jobs, "9004");
     check(partial != nullptr, "the stepd must still publish from its children");
     check(!partial->execution.members_authoritative,
           "an unreadable step cgroup must not claim an authoritative member set");
@@ -1273,10 +1326,11 @@ int main(int argc, char** argv)
             void (*run)(const Fixture&);
         };
         const Test tests[] = {
-            {"condor_scan_finds_fixture_job", condor_scan_finds_fixture_job},
-            {"condor_incomplete_observations_are_explicit",
-             condor_incomplete_observations_are_explicit},
-            {"slurm_scan_finds_fixture_job", slurm_scan_finds_fixture_job},
+            {"condor_pass_finds_fixture_job", condor_pass_finds_fixture_job},
+            {"condor_incomplete_observations_are_not_published",
+             condor_incomplete_observations_are_not_published},
+            {"slurm_pass_finds_fixture_job", slurm_pass_finds_fixture_job},
+            {"slurm_spool_root_is_pass_coverage", slurm_spool_root_is_pass_coverage},
             {"health_degrades_and_recovers", health_degrades_and_recovers},
             {"rescan_request_is_consumed", rescan_request_is_consumed},
             {"construction_does_nothing_until_start", construction_does_nothing_until_start},
@@ -1297,10 +1351,14 @@ int main(int argc, char** argv)
              condor_cgroup_subtree_without_starters_falls_back},
             // Unified discovery (enumerateManagers/observe), appended last for
             // the same fixture-mutation reason.
-            {"condor_enumerate_managers_covers_scan", condor_enumerate_managers_covers_scan},
-            {"slurm_enumerate_managers_covers_scan", slurm_enumerate_managers_covers_scan},
-            {"condor_enumerate_managers_matches_scan", condor_enumerate_managers_matches_scan},
-            {"slurm_enumerate_managers_matches_scan", slurm_enumerate_managers_matches_scan},
+            {"condor_pass_owns_health", condor_pass_owns_health},
+            {"slurm_pass_owns_health", slurm_pass_owns_health},
+            {"condor_observe_matches_enumerated_managers",
+             condor_observe_matches_enumerated_managers},
+            {"slurm_observe_matches_enumerated_managers",
+             slurm_observe_matches_enumerated_managers},
+            {"condor_daemon_shared_cgroup_falls_back",
+             condor_daemon_shared_cgroup_falls_back},
             {"slurm_empty_cgroup_stays_authoritative", slurm_empty_cgroup_stays_authoritative},
             // Fact refresh without a readable cgroup, appended last: it adds
             // its own starter/child pair to the shared fixture.

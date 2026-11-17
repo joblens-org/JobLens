@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Discovery-adapter scan/health/lifecycle acceptance (Task 3, items 1-2):
-# CondorJobWatcher::scan()/health()/start()/stop() against a fixture procfs,
-# cgroup, job-ad and slurmd-spool tree.
+# Discovery-adapter manager-pass/health/lifecycle acceptance (Task 3, items 1-2):
+# CondorJobWatcher::enumerateManagers()/observe()/health()/start()/stop()
+# against a fixture procfs, cgroup, job-ad and slurmd-spool tree.
 #
 # Usage:
 #   bash tests/integration/run_watcher_scan_test.sh [build-dir]
@@ -12,7 +12,7 @@
 # JobLens link command, so the sources are exercised exactly as shipped.
 #
 # No root and no eBPF are required: the fixture supplies the discovery roots and
-# an unavailable event source is reported as an explicit scan note.
+# an unavailable event source is reported as an explicit pass note.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 

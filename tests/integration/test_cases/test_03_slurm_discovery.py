@@ -102,7 +102,7 @@ def test_slurm_job_has_pids(
     """已发现的 Slurm 作业拥有非空的进程 PID 列表。
 
     SlurmJobWatcher 通过 eBPF 捕获 slurmstepd 子进程 exec 事件后,
-    update_job_pids() 从 cgroup 中收集该作业的所有进程 PID。
+    observe() 读取该 step cgroup 的 cgroup.procs 得到作业的成员进程 PID。
     """
     submit_slurm_job(controller)
     slurm_job = _wait_for_slurm_job(joblens_api, timeout=60.0)

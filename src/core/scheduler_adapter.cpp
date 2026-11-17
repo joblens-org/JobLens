@@ -106,15 +106,6 @@ void ISchedulerAdapter::applyMemberEvidence(Job& job, const std::string& proc_ro
     }
 }
 
-RefreshResult ISchedulerAdapter::refreshFacts(Job& job,
-                                              const ProcessLivenessProbe& process_probe,
-                                              const CgroupMembershipProbe& cgroup_probe) const
-{
-    // Generic/manual rows carry no scheduler reader of their own: the probes
-    // over the recorded evidence are the fact source.
-    return probeExecutionEvidence(job, process_probe, cgroup_probe);
-}
-
 RefreshResult ISchedulerAdapter::refreshManagerMembership(
     Job& job, const std::string& proc_root, const std::string& cgroup_root,
     const std::string& recorded_cgroup_path,
