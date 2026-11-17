@@ -2071,7 +2071,7 @@ void JobRegistry::remove_job_from_kernel(const Job& job, bool& ok, std::string& 
 // discovery upsert: manual input has no execution evidence to merge)
 // ---------------------------------------------------------------------------
 
-bool JobRegistry::createManualJob(const Job& job) {
+bool JobRegistry::createManualJob(Job& job) {
     spdlog::info("JobRegistry: addJob entry JobID={}, native_id={}, collectors={}, PIDs={}",
                  job.JobID, job.NativeJobID, job.CollectorNames.size(), pids_of(job).size());
     // 错误检查
@@ -2200,13 +2200,15 @@ bool JobRegistry::createManualJob(const Job& job) {
     // never a synchronous apply on this stack.
     wake_runtime();
     spdlog::info("JobRegistry: add job with JobID {}", job_copy.JobID);
+    job.JobID = job_copy.JobID;
     return true;
 }
 
 bool JobRegistry::addJob(const Job& job) {
     // Thin alias: the CREATE branch of the manual upsert, exactly the
     // historical registration semantics.
-    return createManualJob(job);
+    Job copy = job;
+    return createManualJob(copy);
 }
 
 JobRegistry::ManualTarget JobRegistry::manualUpdateTarget(
@@ -2337,10 +2339,18 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
             job.JobID, job.NativeJobID);
         return out;
     }
-    // The create response keeps the historical shape (status only): old
-    // consumers of the manual add see no contract change on this path.
+    // Return the created resource identity. The legacy trigger adapter ignores
+    // these fields; the v2 job resource uses them to address the new record.
     nlohmann::json out;
     out["status"] = "success";
+    out["JobID"] = create_job.JobID;
+    out["internal_job_id"] = format_internal_id(create_job.JobID);
+    out["instance_id"] = format_internal_id(create_job.JobID);
+    if (const auto record = jobRecord(create_job.JobID)) {
+        out["record_revision"] = record->revision;
+        out["mode"] = to_string(record->selection.mode());
+        out["desired_collectors"] = record->selection.effectiveCollectors();
+    }
     return out;
 }
 

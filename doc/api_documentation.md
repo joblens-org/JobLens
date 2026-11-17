@@ -680,6 +680,35 @@ Trigger never declares a capability the Core did not report.
 
 ---
 
+## 13. v2 Resource API
+
+The v2 surface is resource-oriented and returns the Core `JobRecord` representation.
+The v1 routes above remain unchanged; v1 and v2 share the same Trigger adapter and
+the same Core methods. The legacy `/joblens/capabilities` response also keeps
+`inventory_version` (1) and `inventory_ready` aliases; `/joblens/inventory/status`
+keeps `inventory_enabled`.
+
+| Method | Path | Semantics |
+|---|---|---|
+| `GET` | `/joblens/v2/jobs` | Paginated job records; same `limit`/`cursor`/filters as `/joblens/jobs/list` |
+| `GET` | `/joblens/v2/jobs/count` | Active job-record count |
+| `GET` | `/joblens/v2/jobs/<internal_job_id>` | One job record |
+| `PUT` | `/joblens/v2/jobs` | Identity-resolved upsert (`jobs/upsert`); body has no `opt` field |
+| `DELETE` | `/joblens/v2/jobs/<internal_job_id>` | Erase/retire (`jobs/erase`) |
+| `POST` | `/joblens/v2/jobs/<internal_job_id>/stop` | Stop collection, retain the record (`jobs/stop`) |
+| `GET` | `/joblens/v2/jobs/<internal_job_id>/collection` | Desired/applied collection state |
+| `PUT` | `/joblens/v2/jobs/<internal_job_id>/collection` | Replace desired collectors (`{"collectors": [...]}`; `[]` stops) |
+| `DELETE` | `/joblens/v2/jobs/<internal_job_id>/collection` | Clear the manual override (reset_auto) |
+| `GET` | `/joblens/v2/status` | Same status payload as `/joblens/jobs/status` |
+| `GET` | `/joblens/v2/capabilities` | Same capabilities payload; `api_version` is `2` |
+
+The v2 job representation includes `internal_job_id`, `record_revision`, `state`,
+`desired_collectors`, `mode`, `processes`, `generation` and `attributes`. The v1
+`dump_job` shape is reconstructed by the Trigger adapter from the same record, so
+old clients do not need to change.
+
+---
+
 ## Response Status Code Summary
 
 | Code | Description |

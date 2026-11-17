@@ -391,7 +391,7 @@ private:
     void regRPCHandle();
     // --- Manual CRUD upsert internals ----------------------------------------
     // The CREATE branch: the manual registration body verbatim.
-    bool createManualJob(const Job& job);
+    bool createManualJob(Job& job);
     // UPDATE-branch routing: the identity selector first (namespace rules),
     // then the typed sub_attr matcher, which discriminates by the
     // subtype's scheduler (schedd) attribution — an identity-less row keeps

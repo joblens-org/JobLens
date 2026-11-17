@@ -860,11 +860,29 @@ def test_read_capabilities_are_forwarded_verbatim(install_core) -> None:
     }
     fake = install_core(response=core_payload)
 
-    response = _app().test_client().get("/joblens/capabilities")
+    response = _app().test_client().get("/joblens/v2/capabilities")
 
     assert response.status_code == 200
     assert fake.calls == [("joblens/capabilities", {})]
     assert response.get_json() == core_payload
+
+
+def test_v1_capabilities_keep_the_legacy_field_aliases(install_core) -> None:
+    install_core(response={
+        "status": "ok",
+        "api_version": 2,
+        "collection_control_version": 1,
+        "native_identity_selectors": True,
+        "job_scope": "current_local_instances",
+        "db_schema_version": 5,
+        "ready": True,
+    })
+
+    payload = _app().test_client().get("/joblens/capabilities").get_json()
+
+    assert payload["api_version"] == 2
+    assert payload["inventory_version"] == 1
+    assert payload["inventory_ready"] is True
 
 
 def test_read_capabilities_are_not_invented_when_core_lacks_them(install_core) -> None:
@@ -927,6 +945,9 @@ def test_job_namespace_claims_reach_rpc_unchanged(
         def __init__(self, socket_path, timeout):
             pass
 
+        def get_function_list(self):
+            return ["jobs/upsert", "jobs/stop", "jobs/erase"]
+
         def call(self, method, params):
             calls.append((method, params))
             if core_error:
@@ -942,7 +963,7 @@ def test_job_namespace_claims_reach_rpc_unchanged(
     response = _app().test_client().post("/joblens/job", json=body)
 
     assert response.status_code == (500 if core_error else 200)
-    assert len(calls) == 1 and calls[0][0] == "JobRegistry/job_opt"
+    assert len(calls) == 1 and calls[0][0] == "jobs/upsert"
     assert calls[0][1]["cluster_name"] == cluster_name
     assert calls[0][1]["cluster_tag"] == cluster_tag
     assert calls[0][1]["sub_attr"] == sub_attr
@@ -1000,3 +1021,219 @@ def test_erase_job_remove_erase_is_coerced_to_boolean(monkeypatch: pytest.Monkey
 
     assert response.status_code == 200
     assert forwarded.get("erase") is True
+
+
+# ==================== v2 resource API ====================
+
+
+def _record(**overrides: Any) -> dict:
+    record = {
+        "internal_job_id": "42",
+        "native_job_id": "172.0",
+        "scheduler_type": "condor",
+        "cluster_name": "htcondor01",
+        "cluster_tag": "schedd-a",
+        "state": "active",
+        "desired_collectors": ["cpumem_collector"],
+        "processes": [{"pid": 1235, "start_ticks": 1000, "boot_id": "boot"}],
+        "attributes": {"owner": "alice"},
+    }
+    record.update(overrides)
+    return record
+
+
+def test_v2_job_list_is_the_resource_page(install_core) -> None:
+    payload = {
+        "status": "ok",
+        "snapshot_revision": 7,
+        "records": [_record()],
+        "next_cursor": None,
+    }
+    fake = install_core(response=payload)
+
+    response = _app().test_client().get("/joblens/v2/jobs?limit=1")
+
+    assert response.status_code == 200
+    assert fake.calls == [("jobs/list", {"limit": 1})]
+    assert response.get_json() == payload
+
+
+def test_v2_job_get_forwards_internal_job_id(install_core) -> None:
+    fake = install_core(response={"status": "ok", **_record()})
+
+    response = _app().test_client().get("/joblens/v2/jobs/42")
+
+    assert response.status_code == 200
+    assert fake.calls == [("jobs/get", {"internal_job_id": "42"})]
+    assert response.get_json()["internal_job_id"] == "42"
+
+
+def test_v2_job_upsert_omits_legacy_opt_field(install_core) -> None:
+    fake = install_core(response={"status": "success", "internal_job_id": "42"})
+
+    response = _app().test_client().put(
+        "/joblens/v2/jobs",
+        json={
+            "type": "job.condor",
+            "JobPIDs": [1235],
+            "Lens": ["cpumem_collector"],
+            "sub_attr": {"cluster_id": 172, "proc_id": 0},
+        },
+    )
+
+    assert response.status_code == 200
+    method, payload = fake.calls[0]
+    assert method == "jobs/upsert"
+    assert "opt" not in payload
+    assert payload["sub_attr"] == {"cluster_id": 172, "proc_id": 0}
+
+
+def test_v2_job_erase_and_stop_are_distinct(install_core) -> None:
+    fake = install_core(response={"status": "success", "mode": "stop"})
+    client = _app().test_client()
+
+    erase = client.delete("/joblens/v2/jobs/42")
+    stop = client.post("/joblens/v2/jobs/42/stop")
+
+    assert erase.status_code == 200
+    assert stop.status_code == 200
+    assert fake.calls == [
+        ("jobs/erase", {"JobID": 42}),
+        ("jobs/stop", {"JobID": 42}),
+    ]
+
+
+def test_v2_collection_subresource_verbs(install_core) -> None:
+    fake = install_core(response={"status": "accepted", "targets": [_target()]})
+    client = _app().test_client()
+
+    read = client.get("/joblens/v2/jobs/42/collection")
+    put = client.put(
+        "/joblens/v2/jobs/42/collection",
+        json={"collectors": ["cpumem_collector"], "expected_revision": 3},
+    )
+    delete = client.delete("/joblens/v2/jobs/42/collection")
+
+    assert read.status_code == 200
+    assert put.status_code == 200
+    assert delete.status_code == 200
+    assert [call[0] for call in fake.calls] == [
+        "jobs/collection/get",
+        "jobs/collection/set",
+        "jobs/collection/reset",
+    ]
+    assert fake.calls[1][1]["selector"] == {"internal_job_id": "42"}
+    assert fake.calls[1][1]["operation"] == "set"
+    assert fake.calls[1][1]["expected_revision"] == 3
+    assert fake.calls[2][1]["operation"] == "reset_auto"
+
+
+def test_v2_status_and_capabilities_are_shared(install_core) -> None:
+    install_core(response={"status": "ok", "api_version": 2, "ready": True})
+    client = _app().test_client()
+
+    status = client.get("/joblens/v2/status")
+    caps = client.get("/joblens/v2/capabilities")
+
+    assert status.status_code == 200
+    assert caps.status_code == 200
+
+
+# ==================== v1 compatibility projection ====================
+
+
+def test_legacy_jobs_list_projects_the_new_record_shape(install_core) -> None:
+    fake = install_core(
+        response={
+            "status": "ok",
+            "snapshot_revision": 1,
+            "records": [_record()],
+            "next_cursor": None,
+        }
+    )
+
+    response = _app().test_client().get("/joblens/jobs")
+
+    assert response.status_code == 200
+    job = response.get_json()["jobs"][0]
+    assert job["JobID"] == 42
+    assert job["NativeJobID"] == "172.0"
+    assert job["JobPIDs"] == [1235]
+    assert job["CollectorNames"] == ["cpumem_collector"]
+    assert job["sub_attr"] == {"owner": "alice"}
+    assert fake.calls == [("jobs/list", {"limit": 1000})]
+
+
+def test_legacy_job_count_uses_the_resource_count(install_core) -> None:
+    fake = install_core(response={"status": "ok", "job_count": 3})
+
+    response = _app().test_client().get("/joblens/jobs/count")
+
+    assert response.status_code == 200
+    assert response.get_json()["job_count"] == 3
+    assert fake.calls == [("jobs/count", {})]
+
+
+def test_legacy_pid_tracker_uses_diagnostics(install_core) -> None:
+    fake = install_core(
+        response={"status": "ok", "running": True, "pushed_events": 1, "dropped_events": 0}
+    )
+
+    response = _app().test_client().get("/joblens/pid_tracker/stats")
+
+    assert response.status_code == 200
+    assert fake.calls == [("diagnostics/pid_tracker", {})]
+
+
+def test_v1_inventory_status_keeps_the_legacy_enabled_alias(install_core) -> None:
+    install_core(response={
+        "status": "healthy",
+        "enabled": True,
+        "sources": [],
+    })
+
+    payload = _app().test_client().get("/joblens/inventory/status").get_json()
+
+    assert payload["enabled"] is True
+    assert payload["inventory_enabled"] is True
+
+
+def test_v1_inventory_records_keep_the_legacy_facts_revision_alias(install_core) -> None:
+    install_core(response={
+        "status": "ok",
+        "snapshot_revision": 1,
+        "records": [{"internal_job_id": "42", "record_revision": 7}],
+        "next_cursor": None,
+    })
+
+    payload = _app().test_client().get("/joblens/inventory").get_json()
+
+    assert payload["records"][0]["record_revision"] == 7
+    assert payload["records"][0]["facts_revision"] == 7
+
+
+def test_job_opt_adapter_maps_remove_to_stop_or_erase(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    class FakeRPC:
+        def __init__(self, socket_path, timeout):
+            pass
+
+        def get_function_list(self):
+            return ["jobs/upsert", "jobs/stop", "jobs/erase"]
+
+        def call(self, method, params):
+            calls.append((method, params))
+            return {"status": "success"}
+
+    monkeypatch.setattr(tools, "USE_MOCK_TOOLS", False)
+    monkeypatch.setattr(tools, "config", {
+        "lens_config": {"rpc_socket_path": "/tmp/test.sock", "rpc_timeout": 5},
+    })
+    monkeypatch.setattr(tools, "RPCClient", FakeRPC)
+
+    tools.job_opt({"opt": "remove", "JobID": 7})
+    tools.job_opt({"opt": "remove", "JobID": 7, "erase": True})
+
+    assert [call[0] for call in calls] == ["jobs/stop", "jobs/erase"]
+    assert all("erase" not in call[1] for call in calls)

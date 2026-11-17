@@ -555,6 +555,20 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
               "reset_auto must return to auto mode: " + reset.dump());
         check(reset["targets"].front()["desired_collectors"].empty(),
               "auto mode without a policy decision selects nothing: " + reset.dump());
+
+        // The dedicated reset sub-resource is the same command with the
+        // operation fixed by the route, not a second implementation.
+        const auto manual = rpc(
+            "jobs/collection/set",
+            collection_request(selector, "set", json::array({"cpumem_collector"})));
+        check(manual["targets"].front()["mode"] == "manual",
+              "set must create a manual override: " + manual.dump());
+        const auto reset_resource =
+            rpc("jobs/collection/reset", collection_request(selector, "reset_auto"));
+        check(reset_resource["status"] == "accepted" &&
+                  reset_resource["targets"].front()["mode"] == "auto",
+              "jobs/collection/reset must clear the manual override: " +
+                  reset_resource.dump());
     }
     // --- unknown operation --------------------------------------------
     {
@@ -630,13 +644,13 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
     {
         auto conflicting = add;
         conflicting["cluster_name"] = "another-pool";
-        const auto response = rpc("JobRegistry/job_opt", conflicting);
+        const auto response = rpc("jobs/upsert", conflicting);
         check(response.value("code", "") == "namespace_conflict",
               "contradictory top-level and typed pool must be rejected: " + response.dump());
     }
 
     {
-        const auto response = rpc("JobRegistry/job_opt", add);
+        const auto response = rpc("jobs/upsert", add);
         check(response["status"] == "success",
               "legacy add of an inventoried job must succeed: " + response.dump());
         check(response["JobID"] == ids.condor_legacy,
@@ -660,7 +674,7 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
     }
     // --- duplicate observation is not a failure ----------------------
     {
-        const auto response = rpc("JobRegistry/job_opt", add);
+        const auto response = rpc("jobs/upsert", add);
         check(response["status"] == "success",
               "a duplicate legacy add must not fail: " + response.dump());
         check(response["duplicate_observation"] == true,
@@ -670,7 +684,7 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
     }
     // --- ambiguous legacy add is actionable, not a guess -------------
     {
-        const auto ambiguous = rpc("JobRegistry/job_opt",
+        const auto ambiguous = rpc("jobs/upsert",
                                    json{{"opt", "add"},
                                         {"type", "job.condor"},
                                         {"JobPIDs", json::array({int(getpid())})},
@@ -685,13 +699,11 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
     }
     // --- legacy remove stops collection and keeps the job record -----
     {
-        const auto response = rpc("JobRegistry/job_opt",
-                                  json{{"opt", "remove"}, {"type", "job.condor"},
-                                       {"JobID", ids.condor_legacy}});
+        const auto response = rpc("jobs/stop",
+                                  json{{"JobID", ids.condor_legacy}});
         check(response["status"] == "success", "legacy remove must succeed: " + response.dump());
         check(response["stopped_count"] == 1, "legacy remove must stop collection");
         check(response["deleted_count"] == 0, "legacy remove must not archive the job record");
-        check(response["deprecated"] == true, "legacy remove must be observable as deprecated");
 
         check(registry.jobRecord(ids.condor_legacy).has_value(),
               "legacy remove must retain the job record");
@@ -713,11 +725,13 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
         }
         check(found, "the removed instance must still be listed in the registry");
     }
-    // --- internal-id lookup route stays untouched --------------------
+    // --- internal-id lookup is a resource read ------------------------
     {
-        const auto response = rpc("JobRegistry/get_job", json{{"JobID", ids.condor_legacy}});
-        check(response.contains("JobID") && response["JobID"] == ids.condor_legacy,
-              "the legacy internal-id lookup must keep working: " + response.dump());
+        const auto response = rpc(
+            "jobs/get", json{{"internal_job_id", format_internal_id(ids.condor_legacy)}});
+        check(response["status"] == "ok" &&
+                  response["internal_job_id"] == format_internal_id(ids.condor_legacy),
+              "the internal-id lookup must return the job resource: " + response.dump());
     }
 }
 
@@ -729,6 +743,10 @@ void run_job_record_cases(JobRegistry& registry, const Fixture& ids)
         check(all["status"] == "ok", "job list must succeed: " + all.dump());
         const auto total = all["records"].size();
         check(total >= size_t{8}, "job list must include the seeded instances");
+        const auto counted = rpc("jobs/count", json::object());
+        check(counted["status"] == "ok" &&
+                  counted["job_count"].get<size_t>() >= total,
+              "jobs/count must count the active records: " + counted.dump());
         check(all["next_cursor"].is_null(), "a single page must not advertise a cursor");
         check(all["snapshot_revision"].is_number_unsigned() ||
                   all["snapshot_revision"].is_number_integer(),
@@ -933,10 +951,8 @@ void run_erase_cases(JobRegistry& registry, const Fixture& ids, const std::strin
 
     // Default remove (no erase): stop semantics, mode observable.
     {
-        const auto response = rpc("JobRegistry/job_opt",
-                                  json{{"opt", "remove"},
-                                       {"type", "job.condor"},
-                                       {"JobID", ids.condor_b}});
+        const auto response = rpc("jobs/stop",
+                                  json{{"JobID", ids.condor_b}});
         check(response["status"] == "success",
               "default remove must keep succeeding: " + response.dump());
         check(response["mode"] == "stop",
@@ -950,11 +966,8 @@ void run_erase_cases(JobRegistry& registry, const Fixture& ids, const std::strin
     // Erase a never-collected instance (nothing was ever attached to it):
     // the retirement is a durable delete, no history row.
     {
-        const auto response = rpc("JobRegistry/job_opt",
-                                  json{{"opt", "remove"},
-                                       {"type", "job.condor"},
-                                       {"JobID", ids.condor_a_other},
-                                       {"erase", true}});
+        const auto response = rpc("jobs/erase",
+                                  json{{"JobID", ids.condor_a_other}});
         check(response["status"] == "success",
               "erase of a never-collected instance must succeed: " + response.dump());
         check(response["mode"] == "erase",
@@ -980,11 +993,8 @@ void run_erase_cases(JobRegistry& registry, const Fixture& ids, const std::strin
         check(registry.actualCollection(ids.slurm_batch).collectors.size() == 1,
               "erase: the runtime must hold a real attachment before the erase");
 
-        const auto response = rpc("JobRegistry/job_opt",
-                                  json{{"opt", "remove"},
-                                       {"type", "job.slurm"},
-                                       {"JobID", ids.slurm_batch},
-                                       {"erase", true}});
+        const auto response = rpc("jobs/erase",
+                                  json{{"JobID", ids.slurm_batch}});
         check(response["status"] == "success",
               "erase of a collected instance must succeed: " + response.dump());
         check(response["mode"] == "erase" && response["deleted_count"] == 1,

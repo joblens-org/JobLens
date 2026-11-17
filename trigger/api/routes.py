@@ -36,7 +36,7 @@ from trigger.utils.hardware_info import hardware_info
 # 兼容两种运行方式：以项目根目录运行或以 trigger 目录运行
 try:
     from trigger.api.schemas import (
-        JobRequest, CondorJobRequest, SlurmJobRequest,
+        JobRequest, JobUpsertRequest, CondorJobRequest, SlurmJobRequest,
         ErrorResponse, HealthResponse, RPCHealthResponse,
         JobResponse, JobCountResponse, JobsListResponse, JobDetailResponse,
         RPCFunctionsResponse, CollectorsPerfResponse, WritersPerfResponse, WriterInfoResponse,
@@ -44,13 +44,13 @@ try:
         RegistryStatusResponse, RegistryRegisterResponse,
         RulesListResponse, RulesSyncResponse, RuleStatusResponse,
         VersionResponse, UpgradeResponse, HardwareInfoResponse, PidTrackerStatsResponse,
-        CollectionControlRequest, CollectionControlResponse, CollectionStatusResponse,
+        CollectionControlRequest, JobCollectionIntentRequest, CollectionControlResponse, CollectionStatusResponse,
         CollectionErrorResponse, JobListPageResponse, JobLensStatusResponse,
         CapabilitiesResponse
     )
 except ImportError:
     from trigger.api.schemas import (
-        JobRequest, CondorJobRequest, SlurmJobRequest,
+        JobRequest, JobUpsertRequest, CondorJobRequest, SlurmJobRequest,
         ErrorResponse, HealthResponse, RPCHealthResponse,
         JobResponse, JobCountResponse, JobsListResponse, JobDetailResponse,
         RPCFunctionsResponse, CollectorsPerfResponse, WritersPerfResponse, WriterInfoResponse,
@@ -58,7 +58,7 @@ except ImportError:
         RegistryStatusResponse, RegistryRegisterResponse,
         RulesListResponse, RulesSyncResponse, RuleStatusResponse,
         VersionResponse, UpgradeResponse, HardwareInfoResponse, PidTrackerStatsResponse,
-        CollectionControlRequest, CollectionControlResponse, CollectionStatusResponse,
+        CollectionControlRequest, JobCollectionIntentRequest, CollectionControlResponse, CollectionStatusResponse,
         CollectionErrorResponse, JobListPageResponse, JobLensStatusResponse,
         CapabilitiesResponse
     )
@@ -191,6 +191,43 @@ def _structured_core_error(payload):
         logger.warning("Unknown core error code %r on job/collection API; replying 503", code)
         status = 503
     return _error_response(status, code, str(message), candidates)
+
+
+def _with_legacy_field_aliases(payload):
+    """v1 旧路径的字段别名；v2 只暴露新字段。"""
+    if not isinstance(payload, dict):
+        return payload
+    if 'enabled' in payload:
+        payload.setdefault('inventory_enabled', payload['enabled'])
+    if 'api_version' in payload:
+        # v1 advertised inventory_version=1; keep that value for old clients.
+        payload.setdefault('inventory_version', 1)
+    if 'ready' in payload:
+        payload.setdefault('inventory_ready', payload['ready'])
+    for record in payload.get('records') or []:
+        if isinstance(record, dict) and 'record_revision' in record:
+            record.setdefault('facts_revision', record['record_revision'])
+    return payload
+
+
+def _legacy_job_from_record(record):
+    """把 Core 的 JobRecord 投影成旧版 `/joblens/jobs` 的 dump_job 形状。
+
+    旧版 API 的字段集合保持不变；新增字段只在 v2 的资源表示里出现。
+    """
+    processes = record.get('processes') or []
+    return {
+        'JobID': int(record['internal_job_id']),
+        'NativeJobID': record.get('native_job_id', ''),
+        'clusterTag': record.get('cluster_tag', ''),
+        'cluster_name': record.get('cluster_name', ''),
+        'jobtype': 'job',
+        'subtype': record.get('scheduler_type') or 'common',
+        'JobPIDs': [process.get('pid') for process in processes
+                    if process.get('pid') is not None],
+        'CollectorNames': record.get('desired_collectors') or [],
+        'sub_attr': record.get('attributes') or {},
+    }
 
 
 def register_routes(app: Flask, rpc_client, config_manager, service_registrar, rule_manager):
@@ -381,7 +418,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             if isinstance(ret, dict) and ret.get('status') == 'error':
                 logger.error("Job opt failed: opt=%s, type=%s, JobID=%s, msg=%s",
                              opt_data.get('opt'), opt_data.get('type'), opt_data.get('JobID'), ret.get('msg'))
-                return abort(500, description=f"作业操作失败: {ret.get('msg', 'unknown error')}")
+                return abort(500, description=f"作业操作失败: {(ret.get('msg') or ret.get('message') or 'unknown error')}")
             logger.info("Job opt success: JobID=%s", opt_data.get('JobID'))
             response = JobResponse(status='ok', received=opt_data)
             return jsonify(response.model_dump())
@@ -431,7 +468,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             if isinstance(ret, dict) and ret.get('status') == 'error':
                 logger.error("Condor job add failed: JobID=%s, slot=%s, msg=%s",
                              opt_data.get('JobID'), opt_data.get('slot'), ret.get('msg'))
-                return abort(500, description=f"Condor作业添加失败: {ret.get('msg', 'unknown error')}")
+                return abort(500, description=f"Condor作业添加失败: {(ret.get('msg') or ret.get('message') or 'unknown error')}")
             logger.info("Condor job add success: JobID=%s, slot=%s", opt_data.get('JobID'), opt_data.get('slot'))
             response = JobResponse(status='ok', received=opt_data)
             return jsonify(response.model_dump())
@@ -477,7 +514,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             ret = add_slurmjob(opt_data)
             if isinstance(ret, dict) and ret.get('status') == 'error':
                 logger.error("Slurm job add failed: JobID=%s, msg=%s", opt_data.get('JobID'), ret.get('msg'))
-                return abort(500, description=f"Slurm作业添加失败: {ret.get('msg', 'unknown error')}")
+                return abort(500, description=f"Slurm作业添加失败: {(ret.get('msg') or ret.get('message') or 'unknown error')}")
             logger.info("Slurm job add success: JobID=%s", opt_data.get('JobID'))
             response = JobResponse(status='ok', received=opt_data)
             return jsonify(response.model_dump())
@@ -497,8 +534,11 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         """调用 Core 的作业/采集控制 RPC（tools.call_core_rpc 为唯一接缝）。"""
         return core_tools.call_core_rpc(method, params, rpc_client)
 
-    def forward_core_rpc(method: str, params, response_model):
-        """转发一次 RPC：Core 错误按契约映射，成功则原样透传 Core payload。"""
+    def forward_core_rpc(method: str, params, response_model, legacy=False):
+        """转发一次 RPC：Core 错误按契约映射，成功则透传 Core payload。
+
+        legacy=True 只在 v1 旧路径上补齐旧字段名；v2 始终返回新表示。
+        """
         try:
             payload = core_rpc(method, params)
         except RPCError as e:
@@ -509,12 +549,15 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             return error
         if not isinstance(payload, dict):
             return _invalid_core_response(method, 'payload is not a JSON object')
+        if legacy:
+            payload = _with_legacy_field_aliases(payload)
         try:
             response_model.model_validate(payload)
         except ValidationError as e:
             return _invalid_core_response(method, _format_validation_error(e))
         return jsonify(payload)
 
+    @app.route('/joblens/v2/jobs', methods=['GET'])
     @app.route('/joblens/jobs/list', methods=['GET'])
     @app.route('/joblens/inventory', methods=['GET'])  # deprecated alias
     def job_list_page():
@@ -542,15 +585,18 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
                 params[name] = value
 
         return forward_core_rpc(
-            'jobs/list', params, JobListPageResponse
+            'jobs/list', params, JobListPageResponse,
+            legacy=(request.path == '/joblens/inventory'),
         )
 
+    @app.route('/joblens/v2/status', methods=['GET'])
     @app.route('/joblens/jobs/status', methods=['GET'])
     @app.route('/joblens/inventory/status', methods=['GET'])  # deprecated alias
     def joblens_status():
         """透传 Core 的来源/持久化/队列/对账健康状态"""
         return forward_core_rpc(
-            'joblens/status', {}, JobLensStatusResponse
+            'joblens/status', {}, JobLensStatusResponse,
+            legacy=request.path.startswith('/joblens/inventory/status'),
         )
 
     @app.route('/joblens/collection', methods=['POST'])
@@ -596,32 +642,54 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             CollectionStatusResponse,
         )
 
+    @app.route('/joblens/v2/capabilities', methods=['GET'])
     @app.route('/joblens/capabilities', methods=['GET'])
     def capabilities():
         """只透传 Core 的能力声明；Core 不支持时返回 503，绝不代其声明能力"""
         return forward_core_rpc(
-            'joblens/capabilities', {}, CapabilitiesResponse
+            'joblens/capabilities', {}, CapabilitiesResponse,
+            legacy=(request.path == '/joblens/capabilities'),
         )
 
+    def all_job_records():
+        """分页拉取 Core 的 JobRecord，供旧版 dump_job 视图使用。"""
+        records = []
+        cursor = None
+        while True:
+            params = {'limit': 1000}
+            if cursor:
+                params['cursor'] = cursor
+            payload = core_rpc("jobs/list", params)
+            error = _structured_core_error(payload)
+            if error is not None:
+                return None, error
+            if not isinstance(payload, dict):
+                return None, _invalid_core_response('jobs/list', 'payload is not a JSON object')
+            records.extend(payload.get('records') or [])
+            cursor = payload.get('next_cursor')
+            if not cursor:
+                return records, None
+
+    @app.route('/joblens/v2/jobs/count', methods=['GET'])
     @app.route('/joblens/jobs/count', methods=['GET'])
     def get_job_count():
         """获取当前注册的作业总数"""
-        try:
-            result = rpc_call("JobRegistry/get_job_count")
-            response = JobCountResponse.model_validate(result)
-            return jsonify(response.model_dump())
-        except RPCError as e:
-            return abort(503, description=f"Failed to get job count: {str(e)}")
-        except Exception as e:
-            return abort(500, description=f"Unexpected error: {str(e)}")
+        return forward_core_rpc("jobs/count", {}, JobCountResponse)
     
     @app.route('/joblens/jobs', methods=['GET'])
     def list_all_jobs():
-        """列出所有作业（不包含彩蛋任务 JobID=0）"""
+        """列出所有作业（旧版 dump_job 形状；内部数据来自 jobs/list）"""
         try:
-            result = rpc_call("JobRegistry/list_jobs")
-            # RPC 返回 {"status": "ok", "jobs": [...]}，需提取 jobs 数组
-            jobs = result.get("jobs", []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
+            records, error = all_job_records()
+            if error is not None:
+                return error
+            # The old list_jobs surface exposed active jobs only; closing
+            # records stay visible in the resource list and v2.
+            jobs = [
+                _legacy_job_from_record(record)
+                for record in records
+                if record.get('state') != 'closing'
+            ]
             response = JobsListResponse(status="ok", jobs=jobs)
             return jsonify(response.model_dump())
         except RPCError as e:
@@ -631,12 +699,20 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     
     @app.route('/joblens/jobs/<int:job_id>', methods=['GET'])
     def get_job_by_id(job_id: int):
-        """获取指定 JobID 的详细信息"""
+        """获取指定 JobID 的详细信息（旧版 dump_job 形状）"""
         try:
-            result = rpc_call("JobRegistry/get_job", {"JobID": job_id})
-            if "error" in result:
-                return abort(404, description=result["error"])
-            response = JobDetailResponse.model_validate(result)
+            result = core_rpc("jobs/get", {"internal_job_id": str(job_id)})
+            error = _structured_core_error(result)
+            if error is not None:
+                return error
+            if not isinstance(result, dict):
+                return _invalid_core_response('jobs/get', 'payload is not a JSON object')
+            # The old get_job surface treated a closing generation as absent.
+            if result.get('state') == 'closing':
+                return abort(404, description=f"job not found with JobID {job_id}")
+            response = JobDetailResponse.model_validate(
+                _legacy_job_from_record(result)
+            )
             return jsonify(response.model_dump())
         except HTTPException:
             raise
@@ -645,6 +721,95 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         except Exception as e:
             return abort(500, description=f"Unexpected error: {str(e)}")
     
+    # ==================== v2 资源 API ====================
+    # v1 的 /joblens/job、/joblens/jobs 等继续保留；v2 直接暴露 JobRecord
+    # 与 collection 子资源，响应即为 Core 的资源表示。
+
+    @app.route('/joblens/v2/jobs/<int:job_id>', methods=['GET'])
+    def get_job_v2(job_id: int):
+        """获取单个作业资源。"""
+        return forward_core_rpc(
+            'jobs/get', {'internal_job_id': str(job_id)}, JobDetailResponse
+        )
+
+    @app.route('/joblens/v2/jobs', methods=['PUT'])
+    def upsert_job_v2():
+        """按原生身份 upsert 作业（有则更新 selection，无则创建）。"""
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return _invalid_request('request body must be a JSON object')
+        try:
+            req = JobUpsertRequest.model_validate(data)
+        except ValidationError as e:
+            return _invalid_request(_format_validation_error(e))
+
+        payload = req.model_dump(exclude_none=True)
+        if not payload.get('Lens'):
+            payload['Lens'] = ['cpumem_collector', 'io_collector', 'net_collector']
+        if 'sub_attr' not in payload:
+            if payload['type'] == 'job.condor':
+                payload['sub_attr'] = {'cluster_id': 0, 'proc_id': 0}
+            elif payload['type'] == 'job.slurm':
+                payload['sub_attr'] = {'job_id': payload.get('JobID', 0), 'step_id': 0}
+        return forward_core_rpc('jobs/upsert', payload, JobDetailResponse)
+
+    @app.route('/joblens/v2/jobs/<int:job_id>', methods=['DELETE'])
+    def erase_job_v2(job_id: int):
+        """退役/删除作业资源（采集过的归档，未采集的删除）。"""
+        return forward_core_rpc(
+            'jobs/erase', {'JobID': job_id}, JobDetailResponse
+        )
+
+    @app.route('/joblens/v2/jobs/<int:job_id>/stop', methods=['POST'])
+    def stop_job_v2(job_id: int):
+        """停止采集，但保留作业记录。"""
+        return forward_core_rpc(
+            'jobs/stop', {'JobID': job_id}, JobDetailResponse
+        )
+
+    @app.route('/joblens/v2/jobs/<int:job_id>/collection', methods=['GET'])
+    def get_job_collection_v2(job_id: int):
+        """读取作业的期望/已生效采集选择。"""
+        return forward_core_rpc(
+            'jobs/collection/get',
+            {'internal_job_id': str(job_id)},
+            CollectionStatusResponse,
+        )
+
+    @app.route('/joblens/v2/jobs/<int:job_id>/collection', methods=['PUT'])
+    def set_job_collection_v2(job_id: int):
+        """替换作业的期望采集器集合；[] 表示持久停止。"""
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return _invalid_request('request body must be a JSON object')
+        try:
+            req = JobCollectionIntentRequest.model_validate(data)
+        except ValidationError as e:
+            return _invalid_request(_format_validation_error(e))
+        payload = {
+            'selector': {'internal_job_id': str(job_id)},
+            'scope': 'instance',
+            'operation': 'set',
+            'collectors': req.collectors,
+        }
+        if req.expected_revision is not None:
+            payload['expected_revision'] = req.expected_revision
+        return forward_core_rpc(
+            'jobs/collection/set', payload, CollectionControlResponse
+        )
+
+    @app.route('/joblens/v2/jobs/<int:job_id>/collection', methods=['DELETE'])
+    def reset_job_collection_v2(job_id: int):
+        """清除 manual override，交回自动采集策略。"""
+        payload = {
+            'selector': {'internal_job_id': str(job_id)},
+            'scope': 'instance',
+            'operation': 'reset_auto',
+        }
+        return forward_core_rpc(
+            'jobs/collection/reset', payload, CollectionControlResponse
+        )
+
     # ==================== RPC函数接口 ====================
     
     @app.route('/joblens/rpc/functions', methods=['GET'])
@@ -668,14 +833,9 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     @app.route('/joblens/pid_tracker/stats', methods=['GET'])
     def pid_tracker_stats():
         """获取 pid 归属追踪状态与 job_event ringbuf 入队/丢弃计数"""
-        try:
-            result = rpc_call("JobRegistry/pid_tracker_stats")
-            response = PidTrackerStatsResponse.model_validate(result)
-            return jsonify(response.model_dump())
-        except RPCError as e:
-            return abort(503, description=f"Failed to get pid tracker stats: {str(e)}")
-        except Exception as e:
-            return abort(500, description=f"Unexpected error: {str(e)}")
+        return forward_core_rpc(
+            "diagnostics/pid_tracker", {}, PidTrackerStatsResponse
+        )
 
     # ==================== Collector接口 ====================
 

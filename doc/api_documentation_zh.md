@@ -671,6 +671,33 @@ Trigger 只做校验与转发：不分配、不推导内部 ID，Core 的错误�
 
 ---
 
+## 13. v2 资源 API
+
+v2 按资源组织并直接返回 Core 的 `JobRecord` 表示。上面的 v1 路由保持不变；
+v1/v2 共用同一套 Trigger 适配层与 Core 方法。旧版 `/joblens/capabilities` 仍保留
+`inventory_version`（1）与 `inventory_ready` 别名；`/joblens/inventory/status`
+保留 `inventory_enabled`。
+
+| 方法 | 路径 | 语义 |
+|---|---|---|
+| `GET` | `/joblens/v2/jobs` | 分页作业记录；`limit`/`cursor`/过滤参数同 `/joblens/jobs/list` |
+| `GET` | `/joblens/v2/jobs/count` | 活跃作业记录数 |
+| `GET` | `/joblens/v2/jobs/<internal_job_id>` | 单个作业记录 |
+| `PUT` | `/joblens/v2/jobs` | 按身份 upsert（`jobs/upsert`）；请求体不带 `opt` |
+| `DELETE` | `/joblens/v2/jobs/<internal_job_id>` | 退役/删除（`jobs/erase`） |
+| `POST` | `/joblens/v2/jobs/<internal_job_id>/stop` | 停止采集、保留记录（`jobs/stop`） |
+| `GET` | `/joblens/v2/jobs/<internal_job_id>/collection` | 期望/已生效采集状态 |
+| `PUT` | `/joblens/v2/jobs/<internal_job_id>/collection` | 替换期望采集器（`{"collectors": [...]}`；`[]` 停止） |
+| `DELETE` | `/joblens/v2/jobs/<internal_job_id>/collection` | 清除 manual override（reset_auto） |
+| `GET` | `/joblens/v2/status` | 与 `/joblens/jobs/status` 相同的状态 |
+| `GET` | `/joblens/v2/capabilities` | 相同能力声明；`api_version` 为 `2` |
+
+v2 作业表示包含 `internal_job_id`、`record_revision`、`state`、
+`desired_collectors`、`mode`、`processes`、`generation`、`attributes`。v1 的
+`dump_job` 形状由 Trigger 适配层从同一条记录重建，旧客户端无需修改。
+
+---
+
 ## 响应状态码汇总
 
 | 状态码 | 描述 |

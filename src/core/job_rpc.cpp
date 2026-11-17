@@ -55,9 +55,7 @@ struct NamespaceConflictError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-std::string json2JobOpt(const nlohmann::json& obj, Job& job, const JobRegistry& registry) {
-    auto opt = obj["opt"].get<std::string>();
-
+void parseJobRequest(const nlohmann::json& obj, Job& job, const JobRegistry& registry) {
     // Internal IDs parse explicitly as uint64: a JSON number or a decimal
     // string, never a 32-bit default. Absent keeps the legacy auto-allocate
     // sentinel; reserved (0) keeps its historical meaning; anything else is
@@ -134,12 +132,10 @@ std::string json2JobOpt(const nlohmann::json& obj, Job& job, const JobRegistry& 
         job.clusterTag = request_cluster_tag;
     }
 
-    spdlog::info("JobRegistry: json2JobOpt parsed opt={}, type={}, subtype={}, JobID={}, "
+    spdlog::info("JobRegistry: parsed type={}, subtype={}, JobID={}, "
                  "PIDs_count={}, Lens_count={}, nativeID={}",
-                 opt, type, subtype, job.JobID, pids_of(job).size(),
+                 type, subtype, job.JobID, pids_of(job).size(),
                  job.CollectorNames.size(), job.NativeJobID);
-    
-    return opt;
 }
 
 }  // namespace
@@ -309,6 +305,10 @@ nlohmann::json job_record_json(JobRegistry& registry, const JobRecord& record)
     out["source"] = job_source(record);
     out["quarantined"] = false;
     out["identity_complete"] = !record.index_key.empty();
+    // Desired intent is part of the job resource; applied state belongs to the
+    // collection sub-resource and is not persisted here.
+    out["mode"] = to_string(record.selection.mode());
+    out["desired_collectors"] = record.selection.effectiveCollectors();
     // Selector fields are projections of the Job: the typed facts are the
     // single source of truth, no second copy rides the record.
     out["scheduler_type"] = record.job.subtype_name;
@@ -587,23 +587,11 @@ SubAttrMatcher parse_legacy_matcher(const nlohmann::json& matcher_json)
     return matcher;
 }
 
-// Legacy remove: stop collection, keep the job record. Only records
-// outside the registry (pure legacy registrations) are archived as before.
-// With "erase": true the command becomes the real-delete tier — every target
-// is retired (closing -> archive for collected instances, durable delete for
-// never-collected ones) instead of stopped.
-nlohmann::json legacy_remove(JobRegistry& registry, const nlohmann::json& req)
+// Stop collection and keep the job record, or erase/retire the target for
+// real. The two resource commands share target resolution but never the same
+// destructive semantics.
+nlohmann::json remove_jobs(JobRegistry& registry, const nlohmann::json& req, bool erase)
 {
-    bool erase = false;
-    if (req.contains("erase") && !req["erase"].is_null()) {
-        if (!req["erase"].is_boolean()) {
-            return error_payload("invalid_request",
-                                 "erase must be a boolean (true retires the instance for "
-                                 "real, the default keeps the stop semantics)");
-        }
-        erase = req["erase"].get<bool>();
-    }
-
     std::vector<uint64_t> targets;
     if (req.contains("JobID") && !req["JobID"].is_null()) {
         const auto parsed = parse_legacy_job_id(req["JobID"]);
@@ -668,7 +656,7 @@ nlohmann::json legacy_remove(JobRegistry& registry, const nlohmann::json& req)
         stop.collectors = std::vector<std::string>{};
         const auto outcome = registry.setCollectors(stop);
         if (!outcome.ok) {
-            spdlog::error("JobRegistry: legacy remove could not stop collection for JobID {}: {}",
+            spdlog::error("JobRegistry: stop could not stop collection for JobID {}: {}",
                           id, outcome.message);
             return error_payload(to_string(outcome.error), outcome.message);
         }
@@ -685,8 +673,8 @@ nlohmann::json legacy_remove(JobRegistry& registry, const nlohmann::json& req)
     }
 
     if (!targets.empty()) {
-        spdlog::warn("JobRegistry: legacy remove is deprecated and now stops collection for "
-                     "{} instance(s); job records are retained",
+        spdlog::info("JobRegistry: stopped collection for {} instance(s); "
+                     "job records are retained",
                      stopped);
     }
 
@@ -698,8 +686,7 @@ nlohmann::json legacy_remove(JobRegistry& registry, const nlohmann::json& req)
     out["stopped_instances"] = stopped_instances;
     out["apply_errors"] = std::move(apply_errors);
     out["record_retained"] = true;
-    out["deprecated"] = true;
-    out["msg"] = "legacy remove now stops collection; job records are retained";
+    out["msg"] = "collection stopped; job records are retained";
     return out;
 }
 
@@ -842,98 +829,100 @@ nlohmann::json joblens_status_payload(JobRegistry& registry)
 }  // namespace
 
 void registerJobRpc(JobRegistry& registry) {
-    // 注册 RPC 方法
-    // 请求体格式示例：
-    // {
-    //     "opt": "add",
-    //     "type": "job.condor",
-    //     "JobID": 1,
-    //     "JobPIDs": [1],
-    //     "Lens": ["cpumem_collector"],
-    //      "auto_update_child": true
-    // }
-    RPCServer::instance().register_method("JobRegistry/job_opt",
+    // --- jobs ---------------------------------------------------------------
+    // The manual add/update path is one identity-resolved upsert. A legacy
+    // JobID is only a hint; a request that names a live record updates its
+    // manual selection, otherwise it creates a new record.
+    RPCServer::instance().register_method("jobs/upsert",
         [&registry](const nlohmann::json& req) -> nlohmann::json {
             nlohmann::json j;
             try {
+                if (!req.is_object())
+                    return error_payload("invalid_request",
+                                         "request body must be a JSON object");
                 Job job;
-                std::string opt = json2JobOpt(req, job, registry);
-                if(opt.compare("add") == 0){
-                    // The manual add and update routes are one upsert.
-                    // The identity selector (kept here as the compatibility
-                    // resolution) routes a request naming a live inventoried
-                    // instance to UPDATE; a legacy JobID is only a hint and
-                    // never allocates or overrides the internal id.
-                    j = registry.upsertJob(job, req, legacy_add_selector(job, registry));
-                }else if(opt.compare("remove") == 0){
-                    // Remove stops collection for resolved live jobs and
-                    // keeps the job record instead of forgetting the
-                    // execution.
-                    j = legacy_remove(registry, req);
-                }else {
-                    j["status"] = "error";
-                    j["code"] = "invalid_request";
-                    j["msg"] = "invalid operation, expected 'add' or 'remove'";
-                }
+                parseJobRequest(req, job, registry);
+                j = registry.upsertJob(job, req, legacy_add_selector(job, registry));
             } catch (const NamespaceConflictError& e) {
                 j["status"] = "error";
                 j["code"] = "namespace_conflict";
-                j["msg"] = fmt::format("failed to add job: {}", e.what());
+                j["msg"] = fmt::format("failed to upsert job: {}", e.what());
             } catch (const std::exception& e) {
                 j["status"] = "error";
                 j["code"] = "invalid_request";
-                j["msg"] = fmt::format("failed to add job: {}", e.what());
+                j["msg"] = fmt::format("failed to upsert job: {}", e.what());
             }
             return j;
         }
     );
 
-    RPCServer::instance().register_method("JobRegistry/get_job_count",
+    // Stop collection, retain the job record.
+    RPCServer::instance().register_method("jobs/stop",
+        [&registry](const nlohmann::json& req) -> nlohmann::json {
+            if (!req.is_object())
+                return error_payload("invalid_request",
+                                     "request body must be a JSON object");
+            return remove_jobs(registry, req, /*erase=*/false);
+        }
+    );
+
+    // Delete/retire the job record for real.
+    RPCServer::instance().register_method("jobs/erase",
+        [&registry](const nlohmann::json& req) -> nlohmann::json {
+            if (!req.is_object())
+                return error_payload("invalid_request",
+                                     "request body must be a JSON object");
+            return remove_jobs(registry, req, /*erase=*/true);
+        }
+    );
+
+    RPCServer::instance().register_method("jobs/get",
+        [&registry](const nlohmann::json& req) -> nlohmann::json {
+            if (!req.is_object())
+                return error_payload("invalid_request",
+                                     "request body must be a JSON object");
+            std::string internal_job_id;
+            try {
+                if (req.contains("internal_job_id") && !req["internal_job_id"].is_null())
+                    internal_job_id = optional_string(req, "internal_job_id");
+                else
+                    internal_job_id = optional_string(req, "instance_id");
+            } catch (const std::exception& error) {
+                return error_payload("invalid_request", error.what());
+            }
+            if (internal_job_id.empty())
+                return error_payload("invalid_request",
+                                     "internal_job_id is required");
+            const auto internal_id = parse_internal_id(internal_job_id);
+            if (!internal_id || is_reserved_internal_id(*internal_id))
+                return error_payload(
+                    "not_found",
+                    "no current job record with internal_job_id '" + internal_job_id + "'");
+            const auto record = registry.jobRecord(*internal_id);
+            if (!record)
+                return error_payload(
+                    "not_found",
+                    "no current job record with internal_job_id '" + internal_job_id + "'");
+            auto out = job_record_json(registry, *record);
+            out["status"] = "ok";
+            return out;
+        }
+    );
+
+    RPCServer::instance().register_method("jobs/count",
         [&registry](const nlohmann::json& req) -> nlohmann::json {
             (void)req;
-            nlohmann::json j;
-            j["status"] = "ok";
-            j["job_count"] = registry.snapshot().size();
-            return j;
+            uint64_t count = 0;
+            for (const auto& record : registry.jobRecords()) {
+                if (is_reserved_internal_id(record.job.JobID)) continue;
+                if (record.state == RecordState::Active) ++count;
+            }
+            return nlohmann::json{{"status", "ok"}, {"job_count", count}};
         }
     );
 
-    // 列出所有 Job
-    RPCServer::instance().register_method("JobRegistry/list_jobs",
-        [&registry](const nlohmann::json& req) -> nlohmann::json {
-            (void)req;
-            nlohmann::json res = nlohmann::json::object();
-            res["status"] = "ok";
-            res["jobs"] = nlohmann::json::array();
-            for (const auto& job : registry.snapshot()) {
-                if (job.JobID == 0) continue; //跳过彩蛋任务
-                res["jobs"].push_back(dump_job(job));
-            }
-            return res;
-        }
-    );
-    // 获取指定 JobID 的 Job 信息
-    RPCServer::instance().register_method("JobRegistry/get_job",
-        [&registry](const nlohmann::json& req) -> nlohmann::json {
-            nlohmann::json j;
-            if (!req.contains("JobID")) {
-                j["error"] = "missing JobID in request";
-                return j;
-            }
-            uint64_t jobID = req["JobID"].get<uint64_t>();
-            auto job = registry.findJob(jobID);
-            if (!job.has_value()) {
-                j["error"] = "job not found with JobID " + std::to_string(jobID);
-                return j;
-            }
-            j = dump_job(job.value());
-            return j;
-        }
-    );
-
-    // pid 归属追踪的运行状态与 ringbuf 入队/丢弃统计。
-    // dropped_events 持续增长说明 job_event ringbuf 溢出、JobPIDs 可能失真。
-    RPCServer::instance().register_method("JobRegistry/pid_tracker_stats",
+    // pid tracker diagnostics are not a job resource.
+    RPCServer::instance().register_method("diagnostics/pid_tracker",
         [&registry](const nlohmann::json& req) -> nlohmann::json {
             (void)req;
             nlohmann::json j;
@@ -1109,8 +1098,7 @@ void registerJobRpc(JobRegistry& registry) {
     // -----------------------------------------------------------------------
     // Collection control surface
     // -----------------------------------------------------------------------
-    RPCServer::instance().register_method("jobs/collection/set",
-        [&registry](const nlohmann::json& req) -> nlohmann::json {
+    auto collection_command = [&registry](const nlohmann::json& req) -> nlohmann::json {
             if (!req.is_object())
                 return error_payload("invalid_request", "request body must be a JSON object");
             if (auto not_ready = store_not_ready_payload(registry.storeHealth()))
@@ -1283,6 +1271,14 @@ void registerJobRpc(JobRegistry& registry) {
             out["scope"] = scope;
             out["targets"] = std::move(targets);
             return out;
+    };
+
+    RPCServer::instance().register_method("jobs/collection/set", collection_command);
+    RPCServer::instance().register_method("jobs/collection/reset",
+        [collection_command](const nlohmann::json& req) -> nlohmann::json {
+            nlohmann::json reset = req.is_object() ? req : nlohmann::json::object();
+            reset["operation"] = "reset_auto";
+            return collection_command(reset);
         }
     );
 

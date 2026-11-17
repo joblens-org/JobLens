@@ -108,42 +108,66 @@ try:
     config = yaml.safe_load(open(real_config_path))
 except FileNotFoundError:
     config = {}
-def use_rpc_opt():
+def _rpc_client_and_methods():
+    """返回 (client, methods)；配置缺失或 Core 不可达时 methods 为 None。"""
     lens_cfg = config.get('lens_config', {})
     socket_path = lens_cfg.get('rpc_socket_path', '')
     timeout = lens_cfg.get('rpc_timeout', 5)
     if not socket_path:
-        return False
+        return None, None
     r = RPCClient(socket_path, timeout)
     try:
-        return 'JobRegistry/job_opt' in r.get_function_list()
+        return r, set(r.get_function_list())
     except RPCError:
+        return r, None
+
+
+def use_rpc_opt():
+    _, methods = _rpc_client_and_methods()
+    if methods is None:
         return False
+    # 新版 Core 用资源方法；旧版 Core 仍是 job_opt。Trigger 同时适配两者。
+    return 'jobs/upsert' in methods or 'JobRegistry/job_opt' in methods
+
+
 def job_opt(data):
     if 'USE_MOCK_TOOLS' in globals() and USE_MOCK_TOOLS:
         # 使用 mock 版本
         return mock_job_opt(data)
-    
-    if use_rpc_opt():
-        lens_cfg = config.get('lens_config', {})
-        r = RPCClient(lens_cfg.get('rpc_socket_path', ''), lens_cfg.get('rpc_timeout', 5))
+
+    r, methods = _rpc_client_and_methods()
+    if methods is not None and ('jobs/upsert' in methods or 'jobs/stop' in methods):
+        opt = data.get('opt', 'add')
+        if opt == 'remove':
+            method = 'jobs/erase' if data.get('erase') else 'jobs/stop'
+            payload = {k: v for k, v in data.items() if k != 'erase'}
+        else:
+            method = 'jobs/upsert'
+            payload = data
+        logger.info("RPC call: %s, type=%s, JobID=%s, PIDs=%s, Lens=%s",
+                    method, data.get('type'), data.get('JobID'),
+                    data.get('JobPIDs'), data.get('Lens'))
+        ret = r.call(method, payload)
+    elif methods is not None and 'JobRegistry/job_opt' in methods:
+        # 旧 Core 兼容路径；仅用于滚动升级。
         logger.info("RPC call: JobRegistry/job_opt, opt=%s, type=%s, JobID=%s, PIDs=%s, Lens=%s",
-                     data.get('opt'), data.get('type'), data.get('JobID'),
-                     data.get('JobPIDs'), data.get('Lens'))
+                    data.get('opt'), data.get('type'), data.get('JobID'),
+                    data.get('JobPIDs'), data.get('Lens'))
         ret = r.call('JobRegistry/job_opt', data)
-        if isinstance(ret, dict):
-            logger.info("RPC response: status=%s, msg=%s", ret.get('status'), ret.get('msg', ''))
-        return ret
     else:
         job_adder_path = config.get('collectors_config', {}).get('job_adder_fifo', '')
         if not job_adder_path:
             raise RuntimeError("无法写入作业：未配置 job_adder_fifo 且 RPC 不可用")
         logger.info("FIFO fallback: writing to %s, opt=%s, type=%s, JobID=%s",
-                     job_adder_path, data.get('opt'), data.get('type'), data.get('JobID'))
+                    job_adder_path, data.get('opt'), data.get('type'), data.get('JobID'))
         with open(job_adder_path, 'w') as f:
             f.write(json.dumps(data))
             f.flush()
         return True
+
+    if isinstance(ret, dict):
+        logger.info("RPC response: status=%s, msg=%s", ret.get('status'), ret.get('msg', ''))
+    return ret
     
 def _to_argv(cmd) -> list:
     """把命令统一成 argv 列表，禁止经过 shell。"""

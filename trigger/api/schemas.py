@@ -36,6 +36,17 @@ class JobRequest(BaseModel):
     erase: Optional[bool] = Field(None, description="remove 的真删档：true=退役实例（采集过归档 h: 行，未采集过纯删）；默认 false 保留 stop 语义（停采集、留库存）")
 
 
+class JobUpsertRequest(BaseModel):
+    """v2 作业 upsert 请求：不带 action 字段，身份由 type/sub_attr 决定。"""
+    type: str = Field(..., description="作业类型: job.condor/job.slurm/job.common")
+    JobID: Optional[int] = Field(None, description="内部 ID 兼容提示，可省略")
+    JobPIDs: Optional[List[int]] = Field(None, description="进程ID列表")
+    Lens: Optional[List[str]] = Field(None, description="采集器列表")
+    cluster_name: Optional[str] = Field(None, description="调度器集群或池路由标签")
+    cluster_tag: Optional[str] = Field(None, description="调度器命名空间标签")
+    sub_attr: Optional[Dict[str, Any]] = Field(None, description="调度器 typed facts")
+
+
 class CondorJobRequest(BaseModel):
     """Condor作业专用请求"""
     opt: str = Field(..., description="操作类型，目前仅支持 'add'")
@@ -225,7 +236,7 @@ class HardwareInfoResponse(BaseModel):
     model_config = {"extra": "allow"}
 
 
-# ==================== 作业清单 / 采集控制模型 ====================
+# ==================== 作业列表 / 采集控制模型 ====================
 # 契约见 doc/api_documentation.md 第 12 节。
 # Trigger 只做边界校验与透传：不分配、不推导内部 ID。
 
@@ -330,6 +341,24 @@ class CollectionControlRequest(BaseModel):
                 "expected_revision is only accepted for a single-instance request (scope=instance)"
             )
         return self
+
+
+class JobCollectionIntentRequest(BaseModel):
+    """v2 作业采集意图：PUT 替换期望集合，DELETE 清回自动策略。"""
+    collectors: List[str] = Field(..., description="显式采集器列表；[] 表示持久停止")
+    expected_revision: Optional[int] = Field(
+        None, ge=0, description="记录修订号；省略表示不校验"
+    )
+
+    @field_validator("collectors")
+    @classmethod
+    def _normalize_collector_names(cls, value: List[str]) -> List[str]:
+        names: List[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("collectors must be a list of non-empty collector names")
+            names.append(item.strip())
+        return names
 
 
 class CollectionErrorResponse(BaseModel):

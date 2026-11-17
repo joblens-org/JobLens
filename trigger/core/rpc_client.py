@@ -185,11 +185,11 @@ class JoblensRPCClient:
 
     def list_jobs(self) -> List[dict]:
         """列出所有Job"""
-        return self.client.call("JobRegistry/list_jobs")
+        return self.client.call("jobs/list", {"limit": 1000})
     
     def get_job(self, job_id: int) -> dict:
-        """获取指定JobID的Job信息"""
-        return self.client.call("JobRegistry/get_job", {"JobID": job_id})
+        """获取指定内部 ID 的 Job 资源"""
+        return self.client.call("jobs/get", {"internal_job_id": str(job_id)})
     
     def metrics_report(self, metric_data: dict) -> bool:
         """上报指标数据"""
@@ -218,7 +218,7 @@ if __name__ == "__main__":
         print(f"Available functions: {functions}")
         client.client.call("CollectorRegistry/CollectorsPerfCount")
         client.client.call("WriterManager/WriterPerfCount")
-        # client.client.call('JobRegistry/job_opt', {
+        # client.client.call("jobs/upsert", {
         #     "opt": "add",
         #     "type": "job.common",
         #     "JobID": 12345,
@@ -226,7 +226,7 @@ if __name__ == "__main__":
         #     "Lens": ["cpumem_collector"]
         # })
 
-        # client.client.call('JobRegistry/job_opt', {
+        # client.client.call("jobs/upsert", {
         #     "opt": "add",
         #     "type": "job.common",
         #     "JobID": 54321,
@@ -234,7 +234,7 @@ if __name__ == "__main__":
         #     "Lens": ["cpumem_collector"]
         # })
 
-        # print(client.client.call('JobRegistry/list_jobs'))
+        # print(client.client.call("jobs/list", {"limit": 10}))
     except RPCError as e:
         print(f"RPC Error: {e}")
     except Exception as e:
