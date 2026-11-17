@@ -11,9 +11,9 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Inventory status/refresh provider seam storage (see
-// core/inventory_status_provider.hpp). The registry heartbeat publishes here.
-#include "core/inventory_status_provider.hpp"
+// Status/refresh provider seam storage (see
+// core/status_provider.hpp). The registry heartbeat publishes here.
+#include "core/status_provider.hpp"
 
 #include <mutex>
 
@@ -39,25 +39,25 @@ std::function<bool()>& refresh_slot()
 
 }  // namespace
 
-void set_inventory_status_provider(std::function<nlohmann::json()> provider)
+void set_status_provider(std::function<nlohmann::json()> provider)
 {
     std::lock_guard<std::mutex> lock(provider_mutex());
     provider_slot() = std::move(provider);
 }
 
-std::function<nlohmann::json()> get_inventory_status_provider()
+std::function<nlohmann::json()> get_status_provider()
 {
     std::lock_guard<std::mutex> lock(provider_mutex());
     return provider_slot();
 }
 
-void set_inventory_refresh_provider(std::function<bool()> provider)
+void set_refresh_provider(std::function<bool()> provider)
 {
     std::lock_guard<std::mutex> lock(provider_mutex());
     refresh_slot() = std::move(provider);
 }
 
-std::function<bool()> get_inventory_refresh_provider()
+std::function<bool()> get_refresh_provider()
 {
     std::lock_guard<std::mutex> lock(provider_mutex());
     return refresh_slot();

@@ -393,7 +393,7 @@ void check(bool condition, const std::string& message) {
 // is derived from the record state so the assertion semantics stay unchanged.
 static bool has_active(const JobRegistry& registry, uint64_t internal_id)
 {
-    const auto record = registry.inventoryRecord(internal_id);
+    const auto record = registry.jobRecord(internal_id);
     return record.has_value() && record->state != RecordState::Closing;
 }
 std::string hex_id(uint64_t id) {
@@ -612,7 +612,7 @@ void run(const std::string& base) {
     // The registry is the desired-state source and the drain sink; the scheduler
     // converges by reading records, never by a synchronous registry callback.
     // The gate lets a test make the source unavailable without pretending the
-    // inventory is empty.
+    // the registry is empty.
     class GateSource : public IJobRecordSource {
     public:
         explicit GateSource(IJobRecordSource& inner) : inner_(inner) {}
@@ -691,7 +691,7 @@ void run(const std::string& base) {
     check(extra_removed.load() == 1, "collector removed by update receives removed");
     check(life_removed.load() == 0, "retained collector must not receive removed");
 
-    // An unavailable desired-state source is NOT an empty inventory: the
+    // An unavailable desired-state source is NOT an empty record set: the
     // runtime must keep the attachment (and its token) until it can read again.
     const auto attached_before = registry.actualCollection(456);
     check(attached_before.tracked &&
@@ -1431,7 +1431,7 @@ void run(const std::string& base) {
         std::filesystem::remove_all(live_db);
         JobRegistryOptions options;
         options.db_path = live_db;
-        options.test_static_inventory = true;
+        options.test_static_registry = true;
         options.enable_pid_tracker = false;
         options.register_rpc = false;
         JobRegistry archive(options);
@@ -1495,7 +1495,7 @@ void run(const std::string& base) {
                       "the stopped lane must owe a tail with no membership");
             }
             check(archive.retireInstance(id), "the real retirement must be accepted");
-            const auto record = archive.inventoryRecord(id);
+            const auto record = archive.jobRecord(id);
             check(record.has_value() && record->state == RecordState::Closing,
                   "the real durable record must stay Closing until the drain completes");
             CollectorSchedulerTestAccess::reconcile(scheduler);
@@ -1512,7 +1512,7 @@ void run(const std::string& base) {
               "before the last ack the Closing row must be durable and no history row may exist");
 
         CollectorSchedulerTestAccess::drainLane(scheduler, "ri_ev_b");
-        check(archive.inventoryRecord(8101).has_value(),
+        check(archive.jobRecord(8101).has_value(),
               "the attached lane's ack must not archive while the adopted tail is pending");
         history_rows = raw_keys_from_store_copy(live_db, base + "-archive-copy-3",
                                                 "h:" + hex_id(8101) + ":");
@@ -1525,7 +1525,7 @@ void run(const std::string& base) {
         CollectorSchedulerTestAccess::setStopping(scheduler, true);
         CollectorSchedulerTestAccess::drainLane(scheduler, "ri_ev_a");
         CollectorSchedulerTestAccess::setStopping(scheduler, false);
-        check(!archive.inventoryRecord(8101).has_value() && !has_active(archive, 8101),
+        check(!archive.jobRecord(8101).has_value() && !has_active(archive, 8101),
               "the last ack must archive the record and release the instance");
         history_rows = raw_keys_from_store_copy(live_db, base + "-archive-copy-4",
                                                 "h:" + hex_id(8101) + ":");
@@ -1543,7 +1543,7 @@ void run(const std::string& base) {
         archive_cleanup_failures = 1;
         CollectorSchedulerTestAccess::drainLane(scheduler, "ri_ev_c");
         CollectorSchedulerTestAccess::drainLane(scheduler, "ri_ev_d");
-        const auto failed = archive.inventoryRecord(8102);
+        const auto failed = archive.jobRecord(8102);
         check(failed.has_value() && failed->state == RecordState::Closing,
               "a failed checked cleanup must keep the Closing record");
         active_rows = raw_keys_from_store_copy(live_db, base + "-archive-copy-6",
@@ -1556,7 +1556,7 @@ void run(const std::string& base) {
               "the failed archive must not repeat a lane's Removed");
 
         CollectorSchedulerTestAccess::reconcile(scheduler);
-        check(!archive.inventoryRecord(8102).has_value(),
+        check(!archive.jobRecord(8102).has_value(),
               "the completion retry must archive the retained Closing record");
         history_rows = raw_keys_from_store_copy(live_db, base + "-archive-copy-8",
                                                 "h:" + hex_id(8102) + ":");

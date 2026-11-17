@@ -45,7 +45,7 @@ try:
         RulesListResponse, RulesSyncResponse, RuleStatusResponse,
         VersionResponse, UpgradeResponse, HardwareInfoResponse, PidTrackerStatsResponse,
         CollectionControlRequest, CollectionControlResponse, CollectionStatusResponse,
-        CollectionErrorResponse, InventoryListResponse, InventoryStatusResponse,
+        CollectionErrorResponse, JobListPageResponse, JobLensStatusResponse,
         CapabilitiesResponse
     )
 except ImportError:
@@ -59,7 +59,7 @@ except ImportError:
         RulesListResponse, RulesSyncResponse, RuleStatusResponse,
         VersionResponse, UpgradeResponse, HardwareInfoResponse, PidTrackerStatsResponse,
         CollectionControlRequest, CollectionControlResponse, CollectionStatusResponse,
-        CollectionErrorResponse, InventoryListResponse, InventoryStatusResponse,
+        CollectionErrorResponse, JobListPageResponse, JobLensStatusResponse,
         CapabilitiesResponse
     )
 
@@ -112,7 +112,7 @@ def _invalid_request(message: str):
 
 
 def _rpc_unavailable(method: str, exc: Exception):
-    logger.error("Inventory/collection RPC unavailable: method=%s, error=%s", method, str(exc))
+    logger.error("Job/collection RPC unavailable: method=%s, error=%s", method, str(exc))
     return _error_response(
         503,
         'rpc_unavailable',
@@ -121,7 +121,7 @@ def _rpc_unavailable(method: str, exc: Exception):
 
 
 def _invalid_core_response(method: str, detail: str):
-    logger.error("Inventory/collection RPC contract mismatch: method=%s, detail=%s", method, detail)
+    logger.error("Job/collection RPC contract mismatch: method=%s, detail=%s", method, detail)
     return _error_response(
         502,
         'core_response_invalid',
@@ -188,7 +188,7 @@ def _structured_core_error(payload):
 
     status = _COLLECTION_ERROR_STATUS.get(code)
     if status is None:
-        logger.warning("Unknown core error code %r on inventory/collection API; replying 503", code)
+        logger.warning("Unknown core error code %r on job/collection API; replying 503", code)
         status = 503
     return _error_response(status, code, str(message), candidates)
 
@@ -485,22 +485,22 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             logger.error("Slurm job add exception: JobID=%s, error=%s", opt_data.get('JobID'), str(e), exc_info=True)
             return abort(500, description=str(e))
     
-    # ==================== 作业清单与采集控制接口 ====================
+    # ==================== 作业列表与采集控制接口 ====================
     # 契约：见 doc/api_documentation.md 第 12 节。
     # 与现有控制接口（/joblens/job 等）一致，请求鉴权沿用部署层/网关策略，
     # 路由内不再额外套 token。Trigger 只校验并转发，不分配内部 ID。
 
-    INVENTORY_DEFAULT_LIMIT = 100
-    INVENTORY_MAX_LIMIT = 1000
+    JOB_LIST_DEFAULT_LIMIT = 100
+    JOB_LIST_MAX_LIMIT = 1000
 
-    def inventory_rpc(method: str, params=None):
-        """调用 Core 清单/采集控制 RPC（tools.call_inventory_rpc 为唯一接缝）。"""
-        return core_tools.call_inventory_rpc(method, params, rpc_client)
+    def core_rpc(method: str, params=None):
+        """调用 Core 的作业/采集控制 RPC（tools.call_core_rpc 为唯一接缝）。"""
+        return core_tools.call_core_rpc(method, params, rpc_client)
 
-    def forward_inventory_rpc(method: str, params, response_model):
+    def forward_core_rpc(method: str, params, response_model):
         """转发一次 RPC：Core 错误按契约映射，成功则原样透传 Core payload。"""
         try:
-            payload = inventory_rpc(method, params)
+            payload = core_rpc(method, params)
         except RPCError as e:
             return _rpc_unavailable(method, e)
 
@@ -515,19 +515,24 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             return _invalid_core_response(method, _format_validation_error(e))
         return jsonify(payload)
 
-    @app.route('/joblens/inventory', methods=['GET'])
-    def inventory_list():
-        """分页查询作业清单，支持 scheduler_type/native_job_id/state/limit/cursor"""
+    @app.route('/joblens/jobs/list', methods=['GET'])
+    @app.route('/joblens/inventory', methods=['GET'])  # deprecated alias
+    def job_list_page():
+        """分页查询作业列表，支持 scheduler_type/native_job_id/state/limit/cursor
+
+        `/joblens/inventory` 是旧路径的兼容 alias；新客户端使用
+        `/joblens/jobs/list`。
+        """
         raw_limit = request.args.get('limit')
         try:
-            limit = INVENTORY_DEFAULT_LIMIT if raw_limit in (None, '') else int(raw_limit)
+            limit = JOB_LIST_DEFAULT_LIMIT if raw_limit in (None, '') else int(raw_limit)
         except (TypeError, ValueError):
             return _invalid_request(
-                f'limit must be an integer between 1 and {INVENTORY_MAX_LIMIT}'
+                f'limit must be an integer between 1 and {JOB_LIST_MAX_LIMIT}'
             )
-        if limit < 1 or limit > INVENTORY_MAX_LIMIT:
+        if limit < 1 or limit > JOB_LIST_MAX_LIMIT:
             return _invalid_request(
-                f'limit must be between 1 and {INVENTORY_MAX_LIMIT}'
+                f'limit must be between 1 and {JOB_LIST_MAX_LIMIT}'
             )
 
         params = {'limit': limit}
@@ -536,15 +541,16 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             if value:
                 params[name] = value
 
-        return forward_inventory_rpc(
-            'JobRegistry/inventory_list', params, InventoryListResponse
+        return forward_core_rpc(
+            'jobs/list', params, JobListPageResponse
         )
 
-    @app.route('/joblens/inventory/status', methods=['GET'])
-    def inventory_status():
+    @app.route('/joblens/jobs/status', methods=['GET'])
+    @app.route('/joblens/inventory/status', methods=['GET'])  # deprecated alias
+    def joblens_status():
         """透传 Core 的来源/持久化/队列/对账健康状态"""
-        return forward_inventory_rpc(
-            'JobRegistry/inventory_status', {}, InventoryStatusResponse
+        return forward_core_rpc(
+            'joblens/status', {}, JobLensStatusResponse
         )
 
     @app.route('/joblens/collection', methods=['POST'])
@@ -565,24 +571,36 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             payload.get('operation'), payload.get('scope'),
             payload.get('ensure_registered'), payload.get('selector'),
         )
-        return forward_inventory_rpc('JobCollection/set', payload, CollectionControlResponse)
+        return forward_core_rpc('jobs/collection/set', payload, CollectionControlResponse)
 
     @app.route('/joblens/collection', methods=['GET'])
     def collection_get():
-        """查询单个实例的期望/已生效采集选择与错误"""
-        instance_id = (request.args.get('instance_id') or '').strip()
-        if not instance_id:
-            return _invalid_request('instance_id query parameter is required')
+        """查询单个实例的期望/已生效采集选择与错误
 
-        return forward_inventory_rpc(
-            'JobCollection/get', {'instance_id': instance_id}, CollectionStatusResponse
+        `internal_job_id` 是规范参数（十进制内部 ID）；`instance_id` 只作为
+        旧客户端的兼容 alias，Trigger 在边界统一成 Core 的新字段。
+        """
+        internal_job_id = (
+            request.args.get('internal_job_id')
+            or request.args.get('instance_id')
+            or ''
+        ).strip()
+        if not internal_job_id:
+            return _invalid_request(
+                'internal_job_id query parameter is required'
+            )
+
+        return forward_core_rpc(
+            'jobs/collection/get',
+            {'internal_job_id': internal_job_id},
+            CollectionStatusResponse,
         )
 
     @app.route('/joblens/capabilities', methods=['GET'])
     def capabilities():
         """只透传 Core 的能力声明；Core 不支持时返回 503，绝不代其声明能力"""
-        return forward_inventory_rpc(
-            'JobRegistry/capabilities', {}, CapabilitiesResponse
+        return forward_core_rpc(
+            'joblens/capabilities', {}, CapabilitiesResponse
         )
 
     @app.route('/joblens/jobs/count', methods=['GET'])

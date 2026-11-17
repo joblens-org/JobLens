@@ -52,7 +52,7 @@ const std::string KEY_PREFIX_COUNTER  = "c:";
 const std::string KEY_PREFIX_META     = "m:";
 const std::string KEY_PREFIX_IDENTITY = "i:";
 
-constexpr uint32_t kInventorySchemaVersion = 5;
+constexpr uint32_t kJobStoreSchemaVersion = 5;
 
 // The schema marker is a canonical decimal: ASCII digits only, no sign, no
 // whitespace, no leading zero, no trailing junk, and it must fit the field.
@@ -202,7 +202,7 @@ CollectionSelection selection_from_json(const nlohmann::json& in);
 nlohmann::json record_json(const JobRecord& record) {
     nlohmann::json out;
     write_job_fields(out, record.job);
-    out["schema_version"] = kInventorySchemaVersion;
+    out["schema_version"] = kJobStoreSchemaVersion;
     // The desired selection lives in the record that owns the instance and is
     // ordered by the record's single revision.
     out["selection"] = selection_to_json(record.selection);
@@ -444,14 +444,14 @@ bool JobStore::init_db(const Options& options) {
             return false;
         }
         if (!initialize_schema()) {
-            spdlog::error("JobStore: could not initialize a new schema-{} store", kInventorySchemaVersion);
+            spdlog::error("JobStore: could not initialize a new schema-{} store", kJobStoreSchemaVersion);
             reject_unsupported_schema(/*found=*/0);
             return false;
         }
-    } else if (schema_version_ != kInventorySchemaVersion) {
+    } else if (schema_version_ != kJobStoreSchemaVersion) {
         spdlog::error("JobStore: db schema {} is not supported by this binary (schema {}); "
                       "refusing to migrate or delete it", schema_version_,
-                      kInventorySchemaVersion);
+                      kJobStoreSchemaVersion);
         reject_unsupported_schema(schema_version_);
         return false;
     }
@@ -500,15 +500,15 @@ bool JobStore::initialize_schema() {
     if (!db_) return false;
     if (db_uuid_.empty()) db_uuid_ = generate_db_uuid();
     leveldb::WriteBatch batch;
-    batch.Put(key_meta("schema_version"), std::to_string(kInventorySchemaVersion));
+    batch.Put(key_meta("schema_version"), std::to_string(kJobStoreSchemaVersion));
     batch.Put(key_meta("db_uuid"), db_uuid_);
     const auto status = write_batch_locked(batch, "initialize schema");
     if (!status.ok()) {
-        spdlog::error("JobStore: failed to initialize schema {}: {}", kInventorySchemaVersion,
+        spdlog::error("JobStore: failed to initialize schema {}: {}", kJobStoreSchemaVersion,
                       status.ToString());
         return false;
     }
-    schema_version_ = kInventorySchemaVersion;
+    schema_version_ = kJobStoreSchemaVersion;
     return true;
 }
 
@@ -607,7 +607,7 @@ std::vector<JobRecord> JobStore::loadAll() {
         spdlog::warn("JobStore: restored {} interrupted closing record(s); they will be "
                      "archived by the closing cleanup", closing_restored);
     }
-    spdlog::info("JobStore: loaded {} inventory record(s) ({} incomplete)",
+    spdlog::info("JobStore: loaded {} job records ({} incomplete)",
                  restored.size(), incomplete);
     return restored;
 }
@@ -1174,7 +1174,7 @@ void JobStore::init_id_counter() {
 }
 
 uint64_t JobStore::allocateId(std::string& error) {
-    // Every allocator consumer shares the same admission order as the inventory
+    // Every allocator consumer shares the same admission order as the registry
     // registration path: a standalone reservation can never land
     // between a batch's id reservation and that batch's commit, which would let
     // the batch write an older counter back and reissue a published id.
@@ -1241,7 +1241,7 @@ bool JobStore::reserveId(uint64_t& id, uint64_t& durable_counter,
 
 uint64_t JobStore::nextJobId() {
     if (!store_ready()) {
-        spdlog::warn("JobStore: refusing JobID allocation before the inventory store is ready");
+        spdlog::warn("JobStore: refusing JobID allocation before the job store is ready");
         return 0;
     }
     std::string error;

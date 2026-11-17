@@ -1,6 +1,6 @@
 # Job Watcher Integration Guide
 
-This guide describes how to add a **new scheduler type** to the job inventory —
+This guide describes how to add a **new scheduler type** to the job registry —
 for example an `ssh` session source — by writing one *job watcher* (a discovery
 source) and one *scheduler adapter*. Everything downstream (the `JobStore`
 merge semantics, the heartbeat's retirement rules, the collection binding and
@@ -32,7 +32,7 @@ What you get for free:
 - the heartbeat: authoritative manager passes, absence tracking, retirement
   evidence rules, per-record execution refresh;
 - desired-vs-applied collection reconciliation and `CollectionStatus`;
-- `JobRegistry/*` and `JobCollection/*` RPC methods and the trigger proxy;
+- `jobs/*` and `jobs/collection/*` RPC methods and the trigger proxy;
 - kernel attribution (`pid2job` / `cgroup2job`) **iff** your adapter declares
   the `kernel_attribution` trait;
 - an unprivileged test path (fixture file trees, injected probes/sources).
@@ -42,9 +42,9 @@ What you get for free:
 1. **Registration (before `main()`):** `REGISTER_SCHEDULER_ADAPTER("ssh",
    SshSchedulerAdapter)` at TU scope inserts a factory into
    `SchedulerAdapterRegistry` — same convention as `AUTO_REGISTER_COLLECTOR`.
-2. **Assembly (`JobRegistry::armInventory()`, called from the registry
+2. **Assembly (`JobRegistry::armDiscovery()`, called from the registry
    constructor):** the resolved config's
-   `inventory.types` entries are built through the registry, one adapter per
+   `maintenance.types` entries are built through the registry, one adapter per
    type. The adapter is the *only* component that knows the scheduler's
    attribute schema, identity format and capabilities.
 3. **Runtime:** the heartbeat drives the adapter's `IDiscoverySource`:
@@ -81,9 +81,9 @@ Latency-critical discovery never waits for a heartbeat pass:
    an **incomplete discovery never creates a record**; the watcher requests
    one coalesced authoritative pass and the next manager pass converges it in
    tens of milliseconds.
-4. `JobRegistry/inventory_status` keeps `exec_ingest_depth`,
+4. `joblens/status` keeps `exec_ingest_depth`,
    `queue_depth` and `events_dropped` as deprecated constant-zero keys:
-   inventory has no ingest worker or observation queue.
+   the registry has no ingest worker or observation queue.
 
 Known limitation: events between the process's first instruction and the
 user-space `pid2job` seeding are still invisible to the syscall-tracepoint
@@ -147,7 +147,7 @@ group, filled where the source parses its inputs. `JobID`, `JobPIDs` and
 
 ### 3.4 Adapter duties (`ISchedulerAdapter`)
 
-- `discoveryOptions(settings)`: map `InventoryTypeSettings` onto your
+- `discoveryOptions(settings)`: map `DiscoveryTypeSettings` onto your
   `DiscoveryOptions` (event source on/off, cluster namespace).
 - (Discovery facts are filled by the watcher itself; there is no
   `encodeFacts` detour through neutral fields.)
@@ -240,13 +240,13 @@ watcher — copy the patterns, not just the shape):
 // include/job_watcher/ssh_adapter.hpp
 class SshSchedulerAdapter final : public ISchedulerAdapter {
 public:
-    explicit SshSchedulerAdapter(const InventoryTypeSettings& settings)
+    explicit SshSchedulerAdapter(const DiscoveryTypeSettings& settings)
         : watcher_(discoveryOptions(settings)) {}
 
     const std::string& name() const override { return name_; }
     std::string configSection() const override { return "ssh_job_watcher"; }
     IDiscoverySource& source() override { return watcher_; }
-    DiscoveryOptions discoveryOptions(const InventoryTypeSettings&) const override;
+    DiscoveryOptions discoveryOptions(const DiscoveryTypeSettings&) const override;
     Job decodeFacts(const nlohmann::json& row) const override;
     NativeSelector legacySelector(const Job&) const override;
     AdapterTraits traits() const override;   // ssh: both traits false
@@ -286,7 +286,7 @@ as a note on the pass, never a startup error.
 
 Without an event source your adapter simply runs without exec hints:
 `start()` returns `false` and starts no poll thread, hints are never produced,
-and the registry's manager pass still maintains the inventory.
+and the registry's manager pass still maintains the registry.
 
 ### Step 6 — configuration
 
@@ -301,7 +301,7 @@ ssh_job_watcher:
   cluster_name: ""            # empty: derive from the source environment
 ```
 
-and list the type under `job_registry_config.inventory.types: [condor, slurm, ssh]`.
+and list the type under `job_registry_config.maintenance.types: [condor, slurm, ssh]`.
 Leaving it out keeps the type dormant; the heartbeat still maintains any
 existing records of that type.
 
@@ -317,7 +317,7 @@ Follow the two existing tiers; neither needs root, live schedulers or eBPF:
    explicit note. The script reuses the Ninja `JobLens` link command so
    production objects are exercised as shipped.
 2. **Registry tier** — fake source + probes through the constructor seams,
-   like `tests/integration/job_inventory_maintenance_test.cpp`:
+   like `tests/integration/job_maintenance_test.cpp`:
 
    ```cpp
    JobRegistryOptions options;
@@ -351,9 +351,9 @@ For eBPF-dependent tests, guard on namespace availability the way
 |---|---|
 | `include/core/job_registry.hpp` (or any compiled TU) | include the adapter header so its `REGISTER_SCHEDULER_ADAPTER` registrar is linked |
 | `include/core/job_discovery.hpp` | optional: a special `DiscoveryEnvironment` root (e.g. a spool dir) |
-| `config/config.example.yaml` | `<t>_job_watcher` section + `inventory.types` entry |
+| `config/config.example.yaml` | `<t>_job_watcher` section + `maintenance.types` entry |
 
-No changes are needed in `collector_type.h`, `job_identity`, `inventory_config`,
+No changes are needed in `collector_type.h`, `job_identity`, `maintenance_config`,
 `JobStore`, the heartbeat/retirement logic, `KernelAttribution`, the RPC methods
 or the trigger: identity, config sections, native-id rules, facts (JSON
 alternative), matching and cgroup derivation are all adapter-driven.

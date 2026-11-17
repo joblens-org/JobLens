@@ -153,7 +153,7 @@ struct FakeJobEvent : IEventJobCollector {
     static inline std::atomic<int> writer_fd{-1};
     static inline std::atomic<int> reader_fd{-1};
     // Target of byte '3', so a test can drive an event for a job id allocated at
-    // runtime by the inventory.
+    // runtime by the registry.
     static inline std::atomic<uint64_t> extra_job_id{0};
 
     bool init(const nlohmann::json&, CollectorInitContext& context) override
@@ -468,9 +468,9 @@ void run(const std::string& base)
 
     const auto bound = upsert("700.0");
     check(bound.ok && bound.disposition == UpsertDisposition::Created,
-          "inventory upsert must create the instance");
+          "job upsert must create the instance");
     check(collector_status(scheduler, "job_event").at("job_count").get<size_t>() == 0,
-          "an unbound inventory instance must not attach a collector lane");
+          "an unbound job instance must not attach a collector lane");
     const int added_before_bind = FakeJobEvent::added.load();
 
     CollectionRequest bind;
@@ -490,7 +490,7 @@ void run(const std::string& base)
     check(attached.tracked &&
               attached.collectors == std::vector<std::string>{"job_event"},
           "actual collectors must name the attached lane");
-    const auto attached_record = JobRegistry::instance().inventoryRecord(bound.internal_id);
+    const auto attached_record = JobRegistry::instance().jobRecord(bound.internal_id);
     check(attached_record.has_value() &&
               attached.last_revision == attached_record->revision,
           "the actual state must name the record revision it converged to");
@@ -500,9 +500,9 @@ void run(const std::string& base)
     send_byte(FakeJobEvent::writer_fd.load(), '3');
     eventually([&] {
         return CaptureWriter::count("job_event") >= 3;
-    }, "bound inventory instance did not produce output");
+    }, "bound job instance did not produce output");
 
-    // A persistent stop detaches the lane but keeps the inventory record.
+    // A persistent stop detaches the lane but keeps the job record.
     const int removed_before_stop = FakeJobEvent::removed.load();
     CollectionRequest stop;
     stop.targets = {bound.internal_id};
@@ -516,7 +516,7 @@ void run(const std::string& base)
     check(JobRegistry::instance().actualCollection(bound.internal_id).collectors.empty(),
           "nothing may remain applied after a persistent stop");
     check(JobRegistry::instance().findJob(bound.internal_id).has_value(),
-          "stopping collection must keep the inventory record");
+          "stopping collection must keep the job record");
 
     // Retirement of a stopped instance is acknowledged without leaving a lane.
     check(JobRegistry::instance().retireInstance(bound.internal_id),
@@ -526,7 +526,7 @@ void run(const std::string& base)
 
     // Natural completion while bound must detach the lane exactly once.
     const auto bound_two = upsert("701.0");
-    check(bound_two.ok, "second inventory upsert");
+    check(bound_two.ok, "second job upsert");
     CollectionRequest bind_two;
     bind_two.targets = {bound_two.internal_id};
     bind_two.collectors = std::vector<std::string>{"job_event"};
@@ -562,7 +562,7 @@ void run(const std::string& base)
     registry.delJob(303);
     eventually([&] { return scheduler.actual(303).draining; }, "failed drain not owned by scheduler");
     check(!registry.cleanupClosingJobs(), "shutdown sweep must refuse an unproven live drain");
-    check(registry.inventoryRecord(303).has_value(), "unproven live drain must remain Closing");
+    check(registry.jobRecord(303).has_value(), "unproven live drain must remain Closing");
     scheduler.shutdown();
     check(!registry.deinit(), "shutdown with an unproven drain must be incomplete");
     leveldb::Options options;
@@ -588,16 +588,16 @@ void run(const std::string& base)
     // newly composed runtime has no in-process owner for the old epoch.
     JobRegistryOptions reopened_options;
     reopened_options.db_path = base + ".db";
-    reopened_options.test_static_inventory = true;
+    reopened_options.test_static_registry = true;
     reopened_options.enable_pid_tracker = false;
     reopened_options.register_rpc = false;
     JobRegistry reopened(reopened_options);
     reopened.setKernelCleanupForTest([](uint64_t, const Job&, std::string&) { return true; });
     TestCollectionRuntime fresh_runtime(reopened);
     reopened.setCollectionRuntime(&fresh_runtime);
-    check(reopened.inventoryRecord(303).has_value(), "restart must restore the Closing row");
+    check(reopened.jobRecord(303).has_value(), "restart must restore the Closing row");
     check(reopened.cleanupClosingJobs(), "ownerless restored Closing must retain restart fallback");
-    check(!reopened.inventoryRecord(303).has_value(), "restart fallback must finish cleanup");
+    check(!reopened.jobRecord(303).has_value(), "restart fallback must finish cleanup");
     check(reopened.deinit(), "reopened fixture must shut down cleanly");
     WriterManager::instance().shutdown();
 }

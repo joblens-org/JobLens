@@ -11,11 +11,11 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Inventory/collection RPC surface, split out of the registry facade.
+// Job/collection RPC surface, split out of the registry facade.
 // Everything here reads state through the public JobRegistry API, so no
 // registry lock is held while a mutation or provider call runs.
 
-#include "core/inventory_rpc.hpp"
+#include "core/job_rpc.hpp"
 
 #include <spdlog/spdlog.h>
 #include <fmt/core.h>
@@ -29,13 +29,13 @@
 #include "common/config.hpp"
 #include "core/collector_registry.hpp"
 #include "core/scheduler_adapter.hpp"
-#include "core/inventory_config.hpp"
-#include "core/inventory_status_provider.hpp"
+#include "core/maintenance_config.hpp"
+#include "core/status_provider.hpp"
 #include "common/local_rpc.hpp"
 
-#if __has_include("core/inventory_status_provider.hpp")
-#include "core/inventory_status_provider.hpp"
-#define JOBLENS_HAS_INVENTORY_STATUS_PROVIDER 1
+#if __has_include("core/status_provider.hpp")
+#include "core/status_provider.hpp"
+#define JOBLENS_HAS_STATUS_PROVIDER 1
 #endif
 
 std::pair<std::string, std::string>
@@ -150,7 +150,7 @@ constexpr uint32_t kRpcSchemaVersion = 2;
 
 // ---------------------------------------------------------------------------
 // Local serialization helpers (the JobRecord wire form lives in job_store;
-// the RPC only needs generation/process projections for inventory views)
+// the RPC only needs generation/process projections for job views)
 // ---------------------------------------------------------------------------
 
 nlohmann::json manager_to_json(const ProcessIdentity& manager) {
@@ -252,7 +252,7 @@ std::optional<std::string> base64url_decode(const std::string& text)
 // Snapshot revision for a bounded page stream. A cursor captured on page one is
 // only valid while the same record set (ids, facts revisions, lifecycle state)
 // is observed; anything else is a changed snapshot, never a silent skip.
-uint64_t inventory_snapshot_revision(const std::vector<JobRecord>& records)
+uint64_t jobs_snapshot_revision(const std::vector<JobRecord>& records)
 {
     std::vector<const JobRecord*> ordered;
     ordered.reserve(records.size());
@@ -280,7 +280,7 @@ uint64_t inventory_snapshot_revision(const std::vector<JobRecord>& records)
     return hash & 0x7fffffffffffffffULL;
 }
 
-std::string inventory_source(const JobRecord& record)
+std::string job_source(const JobRecord& record)
 {
     return record.job.subtype_name.empty() ? "manual" : record.job.subtype_name;
 }
@@ -295,7 +295,7 @@ std::string step_id_text(const JobRegistry& registry, const JobRecord& record)
     return {};
 }
 
-nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& record)
+nlohmann::json job_record_json(JobRegistry& registry, const JobRecord& record)
 {
     nlohmann::json out;
     // Deprecated key kept for old readers; the value is the internal id as a
@@ -306,7 +306,7 @@ nlohmann::json inventory_record_json(JobRegistry& registry, const JobRecord& rec
     out["schema_version"] = kRpcSchemaVersion;
     out["record_revision"] = record.revision;
     out["state"] = to_string(record.state);
-    out["source"] = inventory_source(record);
+    out["source"] = job_source(record);
     out["quarantined"] = false;
     out["identity_complete"] = !record.index_key.empty();
     // Selector fields are projections of the Job: the typed facts are the
@@ -371,15 +371,15 @@ std::string optional_string(const nlohmann::json& node, const char* key)
 // One on-demand authoritative pass through the registry heartbeat. Returns
 // false when no controller is running, so callers keep an explicit "not found"
 // instead of inventing a record. Never allocates ids or guesses an identity.
-bool refresh_inventory_once()
+bool refresh_jobs_once()
 {
-#ifdef JOBLENS_HAS_INVENTORY_STATUS_PROVIDER
-    auto provider = get_inventory_refresh_provider();
+#ifdef JOBLENS_HAS_STATUS_PROVIDER
+    auto provider = get_refresh_provider();
     if (!provider) return false;
     try {
         return provider();
     } catch (const std::exception& error) {
-        spdlog::warn("JobRegistry: on-demand inventory refresh failed: {}", error.what());
+        spdlog::warn("JobRegistry: on-demand job refresh failed: {}", error.what());
         return false;
     }
 #else
@@ -405,7 +405,7 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
     // the adapter-owned structured form (never by re-parsing the combined
     // canonical namespace).
     const auto selector_facts = registry.selectorFactsOf(selector);
-    for (auto& record : registry.inventoryRecords()) {
+    for (auto& record : registry.jobRecords()) {
         if (is_reserved_internal_id(record.job.JobID)) continue;
         if (record.index_key.empty()) continue;
         const auto* adapter = registry.adapterNamed(record.job.subtype_name);
@@ -426,7 +426,7 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
             // Refresh discovery before declaring the target missing.
             // Only a real source pass may create the record; no caller-supplied
             // PID or native number authorizes an invented live instance.
-            if (refresh_inventory_once()) {
+            if (refresh_jobs_once()) {
                 return resolve_native_target(registry, selector, scope,
                                              /*ensure_registered=*/false);
             }
@@ -474,7 +474,7 @@ TargetResolution resolve_instance_handle_by_id(JobRegistry& registry, uint64_t i
     TargetResolution result;
     auto record = is_reserved_internal_id(internal_id)
                       ? std::nullopt
-                      : registry.inventoryRecord(internal_id);
+                      : registry.jobRecord(internal_id);
     if (!record) {
         result.code = "not_found";
         result.message = "no verified current instance with internal_job_id '" +
@@ -587,8 +587,8 @@ SubAttrMatcher parse_legacy_matcher(const nlohmann::json& matcher_json)
     return matcher;
 }
 
-// Legacy remove: stop collection, keep the inventory fact. Only records
-// outside the inventory (pure legacy registrations) are archived as before.
+// Legacy remove: stop collection, keep the job record. Only records
+// outside the registry (pure legacy registrations) are archived as before.
 // With "erase": true the command becomes the real-delete tier — every target
 // is retired (closing -> archive for collected instances, durable delete for
 // never-collected ones) instead of stopped.
@@ -642,7 +642,7 @@ nlohmann::json legacy_remove(JobRegistry& registry, const nlohmann::json& req)
         out["mode"] = "erase";
         out["deleted_count"] = erased;
         out["erased_instances"] = std::move(erased_instances);
-        out["inventory_retained"] = false;
+        out["record_retained"] = false;
         out["msg"] = "erase retired the instances (collected ones archived, "
                      "never-collected ones deleted)";
         return out;
@@ -654,7 +654,7 @@ nlohmann::json legacy_remove(JobRegistry& registry, const nlohmann::json& req)
     size_t retired = 0;
     for (const auto id : targets) {
         if (id == kSystemSentinelJobId) continue;
-        if (!registry.inventoryRecord(id).has_value()) {
+        if (!registry.jobRecord(id).has_value()) {
             if (registry.retireInstance(id)) ++retired;
             continue;
         }
@@ -686,7 +686,7 @@ nlohmann::json legacy_remove(JobRegistry& registry, const nlohmann::json& req)
 
     if (!targets.empty()) {
         spdlog::warn("JobRegistry: legacy remove is deprecated and now stops collection for "
-                     "{} instance(s); inventory records are retained",
+                     "{} instance(s); job records are retained",
                      stopped);
     }
 
@@ -697,9 +697,9 @@ nlohmann::json legacy_remove(JobRegistry& registry, const nlohmann::json& req)
     out["stopped_count"] = stopped;
     out["stopped_instances"] = stopped_instances;
     out["apply_errors"] = std::move(apply_errors);
-    out["inventory_retained"] = true;
+    out["record_retained"] = true;
     out["deprecated"] = true;
-    out["msg"] = "legacy remove now stops collection; inventory records are retained";
+    out["msg"] = "legacy remove now stops collection; job records are retained";
     return out;
 }
 
@@ -730,17 +730,17 @@ nlohmann::json provider_payload(const T& provider)
 }
 
 // Empty when no maintenance provider is registered.
-nlohmann::json current_inventory_status_provider()
+nlohmann::json current_status_provider()
 {
-#ifdef JOBLENS_HAS_INVENTORY_STATUS_PROVIDER
-    auto provider = get_inventory_status_provider();
+#ifdef JOBLENS_HAS_STATUS_PROVIDER
+    auto provider = get_status_provider();
     return provider_payload(provider);
 #else
     return nlohmann::json();
 #endif
 }
 
-// Readiness gate for the inventory/control surface. A rejected schema or a
+// Readiness gate for the job/control surface. A rejected schema or a
 // closed store must not look like "no jobs" or "no such instance".
 std::optional<nlohmann::json> store_not_ready_payload(const StoreHealth& health)
 {
@@ -748,21 +748,21 @@ std::optional<nlohmann::json> store_not_ready_payload(const StoreHealth& health)
     if (!health.db_running) {
         if (health.migration_state == "malformed_schema_marker") {
             return error_payload("store_unavailable",
-                                 "inventory store has a schema marker this build did not "
+                                 "job store has a schema marker this build did not "
                                  "write; the database was left untouched (no rewrite, no "
                                  "deletion)");
         }
         if (health.migration_state.rfind("unsupported_schema", 0) == 0) {
             return error_payload("store_unavailable",
-                                 "inventory store schema is not supported by this build; "
+                                 "job store schema is not supported by this build; "
                                  "it was left untouched (no migration, no deletion): " +
                                      health.migration_state);
         }
         return error_payload("store_unavailable",
-                             "inventory store is not running on this core");
+                             "job store is not running on this core");
     }
     return error_payload("store_unavailable",
-                         "inventory store is not ready (" +
+                         "job store is not ready (" +
                              (health.migration_state.empty() ? std::string{"unknown"}
                                                              : health.migration_state) + ")");
 }
@@ -794,7 +794,7 @@ nlohmann::json store_health_json(const StoreHealth& health){
     };
 }
 
-nlohmann::json inventory_status_payload(JobRegistry& registry)
+nlohmann::json joblens_status_payload(JobRegistry& registry)
 {
     const auto health = registry.storeHealth();
 
@@ -806,13 +806,13 @@ nlohmann::json inventory_status_payload(JobRegistry& registry)
                                 : ((health.degraded || health.recovery_required)
                                        ? "degraded"
                                        : "healthy"));
-    body["inventory_enabled"] = health.db_running;
+    body["enabled"] = health.db_running;
     body["sources"] = nlohmann::json{{"state", "not_configured"}};
 
     uint64_t active = 0;
     uint64_t suspect = 0;
     uint64_t closing = 0;
-    for (const auto& record : registry.inventoryRecords()) {
+    for (const auto& record : registry.jobRecords()) {
         if (is_reserved_internal_id(record.job.JobID)) continue;
         if (!record.verified) ++suspect;
         else if (record.state == RecordState::Closing) ++closing;
@@ -830,7 +830,7 @@ nlohmann::json inventory_status_payload(JobRegistry& registry)
 
     // Maintenance-controller keys (sources/queue/reconciliation) win over the
     // defaults above; store facts always come from the store itself.
-    const auto provider = current_inventory_status_provider();
+    const auto provider = current_status_provider();
     if (provider.is_object()) body.update(provider);
     body["store"] = store_health_json(health);
     body["persistence"] = body["store"]["persistence"];
@@ -841,7 +841,7 @@ nlohmann::json inventory_status_payload(JobRegistry& registry)
 
 }  // namespace
 
-void registerInventoryRpc(JobRegistry& registry) {
+void registerJobRpc(JobRegistry& registry) {
     // 注册 RPC 方法
     // 请求体格式示例：
     // {
@@ -867,7 +867,7 @@ void registerInventoryRpc(JobRegistry& registry) {
                     j = registry.upsertJob(job, req, legacy_add_selector(job, registry));
                 }else if(opt.compare("remove") == 0){
                     // Remove stops collection for resolved live jobs and
-                    // keeps the inventory fact instead of forgetting the
+                    // keeps the job record instead of forgetting the
                     // execution.
                     j = legacy_remove(registry, req);
                 }else {
@@ -946,9 +946,9 @@ void registerInventoryRpc(JobRegistry& registry) {
     );
 
     // -----------------------------------------------------------------------
-    // Inventory read surface
+    // Job read surface
     // -----------------------------------------------------------------------
-    RPCServer::instance().register_method("JobRegistry/inventory_list",
+    RPCServer::instance().register_method("jobs/list",
         [&registry](const nlohmann::json& req) -> nlohmann::json {
             if (auto not_ready = store_not_ready_payload(registry.storeHealth()))
                 return *not_ready;
@@ -1007,7 +1007,7 @@ void registerInventoryRpc(JobRegistry& registry) {
             }
 
             std::vector<JobRecord> matching;
-            for (auto& record : registry.inventoryRecords()) {
+            for (auto& record : registry.jobRecords()) {
                 if (is_reserved_internal_id(record.job.JobID)) continue;
                 if (!scheduler_filter.empty() &&
                     record.job.subtype_name != scheduler_filter)
@@ -1022,7 +1022,7 @@ void registerInventoryRpc(JobRegistry& registry) {
             }
             sort_records(matching);
 
-            const uint64_t snapshot_revision = inventory_snapshot_revision(matching);
+            const uint64_t snapshot_revision = jobs_snapshot_revision(matching);
             const std::string filter_fingerprint =
                 scheduler_filter + "|" + native_filter + "|" + state_filter;
 
@@ -1041,7 +1041,7 @@ void registerInventoryRpc(JobRegistry& registry) {
                     cursor_revision != snapshot_revision) {
                     return error_payload(
                         "cursor_invalidated",
-                        fmt::format("inventory snapshot {} no longer matches cursor snapshot {}; "
+                        fmt::format("job snapshot {} no longer matches cursor snapshot {}; "
                                     "restart from the first page",
                                     snapshot_revision, cursor_revision));
                 }
@@ -1058,7 +1058,7 @@ void registerInventoryRpc(JobRegistry& registry) {
                     more = true;
                     break;
                 }
-                records.push_back(inventory_record_json(registry, record));
+                records.push_back(job_record_json(registry, record));
                 last_emitted = record.job.JobID;
                 ++emitted;
             }
@@ -1082,26 +1082,26 @@ void registerInventoryRpc(JobRegistry& registry) {
         }
     );
 
-    RPCServer::instance().register_method("JobRegistry/inventory_status",
+    RPCServer::instance().register_method("joblens/status",
         [&registry](const nlohmann::json& req) -> nlohmann::json {
             (void)req;
-            return inventory_status_payload(registry);
+            return joblens_status_payload(registry);
         }
     );
 
-    RPCServer::instance().register_method("JobRegistry/capabilities",
+    RPCServer::instance().register_method("joblens/capabilities",
         [&registry](const nlohmann::json& req) -> nlohmann::json {
             (void)req;
             const auto health = registry.storeHealth();
             nlohmann::json out;
             out["status"] = "ok";
-            out["inventory_version"] = 1;
+            out["api_version"] = 2;
             out["collection_control_version"] = 1;
             out["native_identity_selectors"] = true;
             out["job_scope"] = "current_local_instances";
             // Contract field name shared with the trigger Pydantic model.
             out["db_schema_version"] = health.schema_version;
-            out["inventory_ready"] = health.db_running && health.migration_complete;
+            out["ready"] = health.db_running && health.migration_complete;
             return out;
         }
     );
@@ -1109,7 +1109,7 @@ void registerInventoryRpc(JobRegistry& registry) {
     // -----------------------------------------------------------------------
     // Collection control surface
     // -----------------------------------------------------------------------
-    RPCServer::instance().register_method("JobCollection/set",
+    RPCServer::instance().register_method("jobs/collection/set",
         [&registry](const nlohmann::json& req) -> nlohmann::json {
             if (!req.is_object())
                 return error_payload("invalid_request", "request body must be a JSON object");
@@ -1271,7 +1271,7 @@ void registerInventoryRpc(JobRegistry& registry) {
 
             nlohmann::json targets = nlohmann::json::array();
             for (const auto& target : outcome.targets) {
-                const auto record = registry.inventoryRecord(target.internal_id);
+                const auto record = registry.jobRecord(target.internal_id);
                 if (!record) continue;
                 targets.push_back(collection_target_json(
                     registry, *record, target.selection, target.revision, target.changed,
@@ -1286,7 +1286,7 @@ void registerInventoryRpc(JobRegistry& registry) {
         }
     );
 
-    RPCServer::instance().register_method("JobCollection/get",
+    RPCServer::instance().register_method("jobs/collection/get",
         [&registry](const nlohmann::json& req) -> nlohmann::json {
             if (!req.is_object())
                 return error_payload("invalid_request", "request body must be a JSON object");

@@ -31,7 +31,7 @@ struct SlurmSchedulerAdapter::Impl {
     SlurmJobWatcher watcher;
 };
 
-SlurmSchedulerAdapter::SlurmSchedulerAdapter(const InventoryTypeSettings& settings)
+SlurmSchedulerAdapter::SlurmSchedulerAdapter(const DiscoveryTypeSettings& settings)
     : impl_(std::make_unique<Impl>(discoveryOptions(settings)))
 {
 }
@@ -63,7 +63,7 @@ AdapterTraits SlurmSchedulerAdapter::traits() const
 }
 
 DiscoveryOptions SlurmSchedulerAdapter::discoveryOptions(
-    const InventoryTypeSettings& settings) const
+    const DiscoveryTypeSettings& settings) const
 {
     DiscoveryOptions options;
     options.enable_event_source = true;

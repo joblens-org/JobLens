@@ -23,17 +23,17 @@ lens_config:
 # ============================================================
 job_registry_config:
   job_db_path: /var/JobLens/job.db          # LevelDB database directory for job persistence
-  # Inventory discovery. `types` is opt-in: an absent list means [] (no broad
-  # discovery). `reconcile_interval_sec` defaults to 30 and must be >= 1;
+  # Discovery and maintenance. `types` is opt-in: an absent list means [] (no
+  # broad discovery). `reconcile_interval_sec` defaults to 30 and must be >= 1;
   # invalid values are rejected at startup. `capture_all` (default true)
   # registers every captured job unconditionally; when false, registration is
   # decided by the type's `<type>_job_watcher.auto_add`.
-  inventory:
+  maintenance:
     types: [condor, slurm]
     reconcile_interval_sec: 30
     capture_all: true
 
-# Scheduler discovery. Listing a type under job_registry_config.inventory.types
+# Scheduler discovery. Listing a type under job_registry_config.maintenance.types
 # maintains every recognized local instance. `auto_add` is the tri-state
 # automatic path:
 #   off     - never select collectors automatically (the job still registers

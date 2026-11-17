@@ -14,15 +14,15 @@
 /* Registry lifecycle acceptance:
  *
  *   * construction is the single assembly point: the store opens, the
- *     inventory heartbeat starts (providers published) even with no
+ *     registry heartbeat starts (providers published) even with no
  *     configured discovery type;
- *   * stopInventoryDiscovery() is idempotent and keeps the status provider
+ *   * stopDiscovery() is idempotent and keeps the status provider
  *     published while records drain;
  *   * deinit() finalizes retirements, closes the store, retracts the
  *     providers and is idempotent; the destructor only backstops it.
  */
 #include "common/config.hpp"
-#include "core/inventory_status_provider.hpp"
+#include "core/status_provider.hpp"
 #include "core/job_registry.hpp"
 #include "job_fixture.h"
 #include "collection_runtime_fixture.hpp"
@@ -44,7 +44,7 @@ struct JobRegistryNamespaceTestAccess {
                                        std::shared_future<void> release)
     {
         registry.store_->setRowProvider([&registry, id, &captured, release](uint64_t current) {
-            auto row = registry.inventoryRecord(current);
+            auto row = registry.jobRecord(current);
             if (current == id) {
                 captured.set_value();
                 release.wait();
@@ -55,7 +55,7 @@ struct JobRegistryNamespaceTestAccess {
     static void restoreProvider(JobRegistry& registry)
     {
         registry.store_->setRowProvider([&registry](uint64_t id) {
-            return registry.inventoryRecord(id);
+            return registry.jobRecord(id);
         });
     }
     static bool pass(JobRegistry& registry) { return registry.runPass(false, true); }
@@ -143,7 +143,7 @@ void manual_readd_preserves_creation_metadata(const std::string& base)
 {
     JobRegistryOptions options;
     options.db_path = fresh_dir(base, "manual-frozen-metadata");
-    options.test_static_inventory = true;
+    options.test_static_registry = true;
     options.enable_pid_tracker = false;
     options.register_rpc = false;
     JobRegistry registry(options);
@@ -157,7 +157,7 @@ void manual_readd_preserves_creation_metadata(const std::string& base)
     original_attr.slots_cgroup_path = "/original/cgroup";
     const auto created = registry.upsertObservedJob(observation);
     check(created.ok, "manual freeze: the discovery fixture must register");
-    const auto initial = registry.inventoryRecord(created.internal_id);
+    const auto initial = registry.jobRecord(created.internal_id);
     const auto writes = registry.storeHealth().durable_commits;
 
     Job request = observation;
@@ -169,7 +169,7 @@ void manual_readd_preserves_creation_metadata(const std::string& base)
     changed_attr.slots_cgroup_path = "/replacement/cgroup";
     changed_attr.auto_update_child = true;
     const auto noop = registry.upsertJob(request, nlohmann::json::object(), selector);
-    const auto kept = registry.inventoryRecord(created.internal_id);
+    const auto kept = registry.jobRecord(created.internal_id);
     check(noop.value("status", "") == "success" && kept && initial &&
               kept->revision == initial->revision &&
               registry.storeHealth().durable_commits == writes,
@@ -184,7 +184,7 @@ void manual_readd_preserves_creation_metadata(const std::string& base)
 
     request.CollectorNames = {"cpumem_collector"};
     const auto selected = registry.upsertJob(request, nlohmann::json::object(), selector);
-    const auto selected_record = registry.inventoryRecord(created.internal_id);
+    const auto selected_record = registry.jobRecord(created.internal_id);
     check(selected.value("status", "") == "success" && selected_record &&
               selected_record->revision == initial->revision + 1 &&
               std::get<CondorJobAttr>(selected_record->job.sub_attr).owner == "alice" &&
@@ -193,7 +193,7 @@ void manual_readd_preserves_creation_metadata(const std::string& base)
           "manual re-add may change selection without a separate metadata revision");
     const auto repeated = registry.upsertJob(request, nlohmann::json::object(), selector);
     check(repeated.value("status", "") == "success" &&
-              registry.inventoryRecord(created.internal_id)->revision == selected_record->revision,
+              registry.jobRecord(created.internal_id)->revision == selected_record->revision,
           "repeating the same manual selection must not create a metadata write");
 
     registry.setKernelCleanupForTest([](uint64_t, const Job&, std::string& error) {
@@ -205,8 +205,8 @@ void manual_readd_preserves_creation_metadata(const std::string& base)
     request.CollectorNames.clear();
     const auto closing = JobRegistryNamespaceTestAccess::update(registry, *initial, request);
     check(closing.value("status", "") == "error" &&
-              registry.inventoryRecord(created.internal_id)->state == RecordState::Closing &&
-              std::get<CondorJobAttr>(registry.inventoryRecord(created.internal_id)->job.sub_attr).owner == "alice",
+              registry.jobRecord(created.internal_id)->state == RecordState::Closing &&
+              std::get<CondorJobAttr>(registry.jobRecord(created.internal_id)->job.sub_attr).owner == "alice",
           "a stale manual target must not accept a closing metadata-only re-add");
     registry.setKernelCleanupForTest(nullptr);
     check(registry.deinit(), "manual freeze: cleanup must complete after restoring the seam");
@@ -215,7 +215,7 @@ void manual_readd_preserves_creation_metadata(const std::string& base)
 void run(const std::string& base)
 {
     // One configuration file for the whole binary (Config::instance keeps the
-    // first path): the first cases run with no inventory types, the automatic
+    // first path): the first cases run with no discovery types, the automatic
     // selection cases get their own registry instances but read the same file.
     const auto rules_root = std::filesystem::path(base) / "rules";
     std::filesystem::create_directories(base);
@@ -339,7 +339,7 @@ void run(const std::string& base)
     }
     Config::instance(config_path.string());
 
-    // Construction with an empty inventory configuration: no watchers, but the
+    // Construction with an empty maintenance configuration: no watchers, but the
     // heartbeat still starts and publishes its providers.
     {
         JobRegistryOptions options;
@@ -348,30 +348,30 @@ void run(const std::string& base)
         options.register_rpc = false;
         JobRegistry registry(options);
 
-        check(static_cast<bool>(get_inventory_status_provider()),
-              "construction must publish the inventory status provider");
-        check(static_cast<bool>(get_inventory_refresh_provider()),
+        check(static_cast<bool>(get_status_provider()),
+              "construction must publish the status provider");
+        check(static_cast<bool>(get_refresh_provider()),
               "construction must publish the on-demand refresh provider");
         check(registry.storeHealth().db_running,
               "construction must leave the store running");
 
-        // stopInventoryDiscovery is idempotent and keeps the status visible
+        // stopDiscovery is idempotent and keeps the status visible
         // while records drain (retraction belongs to finalize).
-        registry.stopInventoryDiscovery();
-        registry.stopInventoryDiscovery();
-        check(static_cast<bool>(get_inventory_status_provider()),
+        registry.stopDiscovery();
+        registry.stopDiscovery();
+        check(static_cast<bool>(get_status_provider()),
               "the status provider must stay published while draining");
 
         check(registry.deinit(), "deinit must succeed");
         check(!registry.storeHealth().db_running, "deinit must close the store");
-        check(!static_cast<bool>(get_inventory_status_provider()),
+        check(!static_cast<bool>(get_status_provider()),
               "deinit must retract the status provider");
-        check(!static_cast<bool>(get_inventory_refresh_provider()),
+        check(!static_cast<bool>(get_refresh_provider()),
               "deinit must retract the refresh provider");
         check(registry.deinit(), "a second deinit must be a no-op that keeps the result");
     }
     // The providers of the previous registry are retracted by its deinit.
-    check(!static_cast<bool>(get_inventory_status_provider()),
+    check(!static_cast<bool>(get_status_provider()),
           "the previous registry must not leave providers installed");
 
     // A closing record is archived by deinit; the destructor does not need to.
@@ -384,9 +384,9 @@ void run(const std::string& base)
 
         const auto job = make_common_job();
         check(registry.addJob(job), "legacy registration must succeed");
-        const uint64_t id = registry.inventoryRecords().front().job.JobID;
+        const uint64_t id = registry.jobRecords().front().job.JobID;
         check(registry.retireInstance(id), "retire the instance");
-        check(!registry.inventoryRecord(id).has_value(),
+        check(!registry.jobRecord(id).has_value(),
               "retirement without subscribers archives immediately");
 
         check(registry.deinit(), "deinit after retirement must succeed");
@@ -429,7 +429,7 @@ void run(const std::string& base)
               "auto policy: the revision must identify the defaults source");
         check(registry.selectionRecord(created.internal_id).effectiveCollectors().size() == 2,
               "auto policy: the derived snapshot must follow the selection");
-        check(registry.inventoryRecord(created.internal_id)->job.CollectorNames.empty(),
+        check(registry.jobRecord(created.internal_id)->job.CollectorNames.empty(),
               "the record image must not carry the dispatch list");
 
         // A manual override keeps winning over the automatic decision.
@@ -685,7 +685,7 @@ void run(const std::string& base)
             const auto binding = registry.selectionRecord(failed.internal_id);
             check(!binding.automatic.has_value(),
                   "a failed intent must leave the automatic decision unrecorded");
-            check(registry.inventoryRecord(failed.internal_id).has_value(),
+            check(registry.jobRecord(failed.internal_id).has_value(),
                   "the instance must stay inventoried");
         }
 
@@ -746,7 +746,7 @@ void run(const std::string& base)
         check(failed2.ok && !*failed2.intent_committed,
               "the second instance must start without a decision");
         registry.clearStoreFaultsForTest();
-        registry.reconcileInventoryNow();
+        registry.reconcileNow();
         const auto repaired2 = registry.selectionRecord(failed2.internal_id);
         check(repaired2.automatic.has_value(),
               "a maintenance pass must repair the missing initial decision");
@@ -860,9 +860,9 @@ void run(const std::string& base)
             std::get<CondorJobAttr>(manual.sub_attr).proc_id = 0;
             manual.CollectorNames = {"cpumem_collector"};
             check(registry.addJob(manual), "upsert: the manual create must succeed");
-            const uint64_t created_id = registry.inventoryRecords().front().job.JobID;
+            const uint64_t created_id = registry.jobRecords().front().job.JobID;
             const uint64_t revision_before =
-                registry.inventoryRecord(created_id)->revision;
+                registry.jobRecord(created_id)->revision;
 
             Job repeat = manual;
             repeat.CollectorNames = {"io_collector"};
@@ -873,13 +873,13 @@ void run(const std::string& base)
             check(updated["JobID"] == created_id,
                   "upsert: the sub_attr route must resolve the existing id: " +
                       updated.dump());
-            check(registry.inventoryRecords().size() == 1,
+            check(registry.jobRecords().size() == 1,
                   "upsert: the sub_attr route must not create a second record");
             const auto binding = registry.selectionRecord(created_id);
             check(binding.manual.has_value() && binding.manual->size() == 2 &&
                       (*binding.manual)[0] == "cpumem_collector",
                   "upsert: the sub_attr update must union into the manual selection");
-            check(registry.inventoryRecord(created_id)->revision > revision_before,
+            check(registry.jobRecord(created_id)->revision > revision_before,
                   "upsert: the sub_attr update must advance the revision");
             registry.deinit();
         }
@@ -916,10 +916,10 @@ void run(const std::string& base)
             check(registry.addJob(manual_condor("schedd-b", "sb.example.com")),
                   "schedd: the same native id under another schedd must create, "
                   "not refuse as a sub_attr duplicate");
-            check(registry.inventoryRecords().size() == 2,
+            check(registry.jobRecords().size() == 2,
                   "schedd: two schedds must persist two records");
             const auto row_of = [&registry](const char* schedd) {
-                for (const auto& record : registry.inventoryRecords()) {
+                for (const auto& record : registry.jobRecords()) {
                     const auto* attr = std::get_if<CondorJobAttr>(&record.job.sub_attr);
                     if (attr != nullptr && attr->scheduler_name == schedd)
                         return record;
@@ -935,7 +935,7 @@ void run(const std::string& base)
             // Same-schedd duplicate: the historical CREATE refusal stays.
             check(!registry.addJob(manual_condor("schedd-b", "sb.example.com")),
                   "schedd: a same-schedd duplicate add must stay refused");
-            check(registry.inventoryRecords().size() == 2,
+            check(registry.jobRecords().size() == 2,
                   "schedd: the refused duplicate must persist nothing");
 
             // A schedd-b claim routes to schedd-b's row only; schedd-a's
@@ -976,7 +976,7 @@ void run(const std::string& base)
                       ambiguous.dump());
             check(ambiguous["candidates"].size() == 2,
                   "schedd: the ambiguity must list both rows: " + ambiguous.dump());
-            check(registry.inventoryRecords().size() == 2,
+            check(registry.jobRecords().size() == 2,
                   "schedd: the ambiguous route must create nothing");
 
             // An existing unknown namespace is frozen too. A later schedd
@@ -992,7 +992,7 @@ void run(const std::string& base)
             check(registry.addJob(legacy),
                   "schedd: the attribution-less legacy row must create");
             const auto legacy_row = [&registry]() {
-                for (const auto& record : registry.inventoryRecords()) {
+                for (const auto& record : registry.jobRecords()) {
                     const auto* attr = std::get_if<CondorJobAttr>(&record.job.sub_attr);
                     if (attr != nullptr && attr->cluster_id == 180) return record;
                 }
@@ -1008,13 +1008,13 @@ void run(const std::string& base)
                       tolerated.value("code", "") == "namespace_conflict",
                   "schedd: a claim cannot adopt an unknown creation namespace: " +
                       tolerated.dump());
-            const auto unchanged_legacy = registry.inventoryRecord(legacy_row.job.JobID);
+            const auto unchanged_legacy = registry.jobRecord(legacy_row.job.JobID);
             check(unchanged_legacy &&
                       std::get<CondorJobAttr>(unchanged_legacy->job.sub_attr).scheduler_name.empty() &&
                       registry.selectionRecord(legacy_row.job.JobID).manual ==
                           std::optional<std::vector<std::string>>(
                               std::vector<std::string>{"cpumem_collector"}) &&
-                      registry.inventoryRecords().size() == 3,
+                      registry.jobRecords().size() == 3,
                   "schedd: a rejected adoption must leave metadata, selection and row count unchanged");
             registry.deinit();
         }
@@ -1075,7 +1075,7 @@ void run(const std::string& base)
             check(claim_b["status"] == "success",
                   "schedd: another schedd must create beside the resolved row: " +
                       claim_b.dump());
-            check(registry.inventoryRecords().size() == 2,
+            check(registry.jobRecords().size() == 2,
                   "schedd: the schedd-b claim must persist its own record");
             check(!registry.selectionRecord(resolved_id).manual.has_value(),
                   "schedd: the resolved schedd-a row must stay untouched by the "
@@ -1089,7 +1089,7 @@ void run(const std::string& base)
             check(claim_a["status"] == "success" && claim_a["JobID"] == resolved_id,
                   "schedd: the agreeing claim must update the resolved row: " +
                       claim_a.dump());
-            check(registry.inventoryRecords().size() == 2,
+            check(registry.jobRecords().size() == 2,
                   "schedd: the agreeing claim must not create a second record");
             {
                 const auto binding = registry.selectionRecord(resolved_id);
@@ -1125,9 +1125,9 @@ void run(const std::string& base)
             check(!collision.ok && collision.error == "identity_index_mismatch" &&
                       collision.message.find("aliases") != std::string::npos,
                   "namespace: aliased observation must fail closed explicitly");
-            check(registry.inventoryRecords().size() == 1,
+            check(registry.jobRecords().size() == 1,
                   "namespace: collision must not create or replace a row");
-            const auto held = registry.inventoryRecords().front().job;
+            const auto held = registry.jobRecords().front().job;
             check(held.cluster_name == "a" && held.clusterTag == "b@c",
                   "namespace: collision must not overwrite the original tuple");
             registry.deinit();
@@ -1159,7 +1159,7 @@ void run(const std::string& base)
                   "namespace: distinct pools must not be deduplicated");
             check(!registry.addJob(second),
                   "namespace: identical complete identity must deduplicate");
-            const auto rows = registry.inventoryRecords();
+            const auto rows = registry.jobRecords();
             uint64_t second_id = 0;
             for (const auto& row : rows)
                 if (row.job.cluster_name == "pool-b") second_id = row.job.JobID;
@@ -1209,7 +1209,7 @@ void run(const std::string& base)
             check(result.value("status", "") == "error" &&
                       result.value("code", "") == "ambiguous_selector",
                   "namespace: manual alias must not update existing owner");
-            check(registry.inventoryRecords().size() == 1,
+            check(registry.jobRecords().size() == 1,
                   "namespace: manual alias leaves one row");
             registry.deinit();
         }
@@ -1236,7 +1236,7 @@ void run(const std::string& base)
             check(registry.addJob(b), "namespace: slurm cluster-b creates separately");
             check(!registry.addJob(b), "namespace: identical slurm create deduplicates");
             uint64_t id_b = 0;
-            for (const auto& row : registry.inventoryRecords())
+            for (const auto& row : registry.jobRecords())
                 if (row.job.cluster_name == "cluster-b") id_b = row.job.JobID;
             NativeSelector selector{"slurm", "cluster-b", "", "904", ""};
             b.CollectorNames = {"io_collector"};
@@ -1310,12 +1310,12 @@ void run(const std::string& base)
                 attr.scheduler_name = job.clusterTag;
                 job.CollectorNames = {"cpumem_collector"};
                 check(registry.addJob(job), "namespace: restart fixture creates");
-                saved = registry.inventoryRecords().front().job.JobID;
+                saved = registry.jobRecords().front().job.JobID;
                 registry.deinit();
             }
             {
                 JobRegistry registry(options);
-                const auto restored = registry.inventoryRecord(saved);
+                const auto restored = registry.jobRecord(saved);
                 check(restored.has_value(), "namespace: restart restores row");
                 check(restored->job.clusterTag == "schedd#one@submit" &&
                           std::get<CondorJobAttr>(restored->job.sub_attr).scheduler_name ==
@@ -1347,7 +1347,7 @@ void run(const std::string& base)
             std::get<CondorJobAttr>(legacy.sub_attr).cluster_id = 908;
             legacy.CollectorNames = {"cpumem_collector"};
             check(registry.addJob(legacy), "namespace race: legacy row creates");
-            const auto id = registry.inventoryRecords().front().job.JobID;
+            const auto id = registry.jobRecords().front().job.JobID;
             Job a = legacy;
             std::get<CondorJobAttr>(a.sub_attr).scheduler_name = "schedd-a@submit";
             Job b = legacy;
@@ -1360,7 +1360,7 @@ void run(const std::string& base)
             check(results.second.value("status", "") == "error" &&
                       results.second.value("code", "") == "namespace_conflict",
                   "namespace race: stale conflicting second claim fails");
-            const auto row = registry.inventoryRecord(id);
+            const auto row = registry.jobRecord(id);
             check(row && std::get<CondorJobAttr>(row->job.sub_attr).scheduler_name.empty(),
                   "namespace freeze: both rejected claims leave the initial namespace unknown");
             const auto selection = registry.selectionRecord(id);
@@ -1378,11 +1378,11 @@ void run(const std::string& base)
             std::get<CondorJobAttr>(other.sub_attr).cluster_id = 909;
             check(registry.addJob(other), "namespace race: selector-only fixture creates");
             uint64_t other_id = 0;
-            for (const auto& candidate : registry.inventoryRecords())
+            for (const auto& candidate : registry.jobRecords())
                 if (candidate.job.NativeJobID == "909.0") other_id = candidate.job.JobID;
             NativeSelector selector{"condor", "pool-a", "schedd-a@submit", "909.0", ""};
             const auto selected = registry.upsertJob(other, nlohmann::json::object(), selector);
-            const auto selected_row = registry.inventoryRecord(other_id);
+            const auto selected_row = registry.jobRecord(other_id);
             check(selected.value("status", "") == "error" &&
                       selected.value("code", "") == "namespace_conflict" && selected_row &&
                       selected_row->job.cluster_name.empty() && selected_row->job.clusterTag.empty(),
@@ -1449,8 +1449,8 @@ void run(const std::string& base)
             const auto owner = registry.upsertObservedJob(observation);
             check(owner.ok && owner.internal_id != target.job.JobID,
                   "adoption occupied: other owner creates");
-            const auto old_before = registry.inventoryRecord(target.job.JobID);
-            const auto owner_before = registry.inventoryRecord(owner.internal_id);
+            const auto old_before = registry.jobRecord(target.job.JobID);
+            const auto owner_before = registry.jobRecord(owner.internal_id);
             const auto owner_selection = registry.selectionRecord(owner.internal_id);
             Job claim = legacy;
             claim.clusterTag = selector.cluster_tag;
@@ -1459,13 +1459,13 @@ void run(const std::string& base)
             const auto rejected = JobRegistryNamespaceTestAccess::update(registry, target, claim);
             check(rejected.value("status", "") == "error",
                   "adoption occupied: stale update must reject occupied key");
-            const auto old = registry.inventoryRecord(target.job.JobID);
-            const auto held = registry.inventoryRecord(owner.internal_id);
+            const auto old = registry.jobRecord(target.job.JobID);
+            const auto held = registry.jobRecord(owner.internal_id);
             check(old && held && old_before && owner_before &&
                       old->revision == old_before->revision && held->revision == owner_before->revision &&
                       old->job.clusterTag.empty() &&
                       held->job.clusterTag == "schedd@submit" &&
-                      registry.inventoryRecords().size() == 2,
+                      registry.jobRecords().size() == 2,
                   "adoption occupied: both rows remain unchanged");
             check(registry.selectionRecord(target.job.JobID).manual ==
                       std::optional<std::vector<std::string>>(
@@ -1477,15 +1477,15 @@ void run(const std::string& base)
             const auto old_identity = canonicalize(old_selector);
             const auto new_identity = canonicalize(selector);
             check(old_identity && new_identity, "adoption occupied: valid test identities");
-            const auto old_index = registry.inventoryRecordByKey(*old_identity);
-            const auto owner_index = registry.inventoryRecordByKey(*new_identity);
+            const auto old_index = registry.jobRecordByKey(*old_identity);
+            const auto owner_index = registry.jobRecordByKey(*new_identity);
             check(old_index && owner_index && old_index->job.JobID == target.job.JobID &&
                       owner_index->job.JobID == owner.internal_id,
                   "adoption occupied: both index owners remain unchanged");
             registry.deinit();
             JobRegistry reopened(options);
-            const auto old_reopened = reopened.inventoryRecordByKey(*old_identity);
-            const auto owner_reopened = reopened.inventoryRecordByKey(*new_identity);
+            const auto old_reopened = reopened.jobRecordByKey(*old_identity);
+            const auto owner_reopened = reopened.jobRecordByKey(*new_identity);
             check(old_reopened && owner_reopened &&
                       old_reopened->job.JobID == target.job.JobID &&
                       owner_reopened->job.JobID == owner.internal_id,
@@ -1508,7 +1508,7 @@ void run(const std::string& base)
             std::get<CondorJobAttr>(legacy.sub_attr).cluster_id = 913;
             legacy.CollectorNames = {"cpumem_collector"};
             check(registry.addJob(legacy), "adoption observed: legacy create");
-            const auto id = registry.inventoryRecords().front().job.JobID;
+            const auto id = registry.jobRecords().front().job.JobID;
             NativeSelector selector{"condor", "pool", "schedd@submit", "913.0", ""};
             Job claim = legacy;
             claim.CollectorNames.clear();
@@ -1523,22 +1523,22 @@ void run(const std::string& base)
             const auto old_identity = canonicalize(old_selector);
             const auto new_identity = canonicalize(selector);
             check(old_identity && new_identity &&
-                      registry.inventoryRecordByKey(*old_identity) &&
-                      registry.inventoryRecordByKey(*old_identity)->job.JobID == id &&
-                      !registry.inventoryRecordByKey(*new_identity),
+                      registry.jobRecordByKey(*old_identity) &&
+                      registry.jobRecordByKey(*old_identity)->job.JobID == id &&
+                      !registry.jobRecordByKey(*new_identity),
                   "namespace freeze: a rejected claim leaves the old identity index intact");
             ProcessIdentity generation{4913, 9913, "boot"};
             auto observation = discovered_job(selector, generation,
                                                {ProcessIdentity{4913, 9913, "boot"}}, true);
             const auto result = registry.upsertObservedJob(observation);
-            check(result.ok && result.internal_id != id && registry.inventoryRecords().size() == 2,
+            check(result.ok && result.internal_id != id && registry.jobRecords().size() == 2,
                   "namespace freeze: a distinct complete identity must create its own record");
             registry.deinit();
             JobRegistry reopened(options);
-            const auto restored = reopened.inventoryRecordByKey(*new_identity);
+            const auto restored = reopened.jobRecordByKey(*new_identity);
             check(restored && restored->job.JobID == result.internal_id &&
-                      reopened.inventoryRecordByKey(*old_identity) &&
-                      reopened.inventoryRecordByKey(*old_identity)->job.JobID == id,
+                      reopened.jobRecordByKey(*old_identity) &&
+                      reopened.jobRecordByKey(*old_identity)->job.JobID == id,
                   "namespace freeze: both original identities survive restart");
             reopened.deinit();
         }
@@ -1560,7 +1560,7 @@ void run(const std::string& base)
             std::get<CondorJobAttr>(legacy.sub_attr).cluster_id = 914;
             legacy.CollectorNames = {"cpumem_collector"};
             check(registry.addJob(legacy), "selection recovery: legacy create");
-            const auto id = registry.inventoryRecords().front().job.JobID;
+            const auto id = registry.jobRecords().front().job.JobID;
             Job claim = legacy;
             claim.CollectorNames = {"io_collector"};
             NativeSelector selector{"condor", "pool", "", "914.0", ""};
@@ -1572,13 +1572,13 @@ void run(const std::string& base)
             check(retried.value("status", "") == "success" && retried["JobID"] == id,
                   "selection recovery: retry resolves original ID");
             const auto identity = canonicalize(selector);
-            check(identity && registry.inventoryRecordByKey(*identity) &&
-                      registry.inventoryRecordByKey(*identity)->job.JobID == id &&
-                      registry.inventoryRecords().size() == 1,
+            check(identity && registry.jobRecordByKey(*identity) &&
+                      registry.jobRecordByKey(*identity)->job.JobID == id &&
+                      registry.jobRecords().size() == 1,
                   "selection recovery: row and index resolve together");
             check(registry.selectionRecord(id).manual ==
                       std::optional<std::vector<std::string>>(std::vector<std::string>{"cpumem_collector", "io_collector"}) &&
-                      registry.inventoryRecord(id)->job.clusterTag.empty(),
+                      registry.jobRecord(id)->job.clusterTag.empty(),
                   "selection recovery: retry changes only collectors, never the namespace");
             registry.deinit();
         }
@@ -1647,7 +1647,7 @@ void run(const std::string& base)
             auto new_job = old_job;
             const auto observed = reopened.upsertObservedJob(new_job);
             check(observed.ok && observed.internal_id == original.internal_id &&
-                      reopened.inventoryRecords().size() == 1,
+                      reopened.jobRecords().size() == 1,
                   "checkpoint selection: observation must reuse original ID after restart");
             reopened.deinit();
             pass_case("CHECKPOINT_NAMESPACE", "checkpoint and selection preserve frozen row/index across restart");
@@ -1666,7 +1666,7 @@ void run(const std::string& base)
             const auto created = registry.upsertJob(manual, nlohmann::json::object());
             check(created["status"] == "success",
                   "upsert: a fresh manual add must create: " + created.dump());
-            check(registry.inventoryRecords().size() == 1,
+            check(registry.jobRecords().size() == 1,
                   "upsert: the create branch must persist one record");
 
             Job empty_collectors = manual;
@@ -1676,14 +1676,14 @@ void run(const std::string& base)
                 registry.upsertJob(empty_collectors, nlohmann::json::object());
             check(refused["status"] == "error",
                   "upsert: empty collectors on CREATE must stay rejected");
-            check(registry.inventoryRecords().size() == 1,
+            check(registry.jobRecords().size() == 1,
                   "upsert: the rejected create must persist nothing");
             registry.deinit();
         }
     }
 
     pass_case("LIFECYCLE",
-              "construction starts inventory, stop/deinit are idempotent and ordered");
+              "construction starts discovery, stop/deinit are idempotent and ordered");
     pass_case("UPSERT",
               "manual upsert: identity/sub_attr routes update with collector union, "
               "the sub_attr route discriminates by the subtype's scheduler (schedd) "

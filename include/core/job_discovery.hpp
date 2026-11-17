@@ -11,7 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Discovery-adapter contract for the job inventory.
+// Discovery-adapter contract for the job registry.
 //
 // This header is the boundary between the scheduler discovery adapters
 // (CondorJobWatcher, SlurmJobWatcher) and the registry heartbeat:
@@ -133,7 +133,7 @@ struct ManagerSet {
 // ---------------------------------------------------------------------------
 
 // Initializing: no source pass has finished yet (startup barrier; section 5.1
-// keeps inventory health here until the first pass completes or degrades).
+// keeps source health here until the first pass completes or degrades).
 // Healthy: the last pass covered its sources. Degraded: the last pass failed
 // or only covered part of its sources; consumers keep retrying and must not
 // treat absence as termination.
@@ -166,7 +166,7 @@ struct SourceHealth {
 // ---------------------------------------------------------------------------
 
 // A discovery adapter never reads Config, never loads eBPF and never starts a
-// thread in its constructor: the assembly layer (JobRegistry::init_inventory)
+// thread in its constructor: the assembly layer (JobRegistry::armDiscovery)
 // builds these options explicitly and start() begins operation.
 struct DiscoveryOptions {
     // Load the eBPF ring buffer used for incremental discovery hints. It is
@@ -195,7 +195,7 @@ using JobSink = std::function<UpsertResult(const Job&)>;
 struct DiscoverySink {
     // Register one discovered Job immediately on the poll thread. The store
     // writes it without a fence, so the callback never waits for persistence.
-    // Empty when this core has no inventory runtime.
+    // Empty when this core has no discovery runtime.
     JobSink on_job;
 };
 

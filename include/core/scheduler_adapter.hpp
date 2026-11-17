@@ -12,7 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 // ISchedulerAdapter — the extension point that turns one scheduler type into
-// an inventory citizen.
+// a registry citizen.
 //
 // Everything scheduler-specific lives behind this interface: discovery
 // (through IDiscoverySource), legacy-row
@@ -22,7 +22,7 @@
 // Adding a scheduler type = declare its facts and its projections in a
 // self-contained adapter header/TU, add one line to the closed-variant
 // manifest in collector_type.h, add one REGISTER_SCHEDULER_ADAPTER line and
-// one inventory.types entry.
+// one maintenance.types entry.
 #pragma once
 
 #include <sys/types.h>
@@ -61,7 +61,7 @@ enum class AutoAdd {
 };
 
 // Resolved settings for one scheduler type, keyed by adapter name.
-// `inventory` mirrors job_registry_config.inventory.types membership;
+// `enabled` mirrors job_registry_config.maintenance.types membership;
 // `auto_add` resolution precedence:
 //   explicit <type>_job_watcher.auto_add (off/default/rule)  wins
 //   otherwise derived from the legacy pair:
@@ -70,8 +70,8 @@ enum class AutoAdd {
 //     auto_collect=true + use_rules=true  -> Rule
 //   with job_registry_config.auto_add_<type>job (legacy) folded into
 //   auto_collect first.
-struct InventoryTypeSettings {
-    bool inventory = false;
+struct DiscoveryTypeSettings {
+    bool enabled = false;
     // DEPRECATED as an input contract: auto_collect/use_rules (and the
     // explicit/legacy provenance flags below) remain parsed and tracked as
     // the mapping sources for one more schema version; consumers read the
@@ -140,7 +140,7 @@ public:
     // Discovery: the authoritative passes and targeted hints.
     virtual IDiscoverySource& source() = 0;
     // Per-type discovery options derived from the resolved settings.
-    virtual DiscoveryOptions discoveryOptions(const InventoryTypeSettings& settings) const = 0;
+    virtual DiscoveryOptions discoveryOptions(const DiscoveryTypeSettings& settings) const = 0;
 
     // Legacy (schema < 2) decode: typed facts from a stored JSON row. The
     // adapter owns the whole record projection: common fields, pids, typed
@@ -296,7 +296,7 @@ protected:
 class SchedulerAdapterRegistry {
 public:
     using Factory = std::function<std::unique_ptr<ISchedulerAdapter>(
-        const InventoryTypeSettings& settings)>;
+        const DiscoveryTypeSettings& settings)>;
 
     static SchedulerAdapterRegistry& instance();
 
@@ -309,7 +309,7 @@ public:
     // Builds one adapter; nullptr for an unknown name (callers report the
     // registered names instead of guessing).
     std::unique_ptr<ISchedulerAdapter> build(const std::string& name,
-                                             const InventoryTypeSettings& settings) const;
+                                             const DiscoveryTypeSettings& settings) const;
 
 private:
     mutable std::mutex mutex_;
@@ -322,7 +322,7 @@ private:
 #define REGISTER_SCHEDULER_ADAPTER(NAME, CLASS)                                \
     static bool joblens_adapter_reg_##CLASS = [] {                             \
         SchedulerAdapterRegistry::instance().registerAdapter(                  \
-            NAME, [](const InventoryTypeSettings& settings)                    \
+            NAME, [](const DiscoveryTypeSettings& settings)                    \
                   -> std::unique_ptr<ISchedulerAdapter> {                      \
                       return std::make_unique<CLASS>(settings);                \
                   });                                                          \

@@ -96,7 +96,7 @@ public:
         // The registry archives the Closing record; a failed cleanup/archive
         // leaves it Closing and the caller can retry.
         registry_.onDrained(internal_id);
-        return !registry_.inventoryRecord(internal_id).has_value();
+        return !registry_.jobRecord(internal_id).has_value();
     }
 
     ActualCollectionState actual(uint64_t internal_id) override {
@@ -234,6 +234,6 @@ inline TestCollectionRuntime& test_runtime(JobRegistry& registry)
 // binding revision read this instead; 0 means the record is gone.
 inline uint64_t record_revision(JobRegistry& registry, uint64_t internal_id)
 {
-    const auto record = registry.inventoryRecord(internal_id);
+    const auto record = registry.jobRecord(internal_id);
     return record ? record->revision : 0;
 }

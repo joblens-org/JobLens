@@ -62,7 +62,7 @@ the syscall regression is not a timing benchmark.
 在已配置 Ninja 构建目录、具备项目 C++ 编译依赖的本机运行（无需特权、无需 eBPF）：
 
 ```bash
-bash tests/integration/run_inventory_tests.sh build            # 可加 --suite identity|store|intent|maintenance
+bash tests/integration/run_registry_tests.sh build            # 可加 --suite identity|store|intent|maintenance
 bash tests/integration/run_collection_rpc_test.sh build
 bash tests/integration/run_watcher_scan_test.sh build
 ```
@@ -70,11 +70,11 @@ bash tests/integration/run_watcher_scan_test.sh build
 - `job_identity_test.cpp`：Condor/Slurm 规范身份、uint64 内部 ID、Slurm step 归一化
   （`batch` = `SLURM_BATCH_SCRIPT` 0xfffffffe、`extern` = `SLURM_EXTERN_CONT` 0xfffffffd）、
   PID 复用、实例句柄与序列化。
-- `job_inventory_store_test.cpp`：零绑定 upsert 幂等、旧 schema 迁移与恢复、冲突隔离、
+- `job_store_test.cpp`：零绑定 upsert 幂等、旧 schema 迁移与恢复、冲突隔离、
   持久写失败与 ID 不复用。
 - `job_collection_intent_test.cpp`：手工选择优先级、持久停止与 `reset_auto`、重复/过期修订、
   重启后的意图恢复；自动策略在手工覆盖下不推进客户端可见修订。
-- `job_inventory_maintenance_test.cpp`：启动竞争、事件回放、两次完整缺席才退休、EPERM 不算死亡、
+- `job_maintenance_test.cpp`：启动竞争、事件回放、两次完整缺席才退休、EPERM 不算死亡、
   队列溢出与重扫、tracker 不可用、旧代际迟到清理；另含**无发现源时手工登记记录的刷新与退休**
   以及**事件触发/按需（`ensure_registered`）的全量对账**。
 - `collection_rpc_test.cpp`：全部清单/采集 RPC 方法通过真实 AF_UNIX RPC 驱动，覆盖选择器形式、
@@ -91,9 +91,9 @@ bash tests/integration/run_watcher_scan_test.sh build
 无绑定的清单实例不产生采集、提交绑定时挂载 lane 并报告 applied、持久停止后摘除且保留清单、
 无论停止后退休还是绑定中自然结束都能被确认且不残留 lane。
 
-`run_inventory_tests.sh --suite lifecycle`（`job_registry_lifecycle_test.cpp`）验证
+`run_registry_tests.sh --suite lifecycle`（`job_registry_lifecycle_test.cpp`）验证
 JobRegistry 自己的生命周期与自动选择：构造即启动清单栈（providers 发布）、
-`stopInventoryDiscovery` 幂等且排空期间状态可见、`deinit` 归档并关库且幂等；
+`stopDiscovery` 幂等且排空期间状态可见、`deinit` 归档并关库且幂等；
 `auto_add` 折算后新实例自动获得配置的采集器、手工覆盖不被覆盖、
 defaults/rules/reject 三种选择语义直接断言。exec hint 的定向观察（不触发全量扫描）
 在 maintenance 套件的 `EXEC` 用例中验证；`EXEC2` 的契约是"一次 hint 一次同步

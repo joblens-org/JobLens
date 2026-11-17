@@ -11,7 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Identity foundation for the job inventory.
+// Identity foundation for the job registry.
 //
 // ONE identity type, two parts:
 //   * logical identity  - which scheduled job (adapter / namespace / native / step)
@@ -54,7 +54,7 @@ std::string normalize_adapter_name(const std::string& raw);
 // Internal IDs (uint64-safe parse/format)
 // ---------------------------------------------------------------------------
 
-// JobID 0 is the system sentinel; no inventory record may use it.
+// JobID 0 is the system sentinel; no job record may use it.
 inline constexpr uint64_t kSystemSentinelJobId = 0;
 inline bool is_reserved_internal_id(uint64_t id) { return id == kSystemSentinelJobId; }
 

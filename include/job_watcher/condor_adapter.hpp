@@ -11,7 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// CondorSchedulerAdapter — the HTCondor inventory adapter. Owns the discovery
+// CondorSchedulerAdapter — the HTCondor discovery adapter. Owns the discovery
 // watcher, the Condor typed facts and every projection between those facts and
 // the Job/JobRecord fields; registered under the name "condor".
 //
@@ -67,7 +67,7 @@ static_assert(joblens::facts::valid_schema<CondorJobAttr>(),
 
 class CondorSchedulerAdapter final : public ISchedulerAdapter {
 public:
-    explicit CondorSchedulerAdapter(const InventoryTypeSettings& settings);
+    explicit CondorSchedulerAdapter(const DiscoveryTypeSettings& settings);
     ~CondorSchedulerAdapter() override;
 
     const std::string& name() const override;
@@ -75,7 +75,7 @@ public:
     IDiscoverySource& source() override;
     AdapterTraits traits() const override;
 
-    DiscoveryOptions discoveryOptions(const InventoryTypeSettings& settings) const override;
+    DiscoveryOptions discoveryOptions(const DiscoveryTypeSettings& settings) const override;
 
     // ---- typed facts / record projection ---------------------------------
     Job decodeFacts(const nlohmann::json& row) const override;

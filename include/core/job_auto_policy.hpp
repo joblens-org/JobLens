@@ -15,7 +15,7 @@
 //
 // The policy answers exactly one question: "which collectors does this job
 // get?" - never "is this job allowed to exist". A rejected job stays in the
-// inventory with an empty selection.
+// registry with an empty selection.
 //
 //   * disabled:      nothing is selected automatically.
 //   * defaults:      the configured default list, verbatim, for every job
@@ -62,7 +62,7 @@ public:
     // a policy has rules to load or a zero-rule condition worth reporting.
     bool uses_rules() const { return mode_ == Mode::Rules; }
 
-    // Loads the rule engine now instead of on the first select(): the inventory
+    // Loads the rule engine now instead of on the first select(): the registry
     // arms its policies during startup, so a missing directory, an unreadable
     // file or a broken rule is a startup fact rather than a surprise on the
     // first observed job. Returns the number of loaded rule files (0 for a

@@ -74,7 +74,7 @@ constexpr bool valid_schema()
     return true;
 }
 
-// Merge one field with the inventory's non-default overwrite rule. A default
+// Merge one field with the registry's non-default overwrite rule. A default
 // observation never erases a known same-typed field:
 //   bool        - a true observation arms it, false changes nothing
 //   string      - a non-empty observation replaces, empty changes nothing

@@ -11,7 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-/* Deterministic identity acceptance for the job inventory.
+/* Deterministic identity acceptance for the job registry.
  *
  *   * Condor namespace separation, "12.34" versus "123.4", original native
  *     strings preserved, no digit concatenation.

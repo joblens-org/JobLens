@@ -655,7 +655,7 @@ std::vector<uint64_t> CollectorScheduler::rmJobCollectLocked(const Job& job){
         if (!deferred && recordRemovalAck(job.JobID, drain_token)) completed.push_back(job.JobID);
     }
 
-    // The System-scope view is a whole-inventory projection diffed once per
+    // The System-scope view is a whole-registry projection diffed once per
     // reconcile pass (see reconcileOnce). Broadcasting Removed here as well
     // would deliver two removals for one retirement.
     return completed;
@@ -1092,7 +1092,7 @@ void CollectorScheduler::reconcileOnce() {
     std::vector<JobRecord> records;
     if (!source->runtimeRecords(records)) {
         // The desired state cannot be read right now. That is NOT an empty
-        // inventory: keep every current attachment instead of detaching all of
+        // registry: keep every current attachment instead of detaching all of
         // them, which would turn a store outage into a collection outage.
         return;
     }
@@ -1174,7 +1174,7 @@ void CollectorScheduler::reconcileOnce() {
             }
         }
 
-        // System-scope collectors see the whole inventory, including records
+        // System-scope collectors see the whole registry, including records
         // that select no job collector. This diff is notification bookkeeping
         // only: the records remain the sole authority.
         {

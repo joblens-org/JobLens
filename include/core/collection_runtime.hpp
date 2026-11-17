@@ -89,7 +89,7 @@ public:
 //
 // Both calls report availability separately from content: "the store cannot be
 // read" and "there are no records" are different facts. A runtime that treats
-// an unavailable source as an empty inventory detaches every collector it
+// an unavailable source as an empty record set detaches every collector it
 // holds, which is exactly the blanket-detach bug this seam exists to prevent.
 class IJobRecordSource {
 public:

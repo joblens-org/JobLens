@@ -10,13 +10,13 @@ watcher 与 adapter 中。接入步骤与接口契约见
 
 - 一个 `IDiscoverySource` 实现（watcher）；
 - 一个 `ISchedulerAdapter` 实现，并用 `REGISTER_SCHEDULER_ADAPTER` 注册；
-- 一条 `inventory.types` 配置；
+- 一条 `maintenance.types` 配置；
 - 一个链接入口：在已编译 TU 中 include adapter 头，或把它的 TU 加入构建，
   使注册器进入 Agent 二进制。
 
 除链接入口外，以下文件不需要改动：`job_identity.{hpp,cpp}`、
-`inventory_config.{hpp,cpp}`、`job_registry.{hpp,cpp}`、`job_store.{hpp,cpp}`、
-`kernel_attribution.{hpp,cpp}`、`inventory_rpc.cpp`、`collector_type.h`、任何
+`maintenance_config.{hpp,cpp}`、`job_registry.{hpp,cpp}`、`job_store.{hpp,cpp}`、
+`kernel_attribution.{hpp,cpp}`、`job_rpc.cpp`、`collector_type.h`、任何
 collector 与 trigger。
 
 ## 2. 设计原则
@@ -68,7 +68,7 @@ using SubAttr = std::variant<CondorJobAttr, CommonJobAttr, SlurmJobAttr, nlohman
 
 1. `REGISTER_SCHEDULER_ADAPTER("ssh", SshSchedulerAdapter)` 在 TU 作用域把工厂
    注册进 `SchedulerAdapterRegistry`。
-2. `JobRegistry` 启动时按 `inventory.types` 构建 adapter；adapter 是唯一知道该
+2. `JobRegistry` 启动时按 `maintenance.types` 构建 adapter；adapter 是唯一知道该
    调度器属性模式、身份格式与能力的组件。
 3. 心跳驱动 adapter 的 `IDiscoverySource`：`enumerateManagers()` 枚举一遍 pass
    的存活 per-job manager，`observe(manager)` 为本 pass 尚未跟踪的 manager 构建
@@ -82,7 +82,7 @@ using SubAttr = std::variant<CondorJobAttr, CommonJobAttr, SlurmJobAttr, nlohman
 
 ## 6. 配置与归因
 
-- `InventoryTypeSettings` 按 adapter 名字键控，并始终包含全部已注册类型。
+- `DiscoveryTypeSettings` 按 adapter 名字键控，并始终包含全部已注册类型。
   未注册的名字在启动时报错并列出可用名字。
 - `ISchedulerAdapter::discoveryOptions()` 把配置映射为 `DiscoveryOptions`。
 - `applyIdentityToFacts()` 在 upsert 时把解析后的身份写回 typed facts；
@@ -123,13 +123,13 @@ private:
 // include/job_watcher/ssh_adapter.hpp
 class SshSchedulerAdapter final : public ISchedulerAdapter {
 public:
-    explicit SshSchedulerAdapter(const InventoryTypeSettings& settings)
+    explicit SshSchedulerAdapter(const DiscoveryTypeSettings& settings)
         : watcher_(discoveryOptions(settings)) {}
 
     const std::string& name() const override { return name_; }
     std::string configSection() const override { return "ssh_job_watcher"; }
     IDiscoverySource& source() override { return watcher_; }
-    DiscoveryOptions discoveryOptions(const InventoryTypeSettings&) const override;
+    DiscoveryOptions discoveryOptions(const DiscoveryTypeSettings&) const override;
 
     Job decodeFacts(const nlohmann::json&) const override;   // ssh 无存量行
     NativeSelector legacySelector(const Job&) const override { return {}; }
@@ -149,7 +149,7 @@ REGISTER_NATIVE_ID_RULE("ssh", [](const NativeSelector& s) {
 
 ```yaml
 job_registry_config:
-  inventory:
+  maintenance:
     types: [condor, slurm, ssh]
 ssh_job_watcher:
   auto_add: default

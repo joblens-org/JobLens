@@ -366,24 +366,25 @@ class CollectionStatusResponse(BaseModel):
     model_config = {"extra": "allow"}
 
 
-class InventoryListResponse(BaseModel):
-    """GET /joblens/inventory 响应"""
+class JobListPageResponse(BaseModel):
+    """GET /joblens/jobs/list 响应"""
     snapshot_revision: int = Field(..., description="首页捕获的快照修订号")
-    records: List[Dict[str, Any]] = Field(..., description="清单记录，内部 ID 为十进制字符串")
+    records: List[Dict[str, Any]] = Field(..., description="作业记录，内部 ID 为十进制字符串")
     next_cursor: Optional[str] = Field(None, description="下一页不透明游标；无更多数据为 null")
     model_config = {"extra": "allow"}
 
 
-class InventoryStatusResponse(BaseModel):
-    """GET /joblens/inventory/status 响应 - 透传 Core 的来源/持久化/队列/对账健康"""
+class JobLensStatusResponse(BaseModel):
+    """GET /joblens/jobs/status 响应 - 透传 Core 的来源/持久化/队列/对账健康"""
     model_config = {"extra": "allow"}
 
 
 class CapabilitiesResponse(BaseModel):
     """GET /joblens/capabilities 响应 - 只透传，绝不代 Core 声明能力"""
-    inventory_version: Optional[int] = Field(None, description="清单契约版本")
+    api_version: Optional[int] = Field(None, description="作业/采集 RPC 契约版本")
     collection_control_version: Optional[int] = Field(None, description="采集控制契约版本")
     native_identity_selectors: Optional[bool] = Field(None, description="是否支持原生身份选择器")
     job_scope: Optional[str] = Field(None, description="job scope 语义，如 current_local_instances")
     db_schema_version: Optional[int] = Field(None, description="DB schema 版本")
+    ready: Optional[bool] = Field(None, description="作业持久层是否已完成迁移并可用")
     model_config = {"extra": "allow"}

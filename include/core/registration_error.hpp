@@ -41,7 +41,7 @@ enum class RegistrationError {
     IdentityQuarantined,
     IdentityIndexMismatch,
     StaleRevision,
-    // The admission gate (inventory capture_all=false) refused the
+    // The admission gate (maintenance capture_all=false) refused the
     // observation before any registration work: no record was created and no
     // state changed. Re-reading the source cannot change the decision.
     NotAdmitted,

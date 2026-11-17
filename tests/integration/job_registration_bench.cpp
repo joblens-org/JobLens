@@ -556,9 +556,9 @@ int main(int argc, char** argv)
     JobRegistryOptions options;
     options.db_path = args.db;
     // Arming a real Lua policy needs the heartbeat wiring (admission + the
-    // deferred-policy drain), so only the rule probes arm the inventory
+    // deferred-policy drain), so only the rule probes arm the registry
     // stack; the plain registration measurement runs a static registry.
-    options.test_static_inventory = args.register_rules == 0;
+    options.test_static_registry = args.register_rules == 0;
     options.test_heartbeat = args.register_rules > 0;
     if (args.register_rules > 0) {
         const auto rules_dir = fs::path(out_dir) / "register-rules";
@@ -579,7 +579,7 @@ int main(int argc, char** argv)
     // desired-state commit path only. Actual attachment belongs to the
     // scheduler and is not part of this number.
 
-    InventoryTypeSettings settings;
+    DiscoveryTypeSettings settings;
     settings.cluster_name = args.cluster;
     auto adapter = SchedulerAdapterRegistry::instance().build("condor", settings);
     if (!adapter) {

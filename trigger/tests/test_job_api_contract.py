@@ -1,11 +1,11 @@
-"""Contract tests for the inventory/collection Flask gateway.
+"""Contract tests for the job/collection Flask gateway.
 
-Covers the collection-control request, inventory/capabilities reads and the
+Covers the collection-control request, job list/capabilities reads and the
 legacy add/remove routes. The HTTP contract is documented in
 doc/api_documentation.md section 12.
 
 The Core is mocked at the single RPC seam in trigger/core/tools.py
-(``call_inventory_rpc``), so these tests pass independently of C++ progress.
+(``call_core_rpc``), so these tests pass independently of C++ progress.
 The Flask side must never allocate internal IDs, never fabricate a response when
 the Core is unavailable, and never turn a Core error into HTTP 200.
 """
@@ -20,7 +20,7 @@ from trigger.core import tools
 from trigger.core.rpc_client import RPCError
 
 
-class FakeInventoryCore:
+class FakeCore:
     """Records forwarded RPC calls and replays one canned Core reply."""
 
     def __init__(self, response: object = None, error: Optional[Exception] = None) -> None:
@@ -42,11 +42,11 @@ class FakeInventoryCore:
 
 @pytest.fixture
 def install_core(monkeypatch: pytest.MonkeyPatch):
-    """Install a fake Core behind trigger.core.tools.call_inventory_rpc."""
+    """Install a fake Core behind trigger.core.tools.call_core_rpc."""
 
-    def _install(response: object = None, error: Optional[Exception] = None) -> FakeInventoryCore:
-        fake = FakeInventoryCore(response=response, error=error)
-        monkeypatch.setattr(tools, "call_inventory_rpc", fake)
+    def _install(response: object = None, error: Optional[Exception] = None) -> FakeCore:
+        fake = FakeCore(response=response, error=error)
+        monkeypatch.setattr(tools, "call_core_rpc", fake)
         return fake
 
     return _install
@@ -113,7 +113,7 @@ def test_selector_condor_native_selector_forwards_scope_and_ensure_registered(in
     assert response.status_code == 200
     assert fake.calls == [
         (
-            "JobCollection/set",
+            "jobs/collection/set",
             {
                 "selector": dict(CONDOR_SELECTOR),
                 "scope": "instance",
@@ -589,7 +589,7 @@ def test_control_core_down_returns_503_for_set_and_get(install_core) -> None:
     client = _app().test_client()
 
     set_response = _post_collection(client, _set_body())
-    get_response = client.get("/joblens/collection?instance_id=inst-condor-01")
+    get_response = client.get("/joblens/collection?internal_job_id=42")
 
     assert set_response.status_code == 503
     assert get_response.status_code == 503
@@ -597,7 +597,7 @@ def test_control_core_down_returns_503_for_set_and_get(install_core) -> None:
     assert get_response.get_json()["code"] == "rpc_unavailable"
 
 
-def test_control_get_forwards_instance_id_and_passes_selection_through(install_core) -> None:
+def test_control_get_forwards_internal_job_id_and_passes_selection_through(install_core) -> None:
     core_payload = {
         "status": "ok",
         "instance_id": "inst-condor-01",
@@ -610,21 +610,31 @@ def test_control_get_forwards_instance_id_and_passes_selection_through(install_c
     }
     fake = install_core(response=core_payload)
 
-    response = _app().test_client().get("/joblens/collection?instance_id=inst-condor-01")
+    response = _app().test_client().get("/joblens/collection?internal_job_id=42")
 
     assert response.status_code == 200
-    assert fake.calls == [("JobCollection/get", {"instance_id": "inst-condor-01"})]
+    assert fake.calls == [("jobs/collection/get", {"internal_job_id": "42"})]
     assert response.get_json() == core_payload
 
 
-def test_control_get_requires_instance_id(install_core) -> None:
+def test_control_get_legacy_instance_id_route_is_adapted(install_core) -> None:
+    """旧查询参数只保留在 Trigger 适配层，Core 只看到 internal_job_id。"""
+    fake = install_core(response={"status": "ok", "internal_job_id": "42"})
+
+    response = _app().test_client().get("/joblens/collection?instance_id=42")
+
+    assert response.status_code == 200
+    assert fake.calls == [("jobs/collection/get", {"internal_job_id": "42"})]
+
+
+def test_control_get_requires_internal_job_id(install_core) -> None:
     fake = install_core(response={"status": "ok"})
 
     response = _app().test_client().get("/joblens/collection")
 
     assert response.status_code == 400
     assert fake.calls == []
-    assert "instance_id" in response.get_json()["message"]
+    assert "internal_job_id" in response.get_json()["message"]
 
 
 def test_control_get_missing_instance_returns_404(install_core) -> None:
@@ -632,11 +642,11 @@ def test_control_get_missing_instance_returns_404(install_core) -> None:
         response={
             "status": "error",
             "code": "not_found",
-            "message": "instance inst-gone is not a current inventory entry",
+            "message": "instance inst-gone is not a current job record",
         }
     )
 
-    response = _app().test_client().get("/joblens/collection?instance_id=inst-gone")
+    response = _app().test_client().get("/joblens/collection?internal_job_id=999")
 
     assert response.status_code == 404
     assert response.get_json()["code"] == "not_found"
@@ -666,7 +676,7 @@ def test_control_per_target_applied_error_is_not_masked(install_core) -> None:
 
 # ==================== list / status / capabilities across health states ====================
 
-def test_read_inventory_list_forwards_filters_and_paging(install_core) -> None:
+def test_read_job_list_forwards_filters_and_paging(install_core) -> None:
     core_payload = {
         "snapshot_revision": 7,
         "records": [{"instance_id": "inst-condor-01", "internal_job_id": "42"}],
@@ -675,14 +685,14 @@ def test_read_inventory_list_forwards_filters_and_paging(install_core) -> None:
     fake = install_core(response=core_payload)
 
     response = _app().test_client().get(
-        "/joblens/inventory"
+        "/joblens/jobs/list"
         "?scheduler_type=condor&native_job_id=172.0&state=running&limit=2&cursor=cursor-1"
     )
 
     assert response.status_code == 200
     assert fake.calls == [
         (
-            "JobRegistry/inventory_list",
+            "jobs/list",
             {
                 "limit": 2,
                 "scheduler_type": "condor",
@@ -697,12 +707,24 @@ def test_read_inventory_list_forwards_filters_and_paging(install_core) -> None:
     assert set(body) == {"snapshot_revision", "records", "next_cursor"}
 
 
-def test_read_inventory_list_defaults_limit_to_100(install_core) -> None:
+def test_read_job_list_legacy_inventory_route_remains_an_alias(install_core) -> None:
+    """旧 URL 只作为 Trigger 侧适配层保留，仍转发到同一个 Core 方法。"""
     fake = install_core(
         response={"snapshot_revision": 1, "records": [], "next_cursor": None}
     )
 
-    response = _app().test_client().get("/joblens/inventory")
+    response = _app().test_client().get("/joblens/inventory?limit=2")
+
+    assert response.status_code == 200
+    assert fake.calls == [("jobs/list", {"limit": 2})]
+
+
+def test_read_job_list_defaults_limit_to_100(install_core) -> None:
+    fake = install_core(
+        response={"snapshot_revision": 1, "records": [], "next_cursor": None}
+    )
+
+    response = _app().test_client().get("/joblens/jobs/list")
 
     assert response.status_code == 200
     assert fake.calls[0][1] == {"limit": 100}
@@ -710,20 +732,20 @@ def test_read_inventory_list_defaults_limit_to_100(install_core) -> None:
 
 
 @pytest.mark.parametrize("limit", ["0", "1001", "abc", "-5"])
-def test_read_inventory_list_rejects_out_of_range_limit(install_core, limit: str) -> None:
+def test_read_job_list_rejects_out_of_range_limit(install_core, limit: str) -> None:
     fake = install_core(response={"snapshot_revision": 1, "records": [], "next_cursor": None})
 
-    response = _app().test_client().get(f"/joblens/inventory?limit={limit}")
+    response = _app().test_client().get(f"/joblens/jobs/list?limit={limit}")
 
     assert response.status_code == 400
     assert fake.calls == []
     assert response.get_json()["code"] == "invalid_request"
 
 
-def test_read_inventory_list_accepts_max_limit(install_core) -> None:
+def test_read_job_list_accepts_max_limit(install_core) -> None:
     fake = install_core(response={"snapshot_revision": 1, "records": [], "next_cursor": None})
 
-    response = _app().test_client().get("/joblens/inventory?limit=1000")
+    response = _app().test_client().get("/joblens/jobs/list?limit=1000")
 
     assert response.status_code == 200
     assert fake.calls[0][1] == {"limit": 1000}
@@ -738,7 +760,7 @@ def test_read_records_pass_through_decimal_string_ids_without_sentinel(install_c
         response={"snapshot_revision": 11, "records": records, "next_cursor": None}
     )
 
-    response = _app().test_client().get("/joblens/inventory")
+    response = _app().test_client().get("/joblens/jobs/list")
 
     assert response.status_code == 200
     body = response.get_json()
@@ -753,11 +775,11 @@ def test_read_stale_cursor_returns_409_without_retry(install_core) -> None:
         response={
             "status": "error",
             "code": "snapshot_changed",
-            "message": "inventory snapshot 7 no longer matches cursor snapshot 6",
+            "message": "job snapshot 7 no longer matches cursor snapshot 6",
         }
     )
 
-    response = _app().test_client().get("/joblens/inventory?cursor=cursor-1")
+    response = _app().test_client().get("/joblens/jobs/list?cursor=cursor-1")
 
     assert response.status_code == 409
     assert response.get_json()["code"] == "snapshot_changed"
@@ -769,24 +791,24 @@ def test_read_stale_cursor_returns_409_without_retry(install_core) -> None:
     [
         {
             "status": "initializing",
-            "inventory_enabled": True,
+            "enabled": True,
             "reconciliation": {"state": "pending", "completed_scans": 0},
         },
         {
             "status": "degraded",
-            "inventory_enabled": True,
+            "enabled": True,
             "sources": [{"scheduler_type": "condor", "state": "degraded"}],
             "queue": {"pending": 4},
         },
         {
             "status": "healthy",
-            "inventory_enabled": True,
+            "enabled": True,
             "sources": [{"scheduler_type": "slurm", "state": "healthy"}],
-            "persistence": {"state": "ok", "schema_version": 4},
+            "persistence": {"state": "ok", "schema_version": 5},
         },
         {
             "status": "disabled",
-            "inventory_enabled": False,
+            "enabled": False,
             "sources": [],
         },
     ],
@@ -794,33 +816,33 @@ def test_read_stale_cursor_returns_409_without_retry(install_core) -> None:
 def test_read_status_passes_through_lifecycle_states(install_core, core_status: dict) -> None:
     install_core(response=core_status)
 
-    response = _app().test_client().get("/joblens/inventory/status")
+    response = _app().test_client().get("/joblens/jobs/status")
 
     assert response.status_code == 200
     assert response.get_json() == core_status
 
 
-def test_read_status_does_not_upgrade_disabled_inventory_to_healthy(install_core) -> None:
-    core_status = {"status": "disabled", "inventory_enabled": False, "sources": []}
+def test_read_status_does_not_upgrade_disabled_registry_to_healthy(install_core) -> None:
+    core_status = {"status": "disabled", "enabled": False, "sources": []}
     install_core(response=core_status)
 
-    body = _app().test_client().get("/joblens/inventory/status").get_json()
+    body = _app().test_client().get("/joblens/jobs/status").get_json()
 
     assert body["status"] == "disabled"
-    assert body["inventory_enabled"] is False
+    assert body["enabled"] is False
     assert "healthy" not in body
 
 
-def test_read_status_missing_inventory_returns_404(install_core) -> None:
+def test_read_status_missing_registry_returns_404(install_core) -> None:
     install_core(
         response={
             "status": "error",
             "code": "not_found",
-            "message": "inventory subsystem is not available on this core",
+            "message": "job registry is not available on this core",
         }
     )
 
-    response = _app().test_client().get("/joblens/inventory/status")
+    response = _app().test_client().get("/joblens/jobs/status")
 
     assert response.status_code == 404
     assert response.get_json()["code"] == "not_found"
@@ -829,37 +851,38 @@ def test_read_status_missing_inventory_returns_404(install_core) -> None:
 def test_read_capabilities_are_forwarded_verbatim(install_core) -> None:
     core_payload = {
         "status": "ok",
-        "inventory_version": 1,
+        "api_version": 2,
         "collection_control_version": 1,
         "native_identity_selectors": True,
         "job_scope": "current_local_instances",
-        "db_schema_version": 4,
+        "db_schema_version": 5,
+        "ready": True,
     }
     fake = install_core(response=core_payload)
 
     response = _app().test_client().get("/joblens/capabilities")
 
     assert response.status_code == 200
-    assert fake.calls == [("JobRegistry/capabilities", {})]
+    assert fake.calls == [("joblens/capabilities", {})]
     assert response.get_json() == core_payload
 
 
 def test_read_capabilities_are_not_invented_when_core_lacks_them(install_core) -> None:
-    install_core(error=RPCError("method not found: JobRegistry/capabilities"))
+    install_core(error=RPCError("method not found: joblens/capabilities"))
 
     response = _app().test_client().get("/joblens/capabilities")
 
     assert response.status_code == 503
     body = response.get_json()
     assert body["code"] == "rpc_unavailable"
-    assert "inventory_version" not in body
+    assert "api_version" not in body
     assert "collection_control_version" not in body
 
 
 def test_read_non_object_core_payload_is_not_reported_as_success(install_core) -> None:
     install_core(response=["unexpected", "shape"])
 
-    response = _app().test_client().get("/joblens/inventory")
+    response = _app().test_client().get("/joblens/jobs/list")
 
     assert response.status_code == 502
     assert response.get_json()["code"] == "core_response_invalid"

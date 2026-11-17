@@ -133,7 +133,7 @@ bool already_running() {
 void onBecomeService() {
     spdlog::info("Main: app start as service mode.");
     // The registry constructor is the single assembly point for durable state:
-    // it opens the store, creates the kernel namespace and starts inventory
+    // it opens the store, creates the kernel namespace and starts registry
     // discovery and maintenance (initial scan included).
     JobRegistry& registry = JobRegistry::instance();
     // Explicit ownership seam: the scheduler pulls desired state from the

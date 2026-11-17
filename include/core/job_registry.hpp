@@ -126,7 +126,7 @@ struct AutoSelection {
 };
 
 // Construction options. Production uses the singleton (all defaults); tests
-// and inventory-only service startup construct an isolated store without
+// and registry-only service startup construct an isolated store without
 // watchers, eBPF or RPC registration.
 struct JobRegistryOptions {
     std::string db_path;                 // empty: job_registry_config.job_db_path
@@ -140,21 +140,21 @@ struct JobRegistryOptions {
     // With this flag the heartbeat runs without reading Config (test wiring;
     // combine with test_sources, or leave it empty for manual-only upkeep).
     bool test_heartbeat = false;
-    // Test-only escape hatch: construct a purely static inventory registry
+    // Test-only escape hatch: construct a purely static registry
     // (no heartbeat, no discovery sources, no maintenance pass — only the
     // restored rows, manual CRUD, the read surface and explicit retirement).
-    // Production never sets it: the inventory stack stays armed so registered
+    // Production never sets it: the registry stack stays armed so registered
     // jobs keep their retirement/checkpoint upkeep.
-    bool test_static_inventory = false;
+    bool test_static_registry = false;
     // Liveness probe overrides (empty = production /proc/cgroup probes).
     ProcessLivenessProbe test_process_probe;
     CgroupMembershipProbe test_cgroup_probe;
     // Automatic-selection policy for test wiring (production builds it from
-    // job_registry_config.inventory + <type>_job_watcher). The adapter name
+    // job_registry_config.maintenance + <type>_job_watcher). The adapter name
     // below is the key it is armed under.
     std::function<AutoCollectorPolicy()> test_auto_policy;
     std::string test_auto_policy_adapter{"condor"};
-    // Admission-gate test wiring (production reads inventory.capture_all and
+    // Admission-gate test wiring (production reads maintenance.capture_all and
     // the per-type auto_add tri-state from the resolved configuration).
     // test_capture_all=false arms the gate; the state map carries the
     // per-subtype tri-state (a missing entry behaves as Off).
@@ -186,7 +186,7 @@ public:
     // entry.
     bool addJob(const Job& job);
     void delJob(uint64_t jobID);
-    // Inventory-grade retirement: archive atomically (active -> history,
+    // Job retirement: archive atomically (active -> history,
     // identity index and binding removed) and report durable success.
     bool retireInstance(uint64_t jobID);
     // 通过 sub_attr 匹配删除作业，返回删除的作业数量
@@ -202,7 +202,7 @@ public:
     // 获取下一个全局唯一递增的JobID（durable 预留；失败返回 0）
     uint64_t getNextJobID();
 
-    // --- Inventory store facade --------------------------------------------
+    // --- JobStore facade --------------------------------------------
     // Admission outcome for one observation (capture_all=false). A present
     // decision means the observation may register; the optional initial
     // collector list is the gate's pre-evaluated automatic selection, applied
@@ -223,9 +223,9 @@ public:
     // list, that list is applied as the initial automatic selection instead
     // of re-evaluating the policy.
     UpsertResult upsertObservedJob(const Job& job, const InitialDecision* admission = nullptr);
-    std::optional<JobRecord> inventoryRecord(uint64_t jobID) const;
-    std::optional<JobRecord> inventoryRecordByKey(const SchedulerKey& key) const;
-    std::vector<JobRecord> inventoryRecords() const;
+    std::optional<JobRecord> jobRecord(uint64_t jobID) const;
+    std::optional<JobRecord> jobRecordByKey(const SchedulerKey& key) const;
+    std::vector<JobRecord> jobRecords() const;
     CollectionSelection selectionRecord(uint64_t jobID) const;
     // Optional collector-name gate. Unset accepts every non-empty name.
     void setCollectorValidator(std::function<bool(const std::string&)> validator);
@@ -274,19 +274,19 @@ public:
     // --- Lifecycle -----------------------------------------------------------
     // Stop discovery admission and polling. Must run before the collector
     // scheduler drains. Idempotent.
-    void stopInventoryDiscovery();
+    void stopDiscovery();
     // Finalize retirements, stop the heartbeat, archive closing records and
     // close the store. Returns false when a closing record could not be
     // archived (the incomplete state stays persisted). Idempotent; the
     // destructor calls it as a fallback.
     bool deinit();
 
-    // --- Inventory heartbeat --------------------------------------------------
+    // --- Registry heartbeat --------------------------------------------------
     // One on-demand authoritative pass (the `ensure_registered` refresh
     // provider): scan -> upsert -> hint merge -> retirement -> reconciliation,
     // exactly what the periodic worker runs. Returns false when the heartbeat
     // is not running.
-    bool reconcileInventoryNow();
+    bool reconcileNow();
     // Kernel exit hint entry (cheap; schedules a coalesced refresh).
     void notifyExit(pid_t pid);
 
@@ -340,14 +340,14 @@ private:
     JobRegistry();
     // Which wiring the heartbeat was assembled from: injected test seams or
     // the production configuration/adapter stack.
-    enum class InventoryWiring { Disabled, Test, Production };
+    enum class DiscoveryWiring { Disabled, Test, Production };
     // Decides WHICH discovery sources, probes and facts encoder the heartbeat
     // drives, once, before any source starts. Test wiring copies the
     // constructor-provided seams verbatim; production resolves the
     // configuration and builds one adapter per configured type.
     // Construction phases, called in order by the constructor: open the
     // store, restore and validate existing rows, gate collector names, arm
-    // the inventory components (adapters/policies/probes/capability gate),
+    // the registry components (adapters/policies/probes/capability gate),
     // then start sources, the first authoritative pass, the status providers
     // and the maintenance worker.
     void openStore(const JobRegistryOptions& options);
@@ -358,15 +358,15 @@ private:
     void restoreExistingRecords();
     void installCollectorValidator();
     void resetHeartbeatState();
-    InventoryWiring armInventory(const JobRegistryOptions& options);
-    void runInitialInventoryPass();
+    DiscoveryWiring armDiscovery(const JobRegistryOptions& options);
+    void runInitialPass();
     // Admit restored active records to kernel ownership through the single
     // admission path (a restarted process starts with an empty namespace).
     void admitRestoredOwners();
-    void startDiscoverySources(InventoryWiring wiring);
+    void startDiscoverySources(DiscoveryWiring wiring);
     // Automatic selection for one newly created instance, evaluated outside
     // every registry lock: a Lua rule may be slow or re-enter the registry,
-    // so it must never run under a lock that serializes inventory changes.
+    // so it must never run under a lock that serializes record changes.
     // Returns nullopt when no automatic decision was needed, true when the
     // decision (including an explicit reject) is durable, false otherwise.
     std::optional<bool> apply_auto_policy(const Job& job, const std::string& adapter);
@@ -528,7 +528,7 @@ private:
     // SchedulerAdapterRegistry; the registry never names a scheduler.
     std::vector<std::unique_ptr<ISchedulerAdapter>> adapters_;
 
-    // --- inventory heartbeat state (guarded by hb_mtx_ unless noted) --------
+    // --- registry heartbeat state (guarded by hb_mtx_ unless noted) --------
     // Discovery registration is synchronous on the producing threads: there is
     // no observation queue and no drain step, so a discovered job is durable
     // before the watcher continues with the next event.
@@ -548,7 +548,7 @@ private:
     std::set<uint64_t> suspect_ids_;
     std::map<std::string, ProcessIdentity> ended_executions_;
     std::vector<std::pair<uint64_t, ProcessIdentity>> closing_executions_;
-    bool hb_admitted_ = false;     // false after stopInventoryDiscovery()
+    bool hb_admitted_ = false;     // false after stopDiscovery()
     bool hb_running_ = false;      // worker thread alive
     bool hb_stopping_ = false;
     // Set by requestRescan() to cut the maintenance wait short (cooldown still
@@ -599,7 +599,7 @@ private:
     ProcessLivenessProbe process_probe_;
     CgroupMembershipProbe cgroup_probe_;
     // Every discovery source the heartbeat drives (adapters or test sources),
-    // populated by armInventory().
+    // populated by armDiscovery().
     std::vector<std::pair<std::string, IDiscoverySource*>> hb_sources_;
     DiscoverySink heartbeat_sink_;
     // Control-plane validation. Guarded because tests install it after
@@ -608,12 +608,12 @@ private:
     mutable std::mutex selection_validation_mtx_;
     std::function<bool(const std::string&)> collector_validator_;
     // Automatic collector selection keyed by adapter name, armed from the
-    // resolved inventory configuration. A disabled entry selects nothing.
+    // resolved maintenance configuration. A disabled entry selects nothing.
     std::map<std::string, AutoCollectorPolicy> auto_policies_;
     // Admission gate state: the blanket-registration switch and the
-    // per-adapter auto_add tri-state, armed from the resolved inventory
-    // configuration in armInventory().
-    bool inventory_capture_all_ = true;
+    // per-adapter auto_add tri-state, armed from the resolved maintenance
+    // configuration in armDiscovery().
+    bool capture_all_ = true;
     std::map<std::string, AutoAdd> auto_add_states_;
     bool deinit_done_{false};
     bool deinit_ok_{true};
@@ -659,7 +659,7 @@ private:
     // execution whose child is still alive.
     void probeSurvivingMembers(const Job& stored, const Job& refreshed,
                                RefreshResult& evidence) const;
-    // Registration admission gate (inventory.capture_all=false). Returns
+    // Registration admission gate (maintenance.capture_all=false). Returns
     // nullopt to drop the observation (counted by the caller-visible
     // hb_dropped_/hb_rejected_ counters); otherwise the register decision
     // and, when the type's policy was pre-evaluated, the initial collector

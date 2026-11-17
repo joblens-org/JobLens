@@ -14,7 +14,7 @@
 // job_registry.cpp — the registry facade.
 //
 // Durable state lives in JobStore (JobRecord); kernel attribution lives in
-// KernelAttribution; the RPC surface lives in inventory_rpc.cpp. This file
+// KernelAttribution; the RPC surface lives in job_rpc.cpp. This file
 // keeps the CollectorScheduler-facing seams: lifecycle callbacks, the
 // collection applier, retirement/drain flow and the automatic-selection
 // trigger.
@@ -38,8 +38,8 @@
 #include "core/job_identity.hpp"
 
 #include "core/reentrancy_gate.hpp"
-#include "core/inventory_config.hpp"
-#include "core/inventory_rpc.hpp"
+#include "core/maintenance_config.hpp"
+#include "core/job_rpc.hpp"
 #include "core/collector_registry.hpp"
 #include "common/utils.hpp"
 #include "common/common_job.hpp"
@@ -51,13 +51,13 @@
 #include <unordered_set>
 #include <type_traits>
 
-// Maintenance-side inventory health (source/queue/reconciliation state) is
+// Maintenance-side source health (source/queue/reconciliation state) is
 // published by the heartbeat through this seam. When no provider
 // is registered, the status handler serves the explicit "not_configured"
 // marker instead of guessing a source state.
-#if __has_include("core/inventory_status_provider.hpp")
-#include "core/inventory_status_provider.hpp"
-#define JOBLENS_HAS_INVENTORY_STATUS_PROVIDER 1
+#if __has_include("core/status_provider.hpp")
+#include "core/status_provider.hpp"
+#define JOBLENS_HAS_STATUS_PROVIDER 1
 #endif
 
 // Collector names are collector-instance names from
@@ -103,7 +103,7 @@ static void load_rules_at_startup(const std::string& adapter_name,
 }
 
 // ---------------------------------------------------------------------------
-// Inventory record helpers
+// Job record helpers
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -403,7 +403,7 @@ ISchedulerAdapter* JobRegistry::namespaceAdapterNamed(const std::string& name) c
     if (cached != namespace_adapters_.end()) return cached->second.get();
     // Built but never armed: the watcher carries no state until a discovery
     // source starts it, so this instance answers facts questions only.
-    auto built = SchedulerAdapterRegistry::instance().build(name, InventoryTypeSettings{});
+    auto built = SchedulerAdapterRegistry::instance().build(name, DiscoveryTypeSettings{});
     if (!built) return nullptr;
     auto* const raw = built.get();
     namespace_adapters_[name] = std::move(built);
@@ -469,25 +469,25 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
 
     // Attribution owns the kernel map namespace, so it must exist before any
     // discovery admission or collector attachment. The capability gate itself
-    // is installed by armInventory below.
+    // is installed by armDiscovery below.
     if (options.enable_pid_tracker) init_pid_tracker();
 
-    // Inventory startup, in the order that matters: reset the heartbeat
+    // Discovery startup, in the order that matters: reset the heartbeat
     // bookkeeping and install the registration sink (both BEFORE the wiring
     // decision, so a Disabled registry exits in the same state as today),
     // then arm the components (adapters, policies, probes, capability gate),
     // then admit the restored owners through that gate, then start the sources
     // (the sink must exist before any poll thread), run the first
-    // authoritative pass (blocking: the inventory is settled before the RPC
+    // authoritative pass (blocking: the record set is settled before the RPC
     // surface opens), publish the status providers and finally start the
     // maintenance worker. Production always arms this stack (a registered job
     // needs retirement/checkpoint upkeep); the purely static form is a
-    // test-only escape hatch (test_static_inventory).
-    InventoryWiring wiring = InventoryWiring::Disabled;
-    if (!options.test_static_inventory) {
+    // test-only escape hatch (test_static_registry).
+    DiscoveryWiring wiring = DiscoveryWiring::Disabled;
+    if (!options.test_static_registry) {
         resetHeartbeatState();
         installHeartbeatSink();
-        wiring = armInventory(options);
+        wiring = armDiscovery(options);
     }
 
     // Restored active records must be re-seeded into the kernel namespace this
@@ -497,16 +497,16 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
     // unconditionally (capable() defaults to true while no lookup is armed).
     admitRestoredOwners();
 
-    if (!options.test_static_inventory && wiring != InventoryWiring::Disabled) {
+    if (!options.test_static_registry && wiring != DiscoveryWiring::Disabled) {
         startDiscoverySources(wiring);
-        runInitialInventoryPass();
+        runInitialPass();
         publishStatusProvider();
         startHeartbeat();
-        if (wiring == InventoryWiring::Test)
+        if (wiring == DiscoveryWiring::Test)
             spdlog::info("JobRegistry: heartbeat running with {} test source(s)",
                          hb_sources_.size());
         else
-            spdlog::info("JobRegistry: inventory heartbeat running with {} discovery type(s)",
+            spdlog::info("JobRegistry: registry heartbeat running with {} discovery type(s)",
                          hb_sources_.size());
     }
 
@@ -592,10 +592,10 @@ void JobRegistry::installCollectorValidator()
         [known](const std::string& name) { return known.count(name) != 0; });
 }
 
-void JobRegistry::runInitialInventoryPass()
+void JobRegistry::runInitialPass()
 {
     if (!runPass(true, /*wait=*/true)) {
-        spdlog::warn("JobRegistry: the initial inventory pass did not run");
+        spdlog::warn("JobRegistry: the initial maintenance pass did not run");
     }
 }
 
@@ -605,7 +605,7 @@ JobRegistry& JobRegistry::instance() {
 }
 
 // ---------------------------------------------------------------------------
-// Inventory heartbeat — the maintenance function of the registry.
+// Registry heartbeat — the maintenance function of the registry.
 // Thread-free policy components (probes, retirement rules, absence counters)
 // are driven from one periodic worker; there is no separate service object.
 // ---------------------------------------------------------------------------
@@ -706,7 +706,7 @@ UpsertResult JobRegistry::processObservation(const Job& job, std::set<uint64_t>&
         const auto admission = admissionDecision(job);
         if (!admission) {
             result.fail(RegistrationError::NotAdmitted,
-                        "the inventory admission policy refused this observation");
+                        "the admission policy refused this observation");
             return result;
         }
         result = upsertObservedJob(job, &*admission);
@@ -743,7 +743,7 @@ UpsertResult JobRegistry::processObservation(const Job& job, std::set<uint64_t>&
         return result;
     }
 
-    noteHeartbeatError("inventory upsert failed: " + result.error +
+    noteHeartbeatError("job upsert failed: " + result.error +
                        (result.message.empty() ? "" : ": " + result.message));
     return result;
 }
@@ -886,7 +886,7 @@ std::optional<JobRegistry::RefreshedEvidence> JobRegistry::applyRefreshedRecord(
             return outcome;
         }
 
-        RecordTxn txn(*this, "refresh inventory evidence", /*durable=*/false);
+        RecordTxn txn(*this, "refresh job evidence", /*durable=*/false);
         txn.touch(current->job.JobID);
         txn.replace(std::move(updated));
         if (!txn.commit()) {
@@ -922,7 +922,7 @@ bool JobRegistry::retireIfConfirmed(const JobRecord& record, const std::string& 
 
     rememberEnded(record);
     if (!retireInstance(record.job.JobID)) {
-        noteHeartbeatError("inventory retirement failed for JobID " +
+        noteHeartbeatError("job retirement failed for JobID " +
                            std::to_string(record.job.JobID));
         return false;
     }
@@ -943,7 +943,7 @@ std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const
     // Blanket registration on: every captured job registers; the
     // automatic selection stays with the post-registration path
     // (apply_auto_policy), so no decision is pre-evaluated here.
-    if (inventory_capture_all_) {
+    if (capture_all_) {
         InitialDecision blanket;
         return blanket;
     }
@@ -1347,7 +1347,7 @@ bool JobRegistry::runPass(bool do_scan, bool wait, bool refresh_facts) {
     return true;
 }
 
-bool JobRegistry::reconcileInventoryNow() {
+bool JobRegistry::reconcileNow() {
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         // A callback running on the heartbeat thread must never wait for a
@@ -1473,7 +1473,7 @@ void JobRegistry::installHeartbeatSink() {
         if (!admission) {
             UpsertResult refused;
             refused.fail(RegistrationError::NotAdmitted,
-                         "the inventory admission policy refused this observation");
+                         "the admission policy refused this observation");
             return refused;
         }
         auto result = upsertObservedJob(job, &*admission);
@@ -1483,8 +1483,8 @@ void JobRegistry::installHeartbeatSink() {
 }
 
 void JobRegistry::publishStatusProvider() {
-    set_inventory_status_provider([this]() { return heartbeatStatusJson(); });
-    set_inventory_refresh_provider([this]() { return reconcileInventoryNow(); });
+    set_status_provider([this]() { return heartbeatStatusJson(); });
+    set_refresh_provider([this]() { return reconcileNow(); });
     {
         std::lock_guard<std::mutex> lock(exit_observer_mtx_);
         exit_observer_ = [this](pid_t pid) { notifyExit(pid); };
@@ -1495,10 +1495,10 @@ void JobRegistry::publishStatusProvider() {
 
 void JobRegistry::retractStatusProvider() {
     if (status_published_) {
-        set_inventory_status_provider({});
+        set_status_provider({});
         status_published_ = false;
     }
-    set_inventory_refresh_provider({});
+    set_refresh_provider({});
     {
         std::lock_guard<std::mutex> lock(exit_observer_mtx_);
         exit_observer_ = {};
@@ -1530,20 +1530,20 @@ void JobRegistry::resetHeartbeatState()
     hb_refresh_failures_ = 0;
 }
 
-// Arms the inventory components from the resolved configuration: one adapter
+// Arms the registry components from the resolved configuration: one adapter
 // per configured type, the automatic-selection policies, the production
 // liveness probes and the kernel-attribution capability gate. Nothing is
 // started here; the caller starts sources and the first pass afterwards, so
 // the gate is guaranteed to exist before any attribution can activate.
-JobRegistry::InventoryWiring
-JobRegistry::armInventory(const JobRegistryOptions& options)
+JobRegistry::DiscoveryWiring
+JobRegistry::armDiscovery(const JobRegistryOptions& options)
 {
     // Symmetric resets first: every exit path (including failures) leaves the
     // same armed-state behind.
     adapters_.clear();
     auto_policies_.clear();
     auto_add_states_.clear();
-    inventory_capture_all_ = true;
+    capture_all_ = true;
 
     // Test wiring: pre-built sources and injected probes, no configuration
     // and no automatic selection.
@@ -1557,24 +1557,24 @@ JobRegistry::armInventory(const JobRegistryOptions& options)
             load_rules_at_startup(options.test_auto_policy_adapter, policy);
             auto_policies_[options.test_auto_policy_adapter] = std::move(policy);
         }
-        inventory_capture_all_ = options.test_capture_all;
+        capture_all_ = options.test_capture_all;
         auto_add_states_ = options.test_auto_add_states;
         reconcile_interval_sec_ = 30;
-        return InventoryWiring::Test;
+        return DiscoveryWiring::Test;
     }
 
-    InventoryMaintenanceConfig config;
+    MaintenanceConfig config;
     try {
-        config = resolve_inventory_maintenance_config(Config::instance().dumpConfig());
+        config = resolve_maintenance_config(Config::instance().dumpConfig());
     } catch (const std::exception& error) {
-        spdlog::error("JobRegistry: invalid inventory configuration; inventory maintenance "
+        spdlog::error("JobRegistry: invalid maintenance configuration; registry maintenance "
                       "is disabled: {}",
                       error.what());
-        return InventoryWiring::Disabled;
+        return DiscoveryWiring::Disabled;
     }
     reconcile_interval_sec_ = config.reconcile_interval_sec;
     // The admission gate follows the resolved configuration.
-    inventory_capture_all_ = config.capture_all;
+    capture_all_ = config.capture_all;
     for (const auto& [adapter_name, settings] : config.settings) {
         auto_add_states_[adapter_name] = settings.auto_add;
     }
@@ -1588,17 +1588,17 @@ JobRegistry::armInventory(const JobRegistryOptions& options)
         const auto& settings = config.settings.at(name);
         auto adapter = SchedulerAdapterRegistry::instance().build(name, settings);
         if (!adapter) {
-            spdlog::error("JobRegistry: no adapter registered for inventory type '{}'; "
+            spdlog::error("JobRegistry: no adapter registered for discovery type '{}'; "
                           "registered: {}",
                           name,
                           fmt::join(SchedulerAdapterRegistry::instance().names(), ", "));
             adapters_.clear();
-            return InventoryWiring::Disabled;
+            return DiscoveryWiring::Disabled;
         }
         adapters_.push_back(std::move(adapter));
     }
     if (config.types.empty()) {
-        spdlog::info("JobRegistry: no inventory types configured; discovery is disabled and "
+        spdlog::info("JobRegistry: no discovery types configured; discovery is disabled and "
                      "existing records are still maintained");
     }
 
@@ -1656,10 +1656,10 @@ JobRegistry::armInventory(const JobRegistryOptions& options)
         });
     }
 
-    return InventoryWiring::Production;
+    return DiscoveryWiring::Production;
 }
 
-void JobRegistry::startDiscoverySources(InventoryWiring wiring)
+void JobRegistry::startDiscoverySources(DiscoveryWiring wiring)
 {
     source_started_.clear();
     source_start_notes_.clear();
@@ -1675,14 +1675,14 @@ void JobRegistry::startDiscoverySources(InventoryWiring wiring)
             note = "event source unavailable; the manager pass drives discovery";
         source_started_.emplace_back(name, started);
         source_start_notes_.push_back(std::move(note));
-        if (!started && wiring == InventoryWiring::Production)
+        if (!started && wiring == DiscoveryWiring::Production)
             spdlog::warn("JobRegistry: source '{}' has no event source; discovery "
                          "continues through the manager pass: {}",
                          name, source_start_notes_.back());
     }
 }
 
-void JobRegistry::stopInventoryDiscovery() {
+void JobRegistry::stopDiscovery() {
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         if (!hb_admitted_ && !hb_running_ &&
@@ -1803,9 +1803,9 @@ bool JobRegistry::deinit()
     if (deinit_done_) return deinit_ok_;
 
     // Shutdown order: discovery admission stopped first (the service calls
-    // stopInventoryDiscovery() before draining the scheduler), then the
+    // stopDiscovery() before draining the scheduler), then the
     // retirements are finalized, then attribution, then the store.
-    stopInventoryDiscovery();
+    stopDiscovery();
 
     bool ok = true;
     // Everything written without a fence becomes durable before the database
@@ -2170,7 +2170,7 @@ bool JobRegistry::createManualJob(const Job& job) {
                 const auto owner = identity_index_.find(key->index_key());
                 if (owner != identity_index_.end() && owner->second != record.job.JobID) {
                     spdlog::error("JobRegistry: identity for JobID {} is already registered "
-                                  "as JobID {}; refusing a duplicate inventory record",
+                                  "as JobID {}; refusing a duplicate job record",
                                   record.job.JobID, owner->second);
                     return false;
                 }
@@ -2444,12 +2444,12 @@ nlohmann::json JobRegistry::updateManualInstance(const JobRecord& target, const 
         if (hint_valid && hint_value != internal_id) {
             out["ignored_job_id_hint"] = format_internal_id(hint_value);
             spdlog::warn("JobRegistry: manual upsert for native job '{}' carried JobID {} "
-                         "as a compatibility hint; resolved to inventory instance {}",
+                         "as a compatibility hint; resolved to job instance {}",
                          record ? record->job.NativeJobID : job.NativeJobID, hint_value,
                          internal_id);
         }
     }
-    spdlog::info("JobRegistry: manual upsert resolved to inventory instance {} (internal "
+    spdlog::info("JobRegistry: manual upsert resolved to job instance {} (internal "
                  "{}, revision {})",
                  format_internal_id(internal_id), internal_id, revision);
     return out;
@@ -2525,7 +2525,7 @@ bool JobRegistry::retireInstance(uint64_t jobID) {
 
     ICollectionRuntime* runtime = collectionRuntime();
     if (runtime == nullptr) {
-        // Inventory-only core: no collectors can hold the instance, so the
+        // Registry-only core: no collectors can hold the instance, so the
         // checked cleanup may run immediately.
         if (!cleanupThenArchive(jobID)) {
             spdlog::error("JobRegistry: retirement of JobID {} stays closing until the "
@@ -2812,7 +2812,7 @@ void JobRegistry::admitRestoredOwners() {
 }
 
 // ---------------------------------------------------------------------------
-// Inventory store facade
+// JobStore facade
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -3259,7 +3259,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
     if (!store_->ready()) {
         result.code = RegistrationError::StoreUnavailable;
         result.error = to_string(result.code);
-        result.message = "inventory store is not ready";
+        result.message = "job store is not ready";
         return result;
     }
 
@@ -3347,7 +3347,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
             // Updated: one unsynced batch; the row joins the dirty set. A
             // failed or ambiguous write publishes nothing (the latch fences
             // the row).
-            RecordTxn txn(*this, "update inventory facts", /*durable=*/false);
+            RecordTxn txn(*this, "update job facts", /*durable=*/false);
             txn.touch(internal_id);
             txn.put(std::move(updated));
             if (!txn.commit()) {
@@ -3360,7 +3360,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
             if (const auto published = ownRecord(internal_id)) record = *published;
         }
     } else {
-        // Create a new inventory record. Nothing is activated and no caller
+        // Create a new job record. Nothing is activated and no caller
         // binding is accepted here. The id reservation rides along in the
         // same batch as the record and its index entry: one commit, not two.
         std::string allocation_error;
@@ -3402,7 +3402,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         // A create has no published memory image to revert: identity
         // lookup repairs an ambiguous create, so it does not fence
         // recovery.
-        RecordTxn txn(*this, "create inventory record", /*durable=*/false);
+        RecordTxn txn(*this, "create job record", /*durable=*/false);
         txn.reserveCounter(durable_counter, durable_exhausted);
         txn.put(std::move(created));
         txn.indexPut(*key, allocated);
@@ -3420,7 +3420,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         std::shared_lock lg(records_mtx_);
         result.revision = records_[allocated].revision;
         record = records_[allocated];
-        spdlog::info("JobRegistry: created inventory instance {} for {} '{}'",
+        spdlog::info("JobRegistry: created job instance {} for {} '{}'",
                      allocated, key->adapter, key->native_job_id);
         }
     }   // mutation_mtx_ released: kernel admission, the runtime wake and the
@@ -3486,16 +3486,16 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
     return result;
 }
 
-std::optional<JobRecord> JobRegistry::inventoryRecord(uint64_t jobID) const {
+std::optional<JobRecord> JobRegistry::jobRecord(uint64_t jobID) const {
     return ownRecord(jobID);
 }
 
-std::optional<JobRecord> JobRegistry::inventoryRecordByKey(
+std::optional<JobRecord> JobRegistry::jobRecordByKey(
     const SchedulerKey& key) const {
     return ownRecordByKey(key);
 }
 
-std::vector<JobRecord> JobRegistry::inventoryRecords() const {
+std::vector<JobRecord> JobRegistry::jobRecords() const {
     return ownRecords();
 }
 
@@ -3624,7 +3624,7 @@ CollectionOutcome JobRegistry::mutateSelection(const CollectionRequest& request,
     for (const auto id : targets) {
         if (!ownHasActive(id)) {
             outcome.error = CollectionError::NotFound;
-            outcome.message = "no verified inventory instance with internal id " +
+            outcome.message = "no verified job instance with internal id " +
                               std::to_string(id);
             return outcome;
         }
@@ -3681,10 +3681,10 @@ CollectionOutcome JobRegistry::applyAutoPolicy(
 
         if (!ownHasActive(selection.internal_id)) {
             ++outcome.skipped_invalid;
-            outcome.message = "no verified inventory instance with internal id " +
+            outcome.message = "no verified job instance with internal id " +
                               std::to_string(selection.internal_id);
             target.selection = ownSelection(selection.internal_id);
-            target.actual.error = "no verified inventory instance";
+            target.actual.error = "no verified job instance";
             target.skipped = true;
             outcome.targets.push_back(std::move(target));
             continue;
@@ -3858,7 +3858,7 @@ void JobRegistry::setExecutionVerified(uint64_t jobID, bool verified) {
 }
 
 void JobRegistry::regRPCHandle() {
-    registerInventoryRpc(*this);
+    registerJobRpc(*this);
     RPCServer::instance().register_method("JobRegistry/group_probe_stats",
         [](const nlohmann::json&) -> nlohmann::json {
             return {{"status", "ok"}, {"stats", GroupProbeStats::instance().to_json()}};
@@ -3869,7 +3869,7 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     // Registry/store queries happen without holding the heartbeat mutex; they
     // take their own locks briefly and never re-enter here.
     const StoreHealth store = storeHealth();
-    const auto records = inventoryRecords();
+    const auto records = jobRecords();
     const std::size_t closing_records = closingJobCount();
 
     std::vector<std::pair<uint64_t, ProcessIdentity>> closing_ids;
@@ -3930,7 +3930,7 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     for (const auto& entry : closing_ids) {
         // Closing records stay in the store until the acknowledgement archives
         // them, so this is the accurate overlap with the active count.
-        if (inventoryRecord(entry.first).has_value()) ++closing_present;
+        if (jobRecord(entry.first).has_value()) ++closing_present;
     }
 
     std::size_t active_count = 0;
@@ -3938,7 +3938,7 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     std::size_t incomplete_count = 0;
     std::size_t pending_decisions = 0;
     for (const auto& record : records) {
-        if (record.job.JobID == 0) continue;   // system sentinel is never inventory
+        if (record.job.JobID == 0) continue;   // system sentinel is never a job record
         if (record.index_key.empty()) ++incomplete_count;
         // The same durable predicate the repair path uses, evaluated on this
         // snapshot: a live record whose automatic decision never landed.
@@ -4010,7 +4010,7 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     out["obsolete_hints"] = obsolete_hints;
     out["incomplete_observations"] = incomplete_observations;
     out["upsert_conflicts"] = upsert_conflicts;
-    out["capture_all"] = inventory_capture_all_;
+    out["capture_all"] = capture_all_;
     out["dropped_observations"] = dropped_observations;
     out["rejected_observations"] = rejected_observations;
     out["admission_errors"] = admission_errors;

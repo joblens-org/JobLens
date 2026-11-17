@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Deterministic inventory/collection-decoupling suites.
+# Deterministic job-record/collection-decoupling suites.
 #
 # Usage:
-#   bash tests/integration/run_inventory_tests.sh [build-dir] [--suite NAME]
+#   bash tests/integration/run_registry_tests.sh [build-dir] [--suite NAME]
 #
 # Suites: identity, store, intent, maintenance, lifecycle, all. Unknown suites
 # fail. Later
@@ -92,7 +92,7 @@ run_identity() {
 }
 
 run_store() {
-    link_test "$root/tests/integration/job_inventory_store_test.cpp" job_inventory_store_test
+    link_test "$root/tests/integration/job_store_test.cpp" job_store_test
 }
 
 run_intent() {
@@ -100,8 +100,8 @@ run_intent() {
 }
 
 run_maintenance() {
-    link_test "$root/tests/integration/job_inventory_maintenance_test.cpp" \
-        job_inventory_maintenance_test
+    link_test "$root/tests/integration/job_maintenance_test.cpp" \
+        job_maintenance_test
 }
 
 run_lifecycle() {
@@ -133,7 +133,7 @@ case "$suite" in
         run_lifecycle
         ;;
     *)
-        printf 'Unknown inventory suite: %s\n' "$suite" >&2
+        printf 'Unknown registry suite: %s\n' "$suite" >&2
         exit 2
         ;;
 esac

@@ -48,7 +48,7 @@ void check(bool condition, const std::string& message)
 // is derived from the record state so the assertion semantics stay unchanged.
 bool has_active(const JobRegistry& registry, uint64_t internal_id)
 {
-    const auto record = registry.inventoryRecord(internal_id);
+    const auto record = registry.jobRecord(internal_id);
     return record.has_value() && record->state != RecordState::Closing;
 }
 
@@ -64,7 +64,7 @@ JobRegistryOptions isolated(const std::string& path)
 {
     JobRegistryOptions options;
     options.db_path = path;
-    options.test_static_inventory = true;    options.enable_pid_tracker = false;
+    options.test_static_registry = true;    options.enable_pid_tracker = false;
     options.register_rpc = false;
     return options;
 }
@@ -299,7 +299,7 @@ void automatic_all_skipped_and_duplicates_do_not_write_or_wake(const std::string
               skipped.skipped_manual_override == 0 && skipped.targets.size() == 2,
           "all invalid automatic decisions are skipped, not unchanged or committed");
     check(skipped.targets[0].internal_id == 987654 && skipped.targets[0].skipped &&
-              skipped.targets[0].actual.error == "no verified inventory instance" &&
+              skipped.targets[0].actual.error == "no verified job instance" &&
               skipped.targets[1].internal_id == created.internal_id &&
               skipped.targets[1].skipped && skipped.targets[1].actual.error ==
                   "unknown automatic collector name: invalid_collector",
@@ -354,7 +354,7 @@ void failed_automatic_batches_never_report_planned_acceptance(const std::string&
                   failed.targets[1].internal_id == 987654 &&
                   failed.targets[2].internal_id == second.internal_id &&
                   failed.targets[1].skipped && failed.targets[1].actual.error ==
-                      "no verified inventory instance",
+                      "no verified job instance",
               "a failed batch must not erase earlier per-target validation errors");
         for (const auto index : {0U, 2U}) {
             const auto& target = failed.targets[index];
@@ -431,7 +431,7 @@ void mixed_automatic_results_preserve_input_order_and_skip_errors(const std::str
     check(outcome.targets[1].skipped && outcome.targets[1].actual.error ==
               "unknown automatic collector name: invalid_collector" &&
               outcome.targets[2].skipped && outcome.targets[2].actual.error ==
-                  "no verified inventory instance",
+                  "no verified job instance",
           "a successful valid batch must not overwrite skipped per-target validation errors");
     for (const auto index : {1U, 2U}) {
         check(outcome.targets[index].revision == 0 && !outcome.targets[index].changed &&
@@ -492,7 +492,7 @@ void manual_selection_wins_over_observations_and_policy(const std::string& base)
                {"cpumem_collector"}),
           "manual selection must be effective");
 
-    // An inventory observation update must not rewrite collection intent.
+    // An discovery observation update must not rewrite collection intent.
     auto updated_observation = observation;
     std::get<CondorJobAttr>(updated_observation.sub_attr).owner = "bob";
     updated_observation.execution.members.push_back({5151, 424242, "boot-aaa"});
@@ -754,8 +754,8 @@ void durable_intent_survives_restart_and_generation_change(const std::string& ba
         JobRegistry registry(isolated(path));
         check(registry.storeHealth().migration_complete, "restart must reopen an initialized db");
 
-        const auto record = registry.inventoryRecord(internal_id);
-        check(record.has_value(), "restart must restore the inventory record");
+        const auto record = registry.jobRecord(internal_id);
+        check(record.has_value(), "restart must restore the job record");
         check(format_internal_id(record->job.JobID) == instance_id,
               "restart must keep the same instance handle (the internal id)");
 
@@ -780,7 +780,7 @@ void durable_intent_survives_restart_and_generation_change(const std::string& ba
 
         check(registry.retireInstance(internal_id),
               "retiring the old generation must be accepted");
-        check(!registry.inventoryRecord(internal_id).has_value(),
+        check(!registry.jobRecord(internal_id).has_value(),
               "retirement without a runtime archives the record immediately");
 
         const auto replacement = registry.upsertObservedJob(
@@ -1375,7 +1375,7 @@ void ambiguous_intent_write_survives_the_shutdown_checkpoint(const std::string& 
     }
     {
         JobRegistry reopened(isolated(path));
-        const auto record = reopened.inventoryRecord(id);
+        const auto record = reopened.jobRecord(id);
         check(record.has_value(),
               "the durable write that landed must survive the shutdown checkpoint");
         check(record->revision == revision + 1,
@@ -1422,7 +1422,7 @@ void closing_keeps_the_runtime_holders_until_the_archive(const std::string& base
           "retirement must be accepted and handed to the runtime");
     check(!has_active(registry, id), "a closing instance leaves the active map");
 
-    const auto closing = registry.inventoryRecord(id);
+    const auto closing = registry.jobRecord(id);
     check(closing.has_value() && closing->state == RecordState::Closing,
           "the record must stay closing until the drain acknowledges");
     check(registry.actualCollection(id).collectors ==
@@ -1430,7 +1430,7 @@ void closing_keeps_the_runtime_holders_until_the_archive(const std::string& base
           "entering closing must not clear the holders that are still attached");
 
     check(test_runtime(registry).completeDrain(id), "the drain ack must archive the record");
-    check(!registry.inventoryRecord(id).has_value(),
+    check(!registry.jobRecord(id).has_value(),
           "the archive removes the record together with its runtime holders");
 }
 

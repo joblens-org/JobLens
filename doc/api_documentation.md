@@ -108,7 +108,7 @@ Generic job operation (add or remove).
 | `JobPIDs` | array[int] | No | List of process PIDs |
 | `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "io_collector", "net_collector"]`) |
 | `sub_attr` | object | No | Sub-attributes: `condor` type needs `cluster_id`/`proc_id`, `slurm` type needs `job_id`/`step_id` |
-| `erase` | bool | No | For `remove` only. `false` or absent keeps the stop tier: collection stops, the inventory fact remains. `true` retires the instance: a collected instance is archived as an `h:` history row, a never-collected instance is deleted |
+| `erase` | bool | No | For `remove` only. `false` or absent keeps the stop tier: collection stops, the job record remains. `true` retires the instance: a collected instance is archived as an `h:` history row, a never-collected instance is deleted |
 
 **Example request:**
 ```json
@@ -549,15 +549,16 @@ Get hardware information including CPU model, memory size, disk info, etc.
 
 ---
 
-## 12. Job Inventory and Collection Control
+## 12. Job List and Collection Control
 
-These routes proxy the Core inventory/collection contract. Trigger validates and
+These routes proxy the Core job/collection contract. Trigger validates and
 forwards only: it never allocates or derives internal IDs, and a Core error is
 never turned into HTTP 200.
 
-### `GET /joblens/inventory`
+### `GET /joblens/jobs/list`
 
-Bounded, read-only inventory snapshot.
+Bounded, read-only job list snapshot. The old `/joblens/inventory` path is a
+deprecated alias served by the Trigger adapter and calls the same Core method.
 
 | Query | Type | Description |
 |---|---|---|
@@ -573,10 +574,10 @@ Bounded, read-only inventory snapshot.
   "status": "ok",
   "snapshot_revision": 1234567890,
   "records": [{
-    "instance_id": "ji1-...",
+    "instance_id": "42",
     "internal_job_id": "42",
     "schema_version": 2,
-    "facts_revision": 3,
+    "record_revision": 3,
     "state": "active",
     "source": "condor",
     "identity_complete": true,
@@ -597,12 +598,13 @@ A cursor is only valid while the snapshot is unchanged; otherwise the request
 fails with `409 cursor_invalidated`. Internal IDs are decimal strings so
 JavaScript consumers keep uint64 precision.
 
-### `GET /joblens/inventory/status`
+### `GET /joblens/jobs/status`
 
 Source, reconciliation, queue and persistence health (active/suspect/closing
 counts, scan timestamps, dropped events, store degradation, incomplete and
 quarantined identities, applied/drain state). Served verbatim from the Core;
-`200` even when the reported state is `degraded`.
+`200` even when the reported state is `degraded`. The old
+`/joblens/inventory/status` path is a deprecated alias.
 
 ### `POST /joblens/collection`
 
@@ -616,19 +618,18 @@ Set or reset collection intent for one exact target set.
   "scope": "instance",
   "ensure_registered": true,
   "operation": "set",
-  "collectors": ["cpumem_collector"],
-  "expected_revision": 0
+  "collectors": ["cpumem_collector"]
 }
 ```
 
 | Field | Required | Description |
 |---|---|---|
-| `selector` | Yes | Exactly one form: `instance_id`, or `scheduler_type` + `cluster_name` + `native_job_id` (+ optional `cluster_tag`, `step_id`) |
-| `scope` | No | `instance` (default) or `job`. `instance_id` only supports `instance`; Slurm `job` targets every currently observed local step |
+| `selector` | Yes | Exactly one form: `internal_job_id`, or `scheduler_type` + `cluster_name` + `native_job_id` (+ optional `cluster_tag`, `step_id`) |
+| `scope` | No | `instance` (default) or `job`. `internal_job_id` only supports `instance`; Slurm `job` targets every currently observed local step |
 | `ensure_registered` | No | Run one authoritative discovery pass before matching |
 | `operation` | Yes | `set` or `reset_auto` |
 | `collectors` | For `set` | Explicit list; `[]` is a persistent stop. Must be omitted for `reset_auto` |
-| `expected_revision` | No | Binding revision guard, single-instance requests only (`0` = no intent yet) |
+| `expected_revision` | No | Record-revision guard, single-instance requests only. Omit for no guard; a supplied value must equal the current `record_revision` (0 is not valid for an existing record) |
 
 **Response (200):**
 ```json
@@ -637,14 +638,14 @@ Set or reset collection intent for one exact target set.
   "operation": "set",
   "scope": "instance",
   "targets": [{
-    "instance_id": "ji1-...",
+    "instance_id": "42",
     "internal_job_id": "42",
     "native_job_id": "172.0",
-    "binding_revision": 1,
+    "record_revision": 1,
     "mode": "manual",
     "desired_collectors": ["cpumem_collector"],
     "applied_collectors": ["cpumem_collector"],
-    "applied_revision": 1,
+    "applied_attach_token": 1,
     "errors": [],
     "changed": true
   }]
@@ -655,17 +656,19 @@ Set or reset collection intent for one exact target set.
 when the Agent has no collection runtime or a collector refused the binding.
 `status: accepted` only means the intent is durable.
 
-### `GET /joblens/collection?instance_id=...`
+### `GET /joblens/collection?internal_job_id=...`
 
 Desired/applied selection, mode, revisions, policy revision and per-collector
-errors for one instance handle. `404` when the handle does not name a verified
-current instance, `409` when it names a closing generation.
+errors for one instance. `internal_job_id` is the decimal internal ID from the
+job list; `instance_id` remains accepted as a deprecated alias by the Trigger
+adapter. `404` when it does not name a verified current instance, `409` when it
+names a closing generation.
 
 ### `GET /joblens/capabilities`
 
-Advertises `inventory_version`, `collection_control_version`,
-`native_identity_selectors`, `job_scope` and the DB schema version. Trigger
-never declares a capability the Core did not report.
+Advertises `api_version`, `collection_control_version`,
+`native_identity_selectors`, `job_scope`, `ready` and the DB schema version.
+Trigger never declares a capability the Core did not report.
 
 **Status Codes:**
 - `200` - Success
@@ -673,7 +676,7 @@ never declares a capability the Core did not report.
 - `404` - No verified current instance
 - `409` - Ambiguous selector, stale `expected_revision`, closing generation, invalidated cursor
 - `502` - Core returned a response that violates the contract
-- `503` - Core RPC unavailable, store unavailable or inventory still migrating
+- `503` - Core RPC unavailable, store unavailable or registry still migrating
 
 ---
 
@@ -690,4 +693,4 @@ never declares a capability the Core did not report.
 | `409` | Conflict (ambiguous selector, stale revision, closing generation, invalidated cursor) |
 | `500` | Internal server error |
 | `502` | Core returned a response that violates the contract |
-| `503` | Service unavailable (RPC failure, store unavailable or inventory initializing) |
+| `503` | Service unavailable (RPC failure, store unavailable or registry initializing) |

@@ -11,7 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-/* Core half of the inventory/collection RPC contract.
+/* Core half of the job/collection RPC contract.
  *
  * Every assertion below drives the real RPCServer over a temporary AF_UNIX
  * socket; nothing calls the handlers directly.
@@ -21,14 +21,14 @@
  *     durable-unavailable mapping, accepted versus applied
  *   * legacy add resolves to the inventoried instance (JobID is only a hint),
  *     duplicate observation is not a failure, legacy remove stops collection
- *     and keeps the inventory
+ *     and keeps the job record
  *   * bounded paging, snapshot invalidation, sentinel exclusion,
  *     decimal-string ids, capabilities field names, truthful status
  */
 #include "core/job_registry.hpp"
 #include "job_fixture.h"
 #include "collection_runtime_fixture.hpp"
-#include "core/inventory_status_provider.hpp"
+#include "core/status_provider.hpp"
 #include "common/config.hpp"
 #include "common/local_rpc.hpp"
 
@@ -64,7 +64,7 @@ void check(bool condition, const std::string& message)
 // is derived from the record state so the assertion semantics stay unchanged.
 bool has_active(const JobRegistry& registry, uint64_t internal_id)
 {
-    const auto record = registry.inventoryRecord(internal_id);
+    const auto record = registry.jobRecord(internal_id);
     return record.has_value() && record->state != RecordState::Closing;
 }
 
@@ -265,14 +265,14 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     {
         auto selector = condor_selector_json("172.0", "schedd-a");
         selector["instance_id"] = "ji1-deadbeef";
-        const auto response = rpc("JobCollection/set",
+        const auto response = rpc("jobs/collection/set",
                                   collection_request(selector, "set", json::array()));
         check(response["status"] == "error" && response["code"] == "invalid_request",
               "the retired instance_id key must be invalid_request: " + response.dump());
     }
     {
         const auto response = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(json{{"instance_id", "ji1-deadbeef"}}, "set", json::array()));
         check(response["status"] == "error" && response["code"] == "invalid_request",
               "a lone retired instance_id selector must be invalid_request: " +
@@ -281,7 +281,7 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     // --- incomplete namespace -----------------------------------------
     {
         json selector{{"scheduler_type", "condor"}, {"native_job_id", "172.0"}};
-        const auto response = rpc("JobCollection/set",
+        const auto response = rpc("jobs/collection/set",
                                   collection_request(selector, "set", json::array()));
         check(response["code"] == "invalid_request",
               "missing cluster namespace must be invalid_request: " + response.dump());
@@ -289,7 +289,7 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     // --- unknown scheduler type ---------------------------------------
     {
         json selector{{"scheduler_type", "pbs"}, {"cluster_name", "c"}, {"native_job_id", "1"}};
-        const auto response = rpc("JobCollection/set",
+        const auto response = rpc("jobs/collection/set",
                                   collection_request(selector, "set", json::array()));
         check(response["code"] == "invalid_request",
               "unknown scheduler_type must be invalid_request: " + response.dump());
@@ -298,14 +298,14 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     {
         auto selector = condor_selector_json("172.0", "");
         selector["cluster_name"] = "htcondor01@schedd-a";
-        const auto response = rpc("JobCollection/set",
+        const auto response = rpc("jobs/collection/set",
                                   collection_request(selector, "set", json::array()));
         check(response.value("code", "") == "not_found",
               "a canonical delimiter alias must not target another pool: " + response.dump());
     }
     {
         const auto response = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(condor_selector_json("172.0", "schedd-a"), "set",
                                json::array({"cpumem_collector"})));
         check(response["status"] == "accepted", "condor set must be accepted: " + response.dump());
@@ -322,7 +322,7 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     // --- schedd-ambiguity without cluster_tag -------------------------
     {
         const auto response = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(condor_selector_json("172.0", ""), "set", json::array()));
         check(response["code"] == "ambiguous_selector",
               "condor selector without schedd tag must be ambiguous: " + response.dump());
@@ -334,14 +334,14 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     }
     // --- unknown target is not_found, with and without ensure_registered
     {
-        const auto plain = rpc("JobCollection/set",
+        const auto plain = rpc("jobs/collection/set",
                                collection_request(condor_selector_json("999.0", "schedd-a"),
                                                   "set", json::array()));
         check(plain["code"] == "not_found",
               "unknown native target must be not_found: " + plain.dump());
 
         const auto ensured = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(condor_selector_json("999.0", "schedd-a"), "set",
                                json::array(), "instance", std::nullopt, true));
         check(ensured["code"] == "not_found",
@@ -349,13 +349,13 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
         check(ensured["message"].get<std::string>().find("ensure_registered") !=
                   std::string::npos,
               "ensure_registered boundary must be explicit in the message: " + ensured.dump());
-        check(registry.inventoryRecords().size() == size_t{8},
-              "a failed resolution must not invent inventory records");
+        check(registry.jobRecords().size() == size_t{8},
+              "a failed resolution must not invent job records");
     }
     // --- ensure_registered performs a verified discovery pass ---------
     {
         std::atomic<int> refreshes{0};
-        set_inventory_refresh_provider([&registry, &refreshes]() {
+        set_refresh_provider([&registry, &refreshes]() {
             ++refreshes;
             // A real source pass would create the instance; the resolver still
             // has to find it by canonical identity afterwards.
@@ -364,11 +364,11 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
             return true;
         });
         const auto ensured = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(condor_selector_json("950.0", "schedd-a"), "set",
                                json::array({"cpumem_collector"}), "instance", std::nullopt,
                                true));
-        set_inventory_refresh_provider({});
+        set_refresh_provider({});
         check(refreshes.load() == 1,
               "ensure_registered must run exactly one authoritative pass");
         check(ensured["status"] == "accepted",
@@ -379,7 +379,7 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     // --- Slurm instance scope without a step is ambiguous -------------
     {
         const auto response = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(slurm_selector_json("9001", ""), "set", json::array()));
         check(response["code"] == "ambiguous_selector",
               "slurm instance scope without step must be ambiguous: " + response.dump());
@@ -391,7 +391,7 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     // --- exact step selector resolves one step ------------------------
     {
         const auto response = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(slurm_selector_json("9001", "2"), "set",
                                json::array({"cpumem_collector"})));
         check(target_ids(response) == std::vector<uint64_t>({ids.slurm_step2}),
@@ -400,7 +400,7 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     // --- job scope lists the exact current targets --------------------
     {
         const auto response = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(slurm_selector_json("9001", ""), "set",
                                json::array({"cpumem_collector"}), "job"));
         check(response["status"] == "accepted", "job scope must be accepted: " + response.dump());
@@ -413,20 +413,20 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
         const auto late = seed(registry,
                                slurm_observation(slurm_selector("9001", "3"), 5353), "slurm step 3");
         const auto refreshed = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(slurm_selector_json("9001", ""), "set",
                                json::array({"cpumem_collector"}), "job"));
         auto expected = std::vector<uint64_t>({ids.slurm_step1, ids.slurm_step2, late});
         std::sort(expected.begin(), expected.end());
         check(target_ids(refreshed) == expected,
               "job scope must resolve the refreshed exact target set: " + refreshed.dump());
-        check(registry.inventoryRecord(late).has_value(),
-              "the later step must exist in the inventory");
+        check(registry.jobRecord(late).has_value(),
+              "the later step must exist in the registry");
     }
     // --- instance handle selector -------------------------------------
     {
         const auto response = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(json{{"internal_job_id", format_internal_id(ids.condor_a)}}, "set",
                                json::array({"cpumem_collector"})));
         check(target_ids(response) == std::vector<uint64_t>({ids.condor_a}),
@@ -434,7 +434,7 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     }
     // --- instance handle only supports instance scope ------------------
     {
-        const auto response = rpc("JobCollection/set",
+        const auto response = rpc("jobs/collection/set",
                                   collection_request(
                                       json{{"internal_job_id", format_internal_id(ids.condor_a)}},
                                       "set", json::array(), "job"));
@@ -444,7 +444,7 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
     // --- unknown instance handle --------------------------------------
     {
         const auto response = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(json{{"internal_job_id", "999999999"}}, "set", json::array()));
         check(response["code"] == "not_found",
               "unknown instance handle must be not_found: " + response.dump());
@@ -457,16 +457,16 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
 
     // --- missing / null collectors ------------------------------------
     {
-        const auto missing = rpc("JobCollection/set", collection_request(selector, "set"));
+        const auto missing = rpc("jobs/collection/set", collection_request(selector, "set"));
         check(missing["code"] == "invalid_request",
               "set without collectors must be invalid_request: " + missing.dump());
         auto body = collection_request(selector, "set");
         body["collectors"] = nullptr;
-        const auto nulled = rpc("JobCollection/set", body);
+        const auto nulled = rpc("jobs/collection/set", body);
         check(nulled["code"] == "invalid_request",
               "set with null collectors must be invalid_request: " + nulled.dump());
         check(record_revision(registry, ids.condor_b) == 0 ||
-                  registry.inventoryRecord(ids.condor_b).has_value(),
+                  registry.jobRecord(ids.condor_b).has_value(),
               "an invalid request must not create a new record");
         check(!registry.selectionRecord(ids.condor_b).manual.has_value(),
               "an invalid request must not create a manual selection");
@@ -474,7 +474,7 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
     // --- unknown collector name ---------------------------------------
     {
         const auto response = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(selector, "set", json::array({"not_a_collector"})));
         check(response["code"] == "unknown_collector",
               "unknown collector must be unknown_collector: " + response.dump());
@@ -484,7 +484,7 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
     // --- accepted set and identical repeat ----------------------------
     {
         const auto accepted = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(selector, "set", json::array({"cpumem_collector"})));
         check(accepted["status"] == "accepted", "valid set must be accepted: " + accepted.dump());
         const auto& target = accepted["targets"].front();
@@ -507,7 +507,7 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
               "unapplied intent must report not_converged: " + target.dump());
 
         const auto repeated = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(selector, "set", json::array({"cpumem_collector"})));
         check(repeated["targets"].front()["record_revision"] ==
                   target["record_revision"],
@@ -518,7 +518,7 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
     // --- stale expected_revision --------------------------------------
     {
         const auto stale = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(selector, "set", json::array({"cpumem_collector"}), "instance", 99));
         check(stale["code"] == "stale_revision",
               "stale expected_revision must be stale_revision: " + stale.dump());
@@ -526,7 +526,7 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
         const auto current_revision = record_revision(registry, ids.condor_b);
         check(current_revision != 0, "the current record revision must be known");
         const auto current = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(selector, "set", json::array({"cpumem_collector"}),
                                "instance", current_revision));
         check(current["status"] == "accepted",
@@ -535,7 +535,7 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
     // --- expected_revision is single-instance only --------------------
     {
         const auto response = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(slurm_selector_json("9001", ""), "set",
                                json::array({"cpumem_collector"}), "job", 1));
         check(response["code"] == "invalid_request",
@@ -544,12 +544,12 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
     // --- reset_auto ---------------------------------------------------
     {
         const auto with_collectors = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(selector, "reset_auto", json::array({"cpumem_collector"})));
         check(with_collectors["code"] == "invalid_request",
               "reset_auto with collectors must be invalid_request: " + with_collectors.dump());
 
-        const auto reset = rpc("JobCollection/set", collection_request(selector, "reset_auto"));
+        const auto reset = rpc("jobs/collection/set", collection_request(selector, "reset_auto"));
         check(reset["status"] == "accepted", "reset_auto must be accepted: " + reset.dump());
         check(reset["targets"].front()["mode"] == "auto",
               "reset_auto must return to auto mode: " + reset.dump());
@@ -558,13 +558,13 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
     }
     // --- unknown operation --------------------------------------------
     {
-        const auto response = rpc("JobCollection/set", collection_request(selector, "delete"));
+        const auto response = rpc("jobs/collection/set", collection_request(selector, "delete"));
         check(response["code"] == "invalid_request",
               "unknown operation must be invalid_request: " + response.dump());
     }
     // --- persistent stop (explicit []) --------------------------------
     {
-        const auto stop = rpc("JobCollection/set",
+        const auto stop = rpc("jobs/collection/set",
                               collection_request(selector, "set", json::array()));
         check(stop["status"] == "accepted", "explicit [] must be accepted: " + stop.dump());
         check(stop["targets"].front()["desired_collectors"].empty(),
@@ -576,7 +576,7 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
         check(record_revision(registry, ids.condor_b) ==
                   stop["targets"].front()["record_revision"],
               "the reported revision must be the persisted revision");
-        const auto status = rpc("JobCollection/get",
+        const auto status = rpc("jobs/collection/get",
                                 json{{"internal_job_id", format_internal_id(ids.condor_b)}});
         check(status["status"] == "ok" && status["desired_collectors"].empty(),
               "collection get must report the stopped selection: " + status.dump());
@@ -588,7 +588,7 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
     {
         registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite);
         const auto response = rpc(
-            "JobCollection/set",
+            "jobs/collection/set",
             collection_request(json{{"internal_job_id", format_internal_id(ids.condor_b)}}, "set",
                                json::array({"cpumem_collector"})));
         registry.clearStoreFaultsForTest();
@@ -600,11 +600,11 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
     }
     // --- get on an unknown instance ----------------------------------
     {
-        const auto response = rpc("JobCollection/get",
+        const auto response = rpc("jobs/collection/get",
                                   json{{"internal_job_id", "999999999"}});
         check(response["code"] == "not_found",
               "collection get on an unknown instance must be not_found: " + response.dump());
-        const auto missing = rpc("JobCollection/get", json::object());
+        const auto missing = rpc("jobs/collection/get", json::object());
         check(missing["code"] == "invalid_request",
               "collection get without internal_job_id must be invalid_request: " +
                   missing.dump());
@@ -613,7 +613,7 @@ void run_intent_cases(JobRegistry& registry, const Fixture& ids)
 
 void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
 {
-    const auto before = registry.inventoryRecords().size();
+    const auto before = registry.jobRecords().size();
     const auto hint = std::to_string(ids.condor_legacy + 5000);
 
     json add{{"opt", "add"},
@@ -646,8 +646,8 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
               "legacy add must report the resolved instance as a decimal string");
         check(response["ignored_job_id_hint"] == hint,
               "the mismatch between hint and identity must be observable");
-        check(registry.inventoryRecords().size() == before,
-              "legacy add must not create another inventory record");
+        check(registry.jobRecords().size() == before,
+              "legacy add must not create another job record");
 
         const auto binding = registry.selectionRecord(ids.condor_legacy);
         check(binding.mode() == CollectionMode::Manual &&
@@ -683,18 +683,18 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
         check(candidates(ambiguous).size() == size_t{2},
               "an ambiguous legacy add must list both candidates: " + ambiguous.dump());
     }
-    // --- legacy remove stops collection and keeps the inventory -----
+    // --- legacy remove stops collection and keeps the job record -----
     {
         const auto response = rpc("JobRegistry/job_opt",
                                   json{{"opt", "remove"}, {"type", "job.condor"},
                                        {"JobID", ids.condor_legacy}});
         check(response["status"] == "success", "legacy remove must succeed: " + response.dump());
         check(response["stopped_count"] == 1, "legacy remove must stop collection");
-        check(response["deleted_count"] == 0, "legacy remove must not archive inventory");
+        check(response["deleted_count"] == 0, "legacy remove must not archive the job record");
         check(response["deprecated"] == true, "legacy remove must be observable as deprecated");
 
-        check(registry.inventoryRecord(ids.condor_legacy).has_value(),
-              "legacy remove must retain the inventory record");
+        check(registry.jobRecord(ids.condor_legacy).has_value(),
+              "legacy remove must retain the job record");
         check(registry.findJob(ids.condor_legacy).has_value(),
               "legacy remove must keep the live execution readable");
         const auto binding = registry.selectionRecord(ids.condor_legacy);
@@ -702,16 +702,16 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
                   binding.manual->empty(),
               "legacy remove must persist a manual empty selection");
 
-        const auto status = rpc("JobCollection/get",
+        const auto status = rpc("jobs/collection/get",
                                 json{{"internal_job_id", format_internal_id(ids.condor_legacy)}});
         check(status["desired_collectors"].empty(),
               "collection get must report the stopped selection after remove: " + status.dump());
-        const auto listed = rpc("JobRegistry/inventory_list", json{{"scheduler_type", "condor"}});
+        const auto listed = rpc("jobs/list", json{{"scheduler_type", "condor"}});
         bool found = false;
         for (const auto& record : listed["records"]) {
             if (record["internal_job_id"] == std::to_string(ids.condor_legacy)) found = true;
         }
-        check(found, "the removed instance must still be listed in the inventory");
+        check(found, "the removed instance must still be listed in the registry");
     }
     // --- internal-id lookup route stays untouched --------------------
     {
@@ -721,14 +721,14 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
     }
 }
 
-void run_inventory_cases(JobRegistry& registry, const Fixture& ids)
+void run_job_record_cases(JobRegistry& registry, const Fixture& ids)
 {
     // --- bounded paging, sentinel exclusion, decimal-string ids -------
     {
-        const auto all = rpc("JobRegistry/inventory_list", json::object());
-        check(all["status"] == "ok", "inventory list must succeed: " + all.dump());
+        const auto all = rpc("jobs/list", json::object());
+        check(all["status"] == "ok", "job list must succeed: " + all.dump());
         const auto total = all["records"].size();
-        check(total >= size_t{8}, "inventory list must include the seeded instances");
+        check(total >= size_t{8}, "job list must include the seeded instances");
         check(all["next_cursor"].is_null(), "a single page must not advertise a cursor");
         check(all["snapshot_revision"].is_number_unsigned() ||
                   all["snapshot_revision"].is_number_integer(),
@@ -747,7 +747,7 @@ void run_inventory_cases(JobRegistry& registry, const Fixture& ids)
         do {
             json params{{"limit", 2}};
             if (!cursor.empty()) params["cursor"] = cursor;
-            const auto page = rpc("JobRegistry/inventory_list", params);
+            const auto page = rpc("jobs/list", params);
             check(page["status"] == "ok", "paged list failed: " + page.dump());
             check(page["records"].size() <= size_t{2}, "limit must bound the page");
             check(page["snapshot_revision"] == all["snapshot_revision"],
@@ -764,59 +764,59 @@ void run_inventory_cases(JobRegistry& registry, const Fixture& ids)
     }
     // --- limit bounds ------------------------------------------------
     {
-        const auto zero = rpc("JobRegistry/inventory_list", json{{"limit", 0}});
+        const auto zero = rpc("jobs/list", json{{"limit", 0}});
         check(zero["code"] == "invalid_request", "limit 0 must be invalid_request: " + zero.dump());
-        const auto too_big = rpc("JobRegistry/inventory_list", json{{"limit", 1001}});
+        const auto too_big = rpc("jobs/list", json{{"limit", 1001}});
         check(too_big["code"] == "invalid_request",
               "limit above 1000 must be invalid_request: " + too_big.dump());
-        const auto max = rpc("JobRegistry/inventory_list", json{{"limit", 1000}});
+        const auto max = rpc("jobs/list", json{{"limit", 1000}});
         check(max["status"] == "ok", "limit 1000 must be accepted: " + max.dump());
-        const auto negative = rpc("JobRegistry/inventory_list", json{{"limit", -3}});
+        const auto negative = rpc("jobs/list", json{{"limit", -3}});
         check(negative["code"] == "invalid_request",
               "a negative limit must be invalid_request: " + negative.dump());
     }
     // --- filters -----------------------------------------------------
     {
-        const auto slurm = rpc("JobRegistry/inventory_list", json{{"scheduler_type", "slurm"}});
+        const auto slurm = rpc("jobs/list", json{{"scheduler_type", "slurm"}});
         check(slurm["status"] == "ok", "scheduler_type filter must work");
         for (const auto& record : slurm["records"]) {
             check(record["scheduler_type"] == "slurm",
                   "scheduler_type filter must not leak other schedulers: " + record.dump());
         }
-        const auto native = rpc("JobRegistry/inventory_list", json{{"native_job_id", "9001"}});
+        const auto native = rpc("jobs/list", json{{"native_job_id", "9001"}});
         check(native["records"].size() == size_t{3},
               "native_job_id filter must match every current step: " + native.dump());
-        const auto state = rpc("JobRegistry/inventory_list", json{{"state", "active"}});
+        const auto state = rpc("jobs/list", json{{"state", "active"}});
         check(state["status"] == "ok", "state filter must work");
-        const auto bogus = rpc("JobRegistry/inventory_list", json{{"state", "gone"}});
+        const auto bogus = rpc("jobs/list", json{{"state", "gone"}});
         check(bogus["code"] == "invalid_request",
               "an unknown state must be invalid_request: " + bogus.dump());
-        const auto bad_type = rpc("JobRegistry/inventory_list", json{{"scheduler_type", "pbs"}});
+        const auto bad_type = rpc("jobs/list", json{{"scheduler_type", "pbs"}});
         check(bad_type["code"] == "invalid_request",
               "an unknown scheduler_type must be invalid_request: " + bad_type.dump());
     }
     // --- changed snapshot invalidates the cursor ---------------------
     {
-        const auto first = rpc("JobRegistry/inventory_list", json{{"limit", 1}});
+        const auto first = rpc("jobs/list", json{{"limit", 1}});
         check(!first["next_cursor"].is_null(), "a truncated page must advertise a cursor");
         const auto cursor = first["next_cursor"].get<std::string>();
 
         seed(registry, condor_observation(condor_selector("191.0", "schedd-a"), 6464),
              "condor 191.0");
 
-        const auto stale = rpc("JobRegistry/inventory_list",
+        const auto stale = rpc("jobs/list",
                                json{{"limit", 1}, {"cursor", cursor}});
         check(stale["status"] == "error" && stale["code"] == "cursor_invalidated",
               "a changed snapshot must invalidate the cursor: " + stale.dump());
 
-        const auto garbage = rpc("JobRegistry/inventory_list", json{{"cursor", "not-a-token"}});
+        const auto garbage = rpc("jobs/list", json{{"cursor", "not-a-token"}});
         check(garbage["code"] == "invalid_request",
               "an unparsable cursor must be invalid_request: " + garbage.dump());
     }
     // --- capabilities ------------------------------------------------
     {
-        const auto response = rpc("JobRegistry/capabilities");
-        check(response["inventory_version"] == 1, "inventory_version must be 1");
+        const auto response = rpc("joblens/capabilities");
+        check(response["api_version"] == 2, "api_version must be 2");
         check(response["collection_control_version"] == 1,
               "collection_control_version must be 1");
         check(response["native_identity_selectors"] == true,
@@ -825,13 +825,13 @@ void run_inventory_cases(JobRegistry& registry, const Fixture& ids)
               "job_scope must document the snapshot semantics");
         check(response["db_schema_version"] == 5,
               "db_schema_version must be the contract field name (schema 5)");
-        check(response["inventory_ready"] == true, "a migrated store must be ready");
+        check(response["ready"] == true, "a migrated store must be ready");
     }
     // --- status without a maintenance provider ----------------------
     {
-        const auto response = rpc("JobRegistry/inventory_status");
+        const auto response = rpc("joblens/status");
         check(response["status"] == "healthy", "a migrated store must report healthy");
-        check(response["inventory_enabled"] == true, "inventory must be enabled");
+        check(response["enabled"] == true, "the job registry must be enabled");
         check(response["sources"]["state"] == "not_configured",
               "without a provider the sources state must be not_configured: " + response.dump());
         check(response["db_schema_version"] == 5, "status must expose db_schema_version");
@@ -845,14 +845,14 @@ void run_inventory_cases(JobRegistry& registry, const Fixture& ids)
     }
     // --- the maintenance provider is merged, store facts win ----------
     {
-        set_inventory_status_provider([] {
+        set_status_provider([] {
             return json{{"status", "degraded"},
                         {"sources", json::array({{{"scheduler_type", "slurm"},
                                                   {"state", "degraded"}}})},
                         {"queue", json{{"pending", 4}}},
                         {"store", json{{"migration_complete", false}, {"running", false}}}};
         });
-        const auto merged = rpc("JobRegistry/inventory_status");
+        const auto merged = rpc("joblens/status");
         check(merged["status"] == "degraded",
               "a degraded maintenance provider must not be masked: " + merged.dump());
         check(merged["sources"].is_array() && merged["sources"].size() == 1,
@@ -863,8 +863,8 @@ void run_inventory_cases(JobRegistry& registry, const Fixture& ids)
               "store facts must not be overridden by the provider payload: " + merged.dump());
         check(merged["db_schema_version"] == 5,
               "db_schema_version must come from store metadata");
-        set_inventory_status_provider({});
-        const auto cleared = rpc("JobRegistry/inventory_status");
+        set_status_provider({});
+        const auto cleared = rpc("joblens/status");
         check(cleared["status"] == "healthy" && cleared["sources"]["state"] == "not_configured",
               "clearing the provider must restore the explicit not_configured state: " +
                   cleared.dump());
@@ -880,7 +880,7 @@ void run_closing_case(JobRegistry& registry, const Fixture& ids)
     check(registry.closingJobCount() == size_t{1}, "the instance must be closing, not archived");
 
     const auto response = rpc(
-        "JobCollection/set",
+        "jobs/collection/set",
         collection_request(json{{"internal_job_id", format_internal_id(ids.condor_extra)}}, "set",
                            json::array({"cpumem_collector"})));
     check(response["code"] == "generation_closing",
@@ -941,9 +941,9 @@ void run_erase_cases(JobRegistry& registry, const Fixture& ids, const std::strin
               "default remove must keep succeeding: " + response.dump());
         check(response["mode"] == "stop",
               "default remove must identify itself as the stop tier");
-        check(response["inventory_retained"] == true,
-              "default remove must keep the inventory");
-        check(registry.inventoryRecord(ids.condor_b).has_value(),
+        check(response["record_retained"] == true,
+              "default remove must keep the job record");
+        check(registry.jobRecord(ids.condor_b).has_value(),
               "default remove must keep the record");
     }
 
@@ -960,12 +960,12 @@ void run_erase_cases(JobRegistry& registry, const Fixture& ids, const std::strin
         check(response["mode"] == "erase",
               "erase must identify itself as the erase tier: " + response.dump());
         check(response["deleted_count"] == 1, "erase must count the retirement");
-        check(response["inventory_retained"] == false,
-              "erase must not claim inventory retention");
+        check(response["record_retained"] == false,
+              "erase must not claim job-record retention");
         // The runtime owns the drain; reconcile drives it to completion, and
         // the never-collected fact turns the archive into a durable delete.
         test_runtime(registry).reconcile(ids.condor_a_other);
-        check(!registry.inventoryRecord(ids.condor_a_other).has_value(),
+        check(!registry.jobRecord(ids.condor_a_other).has_value(),
               "erase must remove the instance from the active map");
     }
 
@@ -992,7 +992,7 @@ void run_erase_cases(JobRegistry& registry, const Fixture& ids, const std::strin
         // The drain converges through the test runtime (auto-drain), which
         // archives the closing record.
         test_runtime(registry).reconcile(ids.slurm_batch);
-        check(!registry.inventoryRecord(ids.slurm_batch).has_value(),
+        check(!registry.jobRecord(ids.slurm_batch).has_value(),
               "the collected instance must leave the active map after the drain");
     }
 
@@ -1096,7 +1096,7 @@ int main(int argc, char** argv)
 
         JobRegistryOptions options;
         options.db_path = base + "/job.db";
-        options.test_static_inventory = true;
+        options.test_static_registry = true;
         options.enable_pid_tracker = false;
         options.register_rpc = true;
         JobRegistry registry(options);
@@ -1132,7 +1132,7 @@ int main(int argc, char** argv)
         run_selector_cases(registry, ids);
         run_intent_cases(registry, ids);
         run_legacy_cases(registry, ids);
-        run_inventory_cases(registry, ids);
+        run_job_record_cases(registry, ids);
         run_closing_case(registry, ids);
         run_erase_cases(registry, ids, base + "/job.db");
         slow_client_does_not_block_stop(base);
@@ -1142,7 +1142,7 @@ int main(int argc, char** argv)
                      "collector, stale revision, durable-unavailable mapping and "
                      "accepted-versus-applied; legacy add identity resolution with "
                      "a JobID hint, duplicate observation, remove-as-stop with retained "
-                     "inventory; bounded paging, cursor invalidation, sentinel "
+                     "job records; bounded paging, cursor invalidation, sentinel "
                      "exclusion, decimal-string ids, capabilities and status"
                   << std::endl;
         return 0;

@@ -11,12 +11,12 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-/* Deterministic inventory-store acceptance.
+/* Deterministic job-store acceptance.
  *
  *   * One complete upsert with zero bindings, repeat and fact update: one
  *     entry, stable ID/instance handle, revision advances only on real fact
  *     change, nothing activated.
- *   * Legacy restore with non-empty CollectorNames: inventory appears
+ *   * Legacy restore with non-empty CollectorNames: job record appears
  *     without any lifecycle subscriber, identity index built, selection
  *     migrated to a manual binding.
  *   * Interrupted migration resumes idempotently with preserved IDs;
@@ -75,18 +75,18 @@ JobRegistryOptions isolated(const std::string& path)
 {
     JobRegistryOptions options;
     options.db_path = path;
-    options.test_static_inventory = true;
+    options.test_static_registry = true;
     options.enable_pid_tracker = false;
     options.register_rpc = false;
     return options;
 }
 
-// hasInstance()/inventoryRecordByIdentity() were removed as production-dead
+// hasInstance()/jobRecordByIdentity() were removed as production-dead
 // registry APIs; the assertions derive the same facts from the public record
 // snapshot so their semantics stay unchanged.
 bool has_active(const JobRegistry& registry, uint64_t internal_id)
 {
-    const auto record = registry.inventoryRecord(internal_id);
+    const auto record = registry.jobRecord(internal_id);
     return record.has_value() && record->state != RecordState::Closing;
 }
 
@@ -94,7 +94,7 @@ std::optional<JobRecord> record_by_identity(const JobRegistry& registry,
                                             const SchedulerKey& key)
 {
     const std::string index_key = key.index_key();
-    for (const auto& record : registry.inventoryRecords()) {
+    for (const auto& record : registry.jobRecords()) {
         if (!record.index_key.empty() && record.index_key == index_key) return record;
     }
     return std::nullopt;
@@ -246,7 +246,7 @@ void stable_metadata_is_a_creation_snapshot(const std::string& base)
         initial.execution.read_order = 10;
         const auto created = registry.upsertObservedJob(initial);
         check(created.ok, "the immutable metadata fixture must register");
-        const auto original = registry.inventoryRecord(created.internal_id);
+        const auto original = registry.jobRecord(created.internal_id);
         check(original.has_value(), "the created snapshot must be readable");
         const auto metadata = metadata_of(original->job);
         const auto writes_before = registry.storeHealth().durable_commits;
@@ -279,7 +279,7 @@ void stable_metadata_is_a_creation_snapshot(const std::string& base)
         check(repeated.ok && repeated.disposition == UpsertDisposition::Unchanged &&
                   repeated.revision == created.revision,
               "metadata-only observations must not update the creation snapshot or revision");
-        const auto kept = registry.inventoryRecord(created.internal_id);
+        const auto kept = registry.jobRecord(created.internal_id);
         check(kept && metadata_of(kept->job) == metadata &&
                   kept->job.execution.read_order == 11 &&
                   kept->index_key == original->index_key &&
@@ -292,7 +292,7 @@ void stable_metadata_is_a_creation_snapshot(const std::string& base)
         check(refreshed.ok && refreshed.disposition == UpsertDisposition::Updated &&
                   refreshed.revision == created.revision + 1,
               "member evidence must still advance the existing record exactly once");
-        const auto updated = registry.inventoryRecord(created.internal_id);
+        const auto updated = registry.jobRecord(created.internal_id);
         check(updated && metadata_of(updated->job) == metadata &&
                   updated->job.execution.members ==
                       std::vector<ProcessIdentity>{{4242, 900000, "boot-aaa"},
@@ -303,11 +303,11 @@ void stable_metadata_is_a_creation_snapshot(const std::string& base)
         incoming.execution.members.clear();
         const auto stale = registry.upsertObservedJob(incoming);
         check(stale.ok && stale.disposition == UpsertDisposition::Unchanged &&
-                  registry.inventoryRecord(created.internal_id)->job.execution.members.size() == 2,
+                  registry.jobRecord(created.internal_id)->job.execution.members.size() == 2,
               "an older read must not clear the refreshed member evidence");
         check(registry.deinit(), "the frozen snapshot must checkpoint");
         JobRegistry reopened(isolated(path));
-        const auto restored = reopened.inventoryRecord(created.internal_id);
+        const auto restored = reopened.jobRecord(created.internal_id);
         check(restored && metadata_of(restored->job) == metadata &&
                   restored->revision == refreshed.revision,
               "the creation metadata and evidence revision must survive restart");
@@ -335,7 +335,7 @@ void host_refresh_preserves_creation_metadata(const std::string& base)
     set_pids(manual, {getpid()});
     manual.CollectorNames = {"cpumem_collector"};
     check(registry.addJob(manual), "the manual-only refresh fixture must register");
-    const auto initial = registry.inventoryRecords().front();
+    const auto initial = registry.jobRecords().front();
     // Create a real member only after the initial snapshot. The child uses
     // async-signal-safe I/O after fork and remains alive until the guard exits.
     int release[2];
@@ -362,8 +362,8 @@ void host_refresh_preserves_creation_metadata(const std::string& base)
             while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
         }
     } child{child_pid, release[1]};
-    check(registry.reconcileInventoryNow(), "the host member refresh pass must run");
-    const auto refreshed = registry.inventoryRecord(initial.job.JobID);
+    check(registry.reconcileNow(), "the host member refresh pass must run");
+    const auto refreshed = registry.jobRecord(initial.job.JobID);
     check(refreshed && refreshed->job.NativeJobID == "manual-without-native-id" &&
               std::get<CommonJobAttr>(refreshed->job.sub_attr).auto_update_child &&
               refreshed->index_key == initial.index_key,
@@ -385,14 +385,14 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
     check(created.ok, "complete observation must be accepted: " + created.error);
     check(created.disposition == UpsertDisposition::Created,
           "first observation must report created");
-    check(created.internal_id > 0, "created inventory must carry an internal id");
+    check(created.internal_id > 0, "created job record must carry an internal id");
     check(created.instance_id == format_internal_id(created.internal_id),
-          "created inventory must report the decimal-string instance handle");
+          "created job record must report the decimal-string instance handle");
     check(created.revision == 1, "first revision must be 1");
 
     {
-        const auto record = registry.inventoryRecord(created.internal_id);
-        check(record.has_value(), "inventory record must be readable");
+        const auto record = registry.jobRecord(created.internal_id);
+        check(record.has_value(), "job record must be readable");
         check(!record->index_key.empty(), "canonicalizable identity must be complete");
         check(record->index_key == canonicalize(selector_of(observation))->index_key(),
               "record must carry the canonical identity");
@@ -402,7 +402,7 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
 
     {
         const auto job = registry.findJob(created.internal_id);
-        check(job.has_value(), "registered inventory must be findable");
+        check(job.has_value(), "registered job record must be findable");
         check(job->CollectorNames.empty(),
               "an observation upsert must not activate collection");
         check(pids_of(*job).size() == 1 && pids_of(*job).front() == 4242,
@@ -411,7 +411,7 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
     {
         // ONE record revision: the observation created revision 1, but it must
         // not decide collection. No automatic and no manual decision exist.
-        const auto record = registry.inventoryRecord(created.internal_id);
+        const auto record = registry.jobRecord(created.internal_id);
         check(record.has_value() && record->revision == created.revision,
               "the observation commits the record revision it reports");
         check(!record->selection.automatic.has_value() &&
@@ -419,7 +419,7 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
                   record->selection.effectiveCollectors().empty(),
               "an observation must not create a collection decision");
     }
-    check(registry.inventoryRecords().size() == 1, "exactly one inventory entry");
+    check(registry.jobRecords().size() == 1, "exactly one job record");
 
     const auto repeat = registry.upsertObservedJob(observation);
     check(repeat.ok && repeat.disposition == UpsertDisposition::Unchanged,
@@ -428,7 +428,7 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
     check(repeat.instance_id == created.instance_id, "repeat must keep the instance handle");
     check(repeat.revision == created.revision,
           "unchanged facts must not advance the revision");
-    check(registry.inventoryRecords().size() == 1, "repeat must not duplicate the entry");
+    check(registry.jobRecords().size() == 1, "repeat must not duplicate the entry");
 
     auto updated_source = observation;
     auto& attr = std::get<CondorJobAttr>(updated_source.sub_attr);
@@ -447,7 +447,7 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
 
     {
         const auto job = registry.findJob(created.internal_id);
-        check(job.has_value(), "updated inventory must stay findable");
+        check(job.has_value(), "updated job record must stay findable");
         check(std::get<CondorJobAttr>(job->sub_attr).owner == "alice",
               "execution updates must retain the creation-time owner");
         check(pids_of(*job).size() == 2, "new processes must merge into facts");
@@ -467,7 +467,7 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
     check(rejected.error == "incomplete_identity",
           "incomplete identity must report a stable code, got " + rejected.error);
     check(rejected.internal_id == 0, "rejected observations must not allocate an id");
-    check(registry.inventoryRecords().size() == 1,
+    check(registry.jobRecords().size() == 1,
           "rejected observations must not create records");
 }
 // Schema 3 is a hard boundary. A store with data but no schema marker is an
@@ -496,8 +496,8 @@ void legacy_schema_is_rejected_without_migration(const std::string& base)
               "a rejected store must not advertise readiness");
         check(health.migration_state.rfind("unsupported_schema", 0) == 0,
               "rejection must name the unsupported schema, got " + health.migration_state);
-        check(registry.inventoryRecords().empty(),
-              "a rejected store must not publish partial inventory");
+        check(registry.jobRecords().empty(),
+              "a rejected store must not publish partial record set");
         check(record_revision(registry, active_id) == 0,
               "a rejected store must not synthesize a record");
         check(registry.getNextJobID() == 0,
@@ -537,8 +537,8 @@ void unsupported_schema_is_rejected_idempotently(const std::string& base)
         JobRegistry rejected(isolated(path));
         check(!rejected.storeHealth().db_running,
               "a populated old-schema store must be rejected");
-        check(rejected.inventoryRecords().empty(),
-              "rejection must not publish a partial inventory");
+        check(rejected.jobRecords().empty(),
+              "rejection must not publish a partial record set");
     }
     check(raw_keys_with_prefix(path, "j:").size() == ids.size(),
           "rejection must preserve every record");
@@ -547,8 +547,8 @@ void unsupported_schema_is_rejected_idempotently(const std::string& base)
         JobRegistry reopened(isolated(path));
         check(!reopened.storeHealth().db_running,
               "reopening must not switch rejection into migration");
-        check(reopened.inventoryRecords().empty(),
-              "a rejected store publishes no inventory on retry");
+        check(reopened.jobRecords().empty(),
+              "a rejected store publishes no records on retry");
     }
     check(raw_keys_with_prefix(path, "j:").size() == ids.size(),
           "repeated rejection must not delete rows");
@@ -575,7 +575,7 @@ void conflicting_live_execution_is_not_merged(const std::string& base)
     check(!conflict.ok && conflict.error == "execution_generation_conflict",
           "a different live generation must not merge into the old record");
 
-    check(registry.inventoryRecords().size() == 1,
+    check(registry.jobRecords().size() == 1,
           "a conflicting live execution must not create a second instance");
     const auto identity = canonicalize(condor_selector("172.0"));
     const auto indexed = record_by_identity(registry, *identity);
@@ -606,7 +606,7 @@ void stale_generation_is_not_replayed(const std::string& base)
 
     {
         JobRegistry registry(isolated(path));
-        const auto record = registry.inventoryRecord(internal_id);
+        const auto record = registry.jobRecord(internal_id);
         check(record.has_value(), "the record must still be restored");
         check(record->state == RecordState::Active,
               "a stale generation is not a lifecycle state: the record stays Open");
@@ -624,7 +624,7 @@ void stale_generation_is_not_replayed(const std::string& base)
         const auto recovered = registry.upsertObservedJob(same);
         check(recovered.ok && recovered.internal_id == internal_id,
               "the same generation must resolve to the restored record");
-        const auto active = registry.inventoryRecord(internal_id);
+        const auto active = registry.jobRecord(internal_id);
         check(active.has_value() && active->state == RecordState::Active,
               "a valid observation must reactivate a suspect record");
     }
@@ -707,8 +707,8 @@ void write_failures_reject_mutations_without_id_reuse(const std::string& base)
           "a failed archive must not report durable retirement");
     check(registry.findJob(retried.internal_id).has_value(),
           "a failed archive must leave the instance readable");
-    check(registry.inventoryRecord(retried.internal_id).has_value(),
-          "a failed archive must leave the inventory record intact");
+    check(registry.jobRecord(retried.internal_id).has_value(),
+          "a failed archive must leave the job record intact");
 
     check(registry.retireInstance(retried.internal_id),
           "retirement must succeed once the store recovers");
@@ -739,7 +739,7 @@ void closing_state_is_durable_and_not_resurrected(const std::string& base)
               "retirement with a subscriber must be accepted");
         check(!has_active(registry, internal_id),
               "a closing instance must leave the active map");
-        check(registry.inventoryRecord(internal_id).has_value(),
+        check(registry.jobRecord(internal_id).has_value(),
               "a closing instance stays visible until the archive");
         // The shutdown checkpoint is the first durable write deinit performs;
         // skip it so the injected failure lands on the archive (the failure
@@ -754,7 +754,7 @@ void closing_state_is_durable_and_not_resurrected(const std::string& base)
         // as closing, never as an active job, and observations of the same
         // identity must be refused instead of resurrecting the instance.
         JobRegistry registry(isolated(path));
-        const auto record = registry.inventoryRecord(internal_id);
+        const auto record = registry.jobRecord(internal_id);
         check(record.has_value(), "the closing record must be restored");
         check(record->state == RecordState::Closing,
               "the restored record must carry the durable closing state, got " +
@@ -770,7 +770,7 @@ void closing_state_is_durable_and_not_resurrected(const std::string& base)
 
         // The closing cleanup finishes the interrupted retirement.
         check(registry.cleanupClosingJobs(), "the closing cleanup must archive the record");
-        check(!registry.inventoryRecord(internal_id).has_value(),
+        check(!registry.jobRecord(internal_id).has_value(),
               "the archive must remove the closing record");
         const auto history = registry.upsertObservedJob(condor_observation("172.0"));
         check(history.ok && history.disposition == UpsertDisposition::Created,
@@ -796,7 +796,7 @@ void restored_suspect_instances_are_not_replayed(const std::string& base)
 
     {
         JobRegistry registry(isolated(path));
-        const auto restored = registry.inventoryRecord(internal_id);
+        const auto restored = registry.jobRecord(internal_id);
         check(restored.has_value() && restored->state == RecordState::Active &&
                   !restored->verified,
               "the stale generation must be restored Open and unverified");
@@ -946,7 +946,7 @@ void shutdown_flush_persists_runtime_changes(const std::string& base)
         // Fresh process on the same directory: no re-observation, no rescan —
         // the state comes back from the shutdown flush only.
         JobRegistry registry(isolated(path));
-        const auto record = registry.inventoryRecord(id);
+        const auto record = registry.jobRecord(id);
         check(record.has_value(), "the instance must survive the restart");
         check(record->job.NativeJobID == "810.0", "the facts must survive the restart");
         const auto binding = registry.selectionRecord(id);
@@ -976,11 +976,11 @@ void conflicting_fresh_candidates_are_rejected(const std::string& base)
     const auto conflict = registry.upsertObservedJob(second);
     check(!conflict.ok && conflict.code == RegistrationError::GenerationConflict,
           "a different manager triple for the same identity must conflict");
-    const auto stored = registry.inventoryRecord(created.internal_id);
+    const auto stored = registry.jobRecord(created.internal_id);
     check(stored.has_value(), "the first candidate must stay readable");
     check(stored->job.execution.manager.pid == 4242,
           "the conflicting candidate must not overwrite the stored generation");
-    check(registry.inventoryRecords().size() == 1, "only one instance may exist");
+    check(registry.jobRecords().size() == 1, "only one instance may exist");
 }
 
 // working set ---------------------------------------------------------
@@ -1012,7 +1012,7 @@ void repeated_observations_keep_memory_and_disk_in_sync(const std::string& base)
                   second.revision == created.revision,
               "metadata-only repeats must be accepted without changing the record revision");
 
-        const auto live = registry.inventoryRecord(id);
+        const auto live = registry.jobRecord(id);
         check(live.has_value(), "the instance must stay readable");
         published_owner = std::get<CondorJobAttr>(live->job.sub_attr).owner;
         published_revision = live->revision;
@@ -1026,7 +1026,7 @@ void repeated_observations_keep_memory_and_disk_in_sync(const std::string& base)
         // A restart reads the durable row: it must agree with what was
         // published before the shutdown instead of diverging from it.
         JobRegistry registry(isolated(path));
-        const auto reopened = registry.inventoryRecord(id);
+        const auto reopened = registry.jobRecord(id);
         check(reopened.has_value(), "the instance must survive the restart");
         const auto owner = std::get<CondorJobAttr>(reopened->job.sub_attr).owner;
         check(owner == published_owner,
@@ -1068,7 +1068,7 @@ void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string
           "a confirmed empty membership must be applied to facts");
     check(pids_of(*registry.findJob(created.internal_id)).empty(),
           "a confirmed empty membership must clear stale member pids");
-    const auto record = registry.inventoryRecord(created.internal_id);
+    const auto record = registry.jobRecord(created.internal_id);
     check(record.has_value() && record->job.execution.members.empty(),
           "the stored process evidence must follow the confirmed empty set");
 
@@ -1080,7 +1080,7 @@ void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string
     const auto with_members = registry.upsertObservedJob(member_facts);
     check(with_members.ok && with_members.disposition == UpsertDisposition::Created,
           "the member normalization fixture must register");
-    const auto normalized = registry.inventoryRecord(with_members.internal_id);
+    const auto normalized = registry.jobRecord(with_members.internal_id);
     check(normalized.has_value() && normalized->job.execution.members ==
               std::vector<ProcessIdentity>{{4343, 0, {}}, {4343, 910000, "boot-aaa"},
                                            {4444, 920000, "boot-aaa"}},
@@ -1097,7 +1097,7 @@ void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string
     check(rebound.ok && rebound.disposition == UpsertDisposition::Updated &&
               rebound.revision == with_members.revision + 1,
           "a changed start tick with the same PIDs must advance the revision");
-    const auto rebound_record = registry.inventoryRecord(with_members.internal_id);
+    const auto rebound_record = registry.jobRecord(with_members.internal_id);
     check(rebound_record.has_value() && rebound_record->job.execution.members ==
               std::vector<ProcessIdentity>{{4343, 0, {}}, {4343, 930000, "boot-aaa"},
                                            {4444, 920000, "boot-aaa"}},
@@ -1110,7 +1110,7 @@ void member_semantics_distinguish_unknown_from_confirmed_empty(const std::string
     check(replaced.ok && replaced.disposition == UpsertDisposition::Updated &&
               replaced.revision == rebound.revision + 1,
           "a nonempty partial member observation must replace the stored set");
-    const auto partial_record = registry.inventoryRecord(with_members.internal_id);
+    const auto partial_record = registry.jobRecord(with_members.internal_id);
     check(partial_record.has_value() && partial_record->job.execution.members ==
               std::vector<ProcessIdentity>{{4444, 0, {}}},
           "partial replacement must neither retain absent PIDs nor reuse old bindings");
@@ -1140,7 +1140,7 @@ void registration_keeps_single_upsert_semantics(const std::string& base)
           "each instance gets its own internal id");
     check(!incomplete_result.ok && incomplete_result.error == "incomplete_identity",
           "an incomplete identity stays rejected");
-    check(registry.inventoryRecords().size() == 2, "only the complete identities persist");
+    check(registry.jobRecords().size() == 2, "only the complete identities persist");
 
     // The same input again is a merge, not a duplicate: the ids are unchanged.
     const auto repeat_first = registry.upsertObservedJob(first);
@@ -1406,11 +1406,11 @@ void archived_instances_leave_no_active_row(const std::string& base)
         // Retirement is accepted as a durable Closing revision; the runtime's
         // own pass proves the boundary and the archive releases the identity.
         check(registry.retireInstance(id), "retirement must be accepted");
-        check(registry.inventoryRecord(id).has_value() &&
-                  registry.inventoryRecord(id)->state == RecordState::Closing,
+        check(registry.jobRecord(id).has_value() &&
+                  registry.jobRecord(id)->state == RecordState::Closing,
               "the accepted retirement must stay Closing until the runtime drains");
         test_runtime(registry).reconcile(id);
-        check(!registry.inventoryRecord(id).has_value(),
+        check(!registry.jobRecord(id).has_value(),
               "the archived instance must leave the active map");
         check(registry.deinit(), "shutdown must not fail after a clean archive");
     }
@@ -1454,7 +1454,7 @@ void ambiguous_registration_resolves_after_restart(const std::string& base)
               "an ambiguous create must not mint a second instance after a restart");
         check(again.internal_id == restored->job.JobID,
               "the identity must resolve to the same internal id");
-        check(registry.inventoryRecords().size() == 2,
+        check(registry.jobRecords().size() == 2,
               "exactly the two real instances may exist");
     }
 }
@@ -1497,10 +1497,10 @@ void sequential_merges_keep_single_upsert_semantics(const std::string& base)
     check(repeated.ok && repeated.internal_id == created.internal_id,
           "a repeated observation must resolve to the stored instance");
 
-    const auto stored = registry.inventoryRecord(created.internal_id);
+    const auto stored = registry.jobRecord(created.internal_id);
     check(stored.has_value() && stored->revision == 2,
           "the repeated observation must have merged into the created record");
-    check(registry.inventoryRecords().size() == 3,
+    check(registry.jobRecords().size() == 3,
           "exactly three instances may exist");
 }
 
@@ -1577,7 +1577,7 @@ void closing_write_failure_keeps_the_instance(const std::string& base)
 
     check(removed_events == 0,
           "a failed closing sync must not deliver Removed");
-    const auto record = registry.inventoryRecord(created.internal_id);
+    const auto record = registry.jobRecord(created.internal_id);
     check(record.has_value() && record->state == RecordState::Active,
           "a failed closing sync must leave the instance active");
     check(registry.findJob(created.internal_id).has_value(),
@@ -1618,8 +1618,8 @@ void schema_marker_must_be_canonical(const std::string& base)
                   "marker '" + marker + "' must not advertise readiness");
             check(!health.recovery_required,
                   "a rejected schema is a read-only rejection, not a pending recovery");
-            check(registry.inventoryRecords().empty(),
-                  "marker '" + marker + "' must not publish inventory");
+            check(registry.jobRecords().empty(),
+                  "marker '" + marker + "' must not publish records");
             check(record_revision(registry, 41) == 0,
                   "marker '" + marker + "' must not synthesize intent");
             check(registry.getNextJobID() == 0,
@@ -1653,7 +1653,7 @@ void ambiguous_closing_state_is_not_reverted(const std::string& base)
               "an ambiguous closing write must not report success");
         check(registry.storeHealth().recovery_required,
               "the ambiguous closing write must latch recovery");
-        const auto record = registry.inventoryRecord(id);
+        const auto record = registry.jobRecord(id);
         check(record.has_value() && record->state == RecordState::Active,
               "memory keeps the pre-failure state until recovery");
         check(!registry.deinit(),
@@ -1661,7 +1661,7 @@ void ambiguous_closing_state_is_not_reverted(const std::string& base)
     }
     {
         JobRegistry reopened(isolated(path));
-        const auto record = reopened.inventoryRecord(id);
+        const auto record = reopened.jobRecord(id);
         check(record.has_value() && record->state == RecordState::Closing,
               "the closing fact that landed must survive; the shutdown checkpoint "
               "must not rewrite the stale active row");
@@ -1671,7 +1671,7 @@ void ambiguous_closing_state_is_not_reverted(const std::string& base)
               "the restored closing reservation must reject a late observation");
         check(reopened.cleanupClosingJobs(),
               "the closing cleanup must finish the interrupted retirement");
-        check(!reopened.inventoryRecord(id).has_value(),
+        check(!reopened.jobRecord(id).has_value(),
               "the archive removes the closing record");
         const auto replacement = reopened.upsertObservedJob(condor_observation("172.0"));
         check(replacement.ok && replacement.internal_id != id,
@@ -1696,7 +1696,7 @@ void cleanup_failure_keeps_the_closing_reservation(const std::string& base)
             // The archive releases the identity index, so at cleanup time the
             // record must still be there; if it were already archived this
             // would be false.
-            record_visible_during_cleanup = registry.inventoryRecord(job_id).has_value();
+            record_visible_during_cleanup = registry.jobRecord(job_id).has_value();
             if (cleanup_calls == 1) {
                 error = "injected cleanup failure";
                 return false;
@@ -1714,7 +1714,7 @@ void cleanup_failure_keeps_the_closing_reservation(const std::string& base)
     // proves the boundary.
     install_deferred_drain(registry);
     check(registry.retireInstance(id), "the retirement must be accepted");
-    const auto closing = registry.inventoryRecord(id);
+    const auto closing = registry.jobRecord(id);
     check(closing.has_value() && closing->state == RecordState::Closing,
           "the accepted retirement is durable Closing before any cleanup");
     check(test_runtime(registry).reconcile(id),
@@ -1724,8 +1724,8 @@ void cleanup_failure_keeps_the_closing_reservation(const std::string& base)
     check(cleanup_calls == 1, "the cleanup must be attempted");
     check(record_visible_during_cleanup,
           "the cleanup must run while the durable record still exists");
-    check(registry.inventoryRecord(id).has_value() &&
-              registry.inventoryRecord(id)->state == RecordState::Closing,
+    check(registry.jobRecord(id).has_value() &&
+              registry.jobRecord(id)->state == RecordState::Closing,
           "a failed cleanup keeps the durable closing reservation");
     check(!has_active(registry, id), "a closing reservation is not an active instance");
 
@@ -1743,7 +1743,7 @@ void cleanup_failure_keeps_the_closing_reservation(const std::string& base)
     check(test_runtime(registry).completeDrain(id),
           "the retry must finish the retirement once cleanup succeeds");
     check(cleanup_calls == 2, "the retry must run the cleanup again");
-    check(!registry.inventoryRecord(id).has_value(),
+    check(!registry.jobRecord(id).has_value(),
           "the successful retry archives the record");
     const auto replacement = registry.upsertObservedJob(condor_observation("172.0"));
     check(replacement.ok && replacement.disposition == UpsertDisposition::Created &&
@@ -1783,7 +1783,7 @@ void ambiguous_closing_retry_restores_the_drain(const std::string& base)
     check(registry.storeHealth().recovery_required,
           "the ambiguous closing write must latch recovery");
     check(removed_events == 0, "a failed closing sync must not deliver Removed");
-    const auto active = registry.inventoryRecord(id);
+    const auto active = registry.jobRecord(id);
     check(active.has_value() && active->state == RecordState::Active,
           "memory keeps the active view until recovery");
 
@@ -1795,7 +1795,7 @@ void ambiguous_closing_retry_restores_the_drain(const std::string& base)
     check(removed_events == 1,
           "exactly one Removed may be dispatched for the recovered closing record");
     check(ack_ok, "the recovered drain ack must archive the record");
-    check(!registry.inventoryRecord(id).has_value(),
+    check(!registry.jobRecord(id).has_value(),
           "the ack archives the recovered closing record");
     check(!has_active(registry, id), "an archived instance is no longer active");
 
@@ -1843,7 +1843,7 @@ void cleanup_failure_after_ack_is_retryable(const std::string& base)
     check(test_runtime(registry).reconcile(id), "the runtime must start the drain");
     check(removed_events == 1, "one Removed starts the drain");
     check(!first_ack, "the ack must report the failed cleanup");
-    const auto closing = registry.inventoryRecord(id);
+    const auto closing = registry.jobRecord(id);
     check(closing.has_value() && closing->state == RecordState::Closing,
           "a cleanup failure after the ack keeps the closing reservation");
     check(!has_active(registry, id), "a closing reservation is not an active instance");
@@ -1855,7 +1855,7 @@ void cleanup_failure_after_ack_is_retryable(const std::string& base)
     check(test_runtime(registry).completeDrain(id),
           "the ack retry must finish the cleanup and archive");
     check(cleanup_calls == 2, "the retry must run the cleanup again");
-    check(!registry.inventoryRecord(id).has_value(),
+    check(!registry.jobRecord(id).has_value(),
           "the successful retry archives the record");
     check(removed_events == 1, "the retry must not emit a second Removed");
 }
@@ -1894,7 +1894,7 @@ void runtime_projection_survives_repeated_observation(const std::string& base)
         check(actual.tracked &&
                   actual.collectors == std::vector<std::string>{"cpumem_collector"},
               "the runtime holders must be reported as actual");
-        const auto projected = registry.inventoryRecord(created.internal_id);
+        const auto projected = registry.jobRecord(created.internal_id);
         check(projected.has_value() &&
                   actual.last_revision == projected->revision,
               "the actual state must name the record revision it converged to");
@@ -2043,7 +2043,7 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
         check(committed.ok, "binding must commit: " + committed.message);
         test_runtime(registry).reconcile(id);
 
-        const auto before_archive = registry.inventoryRecord(id);
+        const auto before_archive = registry.jobRecord(id);
         check(before_archive.has_value(), "the instance must be readable before retirement");
         archived_first_seen = before_archive->first_seen_us;
 
@@ -2061,7 +2061,7 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
 
         // The closing transition is itself a record mutation, so the durable
         // image the archive write copies carries the revision after that bump.
-        const auto closing_row = registry.inventoryRecord(id);
+        const auto closing_row = registry.jobRecord(id);
         check(closing_row.has_value() && closing_row->state == RecordState::Closing,
               "the closing reservation must be durable before the archive");
         archived_revision = closing_row->revision;
@@ -2073,7 +2073,7 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
         const auto latched = registry.storeHealth();
         check(latched.recovery_required, "the ambiguous archive must latch recovery");
         check(latched.active_instances == 1, "memory keeps the instance until recovery");
-        check(registry.inventoryRecord(id).has_value(),
+        check(registry.jobRecord(id).has_value(),
               "the instance stays readable until recovery adopts the archive");
 
         // A failing fence must keep the latch and the obligation. The instance
@@ -2181,7 +2181,7 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
 
     {
         JobRegistry reopened(isolated(path));
-        check(!reopened.inventoryRecord(id).has_value(),
+        check(!reopened.jobRecord(id).has_value(),
               "the recovered archive must not be resurrected by a restart");
         check(!record_by_identity(reopened, *identity).has_value(),
               "the archived identity must not resolve to the archived instance");
@@ -2211,7 +2211,7 @@ void never_collected_instances_are_discarded(const std::string& base)
         check(created.ok, "baseline registration must succeed");
         id = created.internal_id;
         check(registry.retireInstance(id), "retirement must be accepted");
-        check(!registry.inventoryRecord(id).has_value(),
+        check(!registry.jobRecord(id).has_value(),
               "the discarded instance must leave the active map");
         check(registry.deinit(), "shutdown must not fail after a clean discard");
     }
@@ -2301,12 +2301,12 @@ void restored_closing_archives_with_effective_fallback(const std::string& base)
 
     {
         JobRegistry registry(isolated(path));
-        const auto record = registry.inventoryRecord(id);
+        const auto record = registry.jobRecord(id);
         check(record.has_value() && record->state == RecordState::Closing,
               "the closing record must be restored");
         check(registry.cleanupClosingJobs(),
               "the closing cleanup must finalize the restored closing");
-        check(!registry.inventoryRecord(id).has_value(),
+        check(!registry.jobRecord(id).has_value(),
               "the restored closing must be archived by the cleanup");
         check(registry.deinit(), "shutdown must succeed after the fallback archive");
     }
@@ -2329,7 +2329,7 @@ void restored_closing_archives_with_effective_fallback(const std::string& base)
 int main(int argc, char** argv)
 {
     try {
-        const std::string base = argc > 1 ? argv[1] : "/tmp/joblens-inventory-store-test";
+        const std::string base = argc > 1 ? argv[1] : "/tmp/joblens-store-test";
         std::filesystem::create_directories(base);
         stable_metadata_is_a_creation_snapshot(base);
         host_refresh_preserves_creation_metadata(base);
@@ -2366,7 +2366,7 @@ int main(int argc, char** argv)
         never_collected_instances_are_discarded(base);
         ambiguous_discard_is_confirmed_by_the_missing_row(base);
         restored_closing_archives_with_effective_fallback(base);
-        std::cout << "PASS inventory store: empty-binding upsert idempotency, "
+        std::cout << "PASS job store: empty-binding upsert idempotency, "
                      "old-schema rejection without migration or deletion, "
                      "canonical schema marker, idempotent rejection and "
                      "live-generation conflict, "

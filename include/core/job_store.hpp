@@ -15,7 +15,7 @@
 //
 // The store owns the LevelDB layout and nothing else: key namespaces, row
 // encode/decode, batch atomicity, tiered durability, recovery fences and the
-// internal-ID high-water mark. Every business decision — inventory merging,
+// internal-ID high-water mark. Every business decision — job-record merging,
 // restore validation, selection strategy, archive-versus-discard — lives in
 // JobRegistry, the single source of truth for JobRecords. The registry runs its
 // whole read-decide-transform sequence under its record lock and then calls
@@ -167,7 +167,7 @@ enum class StoreFaultMode {
 };
 
 // One scheduler discovery. `facts` carries the typed scheduler attributes;
-// its JobID and CollectorNames are deliberately ignored: inventory upserts
+// its JobID and CollectorNames are deliberately ignored: registry upserts
 // never allocate a caller-chosen ID and never activate collection.
 //
 // `members_complete` mirrors the discovery flag: true means the process list
@@ -238,7 +238,7 @@ public:
         // Scheduler-owned row projection. The store parses the row envelope
         // (revision/selection/identity), but the Job fields and typed facts
         // are decoded by the adapter that owns them. Empty keeps the generic
-        // open-world/Common decoder (tests and inventory-only builds).
+        // open-world/Common decoder (tests and registry-only builds).
         using RowDecoder = std::function<Job(const nlohmann::json&)>;
         RowDecoder row_decoder;
         // NOTE: process-identity verification no longer lives here. The registry

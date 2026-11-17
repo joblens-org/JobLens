@@ -122,10 +122,10 @@ int runJobLensService(const cxxopts::ParseResult& result){
     
     // 执行清理操作
     if (mode.compare("service") == 0){
-        // Shutdown order: stop inventory admission and discovery polling,
+        // Shutdown order: stop admission and discovery polling,
         // drain the scheduler's accepted work, then finalize the retirement
         // acknowledgements and close the registry-owned store.
-        JobRegistry::instance().stopInventoryDiscovery();
+        JobRegistry::instance().stopDiscovery();
         CollectorScheduler::instance().shutdown();
         WriterManager::instance().shutdown();
         CollectorRegistry::instance().shutdown();

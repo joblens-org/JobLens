@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Core half of the section 9 inventory/collection RPC contract
-# (doc/job_inventory_collection_decoupling_plan.md, cases A30-A33).
+# Core half of the section 9 job/collection RPC contract.
 #
 # Usage:
 #   bash tests/integration/run_collection_rpc_test.sh [build-dir]

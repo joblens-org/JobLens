@@ -1,6 +1,6 @@
 # Job Watcher 接入指南
 
-本指南描述如何向作业清单（inventory）接入一种**新的调度器类型**——例如一个
+本指南描述如何向作业注册表接入一种**新的调度器类型**——例如一个
 `ssh` 会话源：写一个 *job watcher*（发现源）和一个 *scheduler adapter*
 （调度器适配器）。其余所有环节（`JobStore` 的 merge 语义、心跳的退休证据
 规则、采集绑定与对账、RPC 面、内核归因）对新类型零改动直接生效。English
@@ -29,7 +29,7 @@ src/ebpf/trace_ssh_session.bpf.c          # 可选：exec-hint 事件源
 - 持久存储（`JobRecord`）、identity 索引、generation 冲突处理；
 - 心跳：权威 manager pass、缺席计数、退休证据规则、逐记录执行证据刷新；
 - desired-vs-applied 采集对账与 `CollectionStatus`；
-- `JobRegistry/*` 和 `JobCollection/*` RPC 方法及 trigger 代理；
+- `jobs/*` 与 `jobs/collection/*` RPC 方法及 trigger 代理；
 - 内核归因（`pid2job` / `cgroup2job`）——**当且仅当**你的 adapter 声明
   `kernel_attribution` trait；
 - 无特权测试路径（fixture 文件树、注入的探针/源）。
@@ -39,8 +39,8 @@ src/ebpf/trace_ssh_session.bpf.c          # 可选：exec-hint 事件源
 1. **注册（`main()` 之前）：** TU 作用域的 `REGISTER_SCHEDULER_ADAPTER("ssh",
    SshSchedulerAdapter)` 把工厂函数插入 `SchedulerAdapterRegistry`——和
    `AUTO_REGISTER_COLLECTOR` 同一套约定。
-2. **装配（`JobRegistry::armInventory()`，由注册表构造函数调用）：** 配置解析出的
-   `inventory.types` 逐项通过注册表构建，每种类型恰好一个 adapter。
+2. **装配（`JobRegistry::armDiscovery()`，由注册表构造函数调用）：** 配置解析出的
+   `maintenance.types` 逐项通过注册表构建，每种类型恰好一个 adapter。
    adapter 是**唯一**知道该调度器属性 schema、身份格式和能力的东西。
 3. **运行：** 心跳驱动 adapter 的 `IDiscoverySource`：`enumerateManagers()`
    枚举一遍 pass 里的全部存活 per-job manager（不读 job ad、不读成员），
@@ -73,7 +73,7 @@ src/ebpf/trace_ssh_session.bpf.c          # 可选：exec-hint 事件源
 3. exec 时刻调度器状态可能还没写好（job ad、spool 目录）：**不完整的发现
    永远不建记录**；watcher 请求一次合并的权威 pass，下一遍 manager pass
    在数十毫秒内收敛。
-4. `JobRegistry/inventory_status` 保留 `exec_ingest_depth`、`queue_depth`
+4. `joblens/status` 保留 `exec_ingest_depth`、`queue_depth`
    与 `events_dropped` 作为废弃的恒零键：ingest worker 与 observation
    队列已不存在。
 
@@ -133,7 +133,7 @@ store/intent 所有。
 
 ### 3.4 Adapter 的职责（`ISchedulerAdapter`）
 
-- `discoveryOptions(settings)`：把 `InventoryTypeSettings` 映射到你的
+- `discoveryOptions(settings)`：把 `DiscoveryTypeSettings` 映射到你的
   `DiscoveryOptions`（事件源开关、集群命名空间）。
 - （发现期 facts 由 watcher 自己填写；没有经过中立字段的
   `encodeFacts` 中转。）
@@ -216,13 +216,13 @@ private:
 // include/job_watcher/ssh_adapter.hpp
 class SshSchedulerAdapter final : public ISchedulerAdapter {
 public:
-    explicit SshSchedulerAdapter(const InventoryTypeSettings& settings)
+    explicit SshSchedulerAdapter(const DiscoveryTypeSettings& settings)
         : watcher_(discoveryOptions(settings)) {}
 
     const std::string& name() const override { return name_; }
     std::string configSection() const override { return "ssh_job_watcher"; }
     IDiscoverySource& source() override { return watcher_; }
-    DiscoveryOptions discoveryOptions(const InventoryTypeSettings&) const override;
+    DiscoveryOptions discoveryOptions(const DiscoveryTypeSettings&) const override;
     Job decodeFacts(const nlohmann::json& row) const override;
     NativeSelector legacySelector(const Job&) const override;
     AdapterTraits traits() const override;   // ssh：两项都是 false
@@ -259,7 +259,7 @@ manager 名比较，向名为 `exec_events` 的 `BPF_MAP_TYPE_RINGBUF`（256KB
 都处理为"pass 上的一条 note"，绝不是启动错误。
 
 没有事件源你的 adapter 就不带 exec hint 运行：`start()` 返回 `false`、
-不建轮询线程、不产生 hint，而 registry 的 manager pass 照常维护清单。
+不建轮询线程、不产生 hint，而 registry 的 manager pass 照常维护作业记录。
 
 ### 第 6 步 — 配置
 
@@ -274,7 +274,7 @@ ssh_job_watcher:
   cluster_name: ""            # 空：从源环境推导
 ```
 
-并在 `job_registry_config.inventory.types: [condor, slurm, ssh]` 里列出
+并在 `job_registry_config.maintenance.types: [condor, slurm, ssh]` 里列出
 该类型。不列出则该类型保持休眠；心跳仍会维护该类型的既有记录。
 
 ### 第 7 步 — 测试
@@ -288,7 +288,7 @@ ssh_job_watcher:
    生命周期，以及"事件源不可用是一条显式 note"。脚本复用 Ninja 的
    `JobLens` 链接命令，生产目标文件按 shipped 状态被演练。
 2. **Registry 层** — 通过构造接缝注入假 source + 探针，参照
-   `tests/integration/job_inventory_maintenance_test.cpp`：
+   `tests/integration/job_maintenance_test.cpp`：
 
    ```cpp
    JobRegistryOptions options;
@@ -321,9 +321,9 @@ ssh_job_watcher:
 |---|---|
 | `include/core/job_registry.hpp`（或任一已编译 TU） | include adapter 头，使其 `REGISTER_SCHEDULER_ADAPTER` 注册器被链接 |
 | `include/core/job_discovery.hpp` | 可选：特殊 `DiscoveryEnvironment` 根字段（如 spool 目录） |
-| `config/config.example.yaml` | `<t>_job_watcher` 配置节 + `inventory.types` 一项 |
+| `config/config.example.yaml` | `<t>_job_watcher` 配置节 + `maintenance.types` 一项 |
 
-`collector_type.h`、`job_identity`、`inventory_config`、`JobStore`、
+`collector_type.h`、`job_identity`、`maintenance_config`、`JobStore`、
 心跳/退休逻辑、`KernelAttribution`、RPC 方法、trigger 均**不需要改动**：
 身份、配置节、native-id 规则、facts（JSON 通道）、匹配与 cgroup 推导全部
 由 adapter 驱动。

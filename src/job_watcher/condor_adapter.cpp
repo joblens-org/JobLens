@@ -32,7 +32,7 @@ struct CondorSchedulerAdapter::Impl {
     CondorJobWatcher watcher;
 };
 
-CondorSchedulerAdapter::CondorSchedulerAdapter(const InventoryTypeSettings& settings)
+CondorSchedulerAdapter::CondorSchedulerAdapter(const DiscoveryTypeSettings& settings)
     : impl_(std::make_unique<Impl>(discoveryOptions(settings)))
 {
 }
@@ -64,7 +64,7 @@ AdapterTraits CondorSchedulerAdapter::traits() const
 }
 
 DiscoveryOptions CondorSchedulerAdapter::discoveryOptions(
-    const InventoryTypeSettings& settings) const
+    const DiscoveryTypeSettings& settings) const
 {
     DiscoveryOptions options;
     options.enable_event_source = true;

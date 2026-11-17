@@ -67,10 +67,10 @@ lens_config:
 ```yaml
 job_registry_config:
   job_db_path: /var/JobLens/job.db      # 持久化作业状态的 LevelDB 数据库目录路径
-  auto_add_condorjob: true               # 已弃用：Condor 自动监控（改用 inventory）
-  auto_add_slurmjob: true                # 已弃用：Slurm 自动监控（改用 inventory）
-  inventory:
-    types: [condor, slurm]               # 需要完整本地清单的调度器类型（opt-in，缺省为 []）
+  auto_add_condorjob: true               # 已弃用：Condor 自动监控（改用 maintenance）
+  auto_add_slurmjob: true                # 已弃用：Slurm 自动监控（改用 maintenance）
+  maintenance:
+    types: [condor, slurm]               # 需要完整本地作业记录的调度器类型（opt-in，缺省为 []）
     capture_all: true                    # 无条件登记每个捕获的作业（默认）；false = 登记与否交给 auto_add
     reconcile_interval_sec: 30           # 对账周期，最小 1 秒
 ```
@@ -78,11 +78,11 @@ job_registry_config:
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
 | `job_db_path` | string | 无 | LevelDB 数据库目录路径。无法打开数据库时仅降级运行，不抛异常 |
-| `auto_add_condorjob` | bool | false | **已弃用**。启动旧版 CondorJobWatcher 并自动登记作业。该类型出现在 `inventory.types` 时忽略（由清单发现源负责） |
+| `auto_add_condorjob` | bool | false | **已弃用**。启动旧版 CondorJobWatcher 并自动登记作业。该类型出现在 `maintenance.types` 时忽略（由发现源负责） |
 | `auto_add_slurmjob` | bool | false | **已弃用**。同上，作用于 Slurm |
-| `inventory.types` | list | `[]` | 需要完整本地清单的调度器类型（包含未被采集的作业）。取值 `condor` / `slurm`，未知值启动即拒绝 |
-| `inventory.capture_all` | bool | `true` | 全量登记开关。`true`：捕获的作业无条件登记；`false`：观测是否登记由该类型的 `<type>_job_watcher.auto_add`判定 |
-| `inventory.reconcile_interval_sec` | int | 30 | 周期性全量对账间隔，单位秒，最小 1 |
+| `maintenance.types` | list | `[]` | 需要完整本地作业记录的调度器类型（包含未被采集的作业）。取值 `condor` / `slurm`，未知值启动即拒绝 |
+| `maintenance.capture_all` | bool | `true` | 全量登记开关。`true`：捕获的作业无条件登记；`false`：观测是否登记由该类型的 `<type>_job_watcher.auto_add`判定 |
+| `maintenance.reconcile_interval_sec` | int | 30 | 周期性全量对账间隔，单位秒，最小 1 |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs`（Condor）或 `{JobLensRootDir}/../config/rules/slurm_jobs`（Slurm） | Lua 规则文件目录，在该类型的 `<type>_job_watcher.auto_add` 为 `rule` 时使用。注意：默认值因 watcher 而异。 |
 
 ### 三开关模型
@@ -91,8 +91,8 @@ job_registry_config:
 
 | 开关 | 键 | 回答的问题 | 默认值 |
 |---|---|---|---|
-| 全量登记 | `job_registry_config.inventory.capture_all` | 捕获的作业是否可以无条件进入清单？ | `true` |
-| 按类型启停 Watcher | `job_registry_config.inventory.types` | 该调度器类型是否启动发现 Watcher？ | `[]`（关） |
+| 全量登记 | `job_registry_config.maintenance.capture_all` | 捕获的作业是否可以无条件进入作业注册表？ | `true` |
+| 按类型启停 Watcher | `job_registry_config.maintenance.types` | 该调度器类型是否启动发现 Watcher？ | `[]`（关） |
 | 自动路径动作 | `<type>_job_watcher.auto_add`（`off` / `default` / `rule`） | 自动路径对该类型的观测做什么？ | `off` |
 
 `auto_add` 的三态：
@@ -143,7 +143,7 @@ Watcher 关闭时 `auto_add` 失去意义，只有全量登记区分两行；Wat
 | 7 | 开 | 关 | default | 登记并把默认采集器列表作为初始选择 |
 | 8 | 开 | 关 | rule | accept = 登记并加规则列表（裸接受回退 `auto_add_collectors`）；reject = 不登记（计入 `rejected_observations`）；引擎错误或无缺省的裸接受 = 本次不登记（计入 `admission_errors`），下一条观测重试 |
 
-全量登记关闭时，准入计数在清单状态中可见：`capture_all`、
+全量登记关闭时，准入计数在作业列表状态中可见：`capture_all`、
 `dropped_observations`、`rejected_observations`、`admission_errors`。
 事件路径返回类型化的 `not_admitted` 结果，且绝不会要求 watcher 重扫。
 
@@ -163,14 +163,14 @@ Watcher 关闭时 `auto_add` 失去意义，只有全量登记区分两行；Wat
 
 `<type>_job_watcher.cluster_name`（可选）在环境变量
 （`COLLECTOR_HOST` / `SLURM_CLUSTER_NAME`）无法推导命名空间时显式指定；
-完全没有来源时观测保持 incomplete，并在清单状态中可见。
+完全没有来源时观测保持 incomplete，并在作业列表状态中可见。
 
 发现集中在 `JobRegistry`：构造函数为每个已配置类型建一个 watcher 并启动
-维护控制器（含首次全量扫描），整个栈通过 `stopInventoryDiscovery()` 与
+维护控制器（含首次全量扫描），整个栈通过 `stopDiscovery()` 与
 `deinit()` 关闭。每个调度器类型只有一个 eBPF 源。
 
 采集意图（期望选择）持久化在 LevelDB 中，由运行中的调度器应用到采集通道。
-`JobCollection/get` 区分 `desired_collectors` 与 `applied_collectors`：请求可以被
+`jobs/collection/get` 区分 `desired_collectors` 与 `applied_collectors`：请求可以被
 受理而运行时应用失败（见 `errors`），接口绝不会把未生效的绑报成"正在采集"。
 
 ### 手工 CRUD 面
@@ -181,8 +181,8 @@ Watcher 关闭时 `auto_add` 失去意义，只有全量登记区分两行；Wat
 | 操作 | 入口 | 语义 |
 |---|---|---|
 | 增 / 改 | `JobRegistry/job_opt`，`opt: "add"`（单次 upsert） | 身份命中活跃实例（类型化 `sub_attr` + 调度器命名空间）路由到 UPDATE：请求采集器**并入**现有手工选择（union 去重，绝不整替），事实只补空合并。类型化 sub_attr 命中的行，只有在其身份未解析、或 subtype 携带的 scheduler（schedd）归属与请求一致时，才按 internal id 路由 UPDATE：同一 native id 在另一个 schedd 下属于不同作业（各自 CREATE），归属未知的旧记录保持 legacy 容忍，多条命中报 `ambiguous_selector`，绝不猜测。其余走 CREATE：旧版手工登记语义，其查重按同样的 scheduler（schedd）归属判别，空采集器列表仍被拒绝（UPDATE 允许空列表 = 纯事实补录） |
-| 查 / 改选择 | `JobCollection/get`、`JobCollection/set`、`JobCollection/reset_auto` | 不变；手工选择（含空 stop）永远压过自动选择 |
-| 删 —— stop 档（默认） | `JobRegistry/job_opt`，`opt: "remove"` | 停止采集（持久化空的手工选择）；清单记录保留 |
+| 查 / 改选择 | `jobs/collection/get`、`jobs/collection/set`、`jobs/collection/set (reset_auto)` | 不变；手工选择（含空 stop）永远压过自动选择 |
+| 删 —— stop 档（默认） | `JobRegistry/job_opt`，`opt: "remove"` | 停止采集（持久化空的手工选择）；作业记录保留 |
 | 删 —— erase 档 | `JobRegistry/job_opt`，`opt: "remove"`，`"erase": true` | 真删：先持久化 closing，采集过的实例归档为 `h:` 历史行，从未采集过的直接持久化删除。响应以 `mode: stop\|erase` 区分两档 |
 
 归档还是删除由采集**事实**决定——退休被接受时捕获的运行时实际挂载快照。

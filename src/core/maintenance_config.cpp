@@ -11,7 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-#include "core/inventory_config.hpp"
+#include "core/maintenance_config.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -28,7 +28,7 @@ namespace {
 
 [[noreturn]] void config_error(const std::string& message)
 {
-    throw std::invalid_argument("inventory configuration: " + message);
+    throw std::invalid_argument("maintenance configuration: " + message);
 }
 
 const nlohmann::json* member(const nlohmann::json& node, const std::string& key)
@@ -137,7 +137,7 @@ std::string section_of(const std::string& adapter)
 
 }  // namespace
 
-InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::json& config)
+MaintenanceConfig resolve_maintenance_config(const nlohmann::json& config)
 {
     if (!config.is_object())
         config_error("the document root must be a mapping");
@@ -148,7 +148,7 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
     if (!registry_node.is_object())
         config_error("job_registry_config must be a mapping");
 
-    InventoryMaintenanceConfig resolved;
+    MaintenanceConfig resolved;
 
     // Candidate names, open world: every REGISTERED adapter (so the resolved
     // picture is complete and a new scheduler appears without edits), every
@@ -171,7 +171,7 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
     }
 
     for (const auto& name : candidates)
-        resolved.settings.emplace(name, InventoryTypeSettings{});
+        resolved.settings.emplace(name, DiscoveryTypeSettings{});
 
     // Legacy flags resolve first (per-type precedence input).
     for (const auto& legacy : kLegacyFlags) {
@@ -181,22 +181,22 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
             parse_bool(*node, std::string("job_registry_config.") + legacy.key);
     }
 
-    const auto* inventory = member(registry_node, "inventory");
-    if (inventory != nullptr) {
-        if (!inventory->is_object())
-            config_error("job_registry_config.inventory must be a mapping");
+    const auto* maintenance = member(registry_node, "maintenance");
+    if (maintenance != nullptr) {
+        if (!maintenance->is_object())
+            config_error("job_registry_config.maintenance must be a mapping");
 
-        if (const auto* types = member(*inventory, "types")) {
+        if (const auto* types = member(*maintenance, "types")) {
             if (!types->is_array())
-                config_error("job_registry_config.inventory.types must be a list");
+                config_error("job_registry_config.maintenance.types must be a list");
             for (const auto& entry : *types) {
                 const std::string raw = scalar_text(
-                    entry, "job_registry_config.inventory.types[]");
+                    entry, "job_registry_config.maintenance.types[]");
                 const std::string name = normalize_adapter_name(raw);
                 if (name.empty() || name == "unknown")
-                    config_error("unknown inventory type '" + raw + "'");
+                    config_error("unknown discovery type '" + raw + "'");
                 if (!SchedulerAdapterRegistry::instance().known(name)) {
-                    config_error("unknown inventory type '" + raw + "' (registered: " +
+                    config_error("unknown discovery type '" + raw + "' (registered: " +
                                  [&] {
                                      std::string joined;
                                      for (const auto& known :
@@ -213,20 +213,20 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
             }
         }
 
-        if (const auto* interval = member(*inventory, "reconcile_interval_sec")) {
+        if (const auto* interval = member(*maintenance, "reconcile_interval_sec")) {
             resolved.reconcile_interval_sec = parse_interval_sec(
-                *interval, "job_registry_config.inventory.reconcile_interval_sec");
+                *interval, "job_registry_config.maintenance.reconcile_interval_sec");
         }
-        if (const auto* capture_all = member(*inventory, "capture_all")) {
+        if (const auto* capture_all = member(*maintenance, "capture_all")) {
             resolved.capture_all =
-                parse_bool(*capture_all, "job_registry_config.inventory.capture_all");
+                parse_bool(*capture_all, "job_registry_config.maintenance.capture_all");
         }
-        if (member(*inventory, "registration_batch_size") != nullptr) {
-            spdlog::warn("inventory: registration_batch_size was removed; a discovery event "
+        if (member(*maintenance, "registration_batch_size") != nullptr) {
+            spdlog::warn("maintenance: registration_batch_size was removed; a discovery event "
                          "registers its job immediately");
         }
-        if (member(*inventory, "auto_policy_budget_us") != nullptr) {
-            spdlog::warn("inventory: auto_policy_budget_us was removed; the initial policy "
+        if (member(*maintenance, "auto_policy_budget_us") != nullptr) {
+            spdlog::warn("maintenance: auto_policy_budget_us was removed; the initial policy "
                          "decision is always evaluated synchronously");
         }
     }
@@ -235,7 +235,7 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
         scalar_field(registry_node, "rules_dir", "job_registry_config", std::string());
 
     for (const auto& name : resolved.types) {
-        resolved.settings[name].inventory = true;
+        resolved.settings[name].enabled = true;
     }
 
     // Per-adapter sections resolve by convention: <name>_job_watcher. The rule
@@ -249,7 +249,7 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
         if (node != nullptr && !node->is_object())
             config_error(section + " must be a mapping");
         if (node != nullptr && !SchedulerAdapterRegistry::instance().known(name))
-            spdlog::warn("inventory configuration: section '{}' present but no adapter "
+            spdlog::warn("maintenance configuration: section '{}' present but no adapter "
                          "'{}' is registered; the settings stay inert",
                          section, name);
 
@@ -291,7 +291,7 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
             settings.cluster_name =
                 scalar_field(*node, "cluster_name", section, std::string{});
             if (member(*node, "rules_prefix") != nullptr) {
-                spdlog::warn("inventory configuration: {}.rules_prefix is ignored; the rule "
+                spdlog::warn("maintenance configuration: {}.rules_prefix is ignored; the rule "
                              "file prefix is the adapter name ('{}')",
                              section, name);
             }
@@ -308,16 +308,16 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
     }
 
     if (!legacy_rules_dir.empty()) {
-        spdlog::warn("inventory configuration: job_registry_config.rules_dir is deprecated; "
+        spdlog::warn("maintenance configuration: job_registry_config.rules_dir is deprecated; "
                      "set <adapter>_job_watcher.rules_dir instead");
     }
 
     // Legacy auto-add folding (user-defined semantics): auto_add_<type>job=true
-    // means "inventory this type and add collectors to every discovered job";
+    // means "discover this type and add collectors to every discovered job";
     // use_rules only decides whether the collector list comes from the rule
     // engine (accept = rule result, reject = empty) or verbatim from
     // auto_add_collectors. An explicit per-type auto_collect or an explicit
-    // inventory.types entry always wins over the legacy flag.
+    // maintenance.types entry always wins over the legacy flag.
     for (const auto& legacy : kLegacyFlags) {
         auto& settings = resolved.settings.at(legacy.adapter);
         const bool explicit_type =
@@ -326,10 +326,10 @@ InventoryMaintenanceConfig resolve_inventory_maintenance_config(const nlohmann::
         if (!settings.legacy_auto_collect || explicit_type || settings.auto_collect_explicit)
             continue;
         resolved.types.push_back(legacy.adapter);
-        settings.inventory = true;
+        settings.enabled = true;
         settings.auto_collect = true;
-        spdlog::warn("inventory configuration: job_registry_config.{} is folded "
-                     "into inventory discovery with automatic collection; set {}.auto_collect "
+        spdlog::warn("maintenance configuration: job_registry_config.{} is folded "
+                     "into discovery with automatic collection; set {}.auto_collect "
                      "explicitly to override",
                      legacy.key, section_of(legacy.adapter));
     }

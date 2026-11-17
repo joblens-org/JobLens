@@ -11,7 +11,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License. */
-// Inventory configuration contract. The scheduler identity here is the
+// Maintenance configuration contract. The scheduler identity here is the
 // ADAPTER REGISTRY NAME (open world, no enum): a new scheduler appears the
 // moment it registers and gets a `<name>_job_watcher` config section. The
 // resolver keeps the legacy auto_add_condorjob/auto_add_slurmjob folding as
@@ -27,11 +27,11 @@
 
 #include "core/scheduler_adapter.hpp"
 
-// Inventory maintenance configuration. Names listed in `types` are validated
+// Maintenance configuration. Names listed in `types` are validated
 // against the adapter registry at startup; an unknown name is a startup
 // error that lists the registered names.
-struct InventoryMaintenanceConfig {
-    // Adapter names that opted into broad discovery. Empty means "inventory
+struct MaintenanceConfig {
+    // Adapter names that opted into broad discovery. Empty means "discovery
     // off", preserving the pre-decoupling opt-in behavior.
     std::vector<std::string> types;
     // Blanket registration switch: true (the default) registers every
@@ -42,9 +42,9 @@ struct InventoryMaintenanceConfig {
     std::uint32_t reconcile_interval_sec = 30;
     // Keyed by adapter name; contains every registered adapter plus every
     // type the configuration mentions, so the resolved picture is complete.
-    std::map<std::string, InventoryTypeSettings> settings;
+    std::map<std::string, DiscoveryTypeSettings> settings;
 };
 
 // Throws std::invalid_argument with a stable message on an invalid document.
-InventoryMaintenanceConfig resolve_inventory_maintenance_config(
+MaintenanceConfig resolve_maintenance_config(
     const nlohmann::json& config);
