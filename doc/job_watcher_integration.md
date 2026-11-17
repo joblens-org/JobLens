@@ -29,8 +29,8 @@ src/ebpf/trace_ssh_session.bpf.c          # optional: exec-hint event source
 What you get for free:
 
 - durable storage (`JobRecord`), identity indexing, generation conflicts;
-- the heartbeat: authoritative scans, absence tracking, retirement evidence
-  rules, legacy-row refresh;
+- the heartbeat: authoritative manager passes, absence tracking, retirement
+  evidence rules, per-record execution refresh;
 - desired-vs-applied collection reconciliation and `CollectionStatus`;
 - `JobRegistry/*` and `JobCollection/*` RPC methods and the trigger proxy;
 - kernel attribution (`pid2job` / `cgroup2job`) **iff** your adapter declares
@@ -48,8 +48,10 @@ What you get for free:
    type. The adapter is the *only* component that knows the scheduler's
    attribute schema, identity format and capabilities.
 3. **Runtime:** the heartbeat drives the adapter's `IDiscoverySource`:
-   periodic authoritative `scan()` passes, plus O(job) `observeForHint(pid)`
-   targeted passes fed by exec-event hints from the eBPF ring buffer. Every
+   `enumerateManagers()` enumerates the live per-job managers of one pass (no
+   job ad, no member reads), `observe(manager)` builds the Job for a manager
+   the pass does not already track, and O(job) `observeForHint(pid)` targeted
+   passes are fed by exec-event hints from the eBPF ring buffer. Every
    discovered **Job** carries its typed facts and one execution evidence
    group, built by the watcher where it parses its sources; the registry
    derives selector/identity on admission. There is no second envelope.
@@ -60,8 +62,8 @@ Two structural rules govern the whole line:
   complete execution generation — `discovery_job_ready`) or is *explicitly
   incomplete* with reasons on `job.execution->incomplete_reason`. There is no
   best-effort middle state.
-- A **failed or partial scan is never "everything else ended"**:
-  `ScanResult::complete` says whether the pass covered its sources; consumers
+- A **failed or partial manager pass is never "everything else ended"**:
+  `ManagerSet::complete` says whether the pass covered its sources; consumers
   must check it before treating absence as termination evidence.
 
 ### The exec fast path (job start → collection)
@@ -74,11 +76,11 @@ Latency-critical discovery never waits for a heartbeat pass:
 2. The poll thread resolves the pid itself (`observeForHint`) and registers
    the discovered Job **synchronously on the same thread** through
    `sink.on_job(job)`: store upsert → lifecycle/attach. No queue, no worker;
-   the heartbeat keeps scans, retirement and reconciliation only.
+   the heartbeat keeps manager passes, retirement and reconciliation only.
 3. Scheduler state may not be written yet at exec time (job ad, spool dir):
    an **incomplete discovery never creates a record**; the watcher requests
-   one coalesced authoritative rescan and the next pass converges it in tens
-   of milliseconds.
+   one coalesced authoritative pass and the next manager pass converges it in
+   tens of milliseconds.
 4. `JobRegistry/inventory_status` keeps `exec_ingest_depth`,
    `queue_depth` and `events_dropped` as deprecated constant-zero keys:
    inventory has no ingest worker or observation queue.
@@ -96,12 +98,13 @@ and therefore changes the collector lifecycle contract.
 | Method | Contract |
 |---|---|
 | ctor | Takes `DiscoveryOptions` only. **No Config access, no eBPF load, no thread.** An adapter that is never started costs nothing. |
-| `start(sink)` | Installs the sink **before** anything can call back, then loads the event source on demand and starts polling. Returns `false` when there is nothing to poll (no event source and no scan interval) — `scan()` / `observeForHint()` keep working. |
+| `start(sink)` | Installs the sink **before** anything can call back, then loads the event source on demand and starts polling. Returns `false` when there is nothing to poll (no event source) — no thread is started, `enumerateManagers()` / `observe()` / `observeForHint()` keep working, and discovery is driven by the registry's manager pass. |
 | `stop()` | Idempotent; joins the poll thread and releases the event source. Bounded latency (slice-based wait, never an unbounded join). |
-| `scan()` | One synchronous authoritative pass. Serialized internally (`scan_mutex_`). |
+| `enumerateManagers()` | The authoritative manager pass of one registry pass: one entry per live per-job manager, no job ad and no member reads. Serialized internally (`pass_mutex_`); it owns the pass's `SourceHealth` update (start stamp, rescan request consumed, `Healthy`/`Degraded` from coverage). |
+| `observe(manager)` | Builds the complete Job for one known manager — identity, initial facts and execution evidence — reading only that execution's files (O(job)). Called only for managers the pass does not already track. `nullopt` means "cannot be observed" (process gone, PID reused, incomplete discovery), never a guessed Job. |
 | `health()` | `Initializing` until the first pass finishes; `Healthy` when the last pass covered its sources; `Degraded` on failure/partial coverage. Consumers must not treat absence as termination while degraded. |
-| `requestRescan()` | Sets a flag the owner consumes; never scans inline. |
-| `observeForHint(pid)` | Targeted pass for one exec-event pid — O(job), only this execution's files. Return `nullopt` when unresolvable (process gone, parent mismatch); the caller falls back to a full scan. |
+| `requestRescan()` | Sets a flag the owner consumes; never runs a pass inline. |
+| `observeForHint(pid)` | Targeted pass for one exec-event pid — O(job), only this execution's files. Return `nullopt` when unresolvable (process gone, parent mismatch); the caller waits for the next authoritative manager pass. |
 
 ### 3.2 Threading and the sink
 
@@ -112,7 +115,8 @@ and therefore changes the collector lifecycle contract.
 - Sink callbacks are caller-owned code running on *your* thread: wrap them in
   try/catch so a throwing consumer cannot take the watcher down.
 - Discovery I/O (`/proc`, ad/spool reads) happens where the Job is built:
-  `scan()` on the heartbeat worker, `observeForHint()` on the poll thread.
+  `enumerateManagers()` and `observe(manager)` on the registry's pass thread,
+  `observeForHint()` on the poll thread.
 
 ### 3.3 Building a discovered `Job`
 
@@ -144,7 +148,7 @@ group, filled where the source parses its inputs. `JobID`, `JobPIDs` and
 ### 3.4 Adapter duties (`ISchedulerAdapter`)
 
 - `discoveryOptions(settings)`: map `InventoryTypeSettings` onto your
-  `DiscoveryOptions` (event source on/off, scan interval, cluster namespace).
+  `DiscoveryOptions` (event source on/off, cluster namespace).
 - (Discovery facts are filled by the watcher itself; there is no
   `encodeFacts` detour through neutral fields.)
 - `decodeFacts(row)` / `legacySelector(job)`: best-effort reconstruction for
@@ -189,10 +193,11 @@ public:
 
     bool start(const DiscoverySink& sink) override;     // sink first, then poll
     void stop() override;                               // idempotent, bounded
-    ScanResult scan() override;                         // authoritative pass
+    ManagerSet enumerateManagers() override;            // authoritative pass
+    std::optional<Job> observe(const ProcessIdentity& manager) override;
     SourceHealth health() const override;
     void requestRescan() override;
-    std::optional<Job> observeForHint(pid_t hint_pid) override;
+    std::optional<Job> observeForHint(pid_t hint_pid, pid_t hint_ppid = 0) override;
 
 private:
     void poll_loop();                                   // event-blocked (epoll)
@@ -208,17 +213,22 @@ watcher — copy the patterns, not just the shape):
 - `poll_loop()`: **event-blocked**, not slice-polled — a single
   `ring_buffer__poll(rb, timeout)` call blocks inside libbpf's own epoll, so
   exec events reach the sink at kernel-wakeup speed; the timeout only bounds
-  how long a `stop()` can go unnoticed (100 ms cadence) and fires the
-  self-scan deadline when `scan_interval_ms > 0`. The old slice design's
-  latency came from sleeping on a condition variable *before* a non-blocking
-  drain — don't reintroduce that split. Self-scan only if
-  `options.scan_interval_ms > 0` — in production the registry heartbeat owns
-  pacing and the interval is 0.
-- `scan()`: check `proc_root` readability first (failure ⇒ `complete=false`);
-  read `boot_id`; enumerate candidate managers from the process table;
-  `skipped` entries are counted and noted, never fabricated into Jobs; build
-  one Job per manager (the store is the identity idempotency point — no merge
-  model); finish through the same health-update path (`finish_scan` pattern).
+  how long a `stop()` can go unnoticed (100 ms cadence). The old slice
+  design's latency came from sleeping on a condition variable *before* a
+  non-blocking drain — don't reintroduce that split. The loop never runs a
+  discovery pass and never scans on a timer: pacing belongs to the registry
+  heartbeat.
+- `enumerateManagers()`: check `proc_root` readability first (failure ⇒
+  `complete=false` and a `Degraded` health update); read `boot_id`; enumerate
+  candidate managers from the process table (or a tier-1 subtree); unreadable
+  process-table entries are counted and noted, never fabricated into Jobs;
+  a manager that exits mid-pass stays in the set as a partial identity and is
+  reported unobservable by the caller's `observe()`. Finish through the same
+  health-update path (`finish_pass` pattern).
+- `observe(manager)`: read exactly that manager's ad and member set, verify the
+  manager identity matches the requested one (a recycled pid is not this
+  execution), and build one Job. No update to `SourceHealth`: a manager that
+  cannot be read is a retry, not a pass failure.
 - `observeForHint(pid)`: read the parent, **verify the parent's cmdline is
   the expected manager** (the eBPF filter guarantees it for real events, but a
   recycled pid must not fabricate a discovery), then build one Job with the
@@ -272,10 +282,11 @@ the shared struct lives in `include/ebpf/<name>.h` behind
 `#ifndef __VMLINUX_H__`, and the build compiles `src/ebpf/*.bpf.c` into
 `build/bpf_obj/*.bpf.o` automatically. Userspace loads it with
 `EbpfCommon::resolve_bpf_obj("trace_<manager>.bpf.o")` — treat every failure
-as a note plus scan-only degradation, never a startup error.
+as a note on the pass, never a startup error.
 
-Without an event source your adapter simply runs scan-only: hints are never
-produced, authoritative passes still maintain the inventory.
+Without an event source your adapter simply runs without exec hints:
+`start()` returns `false` and starts no poll thread, hints are never produced,
+and the registry's manager pass still maintains the inventory.
 
 ### Step 6 — configuration
 
@@ -301,12 +312,12 @@ Follow the two existing tiers; neither needs root, live schedulers or eBPF:
 1. **Watcher tier** — fixture file tree + real watcher, like
    `tests/integration/run_watcher_scan_test.sh`: build a fake
    procfs/cgroup/job-ad tree, point `DiscoveryEnvironment` at it, assert
-   `scan()` observations, health transitions, `start/stop` lifecycle, and
-   that an unavailable event source is an explicit note. The script reuses
-   the Ninja `JobLens` link command so production objects are exercised as
-   shipped.
-2. **Registry tier** — fake source + probes + encoder through the
-   constructor seams, like `tests/integration/job_inventory_maintenance_test.cpp`:
+   `enumerateManagers()`/`observe()` results, health transitions,
+   `start/stop` lifecycle, and that an unavailable event source is an
+   explicit note. The script reuses the Ninja `JobLens` link command so
+   production objects are exercised as shipped.
+2. **Registry tier** — fake source + probes through the constructor seams,
+   like `tests/integration/job_inventory_maintenance_test.cpp`:
 
    ```cpp
    JobRegistryOptions options;
@@ -315,10 +326,9 @@ Follow the two existing tiers; neither needs root, live schedulers or eBPF:
    options.test_sources       = {{"ssh", &fake_source}};
    options.test_process_probe = probes.process_probe();
    options.test_cgroup_probe  = probes.cgroup_probe();
-   options.test_facts_encoder = encode_test_facts;
    options.test_heartbeat     = true;
    JobRegistry registry(options);
-   registry.runInventoryPass(/*do_scan=*/true);   // drive passes directly
+   registry.runPass(/*do_scan=*/true, /*wait=*/true);   // drive passes directly
    ```
 
    This is where the invariants (I1–I8) get pinned: merge semantics,
@@ -352,19 +362,20 @@ alternative), matching and cgroup derivation are all adapter-driven.
 
 - Constructor: options only — no Config, no eBPF, no threads.
 - `start()` installs the sink before any possible callback.
-- Poll thread registers exec hints synchronously through `on_job`;
-      periodic self-scans (if `scan_interval_ms > 0`) use the same entry.
+- The poll thread registers exec hints synchronously through `on_job`;
+  discovery passes run on the registry's thread, never on the poll thread.
 - `stop()` is idempotent and bounded; safe from the destructor.
-- `scan()` reports `complete=false` only for pass-level failures;
-      skipped sources are counted and noted, never treated as absence.
+- `enumerateManagers()` reports `complete=false` only for pass-level failures;
+  unreadable process-table entries are counted and noted, and an unobservable
+  manager is a retry, never absence.
 - Discovered Jobs are ready or explicitly incomplete
-      (`execution->incomplete_reason`); the cluster namespace is never guessed
-      from a native id.
+  (`execution->incomplete_reason`); the cluster namespace is never guessed
+  from a native id.
 - Cgroup membership: successful read (including empty) is authoritative;
-      fallback paths mark `members_authoritative=false`.
+  fallback paths mark `members_authoritative=false`.
 - The builder leaves `JobID`/`JobPIDs`/`CollectorNames` empty (store and
-      intent own them).
+  intent own them).
 - `traits()` is truthful; missing capabilities are normal states.
-- eBPF failures degrade to scan-only with an explicit note.
+- eBPF failures leave discovery to the manager pass with an explicit note.
 - Both test tiers pass unprivileged; new invariants covered in the
-      registry tier.
+  registry tier.

@@ -24,7 +24,6 @@
 #include "core/collector_type.h"
 #include "job_watcher/condor_job_watcher.hpp"
 #include "common/condor_job.hpp"
-#include "common/common_job.hpp"
 #include "common/procfs.hpp"
 #include "common/utils.hpp"
 
@@ -69,7 +68,6 @@ DiscoveryOptions CondorSchedulerAdapter::discoveryOptions(
 {
     DiscoveryOptions options;
     options.enable_event_source = true;
-    options.scan_interval_ms = 0;
     // Verified on the integration node (192.168.82.26): the startd keeps
     // one directory per slot under this subtree, each slot's cgroup.procs
     // listing its processes (starter included).
@@ -182,13 +180,6 @@ SubAttrMatcher CondorSchedulerAdapter::duplicateMatcher(const Job& job) const
         matcher.condor_proc_id = attr->proc_id;
     }
     return matcher;
-}
-
-void CondorSchedulerAdapter::refreshLegacyFacts(Job& job) const
-{
-    CondorJob::update_job_info(job);
-    if (!CondorJob::update_job_pids(job))
-        CommonJob::update_job_child_process(job);
 }
 
 std::optional<ProcessIdentity> CondorSchedulerAdapter::managerOfPid(pid_t job_pid) const

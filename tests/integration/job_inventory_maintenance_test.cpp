@@ -97,8 +97,17 @@ std::string fresh_dir(const std::string& base, const std::string& name)
 }
 
 // ---------------------------------------------------------------------------
-// Fake discovery source (an IDiscoverySource with controllable scans/hints)
+// Fake discovery source (an IDiscoverySource with controllable passes/hints)
 // ---------------------------------------------------------------------------
+
+// What one fake pass publishes: the discovered Jobs, its coverage and its
+// error. Local to this test — the production contract exposes managers through
+// ManagerSet and one Job at a time through observe().
+struct PassPayload {
+    std::vector<Job> jobs;
+    bool complete = true;
+    std::string error;
+};
 
 class FakeSource final : public IDiscoverySource {
 public:
@@ -125,28 +134,20 @@ public:
         started_ = false;
     }
 
-    ScanResult scan() override
-    {
-        const ScanResult scanned = run_scan();
-        std::lock_guard<std::mutex> lock(mutex_);
-        last_scan_ = scanned;
-        return scanned;
-    }
-
     // The heartbeat pass enumerates managers once and then pays observe() only
-    // for managers it does not track. The fixture implements the same cheap
-    // split: one source read per pass, observe() answers from that read.
+    // for managers it does not track. The fixture implements the same split:
+    // one source read per pass, observe() answers from that read.
     ManagerSet enumerateManagers() override
     {
-        const ScanResult scanned = run_scan();
+        const PassPayload pass = run_pass();
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            last_scan_ = scanned;
+            last_pass_ = pass;
         }
         ManagerSet set;
-        set.complete = scanned.complete;
-        set.error = scanned.error;
-        for (const auto& job : scanned.jobs) {
+        set.complete = pass.complete;
+        set.error = pass.error;
+        for (const auto& job : pass.jobs) {
             const ProcessIdentity& manager = job.execution.manager;
             if (!manager.complete()) continue;
             if (std::find(set.managers.begin(), set.managers.end(), manager) ==
@@ -161,7 +162,7 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         ++observes_;
-        for (const auto& job : last_scan_.jobs) {
+        for (const auto& job : last_pass_.jobs) {
             if (job.execution.manager == manager) return job;
         }
         return std::nullopt;
@@ -186,10 +187,10 @@ public:
     }
 
     // --- test controls -----------------------------------------------------
-    void set_scan(std::function<ScanResult()> fn)
+    void set_scan(std::function<PassPayload()> fn)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        scan_fn_ = std::move(fn);
+        pass_fn_ = std::move(fn);
     }
     void set_start_result(bool value)
     {
@@ -221,43 +222,43 @@ public:
 
     int starts() const { std::lock_guard<std::mutex> lock(mutex_); return starts_; }
     int stops() const { std::lock_guard<std::mutex> lock(mutex_); return stops_; }
-    int scans() const { std::lock_guard<std::mutex> lock(mutex_); return scans_; }
+    int scans() const { std::lock_guard<std::mutex> lock(mutex_); return passes_; }
     int observes() const { std::lock_guard<std::mutex> lock(mutex_); return observes_; }
     bool scanned_without_start() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        return scanned_without_start_;
+        return passed_without_start_;
     }
 
 private:
-    ScanResult run_scan()
+    PassPayload run_pass()
     {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (!started_) scanned_without_start_ = true;
-            ++scans_;
+            if (!started_) passed_without_start_ = true;
+            ++passes_;
         }
-        std::function<ScanResult()> fn;
+        std::function<PassPayload()> fn;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            fn = scan_fn_;
+            fn = pass_fn_;
         }
-        return fn ? fn() : ScanResult{};
+        return fn ? fn() : PassPayload{};
     }
 
     std::string name_;
     mutable std::mutex mutex_;
     DiscoverySink sink_;
-    std::function<ScanResult()> scan_fn_;
-    ScanResult last_scan_;
+    std::function<PassPayload()> pass_fn_;
+    PassPayload last_pass_;
     SourceHealth health_;
     bool start_result_ = true;
     bool start_throw_ = false;
     bool started_ = false;
-    bool scanned_without_start_ = false;
+    bool passed_without_start_ = false;
     int starts_ = 0;
     int stops_ = 0;
-    int scans_ = 0;
+    int passes_ = 0;
     int observes_ = 0;
 };
 
@@ -389,22 +390,14 @@ Job make_manual_condor_job(const std::string& native, pid_t manager_pid,
     return job;
 }
 
-ScanResult scan_with(std::vector<Job> jobs, bool complete = true,
-                     const std::string& error = "")
+PassPayload scan_with(std::vector<Job> jobs, bool complete = true,
+                      const std::string& error = "")
 {
-    ScanResult result;
-    result.complete = complete;
-    result.error = error;
-    result.started_at_ms = 10;
-    result.finished_at_ms = 11;
-    result.jobs = std::move(jobs);
-    for (const auto& job : result.jobs) {
-        if (execution_complete(job.execution) && canonicalize(selector_of(job)).has_value())
-            ++result.counts.complete;
-        else ++result.counts.incomplete;
-    }
-    result.counts.candidates = result.jobs.size();
-    return result;
+    PassPayload pass;
+    pass.complete = complete;
+    pass.error = error;
+    pass.jobs = std::move(jobs);
+    return pass;
 }
 
 JobRegistryOptions heartbeat_options(const std::string& path, FakeSource& source,
@@ -1047,7 +1040,7 @@ void run_a12(const std::string& base)
 }
 
 // ---------------------------------------------------------------------------
-// source started without an event source (scan-only)
+// source started without an event source (manager pass only)
 // ---------------------------------------------------------------------------
 
 void run_a13(const std::string& base)
@@ -1055,12 +1048,12 @@ void run_a13(const std::string& base)
     FakeSource source("condor");
     FakeProbes probes;
     auto options = heartbeat_options(fresh_dir(base, "a13"), source, probes);
-    source.set_start_result(false);   // scan-only source
+    source.set_start_result(false);   // no event source: manager pass only
     JobRegistry registry(options);
 
     const auto status = heartbeat_status();
     check(status["tracker_unavailable"] == true,
-          "a scan-only source was not reported");
+          "a pass-only source was not reported");
     check(status["state"] != "stopped", "the heartbeat did not run");
 
     const Job job =

@@ -70,14 +70,15 @@ using SubAttr = std::variant<CondorJobAttr, CommonJobAttr, SlurmJobAttr, nlohman
    注册进 `SchedulerAdapterRegistry`。
 2. `JobRegistry` 启动时按 `inventory.types` 构建 adapter；adapter 是唯一知道该
    调度器属性模式、身份格式与能力的组件。
-3. 心跳驱动 adapter 的 `IDiscoverySource`：周期性权威 `scan()`，以及由 exec
-   事件触发的 O(job) `observeForHint(pid)`。
+3. 心跳驱动 adapter 的 `IDiscoverySource`：`enumerateManagers()` 枚举一遍 pass
+   的存活 per-job manager，`observe(manager)` 为本 pass 尚未跟踪的 manager 构建
+   Job，以及由 exec 事件触发的 O(job) `observeForHint(pid)`。
 4. watcher 在解析源的位置直接构造 `Job`：typed facts + 一个 execution 证据组。
    注册表在准入时派生 selector / identity，不存在第二层传输信封。
 
 发现结果只有两种状态：可解析身份且执行代次完整（ready），或显式 incomplete
-并在 `job.execution->incomplete_reason` 写明原因。部分扫描不得被解释为
-“其余作业都已结束”；消费者必须先检查 `ScanResult::complete`。
+并在 `job.execution->incomplete_reason` 写明原因。部分 pass 不得被解释为
+“其余作业都已结束”；消费者必须先检查 `ManagerSet::complete`。
 
 ## 6. 配置与归因
 
@@ -109,10 +110,11 @@ public:
     const std::string& name() const override { return name_; }
     bool start(const DiscoverySink& sink) override;     // 先装 sink，再启动轮询
     void stop() override;
-    ScanResult scan() override;                         // 权威扫描
+    ManagerSet enumerateManagers() override;            // 权威枚举
+    std::optional<Job> observe(const ProcessIdentity& manager) override;
     SourceHealth health() const override;
     void requestRescan() override;
-    std::optional<Job> observeForHint(pid_t) override { return std::nullopt; }
+    std::optional<Job> observeForHint(pid_t, pid_t = 0) override { return std::nullopt; }
 private:
     std::string name_{"ssh"};
     DiscoveryOptions options_;

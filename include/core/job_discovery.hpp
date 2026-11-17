@@ -16,17 +16,16 @@
 // This header is the boundary between the scheduler discovery adapters
 // (CondorJobWatcher, SlurmJobWatcher) and the registry heartbeat:
 //
-//   * enumerateManagers() - cheap pass: the live per-job managers only
+//   * enumerateManagers() - the authoritative pass: the live per-job managers
+//                   of one source, its coverage and its health update
 //   * observe(manager)    - O(job) targeted pass for one known manager
-//   * scan()      - one synchronous source pass, returns ScanResult
 //   * health()    - SourceHealth of that source (initializing/healthy/degraded)
 //   * observeForHint(pid) - O(job) targeted pass for one exec-event pid
-//   * jobs        - discovered Jobs (typed facts + execution evidence group)
-//                   the sink admits through JobRegistry upserts
 //
-// The header owns source and scan. The root-explicit proc/cgroup readers live
-// in common/procfs.hpp, and this contract must never depend on LevelDB; the
-// registration result type lives in its own contract header.
+// The header owns the sources and the manager-pass contract. The root-explicit
+// proc/cgroup readers live in common/procfs.hpp, and this contract must never
+// depend on LevelDB; the registration result type lives in its own contract
+// header.
 //
 // Two rules are structural rather than conventional:
 //
@@ -35,8 +34,8 @@
 //      execution group. There is no "best effort" middle state, and an
 //      incomplete discovery is not eligible for automatic collection or for
 //      retirement decisions.
-//   2. A failed or incomplete scan is never interpreted as "everything else
-//      ended". ScanResult::complete says whether the pass covered the
+//   2. A failed or incomplete pass is never interpreted as "everything else
+//      ended". ManagerSet::complete says whether the pass covered the
 //      configured sources; a consumer must check it before treating absence as
 //      termination evidence.
 #pragma once
@@ -45,10 +44,8 @@
 #include "core/job_identity.hpp"
 #include "core/registration_contract.hpp"
 
-#include <algorithm>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -95,44 +92,22 @@ struct DiscoveryEnvironment {
 };
 
 // ---------------------------------------------------------------------------
-// Scan result
+// Pass notes
 // ---------------------------------------------------------------------------
 
-// Counts are all "inputs of this source pass", not "jobs in the registry".
-struct ScanCounts {
-    // Manager-level discovery inputs examined (one Condor starter, one
-    // slurmstepd, one spool directory).
-    std::size_t candidates = 0;
-    std::size_t complete = 0;
-    std::size_t incomplete = 0;
-    // Process or spool entries that could not be read or attributed at all
-    // (permission denied, exited mid-scan, not a job<id> directory). They never
-    // become observations and never stand in for the observed absence of a
-    // known execution.
-    std::size_t skipped = 0;
-
-    std::size_t observed() const { return complete + incomplete; }
-};
-
-struct ScanResult {
-    // The discovered Jobs: typed facts plus the execution evidence group,
-    // built where the source parsed its inputs. JobID, JobPIDs and
-    // CollectorNames stay empty: they are store/intent owned.
-    std::vector<Job> jobs;
-    // True when the pass covered every configured source without an I/O or
-    // configuration error. Incomplete *discoveries* (missing ad, unresolved
-    // namespace) do not make a pass incomplete: they were still observed.
-    // Consumers must never read absent jobs out of a pass with complete=false.
-    bool complete = false;
-    std::string error;
-    ScanCounts counts;
-    // Source-level notes: skipped sources, unavailable eBPF event source, ...
-    std::vector<std::string> notes;
-    std::int64_t started_at_ms = 0;
-    std::int64_t finished_at_ms = 0;
-
-    bool ok() const { return error.empty(); }
-};
+// Human-readable join of one pass' source notes, stored in
+// SourceHealth::last_note. Notes are short diagnostics ("eBPF event source
+// unavailable", "fell back to process-table enumeration"), so one field keeps
+// them all visible instead of silently dropping every note but the first.
+inline std::string join_source_notes(const std::vector<std::string>& notes)
+{
+    std::string joined;
+    for (const auto& note : notes) {
+        if (!joined.empty()) joined += "; ";
+        joined += note;
+    }
+    return joined;
+}
 
 // ---------------------------------------------------------------------------
 // Manager enumeration
@@ -146,10 +121,9 @@ struct ScanResult {
 struct ManagerSet {
     std::vector<ProcessIdentity> managers;
     // True when the pass covered its inputs without an I/O or configuration
-    // error — the same semantics as ScanResult::complete. An individually
-    // unreadable manager (start ticks or boot id missing) is a partial entry,
-    // not an incomplete pass. Consumers must never read absence out of a
-    // ManagerSet with complete=false.
+    // error. An individually unreadable manager (start ticks or boot id
+    // missing) is a partial entry, not an incomplete pass. Consumers must never
+    // read absence out of a ManagerSet with complete=false.
     bool complete = false;
     std::string error;
 };
@@ -171,15 +145,16 @@ enum class SourceState {
 
 struct SourceHealth {
     SourceState state = SourceState::Initializing;
-    // True while the adapter owns a running poll/scan thread.
+    // True while the adapter owns a running poll thread.
     bool polling = false;
-    // Epoch ms; 0 means "never".
+    // Epoch ms of the last authoritative pass; 0 means "never".
     std::int64_t last_scan_start_ms = 0;
     std::int64_t last_scan_success_ms = 0;
-    // Most recent failure text. Kept after recovery for diagnosis; `state` is
+    // Most recent failure text; cleared by the next successful pass. `state` is
     // authoritative.
     std::string last_error;
-    // Most recent source-level note (e.g. "eBPF event source unavailable").
+    // Most recent pass' source-level notes, joined with "; " (e.g. "eBPF event
+    // source unavailable"). Empty when the last pass had no notes.
     std::string last_note;
     // A consumer asked for an out-of-band pass; cleared when one starts.
     bool rescan_requested = false;
@@ -197,9 +172,6 @@ struct DiscoveryOptions {
     // Load the eBPF ring buffer used for incremental discovery hints. It is
     // always started by start(), never by the constructor.
     bool enable_event_source = true;
-    // Periodic scan tick of the adapter's poll thread; 0 disables it (the
-    // registry heartbeat owns pacing and runs the authoritative passes).
-    std::uint32_t scan_interval_ms = 0;
     // Condor tier-1 starter enumeration: path of the slot cgroup subtree
     // RELATIVE to discovery.cgroup_root (verified layout: the startd keeps
     // one directory per slot under <cgroup_root>/system.slice/htcondor, each
@@ -214,8 +186,9 @@ struct DiscoveryOptions {
 
 // Synchronous single-job registration entry: registers one
 // discovered Job and returns the result. It runs on the caller's
-// thread (the source's poll thread), never on a worker. Both discovery
-// paths — exec events and the source's own periodic scan — use it.
+// thread (the source's poll thread), never on a worker. The exec-event path
+// registers through it; the registry's manager pass upserts its observe()
+// results directly.
 using JobSink = std::function<UpsertResult(const Job&)>;
 
 // Receives discovery output from a source.
@@ -238,58 +211,28 @@ public:
 
     // Installs the sink and then starts polling (the sink exists before any
     // callback can run). Returns false when the adapter has nothing to poll
-    // for (no event source and no scan interval); the sink stays installed and
-    // scan()/observeForHint() keep working.
+    // for (no event source); the sink stays installed and
+    // enumerateManagers()/observe()/observeForHint() keep working — discovery
+    // just runs without exec-hint acceleration.
     virtual bool start(const DiscoverySink& sink) = 0;
     // Idempotent: stops and joins the poll thread, releases the event source.
     virtual void stop() = 0;
-    // One synchronous authoritative source pass.
-    virtual ScanResult scan() = 0;
 
-    // Cheap manager enumeration for the discovery pass: one entry per live
-    // per-job manager, with no job ad and no member reads. Called every pass;
-    // the caller then pays observe() only for managers it does not track.
-    //
-    // The default below is a compatibility bridge for sources that implement
-    // scan() only: it derives the set from a full scan. Production watchers
-    // MUST override it with a cheap implementation — otherwise every pass pays
-    // a complete scan plus one targeted read per unknown manager.
-    virtual ManagerSet enumerateManagers()
-    {
-        ManagerSet set;
-        const ScanResult scanned = scan();
-        set.complete = scanned.complete;
-        set.error = scanned.error;
-        // Deduplicated by the full triple: one manager can only appear once in
-        // a source pass, but the derived view must not depend on that.
-        for (const auto& job : scanned.jobs) {
-            const ProcessIdentity& manager = job.execution.manager;
-            if (!manager.complete()) continue;
-            if (std::find(set.managers.begin(), set.managers.end(), manager) ==
-                set.managers.end()) {
-                set.managers.push_back(manager);
-            }
-        }
-        return set;
-    }
+    // The authoritative manager enumeration of one pass: one entry per live
+    // per-job manager, with no job ad and no member reads. Called once per
+    // registry pass. It owns the source health of that pass: it stamps
+    // last_scan_start_ms, consumes a pending rescan request, and sets
+    // Healthy/Degraded from its coverage. The caller then pays observe() only
+    // for managers it does not track.
+    virtual ManagerSet enumerateManagers() = 0;
 
     // The complete Job for one known manager: identity plus initial facts and
     // execution evidence, built without touching any other execution. Called
-    // only for managers the caller does not already track.
-    //
-    // The default derives it from scan() for compatibility; production
-    // watchers MUST override it so M new managers cost O(M x job), never O(M x
-    // process-table). nullopt means "cannot be observed" (process gone, PID
-    // reused, discovery incomplete), never a guessed Job.
-    virtual std::optional<Job> observe(const ProcessIdentity& manager)
-    {
-        if (!manager.complete()) return std::nullopt;
-        const ScanResult scanned = scan();
-        for (const auto& job : scanned.jobs) {
-            if (job.execution.manager == manager) return job;
-        }
-        return std::nullopt;
-    }
+    // only for managers the caller does not already track. It never updates
+    // SourceHealth: a manager that cannot be observed is a retry, not a pass
+    // failure. nullopt means "cannot be observed" (process gone, PID reused,
+    // discovery incomplete), never a guessed Job.
+    virtual std::optional<Job> observe(const ProcessIdentity& manager) = 0;
 
     virtual SourceHealth health() const = 0;
     // Ask for an out-of-band authoritative pass; consumed by the owner.
@@ -300,13 +243,13 @@ public:
     // the exec event's own ppid: when positive (event objects that carry the
     // field) the /proc ppid read is skipped; when zero (old BPF objects) the
     // hint's stat is read instead. Returns nullopt when the hint cannot be
-    // resolved (process gone, parent is not the expected manager); the caller
-    // then falls back to a full scan.
+    // resolved (process gone, parent is not the expected manager); discovery
+    // then waits for the next authoritative manager pass.
     virtual std::optional<Job> observeForHint(pid_t hint_pid, pid_t hint_ppid = 0) = 0;
 };
 
 // Process-monotonic read order, assigned before a builder starts reading. The
-// store uses it so an older scan can never overwrite a newer event.
+// store uses it so an older observation can never overwrite a newer event.
 std::uint64_t next_discovery_read_order();
 
 // Process identity from the fake or real procfs (see common/procfs.hpp).

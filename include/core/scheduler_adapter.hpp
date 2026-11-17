@@ -181,14 +181,6 @@ public:
     // still get the subtype the adapter was registered under.
     virtual SubAttrMatcher duplicateMatcher(const Job& job) const;
 
-    // Legacy/manual fact refresh from the host (/proc, scheduler metadata).
-    // Discovery rows are refreshed by their source; only rows without a
-    // source reach this.
-    virtual void refreshLegacyFacts(Job& job) const
-    {
-        (void)job;
-    }
-
     // ---- per-record fact refresh -------------------------------------------
     //
     // The framework supervisor that launched this job process: Condor's
@@ -211,7 +203,7 @@ public:
     // observation that reads later keeps its own, newer order).
     virtual RefreshResult refreshFacts(Job& job,
                                        const ProcessLivenessProbe& process_probe,
-                                       const CgroupMembershipProbe& cgroup_probe) const;
+                                       const CgroupMembershipProbe& cgroup_probe) const = 0;
 
     // The execution cgroup of one job as told by its typed facts, used by
     // kernel attribution (empty = none; the kernel_attribution trait gates
@@ -270,8 +262,7 @@ protected:
     // same rule the retirement pass uses: manager liveness from its complete
     // identity, "cgroup empty" only from a readable job cgroup, member
     // liveness/inconclusiveness from the cgroup members and the recorded
-    // member identities. Shared by the default refreshFacts and by adapters
-    // that read their own facts.
+    // member identities. Shared by the adapters' refreshFacts.
     RefreshResult probeExecutionEvidence(const Job& job,
                                          const ProcessLivenessProbe& process_probe,
                                          const CgroupMembershipProbe& cgroup_probe) const;

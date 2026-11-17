@@ -450,7 +450,6 @@ private:
     std::optional<JobRecord> ownRecordByKey(const SchedulerKey& key) const;
     CollectionSelection ownSelection(uint64_t id) const;
     void publishRecord(JobRecord record);
-    void eraseRecord(uint64_t id);
     void eraseRecordLocked(uint64_t id);   // caller holds records_mtx_ exclusively
 
     // One record transaction: the single durable write path for record state.
@@ -477,12 +476,6 @@ private:
                                   const SchedulerKey& key, uint64_t internal_id,
                                   int64_t observed_at, JobRecord& updated_out,
                                   MergeKind kind = MergeKind::Observation);
-    // Resolves the adapter that owns one Job's scheduler facts: the Job's
-    // subtype_name first (the one copy of the adapter name), the subtype
-    // enum as a fallback for pre-name legacy rows. nullptr when no
-    // configured adapter owns the Job — callers keep an incomplete selector
-    // rather than guessing.
-    ISchedulerAdapter* adapterOf(const Job& job) const;
     // Interpretation-only adapter access: namespace semantics must not
     // depend on which discovery types are CONFIGURED. Returns the configured
     // adapter when the type is armed, otherwise a lazily built and cached

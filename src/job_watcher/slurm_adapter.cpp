@@ -23,7 +23,6 @@
 
 #include "core/collector_type.h"
 #include "job_watcher/slurm_job_watcher.hpp"
-#include "common/common_job.hpp"
 #include "common/procfs.hpp"
 #include "common/slurm_job.hpp"
 
@@ -68,7 +67,6 @@ DiscoveryOptions SlurmSchedulerAdapter::discoveryOptions(
 {
     DiscoveryOptions options;
     options.enable_event_source = true;
-    options.scan_interval_ms = 0;
     if (!settings.cluster_name.empty())
         options.discovery.cluster_name = settings.cluster_name;
     return options;
@@ -174,12 +172,6 @@ SubAttrMatcher SlurmSchedulerAdapter::duplicateMatcher(const Job& job) const
         matcher.slurm_step_id = attr->step_id;
     }
     return matcher;
-}
-
-void SlurmSchedulerAdapter::refreshLegacyFacts(Job& job) const
-{
-    SlurmJob::update_job_info(job);
-    CommonJob::update_job_child_process(job);
 }
 
 std::optional<ProcessIdentity> SlurmSchedulerAdapter::managerOfPid(pid_t job_pid) const
