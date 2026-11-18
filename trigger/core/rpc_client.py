@@ -189,7 +189,7 @@ class JoblensRPCClient:
     
     def get_job(self, job_id: int) -> dict:
         """获取指定内部 ID 的 Job 资源"""
-        return self.client.call("jobs/get", {"internal_job_id": str(job_id)})
+        return self.client.call("jobs/get", {"JobID": str(job_id)})
     
     def metrics_report(self, metric_data: dict) -> bool:
         """上报指标数据"""

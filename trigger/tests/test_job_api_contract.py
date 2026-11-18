@@ -61,9 +61,9 @@ def _app(rpc_client: object = None) -> Flask:
 
 CONDOR_SELECTOR = {
     "scheduler_type": "condor",
-    "cluster_name": "htcondor01",
-    "cluster_tag": "schedd-a",
-    "native_job_id": "172.0",
+    "clusterName": "htcondor01",
+    "clusterTag": "schedd-a",
+    "JobNativeID": "172.0",
 }
 
 
@@ -82,11 +82,10 @@ def _set_body(**overrides: Any) -> dict:
 
 def _target(**overrides: Any) -> dict:
     target = {
-        "instance_id": "inst-condor-01",
-        "internal_job_id": "42",
-        "native_job_id": "172.0",
+        "JobID": "42",
+        "JobNativeID": "172.0",
         # Accepted durable revision (the ONE record revision).
-        "record_revision": 3,
+        "revision": 3,
         "mode": "manual",
         "desired_collectors": ["cpumem_collector"],
         "applied_collectors": [],
@@ -126,10 +125,9 @@ def test_selector_condor_native_selector_forwards_scope_and_ensure_registered(in
     ]
     body = response.get_json()
     assert body["status"] == "accepted"
-    assert [target["instance_id"] for target in body["targets"]] == ["inst-condor-01"]
-    assert body["targets"][0]["internal_job_id"] == "42"
+    assert [target["JobID"] for target in body["targets"]] == ["42"]
 
-    # 不猜身份、不分配内部 ID：转发体里只有契约字段，没有 JobID/internal_job_id 注入
+    # 不猜身份、不分配内部 ID：转发体里只有契约字段，没有 JobID 注入
     forwarded = fake.calls[0][1]
     assert set(forwarded) == {
         "selector",
@@ -140,7 +138,8 @@ def test_selector_condor_native_selector_forwards_scope_and_ensure_registered(in
         "expected_revision",
     }
     assert "JobID" not in forwarded
-    assert "internal_job_id" not in forwarded["selector"]
+    # 原生身份选择器不被翻译成实例句柄
+    assert "JobID" not in forwarded["selector"]
 
 
 def test_selector_native_selector_defaults_ensure_registered_to_false(install_core) -> None:
@@ -171,36 +170,36 @@ def test_selector_retired_instance_id_selector_is_rejected_at_the_boundary(
     assert fake.calls == []
 
 
-def test_selector_internal_job_id_selector_forwards_verbatim(install_core) -> None:
-    """internal_job_id 实例句柄（唯一形式）：原样转发，不注入内部推导。"""
+def test_selector_job_id_selector_forwards_verbatim(install_core) -> None:
+    """JobID 实例句柄（唯一形式）：原样转发，不注入内部推导。"""
     fake = install_core(
         response={
             "status": "accepted",
-            "targets": [_target(instance_id="opaque-handle-9", native_job_id=None)],
+            "targets": [_target(JobID="42", JobNativeID=None)],
         }
     )
 
     response = _post_collection(
         _app().test_client(),
-        {"selector": {"internal_job_id": "42"}, "operation": "set", "collectors": []},
+        {"selector": {"JobID": "42"}, "operation": "set", "collectors": []},
     )
 
     assert response.status_code == 200
     forwarded = fake.calls[0][1]
-    assert forwarded["selector"] == {"internal_job_id": "42"}
+    assert forwarded["selector"] == {"JobID": "42"}
     assert forwarded["scope"] == "instance"
     # 透传边界：Trigger 不把一种句柄形式翻译成另一种
     assert "instance_id" not in forwarded["selector"]
 
 
-def test_selector_internal_job_id_rejects_non_decimal(install_core) -> None:
-    """非十进制 internal_job_id 在边界即拒绝，不打扰 Core。"""
+def test_selector_job_id_rejects_non_decimal(install_core) -> None:
+    """非十进制 JobID 在边界即拒绝，不打扰 Core。"""
     fake = install_core()
     client = _app().test_client()
 
     response = _post_collection(
         client,
-        {"selector": {"internal_job_id": "4x2"}, "operation": "set", "collectors": []},
+        {"selector": {"JobID": "4x2"}, "operation": "set", "collectors": []},
     )
     assert response.status_code == 400
     assert fake.calls == []
@@ -211,12 +210,11 @@ def test_selector_internal_job_id_rejects_non_decimal(install_core) -> None:
 
 def test_selector_slurm_job_scope_reports_each_observed_step(install_core) -> None:
     targets = [
-        _target(instance_id="inst-step-batch", native_job_id="9001", mode="auto"),
+        _target(JobID="42", JobNativeID="9001", mode="auto"),
         _target(
-            instance_id="inst-step-1",
-            native_job_id="9001",
-            internal_job_id="43",
-            record_revision=1,
+            JobID="43",
+            JobNativeID="9001",
+            revision=1,
             applied_attach_token=1,
         ),
     ]
@@ -227,8 +225,8 @@ def test_selector_slurm_job_scope_reports_each_observed_step(install_core) -> No
         {
             "selector": {
                 "scheduler_type": "slurm",
-                "cluster_name": "slurm-cluster",
-                "native_job_id": "9001",
+                "clusterName": "slurm-cluster",
+                "JobNativeID": "9001",
             },
             "scope": "job",
             "operation": "set",
@@ -241,22 +239,22 @@ def test_selector_slurm_job_scope_reports_each_observed_step(install_core) -> No
     assert "step_id" not in fake.calls[0][1]["selector"]
     body = response.get_json()
     assert body["status"] == "accepted"
-    assert [target["instance_id"] for target in body["targets"]] == [
-        "inst-step-batch",
-        "inst-step-1",
+    assert [target["JobID"] for target in body["targets"]] == [
+        "42",
+        "43",
     ]
 
 
 def test_selector_slurm_step_selector_is_forwarded_as_native_string(install_core) -> None:
-    fake = install_core(response={"status": "accepted", "targets": [_target(native_job_id="9001")]})
+    fake = install_core(response={"status": "accepted", "targets": [_target(JobNativeID="9001")]})
 
     response = _post_collection(
         _app().test_client(),
         {
             "selector": {
                 "scheduler_type": "slurm",
-                "cluster_name": "slurm-cluster",
-                "native_job_id": 9001,
+                "clusterName": "slurm-cluster",
+                "JobNativeID": 9001,
                 "step_id": 2,
             },
             "operation": "set",
@@ -267,8 +265,8 @@ def test_selector_slurm_step_selector_is_forwarded_as_native_string(install_core
     assert response.status_code == 200
     assert fake.calls[0][1]["selector"] == {
         "scheduler_type": "slurm",
-        "cluster_name": "slurm-cluster",
-        "native_job_id": "9001",
+        "clusterName": "slurm-cluster",
+        "JobNativeID": "9001",
         "step_id": "2",
     }
 
@@ -278,7 +276,7 @@ def test_selector_missing_target_returns_404_and_no_fabricated_targets(install_c
         response={
             "status": "error",
             "code": "no_verified_instance",
-            "message": "no verified current instance for condor htcondor01 172.0",
+            "message": "no active instance for condor htcondor01 172.0",
         }
     )
 
@@ -287,7 +285,7 @@ def test_selector_missing_target_returns_404_and_no_fabricated_targets(install_c
     assert response.status_code == 404
     assert response.get_json() == {
         "code": "no_verified_instance",
-        "message": "no verified current instance for condor htcondor01 172.0",
+        "message": "no active instance for condor htcondor01 172.0",
     }
 
 
@@ -297,7 +295,7 @@ def test_selector_incomplete_native_namespace_is_rejected_before_rpc(install_cor
     response = _post_collection(
         _app().test_client(),
         {
-            "selector": {"scheduler_type": "condor", "native_job_id": "172.0"},
+            "selector": {"scheduler_type": "condor", "JobNativeID": "172.0"},
             "operation": "set",
             "collectors": ["cpumem_collector"],
         },
@@ -307,7 +305,7 @@ def test_selector_incomplete_native_namespace_is_rejected_before_rpc(install_cor
     assert fake.calls == []
     payload = response.get_json()
     assert payload["code"] == "invalid_request"
-    assert "cluster_name" in payload["message"]
+    assert "clusterName" in payload["message"]
 
 
 def test_selector_both_selector_forms_are_rejected(install_core) -> None:
@@ -315,13 +313,19 @@ def test_selector_both_selector_forms_are_rejected(install_core) -> None:
 
     response = _post_collection(
         _app().test_client(),
-        _set_body(selector={"instance_id": "inst-1", "native_job_id": "172.0"}),
+        _set_body(
+            selector={
+                "JobID": "42",
+                "scheduler_type": "condor",
+                "clusterName": "htcondor01",
+                "JobNativeID": "172.0",
+            }
+        ),
     )
 
     assert response.status_code == 400
     assert fake.calls == []
-    # 退役的 instance_id 键在任何组合里都是边界错误
-    assert "instance_id" in response.get_json()["message"]
+    assert "exactly one form" in response.get_json()["message"]
 
 
 def test_selector_non_object_request_body_is_rejected(install_core) -> None:
@@ -359,8 +363,8 @@ def test_selector_ambiguous_slurm_scope_returns_409_with_candidates(install_core
         _set_body(
             selector={
                 "scheduler_type": "slurm",
-                "cluster_name": "slurm-cluster",
-                "native_job_id": "9001",
+                "clusterName": "slurm-cluster",
+                "JobNativeID": "9001",
             }
         ),
     )
@@ -387,8 +391,8 @@ def test_selector_nested_core_error_envelope_preserves_code_and_candidates(insta
         _set_body(
             selector={
                 "scheduler_type": "slurm",
-                "cluster_name": "slurm-cluster",
-                "native_job_id": "9001",
+                "clusterName": "slurm-cluster",
+                "JobNativeID": "9001",
             }
         ),
     )
@@ -427,7 +431,7 @@ def test_control_set_distinguishes_accepted_from_applied(install_core) -> None:
     target = body["targets"][0]
     assert target["desired_collectors"] == ["cpumem_collector"]
     assert target["applied_collectors"] == []
-    assert target["record_revision"] == 3
+    assert target["revision"] == 3
     assert target["applied_attach_token"] == 0
     assert target["mode"] == "manual"
     assert target["errors"] == []
@@ -572,7 +576,7 @@ def test_control_instance_scope_forwards_expected_revision(install_core) -> None
     response = _post_collection(
         _app().test_client(),
         {
-            "selector": {"internal_job_id": "42"},
+            "selector": {"JobID": "42"},
             "operation": "set",
             "collectors": ["cpumem_collector"],
             "expected_revision": 2,
@@ -589,7 +593,7 @@ def test_control_core_down_returns_503_for_set_and_get(install_core) -> None:
     client = _app().test_client()
 
     set_response = _post_collection(client, _set_body())
-    get_response = client.get("/joblens/collection?internal_job_id=42")
+    get_response = client.get("/joblens/collection?JobID=42")
 
     assert set_response.status_code == 503
     assert get_response.status_code == 503
@@ -597,12 +601,12 @@ def test_control_core_down_returns_503_for_set_and_get(install_core) -> None:
     assert get_response.get_json()["code"] == "rpc_unavailable"
 
 
-def test_control_get_forwards_internal_job_id_and_passes_selection_through(install_core) -> None:
+def test_control_get_forwards_job_id_and_passes_selection_through(install_core) -> None:
     core_payload = {
         "status": "ok",
-        "instance_id": "inst-condor-01",
+        "JobID": "42",
         "mode": "manual",
-        "record_revision": 3,
+        "revision": 3,
         "applied_attach_token": 0,
         "desired_collectors": ["cpumem_collector"],
         "applied_collectors": [],
@@ -610,31 +614,32 @@ def test_control_get_forwards_internal_job_id_and_passes_selection_through(insta
     }
     fake = install_core(response=core_payload)
 
-    response = _app().test_client().get("/joblens/collection?internal_job_id=42")
+    response = _app().test_client().get("/joblens/collection?JobID=42")
 
     assert response.status_code == 200
-    assert fake.calls == [("jobs/collection/get", {"internal_job_id": "42"})]
+    assert fake.calls == [("jobs/collection/get", {"JobID": "42"})]
     assert response.get_json() == core_payload
 
 
-def test_control_get_legacy_instance_id_route_is_adapted(install_core) -> None:
-    """旧查询参数只保留在 Trigger 适配层，Core 只看到 internal_job_id。"""
-    fake = install_core(response={"status": "ok", "internal_job_id": "42"})
+def test_control_get_retired_instance_id_query_is_rejected(install_core) -> None:
+    """旧查询参数名已退役：边界显式拒绝，绝不下发 Core。"""
+    fake = install_core(response={"status": "ok"})
 
     response = _app().test_client().get("/joblens/collection?instance_id=42")
 
-    assert response.status_code == 200
-    assert fake.calls == [("jobs/collection/get", {"internal_job_id": "42"})]
+    assert response.status_code == 400
+    assert fake.calls == []
+    assert "JobID" in response.get_json()["message"]
 
 
-def test_control_get_requires_internal_job_id(install_core) -> None:
+def test_control_get_requires_job_id(install_core) -> None:
     fake = install_core(response={"status": "ok"})
 
     response = _app().test_client().get("/joblens/collection")
 
     assert response.status_code == 400
     assert fake.calls == []
-    assert "internal_job_id" in response.get_json()["message"]
+    assert "JobID" in response.get_json()["message"]
 
 
 def test_control_get_missing_instance_returns_404(install_core) -> None:
@@ -646,7 +651,7 @@ def test_control_get_missing_instance_returns_404(install_core) -> None:
         }
     )
 
-    response = _app().test_client().get("/joblens/collection?internal_job_id=999")
+    response = _app().test_client().get("/joblens/collection?JobID=999")
 
     assert response.status_code == 404
     assert response.get_json()["code"] == "not_found"
@@ -679,14 +684,14 @@ def test_control_per_target_applied_error_is_not_masked(install_core) -> None:
 def test_read_job_list_forwards_filters_and_paging(install_core) -> None:
     core_payload = {
         "snapshot_revision": 7,
-        "records": [{"instance_id": "inst-condor-01", "internal_job_id": "42"}],
+        "records": [{"JobID": "42", "JobNativeID": "172.0"}],
         "next_cursor": "cursor-2",
     }
     fake = install_core(response=core_payload)
 
     response = _app().test_client().get(
         "/joblens/jobs/list"
-        "?scheduler_type=condor&native_job_id=172.0&state=running&limit=2&cursor=cursor-1"
+        "?scheduler_type=condor&JobNativeID=172.0&state=running&limit=2&cursor=cursor-1"
     )
 
     assert response.status_code == 200
@@ -696,7 +701,7 @@ def test_read_job_list_forwards_filters_and_paging(install_core) -> None:
             {
                 "limit": 2,
                 "scheduler_type": "condor",
-                "native_job_id": "172.0",
+                "JobNativeID": "172.0",
                 "state": "running",
                 "cursor": "cursor-1",
             },
@@ -705,18 +710,6 @@ def test_read_job_list_forwards_filters_and_paging(install_core) -> None:
     body = response.get_json()
     assert body == core_payload
     assert set(body) == {"snapshot_revision", "records", "next_cursor"}
-
-
-def test_read_job_list_legacy_inventory_route_remains_an_alias(install_core) -> None:
-    """旧 URL 只作为 Trigger 侧适配层保留，仍转发到同一个 Core 方法。"""
-    fake = install_core(
-        response={"snapshot_revision": 1, "records": [], "next_cursor": None}
-    )
-
-    response = _app().test_client().get("/joblens/inventory?limit=2")
-
-    assert response.status_code == 200
-    assert fake.calls == [("jobs/list", {"limit": 2})]
 
 
 def test_read_job_list_defaults_limit_to_100(install_core) -> None:
@@ -753,8 +746,8 @@ def test_read_job_list_accepts_max_limit(install_core) -> None:
 
 def test_read_records_pass_through_decimal_string_ids_without_sentinel(install_core) -> None:
     records = [
-        {"instance_id": "inst-1", "internal_job_id": "42", "state": "running"},
-        {"instance_id": "inst-2", "internal_job_id": "9007199254740993", "state": "running"},
+        {"JobID": "42", "state": "running"},
+        {"JobID": "9007199254740993", "state": "running"},
     ]
     install_core(
         response={"snapshot_revision": 11, "records": records, "next_cursor": None}
@@ -765,8 +758,8 @@ def test_read_records_pass_through_decimal_string_ids_without_sentinel(install_c
     assert response.status_code == 200
     body = response.get_json()
     assert body["records"] == records
-    assert all(isinstance(record["internal_job_id"], str) for record in body["records"])
-    assert "0" not in [record["internal_job_id"] for record in body["records"]]
+    assert all(isinstance(record["JobID"], str) for record in body["records"])
+    assert "0" not in [record["JobID"] for record in body["records"]]
     assert len(body["records"]) == 2
 
 
@@ -867,7 +860,7 @@ def test_read_capabilities_are_forwarded_verbatim(install_core) -> None:
     assert response.get_json() == core_payload
 
 
-def test_v1_capabilities_keep_the_legacy_field_aliases(install_core) -> None:
+def test_v1_capabilities_do_not_inject_retired_inventory_aliases(install_core) -> None:
     install_core(response={
         "status": "ok",
         "api_version": 2,
@@ -881,8 +874,10 @@ def test_v1_capabilities_keep_the_legacy_field_aliases(install_core) -> None:
     payload = _app().test_client().get("/joblens/capabilities").get_json()
 
     assert payload["api_version"] == 2
-    assert payload["inventory_version"] == 1
-    assert payload["inventory_ready"] is True
+    # inventory_* 兼容键随 inventory 名词一起删除：v1 路径只透传 Core
+    assert "inventory_version" not in payload
+    assert "inventory_ready" not in payload
+    assert "inventory_enabled" not in payload
 
 
 def test_read_capabilities_are_not_invented_when_core_lacks_them(install_core) -> None:
@@ -912,7 +907,8 @@ def test_read_contract_violating_collection_target_is_not_reported_as_success(
     install_core(
         response={
             "status": "accepted",
-            "targets": [_target(internal_job_id=42)],
+            # JobID 是十进制字符串（JavaScript uint64 安全），数字违反契约
+            "targets": [_target(JobID=42)],
         }
     )
 
@@ -958,14 +954,14 @@ def test_job_namespace_claims_reach_rpc_unchanged(
     monkeypatch.setattr(tools, "use_rpc_opt", lambda: True)
     monkeypatch.setattr(tools, "config", {"lens_config": {"rpc_socket_path": "/tmp/test.sock"}})
     monkeypatch.setattr(tools, "RPCClient", FakeRPC)
-    body = {"opt": "add", "type": job_type, "cluster_name": cluster_name,
-            "cluster_tag": cluster_tag, "sub_attr": sub_attr}
+    body = {"opt": "add", "type": job_type, "clusterName": cluster_name,
+            "clusterTag": cluster_tag, "sub_attr": sub_attr}
     response = _app().test_client().post("/joblens/job", json=body)
 
     assert response.status_code == (500 if core_error else 200)
     assert len(calls) == 1 and calls[0][0] == "jobs/upsert"
-    assert calls[0][1]["cluster_name"] == cluster_name
-    assert calls[0][1]["cluster_tag"] == cluster_tag
+    assert calls[0][1]["clusterName"] == cluster_name
+    assert calls[0][1]["clusterTag"] == cluster_tag
     assert calls[0][1]["sub_attr"] == sub_attr
 
 
@@ -1028,14 +1024,15 @@ def test_erase_job_remove_erase_is_coerced_to_boolean(monkeypatch: pytest.Monkey
 
 def _record(**overrides: Any) -> dict:
     record = {
-        "internal_job_id": "42",
-        "native_job_id": "172.0",
+        "JobID": "42",
+        "JobNativeID": "172.0",
         "scheduler_type": "condor",
-        "cluster_name": "htcondor01",
-        "cluster_tag": "schedd-a",
+        "clusterName": "htcondor01",
+        "clusterTag": "schedd-a",
+        "revision": 3,
         "state": "active",
         "desired_collectors": ["cpumem_collector"],
-        "processes": [{"pid": 1235, "start_ticks": 1000, "boot_id": "boot"}],
+        "pid_identities": [{"pid": 1235, "start_ticks": 1000, "boot_id": "boot"}],
         "attributes": {"owner": "alice"},
     }
     record.update(overrides)
@@ -1058,18 +1055,18 @@ def test_v2_job_list_is_the_resource_page(install_core) -> None:
     assert response.get_json() == payload
 
 
-def test_v2_job_get_forwards_internal_job_id(install_core) -> None:
+def test_v2_job_get_forwards_job_id(install_core) -> None:
     fake = install_core(response={"status": "ok", **_record()})
 
     response = _app().test_client().get("/joblens/v2/jobs/42")
 
     assert response.status_code == 200
-    assert fake.calls == [("jobs/get", {"internal_job_id": "42"})]
-    assert response.get_json()["internal_job_id"] == "42"
+    assert fake.calls == [("jobs/get", {"JobID": "42"})]
+    assert response.get_json()["JobID"] == "42"
 
 
 def test_v2_job_upsert_omits_legacy_opt_field(install_core) -> None:
-    fake = install_core(response={"status": "success", "internal_job_id": "42"})
+    fake = install_core(response={"status": "success", "JobID": "42"})
 
     response = _app().test_client().put(
         "/joblens/v2/jobs",
@@ -1089,7 +1086,7 @@ def test_v2_job_upsert_omits_legacy_opt_field(install_core) -> None:
 
 
 def test_v2_job_create_is_strict_and_forwards_jobs_create(install_core) -> None:
-    fake = install_core(response={"status": "success", "internal_job_id": "42"})
+    fake = install_core(response={"status": "success", "JobID": "42"})
 
     response = _app().test_client().post(
         "/joblens/v2/jobs",
@@ -1106,7 +1103,7 @@ def test_v2_job_create_conflict_maps_to_409(install_core) -> None:
         "status": "error",
         "code": "already_exists",
         "message": "job instance 42 already exists",
-        "internal_job_id": "42",
+        "JobID": "42",
     })
 
     response = _app().test_client().post(
@@ -1152,7 +1149,7 @@ def test_v2_collection_subresource_verbs(install_core) -> None:
         "jobs/collection/set",
         "jobs/collection/reset",
     ]
-    assert fake.calls[1][1]["selector"] == {"internal_job_id": "42"}
+    assert fake.calls[1][1]["selector"] == {"JobID": "42"}
     assert fake.calls[1][1]["operation"] == "set"
     assert fake.calls[1][1]["expected_revision"] == 3
     assert fake.calls[2][1]["operation"] == "reset_auto"
@@ -1187,7 +1184,9 @@ def test_legacy_jobs_list_projects_the_new_record_shape(install_core) -> None:
     assert response.status_code == 200
     job = response.get_json()["jobs"][0]
     assert job["JobID"] == 42
-    assert job["NativeJobID"] == "172.0"
+    assert job["JobNativeID"] == "172.0"
+    assert job["clusterName"] == "htcondor01"
+    assert job["clusterTag"] == "schedd-a"
     assert job["JobPIDs"] == [1235]
     assert job["CollectorNames"] == ["cpumem_collector"]
     assert job["sub_attr"] == {"owner": "alice"}
@@ -1215,30 +1214,15 @@ def test_legacy_pid_tracker_uses_diagnostics(install_core) -> None:
     assert fake.calls == [("diagnostics/pid_tracker", {})]
 
 
-def test_v1_inventory_status_keeps_the_legacy_enabled_alias(install_core) -> None:
-    install_core(response={
-        "status": "healthy",
-        "enabled": True,
-        "sources": [],
-    })
+def test_v1_record_projection_keeps_the_facts_revision_alias() -> None:
+    """`facts_revision` 是 `revision` 的旧拼写，作为兼容别名保留。"""
+    from trigger.api.routes import _with_legacy_field_aliases
 
-    payload = _app().test_client().get("/joblens/inventory/status").get_json()
+    payload = _with_legacy_field_aliases(
+        {"records": [{"JobID": "42", "revision": 7}]}
+    )
 
-    assert payload["enabled"] is True
-    assert payload["inventory_enabled"] is True
-
-
-def test_v1_inventory_records_keep_the_legacy_facts_revision_alias(install_core) -> None:
-    install_core(response={
-        "status": "ok",
-        "snapshot_revision": 1,
-        "records": [{"internal_job_id": "42", "record_revision": 7}],
-        "next_cursor": None,
-    })
-
-    payload = _app().test_client().get("/joblens/inventory").get_json()
-
-    assert payload["records"][0]["record_revision"] == 7
+    assert payload["records"][0]["revision"] == 7
     assert payload["records"][0]["facts_revision"] == 7
 
 

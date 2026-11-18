@@ -76,7 +76,7 @@ _COLLECTION_ERROR_STATUS = {
     'invalid_selector': 400,
     'invalid_collectors': 400,
     'unknown_collector': 400,
-    # 404 no verified current instance
+    # 404 no active instance
     'not_found': 404,
     'no_verified_instance': 404,
     'instance_not_found': 404,
@@ -140,10 +140,13 @@ def _format_validation_error(exc: ValidationError) -> str:
     return '; '.join(parts) or 'invalid request body'
 
 
-def _candidate_instance_id(candidate):
-    """候选实例只暴露句柄，避免把内部结构当成契约泄漏出去。"""
+def _candidate_handle(candidate):
+    """候选实例只暴露句柄，避免把内部结构当成契约泄漏出去。
+
+    `JobID` 是规范键；`instance_id` / `instance` 作为旧信封的兼容别名保留。
+    """
     if isinstance(candidate, dict):
-        for key in ('instance_id', 'instance'):
+        for key in ('JobID', 'instance_id', 'instance'):
             if candidate.get(key) is not None:
                 return str(candidate[key])
         return str(candidate)
@@ -183,7 +186,7 @@ def _structured_core_error(payload):
         or payload.get('candidates') or payload.get('candidate_instance_ids')
     )
     candidates = (
-        [_candidate_instance_id(item) for item in raw_candidates]
+        [_candidate_handle(item) for item in raw_candidates]
         if isinstance(raw_candidates, list) else None
     )
 
@@ -198,16 +201,10 @@ def _with_legacy_field_aliases(payload):
     """v1 旧路径的字段别名；v2 只暴露新字段。"""
     if not isinstance(payload, dict):
         return payload
-    if 'enabled' in payload:
-        payload.setdefault('inventory_enabled', payload['enabled'])
-    if 'api_version' in payload:
-        # v1 advertised inventory_version=1; keep that value for old clients.
-        payload.setdefault('inventory_version', 1)
-    if 'ready' in payload:
-        payload.setdefault('inventory_ready', payload['ready'])
     for record in payload.get('records') or []:
-        if isinstance(record, dict) and 'record_revision' in record:
-            record.setdefault('facts_revision', record['record_revision'])
+        if isinstance(record, dict) and 'revision' in record:
+            # `facts_revision` is the retired v1 spelling of `revision`.
+            record.setdefault('facts_revision', record['revision'])
     return payload
 
 
@@ -230,15 +227,15 @@ def _legacy_job_from_record(record):
 
     旧版 API 的字段集合保持不变；新增字段只在 v2 的资源表示里出现。
     """
-    processes = record.get('processes') or []
+    pid_identities = record.get('pid_identities') or []
     return {
-        'JobID': int(record['internal_job_id']),
-        'NativeJobID': record.get('native_job_id', ''),
-        'clusterTag': record.get('cluster_tag', ''),
-        'cluster_name': record.get('cluster_name', ''),
+        'JobID': int(record['JobID']),
+        'JobNativeID': record.get('JobNativeID', ''),
+        'clusterTag': record.get('clusterTag', ''),
+        'clusterName': record.get('clusterName', ''),
         'jobtype': 'job',
         'subtype': record.get('scheduler_type') or 'common',
-        'JobPIDs': [process.get('pid') for process in processes
+        'JobPIDs': [process.get('pid') for process in pid_identities
                     if process.get('pid') is not None],
         'CollectorNames': record.get('desired_collectors') or [],
         'sub_attr': record.get('attributes') or {},
@@ -574,13 +571,8 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
 
     @app.route('/joblens/v2/jobs', methods=['GET'])
     @app.route('/joblens/jobs/list', methods=['GET'])
-    @app.route('/joblens/inventory', methods=['GET'])  # deprecated alias
     def job_list_page():
-        """分页查询作业列表，支持 scheduler_type/native_job_id/state/limit/cursor
-
-        `/joblens/inventory` 是旧路径的兼容 alias；新客户端使用
-        `/joblens/jobs/list`。
-        """
+        """分页查询作业列表，支持 scheduler_type/JobNativeID/state/limit/cursor"""
         raw_limit = request.args.get('limit')
         try:
             limit = JOB_LIST_DEFAULT_LIMIT if raw_limit in (None, '') else int(raw_limit)
@@ -594,25 +586,18 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             )
 
         params = {'limit': limit}
-        for name in ('scheduler_type', 'native_job_id', 'state', 'cursor'):
+        for name in ('scheduler_type', 'JobNativeID', 'state', 'cursor'):
             value = request.args.get(name)
             if value:
                 params[name] = value
 
-        return forward_core_rpc(
-            'jobs/list', params, JobListPageResponse,
-            legacy=(request.path == '/joblens/inventory'),
-        )
+        return forward_core_rpc('jobs/list', params, JobListPageResponse)
 
     @app.route('/joblens/v2/status', methods=['GET'])
     @app.route('/joblens/jobs/status', methods=['GET'])
-    @app.route('/joblens/inventory/status', methods=['GET'])  # deprecated alias
     def joblens_status():
         """透传 Core 的来源/持久化/队列/对账健康状态"""
-        return forward_core_rpc(
-            'joblens/status', {}, JobLensStatusResponse,
-            legacy=request.path.startswith('/joblens/inventory/status'),
-        )
+        return forward_core_rpc('joblens/status', {}, JobLensStatusResponse)
 
     @app.route('/joblens/collection', methods=['POST'])
     def collection_set():
@@ -638,22 +623,17 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     def collection_get():
         """查询单个实例的期望/已生效采集选择与错误
 
-        `internal_job_id` 是规范参数（十进制内部 ID）；`instance_id` 只作为
-        旧客户端的兼容 alias，Trigger 在边界统一成 Core 的新字段。
+        `JobID` 是唯一的实例句柄参数（内部记录 ID 的十进制字符串）；
+        旧参数名 `internal_job_id` / `instance_id` 已退役，Trigger 直接把
+        JobID 交给 Core。
         """
-        internal_job_id = (
-            request.args.get('internal_job_id')
-            or request.args.get('instance_id')
-            or ''
-        ).strip()
-        if not internal_job_id:
-            return _invalid_request(
-                'internal_job_id query parameter is required'
-            )
+        job_id = (request.args.get('JobID') or '').strip()
+        if not job_id:
+            return _invalid_request('JobID query parameter is required')
 
         return forward_core_rpc(
             'jobs/collection/get',
-            {'internal_job_id': internal_job_id},
+            {'JobID': job_id},
             CollectionStatusResponse,
         )
 
@@ -716,7 +696,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     def get_job_by_id(job_id: int):
         """获取指定 JobID 的详细信息（旧版 dump_job 形状）"""
         try:
-            result = core_rpc("jobs/get", {"internal_job_id": str(job_id)})
+            result = core_rpc("jobs/get", {"JobID": str(job_id)})
             error = _structured_core_error(result)
             if error is not None:
                 return error
@@ -744,7 +724,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     def get_job_v2(job_id: int):
         """获取单个作业资源。"""
         return forward_core_rpc(
-            'jobs/get', {'internal_job_id': str(job_id)}, JobDetailResponse
+            'jobs/get', {'JobID': str(job_id)}, JobDetailResponse
         )
 
     @app.route('/joblens/v2/jobs', methods=['POST'])
@@ -790,7 +770,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         """读取作业的期望/已生效采集选择。"""
         return forward_core_rpc(
             'jobs/collection/get',
-            {'internal_job_id': str(job_id)},
+            {'JobID': str(job_id)},
             CollectionStatusResponse,
         )
 
@@ -805,7 +785,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         except ValidationError as e:
             return _invalid_request(_format_validation_error(e))
         payload = {
-            'selector': {'internal_job_id': str(job_id)},
+            'selector': {'JobID': str(job_id)},
             'scope': 'instance',
             'operation': 'set',
             'collectors': req.collectors,
@@ -820,7 +800,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
     def reset_job_collection_v2(job_id: int):
         """清除 manual override，交回自动采集策略。"""
         payload = {
-            'selector': {'internal_job_id': str(job_id)},
+            'selector': {'JobID': str(job_id)},
             'scope': 'instance',
             'operation': 'reset_auto',
         }
