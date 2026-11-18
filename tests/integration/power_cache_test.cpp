@@ -280,7 +280,7 @@ int main(int argc, char** argv) {
         batch_fallback = false;
         run_empty(object.get(), jobs[0], jobs[1], false);
         run_empty(object.get(), jobs[0], jobs[1], true);
-        for (const auto& job : jobs) JobRegistry::instance().retireJob(job.JobID);
+        for (const auto& job : jobs) JobRegistry::instance().removeJob(job.JobID);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

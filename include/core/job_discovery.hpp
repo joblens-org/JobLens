@@ -33,7 +33,7 @@
 //      execution manager) or is explicitly incomplete with a reason on the
 //      execution group. There is no "best effort" middle state, and an
 //      incomplete discovery is not eligible for automatic collection or for
-//      retirement decisions.
+//      removal decisions.
 //   2. A failed or incomplete pass is never interpreted as "everything else
 //      ended". ManagerSet::complete says whether the pass covered the
 //      configured sources; a consumer must check it before treating absence as

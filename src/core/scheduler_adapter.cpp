@@ -43,7 +43,7 @@ RefreshResult ISchedulerAdapter::probeExecutionEvidence(
     RefreshResult result;
 
     // A record without a complete manager identity has no manager to probe:
-    // its pid identity list is the only evidence (exactly like the retirement pass).
+    // its pid identity list is the only evidence (exactly like the removal pass).
     const ProcessIdentity& manager = manager_of(job);
     if (manager.complete()) {
         const LivenessResult liveness =
@@ -122,7 +122,7 @@ RefreshResult ISchedulerAdapter::refreshPidIdentities(
     RefreshResult evidence = probeExecutionEvidence(job, process_probe, cgroup_probe);
     // A job-scoped cgroup that was read and listed no process is positive
     // termination evidence even when the record never carried its path: the
-    // read proves the execution scope is empty, which is what the retirement
+    // read proves the execution scope is empty, which is what the removal
     // rule needs. A shared daemon tree is discarded by read_job_membership and
     // never reaches this branch.
     if (membership.authoritative && membership.pids.empty())

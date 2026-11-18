@@ -8,7 +8,7 @@
 - 行编解码、批量写原子性、durability 分层、恢复围栏与自动 ID 分配。
 
 所有业务判定都在 `JobRegistry` 完成：记录合并、恢复验证、选择策略、归档与删除、
-退休时机。`JobRegistry` 在记录锁内完成“读事实 → 判定 → 变换”，然后调用
+移除时机。`JobRegistry` 在记录锁内完成“读事实 → 判定 → 变换”，然后调用
 `JobStore::commit()` 写入结果；`JobStore` 不解释这些行。
 
 ## 2. 持久化范围
@@ -36,7 +36,7 @@
 | `index_key` + `i:` 索引 | 重启后再观察时的身份解析（逻辑身份只从 facts 派生，不落行） |
 | `manager` / `pid_identities` / `pids` | 防 PID 复用的恢复验证证据：`manager` 三元组、成员身份三元组（`pid` + `start_ticks` + `boot_id`），以及由 `pid_identities` 派生的裸 pid 投影 `pids`；三者都落行。`pid_identities_authoritative` 与 `read_order` 不落盘，恢复后分别为 `false` / `0`。判定逻辑在 registry |
 | `revision` | 变更定序与 CAS |
-| `first_seen_us` / `last_seen_us` | 退休时限判定 |
+| `first_seen_us` / `last_seen_us` | 移除判定依据 |
 | `quarantined`（不落盘） | 当前没有隔离层：行内不写该键，健康计数 `quarantined_identities` 恒为 0 |
 
 采集选择不单独携带 revision：`JobRecord::revision` 是唯一单调计数器，选择命令的
@@ -118,7 +118,7 @@ public:
 | 业务动作 | 责任方 |
 |---|---|
 | upsert 合并、事实更新、身份解析 | `JobRegistry` |
-| 恢复验证、suspect 标记、退休判定 | `JobRegistry` |
+| 恢复验证、suspect 标记、移除判定 | `JobRegistry` |
 | manual / automatic 选择策略与 CAS | `JobRegistry` |
 | 归档分流（采集过 → `h:`，未采集 → 删除） | `JobRegistry` 判定，`JobStore` 执行 |
 | 内核归因 PID 增删、运行中执行验证 | `JobRegistry` / `KernelAttribution` |

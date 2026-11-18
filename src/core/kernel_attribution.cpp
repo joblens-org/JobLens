@@ -65,7 +65,7 @@ bool KernelAttribution::start()
         // 内核已从 pid2job 删除, 这里同步移除用户态 Job.JobPIDs。
         if (host_.attributionJobExists(job_id))
             host_.attributionJobRemovePid(job_id, static_cast<pid_t>(pid));
-        // Maintenance/heartbeat owns fact refresh and retirement; the kernel
+        // Maintenance/heartbeat owns fact refresh and removal; the kernel
         // callback only hands over a cheap hint, never discovery I/O.
         host_.attributionExitHint(static_cast<pid_t>(pid));
     });

@@ -140,9 +140,9 @@ struct JobRegistryOptions {
     bool test_heartbeat = false;
     // Test-only escape hatch: construct a purely static registry
     // (no heartbeat, no discovery sources, no maintenance pass — only the
-    // restored rows, manual CRUD, the read surface and explicit retirement).
+    // restored rows, manual CRUD, the read surface and explicit removal).
     // Production never sets it: the registry stack stays armed so registered
-    // jobs keep their retirement/checkpoint upkeep.
+    // jobs keep their removal/checkpoint upkeep.
     bool test_static_registry = false;
     // Liveness probe overrides (empty = production /proc/cgroup probes).
     ProcessLivenessProbe test_process_probe;
@@ -185,20 +185,19 @@ public:
     // Thin alias for the CREATE branch — the historical manual registration
     // entry.
     bool addJob(const Job& job);
-    // Thin alias for retireInstance: it begins a retirement, it does not
-    // promise deletion.
-    void retireJob(uint64_t jobID);
-    // Begin retirement: durably mark the record Closing, capture the
+    // Begin removal: durably mark the record Closing, capture the
     // runtime-applied collector snapshot and report whether that durable
-    // Closing was accepted. The drain, checked kernel cleanup and the archive
-    // that follow belong to onDrained() / cleanupThenArchive(); a record whose
-    // Closing write fails stays Active and retryable.
-    bool retireInstance(uint64_t jobID);
-    // 通过 sub_attr 匹配发起退休，返回被接受的退休数量（不是删除数量）
-    size_t retireMatchingJobs(const SubAttrMatcher& matcher);
+    // Closing was accepted. Deletion/archival is asynchronous — the drain,
+    // checked kernel cleanup and the archive belong to onDrained() /
+    // cleanupThenArchive() — so true means "the removal started", not "the
+    // record is gone". A record whose Closing write fails stays Active and
+    // retryable.
+    bool removeJob(uint64_t jobID);
+    // 通过 sub_attr 匹配发起移除，返回被接受的移除数量（不是已删除数量）
+    size_t removeMatchingJobs(const SubAttrMatcher& matcher);
     size_t closingJobCount() const;
     bool cleanupClosingJobs();
-    // Read-only snapshot: no refresh, no PID pruning, no retirement.
+    // Read-only snapshot: no refresh, no PID pruning, no removal.
     std::optional<Job> findJob(uint64_t jobID);
     // 通过 sub_attr 匹配查找作业，返回匹配的作业列表
     std::vector<Job> findJob(const SubAttrMatcher& matcher) const;
@@ -243,7 +242,7 @@ public:
     // Automatic policy decision for a batch of instances. Manual overrides,
     // including empty ones, are never overwritten.
     CollectionOutcome applyAutoPolicy(const std::vector<AutoSelection>& selections);
-    // Test seam: replaces the kernel-cleanup step so the retirement ordering
+    // Test seam: replaces the kernel-cleanup step so the removal ordering
     // (closing -> cleanup -> archive) can be exercised without BPF. Production
     // leaves it unset and uses KernelAttribution; it grants no way to write job
     // state.
@@ -281,7 +280,7 @@ public:
     // Stop discovery admission and polling. Must run before the collector
     // scheduler drains. Idempotent.
     void stopDiscovery();
-    // Finalize retirements, stop the heartbeat, archive closing records and
+    // Finalize removals, stop the heartbeat, archive closing records and
     // close the store. Returns false when a closing record could not be
     // archived (the incomplete state stays persisted). Idempotent; the
     // destructor calls it as a fallback.
@@ -289,7 +288,7 @@ public:
 
     // --- Registry heartbeat --------------------------------------------------
     // One on-demand authoritative pass (the `ensure_registered` refresh
-    // provider): scan -> upsert -> hint merge -> retirement -> reconciliation,
+    // provider): scan -> upsert -> hint merge -> removal -> reconciliation,
     // exactly what the periodic worker runs. Returns false when the heartbeat
     // is not running.
     bool reconcileNow();
@@ -442,7 +441,7 @@ private:
     // the collection runtime keeps reading the previous image while the store
     // writes, exactly as it did when publication happened after the store
     // call — the runtime converges in that window (bind -> attach before a
-    // retire's drain).
+    // removal's drain).
     mutable std::mutex mutation_mtx_;
 
     // Registry-side record-map accessors and publish points. Query helpers
@@ -584,7 +583,7 @@ private:
     // refused manager/identity merge). Observability only: a record that
     // failed to refresh is retried next pass.
     std::uint64_t hb_refresh_failures_ = 0;
-    std::uint64_t hb_retirements_ = 0;
+    std::uint64_t hb_removals_ = 0;
     std::uint64_t hb_passes_ = 0;
     std::uint64_t hb_stop_errors_ = 0;
     // Bumped by every noteHeartbeatError(); a pass uses it to tell whether an
@@ -632,7 +631,7 @@ private:
     // pipeline instead of one procedure that owns both flow and work.
     bool runPass(bool do_scan, bool wait, bool refresh_facts = true);
 
-    // Result of the one eager refresh of a record: the evidence the retirement
+    // Result of the one eager refresh of a record: the evidence the removal
     // rule consumes, plus whether any pid identity survived the merge (a
     // record with no pid identity evidence at all is "retry later", not "all dead").
     struct RefreshedEvidence {
@@ -708,14 +707,14 @@ private:
     // the execution-evidence merge, the single durable batch and the runtime
     // wake. Metadata and identity are never rewritten (the record is a creation
     // snapshot). Nullopt means the record moved on (archived, closing, newer
-    // facts, refused merge) and the evidence must not be used for retirement.
+    // facts, refused merge) and the evidence must not be used for removal.
     std::optional<RefreshedEvidence> applyRefreshedRecord(const JobRecord& snapshot,
                                                           Job refreshed,
                                                           RefreshResult evidence);
     // The merge keeps the stored pid identity set when a refresh produced an empty,
     // non-authoritative read (a failed legacy/host read, not a confirmed empty
-    // scope). The retirement evidence must describe those same survivors:
-    // probing only the refreshed image would read "all dead" and retire an
+    // scope). The removal evidence must describe those same survivors:
+    // probing only the refreshed image would read "all dead" and remove an
     // execution whose child is still alive.
     void probeSurvivingPidIdentities(const Job& stored, const Job& refreshed,
                                      RefreshResult& evidence) const;
@@ -730,15 +729,15 @@ private:
     // Re-evaluates the automatic decision for live instances that never got a
     // durable one. Bounded per pass so the heartbeat keeps its cadence.
     void repairMissingInitialDecisions();
-    // Absence accounting plus the retirement verdict. The pass context carries
+    // Absence accounting plus the removal verdict. The pass context carries
     // both: `scan_seq` is the observation sequence captured before the pass
     // began (a registration accepted on another thread during the pass carries
     // a greater sequence and therefore counts as observed), and `refreshed`
     // carries this pass' evidence per record, so no record is probed twice. A
     // targeted pass (`enumerate` false) has no authoritative coverage and never
     // counts an absence.
-    void evaluateRetirements(const PassRun& pass);
-    bool retireIfConfirmed(const JobRecord& record, const std::string& reason);
+    void evaluateRemovals(const PassRun& pass);
+    bool removeIfConfirmed(const JobRecord& record, const std::string& reason);
     void rememberEnded(const JobRecord& record);
     bool isObsolete(const SchedulerKey& key, const ProcessIdentity& gen);
     void publishStatusProvider();
@@ -771,7 +770,7 @@ private:
     void stop_pid_tracker();
     std::unique_ptr<KernelAttribution> attribution_;
     // 内核登记入口：KernelAttribution 的生命周期调用薄封装（Added/Removed）。
-    // Serializes activation against retirement so a stale snapshot cannot
+    // Serializes activation against removal so a stale snapshot cannot
     // revive a closing owner.
     bool sync_job_to_kernel(const Job& job);
     // Discovery/startup repair: (re)installs the kernel projection of one
@@ -792,12 +791,12 @@ private:
     mutable std::mutex drain_mtx_;
     std::set<uint64_t> drain_complete_;
     // Fact snapshot of what the collection runtime really had attached when a
-    // retirement was accepted, taken at the closing transition while the
+    // removal was accepted, taken at the closing transition while the
     // runtime still holds the instance. Runtime state only: never persisted,
     // lost on restart (a restored closing falls back to the durable selection
     // at archive time). Decides archive-versus-discard.
-    mutable std::mutex retire_applied_mtx_;
-    std::unordered_map<uint64_t, std::vector<std::string>> retire_applied_;
+    mutable std::mutex removal_applied_mtx_;
+    std::unordered_map<uint64_t, std::vector<std::string>> removal_applied_;
     // KernelAttribution::Host — the registry-side projection updates.
     bool attributionJobExists(uint64_t job_id) override;
     void attributionJobAddPid(uint64_t job_id, pid_t pid) override;

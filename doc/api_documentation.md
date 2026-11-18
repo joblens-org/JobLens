@@ -108,7 +108,7 @@ Generic job operation (add or remove).
 | `JobPIDs` | array[int] | No | Bare pid list, accepted on the v1 job endpoints; the legacy `dump_job`/Lua name for the `pids` projection of `pid_identities` |
 | `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "io_collector", "net_collector"]`) |
 | `sub_attr` | object | No | Sub-attributes: `condor` type needs `cluster_id`/`proc_id`, `slurm` type needs `job_id`/`step_id` |
-| `erase` | bool | No | For `remove` only. `false` or absent keeps the stop tier: collection stops, the job record remains. `true` retires the instance: a collected instance is archived as an `h:` history row, a never-collected instance is deleted |
+| `erase` | bool | No | For `remove` only. `false` or absent keeps the stop tier: collection stops, the job record remains. `true` removes the instance: a collected instance is archived as an `h:` history row, a never-collected instance is deleted |
 
 **Example request:**
 ```json
@@ -698,7 +698,7 @@ legacy `dump_job` name for the bare `pids` projection of `pid_identities`).
 | `GET` | `/joblens/v2/jobs/<JobID>` | One job record |
 | `POST` | `/joblens/v2/jobs` | Strict create (`jobs/create`); an existing identity or ID returns 409 |
 | `PUT` | `/joblens/v2/jobs` | Identity-resolved upsert (`jobs/upsert`); body has no `opt` field |
-| `DELETE` | `/joblens/v2/jobs/<JobID>` | Erase/retire (`jobs/erase`) |
+| `DELETE` | `/joblens/v2/jobs/<JobID>` | Erase/remove (`jobs/erase`) |
 | `POST` | `/joblens/v2/jobs/<JobID>/stop` | Stop collection, retain the record (`jobs/stop`) |
 | `GET` | `/joblens/v2/jobs/<JobID>/collection` | Desired/applied collection state |
 | `PUT` | `/joblens/v2/jobs/<JobID>/collection` | Replace desired collectors (`{"collectors": [...]}`; `[]` stops) |

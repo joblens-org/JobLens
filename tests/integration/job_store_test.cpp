@@ -698,19 +698,19 @@ void write_failures_reject_mutations_without_id_reuse(const std::string& base)
 
     // (4) Archive transaction failure must keep the instance active.
     registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite);
-    check(!registry.retireInstance(retried.job_id),
-          "a failed archive must not report durable retirement");
+    check(!registry.removeJob(retried.job_id),
+          "a failed archive must not report durable removal");
     check(registry.findJob(retried.job_id).has_value(),
           "a failed archive must leave the instance readable");
     check(registry.jobRecord(retried.job_id).has_value(),
           "a failed archive must leave the job record intact");
 
-    check(registry.retireInstance(retried.job_id),
-          "retirement must succeed once the store recovers");
+    check(registry.removeJob(retried.job_id),
+          "removal must succeed once the store recovers");
     check(!registry.findJob(retried.job_id).has_value(),
-          "successful retirement removes the active record");
+          "successful removal removes the active record");
     check(revision_of(registry, retried.job_id) == 0,
-          "successful retirement removes the record, not just its selection");
+          "successful removal removes the record, not just its selection");
 
     registry.clearStoreFaultsForTest();
 }
@@ -725,13 +725,13 @@ void closing_state_is_durable_and_not_resurrected(const std::string& base)
         check(created.ok, "baseline registration must succeed");
         job_id = created.job_id;
 
-        // A subscriber makes the retirement a drain: the record must survive
+        // A subscriber makes the removal a drain: the record must survive
         // the process as closing, not as an active instance. The injected
         // fault models the archive failing (or the process dying) before the
         // drain completes — exactly the restart scenario being tested.
         install_deferred_drain(registry, [](JobEvent, const Job&) {});
-        check(registry.retireInstance(job_id),
-              "retirement with a subscriber must be accepted");
+        check(registry.removeJob(job_id),
+              "removal with a subscriber must be accepted");
         check(!has_active(registry, job_id),
               "a closing instance must leave the active map");
         check(registry.jobRecord(job_id).has_value(),
@@ -745,7 +745,7 @@ void closing_state_is_durable_and_not_resurrected(const std::string& base)
     }
 
     {
-        // Restart on the same DB: the interrupted retirement must be restored
+        // Restart on the same DB: the interrupted removal must be restored
         // as closing, never as an active job, and observations of the same
         // identity must be refused instead of resurrecting the instance.
         JobRegistry registry(isolated(path));
@@ -763,7 +763,7 @@ void closing_state_is_durable_and_not_resurrected(const std::string& base)
         check(!late.ok && late.error == "instance_closing",
               "a closing instance must reject late observations, got " + late.error);
 
-        // The closing cleanup finishes the interrupted retirement.
+        // The closing cleanup finishes the interrupted removal.
         check(registry.cleanupClosingJobs(), "the closing cleanup must archive the record");
         check(!registry.jobRecord(job_id).has_value(),
               "the archive must remove the closing record");
@@ -1398,12 +1398,12 @@ void archived_instances_leave_no_active_row(const std::string& base)
         check(committed.ok, "binding must commit: " + committed.message);
         test_runtime(registry).reconcile(id);
 
-        // Retirement is accepted as a durable Closing revision; the runtime's
+        // Removal is accepted as a durable Closing revision; the runtime's
         // own pass proves the boundary and the archive releases the identity.
-        check(registry.retireInstance(id), "retirement must be accepted");
+        check(registry.removeJob(id), "removal must be accepted");
         check(registry.jobRecord(id).has_value() &&
                   registry.jobRecord(id)->state == RecordState::Closing,
-              "the accepted retirement must stay Closing until the runtime drains");
+              "the accepted removal must stay Closing until the runtime drains");
         test_runtime(registry).reconcile(id);
         check(!registry.jobRecord(id).has_value(),
               "the archived instance must leave the active map");
@@ -1566,8 +1566,8 @@ void closing_write_failure_keeps_the_instance(const std::string& base)
     });
 
     registry.injectStoreFaultForTest(StoreFaultMode::FailBeforeWrite);
-    check(!registry.retireInstance(created.job_id),
-          "a failed closing sync must refuse retirement");
+    check(!registry.removeJob(created.job_id),
+          "a failed closing sync must refuse removal");
     registry.clearStoreFaultsForTest();
 
     check(removed_events == 0,
@@ -1576,7 +1576,7 @@ void closing_write_failure_keeps_the_instance(const std::string& base)
     check(record.has_value() && record->state == RecordState::Active,
           "a failed closing sync must leave the instance active");
     check(registry.findJob(created.job_id).has_value(),
-          "the instance must remain readable after the refused retirement");
+          "the instance must remain readable after the refused removal");
 }
 
 // canonical marker ----------------------------------------------------
@@ -1644,7 +1644,7 @@ void ambiguous_closing_state_is_not_reverted(const std::string& base)
 
         registry.injectStoreFaultForTest(StoreFaultMode::FailAfterWrite, /*skip=*/0,
                                          /*count=*/1);
-        check(!registry.retireInstance(id),
+        check(!registry.removeJob(id),
               "an ambiguous closing write must not report success");
         check(registry.storeHealth().recovery_required,
               "the ambiguous closing write must latch recovery");
@@ -1665,7 +1665,7 @@ void ambiguous_closing_state_is_not_reverted(const std::string& base)
         check(!late.ok && late.error == "instance_closing",
               "the restored closing reservation must reject a late observation");
         check(reopened.cleanupClosingJobs(),
-              "the closing cleanup must finish the interrupted retirement");
+              "the closing cleanup must finish the interrupted removal");
         check(!reopened.jobRecord(id).has_value(),
               "the archive removes the closing record");
         const auto replacement = reopened.upsertObservedJob(condor_observation("172.0"));
@@ -1704,18 +1704,18 @@ void cleanup_failure_keeps_the_closing_reservation(const std::string& base)
     check(created.ok, "baseline registration must succeed");
     const uint64_t id = created.job_id;
 
-    // The runtime owns the drain: install it before the command so retirement
+    // The runtime owns the drain: install it before the command so removal
     // is accepted as Closing and the cleanup runs only after the runtime
     // proves the boundary.
     install_deferred_drain(registry);
-    check(registry.retireInstance(id), "the retirement must be accepted");
+    check(registry.removeJob(id), "the removal must be accepted");
     const auto closing = registry.jobRecord(id);
     check(closing.has_value() && closing->state == RecordState::Closing,
-          "the accepted retirement is durable Closing before any cleanup");
+          "the accepted removal is durable Closing before any cleanup");
     check(test_runtime(registry).reconcile(id),
           "the runtime must accept the Closing record");
     check(!test_runtime(registry).completeDrain(id),
-          "a failed kernel cleanup must not report a completed retirement");
+          "a failed kernel cleanup must not report a completed removal");
     check(cleanup_calls == 1, "the cleanup must be attempted");
     check(record_visible_during_cleanup,
           "the cleanup must run while the durable record still exists");
@@ -1736,7 +1736,7 @@ void cleanup_failure_keeps_the_closing_reservation(const std::string& base)
           "the identity must still resolve to the closing instance");
 
     check(test_runtime(registry).completeDrain(id),
-          "the retry must finish the retirement once cleanup succeeds");
+          "the retry must finish the removal once cleanup succeeds");
     check(cleanup_calls == 2, "the retry must run the cleanup again");
     check(!registry.jobRecord(id).has_value(),
           "the successful retry archives the record");
@@ -1749,7 +1749,7 @@ void cleanup_failure_keeps_the_closing_reservation(const std::string& base)
 // ambiguous closing retry ---------------------------------------------
 
 // A closing write whose outcome is unknown may have landed. Memory keeps the
-// active view until recovery, so the first retire reports failure without a
+// active view until recovery, so the first remove reports failure without a
 // Removed. The retry adopts the durable closing row and must dispatch the
 // missing drain exactly once instead of returning "closing and subscribed"
 // forever; after the subscriber acks, the record is archived and the identity
@@ -1773,7 +1773,7 @@ void ambiguous_closing_retry_restores_the_drain(const std::string& base)
 
     registry.injectStoreFaultForTest(StoreFaultMode::FailAfterWrite, /*skip=*/0,
                                      /*count=*/1);
-    check(!registry.retireInstance(id),
+    check(!registry.removeJob(id),
           "an ambiguous closing write must not report success");
     check(registry.storeHealth().recovery_required,
           "the ambiguous closing write must latch recovery");
@@ -1783,7 +1783,7 @@ void ambiguous_closing_retry_restores_the_drain(const std::string& base)
           "memory keeps the active view until recovery");
 
     registry.clearStoreFaultsForTest();
-    check(registry.retireInstance(id),
+    check(registry.removeJob(id),
           "the retry must accept the recovered closing record");
     check(test_runtime(registry).reconcile(id),
           "the runtime must resume the drain for the recovered record");
@@ -1833,7 +1833,7 @@ void cleanup_failure_after_ack_is_retryable(const std::string& base)
     check(created.ok, "baseline registration must succeed");
     id = created.job_id;
 
-    check(registry.retireInstance(id), "retirement must be accepted");
+    check(registry.removeJob(id), "removal must be accepted");
     check(removed_events == 0, "acceptance alone does not dispatch a drain");
     check(test_runtime(registry).reconcile(id), "the runtime must start the drain");
     check(removed_events == 1, "one Removed starts the drain");
@@ -1842,10 +1842,10 @@ void cleanup_failure_after_ack_is_retryable(const std::string& base)
     check(closing.has_value() && closing->state == RecordState::Closing,
           "a cleanup failure after the ack keeps the closing reservation");
     check(!has_active(registry, id), "a closing reservation is not an active instance");
-    check(registry.retireInstance(id),
-          "a second retire is an idempotent acceptance of the same Closing record");
+    check(registry.removeJob(id),
+          "a second remove is an idempotent acceptance of the same Closing record");
     check(removed_events == 1,
-          "the second retire must not emit a second Removed");
+          "the second remove must not emit a second Removed");
 
     check(test_runtime(registry).completeDrain(id),
           "the ack retry must finish the cleanup and archive");
@@ -2017,7 +2017,7 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
     {
         JobRegistry registry(isolated(path));
         // The archive path only fires for an instance that WAS collected: the
-        // registry captures the runtime's actual attachment at the retire
+        // registry captures the runtime's actual attachment at the removal
         // decision point. Attach a collector first so this stays the archive
         // (history-row) scenario; a never-collected instance is the discard
         // scenario covered by its own case below.
@@ -2039,18 +2039,18 @@ void ambiguous_archive_is_fenced_from_the_durable_image(const std::string& base)
         test_runtime(registry).reconcile(id);
 
         const auto before_archive = registry.jobRecord(id);
-        check(before_archive.has_value(), "the instance must be readable before retirement");
+        check(before_archive.has_value(), "the instance must be readable before removal");
         archived_first_seen = before_archive->first_seen_us;
 
-        // This retirement makes two durable writes: the closing state and then
+        // This removal makes two durable writes: the closing state and then
         // the archive. `skip=1` lands the injected failure on the archive.
         registry.injectStoreFaultForTest(StoreFaultMode::FailAfterWrite, /*skip=*/1,
                                          /*count=*/1);
-        // With a runtime holding the instance the retirement is accepted
+        // With a runtime holding the instance the removal is accepted
         // immediately; the runtime's own pass drives the drain and the archive,
         // and it is that archive write whose outcome becomes ambiguous.
-        check(registry.retireInstance(id),
-              "retirement with a subscriber must be accepted");
+        check(registry.removeJob(id),
+              "removal with a subscriber must be accepted");
         test_runtime(registry).reconcile(id);
         registry.clearStoreFaultsForTest();
 
@@ -2202,11 +2202,11 @@ void never_collected_instances_are_discarded(const std::string& base)
     {
         JobRegistry registry(isolated(path));
         // No runtime is installed: nothing can ever have collected the job, and
-        // the retirement finalizes synchronously.
+        // the removal finalizes synchronously.
         const auto created = registry.upsertObservedJob(condor_observation("172.0"));
         check(created.ok, "baseline registration must succeed");
         id = created.job_id;
-        check(registry.retireInstance(id), "retirement must be accepted");
+        check(registry.removeJob(id), "removal must be accepted");
         check(!registry.jobRecord(id).has_value(),
               "the discarded instance must leave the active map");
         check(registry.deinit(), "shutdown must not fail after a clean discard");
@@ -2235,8 +2235,8 @@ void ambiguous_discard_is_confirmed_by_the_missing_row(const std::string& base)
         // (lands, reports failure).
         registry.injectStoreFaultForTest(StoreFaultMode::FailAfterWrite, /*skip=*/1,
                                          /*count=*/1);
-        check(!registry.retireInstance(id),
-              "an ambiguous discard must not report a completed retirement");
+        check(!registry.removeJob(id),
+              "an ambiguous discard must not report a completed removal");
         registry.clearStoreFaultsForTest();
 
         const auto latched = registry.storeHealth();
@@ -2285,8 +2285,8 @@ void restored_closing_archives_with_effective_fallback(const std::string& base)
         const auto committed = registry.applyAutoPolicy(
             {{id, {"disk_collector"}, "fallback"}});
         check(committed.ok, "binding must commit: " + committed.message);
-        check(registry.retireInstance(id),
-              "retirement with a subscriber must be accepted");
+        check(registry.removeJob(id),
+              "removal with a subscriber must be accepted");
         // The shutdown checkpoint is skipped so the injected failure lands on
         // the archive write: the closing row survives as if the process died
         // between the closing transition and the archive.

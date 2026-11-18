@@ -303,8 +303,8 @@ void run(const std::string& base) {
     const auto status = rpc(socket_path, "CollectorScheduler/status");
     check(status["operation_semantics_version"] == 2, "missing operation_semantics_version 2");
 
-    JobRegistry::instance().retireJob(9001);
-    JobRegistry::instance().retireJob(9002);
+    JobRegistry::instance().removeJob(9001);
+    JobRegistry::instance().removeJob(9002);
     scheduler.shutdown();
     WriterManager::instance().shutdown();
     server.stop();

@@ -80,7 +80,7 @@ void registerJobsRpc(JobRegistry& registry) {
         }
     );
 
-    // Delete/retire the job record for real.
+    // Delete/remove the job record for real.
     RPCServer::instance().register_method("jobs/erase",
         [&registry](const nlohmann::json& req) -> nlohmann::json {
             if (!req.is_object())

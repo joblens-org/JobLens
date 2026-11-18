@@ -992,7 +992,7 @@ void run(const std::string& base)
                "frame delivered together with hangup was lost");
     check(!captured_contains("stream_sys", "two"), "partial frame was emitted early");
     check(StreamSystemEvent::connections_active.load() == 1,
-          "disconnected client was not retired");
+          "disconnected client was not removed");
 
     second.send_bytes("o", 1); // completes the buffered frame
     eventually([&] { return captured_contains("stream_sys", "two"); },

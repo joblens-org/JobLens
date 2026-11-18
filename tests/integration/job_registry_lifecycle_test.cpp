@@ -18,7 +18,7 @@
  *     configured discovery type;
  *   * stopDiscovery() is idempotent and keeps the status provider
  *     published while records drain;
- *   * deinit() finalizes retirements, closes the store, retracts the
+ *   * deinit() finalizes removals, closes the store, retracts the
  *     providers and is idempotent; the destructor only backstops it.
  */
 #include "common/config.hpp"
@@ -200,7 +200,7 @@ void manual_readd_preserves_creation_metadata(const std::string& base)
         error = "leave the row closing for the stale-target check";
         return false;
     });
-    check(!registry.retireInstance(created.job_id),
+    check(!registry.removeJob(created.job_id),
           "manual freeze: failed cleanup must retain a closing row");
     request.CollectorNames.clear();
     const auto closing = JobRegistryNamespaceTestAccess::update(registry, *initial, request);
@@ -385,11 +385,11 @@ void run(const std::string& base)
         const auto job = make_common_job();
         check(registry.addJob(job), "legacy registration must succeed");
         const uint64_t id = registry.jobRecords().front().job.JobID;
-        check(registry.retireInstance(id), "retire the instance");
+        check(registry.removeJob(id), "remove the instance");
         check(!registry.jobRecord(id).has_value(),
-              "retirement without subscribers archives immediately");
+              "removal without subscribers archives immediately");
 
-        check(registry.deinit(), "deinit after retirement must succeed");
+        check(registry.deinit(), "deinit after removal must succeed");
     }
 
     // Automatic selection: with auto_add armed, every created

@@ -20,10 +20,10 @@
  *   * start-before-scan: events injected during a scan are replayed,
  *     duplicate hints do not duplicate records, obsolete hints do not
  *     resurrect an ended manager
- *   * one missed scan recovers; two complete absences retire; failed or
+ *   * one missed scan recovers; two complete absences remove; failed or
  *     incomplete scans never count as absence
- *   * empty PID list with a live manager/cgroup does not retire; positive
- *     evidence (manager ended + confirmed empty cgroup) retires
+ *   * empty PID list with a live manager/cgroup does not remove; positive
+ *     evidence (manager ended + confirmed empty cgroup) removes
  *   * EPERM/unreadable/unresolved input is unknown, not death; incomplete
  *     identities stay visible and retried; no wrong merge
  *   * tracker-unavailable mode (source started without an event source)
@@ -32,14 +32,14 @@
  *   * reads are side-effect free; snapshots coherent; sentinel excluded
  *   * heartbeat stop is idempotent and ordered; a failed source start is
  *     not fatal; an interrupted closing survives a restart and archives
- *   * unknown cgroup members are not death evidence; confirmed death retires
- *   * RETIRE-EXPLICIT: an explicit retirement marks the ended manager; a
+ *   * unknown cgroup members are not death evidence; confirmed death removes
+ *   * REMOVE-EXPLICIT: an explicit removal marks the ended manager; a
  *     late same-manager observation is refused, a new one registers
  *   * ADMIT: the capture_all admission gate (capture_all/auto_add
  *     combinations), drop/reject counters, NotAdmitted on the event path
  *   * STOP-PIN: a manual empty selection survives scan rotation and fact
  *     changes; automatic policy never re-pins collectors over a stop
- *   * LEGACY: manual registrations retire on process evidence without a source
+ *   * LEGACY: manual registrations remove on process evidence without a source
  *   * RESCAN: event-driven and on-demand passes run the same reconcile path
  *   * EXEC: exec hints resolve to targeted observations without a full scan
  *   * EXEC2: an incomplete exec observation converges through a coalesced
@@ -48,7 +48,7 @@
  *     advertisement under a known manager never reaches the record
  *   * MANUAL-REFRESH: a manual record keeps manager/members through the
  *     adapter refresh and a no-change refresh moves no revision
- *   * MANUAL-ABSENCE: a manual record retires on two complete manager-miss
+ *   * MANUAL-ABSENCE: a manual record removes on two complete manager-miss
  *     passes when positive evidence is blocked
  *   * EVENT-ADMISSION: admission is a creation gate; a closed gate still
  *     updates a tracked identity (evidence and provenance, never the creation
@@ -471,7 +471,7 @@ bool wait_until(Predicate predicate, int timeout_ms)
 }
 
 // Waits until the heartbeat drained its queued hints, so an explicit pass
-// evaluates retirements against an empty observation set.
+// evaluates removals against an empty observation set.
 void wait_hb_quiet()
 {
     wait_until([] {
@@ -688,9 +688,9 @@ void run_a08(const std::string& base)
     probes.set_process(5101, LivenessState::Dead);
     probes.set_cgroup("/cg/slot-2", {}, true);
     source.set_scan([&]() { return scan_with({}); });
-    check(registry.reconcileNow(), "the retirement pass did not run");
+    check(registry.reconcileNow(), "the removal pass did not run");
     check(!find_native(registry, "101.0").has_value(),
-          "terminated execution not retired");
+          "terminated execution not removed");
     source.inject(injected);
     wait_hb_quiet();
     registry.reconcileNow();
@@ -706,7 +706,7 @@ void run_a08(const std::string& base)
     const auto revived_record = find_native(registry, "101.0");
     check(revived_record.has_value() &&
               revived_record->job.execution.manager.pid == 5102,
-          "a new manager was rejected after retirement");
+          "a new manager was rejected after removal");
     check(count_records(registry) == 2, "duplicate entry for one manager");
 
     registry.deinit();
@@ -719,7 +719,7 @@ void run_a08(const std::string& base)
 
 void run_a09(const std::string& base)
 {
-    // Scenario 1: one missed scan recovers; only a second retires.
+    // Scenario 1: one missed scan recovers; only a second removes.
     {
         FakeSource source("condor");
         FakeProbes probes;
@@ -733,18 +733,18 @@ void run_a09(const std::string& base)
             return scan_with({job});
         });
         probes.set_process(5200, LivenessState::Dead);
-        probes.unset_cgroup("/cg/slot-1");   // unreadable: absence-only retirement
+        probes.unset_cgroup("/cg/slot-1");   // unreadable: absence-only removal
         JobRegistry registry(heartbeat_options(fresh_dir(base, "a09-recover"), source, probes));
         check(registry.reconcileNow(), "pass 2 did not run");
         check(find_native(registry, "200.0").has_value(),
-              "one missed scan retired the instance");
+              "one missed scan removed the instance");
         check(registry.reconcileNow(), "pass 3 did not run");
         check(find_native(registry, "200.0").has_value(),
-              "recovered instance was retired");
+              "recovered instance was removed");
         registry.deinit();
     }
 
-    // Scenario 2: two complete absences with positive evidence retire.
+    // Scenario 2: two complete absences with positive evidence remove.
     {
         FakeSource source("condor");
         FakeProbes probes;
@@ -756,16 +756,16 @@ void run_a09(const std::string& base)
             return pass == 1 ? scan_with({job}) : scan_with({});
         });
         probes.set_process(5301, LivenessState::Dead);
-        probes.unset_cgroup("/cg/slot-2");   // unreadable: absence-only retirement
-        JobRegistry registry(heartbeat_options(fresh_dir(base, "a09-retire"), source, probes));
+        probes.unset_cgroup("/cg/slot-2");   // unreadable: absence-only removal
+        JobRegistry registry(heartbeat_options(fresh_dir(base, "a09-remove"), source, probes));
         registry.reconcileNow();   // complete miss #1
         check(find_native(registry, "210.0").has_value(),
-              "retirement happened after a single absence");
+              "removal happened after a single absence");
         check(heartbeat_status()["suspect_count"] == 1,
               "an absent instance was not reported suspect");
         registry.reconcileNow();
         check(!find_native(registry, "210.0").has_value(),
-              "two complete absences did not retire");
+              "two complete absences did not remove");
         registry.deinit();
     }
 
@@ -793,14 +793,14 @@ void run_a09(const std::string& base)
               "failed scans marked the instance suspect");
         registry.reconcileNow();   // pass 4: complete miss #1
         check(find_native(registry, "220.0").has_value(),
-              "retirement after one complete absence");
+              "removal after one complete absence");
         check(registry.reconcileNow(), "pass 5 did not run");   // complete miss #2
         check(!find_native(registry, "220.0").has_value(),
-              "two complete absences after failures did not retire");
+              "two complete absences after failures did not remove");
         registry.deinit();
     }
 
-    pass_case("", "recovery after one miss, retirement after two complete absences only");
+    pass_case("", "recovery after one miss, removal after two complete absences only");
 }
 
 // ---------------------------------------------------------------------------
@@ -829,7 +829,7 @@ void run_seen_recovery(const std::string& base)
     present = false;
     check(registry.reconcileNow(), "SEEN-RECOVERY: the absence pass did not run");
     const auto absent = registry.jobRecord(id);
-    check(absent.has_value(), "SEEN-RECOVERY: one absence retired a live record");
+    check(absent.has_value(), "SEEN-RECOVERY: one absence removed a live record");
     check(!absent->presumed_live,
           "SEEN-RECOVERY: an absent record must carry the unverified verdict");
     check(heartbeat_status()["suspect_count"] == 1,
@@ -880,26 +880,26 @@ void run_a10(const std::string& base)
     registry.reconcileNow();
     registry.reconcileNow();
     check(find_native(registry, "300.0").has_value(),
-          "an empty PID list retired a live execution");
+          "an empty PID list removed a live execution");
 
     // Positive evidence: manager ended and the execution cgroup is empty. An
-    // exit hint is enough: the targeted pass retires it without any source
+    // exit hint is enough: the targeted pass removes it without any source
     // read and without any collector involvement.
     probes.set_process(5400, LivenessState::Dead);
     probes.set_cgroup("/cg/slot-4", {}, true);
     // Consume any rescan request left over from the earlier phases: a pending
     // request legitimately forces a scan, which would make this assertion about
-    // the targeted retirement path meaningless.
+    // the targeted removal path meaningless.
     registry.reconcileNow();
     const int scans_before = source.scans();
     registry.notifyExit(5400);
     check(wait_until([&]() { return !find_native(registry, "300.0").has_value(); }, 3000),
-          "positive termination evidence did not retire");
+          "positive termination evidence did not remove");
     check(source.scans() == scans_before,
-          "retirement needed a source scan instead of targeted evidence");
+          "removal needed a source scan instead of targeted evidence");
 
     registry.deinit();
-    pass_case("", "no premature retirement on an empty PID window; positive evidence retires");
+    pass_case("", "no premature removal on an empty PID window; positive evidence removes");
 }
 
 // ---------------------------------------------------------------------------
@@ -951,7 +951,7 @@ void run_a11(const std::string& base)
 
     const Job resolved =
         make_condor_job("401.0", 5501, 999, "htcondor01", "schedd-a", "/cg/slot-6");
-    // The manager is live; the empty scans must not retire it (absence is not
+    // The manager is live; the empty scans must not remove it (absence is not
     // the subject of this case).
     probes.set_process(5501, LivenessState::Alive, 999);
     scan_jobs = {resolved};
@@ -1072,10 +1072,10 @@ void run_a13(const std::string& base)
     probes.set_cgroup("/cg/slot-10", {}, true);
     registry.reconcileNow();
     check(!find_native(registry, "600.0").has_value(),
-          "retirement did not work in tracker-unavailable mode");
+          "removal did not work in tracker-unavailable mode");
 
     registry.deinit();
-    pass_case("", "tracker unavailable: maintenance and retirement continue, health reports it");
+    pass_case("", "tracker unavailable: maintenance and removal continue, health reports it");
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,7 +1091,7 @@ void run_a14(const std::string& base)
     source.set_scan([&]() { return scan_with({old_job}); });
     JobRegistry registry(heartbeat_options(fresh_dir(base, "a14"), source, probes));
 
-    // A registered lifecycle observer makes retirements go through the
+    // A registered lifecycle observer makes removals go through the
     // closing state instead of archiving immediately.
     std::mutex observer_mutex;
     std::vector<uint64_t> removed;
@@ -1109,14 +1109,14 @@ void run_a14(const std::string& base)
     probes.set_cgroup("/cg/slot-11", {}, true);
     registry.reconcileNow();
     check(registry.closingJobCount() == 1,
-          "retirement did not enter the closing state");
+          "removal did not enter the closing state");
     // The runtime's own pass is what dispatches the drain/Removed; the
     // heartbeat only committed the Closing intent.
     test_runtime(registry).reconcile(old_record->job.JobID);
     {
         std::lock_guard<std::mutex> lock(observer_mutex);
         check(removed.size() == 1 && removed.front() == old_record->job.JobID,
-              "the closing retirement was not published to observers");
+              "the closing removal was not published to observers");
     }
     check(registry.jobRecord(old_record->job.JobID).has_value(),
           "closing instance disappeared before acknowledgement");
@@ -1131,7 +1131,7 @@ void run_a14(const std::string& base)
     const auto new_record = find_native(registry, "700.1");
     check(new_record.has_value(), "new instance was not registered");
     check(new_record->job.JobID != old_record->job.JobID,
-          "new instance reused the retired internal id");
+          "new instance reused the removed internal id");
 
     // The collector drain acknowledges the removal: this is the real
     // production ack path, and it must never touch the new ownership.
@@ -1146,11 +1146,11 @@ void run_a14(const std::string& base)
     check(still_new->job.execution.manager.start_ticks == 1616,
           "new manager was replaced by stale state");
 
-    // A stale discovery for the retired manager still cannot resurrect it.
+    // A stale discovery for the removed manager still cannot resurrect it.
     source.set_scan([&]() { return scan_with({old_job}); });
     registry.reconcileNow();
     check(!find_native(registry, "700.0").has_value(),
-          "a stale discovery resurrected the retired manager");
+          "a stale discovery resurrected the removed manager");
     check(find_native(registry, "700.1").has_value(),
           "a stale discovery disturbed the new instance");
 
@@ -1200,8 +1200,8 @@ void run_a23(const std::string& base)
     const auto after = heartbeat_status();
     check(before["pass_count"] == after["pass_count"],
           "reads triggered a maintenance pass");
-    check(before["retirements"] == after["retirements"],
-          "reads triggered retirements");
+    check(before["removals"] == after["removals"],
+          "reads triggered removals");
     check(before["events_received"] == after["events_received"],
           "reads emitted events");
     check(before["last_scan_start_ms"] == after["last_scan_start_ms"],
@@ -1358,7 +1358,7 @@ void run_a25(const std::string& base)
         }
 
         {
-            // Restart: the interrupted retirement is restored as closing and
+            // Restart: the interrupted removal is restored as closing and
             // the closing cleanup archives it. Maintenance is disabled on this
             // instance so the restored row can be observed before the same
             // cleanup the heartbeat would run archives it (otherwise the
@@ -1405,8 +1405,8 @@ void run_a28(const std::string& base)
 
     // The manager exited, the cgroup still lists a member, but the member's
     // stat is unreadable (Unknown). "Readable and non-empty" is never "empty",
-    // so the first pass must not retire — the old rule treated Unknown members
-    // as dead and retired a possibly-running execution.
+    // so the first pass must not remove — the old rule treated Unknown members
+    // as dead and removed a possibly-running execution.
     probes.set_process(5800, LivenessState::Dead);
     probes.set_process(6101, LivenessState::Unknown);
     probes.set_cgroup("/cg/slot-10", {6101}, true);
@@ -1421,10 +1421,10 @@ void run_a28(const std::string& base)
     probes.set_process(6101, LivenessState::Dead);
     registry.reconcileNow();
     check(!find_native(registry, "600.0").has_value(),
-          "a conclusively dead execution was not retired");
+          "a conclusively dead execution was not removed");
 
     registry.deinit();
-    pass_case("", "unknown cgroup members are not death evidence; confirmed death retires");
+    pass_case("", "unknown cgroup members are not death evidence; confirmed death removes");
 }
 
 // ---------------------------------------------------------------------------
@@ -1459,26 +1459,26 @@ void run_legacy(const std::string& base)
 
     check(registry.reconcileNow(), "legacy: the pass did not run");
     check(registry.findJob(id).has_value(),
-          "legacy: a live manual registration was retired");
+          "legacy: a live manual registration was removed");
     check(registry.jobRecord(id).has_value() &&
               registry.jobRecord(id)->state == RecordState::Active,
           "legacy: a live registration must stay active");
 
     probes.set_process(4321, LivenessState::Dead);
-    check(registry.reconcileNow(), "legacy: the retirement pass did not run");
+    check(registry.reconcileNow(), "legacy: the removal pass did not run");
     check(!registry.findJob(id).has_value(),
-          "legacy: a dead manual registration was not retired");
+          "legacy: a dead manual registration was not removed");
     check(!registry.jobRecord(id).has_value(),
-          "legacy: the retired record was not archived");
+          "legacy: the removed record was not archived");
     registry.deinit();
 
-    pass_case("LEGACY", "manual registrations retire on process evidence without a source");
+    pass_case("LEGACY", "manual registrations remove on process evidence without a source");
 }
 
 // ---------------------------------------------------------------------------
 // RESTORE-UNKNOWN (round 3): an unverifiable restored execution keeps its saved
 // evidence.  The suspect verdict blocks admission; deleting the members is not a
-// verdict and would let the later absence rule retire an instance whose child is
+// verdict and would let the later absence rule remove an instance whose child is
 // still alive.
 // ---------------------------------------------------------------------------
 
@@ -1548,7 +1548,7 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
 
     // Heartbeat restart: later the manager is positively dead and the cgroup is
     // unreadable.  Two complete source passes without an observation must still
-    // not retire the instance while the saved child is alive.
+    // not remove the instance while the saved child is alive.
     FakeSource source("condor");
     FakeProbes probes;
     probes.set_process(manager_pid, LivenessState::Unknown, 181818);
@@ -1570,7 +1570,7 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
 
     const auto after = find_native(registry, "810.0");
     check(after.has_value(),
-          "RESTORE-UNKNOWN: the instance was retired although its saved child is alive");
+          "RESTORE-UNKNOWN: the instance was removed although its saved child is alive");
     check(std::any_of(after->job.execution.pid_identities.begin(),
                       after->job.execution.pid_identities.end(),
                       [&](const ProcessIdentity& pid_identity) { return pid_identity.pid == child_pid; }),
@@ -1580,14 +1580,14 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
     check(registry.deinit(), "RESTORE-UNKNOWN: shutdown failed");
 
     pass_case("RESTORE-UNKNOWN",
-              "unverifiable restore is suspect, keeps member evidence and is not retired");
+              "unverifiable restore is suspect, keeps member evidence and is not removed");
 }
 
 // ---------------------------------------------------------------------------
-// RETIRE-EXPLICIT - an explicit retirement marks the ended manager
+// REMOVE-EXPLICIT - an explicit removal marks the ended manager
 // ---------------------------------------------------------------------------
 
-void run_retire_explicit(const std::string& base)
+void run_remove_explicit(const std::string& base)
 {
     FakeSource source("condor");
     FakeProbes probes;
@@ -1596,30 +1596,30 @@ void run_retire_explicit(const std::string& base)
     probes.set_process(5400, LivenessState::Alive, 888);
     source.set_scan([&]() { return scan_with({job}); });
     JobRegistry registry(
-        heartbeat_options(fresh_dir(base, "retire-explicit"), source, probes));
+        heartbeat_options(fresh_dir(base, "remove-explicit"), source, probes));
 
     const auto active = find_native(registry, "310.0");
-    check(active.has_value(), "RETIRE-EXPLICIT: the live instance was not inventoried");
-    const std::uint64_t retired_id = active->job.JobID;
+    check(active.has_value(), "REMOVE-EXPLICIT: the live instance was not inventoried");
+    const std::uint64_t removed_id = active->job.JobID;
 
-    // Explicit retirement while every process is still alive: no evidence
+    // Explicit removal while every process is still alive: no evidence
     // path runs, so the command itself must mark the ended manager.
-    check(registry.retireInstance(retired_id),
-          "RETIRE-EXPLICIT: the explicit retirement was refused");
+    check(registry.removeJob(removed_id),
+          "REMOVE-EXPLICIT: the explicit removal was refused");
     check(!find_native(registry, "310.0").has_value(),
-          "RETIRE-EXPLICIT: the retired instance stayed active");
+          "REMOVE-EXPLICIT: the removed instance stayed active");
 
     // A scan observation of the SAME execution manager must not
-    // re-register the retired instance: isObsolete() refuses it.
+    // re-register the removed instance: isObsolete() refuses it.
     const std::uint64_t obsolete_before =
         heartbeat_status()["obsolete_hints"].get<std::uint64_t>();
     check(registry.reconcileNow(),
-          "RETIRE-EXPLICIT: the post-retirement pass did not run");
+          "REMOVE-EXPLICIT: the post-removal pass did not run");
     check(!find_native(registry, "310.0").has_value(),
-          "RETIRE-EXPLICIT: a same-manager observation resurrected the "
-          "explicitly retired instance");
+          "REMOVE-EXPLICIT: a same-manager observation resurrected the "
+          "explicitly removed instance");
     check(heartbeat_status()["obsolete_hints"].get<std::uint64_t>() > obsolete_before,
-          "RETIRE-EXPLICIT: the refused observation was not counted as obsolete");
+          "REMOVE-EXPLICIT: the refused observation was not counted as obsolete");
 
     // A NEW manager (different manager, different start ticks) registers
     // as a new instance: the mark is per manager, never per identity.
@@ -1628,17 +1628,17 @@ void run_retire_explicit(const std::string& base)
     probes.set_process(5401, LivenessState::Alive, 889);
     source.set_scan([&]() { return scan_with({revived}); });
     check(registry.reconcileNow(),
-          "RETIRE-EXPLICIT: the revival pass did not run");
+          "REMOVE-EXPLICIT: the revival pass did not run");
     const auto revived_record = find_native(registry, "310.0");
     check(revived_record.has_value() &&
               revived_record->job.execution.manager.pid == 5401,
-          "RETIRE-EXPLICIT: a new manager was refused after the explicit "
-          "retirement");
-    check(count_records(registry) == 1, "RETIRE-EXPLICIT: unexpected record count");
+          "REMOVE-EXPLICIT: a new manager was refused after the explicit "
+          "removal");
+    check(count_records(registry) == 1, "REMOVE-EXPLICIT: unexpected record count");
 
     registry.deinit();
-    pass_case("RETIRE-EXPLICIT",
-              "explicit retirement marks the ended manager; a same-manager "
+    pass_case("REMOVE-EXPLICIT",
+              "explicit removal marks the ended manager; a same-manager "
               "observation is refused, a new manager registers");
 }
 
@@ -1975,13 +1975,13 @@ void run_rescan(const std::string& base)
     check(source.scans() > scans_before_refresh,
           "rescan: on-demand refresh did not run a scan");
 
-    // Positive termination evidence still retires through the same pass.
+    // Positive termination evidence still removes through the same pass.
     source.set_scan([&]() { return scan_with({}); });
     probes.set_process(9100, LivenessState::Dead);
     probes.set_cgroup("/cg/slot-95", {}, true);
     registry.reconcileNow();
     check(!find_native(registry, "950.0").has_value(),
-          "rescan: positive termination evidence did not retire the instance");
+          "rescan: positive termination evidence did not remove the instance");
     registry.deinit();
 
     pass_case("RESCAN", "event-driven and on-demand passes run the same reconcile path");
@@ -2135,10 +2135,10 @@ void run_manual_refresh_parity(const std::string& base)
 
 // ---------------------------------------------------------------------------
 // MANUAL-ABSENCE: a manager that disappears from two complete manager passes
-// retires a manual record too (positive evidence is blocked in this case)
+// removes a manual record too (positive evidence is blocked in this case)
 // ---------------------------------------------------------------------------
 
-void run_manual_absence_retirement(const std::string& base)
+void run_manual_absence_removal(const std::string& base)
 {
     FakeSource source("condor");
     FakeProbes probes;
@@ -2147,7 +2147,7 @@ void run_manual_absence_retirement(const std::string& base)
     probes.set_process(manager_pid, LivenessState::Dead);
     probes.set_process(member_pid, LivenessState::Dead);
     // Readable but non-empty: NOT positive termination evidence, so only the
-    // absence rule can retire the record.
+    // absence rule can remove the record.
     probes.set_cgroup("/cg/slot-1200", {member_pid}, true);
     source.set_scan([]() { return scan_with({}); });
     JobRegistry registry(heartbeat_options(fresh_dir(base, "manual-absence"), source, probes));
@@ -2158,29 +2158,29 @@ void run_manual_absence_retirement(const std::string& base)
     const auto created = find_native(registry, "1200.0");
     check(created.has_value(), "MANUAL-ABSENCE: the manual record was not indexed");
     const std::uint64_t id = created->job.JobID;
-    const std::uint64_t retirements_before =
-        heartbeat_status()["retirements"].get<std::uint64_t>();
+    const std::uint64_t removals_before =
+        heartbeat_status()["removals"].get<std::uint64_t>();
 
     check(registry.reconcileNow(), "MANUAL-ABSENCE: the first pass did not run");
     check(registry.jobRecord(id).has_value(),
-          "MANUAL-ABSENCE: one absence retired the manual record");
-    check(heartbeat_status()["retirements"].get<std::uint64_t>() == retirements_before,
-          "MANUAL-ABSENCE: one absence counted as a retirement");
+          "MANUAL-ABSENCE: one absence removed the manual record");
+    check(heartbeat_status()["removals"].get<std::uint64_t>() == removals_before,
+          "MANUAL-ABSENCE: one absence counted as a removal");
     check(heartbeat_status()["suspect_count"] == 1,
           "MANUAL-ABSENCE: the absent record was not reported suspect");
 
     check(registry.reconcileNow(), "MANUAL-ABSENCE: the second pass did not run");
     check(!registry.jobRecord(id).has_value(),
-          "MANUAL-ABSENCE: two complete absences did not retire the manual record");
-    check(heartbeat_status()["retirements"].get<std::uint64_t>() == retirements_before + 1,
-          "MANUAL-ABSENCE: the retirement was not counted");
+          "MANUAL-ABSENCE: two complete absences did not remove the manual record");
+    check(heartbeat_status()["removals"].get<std::uint64_t>() == removals_before + 1,
+          "MANUAL-ABSENCE: the removal was not counted");
     check(!find_native(registry, "1200.0").has_value(),
-          "MANUAL-ABSENCE: the retired record kept its identity index entry");
+          "MANUAL-ABSENCE: the removed record kept its identity index entry");
 
     registry.deinit();
     pass_case("MANUAL-ABSENCE",
               "a manual record whose manager is missing from two complete manager passes "
-              "retires on absence, never after one pass and never on a non-empty cgroup");
+              "removes on absence, never after one pass and never on a non-empty cgroup");
 }
 
 // ---------------------------------------------------------------------------
@@ -2279,7 +2279,7 @@ void run_manager_conflict_tracking(const std::string& base)
     const std::string cgroup = "/cg/slot-1400";
     probes.set_process(first_manager, LivenessState::Dead);
     probes.set_process(second_manager, LivenessState::Alive, 919191);
-    // Unreadable cgroup: only the absence rule can retire the first record.
+    // Unreadable cgroup: only the absence rule can remove the first record.
     probes.unset_cgroup(cgroup);
 
     const Job first = make_condor_job("1400.0", first_manager, 818181, "htcondor01",
@@ -2329,9 +2329,9 @@ void run_manager_conflict_tracking(const std::string& base)
           "MANAGER-CONFLICT: the old record is not reported absent");
 
     // The next complete pass must observe the manager again (it is not
-    // tracked), and the old record's second absence retires it.
+    // tracked), and the old record's second absence removes it.
     check(registry.reconcileNow(),
-          "MANAGER-CONFLICT: the retirement pass did not run");
+          "MANAGER-CONFLICT: the removal pass did not run");
     check(source.observes() == observes_after_create + 2,
           "MANAGER-CONFLICT: the refused manager became tracked");
     check(mirror.observes() == 2,
@@ -2339,7 +2339,7 @@ void run_manager_conflict_tracking(const std::string& base)
     check(!registry.jobRecord(first_id).has_value(),
           "MANAGER-CONFLICT: the old manager was kept alive by a refused observation");
     check(!find_native(registry, "1400.0").has_value(),
-          "MANAGER-CONFLICT: the retired identity stayed indexed");
+          "MANAGER-CONFLICT: the removed identity stayed indexed");
 
     // With the identity free, the same manager creates the new execution.
     check(registry.reconcileNow(),
@@ -2348,7 +2348,7 @@ void run_manager_conflict_tracking(const std::string& base)
     check(revived.has_value(),
           "MANAGER-CONFLICT: the new execution was not registered");
     check(revived->job.JobID != first_id,
-          "MANAGER-CONFLICT: the new execution reused the retired internal id");
+          "MANAGER-CONFLICT: the new execution reused the removed internal id");
     check(revived->job.execution.manager.pid == second_manager,
           "MANAGER-CONFLICT: the new execution does not own its manager");
     check(count_records(registry) == 1,
@@ -2357,7 +2357,7 @@ void run_manager_conflict_tracking(const std::string& base)
     registry.deinit();
     pass_case("MANAGER-CONFLICT",
               "a refused observation leaves its manager unknown so it is retried, the old "
-              "record still retires on absence, and the new execution creates afterwards");
+              "record still removes on absence, and the new execution creates afterwards");
 }
 
 // ---------------------------------------------------------------------------
@@ -2440,13 +2440,13 @@ int main(int argc, char** argv)
         run_a28(base);
         run_legacy(base);
         run_restore_unknown_keeps_evidence(base);
-        run_retire_explicit(base);
+        run_remove_explicit(base);
         run_admit(base);
         run_stop_pin(base);
         run_rescan(base);
         run_discovery_create_only(base);
         run_manual_refresh_parity(base);
-        run_manual_absence_retirement(base);
+        run_manual_absence_removal(base);
         run_event_admission_create_only(base);
         run_manager_conflict_tracking(base);
         run_pass_admission_create_only(base);

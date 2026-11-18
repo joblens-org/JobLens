@@ -693,7 +693,7 @@ void lifecycle_is_safe(const Fixture& fixture)
 // Adapter fact refresh: the per-record reader the unified update chain uses.
 // managerOfPid names the framework supervisor of one job pid; refreshFacts
 // refreshes one record in place (facts + execution evidence) and reports what
-// the CALLER's probes saw, so the registry keeps deciding retirement.
+// the CALLER's probes saw, so the registry keeps deciding removal.
 // ---------------------------------------------------------------------------
 
 // One Condor record as the registry holds it: typed facts, a member identity
@@ -781,7 +781,7 @@ void condor_adapter_refresh_evidence(const Fixture& fixture)
           "a non-empty execution cgroup is not confirmed empty");
 
     // The cgroup probe is the caller's too: a readable but empty cgroup is the
-    // positive termination evidence the retirement rule needs.
+    // positive termination evidence the removal rule needs.
     const CgroupMembershipProbe empty_cgroup = [](const std::string&) {
         CgroupMembership membership;
         membership.readable = true;

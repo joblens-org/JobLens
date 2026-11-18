@@ -1412,7 +1412,7 @@ bool JobStore::apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& bat
             history["state"] = to_string(RecordState::Closing);
             history["end_time_us"] = end_time;
             // The fact snapshot of what the collection runtime really had
-            // attached when the registry accepted the retirement, and how it
+            // attached when the registry accepted the removal, and how it
             // was established. The desired selection alone never decides this
             // row.
             history["applied_collectors"] = op.applied_collectors;

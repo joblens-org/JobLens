@@ -657,7 +657,7 @@ std::vector<uint64_t> CollectorScheduler::rmJobCollectLocked(const Job& job){
 
     // The System-scope view is a whole-registry projection diffed once per
     // reconcile pass (see reconcileOnce). Broadcasting Removed here as well
-    // would deliver two removals for one retirement.
+    // would deliver two Removed events for one removal.
     return completed;
 }
 

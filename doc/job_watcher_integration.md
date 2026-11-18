@@ -3,7 +3,7 @@
 This guide describes how to add a **new scheduler type** to the job registry —
 for example an `ssh` session source — by writing one *job watcher* (a discovery
 source) and one *scheduler adapter*. Everything downstream (the `JobStore`
-merge semantics, the heartbeat's retirement rules, the collection binding and
+merge semantics, the heartbeat's removal rules, the collection binding and
 reconciliation, the RPC surface, kernel attribution) works for the new type
 without modification. Chinese version:
 [job_watcher_integration.zh-CN.md](job_watcher_integration.zh-CN.md)
@@ -29,7 +29,7 @@ src/ebpf/trace_ssh_session.bpf.c          # optional: exec-hint event source
 What you get for free:
 
 - durable storage (`JobRecord`), identity indexing, manager conflicts;
-- the heartbeat: authoritative manager passes, absence tracking, retirement
+- the heartbeat: authoritative manager passes, absence tracking, removal
   evidence rules, per-record execution refresh;
 - desired-vs-applied collection reconciliation and `CollectionStatus`;
 - `jobs/*` and `jobs/collection/*` RPC methods and the trigger proxy;
@@ -79,7 +79,7 @@ Latency-critical discovery never waits for a heartbeat pass:
 2. The poll thread resolves the pid itself (`observeForHint`) and registers
    the discovered Job **synchronously on the same thread** through
    `sink.on_job(job)`: store upsert → lifecycle/attach. No queue, no worker;
-   the heartbeat keeps manager passes, retirement and reconciliation only.
+   the heartbeat keeps manager passes, removal and reconciliation only.
 3. Scheduler state may not be written yet at exec time (job ad, spool dir):
    an **incomplete discovery never creates a record**; the watcher requests
    one coalesced authoritative pass and the next manager pass converges it in
@@ -164,7 +164,7 @@ group, filled where the source parses its inputs. `JobID`, `JobPIDs` and
   authoritative membership for your executions;
   `kernel_attribution = true` only if your manager semantics support pid/cgroup
   attribution. A missing trait is a normal state, never an error: jobs of an
-  adapter without the trait simply never get cgroup-based retirement evidence
+  adapter without the trait simply never get cgroup-based removal evidence
   or kernel maps.
 
 ## 4. Step by step
@@ -338,7 +338,7 @@ Follow the two existing tiers; neither needs root, live schedulers or eBPF:
    ```
 
    This is where the invariants (I1–I8) get pinned: merge semantics,
-   manager conflicts, absence/suspect transitions, retirement evidence,
+   manager conflicts, absence/suspect transitions, removal evidence,
    closing semantics.
 
 For eBPF-dependent tests, guard on namespace availability the way
@@ -360,7 +360,7 @@ For eBPF-dependent tests, guard on namespace availability the way
 | `config/config.example.yaml` | `<t>_job_watcher` section + `maintenance.types` entry |
 
 No changes are needed in `collector_type.h`, `job_identity`, `maintenance_config`,
-`JobStore`, the heartbeat/retirement logic, `KernelAttribution`, the RPC methods
+`JobStore`, the heartbeat/removal logic, `KernelAttribution`, the RPC methods
 or the trigger: identity, config sections, native-id rules, facts (JSON
 alternative), matching and cgroup derivation are all adapter-driven.
 

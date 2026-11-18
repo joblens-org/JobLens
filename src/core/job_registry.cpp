@@ -16,7 +16,7 @@
 // Durable state lives in JobStore (JobRecord); kernel attribution lives in
 // KernelAttribution; the RPC surface lives in core/rpc/. This file
 // keeps the CollectorScheduler-facing seams: lifecycle callbacks, the
-// collection applier, retirement/drain flow and the automatic-selection
+// collection applier, removal/drain flow and the automatic-selection
 // trigger.
 #include "core/job_registry.hpp"
 #include <spdlog/spdlog.h>
@@ -477,7 +477,7 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
     // authoritative pass (blocking: the record set is settled before the RPC
     // surface opens), publish the status providers and finally start the
     // maintenance worker. Production always arms this stack (a registered job
-    // needs retirement/checkpoint upkeep); the purely static form is a
+    // needs removal/checkpoint upkeep); the purely static form is a
     // test-only escape hatch (test_static_registry).
     DiscoveryWiring wiring = DiscoveryWiring::Disabled;
     if (!options.test_static_registry) {
@@ -602,7 +602,7 @@ JobRegistry& JobRegistry::instance() {
 
 // ---------------------------------------------------------------------------
 // Registry heartbeat — the maintenance function of the registry.
-// Thread-free policy components (probes, retirement rules, absence counters)
+// Thread-free policy components (probes, removal rules, absence counters)
 // are driven from one periodic worker; there is no separate service object.
 // ---------------------------------------------------------------------------
 
@@ -752,7 +752,7 @@ void JobRegistry::repairMissingInitialDecisions() {
     for (const auto& record : ownRecords()) {
         if (repaired >= kMaxPerPass) break;
         if (!missing_initial_decision(record)) continue;
-        // The snapshot may predate a retirement this pass already applied:
+        // The snapshot may predate a removal this pass already applied:
         // re-read the record and decide from the current image, never from a
         // closing or vanished one.
         const auto current = ownRecord(record.job.JobID);
@@ -785,7 +785,7 @@ RefreshResult JobRegistry::probeRecordEvidence(const Job& job) const {
     // No adapter, no scheduler scope: the manager identity (when the record has
     // one) and the recorded pid identities are the only evidence. This is the
     // pre-existing pid identity rule, now reported as a RefreshResult so the
-    // retirement decision reads one shape.
+    // removal decision reads one shape.
     RefreshResult result;
     const ProcessIdentity& manager = manager_of(job);
     if (manager.complete()) {
@@ -900,33 +900,33 @@ std::optional<JobRegistry::RefreshedEvidence> JobRegistry::applyRefreshedRecord(
     return outcome;
 }
 
-bool JobRegistry::retireIfConfirmed(const JobRecord& record, const std::string& reason) {
-    // Only retire the manager the evidence was gathered for. A late
+bool JobRegistry::removeIfConfirmed(const JobRecord& record, const std::string& reason) {
+    // Only remove the manager the evidence was gathered for. A late
     // decision for an older execution must never remove newer ownership.
     const auto current = ownRecord(record.job.JobID);
     if (!current) return false;
     if (!(manager_of(current->job) == manager_of(record.job))) {
         spdlog::info("JobRegistry: JobID {} changed execution identity before "
-                     "retirement; keeping current ownership", record.job.JobID);
+                     "removal; keeping current ownership", record.job.JobID);
         return false;
     }
 
     rememberEnded(record);
-    if (!retireInstance(record.job.JobID)) {
-        noteHeartbeatError("job retirement failed for JobID " +
+    if (!removeJob(record.job.JobID)) {
+        noteHeartbeatError("job removal failed for JobID " +
                            std::to_string(record.job.JobID));
         return false;
     }
 
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
-        ++hb_retirements_;
+        ++hb_removals_;
         closing_managers_.emplace_back(record.job.JobID,
                                            manager_of(record.job));
         absences_.erase(record.job.JobID);
         suspect_ids_.erase(record.job.JobID);
     }
-    spdlog::info("JobRegistry: retired JobID {}: {}", record.job.JobID, reason);
+    spdlog::info("JobRegistry: removed JobID {}: {}", record.job.JobID, reason);
     return true;
 }
 
@@ -1024,7 +1024,7 @@ bool JobRegistry::isObsolete(const SchedulerKey& key,
     return it != ended_managers_.end() && it->second == manager;
 }
 
-void JobRegistry::evaluateRetirements(const PassRun& pass) {
+void JobRegistry::evaluateRemovals(const PassRun& pass) {
     const auto records = ownRecords();
     const std::int64_t now = clockNow();
     // A targeted pass (`enumerate` false) has no authoritative source coverage,
@@ -1073,7 +1073,7 @@ void JobRegistry::evaluateRetirements(const PassRun& pass) {
 
         // Absence is liveness evidence, not a lifecycle state: the record
         // stays Active, and an unverified instance is refused kernel admission
-        // and never retired. A presence observation restores the verdict; the
+        // and never removed. A presence observation restores the verdict; the
         // call is outside hb_mtx_ (records_mtx_ is taken under it, never the
         // other way) and before the seen/no-evidence short-circuits.
         setExecutionPresumedLive(record.job.JobID, absences == 0);
@@ -1090,25 +1090,25 @@ void JobRegistry::evaluateRetirements(const PassRun& pass) {
         // Records without a complete execution manager (manual
         // registrations, unresolved observations) have no manager to probe.
         // The pid identity list is their only evidence: live or unreadable pids keep
-        // the record, an all-dead list retires it, and an empty list is "no
+        // the record, an all-dead list removes it, and an empty list is "no
         // evidence yet", never "all dead".
         const ProcessIdentity manager = manager_of(record.job);
         if (!manager.complete()) {
             if (!evidence.has_pid_identity_evidence) continue;
             if (evidence.evidence.any_pid_identity_live || evidence.evidence.pid_identity_inconclusive)
                 continue;
-            retireIfConfirmed(record,
+            removeIfConfirmed(record,
                               "no live process for a manually registered instance");
             continue;
         }
 
-        // Retire only on positive termination evidence: a dead manager plus a
+        // Remove only on positive termination evidence: a dead manager plus a
         // cgroup that was read and is confirmed empty. A readable but
         // non-empty cgroup whose pids could not be stat'ed is NOT an empty
         // cgroup, and an unreadable cgroup is no evidence at all.
         if (evidence.evidence.manager == LivenessState::Dead &&
             evidence.evidence.cgroup_empty_confirmed) {
-            retireIfConfirmed(
+            removeIfConfirmed(
                 record, "positive termination evidence (manager ended, execution cgroup empty)");
             continue;
         }
@@ -1120,7 +1120,7 @@ void JobRegistry::evaluateRetirements(const PassRun& pass) {
         if (evidence.evidence.any_pid_identity_live || evidence.evidence.pid_identity_inconclusive)
             continue;
 
-        retireIfConfirmed(
+        removeIfConfirmed(
             record, "two complete source passes without an observation and no live pid identity");
     }
 
@@ -1163,8 +1163,8 @@ bool JobRegistry::runPass(bool do_scan, bool wait, bool refresh_facts) {
     // Phase 4: one fsynced batch, then the status the scan justifies.
     checkpointPass();
     publishPassStatus(*pass);
-    // Phase 5: retire what the evidence no longer supports.
-    evaluateRetirements(*pass);
+    // Phase 5: remove what the evidence no longer supports.
+    evaluateRemovals(*pass);
     // Phase 6: a Closing record is not "done" just because it left the active
     // map — finalize restored closings and retry cleanups that failed.
     reconcileClosingRemovals();
@@ -1242,7 +1242,7 @@ void JobRegistry::observeManager(const std::string& source_name, IDiscoverySourc
     // Only an accepted observation may make this manager "tracked". An identity
     // conflict (a different live execution owns the job) must keep it unknown:
     // mapping it to the old record would hide the new manager and keep the old
-    // record permanently "seen", so it could never retire.
+    // record permanently "seen", so it could never remove.
     if (!observation.ok) return;
 
     uint64_t record_id = 0;
@@ -1818,7 +1818,7 @@ bool JobRegistry::deinit()
 
     // Shutdown order: discovery admission stopped first (the service calls
     // stopDiscovery() before draining the scheduler), then the
-    // retirements are finalized, then attribution, then the store.
+    // removals are finalized, then attribution, then the store.
     stopDiscovery();
 
     bool ok = true;
@@ -1836,7 +1836,7 @@ bool JobRegistry::deinit()
     // not reported as an incomplete drain even though the archive succeeds.
     if (!cleanupClosingJobs()) ok = false;
 
-    // Finalize: acknowledge the retirements this heartbeat made. The collector
+    // Finalize: acknowledge the removals this heartbeat made. The collector
     // drain has completed by now; a late acknowledgement for an old manager
     // is discarded.
     {
@@ -1848,7 +1848,7 @@ bool JobRegistry::deinit()
         for (const auto& [job_id, manager] : closing) {
             const auto record = ownRecord(job_id);
             if (record && !(manager_of(record->job) == manager)) {
-                spdlog::info("JobRegistry: JobID {} no longer carries the retired "
+                spdlog::info("JobRegistry: JobID {} no longer carries the removed "
                              "manager; acknowledgement discarded", job_id);
                 continue;
             }
@@ -2022,7 +2022,7 @@ bool JobRegistry::sync_job_to_kernel(const Job& job) {
     std::lock_guard<std::mutex> lock(kernel_owner_mtx_);
     if (!attribution_) return true;   // intentionally disabled: no kernel state
     if (!ownHasActive(job.JobID)) {
-        // A stale Created/Updated snapshot whose instance has been retired
+        // A stale Created/Updated snapshot whose instance has been removed
         // must not install a new owner.  KernelAttribution re-reads the full
         // eligibility under its own serial gate.
         spdlog::debug("JobRegistry: refusing kernel activation for non-active JobID {}",
@@ -2501,13 +2501,13 @@ nlohmann::json JobRegistry::updateManualInstance(const JobRecord& target, const 
     return out;
 }
 
-bool JobRegistry::retireInstance(uint64_t jobID) {
+bool JobRegistry::removeJob(uint64_t jobID) {
     // A registered command is also the retry point after a failed write: the
     // store first verifies every uncertain row before any new mutation.
     if (store_ && store_->recoveryRequired()) {
         std::string recovery_error;
         if (!recoverStoreIfNeeded(recovery_error)) {
-            spdlog::error("JobRegistry: cannot retire JobID {}: store recovery failed ({})",
+            spdlog::error("JobRegistry: cannot remove JobID {}: store recovery failed ({})",
                           jobID, recovery_error);
             return false;
         }
@@ -2523,8 +2523,8 @@ bool JobRegistry::retireInstance(uint64_t jobID) {
         // after a restart, the fact of "was this ever collected" is gone. This
         // snapshot decides archive-versus-discard later, at cleanup time.
         {
-            std::lock_guard<std::mutex> applied_lock(retire_applied_mtx_);
-            retire_applied_[jobID] = actualCollection(jobID).collectors;
+            std::lock_guard<std::mutex> applied_lock(removal_applied_mtx_);
+            removal_applied_[jobID] = actualCollection(jobID).collectors;
         }
         // The whole read-decide-commit sequence runs under the record
         // transaction lock; the registry image is the truth being marked
@@ -2554,15 +2554,15 @@ bool JobRegistry::retireInstance(uint64_t jobID) {
         }
         if (!closing_persisted) {
             spdlog::error("JobRegistry: could not persist the closing state for JobID {}; "
-                          "retirement refused (the record stays active)", jobID);
+                          "removal refused (the record stays active)", jobID);
             return false;
         }
-        // The heartbeat path (retireIfConfirmed) records the ended manager
-        // before retiring; an explicit retirement carries no such caller, so
+        // The heartbeat path (removeIfConfirmed) records the ended manager
+        // before removing; an explicit removal carries no such caller, so
         // the mark is made here. It is idempotent (a map insert) and uses the
         // record snapshot taken before the closing write, so the manager
         // remembered is the one that actually ended. Without it, a late
-        // observation of the same execution would re-register the retired
+        // observation of the same execution would re-register the removed
         // instance instead of being refused by isObsolete().
         rememberEnded(*record);
         spdlog::info("JobRegistry: JobID {} is Closing; the collection runtime drains it",
@@ -2574,11 +2574,11 @@ bool JobRegistry::retireInstance(uint64_t jobID) {
         // Registry-only core: no collectors can hold the instance, so the
         // checked cleanup may run immediately.
         if (!cleanupThenArchive(jobID)) {
-            spdlog::error("JobRegistry: retirement of JobID {} stays closing until the "
+            spdlog::error("JobRegistry: removal of JobID {} stays closing until the "
                           "cleanup succeeds; it will be retried", jobID);
             return false;
         }
-        spdlog::info("JobRegistry: retire instance with JobID {}", jobID);
+        spdlog::info("JobRegistry: remove instance with JobID {}", jobID);
         return true;
     }
 
@@ -2606,11 +2606,6 @@ void JobRegistry::onDrained(uint64_t job_id) {
     drain_complete_.erase(job_id);
 }
 
-void JobRegistry::retireJob(uint64_t jobID) {
-    // Thin alias: the caller gets the accepted retirement, not a deletion.
-    retireInstance(jobID);
-}
-
 bool JobRegistry::cleanupThenArchive(uint64_t jobID) {
     // One finalization at a time: an ack, the maintenance retry and the
     // shutdown sweep may all try to finish the same closing record. The
@@ -2623,7 +2618,7 @@ bool JobRegistry::cleanupThenArchive(uint64_t jobID) {
     if (current->state != RecordState::Closing) return false;
 
     // A live runtime's accepted tail requires its explicit completion. A
-    // locally captured retirement also covers the window before the runtime
+    // locally captured removal also covers the window before the runtime
     // has reconciled the Closing row. Restored Closing rows have no such
     // capture: if the new runtime has no owner, preserve the restart fallback.
     if (auto* runtime = collectionRuntime()) {
@@ -2633,13 +2628,13 @@ bool JobRegistry::cleanupThenArchive(uint64_t jobID) {
             drained = drain_complete_.count(jobID) != 0;
         }
         if (!drained) {
-            bool locally_retired = false;
+            bool locally_removed = false;
             {
-                std::lock_guard<std::mutex> lock(retire_applied_mtx_);
-                locally_retired = retire_applied_.count(jobID) != 0;
+                std::lock_guard<std::mutex> lock(removal_applied_mtx_);
+                locally_removed = removal_applied_.count(jobID) != 0;
             }
             const auto actual = runtime->actual(jobID);
-            if (locally_retired || actual.tracked || actual.draining) {
+            if (locally_removed || actual.tracked || actual.draining) {
                 spdlog::warn("JobRegistry: closing JobID {} has no proven runtime drain; "
                              "retaining the Closing reservation", jobID);
                 return false;
@@ -2649,7 +2644,7 @@ bool JobRegistry::cleanupThenArchive(uint64_t jobID) {
     const Job& closing_job = current->job;
 
     // Archive-versus-discard is a fact decision made here, not in the store:
-    // the runtime snapshot captured when the retirement was accepted
+    // the runtime snapshot captured when the removal was accepted
     // ("applied"), or — for a closing restored from disk, whose capture died
     // with the previous process — the durable effective selection as the
     // documented fallback. An empty resolved set means the instance was never
@@ -2657,9 +2652,9 @@ bool JobRegistry::cleanupThenArchive(uint64_t jobID) {
     std::vector<std::string> applied;
     const char* provenance = "effective";
     {
-        std::lock_guard<std::mutex> applied_lock(retire_applied_mtx_);
-        const auto captured = retire_applied_.find(jobID);
-        if (captured != retire_applied_.end()) {
+        std::lock_guard<std::mutex> applied_lock(removal_applied_mtx_);
+        const auto captured = removal_applied_.find(jobID);
+        if (captured != removal_applied_.end()) {
             applied = captured->second;
             provenance = "applied";
         }
@@ -2702,8 +2697,8 @@ bool JobRegistry::cleanupThenArchive(uint64_t jobID) {
         }
     }
     {
-        std::lock_guard<std::mutex> applied_lock(retire_applied_mtx_);
-        retire_applied_.erase(jobID);
+        std::lock_guard<std::mutex> applied_lock(removal_applied_mtx_);
+        removal_applied_.erase(jobID);
     }
     return true;
 }
@@ -2784,22 +2779,22 @@ void JobRegistry::reconcileClosingRemovals() {
     }
 }
 
-size_t JobRegistry::retireMatchingJobs(const SubAttrMatcher& matcher) {
+size_t JobRegistry::removeMatchingJobs(const SubAttrMatcher& matcher) {
     const auto matched = ownFindActive(
         [&matcher](const Job& job) { return matches_job(matcher, job); });
 
     size_t accepted = 0;
     for (const auto& record : matched) {
-        // The same retirement path every caller takes: durable Closing, then
+        // The same removal path every caller takes: durable Closing, then
         // the runtime's drain, then checked kernel cleanup and the archive.
-        if (retireInstance(record.job.JobID)) {
+        if (removeJob(record.job.JobID)) {
             ++accepted;
-            spdlog::info("JobRegistry: retire job with JobID {} by sub_attr matcher",
+            spdlog::info("JobRegistry: remove job with JobID {} by sub_attr matcher",
                          record.job.JobID);
         }
     }
 
-    spdlog::info("JobRegistry: retired {} of {} matching jobs", accepted, matched.size());
+    spdlog::info("JobRegistry: removed {} of {} matching jobs", accepted, matched.size());
     return accepted;
 }
 
@@ -2816,7 +2811,7 @@ inline void JobRegistry::update_job(Job& job){
 }
 
 std::optional<Job> JobRegistry::findJob(uint64_t jobID) {
-    // Read-only snapshot: the heartbeat owns pid identity refresh and retirement,
+    // Read-only snapshot: the heartbeat owns pid identity refresh and removal,
     // so reads never mutate the registry.
     if (jobID == kSystemSentinelJobId) return sentinel_job_;
     auto record = ownRecord(jobID);
@@ -2996,12 +2991,12 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     const bool pid_identities_authoritative = pid_identities_authoritative_of(job);
 
     if (stored.state == RecordState::Closing) {
-        // A retiring instance must never be resurrected into the active set by
+        // A removing instance must never be resurrected into the active set by
         // a late observation: the drain owns it until it is archived.
         result.disposition = UpsertDisposition::Conflict;
         result.code = RegistrationError::InstanceClosing;
         result.error = "instance_closing";
-        result.message = "the instance is retiring and no longer accepts observations";
+        result.message = "the instance is removing and no longer accepts observations";
         return result;
     }
     if (!stored.index_key.empty() && stored.index_key != key.index_key()) {
@@ -3069,7 +3064,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
 
     // A positive observation re-admits a record whose liveness could not be
     // verified. Unverified is not a lifecycle state. A refresh carries no such
-    // verdict: the retirement pass owns it.
+    // verdict: the removal pass owns it.
     const bool recovered = observation && !stored.presumed_live;
     if (recovered) updated.presumed_live = true;
     // Provenance is a durable fact of its own: a manual row that first meets a
@@ -3210,7 +3205,7 @@ void JobRegistry::validateRestoredExecutions(std::vector<JobRecord>& rows) {
     // written". One pass over the manager triple and the pid identities keeps what
     // still exists and drops what a restart cannot re-bind; the first
     // observation re-establishes the manager. A record whose evidence does
-    // not survive stays active but unverified, never retired on a guess.
+    // not survive stays active but unverified, never removed on a guess.
     const std::string boot_id = read_boot_id();
     for (auto& record : rows) {
         if (record.state == RecordState::Closing) continue;   // the drain owns it
@@ -3896,7 +3891,7 @@ bool JobRegistry::runtimeRecord(uint64_t job_id,
 
 void JobRegistry::setExecutionPresumedLive(uint64_t jobID, bool presumed_live) {
     // Liveness evidence only. It never changes the lifecycle state and never
-    // authorizes retirement; it gates kernel admission. Runtime state: not
+    // authorizes removal; it gates kernel admission. Runtime state: not
     // persisted, rebuilt by observation after a restart.
     std::unique_lock lg(records_mtx_);
     const auto it = records_.find(jobID);
@@ -3931,7 +3926,7 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     std::uint64_t decision_repairs = 0;
     std::uint64_t decision_failures = 0;
     std::uint64_t refresh_failures = 0;
-    std::uint64_t retirements = 0;
+    std::uint64_t removals = 0;
     std::uint64_t passes = 0;
     std::int64_t last_scan_start_ms = 0;
     std::int64_t last_scan_success_ms = 0;
@@ -3956,7 +3951,7 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
         decision_repairs = hb_decision_repairs_;
         decision_failures = hb_decision_failures_;
         refresh_failures = hb_refresh_failures_;
-        retirements = hb_retirements_;
+        removals = hb_removals_;
         passes = hb_passes_;
         last_scan_start_ms = last_scan_start_ms_;        last_scan_success_ms = last_scan_success_ms_;
         last_scan_complete = last_scan_complete_;
@@ -4064,7 +4059,7 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     out["decision_repairs"] = decision_repairs;
     out["decision_repair_failures"] = decision_failures;
     out["refresh_failures"] = refresh_failures;
-    out["retirements"] = retirements;
+    out["removals"] = removals;
     out["pass_count"] = passes;
     out["tracker_unavailable"] = tracker_unavailable;
     out["incomplete_drain"] = incomplete_drain;

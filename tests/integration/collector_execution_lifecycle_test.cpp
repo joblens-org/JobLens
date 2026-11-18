@@ -360,7 +360,7 @@ void run(const std::string& base)
     Config::instance(base + ".yaml");
     // This suite exercises collector execution, not kernel ownership, and the
     // test environment has no BPF privileges. Use the documented test seam so
-    // an unavailable kernel attribution does not block retirement/archive.
+    // an unavailable kernel attribution does not block removal/archive.
     JobRegistry::instance().setKernelCleanupForTest(
         [](uint64_t, const Job&, std::string&) { return true; });
     WriterManager::instance().registerWriter<CaptureWriter>("CaptureWriter");
@@ -403,7 +403,7 @@ void run(const std::string& base)
     check(two[1]->sample->job.JobID == 202, "second Job event attribution");
 
     // One Job ends; the other continues through the same source/lane.
-    JobRegistry::instance().retireJob(101);
+    JobRegistry::instance().removeJob(101);
     eventually([&] { return JobRegistry::instance().closingJobCount() == 0; },
                "closing Job was not acknowledged by all collectors");
     eventually([&] { return FakeJobEvent::removed.load() >= 1; },
@@ -423,7 +423,7 @@ void run(const std::string& base)
     check(scheduler.snapshot().at("scheduler").at("scheduling_semantics_version") == 2,
           "scheduling semantics version missing");
 
-    JobRegistry::instance().retireJob(202);
+    JobRegistry::instance().removeJob(202);
     eventually([&] { return JobRegistry::instance().closingJobCount() == 0; },
                "last Job was not acknowledged");
 
@@ -441,7 +441,7 @@ void run(const std::string& base)
     //
     // An inventoried-but-unbound instance must create no collector work; a
     // committed binding must attach the lane and report itself as applied; a
-    // persistent stop must detach it; retirement must still acknowledge.
+    // persistent stop must detach it; removal must still acknowledge.
     // ---------------------------------------------------------------------
     JobRegistry::instance().setCollectorValidator([](const std::string& name) {
         return name == "job_event" || name == "job_periodic";
@@ -518,11 +518,11 @@ void run(const std::string& base)
     check(JobRegistry::instance().findJob(bound.job_id).has_value(),
           "stopping collection must keep the job record");
 
-    // Retirement of a stopped instance is acknowledged without leaving a lane.
-    check(JobRegistry::instance().retireInstance(bound.job_id),
-          "retire the stopped instance");
+    // Removal of a stopped instance is acknowledged without leaving a lane.
+    check(JobRegistry::instance().removeJob(bound.job_id),
+          "remove the stopped instance");
     eventually([&] { return JobRegistry::instance().closingJobCount() == 0; },
-               "stopped instance was not acknowledged after retirement");
+               "stopped instance was not acknowledged after removal");
 
     // Natural completion while bound must detach the lane exactly once.
     const auto bound_two = upsert("701.0");
@@ -531,15 +531,15 @@ void run(const std::string& base)
     bind_two.targets = {bound_two.job_id};
     bind_two.collectors = std::vector<std::string>{"job_event"};
     check(JobRegistry::instance().setCollectors(bind_two).ok, "second bind");
-    const int removed_before_retire = FakeJobEvent::removed.load();
-    check(JobRegistry::instance().retireInstance(bound_two.job_id),
-          "retire the bound instance");
+    const int removed_before_removal = FakeJobEvent::removed.load();
+    check(JobRegistry::instance().removeJob(bound_two.job_id),
+          "remove the bound instance");
     eventually([&] { return JobRegistry::instance().closingJobCount() == 0; },
-               "bound instance was not acknowledged after retirement");
-    check(FakeJobEvent::removed.load() > removed_before_retire,
+               "bound instance was not acknowledged after removal");
+    check(FakeJobEvent::removed.load() > removed_before_removal,
           "natural completion must detach a still-bound lane");
     check(collector_status(scheduler, "job_event").at("job_count").get<size_t>() == 0,
-          "the retired instance must leave the lane");
+          "the removed instance must leave the lane");
 
     // A distinct final fixture poisons the event lane: the invalid binding is
     // still diagnosed and emits nothing, but cannot contaminate the successful
@@ -559,7 +559,7 @@ void run(const std::string& base)
     check(registry.setCollectors(stop_failed).ok, "manual stop of failed event lane must be accepted");
     eventually([&] { return collector_status(scheduler, "job_event").at("job_count") == 0; },
                "manual stop did not detach the failed job");
-    registry.retireJob(303);
+    registry.removeJob(303);
     eventually([&] { return scheduler.actual(303).draining; }, "failed drain not owned by scheduler");
     check(!registry.cleanupClosingJobs(), "shutdown sweep must refuse an unproven live drain");
     check(registry.jobRecord(303).has_value(), "unproven live drain must remain Closing");

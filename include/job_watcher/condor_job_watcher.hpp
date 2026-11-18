@@ -42,7 +42,7 @@
 //
 // The poll thread resolves each exec event into a Job and registers it
 // synchronously through the sink; policy, storage and /proc work stay on that
-// thread, while the heartbeat keeps enumeration, retirement and reconciliation.
+// thread, while the heartbeat keeps enumeration, removal and reconciliation.
 class CondorJobWatcher final : public IDiscoverySource{
 public:
     // Options only: nothing is loaded and nothing polls until start().

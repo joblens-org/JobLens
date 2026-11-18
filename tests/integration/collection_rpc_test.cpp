@@ -263,7 +263,7 @@ struct Fixture {
 void run_selector_cases(JobRegistry& registry, const Fixture& ids)
 {
     // --- a selector that addresses nothing is rejected ------------------
-    // The retired instance_id spelling is no longer singled out: the selector
+    // The removed instance_id spelling is no longer singled out: the selector
     // has to name the target by JobID or by native identity fields. A selector
     // carrying only the old key addresses nothing, so it stays a request error.
     {
@@ -768,7 +768,7 @@ void run_job_record_cases(JobRegistry& registry, const Fixture& ids)
                   "internal ids must be decimal strings: " + record.dump());
             check(record["JobID"] != "0",
                   "the system sentinel must never be listed");
-            // The record carries one id key (JobID above); the retired
+            // The record carries one id key (JobID above); the removed
             // instance handle is not projected any more.
         }
 
@@ -906,8 +906,8 @@ void run_closing_case(JobRegistry& registry, const Fixture& ids)
 {
     // A closing manager rejects new binding mutations.
     install_deferred_drain(registry, [](JobEvent, const Job&) {});
-    check(registry.retireInstance(ids.condor_extra),
-          "retiring an instance with subscribers must start the drain");
+    check(registry.removeJob(ids.condor_extra),
+          "removing an instance with subscribers must start the drain");
     check(registry.closingJobCount() == size_t{1}, "the instance must be closing, not archived");
 
     const auto response = rpc(
@@ -917,11 +917,11 @@ void run_closing_case(JobRegistry& registry, const Fixture& ids)
     check(response["code"] == "instance_closing",
           "a closing instance must reject new intent with instance_closing: " + response.dump());
     check(test_runtime(registry).completeDrain(ids.condor_extra),
-          "closing case: explicit deferred drain completion must finish retirement");
+          "closing case: explicit deferred drain completion must finish removal");
 }
 
 // The remove two-tier: the default keeps the stop semantics; erase:true
-// retires the instance for real — a collected instance leaves a durable h:
+// removes the instance for real — a collected instance leaves a durable h:
 // history row, a never-collected one leaves none. This runs LAST and closes
 // the registry so the raw LevelDB image can be inspected.
 void run_erase_cases(JobRegistry& registry, const Fixture& ids, const std::string& db_path)
@@ -953,7 +953,7 @@ void run_erase_cases(JobRegistry& registry, const Fixture& ids, const std::strin
     };
 
     // The closing case left the runtime double in deferred-drain mode; restore
-    // the auto-drain so the retirements below converge through reconcile.
+    // the auto-drain so the removals below converge through reconcile.
     install_collection_runtime(
         registry, [](const Job& job, std::vector<std::string>& applied, std::string& error) {
             applied = job.CollectorNames;
@@ -977,7 +977,7 @@ void run_erase_cases(JobRegistry& registry, const Fixture& ids, const std::strin
     }
 
     // Erase a never-collected instance (nothing was ever attached to it):
-    // the retirement is a durable delete, no history row.
+    // the removal is a durable delete, no history row.
     {
         const auto response = rpc("jobs/erase",
                                   json{{"JobID", ids.condor_a_other}});
@@ -985,7 +985,7 @@ void run_erase_cases(JobRegistry& registry, const Fixture& ids, const std::strin
               "erase of a never-collected instance must succeed: " + response.dump());
         check(response["mode"] == "erase",
               "erase must identify itself as the erase tier: " + response.dump());
-        check(response["deleted_count"] == 1, "erase must count the retirement");
+        check(response["deleted_count"] == 1, "erase must count the removal");
         check(response["record_retained"] == false,
               "erase must not claim job-record retention");
         // The runtime owns the drain; reconcile drives it to completion, and
@@ -996,7 +996,7 @@ void run_erase_cases(JobRegistry& registry, const Fixture& ids, const std::strin
     }
 
     // Erase a COLLECTED instance: with the runtime holding a real attachment,
-    // the retirement archives a durable history row instead of discarding.
+    // the removal archives a durable history row instead of discarding.
     {
         CollectionRequest bind;
         bind.targets = {ids.slurm_batch};
@@ -1011,7 +1011,7 @@ void run_erase_cases(JobRegistry& registry, const Fixture& ids, const std::strin
         check(response["status"] == "success",
               "erase of a collected instance must succeed: " + response.dump());
         check(response["mode"] == "erase" && response["deleted_count"] == 1,
-              "erase must report one retired instance: " + response.dump());
+              "erase must report one removed instance: " + response.dump());
         // The drain converges through the test runtime (auto-drain), which
         // archives the closing record.
         test_runtime(registry).reconcile(ids.slurm_batch);
@@ -1038,7 +1038,7 @@ void run_erase_cases(JobRegistry& registry, const Fixture& ids, const std::strin
               "the discarded instance must leave no active row");
     }
 
-    std::cout << "PASS erase tier: remove keeps stop semantics; erase retires for "
+    std::cout << "PASS erase tier: remove keeps stop semantics; erase removes for "
                  "real (collected -> history row, never-collected -> delete)"
               << std::endl;
 }

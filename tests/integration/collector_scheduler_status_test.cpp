@@ -471,7 +471,7 @@ void run(const std::string& base) {
     Config::instance(base + ".yaml");
     WriterManager::instance().registerWriter<DrainCaptureWriter>("DrainCaptureWriter");
     auto& scheduler = CollectorScheduler::instance();
-    JobRegistry::instance().retireJob(0);
+    JobRegistry::instance().removeJob(0);
     std::vector<std::string> early_timer_failures;
     const auto timer_test = [&](const char* name, const std::function<void()>& body) {
         try { body(); }
@@ -745,7 +745,7 @@ void run(const std::string& base) {
           "a reattach must get a strictly greater attach token");
 
     // Job 结束 → removed；重复摘除不重复投递
-    registry.retireJob(456);
+    registry.removeJob(456);
     CollectorSchedulerTestAccess::reconcile(scheduler);
     check(life_removed.load() == 2, "on_job_removed fired on job removal");
     check(sys_removed.load() == 1,
@@ -1342,7 +1342,7 @@ void run(const std::string& base) {
               "manual stop must retain the failed epoch obligation and snapshot");
         close_source.set({record_of(7208, RecordState::Closing, {})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
-        check(close_sink.count(7208) == 0, "retirement must adopt the failed manual-stop tail");
+        check(close_sink.count(7208) == 0, "removal must adopt the failed manual-stop tail");
         close_source.set({});
         CollectorSchedulerTestAccess::reconcile(scheduler);
     });
@@ -1426,7 +1426,7 @@ void run(const std::string& base) {
         // reaches the checked cleanup or the durable archive. This fixture runs
         // the REAL JobRegistry and the REAL CollectorScheduler against their
         // own temporary LevelDB directory, with a real selection command and a
-        // real retirement, and pauses/drains the lanes through test access.
+        // real removal, and pauses/drains the lanes through test access.
         const std::string live_db = base + "-archive.db";
         std::filesystem::remove_all(live_db);
         JobRegistryOptions options;
@@ -1494,7 +1494,7 @@ void run(const std::string& base) {
                           CollectorSchedulerTestAccess::pendingCloses(scheduler, first) == 1,
                       "the stopped lane must owe a tail with no membership");
             }
-            check(archive.retireInstance(id), "the real retirement must be accepted");
+            check(archive.removeJob(id), "the real removal must be accepted");
             const auto record = archive.jobRecord(id);
             check(record.has_value() && record->state == RecordState::Closing,
                   "the real durable record must stay Closing until the drain completes");

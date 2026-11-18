@@ -775,10 +775,10 @@ void durable_intent_survives_restart_and_manager_change(const std::string& base)
         check(!conflict.ok && conflict.error == "execution_manager_conflict",
               "a different live manager must not merge into the old record");
 
-        check(registry.retireInstance(job_id),
-              "retiring the old manager must be accepted");
+        check(registry.removeJob(job_id),
+              "removing the old manager must be accepted");
         check(!registry.jobRecord(job_id).has_value(),
-              "retirement without a runtime archives the record immediately");
+              "removal without a runtime archives the record immediately");
 
         const auto replacement = registry.upsertObservedJob(
             condor_observation("172.0", "boot-bbb", 5252, 990000));
@@ -1410,11 +1410,11 @@ void closing_keeps_the_runtime_holders_until_the_archive(const std::string& base
     test_runtime(registry).reconcile(id);
     check(registry.actualCollection(id).collectors ==
               std::vector<std::string>{"cpumem_collector"},
-          "the binding must be attached before the retirement");
+          "the binding must be attached before the removal");
 
     install_deferred_drain(registry, [](JobEvent, const Job&) {});
-    check(registry.retireInstance(id),
-          "retirement must be accepted and handed to the runtime");
+    check(registry.removeJob(id),
+          "removal must be accepted and handed to the runtime");
     check(!has_active(registry, id), "a closing instance leaves the active map");
 
     const auto closing = registry.jobRecord(id);

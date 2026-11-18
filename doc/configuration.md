@@ -203,13 +203,13 @@ policy down forever).
 | Remove — erase tier | `jobs/erase` | Retires the instance for real: the closing fact is durable first, then a collected instance is archived as an `h:` history row and a never-collected one is durably deleted. The response distinguishes the tiers through `mode: stop\|erase` |
 
 Archive-versus-delete is decided by the collection *fact* — the runtime's
-actual attachment snapshot captured when the retirement is accepted. One
+actual attachment snapshot captured when the removal is accepted. One
 documented exception: when the process restarts between the durable
 Closing write and the finalization (the in-memory capture dies with the
 process), the restored closing row falls back to its durable effective
 selection instead. A selected-but-never-attached instance may therefore
 leave a history row after such a restart. The failure direction is
-keep-a-row over silently dropping one; instances that retired without a
+keep-a-row over silently dropping one; instances removed without a
 restart are classified strictly.
 
 Both remove tiers address targets by `JobID` or by `matcher`, the same

@@ -2,7 +2,7 @@
 
 本指南描述如何向作业注册表接入一种**新的调度器类型**——例如一个
 `ssh` 会话源：写一个 *job watcher*（发现源）和一个 *scheduler adapter*
-（调度器适配器）。其余所有环节（`JobStore` 的 merge 语义、心跳的退休证据
+（调度器适配器）。其余所有环节（`JobStore` 的 merge 语义、心跳的移除证据
 规则、采集绑定与对账、RPC 面、内核归因）对新类型零改动直接生效。English
 version: [job_watcher_integration.md](job_watcher_integration.md)
 
@@ -27,7 +27,7 @@ src/ebpf/trace_ssh_session.bpf.c          # 可选：exec-hint 事件源
 你免费得到的东西：
 
 - 持久存储（`JobRecord`）、identity 索引、manager 冲突处理；
-- 心跳：权威 manager pass、缺席计数、退休证据规则、逐记录执行证据刷新；
+- 心跳：权威 manager pass、缺席计数、移除证据规则、逐记录执行证据刷新；
 - desired-vs-applied 采集对账与 `CollectionStatus`；
 - `jobs/*` 与 `jobs/collection/*` RPC 方法及 trigger 代理；
 - 内核归因（`pid2job` / `cgroup2job`）——**当且仅当**你的 adapter 声明
@@ -71,7 +71,7 @@ src/ebpf/trace_ssh_session.bpf.c          # 可选：exec-hint 事件源
    轮询切片）。
 2. 轮询线程自己解析 pid（`observeForHint`），并**同线程同步**通过
    `sink.on_job(job)` 登记发现的 Job：store upsert → 生命周期/attach。
-   没有队列、没有 worker；心跳只保留 manager pass、退休与对账。
+   没有队列、没有 worker；心跳只保留 manager pass、移除与对账。
 3. exec 时刻调度器状态可能还没写好（job ad、spool 目录）：**不完整的发现
    永远不建记录**；watcher 请求一次合并的权威 pass，下一遍 manager pass
    在数十毫秒内收敛。
@@ -147,7 +147,7 @@ store/intent 所有。
   `cgroup_scoped_membership = true` 仅当 `cgroup.procs` 是你的执行实例的
   权威成员证据；`kernel_attribution = true` 仅当你的 manager 语义支持
   pid/cgroup 归因。缺 trait 是正常状态、绝不是错误：没有该 trait 的
-  adapter，其作业只是不参与基于 cgroup 的退休证据和内核 map。
+  adapter，其作业只是不参与基于 cgroup 的移除证据和内核 map。
 
 ## 4. 分步操作
 
@@ -307,7 +307,7 @@ ssh_job_watcher:
    ```
 
    不变量（I1–I8）在这一层钉死：merge 语义、manager 冲突、
-   缺席/suspect 迁移、退休证据、closing 语义。
+   缺席/suspect 迁移、移除证据、closing 语义。
 
 依赖 eBPF 的测试，照 `tests/integration/run_net_usage_test.sh` 的方式先
 探测 namespace 可用性、不可用就干净跳过。
@@ -328,7 +328,7 @@ ssh_job_watcher:
 | `config/config.example.yaml` | `<t>_job_watcher` 配置节 + `maintenance.types` 一项 |
 
 `collector_type.h`、`job_identity`、`maintenance_config`、`JobStore`、
-心跳/退休逻辑、`KernelAttribution`、RPC 方法、trigger 均**不需要改动**：
+心跳/移除逻辑、`KernelAttribution`、RPC 方法、trigger 均**不需要改动**：
 身份、配置节、native-id 规则、facts（JSON 通道）、匹配与 cgroup 推导全部
 由 adapter 驱动。
 

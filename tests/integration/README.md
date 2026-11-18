@@ -74,8 +74,8 @@ bash tests/integration/run_watcher_scan_test.sh build
   持久写失败与 ID 不复用。
 - `job_collection_intent_test.cpp`：手工选择优先级、持久停止与 `reset_auto`、重复/过期修订、
   重启后的意图恢复；自动策略在手工覆盖下不推进客户端可见修订。
-- `job_maintenance_test.cpp`：启动竞争、事件回放、两次完整缺席才退休、EPERM 不算死亡、
-  队列溢出与重扫、tracker 不可用、旧代际迟到清理；另含**无发现源时手工登记记录的刷新与退休**
+- `job_maintenance_test.cpp`：启动竞争、事件回放、两次完整缺席才移除、EPERM 不算死亡、
+  队列溢出与重扫、tracker 不可用、旧代际迟到清理；另含**无发现源时手工登记记录的刷新与移除**
   以及**事件触发/按需（`ensure_registered`）的全量对账**。
 - `collection_rpc_test.cpp`：全部清单/采集 RPC 方法通过真实 AF_UNIX RPC 驱动，覆盖选择器形式、
   分页游标失效、409/503/404 分类、`ensure_registered` 实际触发一次权威发现、
@@ -89,7 +89,7 @@ bash tests/integration/run_watcher_scan_test.sh build
 采集意图真正落到采集器的端到端验证在
 `run_execution_tests.sh --suite lifecycle`（`collector_execution_lifecycle_test.cpp`）：
 无绑定的清单实例不产生采集、提交绑定时挂载 lane 并报告 applied、持久停止后摘除且保留清单、
-无论停止后退休还是绑定中自然结束都能被确认且不残留 lane。
+无论停止后移除还是绑定中自然结束都能被确认且不残留 lane。
 
 `run_registry_tests.sh --suite lifecycle`（`job_registry_lifecycle_test.cpp`）验证
 JobRegistry 自己的生命周期与自动选择：构造即启动清单栈（providers 发布）、

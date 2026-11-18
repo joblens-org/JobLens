@@ -179,7 +179,7 @@ enum class StoreFaultMode {
 // ---------------------------------------------------------------------------
 
 // Durable lifecycle state persisted with the record. Closing is written before
-// the collector drain starts, so an interrupted retirement can never resurrect
+// the collector drain starts, so an interrupted removal can never resurrect
 // as active. A missing presumed-live verdict (JobRecord::presumed_live ==
 // false) is NOT a lifecycle state: a restored record is Active unless it is
 // Closing, and an unreadable process is "unknown", never dead.

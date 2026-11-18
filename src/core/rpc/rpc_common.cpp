@@ -562,7 +562,7 @@ SubAttrMatcher parse_legacy_matcher(const nlohmann::json& matcher_json)
     return matcher;
 }
 
-// Stop collection and keep the job record, or erase/retire the target for
+// Stop collection and keep the job record, or erase/remove the target for
 // real. The two resource commands share target resolution but never the same
 // destructive semantics.
 nlohmann::json remove_jobs(JobRegistry& registry, const nlohmann::json& req, bool erase)
@@ -583,17 +583,17 @@ nlohmann::json remove_jobs(JobRegistry& registry, const nlohmann::json& req, boo
     }
 
     if (erase) {
-        // The erase tier: a real retirement. The closing fact is durable
+        // The erase tier: a real removal. The closing fact is durable
         // before anything destructive starts; collected instances end as a
         // history row, never-collected ones as a durable delete.
         std::vector<std::string> erased_instances;
         size_t erased = 0;
         for (const auto id : targets) {
             if (id == kSystemSentinelJobId) continue;
-            if (!registry.retireInstance(id)) {
+            if (!registry.removeJob(id)) {
                 return error_payload(
                     "remove_failed",
-                    fmt::format("could not retire instance {}; the record stays "
+                    fmt::format("could not remove instance {}; the record stays "
                                 "active and the command is retryable",
                                 format_job_id(id)));
             }
@@ -606,7 +606,7 @@ nlohmann::json remove_jobs(JobRegistry& registry, const nlohmann::json& req, boo
         out["deleted_count"] = erased;
         out["erased_instances"] = std::move(erased_instances);
         out["record_retained"] = false;
-        out["msg"] = "erase retired the instances (collected ones archived, "
+        out["msg"] = "erase removed the instances (collected ones archived, "
                      "never-collected ones deleted)";
         return out;
     }
@@ -614,15 +614,15 @@ nlohmann::json remove_jobs(JobRegistry& registry, const nlohmann::json& req, boo
     std::vector<std::string> stopped_instances;
     nlohmann::json apply_errors = nlohmann::json::array();
     size_t stopped = 0;
-    size_t retired = 0;
+    size_t removed = 0;
     for (const auto id : targets) {
         if (id == kSystemSentinelJobId) continue;
         if (!registry.jobRecord(id).has_value()) {
-            if (registry.retireInstance(id)) ++retired;
+            if (registry.removeJob(id)) ++removed;
             continue;
         }
         if (!registry.findJob(id).has_value()) {
-            // Already draining/retired: stopping again is idempotent.
+            // Already draining/removed: stopping again is idempotent.
             ++stopped;
             continue;
         }
@@ -656,7 +656,7 @@ nlohmann::json remove_jobs(JobRegistry& registry, const nlohmann::json& req, boo
     nlohmann::json out;
     out["status"] = "success";
     out["mode"] = "stop";
-    out["deleted_count"] = retired;
+    out["deleted_count"] = removed;
     out["stopped_count"] = stopped;
     out["stopped_instances"] = stopped_instances;
     out["apply_errors"] = std::move(apply_errors);

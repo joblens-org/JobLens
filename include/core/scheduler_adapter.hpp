@@ -96,7 +96,7 @@ struct DiscoveryTypeSettings {
 
 // Capability traits of one adapter. A trait being absent is a normal state,
 // never an error: jobs of an adapter without the cgroup trait simply never
-// get cgroup-based retirement evidence or kernel attribution.
+// get cgroup-based removal evidence or kernel attribution.
 struct AdapterTraits {
     bool cgroup_scoped_membership = false;  // cgroup.procs is authoritative membership
     bool kernel_attribution = false;        // participates in pid2job/cgroup2job
@@ -109,7 +109,7 @@ struct AdapterTraits {
 // details — the virtuals below own every bit of that mapping.
 using NamespaceFacts = std::vector<std::string>;
 
-// What one fact-refresh read saw, in the terms the retirement decision uses.
+// What one fact-refresh read saw, in the terms the removal decision uses.
 // The registry owns the decision; the adapter only reports evidence:
 //   * manager                — liveness of the execution manager (Unknown is
 //                              never death evidence);
@@ -259,7 +259,7 @@ public:
 
 protected:
     // Liveness evidence for one job from the caller's probes, applying the
-    // same rule the retirement pass uses: manager liveness from its complete
+    // same rule the removal pass uses: manager liveness from its complete
     // identity, "cgroup empty" only from a readable job cgroup, member
     // liveness/inconclusiveness from the cgroup members and the recorded
     // pid identities. Shared by the adapters' refreshFacts.
