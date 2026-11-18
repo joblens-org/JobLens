@@ -114,34 +114,30 @@ int64_t now_us()
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-// Stable map key for one process generation. The triple is what makes a pid a
-// process; comparing bare pids would let a recycled number alias an old
-// manager.
-std::string process_identity_key(const ProcessIdentity& identity)
-{
-    return fmt::format("{}:{}:{}", identity.pid, identity.start_ticks, identity.boot_id);
-}
+// Stable map key for one manager identity lives on JobRegistry
+// (managerKey): the triple is what makes a pid a process, and comparing
+// bare pids would let a recycled number alias an old manager.
 
 JobStore::WriteOp put_record_op(const JobRecord& record) {
     JobStore::WriteOp op;
     op.kind = JobStore::WriteOp::PutRecord;
-    op.internal_id = record.job.JobID;
+    op.job_id = record.job.JobID;
     op.record = record;
     return op;
 }
 
-JobStore::WriteOp delete_record_op(uint64_t internal_id) {
+JobStore::WriteOp delete_record_op(uint64_t job_id) {
     JobStore::WriteOp op;
     op.kind = JobStore::WriteOp::DeleteRecord;
-    op.internal_id = internal_id;
+    op.job_id = job_id;
     return op;
 }
 
-JobStore::WriteOp identity_op(JobStore::WriteOp::Kind kind, uint64_t internal_id,
+JobStore::WriteOp identity_op(JobStore::WriteOp::Kind kind, uint64_t job_id,
                               SchedulerKey key) {
     JobStore::WriteOp op;
     op.kind = kind;
-    op.internal_id = internal_id;
+    op.job_id = job_id;
     op.key = std::move(key);
     return op;
 }
@@ -196,7 +192,7 @@ public:
     // only when the derived key is complete.
     RecordTxn& putIndexed(JobRecord record)
     {
-        const uint64_t internal_id = record.job.JobID;
+        const uint64_t job_id = record.job.JobID;
         std::string index_key;
         std::optional<SchedulerKey> key = registry_.keyOf(record.job);
         if (key) {
@@ -205,9 +201,9 @@ public:
         }
         put(std::move(record));
         if (key) {
-            index_put_.emplace_back(std::move(index_key), internal_id);
+            index_put_.emplace_back(std::move(index_key), job_id);
             ops_.push_back(
-                identity_op(JobStore::WriteOp::PutIdentity, internal_id, std::move(*key)));
+                identity_op(JobStore::WriteOp::PutIdentity, job_id, std::move(*key)));
         }
         return *this;
     }
@@ -226,28 +222,28 @@ public:
     // removal of its memory image.
     RecordTxn& erase(const JobRecord& record)
     {
-        const uint64_t internal_id = record.job.JobID;
-        ops_.push_back(delete_record_op(internal_id));
+        const uint64_t job_id = record.job.JobID;
+        ops_.push_back(delete_record_op(job_id));
         if (const auto key = registry_.keyOf(record.job)) {
             ops_.push_back(
-                identity_op(JobStore::WriteOp::DeleteIdentity, internal_id, *key));
+                identity_op(JobStore::WriteOp::DeleteIdentity, job_id, *key));
         }
-        erased_.push_back(internal_id);
+        erased_.push_back(job_id);
         return *this;
     }
 
     // i: maintenance that carries no record image of its own.
-    RecordTxn& indexPut(const SchedulerKey& key, uint64_t internal_id)
+    RecordTxn& indexPut(const SchedulerKey& key, uint64_t job_id)
     {
-        index_put_.emplace_back(key.index_key(), internal_id);
-        ops_.push_back(identity_op(JobStore::WriteOp::PutIdentity, internal_id, key));
+        index_put_.emplace_back(key.index_key(), job_id);
+        ops_.push_back(identity_op(JobStore::WriteOp::PutIdentity, job_id, key));
         return *this;
     }
 
-    RecordTxn& indexRelease(const SchedulerKey& key, uint64_t internal_id)
+    RecordTxn& indexRelease(const SchedulerKey& key, uint64_t job_id)
     {
-        index_release_.emplace_back(key.index_key(), internal_id);
-        ops_.push_back(identity_op(JobStore::WriteOp::DeleteIdentity, internal_id, key));
+        index_release_.emplace_back(key.index_key(), job_id);
+        ops_.push_back(identity_op(JobStore::WriteOp::DeleteIdentity, job_id, key));
         return *this;
     }
 
@@ -257,7 +253,7 @@ public:
     {
         JobStore::WriteOp op;
         op.kind = JobStore::WriteOp::PutHistory;
-        op.internal_id = record.job.JobID;
+        op.job_id = record.job.JobID;
         op.record = record;
         op.applied_collectors = std::move(applied);
         op.history_provenance = provenance;
@@ -278,9 +274,9 @@ public:
 
     // Names a row whose previous image this batch overwrites (the recovery
     // fence). A create passes none: it published no image to revert.
-    RecordTxn& touch(uint64_t internal_id)
+    RecordTxn& touch(uint64_t job_id)
     {
-        touched_.push_back(internal_id);
+        touched_.push_back(job_id);
         return *this;
     }
 
@@ -327,8 +323,8 @@ private:
         }
         for (const auto& entry : index_put_)
             registry_.identity_index_[entry.first] = entry.second;
-        for (const auto internal_id : erased_)
-            registry_.eraseRecordLocked(internal_id);
+        for (const auto job_id : erased_)
+            registry_.eraseRecordLocked(job_id);
     }
 
     JobRegistry& registry_;
@@ -355,28 +351,28 @@ SubAttrMatcher JobRegistry::duplicateMatcherOf(const Job& job) const {
 NamespaceFacts JobRegistry::namespaceFactsOf(const Job& job) const {
     const auto* adapter = namespaceAdapterOf(job);
     if (adapter != nullptr) return adapter->namespaceFacts(job);
-    return {job.cluster_name, job.clusterTag};
+    return {job.clusterName, job.clusterTag};
 }
 
 NamespaceFacts JobRegistry::selectorFactsOf(const NativeSelector& selector) const {
     const auto* adapter = namespaceAdapterNamed(selector.adapter);
     if (adapter != nullptr) return adapter->selectorNamespaceFacts(selector);
-    return {selector.cluster_name, selector.cluster_tag};
+    return {selector.clusterName, selector.clusterTag};
 }
 
 const ISchedulerAdapter* JobRegistry::adapterNamed(const std::string& name) const {
     return namespaceAdapterNamed(name);
 }
 
-bool JobRegistry::adoptNamespaceAliases(Job& job, const std::string& cluster_name,
-                                        const std::string& cluster_tag) const {
+bool JobRegistry::adoptNamespaceAliases(Job& job, const std::string& clusterName,
+                                        const std::string& clusterTag) const {
     if (const auto* adapter = namespaceAdapterOf(job))
-        return adapter->adoptNamespaceAliases(job, cluster_name, cluster_tag);
+        return adapter->adoptNamespaceAliases(job, clusterName, clusterTag);
     // No registered adapter answers for this scheduler: the generic business
     // keeps the aliases in the common fields — the same fields the generic
     // comparisons read.
-    job.cluster_name = cluster_name;
-    job.clusterTag = cluster_tag;
+    job.clusterName = clusterName;
+    job.clusterTag = clusterTag;
     return true;
 }
 
@@ -389,7 +385,7 @@ void JobRegistry::normalizeNamespaceFacts(Job& job) const {
         // Ingress and restored facts may carry namespace aliases only in the
         // common fields. Adopt them into empty typed slots (facts win), then
         // render the typed namespace back to the common fields.
-        adapter->adoptNamespaceAliases(job, job.cluster_name, job.clusterTag);
+        adapter->adoptNamespaceAliases(job, job.clusterName, job.clusterTag);
         adapter->renderNamespace(job);
     }
 }
@@ -558,8 +554,8 @@ Job JobRegistry::decodeStoredJob(const nlohmann::json& row) const
     job.subtype = skeleton.subtype;
     job.subtype_name = skeleton.subtype_name;
     set_pids(job, row.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>());
-    job.NativeJobID = row.value("native_job_id", "");
-    job.cluster_name = row.value("cluster_name", "");
+    job.JobNativeID = row.value("JobNativeID", "");
+    job.clusterName = row.value("clusterName", "");
     job.clusterTag = row.value("clusterTag", "");
     if (!job.subtype_name.empty()) {
         job.sub_attr = row.contains("sub_attr") && row["sub_attr"].is_object()
@@ -612,7 +608,7 @@ JobRegistry& JobRegistry::instance() {
 
 namespace {
 constexpr int kAbsencesBeforeRetirement = 2;
-constexpr std::size_t kEndedExecutionCapacity = 4096;
+constexpr std::size_t kEndedManagerCapacity = 4096;
 constexpr std::uint32_t kWaitSliceMs = 100;
 }  // namespace
 
@@ -684,16 +680,16 @@ UpsertResult JobRegistry::processObservation(const Job& job, std::set<uint64_t>&
         std::lock_guard<std::mutex> lock(hb_mtx_);
         ++hb_obsolete_hints_;
         spdlog::debug("JobRegistry: discarded hint for the ended execution of '{}'",
-                      key->native_job_id);
-        result.message = "obsolete execution generation";
+                      key->job_native_id);
+        result.message = "obsolete execution manager";
         return result;
     }
 
-    // Readiness: the facts name a job AND the execution generation is complete.
+    // Readiness: the facts name a job AND its execution manager is complete.
     if (!key || !manager.complete()) {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         ++hb_incomplete_observations_;
-        spdlog::debug("JobRegistry: incomplete discovery '{}'", job.NativeJobID);
+        spdlog::debug("JobRegistry: incomplete discovery '{}'", job.JobNativeID);
     }
 
     // Admission is a creation gate. An identity the registry already owns (a
@@ -712,16 +708,16 @@ UpsertResult JobRegistry::processObservation(const Job& job, std::set<uint64_t>&
         result = upsertObservedJob(job, &*admission);
     }
     if (result.ok) {
-        observed.insert(result.internal_id);
+        observed.insert(result.job_id);
         if (result.disposition == UpsertDisposition::Created)
-            created.insert(result.internal_id);
+            created.insert(result.job_id);
         std::lock_guard<std::mutex> lock(hb_mtx_);
-        auto& entry = absences_[result.internal_id];
+        auto& entry = absences_[result.job_id];
         entry.manager = manager;
         entry.complete_absences = 0;
         entry.last_seen_ms = clockNow();
         entry.last_seen_seq = ++observation_seq_;
-        suspect_ids_.erase(result.internal_id);
+        suspect_ids_.erase(result.job_id);
         return result;
     }
 
@@ -731,7 +727,7 @@ UpsertResult JobRegistry::processObservation(const Job& job, std::set<uint64_t>&
         return result;
     }
 
-    if (result.error == "execution_generation_conflict" ||
+    if (result.error == "execution_manager_conflict" ||
         result.error == "identity_quarantined" ||
         result.error == "instance_closing" ||
         result.error == "identity_index_mismatch") {
@@ -739,7 +735,7 @@ UpsertResult JobRegistry::processObservation(const Job& job, std::set<uint64_t>&
         ++hb_upsert_conflicts_;
         hb_last_error_ = result.error + (result.message.empty() ? "" : ": " + result.message);
         spdlog::warn("JobRegistry: discovery for '{}' rejected: {}",
-                     job.NativeJobID, result.error);
+                     job.JobNativeID, result.error);
         return result;
     }
 
@@ -787,8 +783,8 @@ void JobRegistry::repairMissingInitialDecisions() {
 
 RefreshResult JobRegistry::probeRecordEvidence(const Job& job) const {
     // No adapter, no scheduler scope: the manager identity (when the record has
-    // one) and the recorded member identities are the only evidence. This is
-    // the pre-existing member rule, now reported as a RefreshResult so the
+    // one) and the recorded pid identities are the only evidence. This is the
+    // pre-existing pid identity rule, now reported as a RefreshResult so the
     // retirement decision reads one shape.
     RefreshResult result;
     const ProcessIdentity& manager = manager_of(job);
@@ -797,34 +793,29 @@ RefreshResult JobRegistry::probeRecordEvidence(const Job& job) const {
             process_probe_ ? process_probe_(manager) : LivenessResult{};
         result.manager = liveness.state;
     }
-    for (const auto& member : members_of(job)) {
-        if (result.any_member_live) break;
-        const LivenessResult liveness =
-            process_probe_ ? process_probe_(member) : LivenessResult{};
-        if (liveness.state == LivenessState::Alive) {
-            result.any_member_live = true;
-        } else if (liveness.state == LivenessState::Unknown) {
-            // An unreadable member might be alive: never death evidence.
-            result.member_inconclusive = true;
-        }
-    }
+    probePidIdentities(job, result);
     return result;
 }
 
-void JobRegistry::probeSurvivingMembers(const Job& stored, const Job& refreshed,
-                                        RefreshResult& evidence) const {
-    if (refreshed.execution.members_authoritative) return;  // a confirmed read wins
-    if (!members_of(refreshed).empty()) return;             // the read produced evidence
-    for (const auto& member : members_of(stored)) {
-        if (evidence.any_member_live) break;
+void JobRegistry::probePidIdentities(const Job& job, RefreshResult& evidence) const {
+    for (const auto& pid_identity : pid_identities_of(job)) {
+        if (evidence.any_pid_identity_live) break;
         const LivenessResult liveness =
-            process_probe_ ? process_probe_(member) : LivenessResult{};
+            process_probe_ ? process_probe_(pid_identity) : LivenessResult{};
         if (liveness.state == LivenessState::Alive) {
-            evidence.any_member_live = true;
+            evidence.any_pid_identity_live = true;
         } else if (liveness.state == LivenessState::Unknown) {
-            evidence.member_inconclusive = true;
+            // An unreadable pid identity might be alive: never death evidence.
+            evidence.pid_identity_inconclusive = true;
         }
     }
+}
+
+void JobRegistry::probeSurvivingPidIdentities(const Job& stored, const Job& refreshed,
+                                              RefreshResult& evidence) const {
+    if (refreshed.execution.pid_identities_authoritative) return;  // a confirmed read wins
+    if (!pid_identities_of(refreshed).empty()) return;             // the read produced evidence
+    probePidIdentities(stored, evidence);
 }
 
 std::optional<JobRegistry::RefreshedEvidence> JobRegistry::applyRefreshedRecord(
@@ -878,7 +869,7 @@ std::optional<JobRegistry::RefreshedEvidence> JobRegistry::applyRefreshedRecord(
             // Publish the memory image anyway so the read order and
             // last_seen_us advance exactly like the old repeated-observation
             // path (bookkeeping only).
-            outcome.has_member_evidence = !members_of(updated.job).empty();
+            outcome.has_pid_identity_evidence = !pid_identities_of(updated.job).empty();
             {
                 std::unique_lock lg(records_mtx_);
                 records_[current->job.JobID] = std::move(updated);
@@ -899,8 +890,8 @@ std::optional<JobRegistry::RefreshedEvidence> JobRegistry::applyRefreshedRecord(
             return std::nullopt;
         }
         const auto published = ownRecord(current->job.JobID);
-        outcome.has_member_evidence =
-            published ? !members_of(published->job).empty() : true;
+        outcome.has_pid_identity_evidence =
+            published ? !pid_identities_of(published->job).empty() : true;
         changed = true;
     }
     // Evidence changes reach bound consumers through the runtime, which re-reads
@@ -910,7 +901,7 @@ std::optional<JobRegistry::RefreshedEvidence> JobRegistry::applyRefreshedRecord(
 }
 
 bool JobRegistry::retireIfConfirmed(const JobRecord& record, const std::string& reason) {
-    // Only retire the generation the evidence was gathered for. A late
+    // Only retire the manager the evidence was gathered for. A late
     // decision for an older execution must never remove newer ownership.
     const auto current = ownRecord(record.job.JobID);
     if (!current) return false;
@@ -930,7 +921,7 @@ bool JobRegistry::retireIfConfirmed(const JobRecord& record, const std::string& 
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
         ++hb_retirements_;
-        closing_executions_.emplace_back(record.job.JobID,
+        closing_managers_.emplace_back(record.job.JobID,
                                            manager_of(record.job));
         absences_.erase(record.job.JobID);
         suspect_ids_.erase(record.job.JobID);
@@ -940,21 +931,21 @@ bool JobRegistry::retireIfConfirmed(const JobRecord& record, const std::string& 
 }
 
 std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const Job& job) {
-    // Blanket registration on: every captured job registers; the
-    // automatic selection stays with the post-registration path
-    // (apply_auto_policy), so no decision is pre-evaluated here.
+    // capture_all on: every captured job is admitted; the automatic selection
+    // stays with the post-registration path (applyAutoPolicyForJob), so no
+    // decision is pre-evaluated here.
     if (capture_all_) {
-        InitialDecision blanket;
-        return blanket;
+        InitialDecision admitted;
+        return admitted;
     }
 
-    // Blanket registration off: the type's auto_add tri-state decides. A type
-    // without an entry — including subtypes no configured adapter owns —
-    // behaves as Off.
+    // capture_all off: the type's auto_add tri-state decides. A type without
+    // an entry — including subtypes no configured adapter owns — behaves as
+    // Off.
     const auto state = auto_add_states_.find(job.subtype_name);
     if (state == auto_add_states_.end() || state->second == AutoAdd::Off) {
         std::lock_guard<std::mutex> lock(hb_mtx_);
-        ++hb_dropped_observations_;
+        ++hb_not_admitted_capture_all_off_;
         return std::nullopt;
     }
 
@@ -968,7 +959,7 @@ std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const
                       "refusing admission",
                       job.subtype_name);
         std::lock_guard<std::mutex> lock(hb_mtx_);
-        ++hb_dropped_observations_;
+        ++hb_not_admitted_capture_all_off_;
         return std::nullopt;
     }
 
@@ -983,12 +974,12 @@ std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const
         // evidence plus time.
         spdlog::warn("JobRegistry: admission evaluation failed for '{}' ({}); the "
                      "observation is not registered",
-                     job.NativeJobID, error);
+                     job.JobNativeID, error);
         {
             std::lock_guard<std::mutex> lock(hb_mtx_);
             ++hb_admission_errors_;
         }
-        noteHeartbeatError("admission evaluation failed for '" + job.NativeJobID +
+        noteHeartbeatError("admission evaluation failed for '" + job.JobNativeID +
                            "': " + error);
         return std::nullopt;
     }
@@ -1001,13 +992,13 @@ std::optional<JobRegistry::InitialDecision> JobRegistry::admissionDecision(const
         return default_decision;
     }
     // Rules mode: the rule's own verdict decides — reject = no registration
-    // at all when blanket registration is off, unlike the blanket mode where
-    // a reject keeps the job inventoried with an empty selection. An accept
-    // without collectors has already resolved to the configured defaults
-    // inside the policy (or was refused there as an error).
+    // at all when capture_all is off, unlike capture_all mode where a reject
+    // keeps the job inventoried with an empty selection. An accept without
+    // collectors has already resolved to the configured defaults inside the
+    // policy (or was refused there as an error).
     if (!decision.accepted) {
         std::lock_guard<std::mutex> lock(hb_mtx_);
-        ++hb_rejected_observations_;
+        ++hb_not_admitted_by_rule_;
         return std::nullopt;
     }
     InitialDecision accepted;
@@ -1020,26 +1011,28 @@ void JobRegistry::rememberEnded(const JobRecord& record) {
     const auto key = keyOf(record.job);
     if (!key) return;
     std::lock_guard<std::mutex> lock(hb_mtx_);
-    ended_executions_[key->key()] = manager_of(record.job);
-    while (ended_executions_.size() > kEndedExecutionCapacity) {
-        ended_executions_.erase(ended_executions_.begin());
+    ended_managers_[key->key()] = manager_of(record.job);
+    while (ended_managers_.size() > kEndedManagerCapacity) {
+        ended_managers_.erase(ended_managers_.begin());
     }
 }
 
 bool JobRegistry::isObsolete(const SchedulerKey& key,
-                             const ProcessIdentity& generation) {
+                             const ProcessIdentity& manager) {
     std::lock_guard<std::mutex> lock(hb_mtx_);
-    const auto it = ended_executions_.find(key.key());
-    return it != ended_executions_.end() && it->second == generation;
+    const auto it = ended_managers_.find(key.key());
+    return it != ended_managers_.end() && it->second == manager;
 }
 
-void JobRegistry::evaluateRetirements(
-    const std::set<uint64_t>& observed_ids,
-    const std::map<std::string, bool>& source_complete,
-    const std::map<uint64_t, RefreshedEvidence>& refreshed,
-    std::uint64_t scan_seq) {
+void JobRegistry::evaluateRetirements(const PassRun& pass) {
     const auto records = ownRecords();
     const std::int64_t now = clockNow();
+    // A targeted pass (`enumerate` false) has no authoritative source coverage,
+    // so it never counts as an absence; only positive termination evidence
+    // applies.
+    const std::map<std::string, bool> no_coverage;
+    const std::map<std::string, bool>& source_complete =
+        pass.enumerate ? pass.source_complete : no_coverage;
 
     for (const auto& record : records) {
         if (record.job.JobID == 0) continue;
@@ -1059,8 +1052,8 @@ void JobRegistry::evaluateRetirements(
             // this pass is not in observed_ids, but its observation sequence is
             // greater than the pass's: counting it absent would mark a job
             // that just registered as suspect and unverified.
-            seen_this_pass = observed_ids.count(record.job.JobID) != 0 ||
-                             entry.last_seen_seq > scan_seq;
+            seen_this_pass = pass.observed.count(record.job.JobID) != 0 ||
+                             entry.last_seen_seq > pass.scan_seq;
             if (seen_this_pass) {
                 entry.complete_absences = 0;
                 entry.last_seen_ms = now;
@@ -1079,30 +1072,30 @@ void JobRegistry::evaluateRetirements(
         }
 
         // Absence is liveness evidence, not a lifecycle state: the record
-        // stays Open, and an unverified instance is refused kernel admission
+        // stays Active, and an unverified instance is refused kernel admission
         // and never retired. A presence observation restores the verdict; the
         // call is outside hb_mtx_ (records_mtx_ is taken under it, never the
         // other way) and before the seen/no-evidence short-circuits.
-        setExecutionVerified(record.job.JobID, absences == 0);
+        setExecutionPresumedLive(record.job.JobID, absences == 0);
         if (seen_this_pass) continue;
 
         // The eager refresh this pass already read is the record's evidence;
         // re-probing here would read the same facts twice. A record without a
         // refresh this pass (created now, or one whose refresh lost to newer
         // facts) has no verdict to apply.
-        const auto refreshed_it = refreshed.find(record.job.JobID);
-        if (refreshed_it == refreshed.end()) continue;
+        const auto refreshed_it = pass.refreshed.find(record.job.JobID);
+        if (refreshed_it == pass.refreshed.end()) continue;
         const RefreshedEvidence& evidence = refreshed_it->second;
 
-        // Records without a validated execution generation (manual
+        // Records without a complete execution manager (manual
         // registrations, unresolved observations) have no manager to probe.
-        // The member list is their only evidence: live or unreadable pids keep
+        // The pid identity list is their only evidence: live or unreadable pids keep
         // the record, an all-dead list retires it, and an empty list is "no
         // evidence yet", never "all dead".
         const ProcessIdentity manager = manager_of(record.job);
         if (!manager.complete()) {
-            if (!evidence.has_member_evidence) continue;
-            if (evidence.evidence.any_member_live || evidence.evidence.member_inconclusive)
+            if (!evidence.has_pid_identity_evidence) continue;
+            if (evidence.evidence.any_pid_identity_live || evidence.evidence.pid_identity_inconclusive)
                 continue;
             retireIfConfirmed(record,
                               "no live process for a manually registered instance");
@@ -1111,7 +1104,7 @@ void JobRegistry::evaluateRetirements(
 
         // Retire only on positive termination evidence: a dead manager plus a
         // cgroup that was read and is confirmed empty. A readable but
-        // non-empty cgroup whose members could not be stat'ed is NOT an empty
+        // non-empty cgroup whose pids could not be stat'ed is NOT an empty
         // cgroup, and an unreadable cgroup is no evidence at all.
         if (evidence.evidence.manager == LivenessState::Dead &&
             evidence.evidence.cgroup_empty_confirmed) {
@@ -1124,11 +1117,11 @@ void JobRegistry::evaluateRetirements(
         // Unknown is not death: an unreadable manager blocks the absence rule
         // exactly like a live one does.
         if (evidence.evidence.manager != LivenessState::Dead) continue;
-        if (evidence.evidence.any_member_live || evidence.evidence.member_inconclusive)
+        if (evidence.evidence.any_pid_identity_live || evidence.evidence.pid_identity_inconclusive)
             continue;
 
         retireIfConfirmed(
-            record, "two complete source passes without an observation and no live member");
+            record, "two complete source passes without an observation and no live pid identity");
     }
 
     // Prune heartbeat state for records that no longer exist.
@@ -1158,193 +1151,214 @@ bool JobRegistry::runPass(bool do_scan, bool wait, bool refresh_facts) {
         return false;
     }
 
-    std::uint64_t error_epoch = 0;
-    std::uint64_t scan_seq = 0;
-    {
-        std::lock_guard<std::mutex> lock(hb_mtx_);
-        if (!hb_admitted_ || hb_stopping_) return false;
-        // Anything noteHeartbeatError() records from here on belongs to this
-        // pass and must survive its own "scan complete" status update. The
-        // observation sequence is captured before the scan: a registration
-        // accepted during the pass must not be read as an absence.
-        error_epoch = hb_error_epoch_;
-        scan_seq = observation_seq_;
+    auto pass = beginPass(do_scan, refresh_facts);
+    if (!pass) return false;
+
+    // Phase 1: discovery — which managers exist, which of them are unknown.
+    discoverManagers(*pass);
+    // Phase 2: evidence — one refresh per active record, applied once.
+    refreshActiveRecords(*pass);
+    // Phase 3: the record-driven obligation that needs no new observation.
+    repairMissingInitialDecisions();
+    // Phase 4: one fsynced batch, then the status the scan justifies.
+    checkpointPass();
+    publishPassStatus(*pass);
+    // Phase 5: retire what the evidence no longer supports.
+    evaluateRetirements(*pass);
+    // Phase 6: a Closing record is not "done" just because it left the active
+    // map — finalize restored closings and retry cleanups that failed.
+    reconcileClosingRemovals();
+
+    return true;
+}
+
+std::optional<JobRegistry::PassRun> JobRegistry::beginPass(bool do_scan, bool refresh_facts) {
+    std::lock_guard<std::mutex> lock(hb_mtx_);
+    if (!hb_admitted_ || hb_stopping_) return std::nullopt;
+    // Anything noteHeartbeatError() records from here on belongs to this pass
+    // and must survive its own "scan complete" status update. The observation
+    // sequence is captured before the scan: a registration accepted during the
+    // pass must not be read as an absence.
+    PassRun pass;
+    pass.enumerate = do_scan;
+    pass.refresh = refresh_facts;
+    pass.error_epoch = hb_error_epoch_;
+    pass.scan_seq = observation_seq_;
+    pass.started_ms = clockNow();
+    return pass;
+}
+
+void JobRegistry::discoverManagers(PassRun& pass) {
+    if (!pass.enumerate) return;
+
+    // Manager triple -> record id from the current image: a manager this
+    // registry already tracks costs no observe() at all.
+    ManagerIndex manager_index;
+    for (const auto& record : ownRecords()) {
+        if (record.state == RecordState::Closing) continue;
+        const ProcessIdentity& manager = manager_of(record.job);
+        if (!manager.complete()) continue;
+        manager_index.emplace(managerKey(manager), record.job.JobID);
     }
 
-    const std::int64_t started_ms = clockNow();
-    std::set<uint64_t> observed;
-    std::set<uint64_t> created;
-    std::map<std::string, bool> source_complete;
-    bool complete = true;
-    std::string error;
-
-    // Manager triple -> record id from the current image, built only when the
-    // pass enumerates: a manager this registry already tracks costs no
-    // observe() at all.
-    std::map<std::string, uint64_t> manager_index;
-    if (do_scan) {
-        for (const auto& record : ownRecords()) {
-            if (record.state == RecordState::Closing) continue;
-            const ProcessIdentity& manager = manager_of(record.job);
-            if (!manager.complete()) continue;
-            manager_index.emplace(process_identity_key(manager), record.job.JobID);
+    for (const auto& [name, source] : hb_sources_) {
+        // The pass only discovers managers: no job ad, no pid identity read, no fact
+        // merge into an existing record.
+        ManagerSet managers;
+        try {
+            managers = source->enumerateManagers();
+        } catch (const std::exception& exception) {
+            managers.complete = false;
+            managers.error = std::string("manager enumeration threw: ") + exception.what();
         }
+        noteSourceCoverage(pass, name, managers);
 
-        for (const auto& [name, source] : hb_sources_) {
-            // The pass only discovers managers: no job ad, no member read, no
-            // fact merge into an existing record.
-            ManagerSet managers;
-            try {
-                managers = source->enumerateManagers();
-            } catch (const std::exception& exception) {
-                managers.complete = false;
-                managers.error =
-                    std::string("manager enumeration threw: ") + exception.what();
+        for (const auto& manager : managers.managers) {
+            if (!manager.complete()) continue;   // a partial entry names nobody
+            const auto tracked = manager_index.find(managerKey(manager));
+            if (tracked != manager_index.end()) {
+                pass.observed.insert(tracked->second);
+                continue;
             }
-            if (!managers.complete) {
-                const std::string detail =
-                    managers.error.empty() ? "incomplete manager pass" : managers.error;
-                if (error.empty()) {
-                    error = name.empty() ? detail : name + ": " + detail;
-                }
-            }
-            complete = complete && managers.complete;
-            // Coverage is keyed by adapter name; a record of one adapter is
-            // only absence-eligible when that adapter's source covered its
-            // inputs (records with no adapter — manual registrations — never
-            // are).
-            const auto inserted = source_complete.emplace(name, managers.complete);
-            if (!inserted.second)
-                inserted.first->second = inserted.first->second && managers.complete;
-
-            for (const auto& manager : managers.managers) {
-                if (!manager.complete()) continue;   // a partial entry names nobody
-                const auto tracked = manager_index.find(process_identity_key(manager));
-                if (tracked != manager_index.end()) {
-                    observed.insert(tracked->second);
-                    continue;
-                }
-                std::optional<Job> job;
-                try {
-                    job = source->observe(manager);
-                } catch (const std::exception& exception) {
-                    spdlog::warn("JobRegistry: observe() for a '{}' manager failed: {}",
-                                 name, exception.what());
-                    continue;
-                }
-                if (!job) continue;   // gone/unreadable: retried, never guessed
-                const auto observation = processObservation(*job, observed, created);
-                // Only an accepted observation may make this manager
-                // "tracked". An identity conflict (a different live execution
-                // owns the job) must keep it unknown: mapping it to the old
-                // record would hide the new manager and keep the old record
-                // permanently "seen", so it could never retire.
-                if (!observation.ok) continue;
-                uint64_t record_id = 0;
-                if (observation.disposition == UpsertDisposition::Created) {
-                    record_id = observation.internal_id;
-                } else if (const auto key = keyOf(*job)) {
-                    if (const auto record = ownRecordByKey(*key);
-                        record && manager_of(record->job) == manager) {
-                        record_id = record->job.JobID;
-                    }
-                }
-                if (record_id != 0) {
-                    manager_index.emplace(process_identity_key(manager), record_id);
-                }
-            }
+            observeManager(name, *source, manager, pass, manager_index);
         }
     }
+}
 
+void JobRegistry::observeManager(const std::string& source_name, IDiscoverySource& source,
+                                 const ProcessIdentity& manager, PassRun& pass,
+                                 ManagerIndex& manager_index) {
+    std::optional<Job> job;
+    try {
+        job = source.observe(manager);
+    } catch (const std::exception& exception) {
+        spdlog::warn("JobRegistry: observe() for a '{}' manager failed: {}", source_name,
+                     exception.what());
+        return;
+    }
+    if (!job) return;   // gone/unreadable: retried, never guessed
+
+    const auto observation = processObservation(*job, pass.observed, pass.created);
+    // Only an accepted observation may make this manager "tracked". An identity
+    // conflict (a different live execution owns the job) must keep it unknown:
+    // mapping it to the old record would hide the new manager and keep the old
+    // record permanently "seen", so it could never retire.
+    if (!observation.ok) return;
+
+    uint64_t record_id = 0;
+    if (observation.disposition == UpsertDisposition::Created) {
+        record_id = observation.job_id;
+    } else if (const auto key = keyOf(*job)) {
+        if (const auto record = ownRecordByKey(*key);
+            record && manager_of(record->job) == manager) {
+            record_id = record->job.JobID;
+        }
+    }
+    if (record_id != 0) manager_index.emplace(managerKey(manager), record_id);
+}
+
+void JobRegistry::noteSourceCoverage(PassRun& pass, const std::string& name,
+                                     const ManagerSet& managers) {
+    if (!managers.complete) {
+        const std::string detail =
+            managers.error.empty() ? "incomplete manager pass" : managers.error;
+        if (pass.error.empty()) pass.error = name.empty() ? detail : name + ": " + detail;
+    }
+    pass.complete = pass.complete && managers.complete;
+    // Coverage is keyed by adapter name; a record of one adapter is only
+    // absence-eligible when that adapter's source covered its inputs (records
+    // with no adapter — manual registrations — never are). Two sources sharing
+    // a name must both have covered it.
+    const auto inserted = pass.source_complete.emplace(name, managers.complete);
+    if (!inserted.second)
+        inserted.first->second = inserted.first->second && managers.complete;
+}
+
+void JobRegistry::refreshActiveRecords(PassRun& pass) {
     // Eager update: every active record, whatever produced it, goes through the
     // same evidence reader and the same apply. A record created by this pass
     // already carries the observe() image and is skipped. An idle retry tick
     // (refresh_facts=false) re-runs the bookkeeping only: the fact readers are
     // cadence-bound, not 100 ms-tick-bound.
-    std::map<uint64_t, RefreshedEvidence> refreshed;
-    if (refresh_facts) {
-        for (const auto& record : ownRecords()) {
-            if (record.job.JobID == 0 || record.state == RecordState::Closing) continue;
-            if (created.count(record.job.JobID) != 0) continue;
-            Job job = record.job;
-            RefreshResult evidence;
-            try {
-                // Reads run strictly outside every registry lock; the adapter
-                // owns the scheduler-specific part, the registry passes the
-                // probes.
-                if (const auto* adapter = namespaceAdapterOf(job)) {
-                    evidence = adapter->refreshFacts(job, process_probe_, cgroup_probe_);
-                    probeSurvivingMembers(record.job, job, evidence);
-                } else {
-                    update_job(job);
-                    evidence = probeRecordEvidence(job);
-                }
-            } catch (const std::exception& exception) {
-                {
-                    std::lock_guard<std::mutex> lock(hb_mtx_);
-                    ++hb_refresh_failures_;
-                }
-                spdlog::warn("JobRegistry: fact refresh for JobID {} failed: {}",
-                             record.job.JobID, exception.what());
-                continue;
-            }
-            if (const auto applied = applyRefreshedRecord(record, std::move(job), evidence))
-                refreshed.emplace(record.job.JobID, *applied);
-        }
-    }
+    if (!pass.refresh) return;
 
-    // Missing initial decisions are a record-driven obligation: repair them on
-    // every pass, even when no new observation arrived.
-    repairMissingInitialDecisions();
+    // The adapter answering for a subtype is fixed once the registry is armed,
+    // so one lookup per subtype replaces a lookup (and its identity scan) per
+    // record. A legacy row without a subtype name has no stable cache key and
+    // falls back to the direct call.
+    std::map<std::string, ISchedulerAdapter*> adapters;
+    const auto adapter_for = [this, &adapters](const Job& job) -> ISchedulerAdapter* {
+        if (job.subtype_name.empty()) return namespaceAdapterOf(job);
+        const auto cached = adapters.find(job.subtype_name);
+        if (cached != adapters.end()) return cached->second;
+        ISchedulerAdapter* const adapter = namespaceAdapterOf(job);
+        adapters.emplace(job.subtype_name, adapter);
+        return adapter;
+    };
 
-    // Checkpoint: facts and intent are written without a fence on the hot path,
-    // so one fsynced batch per pass bounds what a process crash can lose. The
-    // pass cadence (reconcile_interval_sec) is the checkpoint cadence on
-    // purpose: no extra knob, no extra thread.
-    {
-        // Keep the row-provider snapshot and its checkpoint write inside the
-        // same transaction boundary as record/index mutations.
-        std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
-        if (!store_->flushDirty("maintenance checkpoint")) {
-            spdlog::warn("JobRegistry: the maintenance checkpoint could not be written");
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(hb_mtx_);
-        ++hb_passes_;
-        if (do_scan) {
-            last_scan_start_ms_ = started_ms;
-            last_scan_complete_ = complete;
-            if (complete) {
-                last_scan_success_ms_ = clockNow();
-                // A registration/admission error raised while this pass was
-                // running is not a scan failure, but the stack is not healthy
-                // either: keep it visible until a later pass observes no new
-                // error (a fresh scan error is recorded below).
-                if (hb_error_epoch_ == error_epoch) {
-                    degraded_ = false;
-                    hb_last_error_.clear();
-                }
+    for (const auto& record : ownRecords()) {
+        if (record.job.JobID == 0 || record.state == RecordState::Closing) continue;
+        if (pass.created.count(record.job.JobID) != 0) continue;
+        Job job = record.job;
+        RefreshResult evidence;
+        try {
+            // Reads run strictly outside every registry lock; the adapter owns
+            // the scheduler-specific part, the registry passes the probes.
+            if (ISchedulerAdapter* const adapter = adapter_for(job); adapter != nullptr) {
+                evidence = adapter->refreshFacts(job, process_probe_, cgroup_probe_);
+                probeSurvivingPidIdentities(record.job, job, evidence);
             } else {
-                degraded_ = true;
-                hb_last_error_ = error.empty() ? "source pass incomplete" : error;
+                update_job(job);
+                evidence = probeRecordEvidence(job);
             }
+        } catch (const std::exception& exception) {
+            {
+                std::lock_guard<std::mutex> lock(hb_mtx_);
+                ++hb_refresh_failures_;
+            }
+            spdlog::warn("JobRegistry: fact refresh for JobID {} failed: {}", record.job.JobID,
+                         exception.what());
+            continue;
         }
+        if (const auto applied = applyRefreshedRecord(record, std::move(job), evidence))
+            pass.refreshed.emplace(record.job.JobID, *applied);
     }
+}
 
-    // A targeted pass has no authoritative source coverage, so it never counts
-    // as an absence; only positive termination evidence applies.
-    static const std::map<std::string, bool> no_coverage;
-    evaluateRetirements(observed, do_scan ? source_complete : no_coverage, refreshed,
-                        scan_seq);
+void JobRegistry::checkpointPass() {
+    // Facts and intent are written without a fence on the hot path, so one
+    // fsynced batch per pass bounds what a process crash can lose. The pass
+    // cadence (reconcile_interval_sec) is the checkpoint cadence on purpose:
+    // no extra knob, no extra thread. The row-provider snapshot and its
+    // checkpoint write stay inside the same transaction boundary as
+    // record/index mutations.
+    std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
+    if (!store_->flushDirty("maintenance checkpoint")) {
+        spdlog::warn("JobRegistry: the maintenance checkpoint could not be written");
+    }
+}
 
-    // Closing records are not "done" just because they left the active map.
-    // Finalize restored closings and retry a cleanup that failed after its ack;
-    // a drain still awaiting its ack is left to the collector runtime.
-    reconcileClosingRemovals();
+void JobRegistry::publishPassStatus(const PassRun& pass) {
+    std::lock_guard<std::mutex> lock(hb_mtx_);
+    ++hb_passes_;
+    if (!pass.enumerate) return;
 
-    return true;
+    last_scan_start_ms_ = pass.started_ms;
+    last_scan_complete_ = pass.complete;
+    if (pass.complete) {
+        last_scan_success_ms_ = clockNow();
+        // A registration/admission error raised while this pass was running is
+        // not a scan failure, but the stack is not healthy either: keep it
+        // visible until a later pass observes no new error (a fresh scan error
+        // is recorded below).
+        if (hb_error_epoch_ == pass.error_epoch) {
+            degraded_ = false;
+            hb_last_error_.clear();
+        }
+        return;
+    }
+    degraded_ = true;
+    hb_last_error_ = pass.error.empty() ? "source pass incomplete" : pass.error;
 }
 
 bool JobRegistry::reconcileNow() {
@@ -1443,14 +1457,14 @@ void JobRegistry::installHeartbeatSink() {
         // An accepted event is positive presence evidence: a pass in flight
         // must not read this record as absent because it was not in that
         // pass' manager set.
-        const auto note_seen = [this, &job](uint64_t internal_id) {
+        const auto note_seen = [this, &job](uint64_t job_id) {
             std::lock_guard<std::mutex> lock(hb_mtx_);
-            auto& entry = absences_[internal_id];
+            auto& entry = absences_[job_id];
             entry.manager = manager_of(job);
             entry.complete_absences = 0;
             entry.last_seen_ms = clockNow();
             entry.last_seen_seq = ++observation_seq_;
-            suspect_ids_.erase(internal_id);
+            suspect_ids_.erase(job_id);
         };
         // Admission is a creation gate. An identity the registry already owns
         // keeps updating without re-running the policy: a rules-mode Lua
@@ -1462,7 +1476,7 @@ void JobRegistry::installHeartbeatSink() {
         }
         if (tracked) {
             auto result = upsertObservedJob(job);
-            if (result.ok) note_seen(result.internal_id);
+            if (result.ok) note_seen(result.job_id);
             return result;
         }
         // Unknown identity: the same gate as the creation path. A refused
@@ -1477,7 +1491,7 @@ void JobRegistry::installHeartbeatSink() {
             return refused;
         }
         auto result = upsertObservedJob(job, &*admission);
-        if (result.ok) note_seen(result.internal_id);
+        if (result.ok) note_seen(result.job_id);
         return result;
     };
 }
@@ -1520,8 +1534,8 @@ void JobRegistry::resetHeartbeatState()
     hb_last_error_.clear();
     absences_.clear();
     suspect_ids_.clear();
-    ended_executions_.clear();
-    closing_executions_.clear();
+    ended_managers_.clear();
+    closing_managers_.clear();
     last_scan_start_ms_ = 0;
     last_scan_success_ms_ = 0;
     last_scan_complete_ = false;
@@ -1645,8 +1659,8 @@ JobRegistry::armDiscovery(const JobRegistryOptions& options)
     // keep participating. Installed before the initial pass can activate
     // anything.
     if (attribution_) {
-        attribution_->setCapabilityLookup([this](uint64_t internal_id) {
-            auto record = ownRecord(internal_id);
+        attribution_->setCapabilityLookup([this](uint64_t job_id) {
+            auto record = ownRecord(job_id);
             if (!record) return false;
             for (const auto& adapter : adapters_) {
                 if (adapter->name() == record->job.subtype_name)
@@ -1744,13 +1758,13 @@ void JobRegistry::stopDiscovery() {
 }
 
 
-std::optional<bool> JobRegistry::apply_auto_policy(const Job& job,
-                                                   const std::string& adapter)
+std::optional<bool> JobRegistry::applyAutoPolicyForJob(const Job& job,
+                                                       const std::string& adapter)
 {
     const auto decision = autoSelectionFor(job, adapter);
     if (!decision) return std::nullopt;   // no enabled policy: no decision needed
     const bool committed =
-        applyAutoSelection(job.JobID, decision->collectors, decision->policy_revision);
+        applyOneAutoSelection(job.JobID, decision->collectors, decision->policy_revision);
     return committed;
 }
 
@@ -1777,22 +1791,22 @@ std::optional<JobRegistry::AutoDecision> JobRegistry::autoSelectionFor(
     return resolved;
 }
 
-bool JobRegistry::applyAutoSelection(uint64_t internal_id,
-                                     const std::vector<std::string>& collectors,
-                                     const std::string& policy_revision)
+bool JobRegistry::applyOneAutoSelection(uint64_t job_id,
+                                        const std::vector<std::string>& collectors,
+                                        const std::string& policy_revision)
 {
     const auto outcome = applyAutoPolicy(
-        {AutoSelection{internal_id, collectors, policy_revision}});
+        {AutoSelection{job_id, collectors, policy_revision}});
     if (!outcome.ok) {
         spdlog::warn("JobRegistry: automatic selection for JobID {} was rejected: {}",
-                     internal_id, outcome.message);
+                     job_id, outcome.message);
         return false;
     }
     // The decision is durable when the instance reached a stored intent. A
     // skipped target (unknown instance/collector) or a failed transaction is
     // not committed even though the batch reported ok.
     for (const auto& target : outcome.targets) {
-        if (target.internal_id != internal_id) continue;
+        if (target.job_id != job_id) continue;
         return !target.skipped && target.revision > 0;
     }
     return false;   // no target: the selection was skipped, not committed
@@ -1823,30 +1837,30 @@ bool JobRegistry::deinit()
     if (!cleanupClosingJobs()) ok = false;
 
     // Finalize: acknowledge the retirements this heartbeat made. The collector
-    // drain has completed by now; a late acknowledgement for an old generation
+    // drain has completed by now; a late acknowledgement for an old manager
     // is discarded.
     {
         std::vector<std::pair<uint64_t, ProcessIdentity>> closing;
         {
             std::lock_guard<std::mutex> lock(hb_mtx_);
-            closing.swap(closing_executions_);
+            closing.swap(closing_managers_);
         }
-        for (const auto& [internal_id, generation] : closing) {
-            const auto record = ownRecord(internal_id);
-            if (record && !(manager_of(record->job) == generation)) {
+        for (const auto& [job_id, manager] : closing) {
+            const auto record = ownRecord(job_id);
+            if (record && !(manager_of(record->job) == manager)) {
                 spdlog::info("JobRegistry: JobID {} no longer carries the retired "
-                             "generation; acknowledgement discarded", internal_id);
+                             "manager; acknowledgement discarded", job_id);
                 continue;
             }
             if (!record) continue;   // already archived
             // Shutdown is a single pass: it never retries a write whose last
             // outcome is unknown. Such a record stays closing and is resolved
             // by an explicit command or the next open.
-            if (!finalizeClosingRemoval(internal_id, /*allow_recovery=*/false) &&
-                ownRecord(internal_id)) {
+            if (!finalizeClosingRemoval(job_id, /*allow_recovery=*/false) &&
+                ownRecord(job_id)) {
                 ok = false;
                 std::lock_guard<std::mutex> lock(hb_mtx_);
-                closing_executions_.emplace_back(internal_id, generation);
+                closing_managers_.emplace_back(job_id, manager);
             }
         }
         if (ownClosingCount() > 0) ok = false;
@@ -1914,11 +1928,11 @@ void JobRegistry::stop_pid_tracker() {
 
 // --- KernelAttribution::Host (registry-side projection updates) -----------
 
-bool JobRegistry::attributionJobExists(uint64_t internal_id) {
-    return store_ && ownHasActive(internal_id);
+bool JobRegistry::attributionJobExists(uint64_t job_id) {
+    return store_ && ownHasActive(job_id);
 }
 
-void JobRegistry::attributionJobAddPid(uint64_t internal_id, pid_t pid) {
+void JobRegistry::attributionJobAddPid(uint64_t job_id, pid_t pid) {
     // Runtime projection on the registry's own record: never persisted, the
     // kernel rebuilds it from events after a restart. The runtime wake happens
     // after the record lock is released, so a wake callback can read the
@@ -1926,42 +1940,42 @@ void JobRegistry::attributionJobAddPid(uint64_t internal_id, pid_t pid) {
     bool changed = false;
     {
         std::unique_lock lg(records_mtx_);
-        const auto it = records_.find(internal_id);
+        const auto it = records_.find(job_id);
         if (it == records_.end()) return;
-        auto& members = it->second.job.execution.members;
+        auto& pid_identities = it->second.job.execution.pid_identities;
         const bool known = std::any_of(
-            members.begin(), members.end(),
-            [pid](const ProcessIdentity& member) { return member.pid == pid; });
+            pid_identities.begin(), pid_identities.end(),
+            [pid](const ProcessIdentity& pid_identity) { return pid_identity.pid == pid; });
         if (!known) {
-            members.push_back(ProcessIdentity{pid, 0, std::string{}});
-            std::sort(members.begin(), members.end(),
+            pid_identities.push_back(ProcessIdentity{pid, 0, std::string{}});
+            std::sort(pid_identities.begin(), pid_identities.end(),
                       [](const ProcessIdentity& lhs, const ProcessIdentity& rhs) {
                           return lhs.pid < rhs.pid;
                       });
             spdlog::trace("JobRegistry: kernel FORK added pid={} to job_id={} (now {} pids)",
-                          pid, internal_id, members.size());
+                          pid, job_id, pid_identities.size());
             changed = true;
         }
     }
     if (changed) wake_runtime();
 }
 
-void JobRegistry::attributionJobRemovePid(uint64_t internal_id, pid_t pid) {
+void JobRegistry::attributionJobRemovePid(uint64_t job_id, pid_t pid) {
     bool changed = false;
     {
         std::unique_lock lg(records_mtx_);
-        const auto it = records_.find(internal_id);
+        const auto it = records_.find(job_id);
         if (it == records_.end()) return;
-        auto& members = it->second.job.execution.members;
-        const auto before = members.size();
-        members.erase(std::remove_if(members.begin(), members.end(),
-                                     [pid](const ProcessIdentity& member) {
-                                         return member.pid == pid;
-                                     }),
-                      members.end());
-        if (members.size() != before) {
+        auto& pid_identities = it->second.job.execution.pid_identities;
+        const auto before = pid_identities.size();
+        pid_identities.erase(std::remove_if(pid_identities.begin(), pid_identities.end(),
+                                            [pid](const ProcessIdentity& pid_identity) {
+                                                return pid_identity.pid == pid;
+                                            }),
+                             pid_identities.end());
+        if (pid_identities.size() != before) {
             spdlog::trace("JobRegistry: kernel EXIT removed pid={} from job_id={} (now {} pids)",
-                          pid, internal_id, members.size());
+                          pid, job_id, pid_identities.size());
             changed = true;
         }
     }
@@ -1993,10 +2007,10 @@ void JobRegistry::attributionExitHint(pid_t pid) {
     }
 }
 
-std::string JobRegistry::attributionCgroupPath(uint64_t internal_id) {
+std::string JobRegistry::attributionCgroupPath(uint64_t job_id) {
     // Adapter-owned: cgroupPathOf is the only place that knows where the
     // cgroup lives in the typed facts. Manual/unknown adapters have none.
-    const auto record = ownRecord(internal_id);
+    const auto record = ownRecord(job_id);
     if (!record) return {};
     for (const auto& adapter : adapters_)
         if (adapter->name() == record->job.subtype_name)
@@ -2073,7 +2087,7 @@ void JobRegistry::remove_job_from_kernel(const Job& job, bool& ok, std::string& 
 
 bool JobRegistry::createManualJob(Job& job) {
     spdlog::info("JobRegistry: addJob entry JobID={}, native_id={}, collectors={}, PIDs={}",
-                 job.JobID, job.NativeJobID, job.CollectorNames.size(), pids_of(job).size());
+                 job.JobID, job.JobNativeID, job.CollectorNames.size(), pids_of(job).size());
     // 错误检查
     if (job.CollectorNames.empty()) {
         spdlog::warn("JobRegistry: job with JobID {} has empty CollectorNames", job.JobID);
@@ -2115,7 +2129,7 @@ bool JobRegistry::createManualJob(Job& job) {
 
     // The record image is registry-owned (moved from the store's manual
     // insert): a manual registration owns no discovery execution — its bound
-    // members are the evidence, and an empty generation is expected.
+    // pid identities are the evidence, and no manager is expected.
     JobRecord record;
     record.job = job_copy;
     record.job.JobID = job_copy.JobID;
@@ -2148,10 +2162,10 @@ bool JobRegistry::createManualJob(Job& job) {
         const std::string boot_id = read_boot_id();
         const std::vector<pid_t> requested_pids = pids_of(record.job);
         ExecutionEvidence& execution = record.job.execution;
-        execution.members.clear();
+        execution.pid_identities.clear();
         for (const auto pid : requested_pids) {
             const auto ticks = read_process_start_ticks(pid);
-            execution.members.push_back(ProcessIdentity{
+            execution.pid_identities.push_back(ProcessIdentity{
                 pid, ticks.value_or(0), ticks.has_value() ? boot_id : std::string{}});
         }
     }
@@ -2241,7 +2255,7 @@ JobRegistry::ManualTarget JobRegistry::manualUpdateTarget(
             if (key && record_key && *key == *record_key) {
                 target.kind = ManualTarget::Kind::Ambiguous;
                 target.message = "canonical identity collision between structured namespaces";
-                target.candidates.push_back(format_internal_id(record.job.JobID));
+                target.candidates.push_back(format_job_id(record.job.JobID));
                 return target;
             }
             continue;
@@ -2259,11 +2273,11 @@ JobRegistry::ManualTarget JobRegistry::manualUpdateTarget(
                   });
         target.kind = ManualTarget::Kind::Ambiguous;
         for (const auto& match : duplicates)
-            target.candidates.push_back(format_internal_id(match.job.JobID));
+            target.candidates.push_back(format_job_id(match.job.JobID));
         target.message =
             fmt::format("typed sub_attr '{}' matches {} current local instances; "
                         "claim the scheduler attribution or use an identity selector",
-                        job.NativeJobID, duplicates.size());
+                        job.JobNativeID, duplicates.size());
         return target;
     }
     if (!duplicates.empty()) {
@@ -2274,9 +2288,10 @@ JobRegistry::ManualTarget JobRegistry::manualUpdateTarget(
     return target;
 }
 
-nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& request,
-                                      std::optional<NativeSelector> identity_selector,
-                                      bool create_only) {
+nlohmann::json JobRegistry::addOrUpdateManualJob(const Job& job,
+                                                 const nlohmann::json& request,
+                                                 std::optional<NativeSelector> identity_selector,
+                                                 bool create_only) {
     std::string recovery_error;
     if (!recoverStoreIfNeeded(recovery_error)) {
         nlohmann::json out;
@@ -2293,23 +2308,22 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
                     {"message", "selector contradicts structured job facts"}};
         }
     }
-    const auto already_exists = [](uint64_t internal_id, uint64_t revision) {
+    const auto already_exists = [](uint64_t job_id, uint64_t revision) {
         nlohmann::json out;
         out["status"] = "error";
         out["code"] = "already_exists";
-        out["message"] = "job instance " + format_internal_id(internal_id) +
+        out["message"] = "job instance " + format_job_id(job_id) +
                          " already exists";
-        out["internal_job_id"] = format_internal_id(internal_id);
-        out["instance_id"] = format_internal_id(internal_id);
-        out["record_revision"] = revision;
+        out["JobID"] = format_job_id(job_id);
+        out["revision"] = revision;
         return out;
     };
 
     if (create_only && job.JobID != 0) {
         if (const auto existing = ownRecord(job.JobID)) {
             if (existing->state == RecordState::Closing) {
-                return {{"status", "error"}, {"code", "generation_closing"},
-                        {"message", "instance " + format_internal_id(job.JobID) +
+                return {{"status", "error"}, {"code", "instance_closing"},
+                        {"message", "instance " + format_job_id(job.JobID) +
                                         " is closing and rejects new binding mutations"}};
             }
             return already_exists(job.JobID, existing->revision);
@@ -2320,8 +2334,8 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
     if (target.kind == ManualTarget::Kind::Closing) {
         nlohmann::json out;
         out["status"] = "error";
-        out["code"] = "generation_closing";
-        out["message"] = "instance " + format_internal_id(target.record.job.JobID) +
+        out["code"] = "instance_closing";
+        out["message"] = "instance " + format_job_id(target.record.job.JobID) +
                          " is closing and rejects new binding mutations";
         return out;
     }
@@ -2339,8 +2353,8 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
         if (identity_selector) {
             // The selector's namespace folds into the typed facts (already
             // proven compatible above), then the common fields render.
-            adoptNamespaceAliases(claimed_job, identity_selector->cluster_name,
-                                  identity_selector->cluster_tag);
+            adoptNamespaceAliases(claimed_job, identity_selector->clusterName,
+                                  identity_selector->clusterTag);
             projectRecordFacts(claimed_job);
         }
         return updateManualInstance(target.record, claimed_job, request);
@@ -2351,8 +2365,8 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
     // collectors is a valid no-op and keeps its creation metadata.
     Job create_job = job;
     if (identity_selector) {
-        adoptNamespaceAliases(create_job, identity_selector->cluster_name,
-                              identity_selector->cluster_tag);
+        adoptNamespaceAliases(create_job, identity_selector->clusterName,
+                              identity_selector->clusterTag);
         projectRecordFacts(create_job);
     }
     if (!createManualJob(create_job)) {
@@ -2361,18 +2375,17 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
         out["msg"] = fmt::format(
             "failed to add job {} (type={}): empty collectors on create, duplicate "
             "JobID, or a rejected durable write — check server logs",
-            job.JobID, job.NativeJobID);
+            job.JobID, job.JobNativeID);
         return out;
     }
     // Return the created resource identity. The legacy trigger adapter ignores
     // these fields; the v2 job resource uses them to address the new record.
     nlohmann::json out;
     out["status"] = "success";
-    out["JobID"] = create_job.JobID;
-    out["internal_job_id"] = format_internal_id(create_job.JobID);
-    out["instance_id"] = format_internal_id(create_job.JobID);
+    // JobID is the decimal string form: uint64-safe for JavaScript consumers.
+    out["JobID"] = format_job_id(create_job.JobID);
     if (const auto record = jobRecord(create_job.JobID)) {
-        out["record_revision"] = record->revision;
+        out["revision"] = record->revision;
         out["mode"] = to_string(record->selection.mode());
         out["desired_collectors"] = record->selection.effectiveCollectors();
     }
@@ -2381,18 +2394,18 @@ nlohmann::json JobRegistry::upsertJob(const Job& job, const nlohmann::json& requ
 
 nlohmann::json JobRegistry::updateManualInstance(const JobRecord& target, const Job& job,
                                                  const nlohmann::json& request) {
-    const uint64_t internal_id = target.job.JobID;
+    const uint64_t job_id = target.job.JobID;
 
     // Re-add only changes selection. Metadata and execution evidence remain
     // the creation/source snapshot; namespace claims cannot rebind that image.
     {
         std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
-        const auto record = ownRecord(internal_id);
+        const auto record = ownRecord(job_id);
         if (!record) {
             return {{"status", "error"}, {"msg", "instance vanished while updating"}};
         }
         if (record->state == RecordState::Closing) {
-            return {{"status", "error"}, {"code", "generation_closing"},
+            return {{"status", "error"}, {"code", "instance_closing"},
                     {"message", "the instance is closing and rejects manual re-add"}};
         }
         const auto requested = namespaceFactsOf(job);
@@ -2412,14 +2425,14 @@ nlohmann::json JobRegistry::updateManualInstance(const JobRecord& target, const 
     std::optional<CollectionTargetOutcome> selection_outcome;
     if (!job.CollectorNames.empty()) {
         std::vector<std::string> merged;
-        if (const auto current = ownSelection(internal_id); current.manual.has_value())
+        if (const auto current = ownSelection(job_id); current.manual.has_value())
             merged = *current.manual;
         for (const auto& name : job.CollectorNames) {
             if (std::find(merged.begin(), merged.end(), name) == merged.end())
                 merged.push_back(name);
         }
         CollectionRequest command;
-        command.targets = {internal_id};
+        command.targets = {job_id};
         command.collectors = std::move(merged);
         const auto outcome = setCollectors(command);
         if (!outcome.ok) {
@@ -2433,20 +2446,18 @@ nlohmann::json JobRegistry::updateManualInstance(const JobRecord& target, const 
     }
 
     // Response in the add response shape.
-    const auto record = ownRecord(internal_id);
-    const auto selection = record ? record->selection : ownSelection(internal_id);
-    const auto actual = actualCollection(internal_id);
+    const auto record = ownRecord(job_id);
+    const auto selection = record ? record->selection : ownSelection(job_id);
+    const auto actual = actualCollection(job_id);
     const uint64_t revision = record ? record->revision : 0;
     const bool changed = selection_outcome.has_value() && selection_outcome->changed;
 
     nlohmann::json out;
     out["status"] = "success";
-    // Legacy numeric field for old consumers; the value is the internal id of
-    // the existing instance, never a fresh allocation from the JobID hint.
-    out["JobID"] = internal_id;
-    out["internal_job_id"] = format_internal_id(internal_id);
-    out["instance_id"] = format_internal_id(internal_id);
-    out["record_revision"] = revision;
+    // The existing record's JobID, never a fresh allocation from the JobID
+    // hint; the decimal string form keeps uint64 precision.
+    out["JobID"] = format_job_id(job_id);
+    out["revision"] = revision;
     out["mode"] = to_string(selection.mode());
     out["desired_collectors"] = selection.effectiveCollectors();
     // Accepted versus actual stays explicit: the request is accepted when the
@@ -2476,17 +2487,17 @@ nlohmann::json JobRegistry::updateManualInstance(const JobRecord& target, const 
             hint_value = std::stoull(hint.get<std::string>());
             hint_valid = true;
         }
-        if (hint_valid && hint_value != internal_id) {
-            out["ignored_job_id_hint"] = format_internal_id(hint_value);
+        if (hint_valid && hint_value != job_id) {
+            out["ignored_job_id_hint"] = format_job_id(hint_value);
             spdlog::warn("JobRegistry: manual upsert for native job '{}' carried JobID {} "
                          "as a compatibility hint; resolved to job instance {}",
-                         record ? record->job.NativeJobID : job.NativeJobID, hint_value,
-                         internal_id);
+                         record ? record->job.JobNativeID : job.JobNativeID, hint_value,
+                         job_id);
         }
     }
     spdlog::info("JobRegistry: manual upsert resolved to job instance {} (internal "
                  "{}, revision {})",
-                 format_internal_id(internal_id), internal_id, revision);
+                 format_job_id(job_id), job_id, revision);
     return out;
 }
 
@@ -2546,10 +2557,10 @@ bool JobRegistry::retireInstance(uint64_t jobID) {
                           "retirement refused (the record stays active)", jobID);
             return false;
         }
-        // The heartbeat path (retireIfConfirmed) records the ended generation
+        // The heartbeat path (retireIfConfirmed) records the ended manager
         // before retiring; an explicit retirement carries no such caller, so
         // the mark is made here. It is idempotent (a map insert) and uses the
-        // record snapshot taken before the closing write, so the generation
+        // record snapshot taken before the closing write, so the manager
         // remembered is the one that actually ended. Without it, a late
         // observation of the same execution would re-register the retired
         // instance instead of being refused by isObsolete().
@@ -2580,22 +2591,23 @@ bool JobRegistry::retireInstance(uint64_t jobID) {
     return true;
 }
 
-void JobRegistry::onDrained(uint64_t internal_id) {
+void JobRegistry::onDrained(uint64_t job_id) {
     {
         std::lock_guard<std::mutex> lock(drain_mtx_);
-        drain_complete_.insert(internal_id);
+        drain_complete_.insert(job_id);
     }
-    if (!finalizeClosingRemoval(internal_id, /*allow_recovery=*/true)) {
+    if (!finalizeClosingRemoval(job_id, /*allow_recovery=*/true)) {
         spdlog::error("JobRegistry: closing JobID {} was not archived after the runtime "
                       "released it; kernel ownership and the Closing reservation are kept",
-                      internal_id);
+                      job_id);
         return;
     }
     std::lock_guard<std::mutex> lock(drain_mtx_);
-    drain_complete_.erase(internal_id);
+    drain_complete_.erase(job_id);
 }
 
-void JobRegistry::delJob(uint64_t jobID) {
+void JobRegistry::retireJob(uint64_t jobID) {
+    // Thin alias: the caller gets the accepted retirement, not a deletion.
     retireInstance(jobID);
 }
 
@@ -2605,7 +2617,7 @@ bool JobRegistry::cleanupThenArchive(uint64_t jobID) {
     // archive is idempotent only when they are serialized.
     std::lock_guard<std::mutex> finalize_lock(closing_mtx_);
     // Re-read under the finalize lock: a concurrent path may already have
-    // archived this instance (or a newer generation may own the id again).
+    // archived this instance (or a newer manager may own the id again).
     const auto current = ownRecord(jobID);
     if (!current) return true;   // already archived: the goal is reached
     if (current->state != RecordState::Closing) return false;
@@ -2772,21 +2784,23 @@ void JobRegistry::reconcileClosingRemovals() {
     }
 }
 
-size_t JobRegistry::delJob(const SubAttrMatcher& matcher) {
+size_t JobRegistry::retireMatchingJobs(const SubAttrMatcher& matcher) {
     const auto matched = ownFindActive(
         [&matcher](const Job& job) { return matches_job(matcher, job); });
 
+    size_t accepted = 0;
     for (const auto& record : matched) {
-        // One retirement path: durable Closing, then the runtime's drain, then
-        // checked kernel cleanup and the archive.
+        // The same retirement path every caller takes: durable Closing, then
+        // the runtime's drain, then checked kernel cleanup and the archive.
         if (retireInstance(record.job.JobID)) {
-            spdlog::info("JobRegistry: remove job with JobID {} by sub_attr matcher",
+            ++accepted;
+            spdlog::info("JobRegistry: retire job with JobID {} by sub_attr matcher",
                          record.job.JobID);
         }
     }
 
-    spdlog::info("JobRegistry: removed {} jobs by sub_attr matcher", matched.size());
-    return matched.size();
+    spdlog::info("JobRegistry: retired {} of {} matching jobs", accepted, matched.size());
+    return accepted;
 }
 
 inline void JobRegistry::update_job(Job& job){
@@ -2802,7 +2816,7 @@ inline void JobRegistry::update_job(Job& job){
 }
 
 std::optional<Job> JobRegistry::findJob(uint64_t jobID) {
-    // Read-only snapshot: the heartbeat owns member refresh and retirement,
+    // Read-only snapshot: the heartbeat owns pid identity refresh and retirement,
     // so reads never mutate the registry.
     if (jobID == kSystemSentinelJobId) return sentinel_job_;
     auto record = ownRecord(jobID);
@@ -2834,14 +2848,14 @@ std::vector<Job> JobRegistry::snapshot() const {
 // ---------------------------------------------------------------------------
 
 void JobRegistry::admitRestoredOwners() {
-    // A record restored as active is verified-live, but this process starts
+    // A record restored as active is presumed live, but this process starts
     // with an empty kernel namespace. Admit it through the same path
     // observations use, otherwise a restarted service only attributes the jobs
     // it happens to observe again.
     for (const auto& record : ownRecords()) {
         if (record.job.JobID == kSystemSentinelJobId) continue;
         if (record.state != RecordState::Active) continue;
-        if (!record.verified) continue;
+        if (!record.presumed_live) continue;
         ensure_kernel_owner(record.job);
     }
 }
@@ -2971,16 +2985,15 @@ void JobRegistry::applyRecovered(const std::vector<JobRecord>& adopted,
 // gets the same result.
 UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job& job,
                                            const SchedulerKey& key,
-                                           uint64_t internal_id, int64_t observed_at,
+                                           uint64_t job_id, int64_t observed_at,
                                            JobRecord& updated_out, MergeKind kind) {
     UpsertResult result;
-    result.internal_id = internal_id;
-    result.instance_id = format_internal_id(internal_id);
+    result.job_id = job_id;
     result.revision = stored.revision;
 
     const ProcessIdentity manager = manager_of(job);
-    const std::vector<ProcessIdentity>& processes = members_of(job);
-    const bool members_complete = members_authoritative_of(job);
+    const std::vector<ProcessIdentity>& processes = pid_identities_of(job);
+    const bool pid_identities_authoritative = pid_identities_authoritative_of(job);
 
     if (stored.state == RecordState::Closing) {
         // A retiring instance must never be resurrected into the active set by
@@ -2997,7 +3010,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
         result.error = "identity_index_mismatch";
         result.message = "the identity index and the stored record disagree";
         spdlog::error("JobRegistry: identity index for JobID {} does not match the stored "
-                      "record; refusing to merge", internal_id);
+                      "record; refusing to merge", job_id);
         return result;
     }
     // Out-of-order commits: an older source read must never overwrite newer
@@ -3016,11 +3029,11 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     if (stored_manager.complete() && manager.complete() &&
         stored_manager != manager) {
         result.disposition = UpsertDisposition::Conflict;
-        result.code = RegistrationError::GenerationConflict;
-        result.error = "execution_generation_conflict";
+        result.code = RegistrationError::ManagerConflict;
+        result.error = "execution_manager_conflict";
         result.message = "a different live execution owns this identity";
-        spdlog::warn("JobRegistry: observation for '{}' carries a different live generation "
-                     "than JobID {}; not merged", key.native_job_id, internal_id);
+        spdlog::warn("JobRegistry: observation for '{}' carries a different live manager "
+                     "than JobID {}; not merged", key.job_native_id, job_id);
         return result;
     }
 
@@ -3034,7 +3047,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     // Discovery may acquire source-owned execution evidence for a manual row,
     // but its stable scheduler metadata remains the creation snapshot.
     updated.job.CollectorNames.clear();   // intent lives in selection
-    // Keep stored execution evidence until the manager/member rules below
+    // Keep stored execution evidence until the manager/pid identity rules below
     // decide which observed evidence can replace it.
     updated.last_seen_us = observed_at;
     const bool execution_became_complete =
@@ -3049,16 +3062,16 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     // Nonempty input replaces the set even when only partially known. An
     // empty input clears it only when the source confirms it is authoritative.
     if (!processes.empty()) {
-        updated_evidence.members = normalized_processes(processes);
-    } else if (members_complete) {
-        updated_evidence.members.clear();
+        updated_evidence.pid_identities = normalized_pid_identities(processes);
+    } else if (pid_identities_authoritative) {
+        updated_evidence.pid_identities.clear();
     }
 
     // A positive observation re-admits a record whose liveness could not be
     // verified. Unverified is not a lifecycle state. A refresh carries no such
     // verdict: the retirement pass owns it.
-    const bool recovered = observation && !stored.verified;
-    if (recovered) updated.verified = true;
+    const bool recovered = observation && !stored.presumed_live;
+    if (recovered) updated.presumed_live = true;
     // Provenance is a durable fact of its own: a manual row that first meets a
     // discovery observation becomes a discovery row even when every other fact
     // is identical, so the next load rebuilds its evidence instead of treating
@@ -3066,7 +3079,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     const bool provenance_changed = updated.source != stored.source;
     const bool changed = recovered || provenance_changed ||
         manager_of(stored.job) != manager_of(updated.job) ||
-        members_of(stored.job) != members_of(updated.job);
+        pid_identities_of(stored.job) != pid_identities_of(updated.job);
     if (!changed) {
         updated.revision = stored.revision;
         result.ok = true;
@@ -3151,8 +3164,7 @@ CollectionOutcome JobRegistry::executeSelectionMutations(
             }
             const bool changed = !(next == current);
             CollectionTargetOutcome target;
-            target.internal_id = mutation.job_id;
-            target.instance_id = format_internal_id(mutation.job_id);
+            target.job_id = mutation.job_id;
             target.changed = (current.manual != next.manual) ||
                              (!next.manual.has_value() && changed);
             outcome.unchanged += !changed;
@@ -3187,7 +3199,7 @@ CollectionOutcome JobRegistry::executeSelectionMutations(
     // No callback or actual-state sampling runs under the registry locks.
     wake_runtime();
     for (auto& target : outcome.targets) {
-        target.actual = actualCollection(target.internal_id);
+        target.actual = actualCollection(target.job_id);
     }
     outcome.ok = true;
     return outcome;
@@ -3195,53 +3207,54 @@ CollectionOutcome JobRegistry::executeSelectionMutations(
 
 void JobRegistry::validateRestoredExecutions(std::vector<JobRecord>& rows) {
     // Evidence is durable, but it only proves "this was the run when the row was
-    // written". One pass over the manager triple and the member pids keeps what
+    // written". One pass over the manager triple and the pid identities keeps what
     // still exists and drops what a restart cannot re-bind; the first
-    // observation re-establishes the generation. A record whose evidence does
+    // observation re-establishes the manager. A record whose evidence does
     // not survive stays active but unverified, never retired on a guess.
     const std::string boot_id = read_boot_id();
     for (auto& record : rows) {
         if (record.state == RecordState::Closing) continue;   // the drain owns it
         ExecutionEvidence& execution = record.job.execution;
-        record.verified = true;
+        record.presumed_live = true;
 
         if (execution.manager.complete()) {
             const LivenessResult manager =
                 verify_process_identity(execution.manager, boot_id, process_probe_);
             if (manager.state == LivenessState::Dead) {
-                record.verified = false;
-                execution.members.clear();
+                record.presumed_live = false;
+                execution.pid_identities.clear();
                 spdlog::warn("JobRegistry: restored JobID {} has a stale execution "
-                             "generation; liveness unknown", record.job.JobID);
+                             "manager; liveness unknown", record.job.JobID);
                 continue;
             }
             if (manager.state == LivenessState::Unknown) {
-                record.verified = false;
-                spdlog::warn("JobRegistry: restored JobID {} has an execution generation "
-                             "that cannot be verified; liveness unknown, {} member(s) kept "
-                             "as evidence", record.job.JobID, execution.members.size());
+                record.presumed_live = false;
+                spdlog::warn("JobRegistry: restored JobID {} has an execution manager "
+                             "that cannot be verified; liveness unknown, {} pid identity(ies) "
+                             "kept as evidence", record.job.JobID,
+                             execution.pid_identities.size());
             }
         }
 
         std::vector<ProcessIdentity> kept;
-        kept.reserve(execution.members.size());
+        kept.reserve(execution.pid_identities.size());
         size_t dropped = 0;
-        for (const auto& member : execution.members) {
-            if (!member.complete()) {
-                kept.push_back(member);   // unbound evidence: the next read fills it
+        for (const auto& pid_identity : execution.pid_identities) {
+            if (!pid_identity.complete()) {
+                kept.push_back(pid_identity);   // unbound evidence: the next read fills it
                 continue;
             }
             const LivenessResult state =
-                verify_process_identity(member, boot_id, process_probe_);
+                verify_process_identity(pid_identity, boot_id, process_probe_);
             if (state.state == LivenessState::Dead) {
                 ++dropped;
                 continue;
             }
-            kept.push_back(member);
+            kept.push_back(pid_identity);
         }
         if (dropped != 0) {
-            execution.members = std::move(kept);
-            spdlog::warn("JobRegistry: restored JobID {} dropped {} reused/gone member "
+            execution.pid_identities = std::move(kept);
+            spdlog::warn("JobRegistry: restored JobID {} dropped {} reused/gone "
                          "process identity(ies)", record.job.JobID, dropped);
         }
     }
@@ -3249,7 +3262,7 @@ void JobRegistry::validateRestoredExecutions(std::vector<JobRecord>& rows) {
 
 // True when an instance is live and policy-eligible but still has no durable
 // intent: the initial decision never landed (write failure, crash) or the
-// execution generation completed later. Derived from durable state, so it also
+// manager identity completed later. Derived from durable state, so it also
 // holds after a restart.
 bool JobRegistry::missing_initial_decision(const JobRecord& record) const
 {
@@ -3269,7 +3282,7 @@ bool JobRegistry::missing_initial_decision(const JobRecord& record) const
 std::optional<bool> JobRegistry::repair_initial_decision(const JobRecord& record,
                                                          UpsertResult& result)
 {
-    const auto committed = apply_auto_policy(record.job, record.job.subtype_name);
+    const auto committed = applyAutoPolicyForJob(record.job, record.job.subtype_name);
     if (committed == false) {
         result.code = RegistrationError::InitialIntentWriteFailed;
         result.error = to_string(result.code);
@@ -3304,13 +3317,13 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         result.error = "incomplete_identity";
         result.message = "scheduler type, cluster namespace and native job id are required";
         spdlog::debug("JobRegistry: rejected incomplete observation (native='{}', "
-                      "cluster='{}')", job.NativeJobID, job.cluster_name);
+                      "cluster='{}')", job.JobNativeID, job.clusterName);
         return result;
     }
     const std::string index_key = key->index_key();
     const ProcessIdentity manager = manager_of(job);
-    const std::vector<ProcessIdentity>& processes = members_of(job);
-    const bool members_complete = members_authoritative_of(job);
+    const std::vector<ProcessIdentity>& processes = pid_identities_of(job);
+    const bool pid_identities_authoritative = pid_identities_authoritative_of(job);
     const int64_t observed_at = now_us();
 
     JobRecord record;   // the authoritative image this call hands back
@@ -3325,34 +3338,34 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
     {
         std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
 
-        uint64_t internal_id = 0;
+        uint64_t job_id = 0;
         {
             std::shared_lock lg(records_mtx_);
             if (const auto indexed = identity_index_.find(index_key);
                 indexed != identity_index_.end()) {
-                internal_id = indexed->second;
+                job_id = indexed->second;
             }
         }
-        if (internal_id == 0) {
+        if (job_id == 0) {
             if (auto durable = store_->readRowByIdentity(*key)) {
                 // An earlier create landed ambiguously without publishing
                 // anything: the durable row is the truth memory never held,
                 // and this identity lookup is the documented repair. Adopt
                 // it, then merge.
-                internal_id = durable->job.JobID;
+                job_id = durable->job.JobID;
                 normalizeNamespaceFacts(durable->job);
                 std::unique_lock lg(records_mtx_);
                 if (!durable->index_key.empty())
-                    identity_index_[durable->index_key] = internal_id;
-                records_[internal_id] = std::move(*durable);
+                    identity_index_[durable->index_key] = job_id;
+                records_[job_id] = std::move(*durable);
             }
         }
 
     bool have_stored = false;
     JobRecord stored;
-    if (internal_id != 0) {
+    if (job_id != 0) {
         std::shared_lock lg(records_mtx_);
-        const auto it = records_.find(internal_id);
+        const auto it = records_.find(job_id);
         if (it != records_.end()) {
             stored = it->second;
             have_stored = true;
@@ -3369,7 +3382,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
             return result;
         }
         JobRecord updated;
-        result = mergeDiscoveredJob(stored, job, *key, internal_id, observed_at, updated);
+        result = mergeDiscoveredJob(stored, job, *key, job_id, observed_at, updated);
         if (!result.ok) return result;
         if (result.disposition == UpsertDisposition::Unchanged) {
             // The facts did not move, but the observed image still refreshes
@@ -3377,13 +3390,13 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
             // previous store-out publishing behavior.
             record = updated;
             std::unique_lock lg(records_mtx_);
-            records_[internal_id] = std::move(updated);
+            records_[job_id] = std::move(updated);
         } else {
             // Updated: one unsynced batch; the row joins the dirty set. A
             // failed or ambiguous write publishes nothing (the latch fences
             // the row).
             RecordTxn txn(*this, "update job facts", /*durable=*/false);
-            txn.touch(internal_id);
+            txn.touch(job_id);
             txn.put(std::move(updated));
             if (!txn.commit()) {
                 result.ok = false;
@@ -3392,7 +3405,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
                 result.message = txn.error();
                 return result;
             }
-            if (const auto published = ownRecord(internal_id)) record = *published;
+            if (const auto published = ownRecord(job_id)) record = *published;
         }
     } else {
         // Create a new job record. Nothing is activated and no caller
@@ -3410,7 +3423,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
             result.error = result.code == RegistrationError::IdExhausted
                                ? allocation_error
                                : to_string(result.code);
-            result.message = "durable internal id allocation failed";
+            result.message = "durable job id allocation failed";
             return result;
         }
 
@@ -3423,7 +3436,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         created.source = FactSource::Discovery;
         created.index_key = index_key;
         created.job.execution.manager = manager;
-        created.job.execution.members_authoritative = members_complete;
+        created.job.execution.pid_identities_authoritative = pid_identities_authoritative;
         // The ordering token is record business (the stale-pass guard
         // compares against it); the observation's reasons/notes stay
         // producer-side diagnostics and are not copied.
@@ -3432,7 +3445,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         created.state = RecordState::Active;
         created.first_seen_us = observed_at;
         created.last_seen_us = observed_at;
-        created.job.execution.members = normalized_processes(processes);
+        created.job.execution.pid_identities = normalized_pid_identities(processes);
 
         // A create has no published memory image to revert: identity
         // lookup repairs an ambiguous create, so it does not fence
@@ -3450,13 +3463,12 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
 
         result.ok = true;
         result.disposition = UpsertDisposition::Created;
-        result.internal_id = allocated;
-        result.instance_id = format_internal_id(allocated);
+        result.job_id = allocated;
         std::shared_lock lg(records_mtx_);
         result.revision = records_[allocated].revision;
         record = records_[allocated];
         spdlog::info("JobRegistry: created job instance {} for {} '{}'",
-                     allocated, key->adapter, key->native_job_id);
+                     allocated, key->adapter, key->job_native_id);
         }
     }   // mutation_mtx_ released: kernel admission, the runtime wake and the
         // automatic-policy evaluation below never run under a registry lock.
@@ -3473,17 +3485,17 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         wake_runtime();
         // First complete registration is an automatic-selection trigger; Lua
         // evaluation happens outside every registry lock. An
-        // observation whose execution generation is not verified yet is never
-        // auto-collected: the update that completes the generation re-runs
+        // observation whose execution manager is not complete yet is never
+        // auto-collected: the update that completes the manager re-runs
         // the selection instead. An admission decision that carried its own
         // evaluation is applied verbatim: the rule already ran once at the
         // gate and must not run twice for one registration.
         if (manager_of(job).complete()) {
             result.intent_committed =
                 admission != nullptr && admission->initial_collectors.has_value()
-                    ? applyAutoSelection(record.job.JobID, *admission->initial_collectors,
-                                         admission->policy_revision)
-                    : apply_auto_policy(record.job, record.job.subtype_name);
+                    ? applyOneAutoSelection(record.job.JobID, *admission->initial_collectors,
+                                            admission->policy_revision)
+                    : applyAutoPolicyForJob(record.job, record.job.subtype_name);
             if (result.intent_committed == false) {
                 result.code = RegistrationError::InitialIntentWriteFailed;
                 result.error = to_string(result.code);
@@ -3497,7 +3509,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         wake_runtime();
         // A record registered from an incomplete observation has never seen
         // an automatic selection. The pass that completes its execution
-        // generation is its first complete registration. A record whose
+        // manager is its first complete registration. A record whose
         // initial decision never became durable is repaired here too, not
         // only on the Created path.
         if (result.execution_became_complete || missing_initial_decision(record))
@@ -3505,7 +3517,7 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         // An observation is also the admission repair point: a live instance
         // with no owner (restored row, capacity refusal) gets one here through
         // the single KernelAttribution path.  Facts changed, so this is not a
-        // no-op even for an existing owner: newly observed members must be
+        // no-op even for an existing owner: newly observed pid identities must be
         // seeded (activate() only seeds identities the admission gate verified).
         sync_job_to_kernel(record.job);
     } else if (result.disposition == UpsertDisposition::Unchanged) {
@@ -3659,7 +3671,7 @@ CollectionOutcome JobRegistry::mutateSelection(const CollectionRequest& request,
     for (const auto id : targets) {
         if (!ownHasActive(id)) {
             outcome.error = CollectionError::NotFound;
-            outcome.message = "no verified job instance with internal id " +
+            outcome.message = "no active instance with job id " +
                               std::to_string(id);
             return outcome;
         }
@@ -3691,7 +3703,7 @@ CollectionOutcome JobRegistry::applyAutoPolicy(
 
     std::unordered_set<uint64_t> seen;
     for (const auto& selection : selections) {
-        if (!seen.insert(selection.internal_id).second) {
+        if (!seen.insert(selection.job_id).second) {
             outcome.error = CollectionError::InvalidRequest;
             outcome.message = "duplicate target in one automatic policy batch";
             return outcome;
@@ -3711,15 +3723,14 @@ CollectionOutcome JobRegistry::applyAutoPolicy(
     outcome.targets.reserve(selections.size());
     for (const auto& selection : selections) {
         CollectionTargetOutcome target;
-        target.internal_id = selection.internal_id;
-        target.instance_id = format_internal_id(selection.internal_id);
+        target.job_id = selection.job_id;
 
-        if (!ownHasActive(selection.internal_id)) {
+        if (!ownHasActive(selection.job_id)) {
             ++outcome.skipped_invalid;
-            outcome.message = "no verified job instance with internal id " +
-                              std::to_string(selection.internal_id);
-            target.selection = ownSelection(selection.internal_id);
-            target.actual.error = "no verified job instance";
+            outcome.message = "no active instance with job id " +
+                              std::to_string(selection.job_id);
+            target.selection = ownSelection(selection.job_id);
+            target.actual.error = "no active instance";
             target.skipped = true;
             outcome.targets.push_back(std::move(target));
             continue;
@@ -3731,8 +3742,8 @@ CollectionOutcome JobRegistry::applyAutoPolicy(
             ++outcome.skipped_invalid;
             outcome.message = "unknown automatic collector name: " + bad_name;
             spdlog::warn("JobRegistry: ignoring invalid automatic selection for "
-                         "instance {} (collector '{}')", selection.internal_id, bad_name);
-            target.selection = ownSelection(selection.internal_id);
+                         "instance {} (collector '{}')", selection.job_id, bad_name);
+            target.selection = ownSelection(selection.job_id);
             target.actual.error = "unknown automatic collector name: " + bad_name;
             target.skipped = true;
             outcome.targets.push_back(std::move(target));
@@ -3740,7 +3751,7 @@ CollectionOutcome JobRegistry::applyAutoPolicy(
         }
 
         SelectionMutation mutation;
-        mutation.job_id = selection.internal_id;
+        mutation.job_id = selection.job_id;
         mutation.operation = SelectionOperation::SetAuto;
         mutation.collectors = names;
         mutation.automatic_source = selection.policy_revision;
@@ -3875,21 +3886,21 @@ bool JobRegistry::runtimeRecords(std::vector<JobRecord>& out) const {
     return true;
 }
 
-bool JobRegistry::runtimeRecord(uint64_t internal_id,
+bool JobRegistry::runtimeRecord(uint64_t job_id,
                                 std::optional<JobRecord>& out) const {
     out.reset();
     if (!store_ || !store_->ready() || store_->recoveryRequired()) return false;
-    out = ownRecord(internal_id);
+    out = ownRecord(job_id);
     return true;
 }
 
-void JobRegistry::setExecutionVerified(uint64_t jobID, bool verified) {
+void JobRegistry::setExecutionPresumedLive(uint64_t jobID, bool presumed_live) {
     // Liveness evidence only. It never changes the lifecycle state and never
     // authorizes retirement; it gates kernel admission. Runtime state: not
     // persisted, rebuilt by observation after a restart.
     std::unique_lock lg(records_mtx_);
     const auto it = records_.find(jobID);
-    if (it != records_.end()) it->second.verified = verified;
+    if (it != records_.end()) it->second.presumed_live = presumed_live;
 }
 
 void JobRegistry::regRPCHandle() {
@@ -3914,8 +3925,8 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     std::uint64_t obsolete_hints = 0;
     std::uint64_t incomplete_observations = 0;
     std::uint64_t upsert_conflicts = 0;
-    std::uint64_t dropped_observations = 0;
-    std::uint64_t rejected_observations = 0;
+    std::uint64_t not_admitted_capture_all_off = 0;
+    std::uint64_t not_admitted_by_rule = 0;
     std::uint64_t admission_errors = 0;
     std::uint64_t decision_repairs = 0;
     std::uint64_t decision_failures = 0;
@@ -3932,15 +3943,15 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     bool tracker_unavailable = false;
     {
         std::lock_guard<std::mutex> lock(hb_mtx_);
-        closing_ids = closing_executions_;
+        closing_ids = closing_managers_;
         suspect_ids = suspect_ids_;
         events_received = hb_events_received_;
         rescan_requests = hb_rescan_requests_;
         obsolete_hints = hb_obsolete_hints_;
         incomplete_observations = hb_incomplete_observations_;
         upsert_conflicts = hb_upsert_conflicts_;
-        dropped_observations = hb_dropped_observations_;
-        rejected_observations = hb_rejected_observations_;
+        not_admitted_capture_all_off = hb_not_admitted_capture_all_off_;
+        not_admitted_by_rule = hb_not_admitted_by_rule_;
         admission_errors = hb_admission_errors_;
         decision_repairs = hb_decision_repairs_;
         decision_failures = hb_decision_failures_;
@@ -3984,7 +3995,7 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
             if (policy != auto_policies_.end() && policy->second.enabled())
                 ++pending_decisions;
         }
-        const bool suspect = !record.verified ||
+        const bool suspect = !record.presumed_live ||
                              suspect_ids.count(record.job.JobID) != 0;
         if (suspect) ++suspect_count;
         else if (record.state == RecordState::Active) ++active_count;
@@ -4046,8 +4057,8 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
     out["incomplete_observations"] = incomplete_observations;
     out["upsert_conflicts"] = upsert_conflicts;
     out["capture_all"] = capture_all_;
-    out["dropped_observations"] = dropped_observations;
-    out["rejected_observations"] = rejected_observations;
+    out["not_admitted_capture_all_off"] = not_admitted_capture_all_off;
+    out["not_admitted_by_rule"] = not_admitted_by_rule;
     out["admission_errors"] = admission_errors;
     out["pending_decisions"] = pending_decisions;
     out["decision_repairs"] = decision_repairs;

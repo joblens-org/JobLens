@@ -119,8 +119,8 @@ int main(int argc, char** argv) {
     std::thread serving([&] { server.listen_after_bind(); });
     Job job{};
     job.JobID = 123;
-    job.NativeJobID = "123";
-    job.cluster_name = "test";
+    job.JobNativeID = "123";
+    job.clusterName = "test";
     job.clusterTag = "test";
     job.jobtype = JobType::Job;
     job.subtype = JobSubType::Common;

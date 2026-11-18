@@ -94,10 +94,10 @@ std::optional<CondorNativeId> parse_condor_native(const std::string& raw)
 }
 
 // ---------------------------------------------------------------------------
-// Internal IDs
+// Job IDs
 // ---------------------------------------------------------------------------
 
-std::optional<uint64_t> parse_internal_id(const std::string& decimal)
+std::optional<uint64_t> parse_job_id_text(const std::string& decimal)
 {
     if (decimal.empty() || decimal.size() > 20) return std::nullopt;
     if (!is_decimal(decimal)) return std::nullopt;
@@ -109,12 +109,12 @@ std::optional<uint64_t> parse_internal_id(const std::string& decimal)
     return value;
 }
 
-std::string format_internal_id(uint64_t id)
+std::string format_job_id(uint64_t id)
 {
     return std::to_string(id);
 }
 
-LegacyId parse_legacy_job_id(const nlohmann::json& node)
+LegacyId parse_job_id(const nlohmann::json& node)
 {
     LegacyId parsed;
     if (node.is_null()) {
@@ -132,7 +132,7 @@ LegacyId parse_legacy_job_id(const nlohmann::json& node)
         }
         value = static_cast<uint64_t>(signed_value);
     } else if (node.is_string()) {
-        const auto decimal = parse_internal_id(node.get<std::string>());
+        const auto decimal = parse_job_id_text(node.get<std::string>());
         if (!decimal) {
             parsed.status = LegacyIdStatus::Invalid;
             return parsed;
@@ -144,7 +144,7 @@ LegacyId parse_legacy_job_id(const nlohmann::json& node)
         return parsed;
     }
     parsed.value = value;
-    parsed.status = is_reserved_internal_id(value) ? LegacyIdStatus::Reserved
+    parsed.status = is_reserved_job_id(value) ? LegacyIdStatus::Reserved
                                                    : LegacyIdStatus::Valid;
     return parsed;
 }
@@ -230,8 +230,8 @@ bool operator!=(const SchedulerKey& lhs, const SchedulerKey& rhs) { return !(lhs
 std::optional<SchedulerKey> canonicalize(const NativeSelector& selector)
 {
     if (selector.adapter.empty()) return std::nullopt;
-    if (selector.cluster_name.empty()) return std::nullopt;
-    if (selector.native_job_id.empty()) return std::nullopt;
+    if (selector.clusterName.empty()) return std::nullopt;
+    if (selector.job_native_id.empty()) return std::nullopt;
 
     // Everything scheduler-specific lives in the adapter's registered rule;
     // no rule means this layer cannot name the job — explicitly incomplete.
@@ -242,7 +242,7 @@ std::optional<SchedulerKey> canonicalize(const NativeSelector& selector)
 
     SchedulerKey identity;
     identity.adapter = selector.adapter;
-    identity.native_job_id = selector.native_job_id; // preserved verbatim
+    identity.job_native_id = selector.job_native_id; // preserved verbatim
     identity.cluster_namespace = parts->cluster_namespace;
     identity.canonical_native = parts->canonical_native;
     identity.step_id = parts->step_id;
@@ -250,7 +250,7 @@ std::optional<SchedulerKey> canonicalize(const NativeSelector& selector)
 }
 
 // ---------------------------------------------------------------------------
-// Process / generation identity
+// Process identity
 // ---------------------------------------------------------------------------
 
 bool operator==(const ProcessIdentity& lhs, const ProcessIdentity& rhs)
@@ -275,9 +275,9 @@ void to_json(nlohmann::json& out, const NativeSelector& selector)
     // legacy key keeps old binaries and rollback scenarios reading new rows.
     out["adapter"] = selector.adapter;
     out["scheduler_type"] = selector.adapter;
-    out["cluster_name"] = selector.cluster_name;
-    out["cluster_tag"] = selector.cluster_tag;
-    out["native_job_id"] = selector.native_job_id;
+    out["clusterName"] = selector.clusterName;
+    out["clusterTag"] = selector.clusterTag;
+    out["JobNativeID"] = selector.job_native_id;
     out["step_id"] = selector.step_id;
 }
 
@@ -289,9 +289,9 @@ void from_json(const nlohmann::json& in, NativeSelector& selector)
     else
         name = in.at("scheduler_type").get<std::string>();
     selector.adapter = normalize_adapter_name(name);
-    selector.cluster_name = in.at("cluster_name").get<std::string>();
-    selector.cluster_tag = in.value("cluster_tag", "");
-    selector.native_job_id = in.at("native_job_id").get<std::string>();
+    selector.clusterName = in.at("clusterName").get<std::string>();
+    selector.clusterTag = in.value("clusterTag", "");
+    selector.job_native_id = in.at("JobNativeID").get<std::string>();
     selector.step_id = in.value("step_id", "");
 }
 

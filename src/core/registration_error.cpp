@@ -39,7 +39,7 @@ constexpr std::array<Entry, 19> kEntries{{
     {RegistrationError::StoreWriteFailed, "store_write_failed", true},
     {RegistrationError::WriteOutcomeUnknown, "store_write_failed", true},
     {RegistrationError::IdExhausted, "id_exhausted", false},
-    {RegistrationError::GenerationConflict, "execution_generation_conflict", false},
+    {RegistrationError::ManagerConflict, "execution_manager_conflict", false},
     {RegistrationError::InstanceClosing, "instance_closing", false},
     {RegistrationError::IdentityQuarantined, "identity_quarantined", false},
     {RegistrationError::IdentityIndexMismatch, "identity_index_mismatch", false},

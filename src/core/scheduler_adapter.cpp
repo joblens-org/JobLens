@@ -25,13 +25,13 @@ SubAttrMatcher ISchedulerAdapter::duplicateMatcher(const Job& job) const
 
 NamespaceFacts ISchedulerAdapter::namespaceFacts(const Job& job) const
 {
-    return {job.cluster_name, job.clusterTag};
+    return {job.clusterName, job.clusterTag};
 }
 
-pid_t ISchedulerAdapter::firstMemberPid(const Job& job)
+pid_t ISchedulerAdapter::firstPid(const Job& job)
 {
-    for (const auto& member : members_of(job)) {
-        if (member.pid > 0) return member.pid;
+    for (const auto& pid_identity : pid_identities_of(job)) {
+        if (pid_identity.pid > 0) return pid_identity.pid;
     }
     return 0;
 }
@@ -42,8 +42,8 @@ RefreshResult ISchedulerAdapter::probeExecutionEvidence(
 {
     RefreshResult result;
 
-    // A record without a complete manager identity has no generation to probe:
-    // its member list is the only evidence (exactly like the retirement pass).
+    // A record without a complete manager identity has no manager to probe:
+    // its pid identity list is the only evidence (exactly like the retirement pass).
     const ProcessIdentity& manager = manager_of(job);
     if (manager.complete()) {
         const LivenessResult liveness =
@@ -58,37 +58,37 @@ RefreshResult ISchedulerAdapter::probeExecutionEvidence(
     if (!cgroup_path.empty() && cgroup_probe) {
         const CgroupMembership membership = cgroup_probe(cgroup_path);
         if (membership.readable) {
-            if (membership.members.empty()) result.cgroup_empty_confirmed = true;
-            for (const pid_t pid : membership.members) {
+            if (membership.pids.empty()) result.cgroup_empty_confirmed = true;
+            for (const pid_t pid : membership.pids) {
                 const LivenessResult member = process_probe
                                                   ? process_probe(ProcessIdentity{pid, 0, {}})
                                                   : LivenessResult{};
                 if (member.state == LivenessState::Alive) {
-                    result.any_member_live = true;
+                    result.any_pid_identity_live = true;
                     break;
                 }
-                if (member.state == LivenessState::Unknown) result.member_inconclusive = true;
+                if (member.state == LivenessState::Unknown) result.pid_identity_inconclusive = true;
             }
         }
     }
 
-    if (!result.any_member_live) {
-        for (const auto& member : members_of(job)) {
+    if (!result.any_pid_identity_live) {
+        for (const auto& pid_identity : pid_identities_of(job)) {
             const LivenessResult liveness =
-                process_probe ? process_probe(member) : LivenessResult{};
+                process_probe ? process_probe(pid_identity) : LivenessResult{};
             if (liveness.state == LivenessState::Alive) {
-                result.any_member_live = true;
+                result.any_pid_identity_live = true;
                 break;
             }
-            // An unreadable member (or one with an unvalidated identity) might
-            // be alive: it is never death evidence.
-            if (liveness.state == LivenessState::Unknown) result.member_inconclusive = true;
+            // An unreadable pid identity (or one with an unvalidated identity)
+            // might be alive: it is never death evidence.
+            if (liveness.state == LivenessState::Unknown) result.pid_identity_inconclusive = true;
         }
     }
     return result;
 }
 
-void ISchedulerAdapter::applyMemberEvidence(Job& job, const std::string& proc_root,
+void ISchedulerAdapter::applyPidIdentityEvidence(Job& job, const std::string& proc_root,
                                             const std::vector<pid_t>& member_pids,
                                             bool authoritative)
 {
@@ -96,17 +96,17 @@ void ISchedulerAdapter::applyMemberEvidence(Job& job, const std::string& proc_ro
 
     const std::string boot_id = read_boot_id(proc_root);
     ExecutionEvidence& execution = job.execution;
-    execution.members.clear();
-    execution.members.reserve(member_pids.size());
-    execution.members_authoritative = authoritative;
+    execution.pid_identities.clear();
+    execution.pid_identities.reserve(member_pids.size());
+    execution.pid_identities_authoritative = authoritative;
     for (const pid_t pid : member_pids) {
-        const ProcessIdentity member = read_process_identity(proc_root, boot_id, pid);
-        if (!member.complete()) execution.members_authoritative = false;
-        execution.members.push_back(member);
+        const ProcessIdentity pid_identity = read_process_identity(proc_root, boot_id, pid);
+        if (!pid_identity.complete()) execution.pid_identities_authoritative = false;
+        execution.pid_identities.push_back(pid_identity);
     }
 }
 
-RefreshResult ISchedulerAdapter::refreshManagerMembership(
+RefreshResult ISchedulerAdapter::refreshPidIdentities(
     Job& job, const std::string& proc_root, const std::string& cgroup_root,
     const std::string& recorded_cgroup_path,
     const ProcessLivenessProbe& process_probe,
@@ -117,7 +117,7 @@ RefreshResult ISchedulerAdapter::refreshManagerMembership(
 
     const JobMembershipRead membership = read_job_membership(
         proc_root, cgroup_root, manager.pid, recorded_cgroup_path);
-    applyMemberEvidence(job, proc_root, membership.members, membership.authoritative);
+    applyPidIdentityEvidence(job, proc_root, membership.pids, membership.authoritative);
 
     RefreshResult evidence = probeExecutionEvidence(job, process_probe, cgroup_probe);
     // A job-scoped cgroup that was read and listed no process is positive
@@ -125,7 +125,7 @@ RefreshResult ISchedulerAdapter::refreshManagerMembership(
     // read proves the execution scope is empty, which is what the retirement
     // rule needs. A shared daemon tree is discarded by read_job_membership and
     // never reaches this branch.
-    if (membership.authoritative && membership.members.empty())
+    if (membership.authoritative && membership.pids.empty())
         evidence.cgroup_empty_confirmed = true;
     return evidence;
 }

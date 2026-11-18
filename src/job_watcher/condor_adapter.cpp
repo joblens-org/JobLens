@@ -72,8 +72,8 @@ DiscoveryOptions CondorSchedulerAdapter::discoveryOptions(
     // one directory per slot under this subtree, each slot's cgroup.procs
     // listing its processes (starter included).
     options.starter_cgroup_subtree = "system.slice/htcondor";
-    if (!settings.cluster_name.empty())
-        options.discovery.cluster_name = settings.cluster_name;
+    if (!settings.clusterName.empty())
+        options.discovery.clusterName = settings.clusterName;
     return options;
 }
 
@@ -84,8 +84,8 @@ Job CondorSchedulerAdapter::decodeFacts(const nlohmann::json& row) const
     job.subtype = static_cast<JobSubType>(row.value("subtype", 0));
     job.subtype_name = row.value("subtype_name", name());
     set_pids(job, row.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>());
-    job.NativeJobID = row.value("native_job_id", "");
-    job.cluster_name = row.value("cluster_name", "");
+    job.JobNativeID = row.value("JobNativeID", "");
+    job.clusterName = row.value("clusterName", "");
     job.clusterTag = row.value("clusterTag", "");
     job.sub_attr = row.contains("sub_attr")
                        ? row["sub_attr"].get<CondorJobAttr>()
@@ -104,17 +104,17 @@ NativeSelector CondorSchedulerAdapter::legacySelector(const Job& job) const
     if (attr != nullptr) {
         // The typed facts are the namespace source; the common fields are
         // their render (kept as a fallback for facts built before one existed).
-        selector.cluster_name = attr->collector_host;
-        selector.cluster_tag = attr->scheduler_name;
+        selector.clusterName = attr->collector_host;
+        selector.clusterTag = attr->scheduler_name;
     }
-    if (selector.cluster_name.empty()) selector.cluster_name = job.cluster_name;
-    if (selector.cluster_tag.empty()) selector.cluster_tag = job.clusterTag;
+    if (selector.clusterName.empty()) selector.clusterName = job.clusterName;
+    if (selector.clusterTag.empty()) selector.clusterTag = job.clusterTag;
     // The original native string wins over the typed ids: a row that carries
     // only a render still names its job, and a zero-initialized typed field
     // must not shadow it.
-    if (selector.native_job_id.empty()) selector.native_job_id = job.NativeJobID;
-    if (selector.native_job_id.empty() && attr != nullptr)
-        selector.native_job_id = fmt::format("{}.{}", attr->cluster_id, attr->proc_id);
+    if (selector.job_native_id.empty()) selector.job_native_id = job.JobNativeID;
+    if (selector.job_native_id.empty() && attr != nullptr)
+        selector.job_native_id = fmt::format("{}.{}", attr->cluster_id, attr->proc_id);
 
     return selector;
 }
@@ -128,9 +128,9 @@ void CondorSchedulerAdapter::projectFacts(Job& job) const
 
     const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr);
     if (attr == nullptr) return;
-    if (job.NativeJobID.empty())
-        job.NativeJobID = fmt::format("{}.{}", attr->cluster_id, attr->proc_id);
-    if (job.cluster_name.empty()) job.cluster_name = attr->collector_host;
+    if (job.JobNativeID.empty())
+        job.JobNativeID = fmt::format("{}.{}", attr->cluster_id, attr->proc_id);
+    if (job.clusterName.empty()) job.clusterName = attr->collector_host;
     if (job.clusterTag.empty()) job.clusterTag = attr->scheduler_name;
 }
 
@@ -140,9 +140,9 @@ NativeSelector CondorSchedulerAdapter::registrationSelector(const Job& job) cons
     NativeSelector selector = legacySelector(job);
     // A manual registration carries no discovery environment; fall back to
     // the local collector for the pool-routing component.
-    if (selector.cluster_name.empty())
-        selector.cluster_name = Utils::get_condor_collector_host();
-    if (selector.cluster_name.empty() || selector.native_job_id.empty()) return {};
+    if (selector.clusterName.empty())
+        selector.clusterName = Utils::get_condor_collector_host();
+    if (selector.clusterName.empty() || selector.job_native_id.empty()) return {};
     return selector;
 }
 
@@ -167,7 +167,7 @@ void CondorSchedulerAdapter::applyRequestFacts(Job& job,
     job.sub_attr = attr;
     job.subtype = JobSubType::Condor;
     job.subtype_name = name();
-    job.NativeJobID = fmt::format("{}.{}", cluster_id, proc_id);
+    job.JobNativeID = fmt::format("{}.{}", cluster_id, proc_id);
     projectFacts(job);
 }
 
@@ -212,10 +212,10 @@ RefreshResult CondorSchedulerAdapter::refreshFacts(
     // overwriting newer facts.
     execution.read_order = next_discovery_read_order();
 
-    // The manager is the execution generation. A record that never carried a
+    // The manager IS the execution identity. A record that never carried a
     // complete one (a manual row, an interrupted discovery) recovers it from
     // any member pid it still knows.
-    const pid_t member_hint = firstMemberPid(job);
+    const pid_t member_hint = firstPid(job);
     if (!execution.manager.complete() && member_hint > 0) {
         if (const auto manager = managerOfPid(member_hint)) execution.manager = *manager;
     }
@@ -226,12 +226,13 @@ RefreshResult CondorSchedulerAdapter::refreshFacts(
     if (execution.manager.complete() && member_hint > 0) {
         if (auto observed =
                 impl_->watcher.observeForHint(member_hint, execution.manager.pid)) {
-            // Execution evidence only. NativeJobID, cluster, typed attrs and
+            // Execution evidence only. JobNativeID, cluster, typed attrs and
             // the record's JobID/selection/state are the creation snapshot and
             // are never rewritten by a refresh.
             execution.manager = observed->execution.manager;
-            execution.members = observed->execution.members;
-            execution.members_authoritative = observed->execution.members_authoritative;
+            execution.pid_identities = observed->execution.pid_identities;
+            execution.pid_identities_authoritative =
+                observed->execution.pid_identities_authoritative;
             execution.read_order = observed->execution.read_order;
             return probeExecutionEvidence(job, process_probe, cgroup_probe);
         }
@@ -245,7 +246,7 @@ RefreshResult CondorSchedulerAdapter::refreshFacts(
     if (!execution.manager.complete())
         return probeExecutionEvidence(job, process_probe, cgroup_probe);
     const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr);
-    return refreshManagerMembership(
+    return refreshPidIdentities(
         job, env.proc_root, env.cgroup_root,
         attr != nullptr ? attr->slots_cgroup_path : std::string{},
         process_probe, cgroup_probe);
@@ -267,28 +268,28 @@ NamespaceFacts CondorSchedulerAdapter::namespaceFacts(const Job& job) const
 NamespaceFacts CondorSchedulerAdapter::selectorNamespaceFacts(
     const NativeSelector& selector) const
 {
-    return {selector.cluster_name, selector.cluster_tag};
+    return {selector.clusterName, selector.clusterTag};
 }
 
 bool CondorSchedulerAdapter::adoptNamespaceAliases(Job& job,
-                                                   const std::string& cluster_name,
-                                                   const std::string& cluster_tag) const
+                                                   const std::string& clusterName,
+                                                   const std::string& clusterTag) const
 {
     auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr);
     if (attr == nullptr) return true;  // no typed facts: nothing contradicts
-    if (!cluster_name.empty() && !attr->collector_host.empty()
-            && cluster_name != attr->collector_host) return false;
-    if (!cluster_tag.empty() && !attr->scheduler_name.empty()
-            && cluster_tag != attr->scheduler_name) return false;
-    if (attr->collector_host.empty()) attr->collector_host = cluster_name;
-    if (attr->scheduler_name.empty()) attr->scheduler_name = cluster_tag;
+    if (!clusterName.empty() && !attr->collector_host.empty()
+            && clusterName != attr->collector_host) return false;
+    if (!clusterTag.empty() && !attr->scheduler_name.empty()
+            && clusterTag != attr->scheduler_name) return false;
+    if (attr->collector_host.empty()) attr->collector_host = clusterName;
+    if (attr->scheduler_name.empty()) attr->scheduler_name = clusterTag;
     return true;
 }
 
 void CondorSchedulerAdapter::renderNamespace(Job& job) const
 {
     if (const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr)) {
-        job.cluster_name = attr->collector_host;
+        job.clusterName = attr->collector_host;
         job.clusterTag = attr->scheduler_name;
     }
 }
@@ -301,12 +302,12 @@ void CondorSchedulerAdapter::renderNamespace(Job& job) const
 REGISTER_NATIVE_ID_RULE("condor", [](const NativeSelector& selector)
     -> std::optional<CanonicalParts> {
     if (!selector.step_id.empty()) return std::nullopt;  // Condor has no steps
-    auto parsed = parse_condor_native(selector.native_job_id);
+    auto parsed = parse_condor_native(selector.job_native_id);
     if (!parsed) return std::nullopt;
     CanonicalParts parts;
-    parts.cluster_namespace = selector.cluster_name;
-    if (!selector.cluster_tag.empty())
-        parts.cluster_namespace += "@" + selector.cluster_tag;
+    parts.cluster_namespace = selector.clusterName;
+    if (!selector.clusterTag.empty())
+        parts.cluster_namespace += "@" + selector.clusterTag;
     parts.canonical_native = parsed->cluster + "." + parsed->proc;
     return parts;
 })

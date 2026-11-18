@@ -43,7 +43,7 @@ std::int64_t now_epoch_ms()
 // Discovered Job readiness moved to the watchers (CondorJobWatcher /
 // SlurmJobWatcher discovery_ready/finalize_discovery): "is my discovery
 // finished" is scheduler-owned semantics, while the registry keeps the
-// admission rule (identity resolvable + generation complete).
+// admission rule (identity resolvable + manager complete).
 // ---------------------------------------------------------------------------
 
 std::uint64_t next_discovery_read_order()

@@ -23,8 +23,8 @@ void check(bool ok, const std::string& message) {
 Job make_job(int id, const std::string& cluster = "batch") {
     Job job{};
     job.JobID = id;
-    job.NativeJobID = std::to_string(id);
-    job.cluster_name = cluster;
+    job.JobNativeID = std::to_string(id);
+    job.clusterName = cluster;
     job.clusterTag = "test";
     job.jobtype = JobType::Job;
     job.subtype = JobSubType::Common;

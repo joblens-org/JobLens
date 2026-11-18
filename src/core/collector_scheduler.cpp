@@ -591,7 +591,7 @@ std::vector<uint64_t> CollectorScheduler::rmJobCollectLocked(const Job& job){
     }
 
     // Membership alone is not the whole boundary: a lane that was stopped while
-    // the record was still Open already holds a deferred close (its tail is
+    // the record was still Active already holds a deferred close (its tail is
     // still owed) and has no membership any more. Hold every Job-scope lane
     // while the boundary is computed, so the completion count and the adopted
     // tokens are fixed before any acknowledgement can be applied.
@@ -966,27 +966,27 @@ void CollectorScheduler::wake() {
     reconcile_cv_.notify_one();
 }
 
-void CollectorScheduler::notifyDrained(const std::vector<uint64_t>& internal_ids) {
-    if (internal_ids.empty()) return;
+void CollectorScheduler::notifyDrained(const std::vector<uint64_t>& job_ids) {
+    if (job_ids.empty()) return;
     IDrainCompletionSink* sink = nullptr;
     {
         std::lock_guard lock(reconcile_m_);
         sink = drain_sink_;
     }
     if (sink == nullptr) return;
-    for (const auto id : internal_ids) sink->onDrained(id);
+    for (const auto id : job_ids) sink->onDrained(id);
 }
 
-uint64_t CollectorScheduler::nextAttachToken(uint64_t internal_id) {
+uint64_t CollectorScheduler::nextAttachToken(uint64_t job_id) {
     // Caller holds m_. A reattach of the same instance gets a strictly greater
     // token; tokens are never reused, so a late completion for an older
     // attachment can be rejected instead of merged.
     const uint64_t token = ++attach_token_seq_;
-    attach_tokens_[internal_id] = token;
+    attach_tokens_[job_id] = token;
     return token;
 }
 
-bool CollectorScheduler::beginDrain(uint64_t internal_id) {
+bool CollectorScheduler::beginDrain(uint64_t job_id) {
     IJobRecordSource* source = nullptr;
     {
         std::lock_guard lock(reconcile_m_);
@@ -997,7 +997,7 @@ bool CollectorScheduler::beginDrain(uint64_t internal_id) {
         return false;
     }
     std::optional<JobRecord> record;
-    if (!source->runtimeRecord(internal_id, record)) {
+    if (!source->runtimeRecord(job_id, record)) {
         // The store cannot be read: an unknown desired state is not proof that
         // nothing is attached, so the caller must keep the Closing record.
         return false;
@@ -1020,19 +1020,19 @@ bool CollectorScheduler::beginDrain(uint64_t internal_id) {
     return true;
 }
 
-ActualCollectionState CollectorScheduler::actual(uint64_t internal_id) {
+ActualCollectionState CollectorScheduler::actual(uint64_t job_id) {
     ActualCollectionState state;
     {
         std::lock_guard lg(m_);
-        const auto token_it = attach_tokens_.find(internal_id);
+        const auto token_it = attach_tokens_.find(job_id);
         if (token_it != attach_tokens_.end()) {
             state.tracked = true;
             state.attach_token = token_it->second;
         }
-        const auto revision_it = attach_revisions_.find(internal_id);
+        const auto revision_it = attach_revisions_.find(job_id);
         if (revision_it != attach_revisions_.end())
             state.last_revision = revision_it->second;
-        const auto error_it = attach_errors_.find(internal_id);
+        const auto error_it = attach_errors_.find(job_id);
         if (error_it != attach_errors_.end()) state.error = error_it->second;
         for (const auto& [name, collector] : collector_state_dict) {
             auto info_it = collector_info_dict.find(name);
@@ -1044,7 +1044,7 @@ ActualCollectionState CollectorScheduler::actual(uint64_t internal_id) {
             if (!collector.running.load()) continue;
             std::lock_guard lg_state(collector.m_);
             if (std::find(collector.jobid_list.begin(), collector.jobid_list.end(),
-                          internal_id) != collector.jobid_list.end()) {
+                          job_id) != collector.jobid_list.end()) {
                 state.collectors.push_back(name);
                 state.tracked = true;
             }
@@ -1052,7 +1052,7 @@ ActualCollectionState CollectorScheduler::actual(uint64_t internal_id) {
     }
     {
         std::lock_guard lock(removal_m_);
-        state.draining = draining_.count(internal_id) != 0;
+        state.draining = draining_.count(job_id) != 0;
     }
     return state;
 }

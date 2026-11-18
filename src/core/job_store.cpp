@@ -143,7 +143,7 @@ std::string generate_db_uuid() {
 // "unknown") nor verified (never claim a complete execution we did not check).
 //
 // Provenance decides what "nothing to verify" means.  A manual/legacy row owns
-// no manager identity and its bound members are the evidence; a discovery row that
+// no manager identity and its bound pid identities are the evidence; a discovery row that
 // never produced a complete manager identity has an UNVERIFIED execution, not a
 // verified one — an incomplete discovery execution must never be replayed as
 
@@ -167,7 +167,7 @@ ProcessIdentity manager_from_json(const nlohmann::json& in) {
     return manager;
 }
 
-nlohmann::json process_to_json(const ProcessIdentity& process) {
+nlohmann::json pid_identity_to_json(const ProcessIdentity& process) {
     return nlohmann::json{
         {"pid", process.pid},
         {"start_ticks", process.start_ticks},
@@ -175,7 +175,7 @@ nlohmann::json process_to_json(const ProcessIdentity& process) {
     };
 }
 
-ProcessIdentity process_from_json(const nlohmann::json& in) {
+ProcessIdentity pid_identity_from_json(const nlohmann::json& in) {
     ProcessIdentity process;
     process.pid = in.value("pid", pid_t{0});
     process.start_ticks = in.value("start_ticks", uint64_t{0});
@@ -188,8 +188,8 @@ void write_job_fields(nlohmann::json& out, const Job& job) {
     out["subtype"]       = static_cast<int>(job.subtype);
     if (!job.subtype_name.empty()) out["subtype_name"] = job.subtype_name;
     out["pids"]          = pids_of(job);
-    out["native_job_id"] = job.NativeJobID;
-    out["cluster_name"]  = job.cluster_name;
+    out["JobNativeID"]   = job.JobNativeID;
+    out["clusterName"]   = job.clusterName;
     out["clusterTag"]    = job.clusterTag;
     std::visit([&out](const auto& obj) {
         out["sub_attr"] = nlohmann::json(obj);
@@ -217,10 +217,10 @@ nlohmann::json record_json(const JobRecord& record) {
     if (!record.job.subtype_name.empty()) out["adapter"] = record.job.subtype_name;
     // Execution evidence: the local run that produced the facts, rebuilt from
     // a read on the next observation.
-    out["generation"]     = manager_to_json(record.job.execution.manager);
-    out["members"]        = nlohmann::json::array();
-    for (const auto& member : members_of(record.job)) {
-        out["members"].push_back(process_to_json(member));
+    out["manager"]        = manager_to_json(record.job.execution.manager);
+    out["pid_identities"] = nlohmann::json::array();
+    for (const auto& pid_identity : pid_identities_of(record.job)) {
+        out["pid_identities"].push_back(pid_identity_to_json(pid_identity));
     }
     return out;
 }
@@ -231,8 +231,8 @@ Job decode_legacy_job(const nlohmann::json& j) {
     job.subtype       = static_cast<JobSubType>(j.value("subtype", 0));
     job.subtype_name  = j.value("subtype_name", "");
     set_pids(job, j.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>());
-    job.NativeJobID   = j.value("native_job_id", "");
-    job.cluster_name  = j.value("cluster_name", "");
+    job.JobNativeID   = j.value("JobNativeID", "");
+    job.clusterName   = j.value("clusterName", "");
     job.clusterTag    = j.value("clusterTag", "");
 
     if (!job.subtype_name.empty()) {
@@ -255,12 +255,12 @@ Job decode_legacy_job(const nlohmann::json& j) {
     return job;
 }
 
-JobRecord parse_record(const std::string& raw, uint64_t internal_id,
+JobRecord parse_record(const std::string& raw, uint64_t job_id,
                        const JobStore::Options::RowDecoder& decoder) {
     const auto j = nlohmann::json::parse(raw);
     JobRecord record;
     record.job = decoder ? decoder(j) : decode_legacy_job(j);
-    record.job.JobID = internal_id;
+    record.job.JobID = job_id;
     ExecutionEvidence& execution = record.job.execution;
 
     record.revision       = j.value("revision", uint64_t{1});
@@ -286,15 +286,16 @@ JobRecord parse_record(const std::string& raw, uint64_t internal_id,
     if (record.job.subtype_name.empty())
         record.job.subtype_name = j.value("adapter", std::string{});
     record.index_key = j.value("index_key", std::string{});
-    if (j.contains("generation") && j["generation"].is_object()) {
-        execution.manager = manager_from_json(j["generation"]);
+    if (j.contains("manager") && j["manager"].is_object()) {
+        execution.manager = manager_from_json(j["manager"]);
     }
-    const auto members_it = j.contains("members") ? j.find("members") : j.find("processes");
-    if (members_it != j.end() && members_it->is_array()) {
-        for (const auto& process : *members_it) {
-            if (process.is_object()) execution.members.push_back(process_from_json(process));
+    const auto pid_identities_it = j.find("pid_identities");
+    if (pid_identities_it != j.end() && pid_identities_it->is_array()) {
+        for (const auto& pid_identity_json : *pid_identities_it) {
+            if (pid_identity_json.is_object())
+                execution.pid_identities.push_back(pid_identity_from_json(pid_identity_json));
         }
-        execution.members = normalized_processes(std::move(execution.members));
+        execution.pid_identities = normalized_pid_identities(std::move(execution.pid_identities));
     }
     // Provenance is stored explicitly. A row written before the field existed
     // is classified from its own evidence: a populated manager triple means a
@@ -339,21 +340,21 @@ CollectionSelection selection_from_json(const nlohmann::json& in) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Row member canonicalization (shared with the registry's merge path)
+// Row pid identity canonicalization (shared with the registry's merge path)
 // ---------------------------------------------------------------------------
 
-std::vector<ProcessIdentity> normalized_processes(std::vector<ProcessIdentity> processes) {
-    std::sort(processes.begin(), processes.end(),
+std::vector<ProcessIdentity> normalized_pid_identities(std::vector<ProcessIdentity> pid_identities) {
+    std::sort(pid_identities.begin(), pid_identities.end(),
               [](const ProcessIdentity& lhs, const ProcessIdentity& rhs) {
                   if (lhs.pid != rhs.pid) return lhs.pid < rhs.pid;
                   return lhs.start_ticks < rhs.start_ticks;
               });
-    processes.erase(std::unique(processes.begin(), processes.end(),
+    pid_identities.erase(std::unique(pid_identities.begin(), pid_identities.end(),
                                 [](const ProcessIdentity& lhs, const ProcessIdentity& rhs) {
                                     return lhs == rhs;
                                 }),
-                    processes.end());
-    return processes;
+                    pid_identities.end());
+    return pid_identities;
 }
 
 // Unambiguous identity index key. Canonical components are validated
@@ -612,9 +613,9 @@ std::vector<JobRecord> JobStore::loadAll() {
     return restored;
 }
 
-void JobStore::mark_record_dirty(uint64_t internal_id) {
+void JobStore::mark_record_dirty(uint64_t job_id) {
     // Callers hold db_mtx_ (dirty_records_ is persistence-side bookkeeping).
-    dirty_records_.insert(internal_id);
+    dirty_records_.insert(job_id);
 }
 
 bool JobStore::flushDirty(const char* reason) {
@@ -849,7 +850,7 @@ bool JobStore::recover_pending_locked(std::vector<JobRecord>& adopted,
             // The active row the archive deleted: re-deleting is the idempotent
             // half of the same image, and it makes the fence non-empty even
             // when the instance had no other active row left.
-            batch.Delete(key_job(archive.internal_id));
+            batch.Delete(key_job(archive.job_id));
             fence_entries += 2;
             if (!archive.identity_key.empty()) {
                 batch.Delete(archive.identity_key);
@@ -911,18 +912,18 @@ bool JobStore::adopt_locked_pass1(uint64_t id,
     }
     return true;
 }
-bool JobStore::read_archive_fence_locked(uint64_t internal_id, ArchiveFence& fence,
+bool JobStore::read_archive_fence_locked(uint64_t job_id, ArchiveFence& fence,
                                          std::string& error) {
-    const std::string prefix = key_history_prefix(internal_id);
+    const std::string prefix = key_history_prefix(job_id);
     std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(leveldb::ReadOptions()));
     size_t found = 0;
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         if (++found > 1) {
-            // Two history rows for one internal id: no image can be called
+            // Two history rows for one job id: no image can be called
             // authoritative, so nothing may be re-asserted or dropped.
             error = "recovery_history_ambiguous";
             spdlog::error("JobStore: JobID {} has more than one history row; recovery "
-                          "cannot choose an archive image", internal_id);
+                          "cannot choose an archive image", job_id);
             return false;
         }
         fence.history_key = it->key().ToString();
@@ -940,18 +941,18 @@ bool JobStore::read_archive_fence_locked(uint64_t internal_id, ArchiveFence& fen
         // resurrect an instance.
         error = "recovery_history_missing";
         spdlog::error("JobStore: JobID {} has no active row and no history row; "
-                      "recovery cannot prove what landed", internal_id);
+                      "recovery cannot prove what landed", job_id);
         return false;
     }
 
-    fence.internal_id = internal_id;
+    fence.job_id = job_id;
     JobRecord archived;
     try {
-        archived = parse_record(fence.history_value, internal_id, options_.row_decoder);
+        archived = parse_record(fence.history_value, job_id, options_.row_decoder);
     } catch (const std::exception& exc) {
         error = "recovery_parse_failed";
         spdlog::error("JobStore: cannot parse the history row of JobID {} during "
-                      "recovery: {}", internal_id, exc.what());
+                      "recovery: {}", job_id, exc.what());
         return false;
     }
     if (archived.index_key.empty()) return true;
@@ -971,22 +972,22 @@ bool JobStore::read_archive_fence_locked(uint64_t internal_id, ArchiveFence& fen
     if (index_status.ok()) {
         uint64_t owner = 0;
         try {
-            owner = nlohmann::json::parse(value).value("internal_id", uint64_t{0});
+            owner = nlohmann::json::parse(value).value("job_id", uint64_t{0});
         } catch (const std::exception&) {
             owner = 0;
         }
-        if (owner == internal_id) fence.identity_key = index_key;
+        if (owner == job_id) fence.identity_key = index_key;
     }
     return true;
 }
 
-bool JobStore::adopt_durable_locked(uint64_t internal_id, std::optional<ArchiveFence>& archive,
+bool JobStore::adopt_durable_locked(uint64_t job_id, std::optional<ArchiveFence>& archive,
                                     bool& delete_confirmed, JobRecord& adopted_record,
                                     std::string& error) {
     archive.reset();
     delete_confirmed = false;
     std::string raw;
-    const auto status = db_->Get(leveldb::ReadOptions(), key_job(internal_id), &raw);
+    const auto status = db_->Get(leveldb::ReadOptions(), key_job(job_id), &raw);
 
     if (status.IsNotFound()) {
         if (recovery_delete_only_) {
@@ -1001,7 +1002,7 @@ bool JobStore::adopt_durable_locked(uint64_t internal_id, std::optional<ArchiveF
         // archive deletes `j:`; the image it left in `h:` is read back as the
         // only authoritative image and must be fenced verbatim.
         ArchiveFence fence;
-        if (!read_archive_fence_locked(internal_id, fence, error)) return false;
+        if (!read_archive_fence_locked(job_id, fence, error)) return false;
         archive = std::move(fence);
         return true;
     }
@@ -1013,11 +1014,11 @@ bool JobStore::adopt_durable_locked(uint64_t internal_id, std::optional<ArchiveF
 
     JobRecord record;
     try {
-        record = parse_record(raw, internal_id, options_.row_decoder);
+        record = parse_record(raw, job_id, options_.row_decoder);
     } catch (const std::exception& exc) {
         error = "recovery_parse_failed";
         spdlog::error("JobStore: cannot parse the durable row of JobID {} during "
-                      "recovery: {}", internal_id, exc.what());
+                      "recovery: {}", job_id, exc.what());
         return false;
     }
     adopted_record = std::move(record);
@@ -1181,7 +1182,7 @@ uint64_t JobStore::allocateId(std::string& error) {
     std::lock_guard<std::mutex> id_lock(id_mtx_);
     if (id_exhausted_ || next_id_ == 0) {
         error = "id_exhausted";
-        spdlog::error("JobStore: internal id space is exhausted, refusing allocation");
+        spdlog::error("JobStore: job id space is exhausted, refusing allocation");
         return 0;
     }
 
@@ -1204,7 +1205,7 @@ uint64_t JobStore::allocateId(std::string& error) {
     batch.Put(key_counter("job_id"),
               std::to_string(next_id_ == 0 ? id : next_id_));
     if (exhaust_now) batch.Put(key_meta("job_id_exhausted"), "true");
-    auto status = write_batch_locked(batch, "allocate internal id");
+    auto status = write_batch_locked(batch, "allocate job id");
     if (!status.ok()) {
         error = "store_write_failed";
         spdlog::error("JobStore: durable id allocation failed for id {}, id is burned", id);
@@ -1218,7 +1219,7 @@ bool JobStore::reserveId(uint64_t& id, uint64_t& durable_counter,
     std::lock_guard<std::mutex> id_lock(id_mtx_);
     if (id_exhausted_ || next_id_ == 0) {
         error = "id_exhausted";
-        spdlog::error("JobStore: internal id space is exhausted, refusing allocation");
+        spdlog::error("JobStore: job id space is exhausted, refusing allocation");
         return false;
     }
     durable_exhausted = false;
@@ -1270,22 +1271,22 @@ std::optional<JobRecord> JobStore::readRowByIdentity(const SchedulerKey& key) {
         record_store_failure("LevelDB read failed (identity lookup): " + status.ToString());
         return std::nullopt;
     }
-    uint64_t internal_id = 0;
+    uint64_t job_id = 0;
     try {
-        internal_id = nlohmann::json::parse(value).value("internal_id", uint64_t{0});
+        job_id = nlohmann::json::parse(value).value("job_id", uint64_t{0});
     } catch (const std::exception& error) {
         spdlog::warn("JobStore: unreadable identity index: {}", error.what());
         return std::nullopt;
     }
-    if (internal_id == 0) return std::nullopt;
+    if (job_id == 0) return std::nullopt;
 
     std::string raw;
-    status = db_->Get(leveldb::ReadOptions(), key_job(internal_id), &raw);
+    status = db_->Get(leveldb::ReadOptions(), key_job(job_id), &raw);
     if (status.IsNotFound()) {
         // A stale entry: its row is gone (batches delete row and index
         // atomically), so the next create's PutIdentity overwrites it.
         spdlog::warn("JobStore: identity index names JobID {} but its row is gone",
-                     internal_id);
+                     job_id);
         return std::nullopt;
     }
     if (!status.ok()) {
@@ -1293,10 +1294,10 @@ std::optional<JobRecord> JobStore::readRowByIdentity(const SchedulerKey& key) {
         return std::nullopt;
     }
     try {
-        auto record = parse_record(raw, internal_id, options_.row_decoder);
+        auto record = parse_record(raw, job_id, options_.row_decoder);
         return record;
     } catch (const std::exception& error) {
-        spdlog::warn("JobStore: unreadable record {}: {}", internal_id, error.what());
+        spdlog::warn("JobStore: unreadable record {}: {}", job_id, error.what());
         return std::nullopt;
     }
 }
@@ -1319,7 +1320,7 @@ bool JobStore::identity_owner_locked(const SchedulerKey& key, uint64_t& owner,
         return false;
     }
     try {
-        owner = nlohmann::json::parse(value).value("internal_id", uint64_t{0});
+        owner = nlohmann::json::parse(value).value("job_id", uint64_t{0});
     } catch (const std::exception&) {
         owner = 0;   // unparsable entry: treat as absent, writes overwrite it
     }
@@ -1331,16 +1332,16 @@ bool JobStore::apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& bat
     // Callers hold db_mtx_.
     switch (op.kind) {
         case WriteOp::PutRecord: {
-            if (!op.record || op.internal_id == 0) {
+            if (!op.record || op.job_id == 0) {
                 error = "invalid_op";
                 return false;
             }
-            batch.Put(key_job(op.internal_id), record_json(*op.record).dump());
+            batch.Put(key_job(op.job_id), record_json(*op.record).dump());
             put_seen = true;
             return true;
         }
         case WriteOp::DeleteRecord: {
-            batch.Delete(key_job(op.internal_id));
+            batch.Delete(key_job(op.job_id));
             return true;
         }
         case WriteOp::PutIdentity: {
@@ -1353,7 +1354,7 @@ bool JobStore::apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& bat
             // archive, unparsable value) is stale and overwritten here.
             uint64_t owner = 0;
             if (!identity_owner_locked(*op.key, owner, error)) return false;
-            if (owner != 0 && owner != op.internal_id) {
+            if (owner != 0 && owner != op.job_id) {
                 std::string raw;
                 const auto row = db_->Get(leveldb::ReadOptions(), key_job(owner), &raw);
                 if (!row.ok() && !row.IsNotFound()) {
@@ -1365,7 +1366,7 @@ bool JobStore::apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& bat
                 if (row.ok()) {
                     spdlog::error("JobStore: identity for JobID {} is already registered "
                                   "as JobID {}; refusing the write",
-                                  op.internal_id, owner);
+                                  op.job_id, owner);
                     error = "identity_conflict";
                     return false;
                 }
@@ -1374,10 +1375,10 @@ bool JobStore::apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& bat
             }
             const SchedulerKey& identity = *op.key;
             batch.Put(key_identity(identity.index_key()), nlohmann::json{
-                {"internal_id", op.internal_id},
+                {"job_id", op.job_id},
                 {"scheduler_type", identity.adapter},
                 {"cluster_namespace", identity.cluster_namespace},
-                {"native_job_id", identity.native_job_id},
+                {"job_native_id", identity.job_native_id},
                 {"canonical_native", identity.canonical_native},
                 {"step_id", identity.step_id},
             }.dump());
@@ -1393,13 +1394,13 @@ bool JobStore::apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& bat
             // execution may have claimed the identity by now.
             uint64_t owner = 0;
             if (!identity_owner_locked(*op.key, owner, error)) return false;
-            if (owner == op.internal_id) {
+            if (owner == op.job_id) {
                 batch.Delete(key_identity(op.key->index_key()));
             }
             return true;
         }
         case WriteOp::PutHistory: {
-            if (!op.record || op.internal_id == 0) {
+            if (!op.record || op.job_id == 0) {
                 error = "invalid_op";
                 return false;
             }
@@ -1416,7 +1417,7 @@ bool JobStore::apply_write_op_locked(const WriteOp& op, leveldb::WriteBatch& bat
             // row.
             history["applied_collectors"] = op.applied_collectors;
             history["applied_provenance"] = op.history_provenance;
-            batch.Put(key_history(op.internal_id, static_cast<uint64_t>(end_time)),
+            batch.Put(key_history(op.job_id, static_cast<uint64_t>(end_time)),
                       history.dump());
             put_seen = true;
             return true;
@@ -1456,7 +1457,7 @@ bool JobStore::commit(std::vector<WriteOp> ops, bool durable,
     std::vector<uint64_t> record_puts;
     for (const auto& op : ops) {
         if (!apply_write_op_locked(op, batch, put_seen, error)) return false;
-        if (op.kind == WriteOp::PutRecord) record_puts.push_back(op.internal_id);
+        if (op.kind == WriteOp::PutRecord) record_puts.push_back(op.job_id);
     }
     // A batch of only deletes proves its own ambiguous outcome by the row's
     // absence; anything that writes a row needs the regular recovery fence.

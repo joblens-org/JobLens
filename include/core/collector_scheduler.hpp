@@ -72,8 +72,8 @@ public:
     void wake() override;
     // Release every collector for one instance and prove the accepted tail is
     // produced. True = the runtime owns the drain and will call onDrained().
-    bool beginDrain(uint64_t internal_id) override;
-    ActualCollectionState actual(uint64_t internal_id) override;
+    bool beginDrain(uint64_t job_id) override;
+    ActualCollectionState actual(uint64_t job_id) override;
 
     static CollectorScheduler& instance();
 
@@ -266,10 +266,10 @@ private:
     // Reconcile worker: converge to the records the registry publishes.
     void reconcileLoop();
     void reconcileOnce();
-    void notifyDrained(const std::vector<uint64_t>& internal_ids);
+    void notifyDrained(const std::vector<uint64_t>& job_ids);
     // Attach bookkeeping: a reattach of the same instance gets a strictly
     // greater token. Caller holds m_.
-    uint64_t nextAttachToken(uint64_t internal_id);
+    uint64_t nextAttachToken(uint64_t job_id);
     void stopAllCollectors();
     /// 挂载 Job 到采集器；返回 true 表示这是一次新的、已成功运行的挂载。
     /// A failed start rolls the membership back so the next reconcile retries

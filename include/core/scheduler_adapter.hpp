@@ -91,7 +91,7 @@ struct DiscoveryTypeSettings {
     std::vector<std::string> default_collectors;
     // Explicit cluster namespace fallback for discovery (wins over the
     // environment-derived value, empty = derive from the source).
-    std::string cluster_name;
+    std::string clusterName;
 };
 
 // Capability traits of one adapter. A trait being absent is a normal state,
@@ -105,7 +105,7 @@ struct AdapterTraits {
 // Structured namespace facts one adapter discriminates by: one value per
 // component, empty = unknown. Which typed sub_attr fields feed a component,
 // how request-level aliases fold into them and how the query-side common
-// fields (cluster_name/clusterTag) render from them are adapter implementation
+// fields (clusterName/clusterTag) render from them are adapter implementation
 // details — the virtuals below own every bit of that mapping.
 using NamespaceFacts = std::vector<std::string>;
 
@@ -115,13 +115,13 @@ using NamespaceFacts = std::vector<std::string>;
 //                              never death evidence);
 //   * cgroup_empty_confirmed — the job cgroup was read and listed no process
 //                              (positive evidence, not missing data);
-//   * any_member_live        — at least one member process answered Alive;
-//   * member_inconclusive    — at least one member could not be judged.
+//   * any_pid_identity_live        — at least one member process answered Alive;
+//   * pid_identity_inconclusive    — at least one member could not be judged.
 struct RefreshResult {
     LivenessState manager = LivenessState::Unknown;
     bool cgroup_empty_confirmed = false;
-    bool any_member_live = false;
-    bool member_inconclusive = false;
+    bool any_pid_identity_live = false;
+    bool pid_identity_inconclusive = false;
 };
 
 // Component-wise compatibility: a component where both sides hold a known,
@@ -153,7 +153,7 @@ public:
     virtual NativeSelector legacySelector(const Job& job) const = 0;
 
     // Publishes the record-visible fields from the typed facts: subtype,
-    // subtype_name, NativeJobID and the common namespace fields. Fill-empty
+    // subtype_name, JobNativeID and the common namespace fields. Fill-empty
     // only; a watcher-provided value is never overwritten.
     virtual void projectFacts(Job& job) const
     {
@@ -193,7 +193,7 @@ public:
     }
 
     // The single execution-evidence reader for one record: refreshes the
-    // execution group (manager, member triples, members_authoritative,
+    // execution group (manager, pid identity triples, pid_identities_authoritative,
     // read_order) IN PLACE and reports what the caller's probes saw. The
     // record's scheduler metadata is the creation snapshot and is never
     // rewritten here. The registry calls this for every active record,
@@ -217,7 +217,7 @@ public:
     // ---- structured namespace (scheduler-owned semantics) -----------------
     //
     // The typed sub_attr is the single fact source. The common fields
-    // cluster_name/clusterTag are a rendered projection of those facts —
+    // clusterName/clusterTag are a rendered projection of those facts —
     // the ES job_info contract the query side filters on — never an
     // independent second source. Defaults implement the generic business
     // (Common jobs, open-world schedulers without a configured adapter):
@@ -229,15 +229,15 @@ public:
     // The namespace facts of a selector addressing jobs of this adapter.
     virtual NamespaceFacts selectorNamespaceFacts(const NativeSelector& selector) const
     {
-        return {selector.cluster_name, selector.cluster_tag};
+        return {selector.clusterName, selector.clusterTag};
     }
     // Fold request-level namespace aliases into the typed facts; existing
     // facts win. False = the aliases contradict known facts (the caller
     // rejects the request instead of guessing which side is right).
-    virtual bool adoptNamespaceAliases(Job& job, const std::string& cluster_name,
-                                       const std::string& cluster_tag) const
+    virtual bool adoptNamespaceAliases(Job& job, const std::string& clusterName,
+                                       const std::string& clusterTag) const
     {
-        (void)job; (void)cluster_name; (void)cluster_tag;
+        (void)job; (void)clusterName; (void)clusterTag;
         return true;
     }
     // Render the query-side common fields from the typed facts. Idempotent
@@ -262,30 +262,30 @@ protected:
     // same rule the retirement pass uses: manager liveness from its complete
     // identity, "cgroup empty" only from a readable job cgroup, member
     // liveness/inconclusiveness from the cgroup members and the recorded
-    // member identities. Shared by the adapters' refreshFacts.
+    // pid identities. Shared by the adapters' refreshFacts.
     RefreshResult probeExecutionEvidence(const Job& job,
                                          const ProcessLivenessProbe& process_probe,
                                          const CgroupMembershipProbe& cgroup_probe) const;
 
-    // The first recorded member pid (0 when the record carries none): the
-    // anchor a targeted per-job read starts from.
-    static pid_t firstMemberPid(const Job& job);
+    // The pid of the first recorded pid identity (0 when the record carries
+    // none): the anchor a targeted per-job read starts from.
+    static pid_t firstPid(const Job& job);
 
-    // Replaces the record's member evidence with one membership read.
+    // Replaces the record's pid identity evidence with one membership read.
     // `authoritative` means the read covered the whole execution scope, so an
-    // empty list really clears the members; a partial read that found nothing
-    // is no evidence at all and keeps the recorded identities.
-    static void applyMemberEvidence(Job& job, const std::string& proc_root,
+    // empty list really clears the pid identities; a partial read that found
+    // nothing is no evidence at all and keeps the recorded identities.
+    static void applyPidIdentityEvidence(Job& job, const std::string& proc_root,
                                     const std::vector<pid_t>& member_pids,
                                     bool authoritative);
 
     // The adapter-independent fallback of refreshFacts: reads one execution's
     // membership from the manager's own scope (the recorded cgroup, else
     // /proc/<manager>/cgroup, else the manager's children — never the process
-    // table), applies it as member evidence and reports what the caller's
+    // table), applies it as pid identity evidence and reports what the caller's
     // probes saw. Only `execution` is written: the record's creation metadata
     // stays the snapshot it was created with.
-    RefreshResult refreshManagerMembership(Job& job, const std::string& proc_root,
+    RefreshResult refreshPidIdentities(Job& job, const std::string& proc_root,
                                            const std::string& cgroup_root,
                                            const std::string& recorded_cgroup_path,
                                            const ProcessLivenessProbe& process_probe,

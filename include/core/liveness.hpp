@@ -41,7 +41,7 @@ struct LivenessResult {
 // Dead, not Alive.
 struct CgroupMembership {
     bool readable = false;  // false = unknown, never "empty"
-    std::vector<pid_t> members;
+    std::vector<pid_t> pids;
     std::string error;
 };
 

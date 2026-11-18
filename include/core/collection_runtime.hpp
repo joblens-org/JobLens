@@ -17,7 +17,7 @@
 // Division of responsibility, and nothing more:
 //
 //   JobRegistry / JobStore   owns facts, the automatic and manual selection and
-//                            the durable Open/Closing lifecycle. It never keeps
+//                            the durable Active/Closing lifecycle. It never keeps
 //                            a copy of what is actually attached.
 //   CollectorScheduler       owns which collector instance really holds which
 //                            job, the monotonic attach token and the drain. It
@@ -68,9 +68,9 @@ public:
     // means the runtime cannot prove the stopping boundary (an unsupported
     // cutoff capability): the caller must not archive and must not treat the
     // stop as complete.
-    virtual bool beginDrain(uint64_t internal_id) = 0;
+    virtual bool beginDrain(uint64_t job_id) = 0;
     // Actual state for status reporting. Honest about an untracked instance.
-    virtual ActualCollectionState actual(uint64_t internal_id) = 0;
+    virtual ActualCollectionState actual(uint64_t job_id) = 0;
 };
 
 // Runtime -> registry.
@@ -81,7 +81,7 @@ public:
     // collector for this instance. The registry may now run checked kernel
     // cleanup and archive. Idempotent: a repeated report for an instance that
     // is no longer Closing is ignored.
-    virtual void onDrained(uint64_t internal_id) = 0;
+    virtual void onDrained(uint64_t job_id) = 0;
 };
 
 // Runtime -> registry read surface. The runtime converges to what the durable
@@ -100,6 +100,6 @@ public:
     virtual bool runtimeRecords(std::vector<JobRecord>& out) const = 0;
     // false = the source is unavailable (do not conclude anything).
     // true with an empty `out` = the instance is not tracked by the registry.
-    virtual bool runtimeRecord(uint64_t internal_id,
+    virtual bool runtimeRecord(uint64_t job_id,
                                std::optional<JobRecord>& out) const = 0;
 };

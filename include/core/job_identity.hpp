@@ -15,10 +15,10 @@
 //
 // ONE identity type, two parts:
 //   * logical identity  - which scheduled job (adapter / namespace / native / step)
-//   * execution identity - which local run of it (manager process + members)
+//   * execution identity - which local run of it (manager process + pid identities)
 //
 // The internal storage id (uint64 JobID, 0 reserved) and the external decimal
-// handle (format_internal_id) are addressing, not identity. A native scheduler
+// handle (format_job_id) are addressing, not identity. A native scheduler
 // number, a caller hash or a bare PID is never a complete identity; incomplete
 // identities fail explicitly and stay out of committed identity indexes.
 #pragma once
@@ -51,18 +51,18 @@ inline constexpr const char* kAdapterSlurm = "slurm";
 std::string normalize_adapter_name(const std::string& raw);
 
 // ---------------------------------------------------------------------------
-// Internal IDs (uint64-safe parse/format)
+// Job IDs (uint64-safe parse/format)
 // ---------------------------------------------------------------------------
 
 // JobID 0 is the system sentinel; no job record may use it.
 inline constexpr uint64_t kSystemSentinelJobId = 0;
-inline bool is_reserved_internal_id(uint64_t id) { return id == kSystemSentinelJobId; }
+inline bool is_reserved_job_id(uint64_t id) { return id == kSystemSentinelJobId; }
 
-// Strict decimal parse of an internal ID string: digits only, no sign, no
-// whitespace, no overflow. New APIs carry internal IDs as decimal strings so
+// Strict decimal parse of a job ID string: digits only, no sign, no
+// whitespace, no overflow. New APIs carry job IDs as decimal strings so
 // JavaScript consumers keep uint64 precision.
-std::optional<uint64_t> parse_internal_id(const std::string& decimal);
-std::string format_internal_id(uint64_t id);
+std::optional<uint64_t> parse_job_id_text(const std::string& decimal);
+std::string format_job_id(uint64_t id);
 
 // Legacy JSON nodes may carry JobID as a JSON number or as a decimal string.
 // Parsing is explicitly uint64: an unsigned integer up to UINT64_MAX or an
@@ -74,7 +74,7 @@ struct LegacyId {
     LegacyIdStatus status = LegacyIdStatus::Absent;
     uint64_t value = 0;
 };
-LegacyId parse_legacy_job_id(const nlohmann::json& node);
+LegacyId parse_job_id(const nlohmann::json& node);
 
 // ---------------------------------------------------------------------------
 // Slurm step identity
@@ -101,11 +101,11 @@ std::optional<uint32_t> slurm_step_value(const std::string& step_id);
 
 struct NativeSelector {
     std::string adapter;            // adapter registry name; empty = unresolved
-    std::string cluster_name;  // resolved cluster namespace (never empty)
+    std::string clusterName;  // resolved cluster namespace (never empty)
     // Condor schedd / tag namespace; required by Condor when the cluster has
     // more than one schedd. Optional for Slurm.
-    std::string cluster_tag;
-    std::string native_job_id;  // original native string, preserved verbatim
+    std::string clusterTag;
+    std::string job_native_id;  // original native string, preserved verbatim
     // Slurm only; empty means "the logical job, no step claim". Use
     // scope=instance selectors with a step for step-exact targeting.
     std::string step_id;
@@ -132,15 +132,15 @@ bool operator!=(const ProcessIdentity& lhs, const ProcessIdentity& rhs);
 // is never stored: the facts that produced it are the single copy.
 struct SchedulerKey {
     std::string adapter;             // adapter registry name (never empty)
-    std::string cluster_namespace;   // cluster_name plus tag when applicable
-    std::string native_job_id;       // original native string, preserved
+    std::string cluster_namespace;   // clusterName plus tag when applicable
+    std::string job_native_id;       // original native string, preserved
     std::string canonical_native;    // numeric-normalized form used for keys
     std::string step_id;             // normalized Slurm step, or empty
 
     bool complete() const
     {
         return !adapter.empty() && !cluster_namespace.empty() &&
-               !native_job_id.empty() && !canonical_native.empty();
+               !job_native_id.empty() && !canonical_native.empty();
     }
     // Total-order key: equal keys mean the same logical scheduler identity.
     std::string key() const;
@@ -152,13 +152,13 @@ bool operator==(const SchedulerKey& lhs, const SchedulerKey& rhs);
 bool operator!=(const SchedulerKey& lhs, const SchedulerKey& rhs);
 
 // Which local run produced the facts: the adapter's manager process plus the
-// member set. Evidence, not identity — it is rebuilt from a read and never the
-// thing that names the job. A bare pid is not evidence: the triple defeats PID
-// reuse.
+// pid identity set. Evidence, not identity — it is rebuilt from a read and
+// never the thing that names the job. A bare pid is not evidence: the triple
+// defeats PID reuse.
 struct ExecutionEvidence {
     ProcessIdentity manager;                 // boot_id + pid + start_ticks
-    std::vector<ProcessIdentity> members;
-    bool members_authoritative = false;
+    std::vector<ProcessIdentity> pid_identities;
+    bool pid_identities_authoritative = false;
     uint64_t read_order = 0;                 // assigned before the read
 };
 

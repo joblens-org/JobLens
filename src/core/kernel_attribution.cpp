@@ -36,16 +36,16 @@ KernelAttribution::~KernelAttribution()
 }
 
 void KernelAttribution::setCapabilityLookup(
-    std::function<bool(uint64_t internal_id)> capable)
+    std::function<bool(uint64_t job_id)> capable)
 {
     std::lock_guard<std::mutex> lock(cache_mtx_);
     capable_ = std::move(capable);
 }
 
-bool KernelAttribution::capable(uint64_t internal_id) const
+bool KernelAttribution::capable(uint64_t job_id) const
 {
     // guarded by cache_mtx_ (callers hold it)
-    return !capable_ || capable_(internal_id);
+    return !capable_ || capable_(job_id);
 }
 
 bool KernelAttribution::start()
@@ -111,42 +111,42 @@ uint64_t KernelAttribution::resolveCgroupId(const Job& job)
     return id;
 }
 
-void KernelAttribution::activate(uint64_t internal_id, const Job& job)
+void KernelAttribution::activate(uint64_t job_id, const Job& job)
 {
-    if (!tracker_ || internal_id == 0) return;
+    if (!tracker_ || job_id == 0) return;
     {
         std::lock_guard<std::mutex> lock(cache_mtx_);
-        if (!capable(internal_id)) return;
+        if (!capable(job_id)) return;
     }
 
     const uint64_t cgid = resolveCgroupId(job);
     if (cgid != 0) {
-        if (tracker_->set_cgroup_job(cgid, internal_id)) {
+        if (tracker_->set_cgroup_job(cgid, job_id)) {
             spdlog::debug("KernelAttribution: cgroup2job registered job_id={} cgroup_id={}",
-                          internal_id, cgid);
+                          job_id, cgid);
         } else {
             spdlog::warn("KernelAttribution: cgroup2job write failed job_id={} cgroup_id={}",
-                         internal_id, cgid);
+                         job_id, cgid);
         }
     }
     for (pid_t pid : pids_of(job)) {
-        if (!tracker_->set_pid_job(static_cast<uint32_t>(pid), internal_id)) {
+        if (!tracker_->set_pid_job(static_cast<uint32_t>(pid), job_id)) {
             spdlog::warn("KernelAttribution: pid2job seed write failed job_id={} pid={}",
-                         internal_id, pid);
+                         job_id, pid);
         }
     }
     spdlog::debug("KernelAttribution: activated job_id={} seed_pids={} has_cgroup={}",
-                  internal_id, pids_of(job).size(), cgid != 0);
+                  job_id, pids_of(job).size(), cgid != 0);
 }
 
-void KernelAttribution::deactivate(uint64_t internal_id, const Job& job)
+void KernelAttribution::deactivate(uint64_t job_id, const Job& job)
 {
-    if (!tracker_ || internal_id == 0) return;
+    if (!tracker_ || job_id == 0) return;
 
     uint64_t cgid = 0;
     {
         std::lock_guard<std::mutex> lock(cache_mtx_);
-        const auto cached = cgroup_ids_.find(internal_id);
+        const auto cached = cgroup_ids_.find(job_id);
         if (cached != cgroup_ids_.end()) {
             cgid = cached->second;
             cgroup_ids_.erase(cached);
@@ -155,13 +155,13 @@ void KernelAttribution::deactivate(uint64_t internal_id, const Job& job)
     if (cgid != 0) {
         tracker_->del_cgroup_job(cgid);
         spdlog::debug("KernelAttribution: cgroup2job removed job_id={} cgroup_id={}",
-                      internal_id, cgid);
+                      job_id, cgid);
     }
     for (pid_t pid : pids_of(job)) {
         tracker_->del_pid_job(static_cast<uint32_t>(pid));
     }
     spdlog::debug("KernelAttribution: deactivated job_id={} cleared_pids={} had_cgroup={}",
-                  internal_id, pids_of(job).size(), cgid != 0);
+                  job_id, pids_of(job).size(), cgid != 0);
 }
 
 void KernelAttribution::reconcile(const Job& job)

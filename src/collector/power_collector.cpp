@@ -378,7 +378,7 @@ PowerSnapshot PowerCollector::compute_energy(
     {
         auto jobs = JobRegistry::instance().snapshot();
         for (const auto& job : jobs) {
-            job_native_ids[job.JobID] = job.NativeJobID;
+            job_native_ids[job.JobID] = job.JobNativeID;
             for (pid_t p : pids_of(job)) {
                 pid2job[p] = job.JobID;
             }
@@ -388,7 +388,7 @@ PowerSnapshot PowerCollector::compute_energy(
     /* ── Sum weighted_ns per job ── */
     struct JobAccum {
         uint64_t job_id = 0;
-        std::string native_job_id;
+        std::string job_native_id;
         double weighted_ns = 0.0;
         std::vector<PowerPerPid> pids;
     };
@@ -396,7 +396,7 @@ PowerSnapshot PowerCollector::compute_energy(
 
     for (const auto& [pt, acc] : pid_map) {
         uint64_t jid = 0;
-        std::string native_jid;
+        std::string job_native_id;
 
         auto it_j = pid2job.find(acc.pid);       // 先按 tid 查
         if (it_j == pid2job.end()) {
@@ -406,7 +406,7 @@ PowerSnapshot PowerCollector::compute_energy(
             jid = it_j->second;
             auto it_nj = job_native_ids.find(jid);
             if (it_nj != job_native_ids.end()) {
-                native_jid = it_nj->second;
+                job_native_id = it_nj->second;
             }
         }
 
@@ -414,7 +414,7 @@ PowerSnapshot PowerCollector::compute_energy(
 
         auto& ja = job_map[jid];
         ja.job_id        = jid;
-        ja.native_job_id = native_jid;
+        ja.job_native_id = job_native_id;
         ja.weighted_ns  += acc.weighted_ns;
 
         PowerPerPid pp;
@@ -433,7 +433,7 @@ PowerSnapshot PowerCollector::compute_energy(
     for (auto& [jid, ja] : job_map) {
         PowerPerJob pj;
         pj.job_id           = ja.job_id;
-        pj.native_job_id    = ja.native_job_id;
+        pj.job_native_id    = ja.job_native_id;
         pj.weighted_ns_total = ja.weighted_ns;
         pj.energy_j         = (total_weighted_ns > 0.0)
             ? snap.delta_rapl_j * ja.weighted_ns / total_weighted_ns
@@ -892,7 +892,7 @@ nlohmann::json PowerCollector::to_document(const PowerSnapshot& snap) const {
     if (!snap.jobs.empty()) {
         const auto& job = snap.jobs[0];
         ret["job_id"]          = job.job_id;
-        ret["native_job_id"]   = job.native_job_id;
+        ret["JobNativeID"]     = job.job_native_id;
         ret["energy_j"]        = job.energy_j;
         ret["power_watt"]      = job.power_watt;
         ret["ipmi_power_watt"] = job.ipmi_power_watt;
@@ -921,7 +921,7 @@ std::string PowerCollector::to_text(const PowerSnapshot& snap) const {
         const auto& job = snap.jobs[0];
         out << "PowerCollector job"
             << " job_id=" << job.job_id
-            << " native_job_id=" << job.native_job_id
+            << " JobNativeID=" << job.job_native_id
             << " energy_j=" << job.energy_j
             << " power_watt=" << job.power_watt
             << " ipmi_power_watt=" << job.ipmi_power_watt

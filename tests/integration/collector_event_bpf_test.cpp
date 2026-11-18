@@ -636,7 +636,7 @@ Job make_job(uint64_t id, std::vector<std::string> collectors)
 {
     Job job;
     job.JobID = id;
-    job.NativeJobID = std::to_string(id);
+    job.JobNativeID = std::to_string(id);
     job.jobtype = JobType::Job;
     job.subtype = JobSubType::Common;
     set_pids(job, {getpid()});

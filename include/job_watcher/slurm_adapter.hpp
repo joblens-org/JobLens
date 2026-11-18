@@ -35,7 +35,7 @@ struct SlurmJobAttr {
     pid_t    stepd_pid{};          // slurmstepd进程PID
     size_t   job_id{};             // Slurm Job ID
     uint32_t step_id{};            // Slurm Step ID
-    std::string cluster_name{};    // 集群名称
+    std::string clusterName{};     // 集群名称
     std::string cgroup_path{};     // cgroup路径
     std::string user{};            // 作业用户
     std::string job_name{};        // 作业名称
@@ -46,7 +46,7 @@ struct SlurmJobAttr {
 
     static constexpr std::array field_names{
         "auto_update_child", "stepd_pid", "job_id", "step_id",
-        "cluster_name", "cgroup_path", "user", "job_name", "partition",
+        "clusterName", "cgroup_path", "user", "job_name", "partition",
         "acct_group", "unix_group", "unix_gid"};
     static constexpr std::array optional_fields{"acct_group", "unix_group", "unix_gid"};
 
@@ -91,8 +91,8 @@ public:
     // ---- structured namespace: the cluster name only ----------------------
     NamespaceFacts namespaceFacts(const Job& job) const override;
     NamespaceFacts selectorNamespaceFacts(const NativeSelector& selector) const override;
-    bool adoptNamespaceAliases(Job& job, const std::string& cluster_name,
-                               const std::string& cluster_tag) const override;
+    bool adoptNamespaceAliases(Job& job, const std::string& clusterName,
+                               const std::string& clusterTag) const override;
     void renderNamespace(Job& job) const override;
     std::string cgroupPathOf(const Job& job) const override;
 

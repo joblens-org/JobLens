@@ -288,7 +288,7 @@ MaintenanceConfig resolve_maintenance_config(const nlohmann::json& config)
                         scalar_text(item, prefix + "auto_add_collectors[]"));
                 }
             }
-            settings.cluster_name =
+            settings.clusterName =
                 scalar_field(*node, "cluster_name", section, std::string{});
             if (member(*node, "rules_prefix") != nullptr) {
                 spdlog::warn("maintenance configuration: {}.rules_prefix is ignored; the rule "

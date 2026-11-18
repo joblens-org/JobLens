@@ -580,7 +580,7 @@ int main(int argc, char** argv)
     // scheduler and is not part of this number.
 
     DiscoveryTypeSettings settings;
-    settings.cluster_name = args.cluster;
+    settings.clusterName = args.cluster;
     auto adapter = SchedulerAdapterRegistry::instance().build("condor", settings);
     if (!adapter) {
         std::cerr << "condor adapter is not registered\n";
@@ -627,7 +627,7 @@ int main(int argc, char** argv)
             continue;
         }
         if (!args.no_apply)
-            registry.applyAutoSelection(result.internal_id, collectors, "bench");
+            registry.applyOneAutoSelection(result.job_id, collectors, "bench");
         const auto t4 = Clock::now();
 
         samples.observe.push_back(elapsed_us(t0, t1));
@@ -657,11 +657,11 @@ int main(int argc, char** argv)
         const Job& templ = executions.front();
         for (int i = 0; i < args.burst; ++i) {
             Job execution = templ;
-            execution.NativeJobID = "9" + std::to_string(100000 + i) + ".0";
+            execution.JobNativeID = "9" + std::to_string(100000 + i) + ".0";
             const auto t0 = Clock::now();
             const auto result = registry.upsertObservedJob(execution);
             if (result.ok)
-                registry.applyAutoSelection(result.internal_id, collectors, "bench");
+                registry.applyOneAutoSelection(result.job_id, collectors, "bench");
             const auto t1 = Clock::now();
             if (result.ok) samples.burst.push_back(elapsed_us(t0, t1));
             else ++rejected;

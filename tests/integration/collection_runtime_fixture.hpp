@@ -67,50 +67,50 @@ public:
     void wake() override { ++wakes_; }
     int wakes() const { return wakes_; }
 
-    bool beginDrain(uint64_t internal_id) override {
+    bool beginDrain(uint64_t job_id) override {
         // Idempotent per instance, as the seam promises: the heartbeat may
         // re-arm a restored Closing record and a test may then drive the same
         // instance again. A second call is not a second detach.
-        if (draining_.count(internal_id) != 0) return true;
-        draining_.insert(internal_id);
-        const auto it = actual_.find(internal_id);
+        if (draining_.count(job_id) != 0) return true;
+        draining_.insert(job_id);
+        const auto it = actual_.find(job_id);
         if (it != actual_.end()) {
             it->second.draining = true;
             it->second.collectors.clear();
         }
         if (events_) {
             std::optional<JobRecord> record;
-            if (registry_.runtimeRecord(internal_id, record) && record)
+            if (registry_.runtimeRecord(job_id, record) && record)
                 events_(JobEvent::Removed, record->job);
         }
         if (!auto_drain_) return true;
-        registry_.onDrained(internal_id);
+        registry_.onDrained(job_id);
         return true;
     }
 
     // The participant reported that its accepted tail is produced.
-    bool completeDrain(uint64_t internal_id) {
-        draining_.erase(internal_id);
-        const auto it = actual_.find(internal_id);
+    bool completeDrain(uint64_t job_id) {
+        draining_.erase(job_id);
+        const auto it = actual_.find(job_id);
         if (it != actual_.end()) it->second.draining = false;
         // The registry archives the Closing record; a failed cleanup/archive
         // leaves it Closing and the caller can retry.
-        registry_.onDrained(internal_id);
-        return !registry_.jobRecord(internal_id).has_value();
+        registry_.onDrained(job_id);
+        return !registry_.jobRecord(job_id).has_value();
     }
 
-    ActualCollectionState actual(uint64_t internal_id) override {
-        const auto it = actual_.find(internal_id);
+    ActualCollectionState actual(uint64_t job_id) override {
+        const auto it = actual_.find(job_id);
         if (it == actual_.end()) return ActualCollectionState{};
         return it->second;
     }
 
     // Test driver: converge one instance to the desired state it currently has.
-    bool reconcile(uint64_t internal_id) {
+    bool reconcile(uint64_t job_id) {
         std::optional<JobRecord> record;
-        if (!registry_.runtimeRecord(internal_id, record)) return false;
+        if (!registry_.runtimeRecord(job_id, record)) return false;
         if (!record) return false;
-        if (record->state == RecordState::Closing) return beginDrain(internal_id);
+        if (record->state == RecordState::Closing) return beginDrain(job_id);
 
         Job desired = record->job;
         desired.CollectorNames = record->selection.effectiveCollectors();
@@ -126,7 +126,7 @@ public:
 
         ActualCollectionState state;
         state.tracked = true;
-        const auto previous = actual_.find(internal_id);
+        const auto previous = actual_.find(job_id);
         // A facts refresh or an unchanged re-drive keeps the attachment token;
         // a real detach/reattach gets a strictly greater one.
         if (previous != actual_.end() && !previous->second.draining &&
@@ -141,13 +141,13 @@ public:
         // A facts-only record selects nothing, so nothing is attached and no
         // collector hook fires for it.
         if (events_ && !applied.empty()) events_(JobEvent::Added, desired);
-        actual_[internal_id] = state;
+        actual_[job_id] = state;
         return true;
     }
 
-    AppliedView applied(uint64_t internal_id) const {
+    AppliedView applied(uint64_t job_id) const {
         AppliedView view;
-        const auto it = actual_.find(internal_id);
+        const auto it = actual_.find(job_id);
         if (it == actual_.end()) {
             view.error = "no_collection_runtime";
             return view;
@@ -232,8 +232,8 @@ inline TestCollectionRuntime& test_runtime(JobRegistry& registry)
 
 // The record revision is the one durable counter. Tests that used to read a
 // binding revision read this instead; 0 means the record is gone.
-inline uint64_t record_revision(JobRegistry& registry, uint64_t internal_id)
+inline uint64_t revision_of(JobRegistry& registry, uint64_t job_id)
 {
-    const auto record = registry.jobRecord(internal_id);
+    const auto record = registry.jobRecord(job_id);
     return record ? record->revision : 0;
 }

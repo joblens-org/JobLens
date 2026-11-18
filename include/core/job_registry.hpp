@@ -14,7 +14,7 @@
 // job_registry.h — the registry facade
 //
 // JobRegistry owns the JobStore: the single durable JobRecord representation
-// and the only writer of facts, desired selection and Open/Closing state. It
+// and the only writer of facts, desired selection and Active/Closing state. It
 // holds NO runtime mirror. Which collectors are actually attached belongs to
 // the collection runtime, reached through the explicit ICollectionRuntime seam;
 // the runtime converges by reading records through IJobRecordSource and reports
@@ -32,6 +32,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <tuple>
 #include <set>
 
 #include "core/collector_type.h"
@@ -89,10 +90,7 @@ struct CollectionRequest {
 };
 
 struct CollectionTargetOutcome {
-    uint64_t internal_id = 0;
-    // Deprecated wire spelling of internal_id (format_internal_id); the
-    // opaque-handle derivation is retired.
-    std::string instance_id;
+    uint64_t job_id = 0;
     // The accepted desired state after the command.
     CollectionSelection selection;
     // The record revision the command committed. Acceptance only: the runtime
@@ -120,7 +118,7 @@ struct CollectionOutcome {
 
 // Automatic policy result for one instance.
 struct AutoSelection {
-    uint64_t internal_id = 0;
+    uint64_t job_id = 0;
     std::vector<std::string> collectors;
     std::string policy_revision;
 };
@@ -174,24 +172,30 @@ public:
     JobRegistry(const JobRegistry&)            = delete;
     JobRegistry& operator=(const JobRegistry&) = delete;
 
-    // Job 增删
+    // Job registration and manual selection updates.
     // Manual upsert: an active typed match constrained by request/selector
     // namespaces updates only the manual collector selection (union); metadata
     // and execution evidence remain unchanged. Unknown namespaces are never
     // adopted on UPDATE. No match takes CREATE, which rejects empty collectors.
     // This path is independent of the automatic admission gate.
-    nlohmann::json upsertJob(const Job& job, const nlohmann::json& request,
-                             std::optional<NativeSelector> identity_selector = std::nullopt,
-                             bool create_only = false);
+    nlohmann::json addOrUpdateManualJob(
+        const Job& job, const nlohmann::json& request,
+        std::optional<NativeSelector> identity_selector = std::nullopt,
+        bool create_only = false);
     // Thin alias for the CREATE branch — the historical manual registration
     // entry.
     bool addJob(const Job& job);
-    void delJob(uint64_t jobID);
-    // Job retirement: archive atomically (active -> history,
-    // identity index and binding removed) and report durable success.
+    // Thin alias for retireInstance: it begins a retirement, it does not
+    // promise deletion.
+    void retireJob(uint64_t jobID);
+    // Begin retirement: durably mark the record Closing, capture the
+    // runtime-applied collector snapshot and report whether that durable
+    // Closing was accepted. The drain, checked kernel cleanup and the archive
+    // that follow belong to onDrained() / cleanupThenArchive(); a record whose
+    // Closing write fails stays Active and retryable.
     bool retireInstance(uint64_t jobID);
-    // 通过 sub_attr 匹配删除作业，返回删除的作业数量
-    size_t delJob(const SubAttrMatcher& matcher);
+    // 通过 sub_attr 匹配发起退休，返回被接受的退休数量（不是删除数量）
+    size_t retireMatchingJobs(const SubAttrMatcher& matcher);
     size_t closingJobCount() const;
     bool cleanupClosingJobs();
     // Read-only snapshot: no refresh, no PID pruning, no retirement.
@@ -263,14 +267,15 @@ public:
     // IDrainCompletionSink: the runtime proved the instance released every
     // collector. Runs checked kernel cleanup then the archive; a failure keeps
     // the Closing record retryable.
-    void onDrained(uint64_t internal_id) override;
+    void onDrained(uint64_t job_id) override;
     // IJobRecordSource: the runtime's read surface for desired state.
     bool runtimeRecords(std::vector<JobRecord>& out) const override;
-    bool runtimeRecord(uint64_t internal_id,
+    bool runtimeRecord(uint64_t job_id,
                        std::optional<JobRecord>& out) const override;
-    // Liveness evidence from the last scan. Not a lifecycle state: an
-    // unverified instance stays Open but must not be admitted to the kernel.
-    void setExecutionVerified(uint64_t jobID, bool verified);
+    // Liveness evidence from the last scan. Not a lifecycle state: an instance
+    // that is not presumed live stays Active but must not be admitted to the
+    // kernel.
+    void setExecutionPresumedLive(uint64_t jobID, bool presumed_live);
 
     // --- Lifecycle -----------------------------------------------------------
     // Stop discovery admission and polling. Must run before the collector
@@ -294,8 +299,8 @@ public:
     // Automatic selection entry point: record the decision as the instance's
     // automatic intent (manual overrides are never touched). Returns false
     // when the transaction was rejected.
-    bool applyAutoSelection(uint64_t internal_id, const std::vector<std::string>& collectors,
-                            const std::string& policy_revision);
+    bool applyOneAutoSelection(uint64_t job_id, const std::vector<std::string>& collectors,
+                               const std::string& policy_revision);
 
     // Kernel attribution stats for the RPC surface.
     bool attributionRunning() const;
@@ -323,8 +328,8 @@ public:
     const ISchedulerAdapter* adapterNamed(const std::string& name) const;
     // Folds request-level aliases into the typed facts (facts win); false =
     // the aliases contradict known facts.
-    bool adoptNamespaceAliases(Job& job, const std::string& cluster_name,
-                               const std::string& cluster_tag) const;
+    bool adoptNamespaceAliases(Job& job, const std::string& clusterName,
+                               const std::string& clusterTag) const;
     // Projects record-visible fields using the adapter's policy, independently
     // of namespace-alias normalization.
     void projectRecordFacts(Job& job) const;
@@ -370,7 +375,7 @@ private:
     // so it must never run under a lock that serializes record changes.
     // Returns nullopt when no automatic decision was needed, true when the
     // decision (including an explicit reject) is durable, false otherwise.
-    std::optional<bool> apply_auto_policy(const Job& job, const std::string& adapter);
+    std::optional<bool> applyAutoPolicyForJob(const Job& job, const std::string& adapter);
     // Shared implementation of set/reset_auto. Validation happens before the
     // store call; the durable read-transform-write and its revision guard are
     // one store transaction.
@@ -474,7 +479,7 @@ private:
     // Execution refresh against an existing creation metadata snapshot.
     // Pure decision: no durable write and no publication.
     UpsertResult mergeDiscoveredJob(const JobRecord& stored, const Job& job,
-                                  const SchedulerKey& key, uint64_t internal_id,
+                                  const SchedulerKey& key, uint64_t job_id,
                                   int64_t observed_at, JobRecord& updated_out,
                                   MergeKind kind = MergeKind::Observation);
     // Interpretation-only adapter access: namespace semantics must not
@@ -547,8 +552,8 @@ private:
     std::condition_variable hb_cv_;
     std::map<uint64_t, AbsenceEntry> absences_;
     std::set<uint64_t> suspect_ids_;
-    std::map<std::string, ProcessIdentity> ended_executions_;
-    std::vector<std::pair<uint64_t, ProcessIdentity>> closing_executions_;
+    std::map<std::string, ProcessIdentity> ended_managers_;
+    std::vector<std::pair<uint64_t, ProcessIdentity>> closing_managers_;
     bool hb_admitted_ = false;     // false after stopDiscovery()
     bool hb_running_ = false;      // worker thread alive
     bool hb_stopping_ = false;
@@ -570,13 +575,13 @@ private:
     std::uint64_t hb_obsolete_hints_ = 0;
     std::uint64_t hb_incomplete_observations_ = 0;
     std::uint64_t hb_upsert_conflicts_ = 0;
-    std::uint64_t hb_dropped_observations_ = 0;
-    std::uint64_t hb_rejected_observations_ = 0;
+    std::uint64_t hb_not_admitted_capture_all_off_ = 0;
+    std::uint64_t hb_not_admitted_by_rule_ = 0;
     std::uint64_t hb_admission_errors_ = 0;
     std::uint64_t hb_decision_repairs_ = 0;
     std::uint64_t hb_decision_failures_ = 0;
     // Eager refreshes this stack could not apply (store write failure or a
-    // refused generation/identity merge). Observability only: a record that
+    // refused manager/identity merge). Observability only: a record that
     // failed to refresh is retried next pass.
     std::uint64_t hb_refresh_failures_ = 0;
     std::uint64_t hb_retirements_ = 0;
@@ -622,10 +627,67 @@ private:
     // Heartbeat internals.
     void startHeartbeat();
     void heartbeatLoop();
+    // The maintenance pass: the phases below, named in order. Everything the
+    // phases exchange travels in the PassRun context, so the pass reads as a
+    // pipeline instead of one procedure that owns both flow and work.
     bool runPass(bool do_scan, bool wait, bool refresh_facts = true);
+
+    // Result of the one eager refresh of a record: the evidence the retirement
+    // rule consumes, plus whether any pid identity survived the merge (a
+    // record with no pid identity evidence at all is "retry later", not "all dead").
+    struct RefreshedEvidence {
+        RefreshResult evidence;
+        bool has_pid_identity_evidence = false;
+    };
+    // Stable map key for one manager identity: the triple is what makes a pid
+    // a process, so a recycled number cannot alias an old manager. A tuple
+    // keeps the per-manager lookup allocation-free.
+    using ManagerKey = std::tuple<pid_t, std::uint64_t, std::string>;
+    using ManagerIndex = std::map<ManagerKey, std::uint64_t>;
+    static ManagerKey managerKey(const ProcessIdentity& identity) {
+        return {identity.pid, identity.start_ticks, identity.boot_id};
+    }
+    // One pass' inputs and ledger: created here, updated by the phases, dead
+    // when the pass returns.
+    struct PassRun {
+        bool enumerate = false;         // this pass enumerated discovery sources
+        bool refresh = false;           // this pass re-read the facts of records
+        std::uint64_t error_epoch = 0;  // noteHeartbeatError() epoch at entry
+        std::uint64_t scan_seq = 0;     // observation sequence at entry
+        std::int64_t started_ms = 0;
+        std::set<uint64_t> observed;
+        std::set<uint64_t> created;
+        std::map<std::string, bool> source_complete;
+        std::map<uint64_t, RefreshedEvidence> refreshed;
+        bool complete = true;
+        std::string error;
+    };
+    // Phase 0: admits the pass (admitted, not stopping) and snapshots the
+    // counters the later phases compare against. The caller holds pass_mtx_.
+    std::optional<PassRun> beginPass(bool do_scan, bool refresh_facts);
+    // Phase 1: enumerates every source's managers, registers the untracked
+    // ones, and records which sources covered their inputs.
+    void discoverManagers(PassRun& pass);
+    // Phase 1b: one untracked manager — observe it, run the admission gate and
+    // the upsert, and remember the record so a duplicate entry costs no second
+    // read.
+    void observeManager(const std::string& source_name, IDiscoverySource& source,
+                        const ProcessIdentity& manager, PassRun& pass,
+                        ManagerIndex& manager_index);
+    // Phase 1c: folds one source's coverage into the pass' completeness and its
+    // per-source absence eligibility.
+    void noteSourceCoverage(PassRun& pass, const std::string& name,
+                            const ManagerSet& managers);
+    // Phase 2: re-reads every active record through the same evidence reader
+    // and applies it through the same merge.
+    void refreshActiveRecords(PassRun& pass);
+    // Phase 3: the pass' single fsynced batch.
+    void checkpointPass();
+    // Phase 4: counters, scan timestamps and the degraded/error verdict.
+    void publishPassStatus(const PassRun& pass);
     // Registers the observation of a manager the pass did not track. Runs the
     // creation admission gate (only for unknown identities), the
-    // obsolete-generation screen and the store upsert; `observed` receives the
+    // obsolete-manager screen and the store upsert; `observed` receives the
     // record id and `created` receives it only for the CREATE disposition (a
     // fresh record already carries the observe() image and is skipped by this
     // pass' update). The result is the caller's acceptance signal: only an
@@ -635,16 +697,13 @@ private:
                                     std::set<uint64_t>& created);
     // Liveness evidence for a record with no scheduler adapter (Common /
     // open-world manual rows): the manager identity when it has one and the
-    // recorded member identities, both through the injected probes. There is
+    // recorded pid identities, both through the injected probes. There is
     // no cgroup scope to read without an adapter.
     RefreshResult probeRecordEvidence(const Job& job) const;
-    // Result of the one eager refresh of a record: the evidence the retirement
-    // rule consumes, plus whether any member identity survived the merge (a
-    // record with no member evidence at all is "retry later", not "all dead").
-    struct RefreshedEvidence {
-        RefreshResult evidence;
-        bool has_member_evidence = false;
-    };
+    // Member half of the liveness evidence: one probe per recorded pid identity,
+    // stopping at the first live one. Shared by the legacy path above and by
+    // probeSurvivingPidIdentities below.
+    void probePidIdentities(const Job& job, RefreshResult& evidence) const;
     // Applies one refreshed image to the current record under mutation_mtx_:
     // the execution-evidence merge, the single durable batch and the runtime
     // wake. Metadata and identity are never rewritten (the record is a creation
@@ -653,16 +712,16 @@ private:
     std::optional<RefreshedEvidence> applyRefreshedRecord(const JobRecord& snapshot,
                                                           Job refreshed,
                                                           RefreshResult evidence);
-    // The merge keeps the stored member set when a refresh produced an empty,
+    // The merge keeps the stored pid identity set when a refresh produced an empty,
     // non-authoritative read (a failed legacy/host read, not a confirmed empty
     // scope). The retirement evidence must describe those same survivors:
     // probing only the refreshed image would read "all dead" and retire an
     // execution whose child is still alive.
-    void probeSurvivingMembers(const Job& stored, const Job& refreshed,
-                               RefreshResult& evidence) const;
+    void probeSurvivingPidIdentities(const Job& stored, const Job& refreshed,
+                                     RefreshResult& evidence) const;
     // Registration admission gate (maintenance.capture_all=false). Returns
     // nullopt to drop the observation (counted by the caller-visible
-    // hb_dropped_/hb_rejected_ counters); otherwise the register decision
+    // hb_not_admitted_* counters); otherwise the register decision
     // and, when the type's policy was pre-evaluated, the initial collector
     // list. Evaluated outside every registry lock.
     std::optional<InitialDecision> admissionDecision(const Job& job);
@@ -671,15 +730,14 @@ private:
     // Re-evaluates the automatic decision for live instances that never got a
     // durable one. Bounded per pass so the heartbeat keeps its cadence.
     void repairMissingInitialDecisions();
-    // Absence accounting plus the retirement verdict. `scan_seq` is the
-    // observation sequence captured before this pass began: a registration
-    // accepted on another thread during the pass carries a greater sequence
-    // and therefore counts as observed. `refreshed` carries this pass' evidence
-    // per record; the duplicate probes are gone.
-    void evaluateRetirements(const std::set<uint64_t>& observed_ids,
-                             const std::map<std::string, bool>& source_complete,
-                             const std::map<uint64_t, RefreshedEvidence>& refreshed,
-                             std::uint64_t scan_seq);
+    // Absence accounting plus the retirement verdict. The pass context carries
+    // both: `scan_seq` is the observation sequence captured before the pass
+    // began (a registration accepted on another thread during the pass carries
+    // a greater sequence and therefore counts as observed), and `refreshed`
+    // carries this pass' evidence per record, so no record is probed twice. A
+    // targeted pass (`enumerate` false) has no authoritative coverage and never
+    // counts an absence.
+    void evaluateRetirements(const PassRun& pass);
     bool retireIfConfirmed(const JobRecord& record, const std::string& reason);
     void rememberEnded(const JobRecord& record);
     bool isObsolete(const SchedulerKey& key, const ProcessIdentity& gen);
@@ -741,10 +799,10 @@ private:
     mutable std::mutex retire_applied_mtx_;
     std::unordered_map<uint64_t, std::vector<std::string>> retire_applied_;
     // KernelAttribution::Host — the registry-side projection updates.
-    bool attributionJobExists(uint64_t internal_id) override;
-    void attributionJobAddPid(uint64_t internal_id, pid_t pid) override;
-    void attributionJobRemovePid(uint64_t internal_id, pid_t pid) override;
+    bool attributionJobExists(uint64_t job_id) override;
+    void attributionJobAddPid(uint64_t job_id, pid_t pid) override;
+    void attributionJobRemovePid(uint64_t job_id, pid_t pid) override;
     void attributionEnumerateJobs(const std::function<void(const Job&)>& fn) override;
     void attributionExitHint(pid_t pid) override;
-    std::string attributionCgroupPath(uint64_t internal_id) override;
+    std::string attributionCgroupPath(uint64_t job_id) override;
 };

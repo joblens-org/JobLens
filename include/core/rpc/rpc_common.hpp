@@ -60,7 +60,7 @@ void sort_records(std::vector<JobRecord>& records);
 std::string optional_string(const nlohmann::json& node, const char* key);
 TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelector& selector,
                                        const std::string& scope, bool ensure_registered);
-TargetResolution resolve_instance_handle_by_id(JobRegistry& registry, uint64_t internal_id);
+TargetResolution resolve_instance_handle_by_id(JobRegistry& registry, uint64_t job_id);
 
 nlohmann::json collection_target_json(JobRegistry& registry, const JobRecord& record,
                                       const CollectionSelection& selection,

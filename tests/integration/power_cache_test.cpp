@@ -260,7 +260,7 @@ int main(int argc, char** argv) {
         for (const auto [id, pid] : {std::pair<uint64_t, pid_t>{7, getpid()}, {9, child.pid}}) {
             Job job;
             job.JobID = id;
-            job.NativeJobID = "fixture-" + std::to_string(id);
+            job.JobNativeID = "fixture-" + std::to_string(id);
             set_pids(job, {pid});
             job.jobtype = JobType::Sys;
             job.subtype = JobSubType::Common;
@@ -280,7 +280,7 @@ int main(int argc, char** argv) {
         batch_fallback = false;
         run_empty(object.get(), jobs[0], jobs[1], false);
         run_empty(object.get(), jobs[0], jobs[1], true);
-        for (const auto& job : jobs) JobRegistry::instance().delJob(job.JobID);
+        for (const auto& job : jobs) JobRegistry::instance().retireJob(job.JobID);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

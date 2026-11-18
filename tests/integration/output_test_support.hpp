@@ -40,7 +40,7 @@ inline std::shared_ptr<SampleMetadata> make_sample(const std::string& collector,
     sample->collector_name = collector;
     sample->collector_type = type;
     sample->job.JobID = job_id;
-    sample->job.NativeJobID = std::to_string(job_id);
+    sample->job.JobNativeID = std::to_string(job_id);
     sample->sampled_at = std::chrono::system_clock::time_point(std::chrono::milliseconds(1700000000000LL));
     return sample;
 }

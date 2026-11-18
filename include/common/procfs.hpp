@@ -386,7 +386,7 @@ inline ProcessIdentity read_process_identity(const std::string& proc_root,
 // (read_proc_children), never the process table.
 struct JobMembershipRead {
     std::string cgroup_path;     // job-scoped cgroup; empty when none applies
-    std::vector<pid_t> members;  // member pids, manager excluded, ascending
+    std::vector<pid_t> pids;  // pids in the job scope, manager excluded, ascending
     // A readable job-scoped cgroup answered: the list is the whole execution
     // scope (an empty list included). false = a partial children-only read.
     bool authoritative = false;
@@ -422,9 +422,9 @@ inline JobMembershipRead read_job_membership(const std::string& proc_root,
                 read.cgroup_path = cgroup_path;
                 read.authoritative = true;
                 for (const pid_t pid : cgroup_members) {
-                    if (pid != manager_pid) read.members.push_back(pid);
+                    if (pid != manager_pid) read.pids.push_back(pid);
                 }
-                std::sort(read.members.begin(), read.members.end());
+                std::sort(read.pids.begin(), read.pids.end());
                 return read;
             }
             cgroup_path.clear();  // the daemon tree is not this job's scope
@@ -432,8 +432,8 @@ inline JobMembershipRead read_job_membership(const std::string& proc_root,
     }
 
     read.cgroup_path = cgroup_path;
-    read.members = read_proc_children(proc_root, manager_pid);
-    read.members.erase(std::remove(read.members.begin(), read.members.end(), manager_pid),
-                       read.members.end());
+    read.pids = read_proc_children(proc_root, manager_pid);
+    read.pids.erase(std::remove(read.pids.begin(), read.pids.end(), manager_pid),
+                       read.pids.end());
     return read;
 }

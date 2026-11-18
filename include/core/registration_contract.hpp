@@ -33,15 +33,15 @@ enum class UpsertDisposition {
 struct UpsertResult {
     bool ok = false;
     UpsertDisposition disposition = UpsertDisposition::Rejected;
-    uint64_t internal_id = 0;
-    // Deprecated wire spelling of internal_id (format_internal_id); the
-    // opaque-handle derivation is retired.
-    std::string instance_id;
+    uint64_t job_id = 0;
     // The accepted record revision this result committed (0 = nothing durable
     // was written). It orders the record; it is not runtime proof.
     uint64_t revision = 0;
-    // True when this upsert completed the execution generation of a record
-    // that was stored unverified: its first-complete-registration trigger.
+    // True when this upsert completed the execution manager identity — the
+    // boot_id + pid + start_ticks triple — of a record that was stored with an
+    // incomplete execution: its first-complete-registration trigger. It says
+    // nothing about JobRecord::presumed_live, which is a liveness verdict and
+    // not part of identity.
     bool execution_became_complete = false;
     // Typed reason. `error` is the stable wire string derived from
     // it; callers must branch on the code, never parse the string.

@@ -31,7 +31,7 @@ void registerJobsRpc(JobRegistry& registry) {
                                          "request body must be a JSON object");
                 Job job;
                 parseJobRequest(req, job, registry);
-                j = registry.upsertJob(job, req, legacy_add_selector(job, registry));
+                j = registry.addOrUpdateManualJob(job, req, legacy_add_selector(job, registry));
             } catch (const NamespaceConflictError& e) {
                 j["status"] = "error";
                 j["code"] = "namespace_conflict";
@@ -55,8 +55,8 @@ void registerJobsRpc(JobRegistry& registry) {
                                          "request body must be a JSON object");
                 Job job;
                 parseJobRequest(req, job, registry);
-                j = registry.upsertJob(job, req, legacy_add_selector(job, registry),
-                                       /*create_only=*/true);
+                j = registry.addOrUpdateManualJob(job, req, legacy_add_selector(job, registry),
+                                                  /*create_only=*/true);
             } catch (const NamespaceConflictError& e) {
                 j["status"] = "error";
                 j["code"] = "namespace_conflict";
@@ -95,28 +95,20 @@ void registerJobsRpc(JobRegistry& registry) {
             if (!req.is_object())
                 return error_payload("invalid_request",
                                      "request body must be a JSON object");
-            std::string internal_job_id;
-            try {
-                if (req.contains("internal_job_id") && !req["internal_job_id"].is_null())
-                    internal_job_id = optional_string(req, "internal_job_id");
-                else
-                    internal_job_id = optional_string(req, "instance_id");
-            } catch (const std::exception& error) {
-                return error_payload("invalid_request", error.what());
-            }
-            if (internal_job_id.empty())
-                return error_payload("invalid_request",
-                                     "internal_job_id is required");
-            const auto internal_id = parse_internal_id(internal_job_id);
-            if (!internal_id || is_reserved_internal_id(*internal_id))
-                return error_payload(
-                    "not_found",
-                    "no current job record with internal_job_id '" + internal_job_id + "'");
-            const auto record = registry.jobRecord(*internal_id);
+            if (!req.contains("JobID") || req["JobID"].is_null())
+                return error_payload("invalid_request", "JobID is required");
+            const auto& job_id_node = req["JobID"];
+            const std::string job_id_text = job_id_node.is_string()
+                                                ? job_id_node.get<std::string>()
+                                                : job_id_node.dump();
+            const auto parsed = parse_job_id(job_id_node);
+            const auto record = parsed.status == LegacyIdStatus::Valid
+                                    ? registry.jobRecord(parsed.value)
+                                    : std::nullopt;
             if (!record)
                 return error_payload(
                     "not_found",
-                    "no current job record with internal_job_id '" + internal_job_id + "'");
+                    "no current job record with JobID '" + job_id_text + "'");
             auto out = job_record_json(registry, *record);
             out["status"] = "ok";
             return out;
@@ -128,7 +120,7 @@ void registerJobsRpc(JobRegistry& registry) {
             (void)req;
             uint64_t count = 0;
             for (const auto& record : registry.jobRecords()) {
-                if (is_reserved_internal_id(record.job.JobID)) continue;
+                if (is_reserved_job_id(record.job.JobID)) continue;
                 if (record.state == RecordState::Active) ++count;
             }
             return nlohmann::json{{"status", "ok"}, {"job_count", count}};
@@ -170,11 +162,11 @@ void registerJobsRpc(JobRegistry& registry) {
                                     fmt::join(SchedulerAdapterRegistry::instance().names(),
                                               ", ")));
             }
-            std::string native_filter;
-            if (params.contains("native_job_id") && !params["native_job_id"].is_null()) {
-                if (!params["native_job_id"].is_string())
-                    return error_payload("invalid_request", "native_job_id must be a string");
-                native_filter = params["native_job_id"].get<std::string>();
+            std::string job_native_filter;
+            if (params.contains("JobNativeID") && !params["JobNativeID"].is_null()) {
+                if (!params["JobNativeID"].is_string())
+                    return error_payload("invalid_request", "JobNativeID must be a string");
+                job_native_filter = params["JobNativeID"].get<std::string>();
             }
             std::string state_filter;
             if (params.contains("state") && !params["state"].is_null()) {
@@ -195,11 +187,12 @@ void registerJobsRpc(JobRegistry& registry) {
 
             std::vector<JobRecord> matching;
             for (auto& record : registry.jobRecords()) {
-                if (is_reserved_internal_id(record.job.JobID)) continue;
+                if (is_reserved_job_id(record.job.JobID)) continue;
                 if (!scheduler_filter.empty() &&
                     record.job.subtype_name != scheduler_filter)
                     continue;
-                if (!native_filter.empty() && record.job.NativeJobID != native_filter)
+                if (!job_native_filter.empty() &&
+                    record.job.JobNativeID != job_native_filter)
                     continue;
                 if (!state_filter.empty() &&
                     (!record_state_from_string(state_filter) ||
@@ -211,7 +204,7 @@ void registerJobsRpc(JobRegistry& registry) {
 
             const uint64_t snapshot_revision = jobs_snapshot_revision(matching);
             const std::string filter_fingerprint =
-                scheduler_filter + "|" + native_filter + "|" + state_filter;
+                scheduler_filter + "|" + job_native_filter + "|" + state_filter;
 
             uint64_t after = 0;
             if (!cursor.empty()) {

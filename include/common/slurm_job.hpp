@@ -99,8 +99,8 @@ inline std::string step_id_name(std::uint32_t numeric_step){
     return std::to_string(numeric_step);
 }
 
-inline std::string get_cluster_name(pid_t pid = 0){
-    return Utils::get_env_field(pid, "SLURM_CLUSTER_NAME");
+inline std::string clusterName(pid_t pid = 0){
+    return get_env_field(pid, "SLURM_CLUSTER_NAME");
 }
 
 /* ===================== 组归属（只读上游标准变量） =====================

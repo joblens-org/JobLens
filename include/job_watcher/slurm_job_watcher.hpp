@@ -85,7 +85,7 @@ public:
     // on an incomplete one, are this adapter's own rules — deliberately NOT
     // an IDiscoverySource virtual (it is not an external dependency). The
     // registry keeps deciding whether a Job may be *registered* (identity
-    // resolvable + generation complete); the watcher decides when *its*
+    // resolvable + manager complete); the watcher decides when *its*
     // discovery is finished. Each scheduler holds its own copy so the rules
     // may diverge later.
     static std::optional<Job> finalize_discovery(Job job,
@@ -120,8 +120,8 @@ private:
     std::atomic<bool> yield_requested_{false};
 
     // Builds the discovered Job for one slurmstepd: manager identity from the
-    // stepd, member processes from its children and the step cgroup, logical
-    // identity from SLURM_* of the members.
+    // stepd, job pids from its children and the step cgroup, logical
+    // identity from SLURM_* of the job processes.
     std::optional<Job> observe_stepd(const DiscoveryEnvironment& env, const std::string& boot_id,
                       pid_t stepd_pid,
                       const std::map<pid_t, std::vector<pid_t>>& children,
@@ -201,7 +201,7 @@ inline std::optional<Job> SlurmJobWatcher::finalize_discovery(
     }
     if (!execution_complete(job.execution)) {
         reasons.push_back(
-            "execution generation unresolved: manager pid, manager start ticks or boot id missing");
+            "execution manager unresolved: manager pid, manager start ticks or boot id missing");
     }
     if (!reasons.empty()) {
         // An incomplete discovery is not published. The registry never sees a
@@ -599,33 +599,33 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
     execution.manager.pid = stepd_pid;
     execution.manager.start_ticks = manager.start_ticks;
 
-    // Typed attrs this observation fills from the members' environment; the
+    // Typed attrs this observation fills from the job pids' environment; the
     // identity derivations join once the env pass below agrees.
     SlurmJobAttr attributes{};
     attributes.auto_update_child = false;
     attributes.stepd_pid = stepd_pid;
 
-    std::vector<pid_t> member_pids;
+    std::vector<pid_t> pids;
     const auto found = children.find(stepd_pid);
-    if (found != children.end()) member_pids = found->second;
+    if (found != children.end()) pids = found->second;
 
-    // Logical identity comes from the members' environment — the same keys
+    // Logical identity comes from the job pids' environment — the same keys
     // SlurmJob::parse_job_id()/parse_step_id() decode. One environ read per
-    // member covers every key (the hot path used to re-read the whole file per
+    // pid covers every key (the hot path used to re-read the whole file per
     // variable).
     static const std::vector<std::string> kEnvKeys = {
         "SLURM_JOB_ID", "SLURM_STEP_ID", "SLURM_JOB_USER",
         "SLURM_JOB_NAME", "SLURM_JOB_PARTITION", "SLURM_CLUSTER_NAME",
     };
-    std::optional<std::uint64_t> job_id;
+    std::optional<std::uint64_t> job_number;
     std::optional<std::uint32_t> step_id;
-    for (pid_t member_pid : member_pids) {
+    for (pid_t pid : pids) {
         std::map<std::string, std::string> env_values;
         std::string env_error;
-        if (!read_proc_env_values(env.proc_root, member_pid, kEnvKeys,
+        if (!read_proc_env_values(env.proc_root, pid, kEnvKeys,
                                   env_values, env_error)) {
             notes.push_back(fmt::format(
-                "child pid {} environment unreadable: {}", member_pid, env_error));
+                "child pid {} environment unreadable: {}", pid, env_error));
             continue;
         }
         const auto job_it = env_values.find("SLURM_JOB_ID");
@@ -634,18 +634,18 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
         if (job_env.empty()) continue;  // not a job process
 
         std::string parse_error;
-        const auto candidate_job = SlurmJob::parse_job_id(job_env, parse_error);
-        if (!candidate_job) {
-            reasons.push_back(fmt::format("child pid {}: {}", member_pid, parse_error));
+        const auto candidate_job_number = SlurmJob::parse_job_id(job_env, parse_error);
+        if (!candidate_job_number) {
+            reasons.push_back(fmt::format("child pid {}: {}", pid, parse_error));
             continue;
         }
-        if (job_id && *job_id != *candidate_job) {
+        if (job_number && *job_number != *candidate_job_number) {
             notes.push_back(fmt::format(
                 "slurmstepd {} children disagree on SLURM_JOB_ID; using {}",
-                stepd_pid, *job_id));
+                stepd_pid, *job_number));
             continue;
         }
-        job_id = candidate_job;
+        job_number = candidate_job_number;
 
         const auto step_it = env_values.find("SLURM_STEP_ID");
         const std::string step_env = step_it != env_values.end() ? step_it->second
@@ -653,7 +653,7 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
         std::string step_error;
         const auto candidate_step = SlurmJob::parse_step_id(step_env, step_error);
         if (!candidate_step) {
-            reasons.push_back(fmt::format("child pid {}: {}", member_pid, step_error));
+            reasons.push_back(fmt::format("child pid {}: {}", pid, step_error));
             continue;
         }
         if (step_id && *step_id != *candidate_step) {
@@ -676,74 +676,74 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
             const auto it = env_values.find("SLURM_JOB_PARTITION");
             if (it != env_values.end() && !it->second.empty()) attributes.partition = it->second;
         }
-        if (job.cluster_name.empty()) {
+        if (job.clusterName.empty()) {
             const auto it = env_values.find("SLURM_CLUSTER_NAME");
-            if (it != env_values.end()) job.cluster_name = it->second;
+            if (it != env_values.end()) job.clusterName = it->second;
         }
     }
 
-    if (!job_id) {
+    if (!job_number) {
         reasons.push_back(fmt::format(
-            "slurmstepd {} has no attributable job members (SLURM_JOB_ID missing)", stepd_pid));
+            "slurmstepd {} has no attributable job pids (SLURM_JOB_ID missing)", stepd_pid));
     } else {
-        job.NativeJobID = std::to_string(*job_id);
-        attributes.job_id = *job_id;
+        job.JobNativeID = std::to_string(*job_number);
+        attributes.job_id = *job_number;
     }
     if (!step_id) {
-        if (job_id) reasons.push_back(fmt::format(
+        if (job_number) reasons.push_back(fmt::format(
             "slurmstepd {} step identity unresolved (SLURM_STEP_ID missing or unparsable)",
             stepd_pid));
     } else {
         attributes.step_id = *step_id;
     }
-    if (job.cluster_name.empty())
-        job.cluster_name = env.cluster_name;
-    if (job.cluster_name.empty())
+    if (job.clusterName.empty())
+        job.clusterName = env.clusterName;
+    if (job.clusterName.empty())
         reasons.push_back("slurm cluster namespace unresolved (SLURM_CLUSTER_NAME unavailable)");
-    attributes.cluster_name = job.cluster_name;
+    attributes.clusterName = job.clusterName;
 
-    // Member processes: stepd children plus step-cgroup members, so a child
-    // created before registration is still attributed. Only a successfully read
-    // step cgroup makes the set authoritative; a failed read is never reported
-    // as a confirmed member set.
+    // Pids: stepd children plus step-cgroup pids, so a child created before
+    // registration is still attributed. Only a successfully read step cgroup
+    // makes the identity set authoritative; a failed read is never reported as
+    // a confirmed pid identity set.
     std::string cgroup_path =
         read_proc_cgroup_path(env.proc_root, stepd_pid, env.cgroup_root);
-    if (cgroup_path.empty() && !member_pids.empty()) {
+    if (cgroup_path.empty() && !pids.empty()) {
         cgroup_path =
-            read_proc_cgroup_path(env.proc_root, member_pids.front(), env.cgroup_root);
+            read_proc_cgroup_path(env.proc_root, pids.front(), env.cgroup_root);
         if (!cgroup_path.empty())
             notes.push_back(fmt::format(
-                "stepd cgroup unknown; used member pid {} cgroup", member_pids.front()));
+                "stepd cgroup unknown; used job pid {} cgroup", pids.front()));
     }
     attributes.cgroup_path = cgroup_path;
 
-    std::vector<pid_t> effective_members = member_pids;
-    std::vector<pid_t> cgroup_members;
+    std::vector<pid_t> effective_pids = pids;
+    std::vector<pid_t> cgroup_pids;
     std::string cgroup_error;
-    // Members start as the stepd's children, which may be incomplete (a child
+    // Pids start as the stepd's children, which may be incomplete (a child
     // created after this read, or an unreadable stepd). A readable step cgroup
     // answers for the whole scope — an empty list included — and is the only
     // thing that makes the set authoritative; an unreadable cgroup leaves it
-    // partial, and an incomplete member identity below clears it again.
+    // partial, and an incomplete pid identity below clears it again.
     if (!cgroup_path.empty()) {
-        if (read_cgroup_members(cgroup_path, cgroup_members, cgroup_error)) {
-            execution.members_authoritative = true;
-            for (pid_t cgroup_pid : cgroup_members) {
-                if (std::find(effective_members.begin(), effective_members.end(),
-                              cgroup_pid) == effective_members.end()) {
-                    effective_members.push_back(cgroup_pid);
+        if (read_cgroup_members(cgroup_path, cgroup_pids, cgroup_error)) {
+            execution.pid_identities_authoritative = true;
+            for (pid_t cgroup_pid : cgroup_pids) {
+                if (std::find(effective_pids.begin(), effective_pids.end(),
+                              cgroup_pid) == effective_pids.end()) {
+                    effective_pids.push_back(cgroup_pid);
                 }
             }
         } else {
-            execution.members_authoritative = false;
+            execution.pid_identities_authoritative = false;
             notes.push_back("step cgroup membership unreadable: " + cgroup_error);
         }
     }
-    for (pid_t member_pid : effective_members) {
-        if (member_pid == stepd_pid) continue;
-        const auto member = read_process_identity(env.proc_root, boot_id, member_pid);
-        if (!member.complete()) execution.members_authoritative = false;
-        execution.members.push_back(member);
+    for (pid_t pid : effective_pids) {
+        if (pid == stepd_pid) continue;
+        const auto pid_identity = read_process_identity(env.proc_root, boot_id, pid);
+        if (!pid_identity.complete()) execution.pid_identities_authoritative = false;
+        execution.pid_identities.push_back(pid_identity);
     }
 
     job.sub_attr = attributes;

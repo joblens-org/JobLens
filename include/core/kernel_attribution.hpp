@@ -41,9 +41,9 @@ public:
         virtual ~Host() = default;
         // True while the instance is live in the registry (a fork/exit event
         // for an unknown id is ignored).
-        virtual bool attributionJobExists(uint64_t internal_id) = 0;
-        virtual void attributionJobAddPid(uint64_t internal_id, pid_t pid) = 0;
-        virtual void attributionJobRemovePid(uint64_t internal_id, pid_t pid) = 0;
+        virtual bool attributionJobExists(uint64_t job_id) = 0;
+        virtual void attributionJobAddPid(uint64_t job_id, pid_t pid) = 0;
+        virtual void attributionJobRemovePid(uint64_t job_id, pid_t pid) = 0;
         // Snapshot enumeration for the periodic reconcile (registry copies).
         virtual void attributionEnumerateJobs(
             const std::function<void(const Job&)>& fn) = 0;
@@ -53,9 +53,9 @@ public:
         // The execution cgroup of one instance as told by its adapter
         // (cgroupPathOf); empty = none. Lets this component stay free of
         // scheduler-facts knowledge.
-        virtual std::string attributionCgroupPath(uint64_t internal_id)
+        virtual std::string attributionCgroupPath(uint64_t job_id)
         {
-            (void)internal_id;
+            (void)job_id;
             return {};
         }
     };
@@ -69,17 +69,17 @@ public:
     // Capability gate: only jobs whose adapter reports the kernel-attribution
     // trait are registered. Installed before start(); an unset lookup means
     // "every job participates" (legacy/manual registrations).
-    void setCapabilityLookup(std::function<bool(uint64_t internal_id)> capable);
+    void setCapabilityLookup(std::function<bool(uint64_t job_id)> capable);
 
     bool start();
     void stop();
 
     // JobEvent::Added: register the cgroup mapping + seed the root pids. The
     // cgroup id is resolved once here and cached for the later removal.
-    void activate(uint64_t internal_id, const Job& job);
+    void activate(uint64_t job_id, const Job& job);
     // JobEvent::Removed (after the collector drain): delete the cgroup
     // mapping from the cache and clear known pids.
-    void deactivate(uint64_t internal_id, const Job& job);
+    void deactivate(uint64_t job_id, const Job& job);
     // Heartbeat-driven resync of one job (also refreshes the cgroup cache).
     void reconcile(const Job& job);
 
@@ -92,7 +92,7 @@ private:
     // Resolves (and caches) the cgroup id for one job from its typed facts.
     uint64_t resolveCgroupId(const Job& job);
     // Capability gate; callers hold cache_mtx_.
-    bool capable(uint64_t internal_id) const;
+    bool capable(uint64_t job_id) const;
 
     Host& host_;
     std::unique_ptr<JobPidTracker> tracker_;
@@ -101,7 +101,7 @@ private:
     // Guards the cache below; the tracker's ringbuf callbacks and the
     // heartbeat both touch it.
     std::mutex cache_mtx_;
-    std::unordered_map<uint64_t, uint64_t> cgroup_ids_;  // internal_id → cgroup inode
+    std::unordered_map<uint64_t, uint64_t> cgroup_ids_;  // job_id → cgroup inode
 
     std::atomic<bool> reconcile_running_{false};
     std::unique_ptr<std::thread> reconcile_thread_;

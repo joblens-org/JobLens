@@ -67,8 +67,8 @@ DiscoveryOptions SlurmSchedulerAdapter::discoveryOptions(
 {
     DiscoveryOptions options;
     options.enable_event_source = true;
-    if (!settings.cluster_name.empty())
-        options.discovery.cluster_name = settings.cluster_name;
+    if (!settings.clusterName.empty())
+        options.discovery.clusterName = settings.clusterName;
     return options;
 }
 
@@ -79,8 +79,8 @@ Job SlurmSchedulerAdapter::decodeFacts(const nlohmann::json& row) const
     job.subtype = static_cast<JobSubType>(row.value("subtype", 0));
     job.subtype_name = row.value("subtype_name", name());
     set_pids(job, row.value("pids", nlohmann::json::array()).get<std::vector<pid_t>>());
-    job.NativeJobID = row.value("native_job_id", "");
-    job.cluster_name = row.value("cluster_name", "");
+    job.JobNativeID = row.value("JobNativeID", "");
+    job.clusterName = row.value("clusterName", "");
     job.clusterTag = row.value("clusterTag", "");
     job.sub_attr = row.contains("sub_attr")
                        ? row["sub_attr"].get<SlurmJobAttr>()
@@ -99,7 +99,7 @@ NativeSelector SlurmSchedulerAdapter::legacySelector(const Job& job) const
     if (attr != nullptr) {
         // The typed facts are the namespace source; the common field is
         // their render (kept as a fallback for facts built before one existed).
-        selector.cluster_name = attr->cluster_name;
+        selector.clusterName = attr->clusterName;
         if (attr->step_id != 0) {
             if (const auto name = slurm_step_name(attr->step_id)) {
                 selector.step_id = *name;
@@ -108,12 +108,12 @@ NativeSelector SlurmSchedulerAdapter::legacySelector(const Job& job) const
             }
         }
     }
-    if (selector.cluster_name.empty()) selector.cluster_name = job.cluster_name;
+    if (selector.clusterName.empty()) selector.clusterName = job.clusterName;
     // The original native string wins over the typed number: a zero-valued
     // field must not shadow the render.
-    if (selector.native_job_id.empty()) selector.native_job_id = job.NativeJobID;
-    if (selector.native_job_id.empty() && attr != nullptr)
-        selector.native_job_id = std::to_string(attr->job_id);
+    if (selector.job_native_id.empty()) selector.job_native_id = job.JobNativeID;
+    if (selector.job_native_id.empty() && attr != nullptr)
+        selector.job_native_id = std::to_string(attr->job_id);
 
     return selector;
 }
@@ -127,8 +127,8 @@ void SlurmSchedulerAdapter::projectFacts(Job& job) const
 
     const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr);
     if (attr == nullptr) return;
-    if (job.NativeJobID.empty()) job.NativeJobID = std::to_string(attr->job_id);
-    if (job.cluster_name.empty()) job.cluster_name = attr->cluster_name;
+    if (job.JobNativeID.empty()) job.JobNativeID = std::to_string(attr->job_id);
+    if (job.clusterName.empty()) job.clusterName = attr->clusterName;
     // clusterTag is not a Slurm namespace component and stays as-is:
     // discovery may carry a display value there.
 }
@@ -136,9 +136,9 @@ void SlurmSchedulerAdapter::projectFacts(Job& job) const
 NativeSelector SlurmSchedulerAdapter::registrationSelector(const Job& job) const
 {
     NativeSelector selector = legacySelector(job);
-    if (selector.cluster_name.empty())
-        selector.cluster_name = SlurmJob::get_cluster_name();
-    if (selector.cluster_name.empty() || selector.native_job_id.empty()) return {};
+    if (selector.clusterName.empty())
+        selector.clusterName = SlurmJob::clusterName();
+    if (selector.clusterName.empty() || selector.job_native_id.empty()) return {};
     return selector;
 }
 
@@ -146,20 +146,20 @@ void SlurmSchedulerAdapter::applyRequestFacts(Job& job,
                                               const nlohmann::json& request) const
 {
     const auto sub = request.value("sub_attr", nlohmann::json::object());
-    const auto job_id = sub.value("job_id", nlohmann::json(0u)).get<size_t>();
+    const auto native_job_number = sub.value("job_id", nlohmann::json(0u)).get<size_t>();
     const auto step_id = sub.value("step_id", nlohmann::json(0u)).get<uint32_t>();
 
     SlurmJobAttr attr;
     attr.auto_update_child = request.value("auto_update_child", true);
-    attr.job_id = job_id;
+    attr.job_id = native_job_number;
     attr.step_id = step_id;
-    attr.cluster_name = sub.value("cluster_name", "");
+    attr.clusterName = sub.value("clusterName", "");
     attr.user = sub.value("user", "");
 
     job.sub_attr = attr;
     job.subtype = JobSubType::Slurm;
     job.subtype_name = name();
-    job.NativeJobID = std::to_string(job_id);
+    job.JobNativeID = std::to_string(native_job_number);
     projectFacts(job);
 }
 
@@ -205,7 +205,7 @@ RefreshResult SlurmSchedulerAdapter::refreshFacts(
     // overwriting newer facts.
     execution.read_order = next_discovery_read_order();
 
-    const pid_t member_hint = firstMemberPid(job);
+    const pid_t member_hint = firstPid(job);
     if (!execution.manager.complete() && member_hint > 0) {
         if (const auto manager = managerOfPid(member_hint)) execution.manager = *manager;
     }
@@ -216,12 +216,13 @@ RefreshResult SlurmSchedulerAdapter::refreshFacts(
     if (execution.manager.complete() && member_hint > 0) {
         if (auto observed =
                 impl_->watcher.observeForHint(member_hint, execution.manager.pid)) {
-            // Execution evidence only. NativeJobID, cluster, typed attrs and
+            // Execution evidence only. JobNativeID, cluster, typed attrs and
             // the record's JobID/selection/state are the creation snapshot and
             // are never rewritten by a refresh.
             execution.manager = observed->execution.manager;
-            execution.members = observed->execution.members;
-            execution.members_authoritative = observed->execution.members_authoritative;
+            execution.pid_identities = observed->execution.pid_identities;
+            execution.pid_identities_authoritative =
+                observed->execution.pid_identities_authoritative;
             execution.read_order = observed->execution.read_order;
             return probeExecutionEvidence(job, process_probe, cgroup_probe);
         }
@@ -235,7 +236,7 @@ RefreshResult SlurmSchedulerAdapter::refreshFacts(
     if (!execution.manager.complete())
         return probeExecutionEvidence(job, process_probe, cgroup_probe);
     const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr);
-    return refreshManagerMembership(
+    return refreshPidIdentities(
         job, env.proc_root, env.cgroup_root,
         attr != nullptr ? attr->cgroup_path : std::string{},
         process_probe, cgroup_probe);
@@ -250,32 +251,32 @@ std::string SlurmSchedulerAdapter::cgroupPathOf(const Job& job) const
 NamespaceFacts SlurmSchedulerAdapter::namespaceFacts(const Job& job) const
 {
     const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr);
-    return {attr ? attr->cluster_name : std::string{}};
+    return {attr ? attr->clusterName : std::string{}};
 }
 
 NamespaceFacts SlurmSchedulerAdapter::selectorNamespaceFacts(
     const NativeSelector& selector) const
 {
-    return {selector.cluster_name};
+    return {selector.clusterName};
 }
 
 bool SlurmSchedulerAdapter::adoptNamespaceAliases(Job& job,
-                                                  const std::string& cluster_name,
-                                                  const std::string& cluster_tag) const
+                                                  const std::string& clusterName,
+                                                  const std::string& clusterTag) const
 {
-    (void)cluster_tag;  // Slurm has no schedd-tag namespace component
+    (void)clusterTag;  // Slurm has no schedd-tag namespace component
     auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr);
     if (attr == nullptr) return true;
-    if (!cluster_name.empty() && !attr->cluster_name.empty()
-            && cluster_name != attr->cluster_name) return false;
-    if (attr->cluster_name.empty()) attr->cluster_name = cluster_name;
+    if (!clusterName.empty() && !attr->clusterName.empty()
+            && clusterName != attr->clusterName) return false;
+    if (attr->clusterName.empty()) attr->clusterName = clusterName;
     return true;
 }
 
 void SlurmSchedulerAdapter::renderNamespace(Job& job) const
 {
     if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr)) {
-        job.cluster_name = attr->cluster_name;
+        job.clusterName = attr->clusterName;
         // clusterTag is not a Slurm namespace component and stays as-is:
         // discovery may carry a display value there.
     }
@@ -286,7 +287,7 @@ void SlurmSchedulerAdapter::renderNamespace(Job& job) const
 // identity (normalized, special names preserved).
 REGISTER_NATIVE_ID_RULE("slurm", [](const NativeSelector& selector)
     -> std::optional<CanonicalParts> {
-    auto job_number = strip_leading_zeros(selector.native_job_id);
+    auto job_number = strip_leading_zeros(selector.job_native_id);
     if (!job_number) return std::nullopt;
     CanonicalParts parts;
     if (!selector.step_id.empty()) {
@@ -294,7 +295,7 @@ REGISTER_NATIVE_ID_RULE("slurm", [](const NativeSelector& selector)
         if (!step) return std::nullopt;
         parts.step_id = *step;
     }
-    parts.cluster_namespace = selector.cluster_name;
+    parts.cluster_namespace = selector.clusterName;
     parts.canonical_native = *job_number;
     return parts;
 })

@@ -93,14 +93,14 @@ AutoCollectorPolicy::Decision AutoCollectorPolicy::select(const Job& job,
             spdlog::error("AutoCollectorPolicy: rule '{}' accepted job '{}' without "
                           "collectors and no auto_add_collectors defaults are configured; "
                           "refusing the decision",
-                          outcome.rule_name, job.NativeJobID);
+                          outcome.rule_name, job.JobNativeID);
             error = "rule '" + outcome.rule_name +
                     "' accepted without collectors but no default collectors are configured";
             return {};
         }
         spdlog::info("AutoCollectorPolicy: rule '{}' accepted job '{}' without "
                      "collectors; using the auto_add_collectors defaults",
-                     outcome.rule_name, job.NativeJobID);
+                     outcome.rule_name, job.JobNativeID);
         return Decision{true, defaults_};
     } catch (const std::exception& failure) {
         error = std::string("rule evaluation failed: ") + failure.what();

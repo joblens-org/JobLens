@@ -19,7 +19,7 @@
  *   * CONFIG precedence, defaults and startup rejection
  *   * start-before-scan: events injected during a scan are replayed,
  *     duplicate hints do not duplicate records, obsolete hints do not
- *     resurrect an ended generation
+ *     resurrect an ended manager
  *   * one missed scan recovers; two complete absences retire; failed or
  *     incomplete scans never count as absence
  *   * empty PID list with a live manager/cgroup does not retire; positive
@@ -27,14 +27,14 @@
  *   * EPERM/unreadable/unresolved input is unknown, not death; incomplete
  *     identities stay visible and retried; no wrong merge
  *   * tracker-unavailable mode (source started without an event source)
- *   * a late acknowledgement for an old generation never removes the new
+ *   * a late acknowledgement for an old manager never removes the new
  *     instance's ownership (real drain-ack path)
  *   * reads are side-effect free; snapshots coherent; sentinel excluded
  *   * heartbeat stop is idempotent and ordered; a failed source start is
  *     not fatal; an interrupted closing survives a restart and archives
  *   * unknown cgroup members are not death evidence; confirmed death retires
- *   * RETIRE-EXPLICIT: an explicit retirement marks the ended generation; a
- *     late same-generation observation is refused, a new one registers
+ *   * RETIRE-EXPLICIT: an explicit retirement marks the ended manager; a
+ *     late same-manager observation is refused, a new one registers
  *   * ADMIT: the capture_all admission gate (capture_all/auto_add
  *     combinations), drop/reject counters, NotAdmitted on the event path
  *   * STOP-PIN: a manual empty selection survives scan rotation and fact
@@ -343,9 +343,9 @@ Job make_condor_job(const std::string& native,
     job.subtype_name = "condor";
     job.jobtype = JobType::Job;
     job.subtype = JobSubType::Condor;
-    job.cluster_name = cluster;
+    job.clusterName = cluster;
     job.clusterTag = tag;
-    job.NativeJobID = native;
+    job.JobNativeID = native;
     CondorJobAttr attributes{};
     attributes.auto_update_child = false;
     attributes.starter_pid = manager_pid;
@@ -359,7 +359,7 @@ Job make_condor_job(const std::string& native,
     job.execution.manager.pid = manager_pid;
     job.execution.manager.start_ticks = manager_ticks;
     for (const pid_t member : members) {
-        job.execution.members.push_back(ProcessIdentity{member, manager_ticks, "boot-aaa"});
+        job.execution.pid_identities.push_back(ProcessIdentity{member, manager_ticks, "boot-aaa"});
     }
     auto finalized = CondorJobWatcher::finalize_discovery(std::move(job));
     return finalized ? *finalized : Job{};
@@ -371,7 +371,7 @@ Job make_unresolved_job(const std::string& native, pid_t manager_pid)
     // the rendered projection, and do not run the watcher's finalize (which
     // would drop the observation instead of publishing it).
     Job job = make_condor_job(native, manager_pid, 900000);
-    job.cluster_name.clear();
+    job.clusterName.clear();
     std::get<CondorJobAttr>(job.sub_attr).collector_host.clear();
     return job;
 }
@@ -443,9 +443,9 @@ std::optional<JobRecord> find_native(JobRegistry& registry, const std::string& n
 {
     NativeSelector selector;
     selector.adapter = "condor";
-    selector.cluster_name = cluster;
-    selector.cluster_tag = tag;
-    selector.native_job_id = native;
+    selector.clusterName = cluster;
+    selector.clusterTag = tag;
+    selector.job_native_id = native;
     const auto identity = canonicalize(selector);
     if (!identity) return std::nullopt;
     return registry.jobRecordByKey(*identity);
@@ -673,7 +673,7 @@ void run_a08(const std::string& base)
 
     const auto before = find_native(registry, "101.0");
     check(before.has_value(), "injected record vanished");
-    source.inject(injected);   // duplicate hint for the same generation
+    source.inject(injected);   // duplicate hint for the same manager
     check(wait_until([&]() {
               auto record = find_native(registry, "101.0");
               return record.has_value() &&
@@ -682,7 +682,7 @@ void run_a08(const std::string& base)
           "duplicate hint changed the internal id");
     check(count_records(registry) == 2, "duplicate hints duplicated records");
 
-    // Termination + obsolete hint: a hint for an ended generation must not
+    // Termination + obsolete hint: a hint for an ended manager must not
     // resurrect it.
     wait_hb_quiet();
     probes.set_process(5101, LivenessState::Dead);
@@ -695,9 +695,9 @@ void run_a08(const std::string& base)
     wait_hb_quiet();
     registry.reconcileNow();
     check(!find_native(registry, "101.0").has_value(),
-          "obsolete hint resurrected an ended generation");
+          "obsolete hint resurrected an ended manager");
 
-    // A new generation for the same identity registers as a new instance.
+    // A new manager for the same identity registers as a new instance.
     const Job revived =
         make_condor_job("101.0", 5102, 556, "htcondor01", "schedd-a", "/cg/slot-2");
     probes.set_process(5102, LivenessState::Alive, 556);
@@ -706,8 +706,8 @@ void run_a08(const std::string& base)
     const auto revived_record = find_native(registry, "101.0");
     check(revived_record.has_value() &&
               revived_record->job.execution.manager.pid == 5102,
-          "a new generation was rejected after retirement");
-    check(count_records(registry) == 2, "duplicate entry for one generation");
+          "a new manager was rejected after retirement");
+    check(count_records(registry) == 2, "duplicate entry for one manager");
 
     registry.deinit();
     pass_case("", "start-before-scan, in-scan event replay, duplicate hints, no resurrection");
@@ -822,7 +822,7 @@ void run_seen_recovery(const std::string& base)
     const auto created = find_native(registry, "205.0");
     check(created.has_value(), "SEEN-RECOVERY: the fixture job did not register");
     const uint64_t id = created->job.JobID;
-    check(registry.jobRecord(id)->verified,
+    check(registry.jobRecord(id)->presumed_live,
           "SEEN-RECOVERY: a freshly observed record must be verified");
 
     // One complete pass without the manager: absence evidence, not death.
@@ -830,7 +830,7 @@ void run_seen_recovery(const std::string& base)
     check(registry.reconcileNow(), "SEEN-RECOVERY: the absence pass did not run");
     const auto absent = registry.jobRecord(id);
     check(absent.has_value(), "SEEN-RECOVERY: one absence retired a live record");
-    check(!absent->verified,
+    check(!absent->presumed_live,
           "SEEN-RECOVERY: an absent record must carry the unverified verdict");
     check(heartbeat_status()["suspect_count"] == 1,
           "SEEN-RECOVERY: an absent record was not reported suspect");
@@ -841,7 +841,7 @@ void run_seen_recovery(const std::string& base)
     check(registry.reconcileNow(), "SEEN-RECOVERY: the recovery pass did not run");
     const auto recovered = registry.jobRecord(id);
     check(recovered.has_value(), "SEEN-RECOVERY: the recovered record disappeared");
-    check(recovered->verified,
+    check(recovered->presumed_live,
           "SEEN-RECOVERY: a seen record stayed unverified");
     check(heartbeat_status()["suspect_count"] == 0,
           "SEEN-RECOVERY: a seen record stayed in the suspect set");
@@ -872,7 +872,7 @@ void run_a10(const std::string& base)
     probes.set_cgroup("/cg/slot-4", {6001}, true);
     const auto record = find_native(registry, "300.0");
     check(record.has_value(), "record missing");
-    check(record->job.execution.members.empty(),
+    check(record->job.execution.pid_identities.empty(),
           "fixture should have an empty PID list");
 
     source.set_scan([&]() { return scan_with({}); });
@@ -1144,18 +1144,18 @@ void run_a14(const std::string& base)
     check(still_new.has_value() && still_new->job.JobID == new_record->job.JobID,
           "old acknowledgement removed the new identity index");
     check(still_new->job.execution.manager.start_ticks == 1616,
-          "new generation was replaced by stale state");
+          "new manager was replaced by stale state");
 
-    // A stale discovery for the retired generation still cannot resurrect it.
+    // A stale discovery for the retired manager still cannot resurrect it.
     source.set_scan([&]() { return scan_with({old_job}); });
     registry.reconcileNow();
     check(!find_native(registry, "700.0").has_value(),
-          "a stale discovery resurrected the retired generation");
+          "a stale discovery resurrected the retired manager");
     check(find_native(registry, "700.1").has_value(),
           "a stale discovery disturbed the new instance");
 
     registry.deinit();
-    pass_case("", "late cleanup of an old generation cannot remove new ownership");
+    pass_case("", "late cleanup of an old manager cannot remove new ownership");
 }
 
 // ---------------------------------------------------------------------------
@@ -1428,7 +1428,7 @@ void run_a28(const std::string& base)
 }
 
 // ---------------------------------------------------------------------------
-// Legacy/manual registrations: no generation, no source, still maintained
+// Legacy/manual registrations: no manager, no source, still maintained
 // ---------------------------------------------------------------------------
 
 void run_legacy(const std::string& base)
@@ -1452,7 +1452,7 @@ void run_legacy(const std::string& base)
     check(records.size() == 1, "legacy: the registration created no job record");
     const uint64_t id = records.front().job.JobID;
     check(!records.front().job.execution.manager.complete(),
-          "legacy: a manual registration must not invent an execution generation");
+          "legacy: a manual registration must not invent an execution manager");
 
     check(heartbeat_status()["configured_types"].empty(),
           "legacy: no discovery type should be configured");
@@ -1497,8 +1497,8 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
     // must carry the real one; the member models a live child under an alive
     // manager with its own start time.
     job.execution.manager.boot_id = boot;
-    job.execution.members.clear();
-    job.execution.members.push_back(ProcessIdentity{child_pid, 191919, boot});
+    job.execution.pid_identities.clear();
+    job.execution.pid_identities.push_back(ProcessIdentity{child_pid, 191919, boot});
     CondorJobWatcher::finalize_discovery(job);
 
     {
@@ -1534,13 +1534,13 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
 
         const auto restored = find_native(registry, "810.0");
         check(restored.has_value(), "RESTORE-UNKNOWN: the record was not restored");
-        check(restored->state == RecordState::Active && !restored->verified,
+        check(restored->state == RecordState::Active && !restored->presumed_live,
               "RESTORE-UNKNOWN: an unverifiable execution must stay Open but "
               "carry the unverified (suspect) evidence, not a lifecycle state");
-        check(std::any_of(restored->job.execution.members.begin(),
-                          restored->job.execution.members.end(),
-                          [&](const ProcessIdentity& member) {
-                              return member.pid == child_pid && member.complete();
+        check(std::any_of(restored->job.execution.pid_identities.begin(),
+                          restored->job.execution.pid_identities.end(),
+                          [&](const ProcessIdentity& pid_identity) {
+                              return pid_identity.pid == child_pid && pid_identity.complete();
                           }),
               "RESTORE-UNKNOWN: restore deleted the saved child identity");
         check(registry.deinit(), "RESTORE-UNKNOWN: the restore-only shutdown failed");
@@ -1558,9 +1558,9 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
     JobRegistry registry(heartbeat_options(path, source, probes));
     const auto restored = find_native(registry, "810.0");
     check(restored.has_value(), "RESTORE-UNKNOWN: the heartbeat restore lost the record");
-    check(std::any_of(restored->job.execution.members.begin(),
-                      restored->job.execution.members.end(),
-                      [&](const ProcessIdentity& member) { return member.pid == child_pid; }),
+    check(std::any_of(restored->job.execution.pid_identities.begin(),
+                      restored->job.execution.pid_identities.end(),
+                      [&](const ProcessIdentity& pid_identity) { return pid_identity.pid == child_pid; }),
           "RESTORE-UNKNOWN: the heartbeat restore dropped the child evidence");
 
     probes.set_process(manager_pid, LivenessState::Dead, 181818);
@@ -1571,9 +1571,9 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
     const auto after = find_native(registry, "810.0");
     check(after.has_value(),
           "RESTORE-UNKNOWN: the instance was retired although its saved child is alive");
-    check(std::any_of(after->job.execution.members.begin(),
-                      after->job.execution.members.end(),
-                      [&](const ProcessIdentity& member) { return member.pid == child_pid; }),
+    check(std::any_of(after->job.execution.pid_identities.begin(),
+                      after->job.execution.pid_identities.end(),
+                      [&](const ProcessIdentity& pid_identity) { return pid_identity.pid == child_pid; }),
           "RESTORE-UNKNOWN: the child evidence was dropped before the verdict");
     check(registry.findJob(after->job.JobID).has_value(),
           "RESTORE-UNKNOWN: the live instance disappeared from the active set");
@@ -1584,7 +1584,7 @@ void run_restore_unknown_keeps_evidence(const std::string& base)
 }
 
 // ---------------------------------------------------------------------------
-// RETIRE-EXPLICIT - an explicit retirement marks the ended generation
+// RETIRE-EXPLICIT - an explicit retirement marks the ended manager
 // ---------------------------------------------------------------------------
 
 void run_retire_explicit(const std::string& base)
@@ -1603,26 +1603,26 @@ void run_retire_explicit(const std::string& base)
     const std::uint64_t retired_id = active->job.JobID;
 
     // Explicit retirement while every process is still alive: no evidence
-    // path runs, so the command itself must mark the ended generation.
+    // path runs, so the command itself must mark the ended manager.
     check(registry.retireInstance(retired_id),
           "RETIRE-EXPLICIT: the explicit retirement was refused");
     check(!find_native(registry, "310.0").has_value(),
           "RETIRE-EXPLICIT: the retired instance stayed active");
 
-    // A scan observation of the SAME execution generation must not
+    // A scan observation of the SAME execution manager must not
     // re-register the retired instance: isObsolete() refuses it.
     const std::uint64_t obsolete_before =
         heartbeat_status()["obsolete_hints"].get<std::uint64_t>();
     check(registry.reconcileNow(),
           "RETIRE-EXPLICIT: the post-retirement pass did not run");
     check(!find_native(registry, "310.0").has_value(),
-          "RETIRE-EXPLICIT: a same-generation observation resurrected the "
+          "RETIRE-EXPLICIT: a same-manager observation resurrected the "
           "explicitly retired instance");
     check(heartbeat_status()["obsolete_hints"].get<std::uint64_t>() > obsolete_before,
           "RETIRE-EXPLICIT: the refused observation was not counted as obsolete");
 
-    // A NEW generation (different manager, different start ticks) registers
-    // as a new instance: the mark is per generation, never per identity.
+    // A NEW manager (different manager, different start ticks) registers
+    // as a new instance: the mark is per manager, never per identity.
     const Job revived =
         make_condor_job("310.0", 5401, 889, "htcondor01", "schedd-a", "/cg/slot-31");
     probes.set_process(5401, LivenessState::Alive, 889);
@@ -1632,14 +1632,14 @@ void run_retire_explicit(const std::string& base)
     const auto revived_record = find_native(registry, "310.0");
     check(revived_record.has_value() &&
               revived_record->job.execution.manager.pid == 5401,
-          "RETIRE-EXPLICIT: a new generation was refused after the explicit "
+          "RETIRE-EXPLICIT: a new manager was refused after the explicit "
           "retirement");
     check(count_records(registry) == 1, "RETIRE-EXPLICIT: unexpected record count");
 
     registry.deinit();
     pass_case("RETIRE-EXPLICIT",
-              "explicit retirement marks the ended generation; a same-generation "
-              "observation is refused, a new generation registers");
+              "explicit retirement marks the ended manager; a same-manager "
+              "observation is refused, a new manager registers");
 }
 
 // ---------------------------------------------------------------------------
@@ -1708,8 +1708,8 @@ void run_admit(const std::string& base)
         const auto status = heartbeat_status();
         check(status["capture_all"].get<bool>() == false,
               "ADMIT: the status must report the gate state");
-        check(status["dropped_observations"].get<std::uint64_t>() >= 2,
-              "ADMIT: drops from the scan and event paths must be counted");
+        check(status["not_admitted_capture_all_off"].get<std::uint64_t>() >= 2,
+              "ADMIT: capture_all-off refusals from the scan and event paths must be counted");
         registry.deinit();
     }
 
@@ -1741,9 +1741,9 @@ void run_admit(const std::string& base)
         check(binding.automatic_source == "defaults",
               "ADMIT: the selection must identify the defaults source");
         const auto status = heartbeat_status();
-        check(status["dropped_observations"].get<std::uint64_t>() == 0 &&
-                  status["rejected_observations"].get<std::uint64_t>() == 0,
-              "ADMIT: an admitted job must not count as dropped or rejected");
+        check(status["not_admitted_capture_all_off"].get<std::uint64_t>() == 0 &&
+                  status["not_admitted_by_rule"].get<std::uint64_t>() == 0,
+              "ADMIT: an admitted job must not count as not admitted");
         registry.deinit();
     }
 
@@ -1771,8 +1771,8 @@ void run_admit(const std::string& base)
         check(registry.reconcileNow(), "ADMIT: the reject pass must run");
         check(count_records(registry) == 0,
               "ADMIT: a rejecting rule must keep the job out across passes");
-        check(heartbeat_status()["rejected_observations"].get<std::uint64_t>() >= 1,
-              "ADMIT: rule rejections must be counted");
+        check(heartbeat_status()["not_admitted_by_rule"].get<std::uint64_t>() >= 1,
+              "ADMIT: rule refusals must be counted as not_admitted_by_rule");
         registry.deinit();
     }
     {
@@ -1799,8 +1799,8 @@ void run_admit(const std::string& base)
               "ADMIT: the rule's list must become the initial automatic selection");
         check(binding.automatic_source.rfind("rules:", 0) == 0,
               "ADMIT: the selection must identify the rules source");
-        check(heartbeat_status()["dropped_observations"].get<std::uint64_t>() == 0,
-              "ADMIT: an accepted job must not count as dropped");
+        check(heartbeat_status()["not_admitted_capture_all_off"].get<std::uint64_t>() == 0,
+              "ADMIT: an accepted job must not count as not admitted by capture_all");
         registry.deinit();
     }
 
@@ -1833,8 +1833,8 @@ void run_admit(const std::string& base)
         check(binding.automatic_source.rfind("rules:", 0) == 0,
               "ADMIT: the fallback selection must still identify the rules source");
         const auto status = heartbeat_status();
-        check(status["dropped_observations"].get<std::uint64_t>() == 0 &&
-                  status["rejected_observations"].get<std::uint64_t>() == 0 &&
+        check(status["not_admitted_capture_all_off"].get<std::uint64_t>() == 0 &&
+                  status["not_admitted_by_rule"].get<std::uint64_t>() == 0 &&
                   status["admission_errors"].get<std::uint64_t>() == 0,
               "ADMIT: a bare accept with defaults must not count as an error");
         registry.deinit();
@@ -1867,10 +1867,10 @@ void run_admit(const std::string& base)
         const auto status = heartbeat_status();
         check(status["admission_errors"].get<std::uint64_t>() >= 1,
               "ADMIT: the refused decision must count as an admission error");
-        check(status["rejected_observations"].get<std::uint64_t>() == 0,
-              "ADMIT: the refused decision must not count as a rule reject");
-        check(status["dropped_observations"].get<std::uint64_t>() == 0,
-              "ADMIT: the refused decision must not count as dropped");
+        check(status["not_admitted_by_rule"].get<std::uint64_t>() == 0,
+              "ADMIT: the refused decision must not count as not_admitted_by_rule");
+        check(status["not_admitted_capture_all_off"].get<std::uint64_t>() == 0,
+              "ADMIT: the refused decision must not count as not admitted by capture_all");
         registry.deinit();
     }
 
@@ -2033,7 +2033,7 @@ void run_discovery_create_only(const std::string& base)
     const auto after = find_native(registry, "1000.0");
     check(after.has_value(),
           "DISCOVERY-CREATE-ONLY: a known-manager advertisement renamed the record");
-    check(after->job.NativeJobID == "1000.0",
+    check(after->job.JobNativeID == "1000.0",
           "DISCOVERY-CREATE-ONLY: a known-manager advertisement replaced the identity");
     const auto* after_attr = std::get_if<CondorJobAttr>(&after->job.sub_attr);
     check(after_attr != nullptr && after_attr->owner == "alice",
@@ -2104,7 +2104,7 @@ void run_manual_refresh_parity(const std::string& base)
           "MANUAL-REFRESH: the refresh rewrote the execution manager");
     check(pids_of(after_first->job) == created_members,
           "MANUAL-REFRESH: the refresh dropped or replaced the member evidence");
-    check(after_first->verified, "MANUAL-REFRESH: a seen record must stay verified");
+    check(after_first->presumed_live, "MANUAL-REFRESH: a seen record must stay verified");
     check(after_first->source == FactSource::Manual,
           "MANUAL-REFRESH: a refresh must not change the record's provenance");
     check(after_first->job.execution.read_order != 0,
@@ -2215,8 +2215,8 @@ void run_event_admission_create_only(const std::string& base)
     check(created.has_value(), "EVENT-ADMISSION: the manual record was not indexed");
     const std::uint64_t id = created->job.JobID;
     const std::uint64_t revision_before = created->revision;
-    const std::uint64_t dropped_before =
-        heartbeat_status()["dropped_observations"].get<std::uint64_t>();
+    const std::uint64_t not_admitted_before =
+        heartbeat_status()["not_admitted_capture_all_off"].get<std::uint64_t>();
 
     // An exec event for the identity the registry already owns: it must update
     // the record without re-running the closed admission gate.
@@ -2239,7 +2239,7 @@ void run_event_admission_create_only(const std::string& base)
           "EVENT-ADMISSION: an accepted observation did not move the provenance");
     check(after->revision > revision_before,
           "EVENT-ADMISSION: the accepted observation did not advance the revision");
-    check(heartbeat_status()["dropped_observations"].get<std::uint64_t>() == dropped_before,
+    check(heartbeat_status()["not_admitted_capture_all_off"].get<std::uint64_t>() == not_admitted_before,
           "EVENT-ADMISSION: a tracked identity was sent through the admission gate");
 
     // Same sink, unknown identity: the gate is armed and refuses the creation.
@@ -2250,8 +2250,8 @@ void run_event_admission_create_only(const std::string& base)
     const UpsertResult refused = source.inject(fresh);
     check(!refused.ok && refused.code == RegistrationError::NotAdmitted,
           "EVENT-ADMISSION: an unknown identity bypassed the closed admission gate");
-    check(heartbeat_status()["dropped_observations"].get<std::uint64_t>() == dropped_before + 1,
-          "EVENT-ADMISSION: the refused creation was not counted as dropped");
+    check(heartbeat_status()["not_admitted_capture_all_off"].get<std::uint64_t>() == not_admitted_before + 1,
+          "EVENT-ADMISSION: the refused creation was not counted as not admitted");
     check(count_records(registry) == 1,
           "EVENT-ADMISSION: a refused observation created a record");
 
@@ -2262,10 +2262,10 @@ void run_event_admission_create_only(const std::string& base)
 }
 
 // ---------------------------------------------------------------------------
-// GENERATION-CONFLICT: a refused observation must not mark its manager tracked
+// MANAGER-CONFLICT: a refused observation must not mark its manager tracked
 // ---------------------------------------------------------------------------
 
-void run_generation_conflict_tracking(const std::string& base)
+void run_manager_conflict_tracking(const std::string& base)
 {
     FakeSource source("condor");
     // A second source with the same adapter name enumerates the same manager in
@@ -2292,70 +2292,70 @@ void run_generation_conflict_tracking(const std::string& base)
     };
     source.set_scan(scan_now);
     mirror.set_scan(scan_now);
-    auto options = heartbeat_options(fresh_dir(base, "generation-conflict"), source, probes);
+    auto options = heartbeat_options(fresh_dir(base, "manager-conflict"), source, probes);
     options.test_sources = {{"condor", &source}, {"condor", &mirror}};
     JobRegistry registry(options);
 
     const auto created = find_native(registry, "1400.0");
     check(created.has_value(),
-          "GENERATION-CONFLICT: the first execution was not registered");
+          "MANAGER-CONFLICT: the first execution was not registered");
     const uint64_t first_id = created->job.JobID;
     check(created->job.execution.manager.pid == first_manager,
-          "GENERATION-CONFLICT: the first record does not own its manager");
+          "MANAGER-CONFLICT: the first record does not own its manager");
     const int observes_after_create = source.observes();
     check(observes_after_create == 1,
-          "GENERATION-CONFLICT: the creation pass observed the manager more than once");
+          "MANAGER-CONFLICT: the creation pass observed the manager more than once");
     check(mirror.observes() == 0,
-          "GENERATION-CONFLICT: the second source re-observed a tracked manager");
+          "MANAGER-CONFLICT: the second source re-observed a tracked manager");
 
     // The second execution reuses the identity while the first record is live:
-    // its observation is refused as a generation conflict and must stay
+    // its observation is refused as a manager conflict and must stay
     // unknown, not be mapped onto the old record.
     second_only = true;
     check(registry.reconcileNow(),
-          "GENERATION-CONFLICT: the conflict pass did not run");
+          "MANAGER-CONFLICT: the conflict pass did not run");
     check(source.observes() == observes_after_create + 1,
-          "GENERATION-CONFLICT: the refused manager was not observed");
+          "MANAGER-CONFLICT: the refused manager was not observed");
     check(mirror.observes() == 1,
-          "GENERATION-CONFLICT: the refused manager was taken as tracked by the second source");
+          "MANAGER-CONFLICT: the refused manager was taken as tracked by the second source");
     const auto still_first = registry.jobRecord(first_id);
     check(still_first.has_value(),
-          "GENERATION-CONFLICT: a refused observation replaced the live generation");
+          "MANAGER-CONFLICT: a refused observation replaced the live manager");
     check(still_first->job.execution.manager.pid == first_manager,
-          "GENERATION-CONFLICT: a refused observation rewrote the manager");
-    check(!still_first->verified,
-          "GENERATION-CONFLICT: a refused manager still cleared the old record's absence");
+          "MANAGER-CONFLICT: a refused observation rewrote the manager");
+    check(!still_first->presumed_live,
+          "MANAGER-CONFLICT: a refused manager still cleared the old record's absence");
     check(heartbeat_status()["suspect_count"] == 1,
-          "GENERATION-CONFLICT: the old record is not reported absent");
+          "MANAGER-CONFLICT: the old record is not reported absent");
 
     // The next complete pass must observe the manager again (it is not
     // tracked), and the old record's second absence retires it.
     check(registry.reconcileNow(),
-          "GENERATION-CONFLICT: the retirement pass did not run");
+          "MANAGER-CONFLICT: the retirement pass did not run");
     check(source.observes() == observes_after_create + 2,
-          "GENERATION-CONFLICT: the refused manager became tracked");
+          "MANAGER-CONFLICT: the refused manager became tracked");
     check(mirror.observes() == 2,
-          "GENERATION-CONFLICT: the refused manager became tracked by the second source");
+          "MANAGER-CONFLICT: the refused manager became tracked by the second source");
     check(!registry.jobRecord(first_id).has_value(),
-          "GENERATION-CONFLICT: the old generation was kept alive by a refused observation");
+          "MANAGER-CONFLICT: the old manager was kept alive by a refused observation");
     check(!find_native(registry, "1400.0").has_value(),
-          "GENERATION-CONFLICT: the retired identity stayed indexed");
+          "MANAGER-CONFLICT: the retired identity stayed indexed");
 
     // With the identity free, the same manager creates the new execution.
     check(registry.reconcileNow(),
-          "GENERATION-CONFLICT: the revival pass did not run");
+          "MANAGER-CONFLICT: the revival pass did not run");
     const auto revived = find_native(registry, "1400.0");
     check(revived.has_value(),
-          "GENERATION-CONFLICT: the new execution was not registered");
+          "MANAGER-CONFLICT: the new execution was not registered");
     check(revived->job.JobID != first_id,
-          "GENERATION-CONFLICT: the new execution reused the retired internal id");
+          "MANAGER-CONFLICT: the new execution reused the retired internal id");
     check(revived->job.execution.manager.pid == second_manager,
-          "GENERATION-CONFLICT: the new execution does not own its manager");
+          "MANAGER-CONFLICT: the new execution does not own its manager");
     check(count_records(registry) == 1,
-          "GENERATION-CONFLICT: the revival duplicated the record");
+          "MANAGER-CONFLICT: the revival duplicated the record");
 
     registry.deinit();
-    pass_case("GENERATION-CONFLICT",
+    pass_case("MANAGER-CONFLICT",
               "a refused observation leaves its manager unknown so it is retried, the old "
               "record still retires on absence, and the new execution creates afterwards");
 }
@@ -2381,7 +2381,7 @@ void run_pass_admission_create_only(const std::string& base)
 
     Job manual = make_manual_condor_job("1500.0", manager_pid, 616161,
                                         "/cg/slot-1500", {});
-    // The registration carries the identity but no execution generation yet.
+    // The registration carries the identity but no execution manager yet.
     manual.execution.manager = ProcessIdentity{};
     check(registry.addJob(manual), "GATE-KNOWN: the manual registration must succeed");
     const auto created = find_native(registry, "1500.0");
@@ -2389,8 +2389,8 @@ void run_pass_admission_create_only(const std::string& base)
     check(!created->job.execution.manager.complete(),
           "GATE-KNOWN: the fixture must start without an execution manager");
     const uint64_t id = created->job.JobID;
-    const std::uint64_t dropped_before =
-        heartbeat_status()["dropped_observations"].get<std::uint64_t>();
+    const std::uint64_t not_admitted_before =
+        heartbeat_status()["not_admitted_capture_all_off"].get<std::uint64_t>();
 
     // The source enumerates a complete manager for the identity the registry
     // already owns. The creation gate must not run: a closed gate would drop
@@ -2407,7 +2407,7 @@ void run_pass_admission_create_only(const std::string& base)
           "GATE-KNOWN: the tracked identity was dropped by the creation gate");
     check(after->job.execution.manager.complete(),
           "GATE-KNOWN: the observed manager is incomplete");
-    check(heartbeat_status()["dropped_observations"].get<std::uint64_t>() == dropped_before,
+    check(heartbeat_status()["not_admitted_capture_all_off"].get<std::uint64_t>() == not_admitted_before,
           "GATE-KNOWN: a tracked identity was sent through the admission gate");
     check(count_records(registry) == 1,
           "GATE-KNOWN: the observation created a second record");
@@ -2448,7 +2448,7 @@ int main(int argc, char** argv)
         run_manual_refresh_parity(base);
         run_manual_absence_retirement(base);
         run_event_admission_create_only(base);
-        run_generation_conflict_tracking(base);
+        run_manager_conflict_tracking(base);
         run_pass_admission_create_only(base);
         std::cout << "ALL PASS\n";
         return 0;

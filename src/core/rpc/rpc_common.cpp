@@ -44,7 +44,7 @@ split_two(std::string s, char sep = '.') {
            : std::pair{s.substr(0, p), s.substr(p + 1)};
 }
 
-// The request-level namespace aliases (cluster_name/cluster_tag) contradicted
+// The request-level namespace aliases (clusterName/clusterTag) contradicted
 // the typed sub_attr facts: an explicit rejection, distinct from a malformed
 // request so the RPC surface can carry the documented error code.
 void parseJobRequest(const nlohmann::json& obj, Job& job, const JobRegistry& registry) {
@@ -52,13 +52,13 @@ void parseJobRequest(const nlohmann::json& obj, Job& job, const JobRegistry& reg
     // string, never a 32-bit default. Absent keeps the legacy auto-allocate
     // sentinel; reserved (0) keeps its historical meaning; anything else is
     // an explicit request error.
-    const auto legacy_id = parse_legacy_job_id(
+    const auto parsed_id = parse_job_id(
         obj.contains("JobID") ? obj["JobID"] : nlohmann::json(nullptr));
-    if (legacy_id.status == LegacyIdStatus::Invalid) {
+    if (parsed_id.status == LegacyIdStatus::Invalid) {
         throw std::runtime_error(
             "invalid JobID: expected a uint64 number or decimal string");
     }
-    job.JobID = legacy_id.value;
+    job.JobID = parsed_id.value;
     set_pids(job, obj.value("JobPIDs", nlohmann::json::array()).get<std::vector<pid_t>>());
     job.CollectorNames = obj.value("Lens", nlohmann::json::array()).get<std::vector<std::string>>();
     if (pids_of(job).size() == 0) {
@@ -101,33 +101,33 @@ void parseJobRequest(const nlohmann::json& obj, Job& job, const JobRegistry& reg
             // 原样入库（该 adapter 的 decodeFacts 是唯一解释者）。
             job.subtype_name = adapter_name;
             job.sub_attr = obj.value("sub_attr", nlohmann::json::object());
-            job.NativeJobID = obj.value("NativeJobID", "");
+            job.JobNativeID = obj.value("JobNativeID", "");
         }
     }
 
     // Structured namespace, by business type: typed schedulers inject the
-    // request-level aliases (cluster_name/cluster_tag) into their typed
+    // request-level aliases (clusterName/clusterTag) into their typed
     // facts — the facts win and a contradiction is an explicit rejection —
     // then render the common fields from the facts. Generic/open-world jobs
     // keep the common fields as their namespace storage; the aliases land
     // there verbatim.
-    const std::string request_cluster_name = obj.value("cluster_name", std::string{});
-    const std::string request_cluster_tag = obj.value("cluster_tag", std::string{});
+    const std::string clusterName = obj.value("clusterName", std::string{});
+    const std::string clusterTag = obj.value("clusterTag", std::string{});
     if (adapter != nullptr) {
-        if (!adapter->adoptNamespaceAliases(job, request_cluster_name, request_cluster_tag)) {
+        if (!adapter->adoptNamespaceAliases(job, clusterName, clusterTag)) {
             throw NamespaceConflictError(
-                "cluster_name/cluster_tag contradict the sub_attr facts");
+                "clusterName/clusterTag contradict the sub_attr facts");
         }
         adapter->projectFacts(job);
     } else {
-        job.cluster_name = request_cluster_name;
-        job.clusterTag = request_cluster_tag;
+        job.clusterName = clusterName;
+        job.clusterTag = clusterTag;
     }
 
     spdlog::info("JobRegistry: parsed type={}, subtype={}, JobID={}, "
                  "PIDs_count={}, Lens_count={}, nativeID={}",
                  type, subtype, job.JobID, pids_of(job).size(),
-                 job.CollectorNames.size(), job.NativeJobID);
+                 job.CollectorNames.size(), job.JobNativeID);
 }
 
 
@@ -135,7 +135,7 @@ constexpr uint32_t kRpcSchemaVersion = 2;
 
 // ---------------------------------------------------------------------------
 // Local serialization helpers (the JobRecord wire form lives in job_store;
-// the RPC only needs generation/process projections for job views)
+// the RPC only needs manager/process projections for job views)
 // ---------------------------------------------------------------------------
 
 nlohmann::json manager_to_json(const ProcessIdentity& manager) {
@@ -143,15 +143,14 @@ nlohmann::json manager_to_json(const ProcessIdentity& manager) {
         {"boot_id", manager.boot_id},
         {"manager_pid", manager.pid},
         {"manager_start_ticks", manager.start_ticks},
-        {"cgroup_identity", std::string{}},
     };
 }
 
-nlohmann::json process_to_json(const ProcessIdentity& process) {
+nlohmann::json pid_identity_to_json(const ProcessIdentity& pid_identity) {
     return nlohmann::json{
-        {"pid", process.pid},
-        {"start_ticks", process.start_ticks},
-        {"boot_id", process.boot_id},
+        {"pid", pid_identity.pid},
+        {"start_ticks", pid_identity.start_ticks},
+        {"boot_id", pid_identity.boot_id},
     };
 }
 
@@ -258,7 +257,7 @@ uint64_t jobs_snapshot_revision(const std::vector<JobRecord>& records)
         mix(record->job.JobID);
         mix(record->revision);
         mix(record->index_key.empty() ? 0u : 2u);
-        mix(record->state == RecordState::Closing ? 3u : (record->verified ? 5u : 4u));
+        mix(record->state == RecordState::Closing ? 3u : (record->presumed_live ? 5u : 4u));
     }
     // Stay inside the signed 63-bit range so JavaScript consumers keep the
     // exact value; the revision is an opaque token, not a counter.
@@ -283,13 +282,11 @@ std::string step_id_text(const JobRegistry& registry, const JobRecord& record)
 nlohmann::json job_record_json(JobRegistry& registry, const JobRecord& record)
 {
     nlohmann::json out;
-    // Deprecated key kept for old readers; the value is the internal id as a
-    // decimal string (same as internal_job_id).
-    out["instance_id"] = format_internal_id(record.job.JobID);
-    // New APIs carry internal ids as decimal strings (JavaScript uint64 safety).
-    out["internal_job_id"] = format_internal_id(record.job.JobID);
+    // The one job handle the RPC surface emits: the record id as a decimal
+    // string (JavaScript uint64 safety).
+    out["JobID"] = format_job_id(record.job.JobID);
     out["schema_version"] = kRpcSchemaVersion;
-    out["record_revision"] = record.revision;
+    out["revision"] = record.revision;
     out["state"] = to_string(record.state);
     out["source"] = job_source(record);
     out["quarantined"] = false;
@@ -301,16 +298,16 @@ nlohmann::json job_record_json(JobRegistry& registry, const JobRecord& record)
     // Selector fields are projections of the Job: the typed facts are the
     // single source of truth, no second copy rides the record.
     out["scheduler_type"] = record.job.subtype_name;
-    out["cluster_name"] = record.job.cluster_name;
-    out["cluster_tag"] = record.job.clusterTag;
-    out["native_job_id"] = record.job.NativeJobID;
+    out["clusterName"] = record.job.clusterName;
+    out["clusterTag"] = record.job.clusterTag;
+    out["JobNativeID"] = record.job.JobNativeID;
     out["step_id"] = step_id_text(registry, record);
     out["first_seen_us"] = record.first_seen_us;
     out["last_seen_us"] = record.last_seen_us;
-    out["generation"] = manager_to_json(manager_of(record.job));
-    out["processes"] = nlohmann::json::array();
-    for (const auto& process : members_of(record.job)) {
-        out["processes"].push_back(process_to_json(process));
+    out["manager"] = manager_to_json(manager_of(record.job));
+    out["pid_identities"] = nlohmann::json::array();
+    for (const auto& pid_identity : pid_identities_of(record.job)) {
+        out["pid_identities"].push_back(pid_identity_to_json(pid_identity));
     }
     if (const auto job = registry.findJob(record.job.JobID)) {
         out["attributes"] = std::visit(
@@ -325,8 +322,8 @@ std::vector<std::string> job_ids_of(const std::vector<JobRecord>& records)
 {
     std::vector<std::string> ids;
     ids.reserve(records.size());
-    // Deprecated key spelling: the value is the internal id, decimal string.
-    for (const auto& record : records) ids.push_back(format_internal_id(record.job.JobID));
+    // The job handle is the record id as a decimal string.
+    for (const auto& record : records) ids.push_back(format_job_id(record.job.JobID));
     return ids;
 }
 
@@ -374,7 +371,7 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
     if (!identity) {
         result.code = "invalid_request";
         result.message =
-            "incomplete native selector: scheduler_type, cluster_name and native_job_id "
+            "incomplete native selector: scheduler_type, clusterName and JobNativeID "
             "must name one scheduler identity (Condor native ids are '<ClusterId>.<ProcId>')";
         return result;
     }
@@ -385,7 +382,7 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
     // canonical namespace).
     const auto selector_facts = registry.selectorFactsOf(selector);
     for (auto& record : registry.jobRecords()) {
-        if (is_reserved_internal_id(record.job.JobID)) continue;
+        if (is_reserved_job_id(record.job.JobID)) continue;
         if (record.index_key.empty()) continue;
         const auto* adapter = registry.adapterNamed(record.job.subtype_name);
         if (adapter == nullptr) continue;
@@ -413,9 +410,9 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
                 "no discovery source is running on this core, so ensure_registered "
                 "cannot confirm a live instance for this request";
         } else {
-            result.message = "no verified current instance for native job '" +
-                             selector.native_job_id + "' in cluster '" +
-                             selector.cluster_name + "'";
+            result.message = "no active instance for native job '" +
+                             selector.job_native_id + "' in cluster '" +
+                             selector.clusterName + "'";
         }
         result.code = "not_found";
         return result;
@@ -425,16 +422,16 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
         result.code = "ambiguous_selector";
         result.message = fmt::format(
             "native job '{}' matches {} current local instances in cluster '{}'; "
-            "add step_id or use scope=job", selector.native_job_id, matches.size(),
-            selector.cluster_name);
+            "add step_id or use scope=job", selector.job_native_id, matches.size(),
+            selector.clusterName);
         result.records = std::move(matches);
         return result;
     }
 
     for (const auto& record : matches) {
         if (!registry.findJob(record.job.JobID).has_value()) {
-            result.code = "generation_closing";
-            result.message = "instance " + format_internal_id(record.job.JobID) +
+            result.code = "instance_closing";
+            result.message = "instance " + format_job_id(record.job.JobID) +
                              " is closing and rejects new binding mutations";
             result.records.clear();
             return result;
@@ -444,25 +441,25 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
     return result;
 }
 
-// Instance addressing by internal_job_id: the durable id resolves in O(1)
+// Instance addressing by JobID: the durable id resolves in O(1)
 // through the registry's record map. Addressability: an active record only
-// (findJob), a closing instance rejects with generation_closing, and the
+// (findJob), a closing instance rejects with instance_closing, and the
 // reserved system sentinel is never addressable.
-TargetResolution resolve_instance_handle_by_id(JobRegistry& registry, uint64_t internal_id)
+TargetResolution resolve_instance_handle_by_id(JobRegistry& registry, uint64_t job_id)
 {
     TargetResolution result;
-    auto record = is_reserved_internal_id(internal_id)
+    auto record = is_reserved_job_id(job_id)
                       ? std::nullopt
-                      : registry.jobRecord(internal_id);
+                      : registry.jobRecord(job_id);
     if (!record) {
         result.code = "not_found";
-        result.message = "no verified current instance with internal_job_id '" +
-                         format_internal_id(internal_id) + "'";
+        result.message = "no active instance with JobID '" +
+                         format_job_id(job_id) + "'";
         return result;
     }
     if (!registry.findJob(record->job.JobID).has_value()) {
-        result.code = "generation_closing";
-        result.message = "instance " + format_internal_id(record->job.JobID) +
+        result.code = "instance_closing";
+        result.message = "instance " + format_job_id(record->job.JobID) +
                          " is closing and rejects new binding mutations";
         return result;
     }
@@ -481,12 +478,11 @@ nlohmann::json collection_target_json(JobRegistry& registry, const JobRecord& re
     const auto desired = selection.effectiveCollectors();
 
     nlohmann::json out;
-    // Deprecated key kept for old readers; same value as internal_job_id.
-    out["instance_id"] = format_internal_id(record.job.JobID);
-    out["internal_job_id"] = format_internal_id(record.job.JobID);
-    out["native_job_id"] = record.job.NativeJobID;
+    // The one job handle this surface emits: the record id as a decimal string.
+    out["JobID"] = format_job_id(record.job.JobID);
+    out["JobNativeID"] = record.job.JobNativeID;
     // Accepted: the durable record revision the command committed.
-    out["record_revision"] = revision;
+    out["revision"] = revision;
     out["mode"] = to_string(selection.mode());
     out["desired_collectors"] = desired;
     // Actual: the runtime's own state, sampled after the commit. It may still
@@ -526,7 +522,7 @@ std::optional<NativeSelector> legacy_add_selector(Job& job, const JobRegistry& r
         return std::nullopt;
     }
     NativeSelector selector = adapter->registrationSelector(job);
-    if (selector.cluster_name.empty() || selector.native_job_id.empty()) return std::nullopt;
+    if (selector.clusterName.empty() || selector.job_native_id.empty()) return std::nullopt;
     return selector;
 }
 
@@ -573,7 +569,7 @@ nlohmann::json remove_jobs(JobRegistry& registry, const nlohmann::json& req, boo
 {
     std::vector<uint64_t> targets;
     if (req.contains("JobID") && !req["JobID"].is_null()) {
-        const auto parsed = parse_legacy_job_id(req["JobID"]);
+        const auto parsed = parse_job_id(req["JobID"]);
         if (parsed.status == LegacyIdStatus::Invalid)
             return error_payload("invalid_request",
                                  "invalid JobID: expected a uint64 number or decimal string");
@@ -599,10 +595,10 @@ nlohmann::json remove_jobs(JobRegistry& registry, const nlohmann::json& req, boo
                     "remove_failed",
                     fmt::format("could not retire instance {}; the record stays "
                                 "active and the command is retryable",
-                                format_internal_id(id)));
+                                format_job_id(id)));
             }
             ++erased;
-            erased_instances.push_back(format_internal_id(id));
+            erased_instances.push_back(format_job_id(id));
         }
         nlohmann::json out;
         out["status"] = "success";
@@ -640,11 +636,11 @@ nlohmann::json remove_jobs(JobRegistry& registry, const nlohmann::json& req, boo
             return error_payload(to_string(outcome.error), outcome.message);
         }
         ++stopped;
-        stopped_instances.push_back(outcome.targets.front().instance_id);
+        stopped_instances.push_back(format_job_id(outcome.targets.front().job_id));
         const auto& target = outcome.targets.front();
         if (!target.actual.error.empty()) {
             apply_errors.push_back(nlohmann::json{
-                {"instance_id", target.instance_id},
+                {"JobID", format_job_id(target.job_id)},
                 {"code", "apply_failed"},
                 {"message", target.actual.error},
             });
@@ -779,8 +775,8 @@ nlohmann::json joblens_status_payload(JobRegistry& registry)
     uint64_t suspect = 0;
     uint64_t closing = 0;
     for (const auto& record : registry.jobRecords()) {
-        if (is_reserved_internal_id(record.job.JobID)) continue;
-        if (!record.verified) ++suspect;
+        if (is_reserved_job_id(record.job.JobID)) continue;
+        if (!record.presumed_live) ++suspect;
         else if (record.state == RecordState::Closing) ++closing;
         else ++active;
     }

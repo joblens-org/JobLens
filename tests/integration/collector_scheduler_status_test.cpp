@@ -249,7 +249,7 @@ struct CollectorSchedulerTestAccess {
         auto& state = scheduler.collector_state_dict.at(name);
         std::lock_guard lock(state.snapshot_m_);
         const auto it = state.job_snapshots.find(job_id);
-        return it == state.job_snapshots.end() ? std::string{} : it->second.NativeJobID;
+        return it == state.job_snapshots.end() ? std::string{} : it->second.JobNativeID;
     }
     static uint64_t attachToken(CollectorScheduler& scheduler, uint64_t job_id) {
         std::lock_guard lock(scheduler.m_);
@@ -391,9 +391,9 @@ void check(bool condition, const std::string& message) {
 
 // JobRegistry::hasInstance() was removed as a production-dead API; active-only
 // is derived from the record state so the assertion semantics stay unchanged.
-static bool has_active(const JobRegistry& registry, uint64_t internal_id)
+static bool has_active(const JobRegistry& registry, uint64_t job_id)
 {
-    const auto record = registry.jobRecord(internal_id);
+    const auto record = registry.jobRecord(job_id);
     return record.has_value() && record->state != RecordState::Closing;
 }
 std::string hex_id(uint64_t id) {
@@ -471,7 +471,7 @@ void run(const std::string& base) {
     Config::instance(base + ".yaml");
     WriterManager::instance().registerWriter<DrainCaptureWriter>("DrainCaptureWriter");
     auto& scheduler = CollectorScheduler::instance();
-    JobRegistry::instance().delJob(0);
+    JobRegistry::instance().retireJob(0);
     std::vector<std::string> early_timer_failures;
     const auto timer_test = [&](const char* name, const std::function<void()>& body) {
         try { body(); }
@@ -620,10 +620,10 @@ void run(const std::string& base) {
             if (!available_.load()) return false;
             return inner_.runtimeRecords(out);
         }
-        bool runtimeRecord(uint64_t internal_id,
+        bool runtimeRecord(uint64_t job_id,
                            std::optional<JobRecord>& out) const override {
             if (!available_.load()) return false;
-            return inner_.runtimeRecord(internal_id, out);
+            return inner_.runtimeRecord(job_id, out);
         }
         void setAvailable(bool value) { available_.store(value); }
     private:
@@ -719,7 +719,7 @@ void run(const std::string& base) {
     }
 
     // The accepted stop applies once the source is readable again. The record
-    // stays Open (persistent stop), so the System view is Updated, not Removed.
+    // stays Active (persistent stop), so the System view is Updated, not Removed.
     gate.setAvailable(true);
     CollectorSchedulerTestAccess::reconcile(scheduler);
     check(life_removed.load() == 1,
@@ -727,7 +727,7 @@ void run(const std::string& base) {
     check(registry.actualCollection(456).collectors.empty(),
           "nothing may remain attached after the persistent stop");
     check(sys_removed.load() == 0,
-          "a stopped but still Open record must stay in the System view");
+          "a stopped but still Active record must stay in the System view");
 
     // Reattach: the same scope gets a strictly greater token.
     CollectionRequest rebind;
@@ -745,7 +745,7 @@ void run(const std::string& base) {
           "a reattach must get a strictly greater attach token");
 
     // Job 结束 → removed；重复摘除不重复投递
-    registry.delJob(456);
+    registry.retireJob(456);
     CollectorSchedulerTestAccess::reconcile(scheduler);
     check(life_removed.load() == 2, "on_job_removed fired on job removal");
     check(sys_removed.load() == 1,
@@ -769,11 +769,11 @@ void run(const std::string& base) {
             out = records_;
             return true;
         }
-        bool runtimeRecord(uint64_t internal_id,
+        bool runtimeRecord(uint64_t job_id,
                            std::optional<JobRecord>& out) const override {
             std::lock_guard lock(mutex_);
             for (const auto& record : records_) {
-                if (record.job.JobID != internal_id) continue;
+                if (record.job.JobID != job_id) continue;
                 out = record;
                 return true;
             }
@@ -786,20 +786,20 @@ void run(const std::string& base) {
     };
     class CompletionSink final : public IDrainCompletionSink {
     public:
-        void onDrained(uint64_t internal_id) override {
+        void onDrained(uint64_t job_id) override {
             std::lock_guard lock(mutex_);
-            completed_.push_back(internal_id);
+            completed_.push_back(job_id);
             cv_.notify_all();
         }
-        size_t count(uint64_t internal_id) const {
+        size_t count(uint64_t job_id) const {
             std::lock_guard lock(mutex_);
             return static_cast<size_t>(
-                std::count(completed_.begin(), completed_.end(), internal_id));
+                std::count(completed_.begin(), completed_.end(), job_id));
         }
-        bool wait_for(uint64_t internal_id) {
+        bool wait_for(uint64_t job_id) {
             std::unique_lock lock(mutex_);
             return cv_.wait_for(lock, std::chrono::seconds(5), [&] {
-                return std::count(completed_.begin(), completed_.end(), internal_id) != 0;
+                return std::count(completed_.begin(), completed_.end(), job_id) != 0;
             });
         }
     private:
@@ -814,7 +814,7 @@ void run(const std::string& base) {
         record.state = state;
         record.revision = 1;
         record.job.JobID = id;
-        record.job.NativeJobID = std::to_string(id);
+        record.job.JobNativeID = std::to_string(id);
         record.job.jobtype = JobType::Sys;
         record.job.subtype = JobSubType::Common;
         record.job.sub_attr = CommonJobAttr{.auto_update_child = false};
@@ -865,7 +865,7 @@ void run(const std::string& base) {
     };
 
     run_regression("closing-drain", [&] {
-        // Regression 1: an Open record selecting two event collectors.
+        // Regression 1: an Active record selecting two event collectors.
         close_source.set({record_of(7001, RecordState::Active, {"ev_a", "ev_b"})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(close_added.load() == 2, "both event collectors must attach");
@@ -925,11 +925,11 @@ void run(const std::string& base) {
     });
 
     run_regression("reselect-epoch", [&] {
-        // Regression 2: Open -> persistent stop -> reselect while the stopped
+        // Regression 2: Active -> persistent stop -> reselect while the stopped
         // attachment's tail is still pending. The old close must never consume the
         // reselected attachment's snapshot, token or membership.
         JobRecord epoch = record_of(7002, RecordState::Active, {"ev_c"});
-        epoch.job.NativeJobID = "epoch-1";
+        epoch.job.JobNativeID = "epoch-1";
         close_source.set({epoch});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(CollectorSchedulerTestAccess::memberCount(scheduler, "ev_c") == 1,
@@ -955,7 +955,7 @@ void run(const std::string& base) {
         // Reselect before the lane ran. The reattach is deferred: it must not
         // install a newer snapshot/token that the old close would then see.
         JobRecord reselected = record_of(7002, RecordState::Active, {"ev_c"});
-        reselected.job.NativeJobID = "epoch-2";
+        reselected.job.JobNativeID = "epoch-2";
         close_source.set({reselected});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(CollectorSchedulerTestAccess::memberCount(scheduler, "ev_c") == 0,
@@ -1066,7 +1066,7 @@ void run(const std::string& base) {
     });
 
     run_regression("late-closing-one-stopped", [&] {
-        // An Open manual stop leaves a deferred tail on a lane that no longer
+        // An Active manual stop leaves a deferred tail on a lane that no longer
         // holds membership. If the record becomes Closing before that tail is
         // drained, the Closing boundary must adopt that obligation: the count
         // is attached holders + that lane's existing pending close.
@@ -1078,7 +1078,7 @@ void run(const std::string& base) {
         CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_d");
         CollectorSchedulerTestAccess::pauseLane(scheduler, "ev_e");
 
-        // Manual stop of ev_d while the record is still Open.
+        // Manual stop of ev_d while the record is still Active.
         close_source.set({record_of(7101, RecordState::Active, {"ev_e"})});
         CollectorSchedulerTestAccess::reconcile(scheduler);
         check(CollectorSchedulerTestAccess::pendingCloses(scheduler, "ev_d") == 1 &&
@@ -1482,7 +1482,7 @@ void run(const std::string& base) {
             CollectorSchedulerTestAccess::pauseLane(scheduler, first);
             CollectorSchedulerTestAccess::pauseLane(scheduler, second);
             if (stop_first_lane) {
-                // Real manual stop while the record is still Open: the lane owes
+                // Real manual stop while the record is still Active: the lane owes
                 // a tail but holds no membership when the record turns Closing.
                 CollectionRequest stop_one;
                 stop_one.targets = {id};
@@ -1587,10 +1587,10 @@ void run(const std::string& base) {
             out = records;
             return true;
         }
-        bool runtimeRecord(uint64_t internal_id,
+        bool runtimeRecord(uint64_t job_id,
                            std::optional<JobRecord>& out) const override {
             for (const auto& record : records) {
-                if (record.job.JobID == internal_id) {
+                if (record.job.JobID == job_id) {
                     out = record;
                     return true;
                 }

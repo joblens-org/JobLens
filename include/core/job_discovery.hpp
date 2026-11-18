@@ -30,7 +30,7 @@
 // Two rules are structural rather than conventional:
 //
 //   1. A discovered Job either is ready (resolvable identity plus a complete
-//      execution generation) or is explicitly incomplete with a reason on the
+//      execution manager) or is explicitly incomplete with a reason on the
 //      execution group. There is no "best effort" middle state, and an
 //      incomplete discovery is not eligible for automatic collection or for
 //      retirement decisions.
@@ -88,7 +88,7 @@ struct DiscoveryEnvironment {
     // Resolved scheduler cluster namespaces. Empty means "derive from the
     // source itself" (Condor: COLLECTOR_HOST, Slurm: SLURM_CLUSTER_NAME).
     // Neither value is ever guessed from a native job number.
-    std::string cluster_name;
+    std::string clusterName;
 };
 
 // ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ inline std::string join_source_notes(const std::vector<std::string>& notes)
 
 // One discovery pass' manager inputs: the processes that supervise exactly one
 // execution of this scheduler (Condor: condor_starter; Slurm: slurmstepd).
-// Deliberately carries no Job: reading ads, environments and member sets is the
+// Deliberately carries no Job: reading ads, environments and pid identity sets is the
 // per-manager observe() step, so a pass can decide what is new before paying
 // for any of it.
 struct ManagerSet {
@@ -219,7 +219,7 @@ public:
     virtual void stop() = 0;
 
     // The authoritative manager enumeration of one pass: one entry per live
-    // per-job manager, with no job ad and no member reads. Called once per
+    // per-job manager, with no job ad and no pid identity reads. Called once per
     // registry pass. It owns the source health of that pass: it stamps
     // last_scan_start_ms, consumes a pending rescan request, and sets
     // Healthy/Degraded from its coverage. The caller then pays observe() only

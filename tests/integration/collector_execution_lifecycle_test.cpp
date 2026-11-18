@@ -300,7 +300,7 @@ Job make_job(uint64_t id, std::vector<std::string> collectors)
 {
     Job job;
     job.JobID = id;
-    job.NativeJobID = std::to_string(id);
+    job.JobNativeID = std::to_string(id);
     job.jobtype = JobType::Job;
     job.subtype = JobSubType::Common;
     set_pids(job, {getpid()});
@@ -403,7 +403,7 @@ void run(const std::string& base)
     check(two[1]->sample->job.JobID == 202, "second Job event attribution");
 
     // One Job ends; the other continues through the same source/lane.
-    JobRegistry::instance().delJob(101);
+    JobRegistry::instance().retireJob(101);
     eventually([&] { return JobRegistry::instance().closingJobCount() == 0; },
                "closing Job was not acknowledged by all collectors");
     eventually([&] { return FakeJobEvent::removed.load() >= 1; },
@@ -423,7 +423,7 @@ void run(const std::string& base)
     check(scheduler.snapshot().at("scheduler").at("scheduling_semantics_version") == 2,
           "scheduling semantics version missing");
 
-    JobRegistry::instance().delJob(202);
+    JobRegistry::instance().retireJob(202);
     eventually([&] { return JobRegistry::instance().closingJobCount() == 0; },
                "last Job was not acknowledged");
 
@@ -450,13 +450,13 @@ void run(const std::string& base)
     const auto upsert = [](const std::string& native) {
         NativeSelector selector;
         selector.adapter = "condor";
-        selector.cluster_name = "htcondor01";
-        selector.native_job_id = native;
-        ProcessIdentity generation;
-        generation.boot_id = "test-boot";
-        generation.pid = getpid();
-        generation.start_ticks = 1;
-        Job job = discovered_job(selector, generation,
+        selector.clusterName = "htcondor01";
+        selector.job_native_id = native;
+        ProcessIdentity manager;
+        manager.boot_id = "test-boot";
+        manager.pid = getpid();
+        manager.start_ticks = 1;
+        Job job = discovered_job(selector, manager,
                                  {ProcessIdentity{getpid(), 1, "test-boot"}}, true);
         job.subtype = JobSubType::Condor;
         CondorJobAttr attr;
@@ -474,7 +474,7 @@ void run(const std::string& base)
     const int added_before_bind = FakeJobEvent::added.load();
 
     CollectionRequest bind;
-    bind.targets = {bound.internal_id};
+    bind.targets = {bound.job_id};
     bind.collectors = std::vector<std::string>{"job_event"};
     const auto bound_outcome = JobRegistry::instance().setCollectors(bind);
     check(bound_outcome.ok, "set must be accepted: " + bound_outcome.message);
@@ -486,17 +486,17 @@ void run(const std::string& base)
         return FakeJobEvent::added.load() > added_before_bind &&
                collector_status(scheduler, "job_event").at("job_count").get<size_t>() == 1;
     }, "on_job_added must run when the runtime attaches the lane");
-    const auto attached = JobRegistry::instance().actualCollection(bound.internal_id);
+    const auto attached = JobRegistry::instance().actualCollection(bound.job_id);
     check(attached.tracked &&
               attached.collectors == std::vector<std::string>{"job_event"},
           "actual collectors must name the attached lane");
-    const auto attached_record = JobRegistry::instance().jobRecord(bound.internal_id);
+    const auto attached_record = JobRegistry::instance().jobRecord(bound.job_id);
     check(attached_record.has_value() &&
               attached.last_revision == attached_record->revision,
           "the actual state must name the record revision it converged to");
 
     // The bound instance produces events through the existing source.
-    FakeJobEvent::extra_job_id.store(bound.internal_id);
+    FakeJobEvent::extra_job_id.store(bound.job_id);
     send_byte(FakeJobEvent::writer_fd.load(), '3');
     eventually([&] {
         return CaptureWriter::count("job_event") >= 3;
@@ -505,7 +505,7 @@ void run(const std::string& base)
     // A persistent stop detaches the lane but keeps the job record.
     const int removed_before_stop = FakeJobEvent::removed.load();
     CollectionRequest stop;
-    stop.targets = {bound.internal_id};
+    stop.targets = {bound.job_id};
     stop.collectors = std::vector<std::string>{};
     const auto stopped = JobRegistry::instance().setCollectors(stop);
     check(stopped.ok, "stop must be accepted: " + stopped.message);
@@ -513,13 +513,13 @@ void run(const std::string& base)
         return FakeJobEvent::removed.load() > removed_before_stop &&
                collector_status(scheduler, "job_event").at("job_count").get<size_t>() == 0;
     }, "on_job_removed must run when a stop detaches the lane");
-    check(JobRegistry::instance().actualCollection(bound.internal_id).collectors.empty(),
+    check(JobRegistry::instance().actualCollection(bound.job_id).collectors.empty(),
           "nothing may remain applied after a persistent stop");
-    check(JobRegistry::instance().findJob(bound.internal_id).has_value(),
+    check(JobRegistry::instance().findJob(bound.job_id).has_value(),
           "stopping collection must keep the job record");
 
     // Retirement of a stopped instance is acknowledged without leaving a lane.
-    check(JobRegistry::instance().retireInstance(bound.internal_id),
+    check(JobRegistry::instance().retireInstance(bound.job_id),
           "retire the stopped instance");
     eventually([&] { return JobRegistry::instance().closingJobCount() == 0; },
                "stopped instance was not acknowledged after retirement");
@@ -528,11 +528,11 @@ void run(const std::string& base)
     const auto bound_two = upsert("701.0");
     check(bound_two.ok, "second job upsert");
     CollectionRequest bind_two;
-    bind_two.targets = {bound_two.internal_id};
+    bind_two.targets = {bound_two.job_id};
     bind_two.collectors = std::vector<std::string>{"job_event"};
     check(JobRegistry::instance().setCollectors(bind_two).ok, "second bind");
     const int removed_before_retire = FakeJobEvent::removed.load();
-    check(JobRegistry::instance().retireInstance(bound_two.internal_id),
+    check(JobRegistry::instance().retireInstance(bound_two.job_id),
           "retire the bound instance");
     eventually([&] { return JobRegistry::instance().closingJobCount() == 0; },
                "bound instance was not acknowledged after retirement");
@@ -559,7 +559,7 @@ void run(const std::string& base)
     check(registry.setCollectors(stop_failed).ok, "manual stop of failed event lane must be accepted");
     eventually([&] { return collector_status(scheduler, "job_event").at("job_count") == 0; },
                "manual stop did not detach the failed job");
-    registry.delJob(303);
+    registry.retireJob(303);
     eventually([&] { return scheduler.actual(303).draining; }, "failed drain not owned by scheduler");
     check(!registry.cleanupClosingJobs(), "shutdown sweep must refuse an unproven live drain");
     check(registry.jobRecord(303).has_value(), "unproven live drain must remain Closing");

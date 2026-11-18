@@ -22,7 +22,7 @@
 // commit() with the resulting rows; the store never interprets them.
 //
 // A JobRecord is "a Job plus what JobLens must remember to manage it":
-// execution evidence (identity, generation, members), the durable lifecycle
+// execution evidence (identity, manager, pid identities), the durable lifecycle
 // state (active | closing), and the desired collection selection. Which
 // collectors are actually attached is owned by the collection runtime and is
 // never persisted here.
@@ -32,7 +32,7 @@
 //   h:  archived history (final record + applied-collector snapshot)
 //   c:  durable allocator high-water mark
 //   m:  schema version, Agent DB UUID, id-exhaustion marker
-//   i:  canonical identity key -> internal ID
+//   i:  canonical identity key -> job ID
 //
 // Schema 4 replaces schema 3's separate intent object (its own revision plus a
 // separate facts revision) with one `selection` object ordered by the record's
@@ -118,10 +118,10 @@ struct CollectionSelection {
     }
 };
 
-// Canonical member-list form of a durable row: sorted by (pid, start_ticks)
+// Canonical pid identity list form of a durable row: sorted by (pid, start_ticks)
 // and deduplicated. Shared by the row codec (parse_record) and the registry's
 // merge path so both write the same j: image.
-std::vector<ProcessIdentity> normalized_processes(std::vector<ProcessIdentity> processes);
+std::vector<ProcessIdentity> normalized_pid_identities(std::vector<ProcessIdentity> processes);
 
 struct StoreHealth {
     bool db_running = false;
@@ -170,19 +170,19 @@ enum class StoreFaultMode {
 // its JobID and CollectorNames are deliberately ignored: registry upserts
 // never allocate a caller-chosen ID and never activate collection.
 //
-// `members_complete` mirrors the discovery flag: true means the process list
-// is authoritative, an empty list included ("read succeeded, no members");
-// false means the member set is only partially known, so an empty list must
-// never erase stored members.
+// `pid_identities_authoritative` mirrors the discovery flag: true means the
+// pid identity list is authoritative, an empty list included ("read succeeded,
+// no pid identities"); false means the set is only partially known, so an
+// empty list must never erase stored pid identities.
 // ---------------------------------------------------------------------------
 // JobRecord — the one durable representation
 // ---------------------------------------------------------------------------
 
 // Durable lifecycle state persisted with the record. Closing is written before
 // the collector drain starts, so an interrupted retirement can never resurrect
-// as active. Unverified liveness is NOT a lifecycle state: a restored record is
-// Active unless it is Closing, and an unreadable process is "unknown", never
-// dead.
+// as active. A missing presumed-live verdict (JobRecord::presumed_live ==
+// false) is NOT a lifecycle state: a restored record is Active unless it is
+// Closing, and an unreadable process is "unknown", never dead.
 enum class RecordState {
     Active,
     Closing,
@@ -204,7 +204,7 @@ inline std::optional<RecordState> record_state_from_string(const std::string& ra
 struct JobRecord {
     // The one core object: facts + evidence. Management state below is the
     // only thing the record adds. `job.JobID` is the storage key; there is no
-    // second internal id. A record image never carries intent:
+    // second job id. A record image never carries intent:
     // job.CollectorNames must stay empty — the dispatch projection is built
     // from `selection` when the runtime asks for it.
     Job job;
@@ -222,9 +222,13 @@ struct JobRecord {
     int64_t last_seen_us = 0;
     // --- desired selection (the runtime's actual state is not stored) -----
     CollectionSelection selection;
-    // Last liveness verdict. Not a lifecycle state, not persisted: rebuilt by
-    // the load pass and by the heartbeat's absence evaluation.
-    bool verified = true;
+    // Last liveness verdict for this execution: true when the execution is
+    // presumed still present (not absent). It is NOT an identity check — the
+    // manager triple in the evidence is what names the run. Not a lifecycle
+    // state, not persisted: rebuilt by the load pass and by the heartbeat's
+    // absence evaluation. Its opposite is the `suspect` count the status
+    // surface reports (see jobs health: suspect = !presumed_live).
+    bool presumed_live = true;
 };
 
 // ---------------------------------------------------------------------------
@@ -298,9 +302,9 @@ public:
     // stale entry the next create's PutIdentity overwrites).
     std::optional<JobRecord> readRowByIdentity(const SchedulerKey& key);
 
-    // --- internal id allocation ------------------------------------------
+    // --- job id allocation ------------------------------------------
     uint64_t nextJobId();   // ready-checked; 0 when the store is not ready
-    // In-memory half of a single-batch create: reserves the next internal id
+    // In-memory half of a single-batch create: reserves the next job id
     // (burned even when the paired commit() later fails — ids are never
     // reused) and reports the durable counter value the ReserveCounter op
     // must carry, so a new instance costs one batch instead of two commits.
@@ -339,7 +343,7 @@ public:
             PutHistory,
             ReserveCounter,
         } kind = PutRecord;
-        uint64_t internal_id = 0;
+        uint64_t job_id = 0;
         std::optional<JobRecord> record;              // PutRecord / PutHistory
         std::optional<SchedulerKey> key;              // i: operations
         // PutHistory: hex end-time suffix of the h: key; empty = stamped by
@@ -428,7 +432,7 @@ private:    // Injected by the registry; see setRowProvider.
     // owned it. Recovery re-asserts this image instead of rebuilding one from
     // memory, which would invent a different timestamp and summary.
     struct ArchiveFence {
-        uint64_t internal_id = 0;
+        uint64_t job_id = 0;
         std::string history_key;
         std::string history_value;
         std::string identity_key;   // empty when there is nothing to release
@@ -436,7 +440,7 @@ private:    // Injected by the registry; see setRowProvider.
     // Reads the durable `h:` row for an instance whose `j:` row is gone. Fails
     // when there is no history row (nothing to prove) or more than one (an
     // image this process cannot disambiguate).
-    bool read_archive_fence_locked(uint64_t internal_id, ArchiveFence& fence,
+    bool read_archive_fence_locked(uint64_t job_id, ArchiveFence& fence,
                                    std::string& error);
     // Reads one durable row and hands it back for adoption. `archive` is set
     // when the row was archived: the recovered history image must be fenced.
@@ -444,7 +448,7 @@ private:    // Injected by the registry; see setRowProvider.
     // was delete-only: the deletion landed and the fence re-asserts it by
     // deleting the row again. Returns false only when the outcome is still
     // unknown (a read error or an image that cannot be proven).
-    bool adopt_durable_locked(uint64_t internal_id, std::optional<ArchiveFence>& archive,
+    bool adopt_durable_locked(uint64_t job_id, std::optional<ArchiveFence>& archive,
                               bool& delete_confirmed, JobRecord& adopted_record,
                               std::string& error);
     // Phase-1 helper of recover_pending_locked (callers hold db_mtx_).
@@ -452,7 +456,7 @@ private:    // Injected by the registry; see setRowProvider.
                             std::vector<JobRecord>& adopted,
                             std::vector<uint64_t>& removed, std::string& error);
     // Marks one record / binding as "written but not yet fsynced".
-    void mark_record_dirty(uint64_t internal_id);
+    void mark_record_dirty(uint64_t job_id);
     void record_store_failure(const std::string& message);
     void record_store_success();
     // Reads the durable `i:` owner of one identity. Returns false on a read

@@ -95,8 +95,8 @@ public:
     // ---- structured namespace: pool routing label + schedd name -----------
     NamespaceFacts namespaceFacts(const Job& job) const override;
     NamespaceFacts selectorNamespaceFacts(const NativeSelector& selector) const override;
-    bool adoptNamespaceAliases(Job& job, const std::string& cluster_name,
-                               const std::string& cluster_tag) const override;
+    bool adoptNamespaceAliases(Job& job, const std::string& clusterName,
+                               const std::string& clusterTag) const override;
     void renderNamespace(Job& job) const override;
     std::string cgroupPathOf(const Job& job) const override;
 

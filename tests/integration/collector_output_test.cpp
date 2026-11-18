@@ -114,7 +114,7 @@ struct NativeSystemCollector : IPeriodicSystemCollector {
 Job job_for(uint64_t id, const std::vector<std::string>& collectors) {
     Job job;
     job.JobID = id;
-    job.NativeJobID = std::to_string(id);
+    job.JobNativeID = std::to_string(id);
     job.jobtype = JobType::Sys;
     job.subtype = JobSubType::Common;
     job.sub_attr = CommonJobAttr{.auto_update_child = false};
@@ -303,8 +303,8 @@ void run(const std::string& base) {
     const auto status = rpc(socket_path, "CollectorScheduler/status");
     check(status["operation_semantics_version"] == 2, "missing operation_semantics_version 2");
 
-    JobRegistry::instance().delJob(9001);
-    JobRegistry::instance().delJob(9002);
+    JobRegistry::instance().retireJob(9001);
+    JobRegistry::instance().retireJob(9002);
     scheduler.shutdown();
     WriterManager::instance().shutdown();
     server.stop();

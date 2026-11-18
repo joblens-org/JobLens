@@ -50,7 +50,7 @@ struct CondorAdIdentity {
     std::string global_job_id;   // raw field value as written in the ad
     std::string scheduler_name;  // schedd namespace, e.g. "scheduler@schedd07.example"
     std::string scheduler_host;  // schedd host part, e.g. "schedd07.example"
-    std::string native_job_id;   // "ClusterId.ProcId" as written in the ad
+    std::string job_native_id;   // "ClusterId.ProcId" as written in the ad
     std::string owner;
 };
 
@@ -137,12 +137,12 @@ inline std::optional<CondorAdIdentity> parse_ad_identity(const std::string& cont
     if (at != std::string::npos && at < first_sharp)
         ad.scheduler_host = ad.global_job_id.substr(at + 1, first_sharp - at - 1);
 
-    ad.native_job_id =
+    ad.job_native_id =
         ad.global_job_id.substr(first_sharp + 1, second_sharp - first_sharp - 1);
-    const auto dot = ad.native_job_id.find('.');
+    const auto dot = ad.job_native_id.find('.');
     if (dot == std::string::npos ||
-        !detail::is_decimal_part(ad.native_job_id.substr(0, dot)) ||
-        !detail::is_decimal_part(ad.native_job_id.substr(dot + 1))) {
+        !detail::is_decimal_part(ad.job_native_id.substr(0, dot)) ||
+        !detail::is_decimal_part(ad.job_native_id.substr(dot + 1))) {
         error = "GlobalJobId '" + ad.global_job_id + "' has an unparsable native job id";
         return std::nullopt;
     }
@@ -224,8 +224,8 @@ inline bool probe_groups(Job& job) {
     std::string content, error;
     if (!read_ad_content(ad_path, content, error)) return bail("cannot read job ad");
     const auto identity = parse_ad_identity(content, error);
-    if (!identity || (!job.NativeJobID.empty() && identity->native_job_id != job.NativeJobID)) {
-        return bail("GlobalJobId missing or does not match NativeJobID");
+    if (!identity || (!job.JobNativeID.empty() && identity->job_native_id != job.JobNativeID)) {
+        return bail("GlobalJobId missing or does not match JobNativeID");
     }
 
     // 3) 读取并校验组值

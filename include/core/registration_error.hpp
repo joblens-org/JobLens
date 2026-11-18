@@ -36,7 +36,7 @@ enum class RegistrationError {
     WriteOutcomeUnknown,
     IdExhausted,
     // Lifecycle/identity conflicts: retrying without new evidence cannot help.
-    GenerationConflict,
+    ManagerConflict,
     InstanceClosing,
     IdentityQuarantined,
     IdentityIndexMismatch,

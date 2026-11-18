@@ -188,14 +188,14 @@ CgroupMembershipProbe make_cgroup_membership_probe()
         while (std::getline(lines, line)) {
             if (line.empty()) continue;
             try {
-                result.members.push_back(static_cast<pid_t>(std::stol(line)));
+                result.pids.push_back(static_cast<pid_t>(std::stol(line)));
             } catch (const std::exception&) {
                 result.error = "unparsable cgroup member '" + line + "'";
-                result.members.clear();
+                result.pids.clear();
                 return result;
             }
         }
-        std::sort(result.members.begin(), result.members.end());
+        std::sort(result.pids.begin(), result.pids.end());
         result.readable = true;
         return result;
     };

@@ -23,20 +23,21 @@
 #include <vector>
 
 inline Job discovered_job(NativeSelector selector, ProcessIdentity manager,
-                          std::vector<ProcessIdentity> members, bool members_complete,
+                          std::vector<ProcessIdentity> pid_identities,
+                          bool pid_identities_complete,
                           std::int64_t read_at_us = 0)
 {
     Job job;
     job.subtype_name = selector.adapter;
-    job.NativeJobID = selector.native_job_id;
+    job.JobNativeID = selector.job_native_id;
     // A discovery source hands over typed facts (the single namespace
     // source) plus their rendered common fields, exactly like the watchers.
     if (selector.adapter == "condor") {
         job.subtype = JobSubType::Condor;
         auto attr = CondorJobAttr{};
-        attr.collector_host = selector.cluster_name;
-        attr.scheduler_name = selector.cluster_tag;
-        if (const auto parsed = parse_condor_native(selector.native_job_id)) {
+        attr.collector_host = selector.clusterName;
+        attr.scheduler_name = selector.clusterTag;
+        if (const auto parsed = parse_condor_native(selector.job_native_id)) {
             attr.cluster_id = std::stoull(parsed->cluster);
             attr.proc_id = std::stoull(parsed->proc);
         }
@@ -44,9 +45,9 @@ inline Job discovered_job(NativeSelector selector, ProcessIdentity manager,
     } else if (selector.adapter == "slurm") {
         job.subtype = JobSubType::Slurm;
         auto attr = SlurmJobAttr{};
-        attr.cluster_name = selector.cluster_name;
+        attr.clusterName = selector.clusterName;
         try {
-            attr.job_id = std::stoull(selector.native_job_id);
+            attr.job_id = std::stoull(selector.job_native_id);
         } catch (const std::exception&) {
             attr.job_id = 0;
         }
@@ -55,12 +56,12 @@ inline Job discovered_job(NativeSelector selector, ProcessIdentity manager,
         }
         job.sub_attr = std::move(attr);
     }
-    job.cluster_name = selector.cluster_name;
-    job.clusterTag = selector.cluster_tag;
+    job.clusterName = selector.clusterName;
+    job.clusterTag = selector.clusterTag;
     job.jobtype = JobType::Job;
     job.execution.manager = std::move(manager);
-    job.execution.members = std::move(members);
-    job.execution.members_authoritative = members_complete;
+    job.execution.pid_identities = std::move(pid_identities);
+    job.execution.pid_identities_authoritative = pid_identities_complete;
     (void)read_at_us;
     return job;
 }

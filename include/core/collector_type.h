@@ -224,13 +224,13 @@ struct SubAttrMatcher {
 // local run produced them; the job itself is named by the facts.
 struct Job {
     uint64_t                              JobID{};
-    std::string                           NativeJobID{};   // 调度器原生作业ID字符串，用于查询（Condor: cluster_id.proc_id, Slurm: job_id.step_id）
+    std::string                           JobNativeID{};   // 调度器原生作业ID字符串，用于查询（Condor: cluster_id.proc_id, Slurm: job_id.step_id）
     // 命名空间公共字段是 typed sub_attr 的渲染投影（ES job_info 查询契约），
     // 不是第二事实源：哪个 attr 字段喂哪个分量由 adapter 拥有
-    //（Condor: collector_host/scheduler_name, Slurm: cluster_name）。比较、
+    //（Condor: collector_host/scheduler_name, Slurm: cluster name）。比较、
     // 判重与注入永远走结构化事实（ISchedulerAdapter 的 namespace 接口）。
     std::string                           clusterTag{};    // 渲染：调度器标签（Condor=schedd 名）
-    std::string                           cluster_name{};  // 渲染：集群名（Condor=COLLECTOR_HOST, Slurm=SLURM_CLUSTER_NAME）
+    std::string                           clusterName{};   // 渲染：集群名（Condor=COLLECTOR_HOST, Slurm=SLURM_CLUSTER_NAME）
     JobType                                 jobtype{JobType::Unknown};
     JobSubType                              subtype{JobSubType::Unknown};
     // Projection of identity.adapter. Persisted next to the numeric subtype
@@ -270,9 +270,9 @@ struct Job {
     static constexpr auto reflection() {
         return std::make_tuple(
             std::make_pair("JobID", &Job::JobID),
-            std::make_pair("NativeJobID", &Job::NativeJobID),
+            std::make_pair("JobNativeID", &Job::JobNativeID),
             std::make_pair("clusterTag", &Job::clusterTag),
-            std::make_pair("cluster_name", &Job::cluster_name),
+            std::make_pair("clusterName", &Job::clusterName),
             std::make_pair("jobtype", &Job::jobtype),
             std::make_pair("subtype", &Job::subtype),
             std::make_pair("sub_attr", &Job::sub_attr)
@@ -307,9 +307,9 @@ inline NativeSelector selector_of(const Job& job) {
         if (const char* name = adapter_name_for(job.subtype))
             selector.adapter = name;
     }
-    selector.cluster_name = job.cluster_name;
-    selector.cluster_tag = job.clusterTag;
-    selector.native_job_id = job.NativeJobID;
+    selector.clusterName = job.clusterName;
+    selector.clusterTag = job.clusterTag;
+    selector.job_native_id = job.JobNativeID;
     return selector;
 }
 
@@ -317,16 +317,17 @@ inline const ProcessIdentity& manager_of(const Job& job) {
     return job.execution.manager;
 }
 
-inline const std::vector<ProcessIdentity>& members_of(const Job& job) {
-    return job.execution.members;
+inline const std::vector<ProcessIdentity>& pid_identities_of(const Job& job) {
+    return job.execution.pid_identities;
 }
 
 // The collector-facing pid projection of the one process set. There is no
 // separate bare pid list on the Job: the evidence is authoritative.
 inline std::vector<pid_t> pids_of(const Job& job) {
     std::vector<pid_t> pids;
-    pids.reserve(job.execution.members.size());
-    for (const auto& member : job.execution.members) pids.push_back(member.pid);
+    pids.reserve(job.execution.pid_identities.size());
+    for (const auto& pid_identity : job.execution.pid_identities)
+        pids.push_back(pid_identity.pid);
     return pids;
 }
 
@@ -338,9 +339,9 @@ inline void set_pids(Job& job, std::vector<pid_t> pids) {
     kept.reserve(pids.size());
     for (const pid_t pid : pids) {
         const auto existing = std::find_if(
-            job.execution.members.begin(), job.execution.members.end(),
-            [pid](const ProcessIdentity& member) { return member.pid == pid; });
-        if (existing != job.execution.members.end()) kept.push_back(*existing);
+            job.execution.pid_identities.begin(), job.execution.pid_identities.end(),
+            [pid](const ProcessIdentity& pid_identity) { return pid_identity.pid == pid; });
+        if (existing != job.execution.pid_identities.end()) kept.push_back(*existing);
         else kept.push_back(ProcessIdentity{pid, 0, std::string{}});
     }
     std::sort(kept.begin(), kept.end(),
@@ -352,13 +353,13 @@ inline void set_pids(Job& job, std::vector<pid_t> pids) {
                                return lhs.pid == rhs.pid;
                            }),
                kept.end());
-    job.execution.members = std::move(kept);
+    job.execution.pid_identities = std::move(kept);
 }
 
 // True only when the source read the execution scope successfully: an empty
-// member list without this flag is "unknown", not "confirmed empty".
-inline bool members_authoritative_of(const Job& job) {
-    return job.execution.members_authoritative;
+// pid identity list without this flag is "unknown", not "confirmed empty".
+inline bool pid_identities_authoritative_of(const Job& job) {
+    return job.execution.pid_identities_authoritative;
 }
 
 // Job 级匹配：开放世界名字（subtype_name）先于字段匹配——新调度器的作业
@@ -420,9 +421,9 @@ inline sol::object to_lua(sol::state_view lua, const Job& job) {
 inline nlohmann::json dump_job(const Job& job) {
     nlohmann::json j;
     j["JobID"] = job.JobID;
-    j["NativeJobID"] = job.NativeJobID;
+    j["JobNativeID"] = job.JobNativeID;
     j["clusterTag"] = job.clusterTag;
-    j["cluster_name"] = job.cluster_name;
+    j["clusterName"] = job.clusterName;
     j["jobtype"] = to_string(job.jobtype);
     j["subtype"] = to_string(job.subtype);
     j["JobPIDs"] = pids_of(job);
@@ -439,9 +440,9 @@ inline nlohmann::json dump_job(const Job& job) {
 inline nlohmann::json job_to_json(const Job& job) {
     nlohmann::json j = {
         {"JobID",         job.JobID},
-        {"NativeJobID",   job.NativeJobID},
+        {"JobNativeID",   job.JobNativeID},
         {"clusterTag",    job.clusterTag}, 
-        {"cluster_name",  job.cluster_name},
+        {"clusterName",   job.clusterName},
         {"jobtype",       to_string(job.jobtype)},
         {"subtype",       to_string(job.subtype)},
         {"JobPIDs",       pids_of(job)},

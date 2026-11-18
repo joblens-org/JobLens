@@ -44,9 +44,9 @@ NativeSelector condor(const std::string& native, const std::string& tag = "sched
 {
     NativeSelector selector;
     selector.adapter = "condor";
-    selector.cluster_name = cluster;
-    selector.cluster_tag = tag;
-    selector.native_job_id = native;
+    selector.clusterName = cluster;
+    selector.clusterTag = tag;
+    selector.job_native_id = native;
     return selector;
 }
 
@@ -55,8 +55,8 @@ NativeSelector slurm(const std::string& native, const std::string& step = "",
 {
     NativeSelector selector;
     selector.adapter = "slurm";
-    selector.cluster_name = cluster;
-    selector.native_job_id = native;
+    selector.clusterName = cluster;
+    selector.job_native_id = native;
     selector.step_id = step;
     return selector;
 }
@@ -67,7 +67,7 @@ void condor_namespace_separation()
     check(first && second, "valid Condor selectors must canonicalize");
     check(first->key() != second->key(),
           "'12.34' and '123.4' must stay distinct (no digit concatenation)");
-    check(first->native_job_id == "12.34" && second->native_job_id == "123.4",
+    check(first->job_native_id == "12.34" && second->job_native_id == "123.4",
           "original native strings must be preserved");
 
     // Two schedds in one cluster are different namespaces for the same number.
@@ -89,7 +89,7 @@ void condor_namespace_separation()
     const auto plain = canonicalize(condor("12.3"));
     check(padded && plain && padded->key() == plain->key(),
           "leading zeros must not fork one Condor job into two identities");
-    check(padded->native_job_id == "012.3" && plain->native_job_id == "12.3",
+    check(padded->job_native_id == "012.3" && plain->job_native_id == "12.3",
           "preserved strings keep their original form");
     check(padded->canonical_native == "12.3", "canonical native drops padding");
 
@@ -100,7 +100,7 @@ void condor_namespace_separation()
               std::string("invalid Condor native '") + native + "' must not canonicalize");
     }
     NativeSelector no_cluster = condor("12.34");
-    no_cluster.cluster_name.clear();
+    no_cluster.clusterName.clear();
     check(!canonicalize(no_cluster), "missing cluster namespace must fail");
     NativeSelector unknown_type = condor("12.34");
     unknown_type.adapter.clear();
@@ -109,16 +109,16 @@ void condor_namespace_separation()
     with_step.step_id = "1";
     check(!canonicalize(with_step), "Condor selectors cannot carry a step");
 }
-void internal_id_bounds()
+void job_id_bounds()
 {
     const uint64_t above_u32 = 4294967296ULL;              // 2^32
     const uint64_t above_js = 9007199254740993ULL;         // 2^53 + 1
     const uint64_t max_u64 = 18446744073709551615ULL;      // UINT64_MAX
     const uint64_t values[] = {uint64_t{1}, above_u32, above_js, max_u64};
     for (const uint64_t value : values) {
-        const auto text = format_internal_id(value);
+        const auto text = format_job_id(value);
         check(text == std::to_string(value), "decimal-string output");
-        const auto parsed = parse_internal_id(text);
+        const auto parsed = parse_job_id_text(text);
         check(parsed && *parsed == value,
               "uint64 round trip failed for " + std::to_string(value));
     }
@@ -126,33 +126,33 @@ void internal_id_bounds()
     const char* invalid[] = {"", "-1", "+1", " 1", "1 ", "0x10", "1.5", "abc",
                              "18446744073709551616", "99999999999999999999999"};
     for (const auto* text : invalid)
-        check(!parse_internal_id(text).has_value(),
+        check(!parse_job_id_text(text).has_value(),
               std::string("internal ID parse must reject '") + text + "'");
 
-    check(format_internal_id(0) == "0", "sentinel formats as decimal zero");
-    check(is_reserved_internal_id(0), "JobID 0 is the reserved system sentinel");
-    check(!is_reserved_internal_id(1), "JobID 1 is not reserved");
+    check(format_job_id(0) == "0", "sentinel formats as decimal zero");
+    check(is_reserved_job_id(0), "JobID 0 is the reserved system sentinel");
+    check(!is_reserved_job_id(1), "JobID 1 is not reserved");
 
     // Legacy JSON nodes: explicit uint64 semantics, no silent coercion.
-    const auto big_number = parse_legacy_job_id(nlohmann::json(above_js));
+    const auto big_number = parse_job_id(nlohmann::json(above_js));
     check(big_number.status == LegacyIdStatus::Valid && big_number.value == above_js,
           "JSON number above 2^53 must round trip exactly");
     const auto big_string =
-        parse_legacy_job_id(nlohmann::json(std::string("18446744073709551615")));
+        parse_job_id(nlohmann::json(std::string("18446744073709551615")));
     check(big_string.status == LegacyIdStatus::Valid &&
               big_string.value == 18446744073709551615ULL,
           "decimal-string IDs must parse to UINT64_MAX exactly");
-    check(parse_legacy_job_id(nlohmann::json(nullptr)).status == LegacyIdStatus::Absent,
+    check(parse_job_id(nlohmann::json(nullptr)).status == LegacyIdStatus::Absent,
           "absent node reports Absent");
-    check(parse_legacy_job_id(nlohmann::json(0)).status == LegacyIdStatus::Reserved,
+    check(parse_job_id(nlohmann::json(0)).status == LegacyIdStatus::Reserved,
           "reserved sentinel is reported, not treated as a valid ID");
-    check(parse_legacy_job_id(nlohmann::json(-5)).status == LegacyIdStatus::Invalid,
+    check(parse_job_id(nlohmann::json(-5)).status == LegacyIdStatus::Invalid,
           "negative IDs are invalid");
-    check(parse_legacy_job_id(nlohmann::json(1.5)).status == LegacyIdStatus::Invalid,
+    check(parse_job_id(nlohmann::json(1.5)).status == LegacyIdStatus::Invalid,
           "fractional IDs are invalid");
-    check(parse_legacy_job_id(nlohmann::json(true)).status == LegacyIdStatus::Invalid,
+    check(parse_job_id(nlohmann::json(true)).status == LegacyIdStatus::Invalid,
           "booleans are invalid IDs");
-    check(parse_legacy_job_id(nlohmann::json("12x")).status == LegacyIdStatus::Invalid,
+    check(parse_job_id(nlohmann::json("12x")).status == LegacyIdStatus::Invalid,
           "non-decimal text is an invalid ID");
 
     // ES-facing documents keep the internal JobID numeric (existing contract).
@@ -257,11 +257,11 @@ void serialization_round_trip()
     const nlohmann::json wire = selector;
     const NativeSelector restored = wire.get<NativeSelector>();
     check(restored.adapter == "condor" &&
-              restored.cluster_name == "htcondor01" &&
-              restored.cluster_tag == "schedd-a" &&
-              restored.native_job_id == "012.34" && restored.step_id.empty(),
+              restored.clusterName == "htcondor01" &&
+              restored.clusterTag == "schedd-a" &&
+              restored.job_native_id == "012.34" && restored.step_id.empty(),
           "NativeSelector round trip preserves every field");
-    check(restored.native_job_id == selector.native_job_id,
+    check(restored.job_native_id == selector.job_native_id,
           "original native string survives the round trip");
 
     const auto key = canonicalize(slurm("7", "batch"));
@@ -278,10 +278,10 @@ void serialization_round_trip()
     // readable), and canonicalize refuses it: no rule means the selector
     // cannot name a job, an incomplete observation.
     const auto foreign = nlohmann::json{{"scheduler_type", "pbs"},
-                                        {"cluster_name", "x"},
-                                        {"native_job_id", "1"}}
+                                        {"clusterName", "x"},
+                                        {"JobNativeID", "1"}}
                              .get<NativeSelector>();
-    check(foreign.adapter == "pbs" && foreign.native_job_id == "1",
+    check(foreign.adapter == "pbs" && foreign.job_native_id == "1",
           "unknown adapter names round trip verbatim");
     check(!canonicalize(foreign).has_value(),
           "unknown adapter names never canonicalize (no rule, no guess)");
@@ -290,7 +290,7 @@ void serialization_round_trip()
 void run()
 {
     condor_namespace_separation();
-    internal_id_bounds();
+    job_id_bounds();
     slurm_steps_and_pid_reuse();
     serialization_round_trip();
 }

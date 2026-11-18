@@ -60,47 +60,45 @@ void registerCollectionRpc(JobRegistry& registry) {
                 return selector_error("selector is required");
             const auto& selector = req["selector"];
 
-            const bool has_internal_id =
-                selector.contains("internal_job_id") &&
-                !selector["internal_job_id"].is_null();
+            const bool has_job_id =
+                selector.contains("JobID") &&
+                !selector["JobID"].is_null();
             std::vector<std::string> native_fields;
-            for (const char* name : {"scheduler_type", "adapter", "cluster_name",
-                                     "cluster_tag", "native_job_id", "step_id"}) {
+            for (const char* name : {"scheduler_type", "adapter", "clusterName",
+                                     "clusterTag", "JobNativeID", "step_id"}) {
                 if (selector.contains(name) && !selector[name].is_null())
                     native_fields.emplace_back(name);
             }
-            if (selector.contains("instance_id") && !selector["instance_id"].is_null())
-                return selector_error(
-                    "instance_id is retired; address the instance by "
-                    "internal_job_id (decimal string) or native identity fields");
-            if (has_internal_id && !native_fields.empty())
-                return selector_error("selector must use exactly one form: an instance "
-                                      "handle (internal_job_id) or native "
+            if (has_job_id && !native_fields.empty())
+                return selector_error("selector must use exactly one form: a job "
+                                      "handle (JobID) or native "
                                       "identity fields, not both");
-            if (!has_internal_id && native_fields.empty())
-                return selector_error("selector is required: an instance handle "
-                                      "(internal_job_id) or native identity "
+            if (!has_job_id && native_fields.empty())
+                return selector_error("selector is required: a job handle "
+                                      "(JobID) or native identity "
                                       "fields");
-            if (has_internal_id && scope != "instance")
-                return selector_error("instance handle selectors only support "
+            if (has_job_id && scope != "instance")
+                return selector_error("job handle selectors only support "
                                       "scope=instance");
 
             NativeSelector native_selector;
-            std::optional<uint64_t> internal_handle;
+            std::optional<uint64_t> job_id_handle;
             try {
-                if (has_internal_id) {
-                    const auto raw = optional_string(selector, "internal_job_id");
-                    internal_handle = parse_internal_id(raw);
-                    if (!internal_handle)
+                if (has_job_id) {
+                    const auto raw = optional_string(selector, "JobID");
+                    const auto parsed = parse_job_id(nlohmann::json(raw));
+                    if (parsed.status == LegacyIdStatus::Absent ||
+                        parsed.status == LegacyIdStatus::Invalid)
                         return selector_error(
-                            "internal_job_id must be a decimal internal id string (got '" +
+                            "JobID must be a decimal job id string (got '" +
                             raw + "')");
+                    job_id_handle = parsed.value;
                 }
-                if (!has_internal_id) {
-                    native_selector.cluster_tag = optional_string(selector, "cluster_tag");
+                if (!has_job_id) {
+                    native_selector.clusterTag = optional_string(selector, "clusterTag");
                     native_selector.step_id = optional_string(selector, "step_id");
-                    native_selector.native_job_id = optional_string(selector, "native_job_id");
-                    native_selector.cluster_name = optional_string(selector, "cluster_name");
+                    native_selector.job_native_id = optional_string(selector, "JobNativeID");
+                    native_selector.clusterName = optional_string(selector, "clusterName");
                     // "adapter" is the preferred key; the legacy
                     // "scheduler_type" spelling keeps old callers working.
                     std::string adapter_name;
@@ -159,8 +157,8 @@ void registerCollectionRpc(JobRegistry& registry) {
             }
 
             const auto resolution =
-                has_internal_id
-                    ? resolve_instance_handle_by_id(registry, *internal_handle)
+                has_job_id
+                    ? resolve_instance_handle_by_id(registry, *job_id_handle)
                     : resolve_native_target(registry, native_selector, scope,
                                             ensure_registered);
             if (!resolution.ok()) {
@@ -184,7 +182,7 @@ void registerCollectionRpc(JobRegistry& registry) {
 
             nlohmann::json targets = nlohmann::json::array();
             for (const auto& target : outcome.targets) {
-                const auto record = registry.jobRecord(target.internal_id);
+                const auto record = registry.jobRecord(target.job_id);
                 if (!record) continue;
                 targets.push_back(collection_target_json(
                     registry, *record, target.selection, target.revision, target.changed,
@@ -213,28 +211,22 @@ void registerCollectionRpc(JobRegistry& registry) {
                 return error_payload("invalid_request", "request body must be a JSON object");
             if (auto not_ready = store_not_ready_payload(registry.storeHealth()))
                 return *not_ready;
-            // internal_job_id is the addressing field; instance_id is the
-            // deprecated spelling kept for readers echoing an old response —
-            // both carry the same decimal-string value now.
-            std::string internal_job_id;
-            try {
-                if (req.contains("internal_job_id") && !req["internal_job_id"].is_null())
-                    internal_job_id = optional_string(req, "internal_job_id");
-                else
-                    internal_job_id = optional_string(req, "instance_id");
-            } catch (const std::exception& error) {
-                return error_payload("invalid_request", error.what());
-            }
-            if (internal_job_id.empty())
-                return error_payload("invalid_request", "internal_job_id is required");
-            const auto internal_id = parse_internal_id(internal_job_id);
-            if (!internal_id)
+            // JobID is the addressing field: the record id as a decimal string.
+            if (!req.contains("JobID") || req["JobID"].is_null())
+                return error_payload("invalid_request", "JobID is required");
+            const auto& job_id_node = req["JobID"];
+            const std::string job_id_text = job_id_node.is_string()
+                                                ? job_id_node.get<std::string>()
+                                                : job_id_node.dump();
+            const auto parsed = parse_job_id(job_id_node);
+            if (parsed.status == LegacyIdStatus::Absent ||
+                parsed.status == LegacyIdStatus::Invalid)
                 return error_payload(
                     "invalid_request",
-                    "internal_job_id must be a decimal internal id string (got '" +
-                        internal_job_id + "')");
+                    "JobID must be a decimal job id string (got '" +
+                        job_id_text + "')");
 
-            const auto resolution = resolve_instance_handle_by_id(registry, *internal_id);
+            const auto resolution = resolve_instance_handle_by_id(registry, parsed.value);
             if (!resolution.ok())
                 return error_payload(resolution.code, resolution.message);
 
@@ -246,17 +238,16 @@ void registerCollectionRpc(JobRegistry& registry) {
 
             nlohmann::json out;
             out["status"] = "ok";
-            out["instance_id"] = target["instance_id"];
-            out["internal_job_id"] = target["internal_job_id"];
-            out["native_job_id"] = target["native_job_id"];
+            out["JobID"] = target["JobID"];
+            out["JobNativeID"] = target["JobNativeID"];
             out["scheduler_type"] = record.job.subtype_name;
-            out["cluster_name"] = record.job.cluster_name;
-            out["cluster_tag"] = record.job.clusterTag;
+            out["clusterName"] = record.job.clusterName;
+            out["clusterTag"] = record.job.clusterTag;
             out["step_id"] = step_id_text(registry, record);
             out["state"] = to_string(record.state);
             out["quarantined"] = false;
             out["mode"] = target["mode"];
-            out["record_revision"] = target["record_revision"];
+            out["revision"] = target["revision"];
             out["desired_collectors"] = target["desired_collectors"];
             out["applied_collectors"] = target["applied_collectors"];
             out["applied_attach_token"] = target["applied_attach_token"];
