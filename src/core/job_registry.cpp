@@ -144,23 +144,6 @@ JobStore::WriteOp identity_op(JobStore::WriteOp::Kind kind, uint64_t job_id,
 
 // Screen native fields here; adapters screen structured namespaces below.
 
-// The surviving rows of the typed-facts duplicate screen, shared by the
-// CREATE dedup and the UPDATE fallback: sub_attr match plus the
-// adapter-owned namespace limit (structured facts disagree = different job).
-// The namespace semantics live with the adapters; this screen only drives
-// the comparison through the registry facade.
-std::vector<JobRecord> scheduler_screened_duplicates(
-    const JobRegistry& registry, const Job& request, std::vector<JobRecord> rows) {
-    const auto request_facts = registry.namespaceFactsOf(request);
-    std::vector<JobRecord> out;
-    for (auto& row : rows) {
-        if (!namespace_facts_compatible(request_facts, registry.namespaceFactsOf(row.job)))
-            continue;
-        out.push_back(std::move(row));
-    }
-    return out;
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -2085,149 +2068,180 @@ void JobRegistry::remove_job_from_kernel(const Job& job, bool& ok, std::string& 
 // discovery upsert: manual input has no execution evidence to merge)
 // ---------------------------------------------------------------------------
 
-bool JobRegistry::createManualJob(Job& job) {
-    spdlog::info("JobRegistry: addJob entry JobID={}, native_id={}, collectors={}, PIDs={}",
-                 job.JobID, job.JobNativeID, job.CollectorNames.size(), pids_of(job).size());
-    // 错误检查
-    if (job.CollectorNames.empty()) {
-        spdlog::warn("JobRegistry: job with JobID {} has empty CollectorNames", job.JobID);
-        return false;
-    }
-    // 自动生成JobID
-    Job job_copy = job; // 先拷贝一份，避免修改外部对象
-    std::string recovery_error;
-    if (!recoverStoreIfNeeded(recovery_error)) {
-        spdlog::error("JobRegistry: refusing registration: {}", recovery_error);
-        return false;
-    }
-    if (job_copy.JobID == 0) {
-        job_copy.JobID = getNextJobID();
-        if (job_copy.JobID == 0) {
-            spdlog::error("JobRegistry: durable JobID allocation failed, refusing to register the job");
-            return false;
-        }
-        spdlog::info("JobRegistry: assigned JobID {} to new job", job_copy.JobID);
-    }
-
-    // Duplicate check over active records: same typed sub_attr or same id.
-    // The screen is scheduler (schedd) discriminating: the same
-    // cluster_id/proc_id under another schedd names a different job and is
-    // allowed to create; an identity-bearing row counts as a duplicate only
-    // when its scheduler attribution agrees with the request.
-    const SubAttrMatcher matcher = duplicateMatcherOf(job_copy);
-    const auto duplicates = scheduler_screened_duplicates(
-        *this, job_copy, ownFindActive(
-                      [&matcher](const Job& existing) { return matches_job(matcher, existing); }));
-    if (!duplicates.empty()) {
-        spdlog::warn("JobRegistry: job with matching sub_attr already exists, ignored");
-        return false;
-    }
-    if (ownHasActive(job_copy.JobID)) {
-        spdlog::warn("JobRegistry: duplicate jobID {}, ignored", job_copy.JobID);
-        return false;
-    }
-
-    // The record image is registry-owned (moved from the store's manual
-    // insert): a manual registration owns no discovery execution — its bound
-    // pid identities are the evidence, and no manager is expected.
+JobRegistry::BuiltRecord JobRegistry::buildJobRecord(
+    Job job, uint64_t job_id, FactSource source,
+    std::optional<std::vector<std::string>> manual_collectors,
+    const std::optional<SchedulerKey>& known_key, int64_t observed_at) {
     JobRecord record;
-    record.job = job_copy;
-    record.job.JobID = job_copy.JobID;
-    // A manual registration IS a manual selection: the caller explicitly asked
-    // for these collectors, so it can never be reported as an automatic
-    // origin.
-    if (!record.job.CollectorNames.empty()) {
-        record.selection.manual = record.job.CollectorNames;
-    }
-    // Intent is the selection; the record image carries no dispatch list.
+    record.job = std::move(job);
+    record.job.JobID = job_id;
+    // Intent lives in the selection; the record image never carries a dispatch
+    // list.
+    if (manual_collectors) record.selection.manual = std::move(*manual_collectors);
     record.job.CollectorNames.clear();
-    record.revision = std::max<uint64_t>(record.revision, 1);
-    record.source = FactSource::Manual;
-    if (record.first_seen_us == 0) record.first_seen_us = now_us();
-    if (record.last_seen_us == 0) record.last_seen_us = record.first_seen_us;
-    // Manual registrations carry their identity only inside the typed facts:
-    // the adapter owning those facts renders the projections the wire and the
-    // collectors read. No configured adapter means the projections stay as
-    // given — incomplete, never a guess.
+    record.state = RecordState::Active;
+    record.source = source;
+    record.revision = 1;
+    record.first_seen_us = observed_at;
+    record.last_seen_us = observed_at;
+    // The adapter owning the facts renders the projections the wire and the
+    // collectors read. No adapter means they stay as given — incomplete, never
+    // a guess.
     normalizeNamespaceFacts(record.job);
     projectRecordFacts(record.job);
-    {
-        // Bind each numeric PID to the process that holds it NOW. A manual
-        // registration has no scheduler-side identity to copy, and a bare
-        // number is not an execution identity: recording the current start
-        // ticks makes the kernel path verify the same process later instead
-        // of trusting a number that may be recycled. An unreadable stat
-        // leaves the identity incomplete, which is reported as incomplete
-        // ownership rather than guessed.
+
+    ExecutionEvidence& execution = record.job.execution;
+    if (!execution.pid_identities.empty()) {
+        execution.pid_identities = normalized_pid_identities(std::move(execution.pid_identities));
+    } else if (!pids_of(record.job).empty()) {
+        // No observation behind this registration: bind the pids it names to
+        // the processes that hold them NOW. A bare number is not an execution
+        // identity — recording the start ticks lets the kernel path verify the
+        // same process later instead of trusting a recycled number.
         const std::string boot_id = read_boot_id();
-        const std::vector<pid_t> requested_pids = pids_of(record.job);
-        ExecutionEvidence& execution = record.job.execution;
-        execution.pid_identities.clear();
-        for (const auto pid : requested_pids) {
+        for (const auto pid : pids_of(record.job)) {
             const auto ticks = read_process_start_ticks(pid);
             execution.pid_identities.push_back(ProcessIdentity{
                 pid, ticks.value_or(0), ticks.has_value() ? boot_id : std::string{}});
         }
     }
 
-    // One atomic durable batch: the row plus its identity index entry. A
-    // duplicate live identity is refused twice — against the registry mirror
-    // first (the map cannot own two live rows of one identity) and against
-    // the durable index inside the commit (an ambiguous earlier create may
-    // have landed without publishing anything).
+    BuiltRecord built;
+    built.record = std::move(record);
+    built.key = known_key ? known_key : keyOf(built.record.job);
+    if (built.key) built.record.index_key = built.key->index_key();
+    return built;
+}
+
+std::optional<JobRegistry::NewRecordId> JobRegistry::reserveJobId(uint64_t requested,
+                                                                  std::string& error) {
+    NewRecordId id;
+    if (requested != 0) {
+        // Explicit caller id: a primary-key write, no allocator movement.
+        id.id = requested;
+        return id;
+    }
+    if (!store_->reserveId(id.id, id.counter, id.exhausted, error)) return std::nullopt;
+    id.reserve_counter = true;
+    return id;
+}
+
+bool JobRegistry::commitNewRecord(BuiltRecord built, const NewRecordId& id, bool durable,
+                                  std::string& error) {
     {
-        std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
-        {
-            std::shared_lock lg(records_mtx_);
-            const auto key = keyOf(record.job);
-            if (key) {
-                const auto owner = identity_index_.find(key->index_key());
-                if (owner != identity_index_.end() && owner->second != record.job.JobID) {
-                    spdlog::error("JobRegistry: identity for JobID {} is already registered "
-                                  "as JobID {}; refusing a duplicate job record",
-                                  record.job.JobID, owner->second);
-                    return false;
-                }
-            }
+        std::shared_lock lg(records_mtx_);
+        if (!id.reserve_counter && records_.count(id.id) != 0) {
+            error = "duplicate_job_id";
+            return false;
         }
-        // A registration that published nothing needs no recovery fence: the
-        // identity lookup repairs an ambiguous landing.
-        RecordTxn txn(*this, "register job");
-        txn.putIndexed(std::move(record));
-        if (!txn.commit()) {
-            spdlog::error("JobRegistry: durable registration failed, JobID {} rejected ({})",
-                          job_copy.JobID, txn.error());
+        if (!built.record.index_key.empty() &&
+            identity_index_.count(built.record.index_key) != 0) {
+            error = "duplicate_identity";
             return false;
         }
     }
-    spdlog::info("JobRegistry: persisted manual registration of JobID {}", job_copy.JobID);
+    // The row, its identity cache and (for an allocated id) the counter ride
+    // one batch. A create has no published image to revert, so it passes no
+    // recovery fence; the identity lookup repairs an ambiguous landing.
+    RecordTxn txn(*this, "create job record", durable);
+    if (id.reserve_counter) txn.reserveCounter(id.counter, id.exhausted);
+    txn.put(std::move(built.record));
+    if (built.key) txn.indexPut(*built.key, id.id);
+    if (!txn.commit()) {
+        error = txn.error();
+        return false;
+    }
+    return true;
+}
+
+bool JobRegistry::createManualJob(Job& job) {
+    spdlog::info("JobRegistry: createJob entry JobID={}, native_id={}, collectors={}, PIDs={}",
+                 job.JobID, job.JobNativeID, job.CollectorNames.size(), pids_of(job).size());
+    if (job.CollectorNames.empty()) {
+        spdlog::warn("JobRegistry: job with JobID {} has empty CollectorNames", job.JobID);
+        return false;
+    }
+    std::string error;
+    if (!recoverStoreIfNeeded(error)) {
+        spdlog::error("JobRegistry: refusing registration: {}", error);
+        return false;
+    }
+    const auto id = reserveJobId(job.JobID, error);
+    if (!id) {
+        spdlog::error("JobRegistry: durable JobID allocation failed, refusing to register the "
+                      "job: {}", error);
+        return false;
+    }
+    auto built = buildJobRecord(job, id->id, FactSource::Manual, job.CollectorNames,
+                                std::nullopt, now_us());
+    {
+        std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
+        if (!commitNewRecord(std::move(built), *id, /*durable=*/false, error)) {
+            spdlog::error("JobRegistry: manual registration of JobID {} was refused ({})",
+                          id->id, error);
+            return false;
+        }
+    }
+    spdlog::info("JobRegistry: persisted manual registration of JobID {}", id->id);
 
     Job job_for_cb;
-    if (auto stored = ownRecord(job_copy.JobID)) {
+    if (auto stored = ownRecord(id->id)) {
         job_for_cb = stored->job;
     } else {
         return false;
     }
-
     sync_job_to_kernel(job_for_cb);
     // The runtime pulls the record it must attach. Waking is a coalesced hint,
     // never a synchronous apply on this stack.
     wake_runtime();
-    spdlog::info("JobRegistry: add job with JobID {}", job_copy.JobID);
-    job.JobID = job_copy.JobID;
+    spdlog::info("JobRegistry: add job with JobID {}", id->id);
+    job.JobID = id->id;
     return true;
 }
 
 bool JobRegistry::addJob(const Job& job) {
-    // Thin alias: the CREATE branch of the manual upsert, exactly the
-    // historical registration semantics.
+    // Strict create: an existing identity or a surviving native-id candidate is
+    // a refusal, never an update. Routing is the same one the upsert entry
+    // uses, so a create carries no second duplicate screen.
     Job copy = job;
+    if (manualUpdateTarget(copy, std::nullopt).kind != ManualTarget::Kind::None) {
+        spdlog::warn("JobRegistry: duplicate manual registration ignored");
+        return false;
+    }
     return createManualJob(copy);
 }
 
 JobRegistry::ManualTarget JobRegistry::manualUpdateTarget(
     const Job& job, const std::optional<NativeSelector>& selector) {
     ManualTarget target;
+    // The derived identity is the first and authoritative route: a full key
+    // names exactly one record, so nothing has to be screened.
+    std::optional<SchedulerKey> request_key;
+    if (selector) request_key = canonicalize(*selector);
+    if (!request_key) request_key = keyOf(job);
+    if (request_key) {
+        if (const auto record = ownRecordByKey(*request_key)) {
+            // The index key is derived from the rendered namespace, so two
+            // different structured splits can alias one canonical string. A
+            // selector that disagrees with the stored facts must never update
+            // the row: it is the same ambiguity the candidate route reports.
+            const NamespaceFacts request_facts =
+                selector ? selectorFactsOf(*selector) : namespaceFactsOf(job);
+            if (!namespace_facts_compatible(request_facts,
+                                            namespaceFactsOf(record->job))) {
+                target.kind = ManualTarget::Kind::Ambiguous;
+                target.message = "canonical identity collision between structured namespaces";
+                target.candidates.push_back(format_job_id(record->job.JobID));
+                return target;
+            }
+            target.record = *record;
+            target.kind = record->state == RecordState::Closing
+                              ? ManualTarget::Kind::Closing
+                              : ManualTarget::Kind::Update;
+            return target;
+        }
+    }
+
     std::vector<JobRecord> duplicates;
     std::optional<NamespaceFacts> selector_facts;
     std::optional<SchedulerKey> key;
@@ -3317,8 +3331,6 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
     }
     const std::string index_key = key->index_key();
     const ProcessIdentity manager = manager_of(job);
-    const std::vector<ProcessIdentity>& processes = pid_identities_of(job);
-    const bool pid_identities_authoritative = pid_identities_authoritative_of(job);
     const int64_t observed_at = now_us();
 
     JobRecord record;   // the authoritative image this call hands back
@@ -3406,64 +3418,35 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         // Create a new job record. Nothing is activated and no caller
         // binding is accepted here. The id reservation rides along in the
         // same batch as the record and its index entry: one commit, not two.
-        std::string allocation_error;
-        uint64_t durable_counter = 0;
-        bool durable_exhausted = false;
-        uint64_t allocated = 0;
-        if (!store_->reserveId(allocated, durable_counter, durable_exhausted,
-                               allocation_error)) {
-            result.code = allocation_error == "id_exhausted"
+        std::string create_error;
+        const auto id = reserveJobId(0, create_error);
+        if (!id) {
+            result.code = create_error == "id_exhausted"
                               ? RegistrationError::IdExhausted
                               : RegistrationError::StoreWriteFailed;
             result.error = result.code == RegistrationError::IdExhausted
-                               ? allocation_error
+                               ? create_error
                                : to_string(result.code);
             result.message = "durable job id allocation failed";
             return result;
         }
-
-        JobRecord created;
-        created.job = job;
-        created.job.JobID = allocated;
-        created.job.CollectorNames.clear();   // intent lives in selection
-        normalizeNamespaceFacts(created.job);
-        projectRecordFacts(created.job);
-        created.source = FactSource::Discovery;
-        created.index_key = index_key;
-        created.job.execution.manager = manager;
-        created.job.execution.pid_identities_authoritative = pid_identities_authoritative;
-        // The ordering token is record business (the stale-pass guard
-        // compares against it); the observation's reasons/notes stay
-        // producer-side diagnostics and are not copied.
-        created.job.execution.read_order = job.execution.read_order;
-        created.revision = 1;
-        created.state = RecordState::Active;
-        created.first_seen_us = observed_at;
-        created.last_seen_us = observed_at;
-        created.job.execution.pid_identities = normalized_pid_identities(processes);
-
-        // A create has no published memory image to revert: identity
-        // lookup repairs an ambiguous create, so it does not fence
-        // recovery.
-        RecordTxn txn(*this, "create job record", /*durable=*/false);
-        txn.reserveCounter(durable_counter, durable_exhausted);
-        txn.put(std::move(created));
-        txn.indexPut(*key, allocated);
-        if (!txn.commit()) {
+        auto built = buildJobRecord(job, id->id, FactSource::Discovery, std::nullopt, *key,
+                                    observed_at);
+        if (!commitNewRecord(std::move(built), *id, /*durable=*/false, create_error)) {
             result.code = RegistrationError::StoreWriteFailed;
             result.error = "store_write_failed";
-            result.message = txn.error();
+            result.message = create_error;
             return result;
         }
 
         result.ok = true;
         result.disposition = UpsertDisposition::Created;
-        result.job_id = allocated;
+        result.job_id = id->id;
         std::shared_lock lg(records_mtx_);
-        result.revision = records_[allocated].revision;
-        record = records_[allocated];
+        result.revision = records_[id->id].revision;
+        record = records_[id->id];
         spdlog::info("JobRegistry: created job instance {} for {} '{}'",
-                     allocated, key->adapter, key->job_native_id);
+                     id->id, key->adapter, key->job_native_id);
         }
     }   // mutation_mtx_ released: kernel admission, the runtime wake and the
         // automatic-policy evaluation below never run under a registry lock.

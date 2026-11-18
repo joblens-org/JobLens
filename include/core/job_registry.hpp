@@ -395,15 +395,43 @@ private:
     std::optional<AutoDecision> autoSelectionFor(const Job& job, const std::string& adapter);
     void regRPCHandle();
     // --- Manual CRUD upsert internals ----------------------------------------
-    // The CREATE branch: the manual registration body verbatim.
+    // One construction path for every new record. The Job may arrive without
+    // what creation owns: the JobID, revision, state, provenance, the manual
+    // selection, the execution-evidence seed (pid identities bound from the
+    // pids projection when no observation brought any), the timestamps and the
+    // identity cache are filled here. `known_key` is the identity the caller
+    // already resolved (an observation); empty derives it from the facts. Both
+    // are empty only for a Common row.
+    struct BuiltRecord {
+        JobRecord record;
+        std::optional<SchedulerKey> key;
+    };
+    BuiltRecord buildJobRecord(Job job, uint64_t job_id, FactSource source,
+                               std::optional<std::vector<std::string>> manual_collectors,
+                               const std::optional<SchedulerKey>& known_key,
+                               int64_t observed_at);
+    // One allocator answer: the id and the high-water counter that rides the
+    // same batch. An explicit caller id reserves nothing.
+    struct NewRecordId {
+        uint64_t id = 0;
+        uint64_t counter = 0;
+        bool exhausted = false;
+        bool reserve_counter = false;
+    };
+    std::optional<NewRecordId> reserveJobId(uint64_t requested, std::string& error);
+    // One insert path: primary-key/identity conflict checks, one RecordTxn
+    // (row + index + counter) and the publication its commit performs. Callers
+    // hold mutation_mtx_.
+    bool commitNewRecord(BuiltRecord built, const NewRecordId& id, bool durable,
+                         std::string& error);
+    // The CREATE branch: the manual registration body.
     bool createManualJob(Job& job);
-    // UPDATE-branch routing: the identity selector first (namespace rules),
-    // then the typed sub_attr matcher, which discriminates by the
-    // subtype's scheduler (schedd) attribution — an identity-less row keeps
-    // the unknown-attribution tolerance, an identity-bearing row joins only
-    // when its scheduler attribution agrees, and more than one surviving
-    // duplicate is reported through `ambiguous`, never guessed. A closing
-    // identity target is reported through `closing`; no target falls through
+    // UPDATE-branch routing, in two steps: the derived identity first (when the
+    // facts name one), then the typed sub_attr candidates for a registration
+    // whose namespace is unknown (offline/no attribution). The candidate route
+    // discriminates by the subtype's scheduler (schedd) attribution; more than
+    // one surviving candidate is reported through `ambiguous`, never guessed.
+    // A closing target is reported through `closing`; no target falls through
     // to CREATE.
     struct ManualTarget {
         enum class Kind { None, Closing, Ambiguous, Update };

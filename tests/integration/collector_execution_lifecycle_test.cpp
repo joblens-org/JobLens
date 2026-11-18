@@ -398,6 +398,12 @@ void run(const std::string& base)
 
     const auto job_two = make_job(202, {"job_event", "job_periodic"});
     check(JobRegistry::instance().addJob(job_two), "add Job 202");
+    // addJob returns once the record is published; the runtime applies the
+    // attachment on its own worker. Sending the event before that binding
+    // lands would race the snapshot the event context resolves from.
+    eventually(
+        [&] { return !JobRegistry::instance().actualCollection(202).collectors.empty(); },
+        "Job 202 binding was not applied before the event");
     send_byte(FakeJobEvent::writer_fd.load(), '2');
     const auto two = CaptureWriter::wait_for("job_event", 2);
     check(two[1]->sample->job.JobID == 202, "second Job event attribution");

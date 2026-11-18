@@ -684,6 +684,17 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
         check(conflict["JobID"] == created["JobID"],
               "already_exists must report the existing instance: " + conflict.dump());
     }
+    // --- a scheduler registration must name a scheduler job -----------
+    {
+        auto missing = add;
+        missing["sub_attr"].erase("cluster_id");
+        missing["sub_attr"].erase("proc_id");
+        const auto response = rpc("jobs/create", missing);
+        check(response["status"] == "error" &&
+                  response.value("code", "") == "invalid_request",
+              "a scheduler registration without cluster_id must be rejected: " +
+                  response.dump());
+    }
     // --- duplicate observation is not a failure ----------------------
     {
         const auto response = rpc("jobs/upsert", add);

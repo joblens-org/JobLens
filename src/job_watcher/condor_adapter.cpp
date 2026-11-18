@@ -18,6 +18,7 @@
 
 #include <utility>
 #include <variant>
+#include <stdexcept>
 
 #include <fmt/format.h>
 
@@ -152,6 +153,11 @@ void CondorSchedulerAdapter::applyRequestFacts(Job& job,
     const auto sub = request.value("sub_attr", nlohmann::json::object());
     const auto cluster_id = sub.value("cluster_id", nlohmann::json(0u)).get<size_t>();
     const auto proc_id = sub.value("proc_id", nlohmann::json(0u)).get<size_t>();
+    // A registration must name a scheduler job. Cluster ids start at 1, so a
+    // missing cluster_id is a missing identity, never the job "0.<proc>".
+    if (cluster_id == 0) {
+        throw std::runtime_error("sub_attr.cluster_id is required");
+    }
 
     CondorJobAttr attr;
     attr.auto_update_child = request.value("auto_update_child", true);

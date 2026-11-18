@@ -18,6 +18,7 @@
 
 #include <utility>
 #include <variant>
+#include <stdexcept>
 
 #include <fmt/format.h>
 
@@ -148,6 +149,10 @@ void SlurmSchedulerAdapter::applyRequestFacts(Job& job,
     const auto sub = request.value("sub_attr", nlohmann::json::object());
     const auto native_job_number = sub.value("job_id", nlohmann::json(0u)).get<size_t>();
     const auto step_id = sub.value("step_id", nlohmann::json(0u)).get<uint32_t>();
+    // A registration must name a scheduler job; 0 is not a Slurm job id.
+    if (native_job_number == 0) {
+        throw std::runtime_error("sub_attr.job_id is required");
+    }
 
     SlurmJobAttr attr;
     attr.auto_update_child = request.value("auto_update_child", true);

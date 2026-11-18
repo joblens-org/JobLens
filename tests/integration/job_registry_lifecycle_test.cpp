@@ -1680,6 +1680,26 @@ void run(const std::string& base)
                   "upsert: the rejected create must persist nothing");
             registry.deinit();
         }
+
+        // --- Common rows carry no identity and no duplicate requirement -----
+        {
+            JobRegistryOptions options;
+            options.db_path = fresh_dir(base, "lifecycle-common-duplicates");
+            options.enable_pid_tracker = false;
+            options.register_rpc = false;
+            JobRegistry registry(options);
+
+            Job first = make_common_job();
+            first.JobNativeID = "901";
+            check(registry.addJob(first), "common: the first row must create");
+            Job second = make_common_job();
+            second.JobNativeID = "902";
+            check(registry.addJob(second),
+                  "common: a second row with no scheduler identity must also create");
+            check(registry.jobRecords().size() == 2,
+                  "common: Common rows carry no duplicate requirement");
+            registry.deinit();
+        }
     }
 
     pass_case("LIFECYCLE",
