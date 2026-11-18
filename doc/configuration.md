@@ -82,7 +82,7 @@ job_registry_config:
 | `auto_add_condorjob` | bool | false | **Deprecated.** Automatically start the legacy CondorJobWatcher and auto-add jobs. Ignored for a type listed in `maintenance.types` (the discovery source owns it) |
 | `auto_add_slurmjob` | bool | false | **Deprecated.** Same as above for Slurm |
 | `maintenance.types` | list | `[]` | Scheduler types that get job records, including unselected jobs. `condor` / `slurm`; unknown values are rejected at startup |
-| `maintenance.capture_all` | bool | `true` | The blanket-registration switch. `true`: every captured job registers unconditionally. `false`: whether an observation registers is decided by the type's `<type>_job_watcher.auto_add` |
+| `maintenance.capture_all` | bool | `true` | The admission gate. `true`: every captured job is admitted unconditionally. `false`: whether an observation is admitted is decided by the type's `<type>_job_watcher.auto_add` |
 | `maintenance.reconcile_interval_sec` | int | 30 | Periodic full reconciliation interval in seconds (minimum 1) |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` (Condor) or `{JobLensRootDir}/../config/rules/slurm_jobs` (Slurm) | Directory for Lua rule files, used when `<type>_job_watcher.auto_add` is `rule`. Note: the default varies by watcher context. |
 
@@ -93,7 +93,7 @@ switches. They answer different questions and never override each other:
 
 | Switch | Key | Question it answers | Default |
 |---|---|---|---|
-| blanket registration | `job_registry_config.maintenance.capture_all` | May every captured job enter the registry unconditionally? | `true` |
+| admission gate | `job_registry_config.maintenance.capture_all` | May every captured job enter the registry unconditionally? | `true` |
 | per-type watcher | `job_registry_config.maintenance.types` | Does this scheduler type get a discovery watcher at all? | `[]` (off) |
 | automatic action | `<type>_job_watcher.auto_add` (`off` / `default` / `rule`) | What does the automatic path do with an observation of this type? | `off` |
 
@@ -103,7 +103,7 @@ The `auto_add` tri-state:
 |---|---|
 | `off` | The automatic path takes no action for this type |
 | `default` | Register the job and arm `<type>_job_watcher.auto_add_collectors` verbatim |
-| `rule` | Register is decided per job by the Lua rule engine: accept = register with the rule's collector list (or the `auto_add_collectors` defaults when the rule names none), reject = do not register (with blanket registration on: register with an empty selection) |
+| `rule` | Register is decided per job by the Lua rule engine: accept = register with the rule's collector list (or the `auto_add_collectors` defaults when the rule names none), reject = do not register (with `capture_all` on: register with an empty selection) |
 
 An invalid `auto_add` value (anything but `off`/`default`/`rule`) rejects
 startup.
@@ -136,25 +136,25 @@ registered, and it is counted in `admission_errors` (not as a reject).
 
 ### The eight-state matrix
 
-With the per-type watcher off, `auto_add` is irrelevant and only blanket
-registration distinguishes the two rows. With the watcher on there are six
-combinations of blanket registration and `auto_add`:
+With the per-type watcher off, `auto_add` is irrelevant and only `capture_all`
+distinguishes the two rows. With the watcher on there are six
+combinations of `capture_all` and `auto_add`:
 
 | # | watcher | `capture_all` | `auto_add` | Behavior for an observation of this type |
 |---|---|---|---|---|
 | 1 | off | — (on) | — | No discovery for the type; manual CRUD still works |
 | 2 | off | — (off) | — | Same: nothing is discovered, so nothing is admitted |
-| 3 | on | on | off | Blanket registration; no automatic collectors (explicit requests only) |
-| 4 | on | on | default | Blanket registration + the default collector list armed automatically |
-| 5 | on | on | rule | Blanket registration; the rule engine picks the collectors (reject or a refused bare accept = registered with an empty selection) |
-| 6 | on | off | off | The watcher keeps scanning, but nothing registers (drops counted in `dropped_observations`) |
+| 3 | on | on | off | Admitted unconditionally; no automatic collectors (explicit requests only) |
+| 4 | on | on | default | Admitted unconditionally + the default collector list armed automatically |
+| 5 | on | on | rule | Admitted unconditionally; the rule engine picks the collectors (reject or a refused bare accept = registered with an empty selection) |
+| 6 | on | off | off | The watcher keeps scanning, but nothing is admitted (counted in `not_admitted_capture_all_off`) |
 | 7 | on | off | default | Registers with the default collector list as the initial selection |
-| 8 | on | off | rule | accept = registers with the rule's list (a bare accept falls back to `auto_add_collectors`); reject = never registers (`rejected_observations`); an engine error or a bare accept without defaults registers nothing, is counted in `admission_errors` and is retried on the next observation |
+| 8 | on | off | rule | accept = registers with the rule's list (a bare accept falls back to `auto_add_collectors`); reject = the observation is not admitted (`not_admitted_by_rule`); an engine error or a bare accept without defaults registers nothing, is counted in `admission_errors` and is retried on the next observation |
 
-With blanket registration off, the admission counters are observable in the
-joblens status: `capture_all`, `dropped_observations`,
-`rejected_observations` and `admission_errors`. The event path reports a
-typed `not_admitted` result that never asks the watcher to rescan.
+With `capture_all` off, the admission counters are observable in the joblens
+status: `capture_all`, `not_admitted_capture_all_off`, `not_admitted_by_rule`
+and `admission_errors`. The event path reports a typed `not_admitted` result
+that never asks the watcher to rescan.
 
 ### Legacy key mapping
 
@@ -197,7 +197,7 @@ policy down forever).
 
 | Operation | Entry | Semantics |
 |---|---|---|
-| Create / Update | `jobs/upsert` (one upsert) | Identity hit on a live instance (typed `sub_attr` + scheduler namespace) routes to UPDATE: the requested collectors UNION into the existing manual selection (never a wholesale replace) and facts merge fill-empty-only. A typed-sub_attr duplicate routes to UPDATE by internal id only when the row has no resolved identity or its scheduler (schedd) attribution agrees with the request: the same native id under another schedd is a different job and creates its own record, a row with an unknown schedd keeps the legacy tolerance, and several surviving duplicates are an `ambiguous_selector` error, never a guess. Otherwise CREATE: the legacy manual registration, whose duplicate check discriminates by the same scheduler (schedd) attribution, and which still rejects an empty collector list (an UPDATE with no collectors is a pure facts update and stays valid) |
+| Create / Update | `jobs/upsert` (one upsert) | Identity hit on a live instance (typed `sub_attr` + scheduler namespace) routes to UPDATE: the requested collectors UNION into the existing manual selection (never a wholesale replace) and facts merge fill-empty-only. A typed-sub_attr duplicate routes to UPDATE by `JobID` only when the row has no resolved identity or its scheduler (schedd) attribution agrees with the request: the same `JobNativeID` under another schedd is a different job and creates its own record, a row with an unknown schedd keeps the legacy tolerance, and several surviving duplicates are an `ambiguous_selector` error, never a guess. Otherwise CREATE: the legacy manual registration, whose duplicate check discriminates by the same scheduler (schedd) attribution, and which still rejects an empty collector list (an UPDATE with no collectors is a pure facts update and stays valid) |
 | Read / modify selection | `jobs/collection/get`, `jobs/collection/set`, `jobs/collection/reset` | Unchanged; a manual selection (including the empty stop) always wins over the automatic one |
 | Remove — stop tier (default) | `jobs/stop` | Stops collection (a persistent empty manual selection); the job record is retained |
 | Remove — erase tier | `jobs/erase` | Retires the instance for real: the closing fact is durable first, then a collected instance is archived as an `h:` history row and a never-collected one is durably deleted. The response distinguishes the tiers through `mode: stop\|erase` |

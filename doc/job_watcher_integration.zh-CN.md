@@ -26,7 +26,7 @@ src/ebpf/trace_ssh_session.bpf.c          # 可选：exec-hint 事件源
 
 你免费得到的东西：
 
-- 持久存储（`JobRecord`）、identity 索引、generation 冲突处理；
+- 持久存储（`JobRecord`）、identity 索引、manager 冲突处理；
 - 心跳：权威 manager pass、缺席计数、退休证据规则、逐记录执行证据刷新；
 - desired-vs-applied 采集对账与 `CollectionStatus`；
 - `jobs/*` 与 `jobs/collection/*` RPC 方法及 trigger 代理；
@@ -53,9 +53,11 @@ src/ebpf/trace_ssh_session.bpf.c          # 可选：exec-hint 事件源
 两条贯穿始终的结构性规则：
 
 - 一个发现的 **Job** 要么 ready（canonical identity 可解析 + 完整
-  execution generation，见 `discovery_job_ready`），要么**显式
-  incomplete 并把原因写在 `job.execution->incomplete_reason`**。不存在
-  "尽力而为"的中间态。
+  execution manager），要么作为 **incomplete 被丢弃**：watcher 的
+  `finalize_discovery()` 返回 `nullopt`，半读的作业永远到不了注册表。
+  原因由 watcher 记日志；调用方传了可选的 `notes` 出参时再一并交回——
+  它不是 Job 上的字段。不存在"尽力而为"的中间态，未发布的发现也绝不
+  被读作"已结束"。
 - **失败或不完整的 manager pass 永远不代表"其余的都结束了"**：
   `ManagerSet::complete` 只说明这次 pass 是否覆盖了配置的源；消费方必须
   先检查它才能把"缺席"当作终止证据。
@@ -114,22 +116,24 @@ Job 就是登记单元：typed facts 加一组 `execution` 证据，在源解析
 地方就地填好。`JobID`、`JobPIDs`、`CollectorNames` 保持为空——它们归
 store/intent 所有。
 
-- 身份字段（`subtype_name`、`cluster_name`、`clusterTag`、`NativeJobID`、
+- 身份字段（`subtype_name`、`clusterName`、`clusterTag`、`JobNativeID`、
   `execution->step_id`）：源真正提供的原生字段，逐字保留。绝不合成数值。
 - 集群命名空间（如 `COLLECTOR_HOST`、`SLURM_CLUSTER_NAME`）：显式配置
   优先；否则从源环境推导。**绝不从原生作业编号瞎猜。** 推不出来 ⇒
-  incomplete 发现并写明原因。
-- `execution->generation`：manager pid + manager start ticks + boot id，
+  该发现作为 incomplete 被丢弃并记下原因。
+- `execution->manager`：manager pid + manager start ticks + boot id，
   三者齐备才算完整。
-- `execution->members`：优先读执行 cgroup 的 `cgroup.procs`——**读成功
-  （包括空列表）即为权威**（`members_authoritative = true`）。cgroup 不可
+- `execution->pid_identities`：优先读执行 cgroup 的 `cgroup.procs`——**读成功
+  （包括空列表）即为权威**（`pid_identities_authoritative = true`）。cgroup 不可
   读才退化为枚举 manager 的子进程，且标记列表为部分
-  （`members_authoritative = false`）。start ticks 读不出来的成员保留在
-  列表里、`start_ticks == 0`，让缺失的证据保持可见。
-- 收尾调 `finalize_discovery_job(job, reasons)`：它按身份/代次检查算出
-  ready 与否（`discovery_job_ready`），把每个缺失环节写进
-  `execution->incomplete_reason`（当且仅当 ready 时为空）。注意事项进
-  `execution->notes`。
+  （`pid_identities_authoritative = false`）。start ticks 读不出来的成员保留在
+  列表里、`start_ticks == 0`，让缺失的证据保持可见。裸 pid 列表（`pids`，
+  Lua/dump_job 兼容名 `JobPIDs`）是该集合的投影，不是第二个来源。
+- 收尾调 `finalize_discovery(job, reasons, &notes)`（Slurm watcher 同签名）：
+  它复查 canonical identity 与 `execution_complete()`（manager 三元组）。
+  任一不满足就返回 `nullopt`，把缺失环节拼成一条
+  `discovery dropped as incomplete: ...` 日志；调用方给了 `notes` 出参时
+  再追加同一条。缺失原因不回写 Job。
 
 ### 3.4 Adapter 的职责（`ISchedulerAdapter`）
 
@@ -302,7 +306,7 @@ ssh_job_watcher:
    registry.runPass(/*do_scan=*/true, /*wait=*/true);   // 直接驱动 pass
    ```
 
-   不变量（I1–I8）在这一层钉死：merge 语义、generation 冲突、
+   不变量（I1–I8）在这一层钉死：merge 语义、manager 冲突、
    缺席/suspect 迁移、退休证据、closing 语义。
 
 依赖 eBPF 的测试，照 `tests/integration/run_net_usage_test.sh` 的方式先
@@ -337,11 +341,11 @@ ssh_job_watcher:
 - `stop()` 幂等、有界；从析构函数调用安全。
 - `enumerateManagers()` 只在 pass 级失败时报 `complete=false`；进程表里
       读不出来的条目只计数加 note，manager 读不出来是重试、绝不是缺席。
-- 发现的 Job 要么 ready 要么显式不完整
-      （`execution->incomplete_reason`）；集群命名空间绝不从原生 id
-      瞎猜。
+- 发现的 Job 只有 ready 才会被发布；不完整的发现由 `finalize_discovery()`
+      丢弃，原因只进日志（调用方传了 `notes` 时再交回它），不写进 Job；
+      集群命名空间绝不从原生 id 瞎猜。
 - cgroup 成员：读成功（含空列表）即权威；退化路径标记
-      `members_authoritative=false`。
+      `pid_identities_authoritative=false`。
 - 构造方让 `JobID`/`JobPIDs`/`CollectorNames` 保持为空（store 与
       intent 所有）。
 - `traits()` 如实；缺失的能力是正常状态。

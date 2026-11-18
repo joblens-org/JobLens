@@ -7,7 +7,7 @@
 - 键空间布局（`j:` 记录、`i:` 身份索引、`h:` 归档、`c:` 自动 ID 高水位、`m:` 元数据）；
 - 行编解码、批量写原子性、durability 分层、恢复围栏与自动 ID 分配。
 
-所有业务判定都在 `JobRegistry` 完成：库存合并、恢复验证、选择策略、归档与删除、
+所有业务判定都在 `JobRegistry` 完成：记录合并、恢复验证、选择策略、归档与删除、
 退休时机。`JobRegistry` 在记录锁内完成“读事实 → 判定 → 变换”，然后调用
 `JobStore::commit()` 写入结果；`JobStore` 不解释这些行。
 
@@ -21,8 +21,7 @@
 以下运行时投影不持久化，重启后由发现与重新观察重建：
 
 - 内核归因中动态增删的 PID；
-- 运行中的 `execution_verified`；
-- 运行时的 suspect 标记；
+- 运行时的 `presumed_live` 判据（`jobs/status` 的 `suspect` 计数即 `!presumed_live`）；
 - 采集器实际挂载集合（`applied_collectors`）。
 
 ## 3. 行格式与字段
@@ -34,11 +33,11 @@
 | `job` 事实（含 `sub_attr`） | 恢复后 collector 复挂、内核归属准入的数据源 |
 | `selection` | 恢复采集的核心；manual 覆盖与显式停止跨重启存活 |
 | `state`（active / closing） | 中断的 closing 不得复活为 active |
-| `identity` + `i:` 索引 | 重启后再观察时的身份解析 |
-| `generation` / `members` / `members_authoritative` / `execution_observed` | 防 PID 复用的恢复验证证据；判定逻辑在 registry |
+| `index_key` + `i:` 索引 | 重启后再观察时的身份解析（逻辑身份只从 facts 派生，不落行） |
+| `manager` / `pid_identities` / `pids` | 防 PID 复用的恢复验证证据：`manager` 三元组、成员身份三元组（`pid` + `start_ticks` + `boot_id`），以及由 `pid_identities` 派生的裸 pid 投影 `pids`；三者都落行。`pid_identities_authoritative` 与 `read_order` 不落盘，恢复后分别为 `false` / `0`。判定逻辑在 registry |
 | `revision` | 变更定序与 CAS |
 | `first_seen_us` / `last_seen_us` | 退休时限判定 |
-| `quarantined` | 准入策略输入 |
+| `quarantined`（不落盘） | 当前没有隔离层：行内不写该键，健康计数 `quarantined_identities` 恒为 0 |
 
 采集选择不单独携带 revision：`JobRecord::revision` 是唯一单调计数器，选择命令的
 CAS 也由它定序。
@@ -67,7 +66,7 @@ public:
 
     // --- 启动装载 -------------------------------------------------------
     std::vector<JobRecord> loadAll();                  // 原始 j: 行，不做业务验证
-    std::optional<JobRecord> readRowByIdentity(const CanonicalIdentity&);
+    std::optional<JobRecord> readRowByIdentity(const SchedulerKey&);
 
     // --- 自动 ID --------------------------------------------------------
     uint64_t nextJobId();
@@ -82,9 +81,9 @@ public:
             PutHistory,                       // h: 归档 = 最终记录 + applied 快照 + 结束时间
             ReserveCounter,                   // c: 与 create 同批的 ID 高水位
         } kind = PutRecord;
-        uint64_t internal_id = 0;
+        uint64_t job_id = 0;
         std::optional<JobRecord> record;
-        std::optional<CanonicalIdentity> identity;
+        std::optional<SchedulerKey> key;              // i: operations
         std::string history_key_suffix;
         std::vector<std::string> applied_collectors;
         std::string history_provenance;

@@ -81,7 +81,7 @@ job_registry_config:
 | `auto_add_condorjob` | bool | false | **已弃用**。启动旧版 CondorJobWatcher 并自动登记作业。该类型出现在 `maintenance.types` 时忽略（由发现源负责） |
 | `auto_add_slurmjob` | bool | false | **已弃用**。同上，作用于 Slurm |
 | `maintenance.types` | list | `[]` | 需要完整本地作业记录的调度器类型（包含未被采集的作业）。取值 `condor` / `slurm`，未知值启动即拒绝 |
-| `maintenance.capture_all` | bool | `true` | 全量登记开关。`true`：捕获的作业无条件登记；`false`：观测是否登记由该类型的 `<type>_job_watcher.auto_add`判定 |
+| `maintenance.capture_all` | bool | `true` | 准入门开关。`true`：捕获的作业无条件准入；`false`：观测是否准入由该类型的 `<type>_job_watcher.auto_add` 判定 |
 | `maintenance.reconcile_interval_sec` | int | 30 | 周期性全量对账间隔，单位秒，最小 1 |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs`（Condor）或 `{JobLensRootDir}/../config/rules/slurm_jobs`（Slurm） | Lua 规则文件目录，在该类型的 `<type>_job_watcher.auto_add` 为 `rule` 时使用。注意：默认值因 watcher 而异。 |
 
@@ -91,7 +91,7 @@ job_registry_config:
 
 | 开关 | 键 | 回答的问题 | 默认值 |
 |---|---|---|---|
-| 全量登记 | `job_registry_config.maintenance.capture_all` | 捕获的作业是否可以无条件进入作业注册表？ | `true` |
+| 准入门（`capture_all`） | `job_registry_config.maintenance.capture_all` | 捕获的作业是否可以无条件进入作业注册表？ | `true` |
 | 按类型启停 Watcher | `job_registry_config.maintenance.types` | 该调度器类型是否启动发现 Watcher？ | `[]`（关） |
 | 自动路径动作 | `<type>_job_watcher.auto_add`（`off` / `default` / `rule`） | 自动路径对该类型的观测做什么？ | `off` |
 
@@ -101,7 +101,7 @@ job_registry_config:
 |---|---|
 | `off` | 自动路径对该类型零动作 |
 | `default` | 登记作业，并把 `<type>_job_watcher.auto_add_collectors` 逐字武装上去 |
-| `rule` | 是否登记由 Lua 规则引擎逐作业判定：accept = 登记并加规则的采集器列表（规则未指定时回退 `auto_add_collectors`）；reject = 不登记（全量登记开启时：登记空选择留在库中） |
+| `rule` | 是否登记由 Lua 规则引擎逐作业判定：accept = 登记并加规则的采集器列表（规则未指定时回退 `auto_add_collectors`）；reject = 不登记（`capture_all` 开启时：登记空选择留在库中） |
 
 `auto_add` 的非法取值（非 `off`/`default`/`rule`）启动即拒绝。
 
@@ -129,22 +129,22 @@ reject）。
 
 ### 八状态组合矩阵
 
-Watcher 关闭时 `auto_add` 失去意义，只有全量登记区分两行；Watcher 开启时
-全量登记 × `auto_add` 共六种组合：
+Watcher 关闭时 `auto_add` 失去意义，只有 `capture_all` 区分两行；Watcher 开启时
+`capture_all` × `auto_add` 共六种组合：
 
 | # | Watcher | `capture_all` | `auto_add` | 该类型观测的行为 |
 |---|---|---|---|---|
 | 1 | 关 | ——（开） | —— | 该类型无发现；手工 CRUD 仍可用 |
-| 2 | 关 | ——（关） | —— | 同上：无发现，自然无登记 |
-| 3 | 开 | 开 | off | 全量登记；无自动采集器（仅显式请求） |
-| 4 | 开 | 开 | default | 全量登记 + 默认采集器列表自动武装 |
-| 5 | 开 | 开 | rule | 全量登记；规则引擎选采集器（reject 或无缺省的裸接受 = 登记空选择） |
-| 6 | 开 | 关 | off | Watcher 照常扫描，但不登记任何作业（丢弃计入 `dropped_observations`） |
+| 2 | 关 | ——（关） | —— | 同上：无发现，自然无准入 |
+| 3 | 开 | 开 | off | 无条件准入；无自动采集器（仅显式请求） |
+| 4 | 开 | 开 | default | 无条件准入 + 默认采集器列表自动武装 |
+| 5 | 开 | 开 | rule | 无条件准入；规则引擎选采集器（reject 或无缺省的裸接受 = 登记空选择） |
+| 6 | 开 | 关 | off | Watcher 照常扫描，但不准入任何作业（计入 `not_admitted_capture_all_off`） |
 | 7 | 开 | 关 | default | 登记并把默认采集器列表作为初始选择 |
-| 8 | 开 | 关 | rule | accept = 登记并加规则列表（裸接受回退 `auto_add_collectors`）；reject = 不登记（计入 `rejected_observations`）；引擎错误或无缺省的裸接受 = 本次不登记（计入 `admission_errors`），下一条观测重试 |
+| 8 | 开 | 关 | rule | accept = 登记并加规则列表（裸接受回退 `auto_add_collectors`）；reject = 不准入（计入 `not_admitted_by_rule`）；引擎错误或无缺省的裸接受 = 本次不登记（计入 `admission_errors`），下一条观测重试 |
 
-全量登记关闭时，准入计数在作业列表状态中可见：`capture_all`、
-`dropped_observations`、`rejected_observations`、`admission_errors`。
+`capture_all` 关闭时，准入计数在作业列表状态中可见：`capture_all`、
+`not_admitted_capture_all_off`、`not_admitted_by_rule`、`admission_errors`。
 事件路径返回类型化的 `not_admitted` 结果，且绝不会要求 watcher 重扫。
 
 ### 旧键映射
@@ -180,7 +180,7 @@ Watcher 关闭时 `auto_add` 失去意义，只有全量登记区分两行；Wat
 
 | 操作 | 入口 | 语义 |
 |---|---|---|
-| 增 / 改 | `jobs/upsert`（单次 upsert） | 身份命中活跃实例（类型化 `sub_attr` + 调度器命名空间）路由到 UPDATE：请求采集器**并入**现有手工选择（union 去重，绝不整替），事实只补空合并。类型化 sub_attr 命中的行，只有在其身份未解析、或 subtype 携带的 scheduler（schedd）归属与请求一致时，才按 internal id 路由 UPDATE：同一 native id 在另一个 schedd 下属于不同作业（各自 CREATE），归属未知的旧记录保持 legacy 容忍，多条命中报 `ambiguous_selector`，绝不猜测。其余走 CREATE：旧版手工登记语义，其查重按同样的 scheduler（schedd）归属判别，空采集器列表仍被拒绝（UPDATE 允许空列表 = 纯事实补录） |
+| 增 / 改 | `jobs/upsert`（单次 upsert） | 身份命中活跃实例（类型化 `sub_attr` + 调度器命名空间）路由到 UPDATE：请求采集器**并入**现有手工选择（union 去重，绝不整替），事实只补空合并。类型化 sub_attr 命中的行，只有在其身份未解析、或 subtype 携带的 scheduler（schedd）归属与请求一致时，才按 `JobID` 路由 UPDATE：同一 `JobNativeID` 在另一个 schedd 下属于不同作业（各自 CREATE），归属未知的旧记录保持 legacy 容忍，多条命中报 `ambiguous_selector`，绝不猜测。其余走 CREATE：旧版手工登记语义，其查重按同样的 scheduler（schedd）归属判别，空采集器列表仍被拒绝（UPDATE 允许空列表 = 纯事实补录） |
 | 查 / 改选择 | `jobs/collection/get`、`jobs/collection/set`、`jobs/collection/set (reset_auto)` | 不变；手工选择（含空 stop）永远压过自动选择 |
 | 删 —— stop 档（默认） | `jobs/stop` | 停止采集（持久化空的手工选择）；作业记录保留 |
 | 删 —— erase 档 | `jobs/erase` | 真删：先持久化 closing，采集过的实例归档为 `h:` 历史行，从未采集过的直接持久化删除。响应以 `mode: stop\|erase` 区分两档 |

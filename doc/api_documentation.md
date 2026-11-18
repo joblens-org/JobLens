@@ -104,8 +104,8 @@ Generic job operation (add or remove).
 |---|---|---|---|
 | `opt` | string | **Yes** | Operation type: `"add"` or `"remove"` |
 | `type` | string | **Yes** | Job type: `"job.condor"`, `"job.slurm"`, or `"job.common"` |
-| `JobID` | int | No | Job ID |
-| `JobPIDs` | array[int] | No | List of process PIDs |
+| `JobID` | int | No | Job handle: the record ID, numeric in this legacy shape (v2 endpoints carry the decimal string) |
+| `JobPIDs` | array[int] | No | Bare pid list, accepted on the v1 job endpoints; the legacy `dump_job`/Lua name for the `pids` projection of `pid_identities` |
 | `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "io_collector", "net_collector"]`) |
 | `sub_attr` | object | No | Sub-attributes: `condor` type needs `cluster_id`/`proc_id`, `slurm` type needs `job_id`/`step_id` |
 | `erase` | bool | No | For `remove` only. `false` or absent keeps the stop tier: collection stops, the job record remains. `true` retires the instance: a collected instance is archived as an `h:` history row, a never-collected instance is deleted |
@@ -147,7 +147,7 @@ Condor job specific operation. Currently only supports `"add"`.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `opt` | string | **Yes** | Operation type, only `"add"` is supported |
-| `JobID` | int | No | Job ID |
+| `JobID` | int | No | Condor job number. The legacy endpoint keeps the name `JobID` for the scheduler-native id the record calls `JobNativeID` |
 | `slot` | string | **Yes** | Slot name, must start with `"slot"` |
 | `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "io_collector", "net_collector"]`) |
 | `sub_attr` | object | No | Sub-attributes (e.g., `{"cluster_id": 123456, "proc_id": 0}`) |
@@ -185,7 +185,7 @@ Slurm job specific operation. Currently only supports `"add"`.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `opt` | string | **Yes** | Operation type, only `"add"` is supported |
-| `JobID` | int | **Yes** | Slurm job ID |
+| `JobID` | int | **Yes** | Slurm job number. The legacy endpoint keeps the name `JobID` for the scheduler-native id the record calls `JobNativeID` |
 | `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "io_collector", "net_collector"]`) |
 | `sub_attr` | object | No | Sub-attributes (e.g., `{"job_id": 12345, "step_id": 0}`) |
 
@@ -552,20 +552,19 @@ Get hardware information including CPU model, memory size, disk info, etc.
 ## 12. Job List and Collection Control
 
 These routes proxy the Core job/collection contract. Trigger validates and
-forwards only: it never allocates or derives internal IDs, and a Core error is
+forwards only: it never allocates or derives a `JobID`, and a Core error is
 never turned into HTTP 200.
 
 ### `GET /joblens/jobs/list`
 
-Bounded, read-only job list snapshot. The old `/joblens/inventory` path is a
-deprecated alias served by the Trigger adapter and calls the same Core method.
+Bounded, read-only job list snapshot.
 
 | Query | Type | Description |
 |---|---|---|
 | `limit` | int | Page size, 1–1000, default 100 |
 | `scheduler_type` | string | `condor` or `slurm` |
-| `native_job_id` | string | Native scheduler ID (exact match) |
-| `state` | string | `active`, `suspect` or `closing` |
+| `JobNativeID` | string | Scheduler-native job ID, unique within one `clusterName` + `clusterTag` (exact match) |
+| `state` | string | Record lifecycle state: `active` or `closing`. `suspect` passes validation but matches no record — it is a `jobs/status` count, not a record state |
 | `cursor` | string | Opaque cursor from the previous page |
 
 **Response (200):**
@@ -574,20 +573,19 @@ deprecated alias served by the Trigger adapter and calls the same Core method.
   "status": "ok",
   "snapshot_revision": 1234567890,
   "records": [{
-    "instance_id": "42",
-    "internal_job_id": "42",
+    "JobID": "42",
     "schema_version": 2,
-    "record_revision": 3,
+    "revision": 3,
     "state": "active",
     "source": "condor",
     "identity_complete": true,
     "scheduler_type": "condor",
-    "cluster_name": "htcondor01",
-    "cluster_tag": "schedd-a",
-    "native_job_id": "172.0",
+    "clusterName": "htcondor01",
+    "clusterTag": "schedd-a",
+    "JobNativeID": "172.0",
     "step_id": "",
-    "generation": {"boot_id": "...", "manager_pid": 1234, "manager_start_ticks": 999},
-    "processes": [{"pid": 1235, "start_ticks": 1000, "boot_id": "..."}],
+    "manager": {"boot_id": "...", "manager_pid": 1234, "manager_start_ticks": 999},
+    "pid_identities": [{"pid": 1235, "start_ticks": 1000, "boot_id": "..."}],
     "attributes": {"owner": "alice"}
   }],
   "next_cursor": null
@@ -595,16 +593,23 @@ deprecated alias served by the Trigger adapter and calls the same Core method.
 ```
 
 A cursor is only valid while the snapshot is unchanged; otherwise the request
-fails with `409 cursor_invalidated`. Internal IDs are decimal strings so
-JavaScript consumers keep uint64 precision.
+fails with `409 cursor_invalidated`. In this resource the `JobID` is a decimal
+string so JavaScript consumers keep uint64 precision.
+
+`state` on a record is its durable lifecycle state, serialized from
+`RecordState` as exactly `active` or `closing`; there is no third value. A
+liveness verdict is not part of it: `jobs/status` counts `instances.suspect` for
+the records whose execution is not `presumed_live`, and that is a statistic over
+the snapshot, not a state a record can hold.
 
 ### `GET /joblens/jobs/status`
 
 Source, reconciliation, queue and persistence health (active/suspect/closing
 counts, scan timestamps, dropped events, store degradation, incomplete and
 quarantined identities, applied/drain state). Served verbatim from the Core;
-`200` even when the reported state is `degraded`. The old
-`/joblens/inventory/status` path is a deprecated alias.
+`200` even when the reported state is `degraded`. Admission counters appear as
+`capture_all`, `not_admitted_capture_all_off`, `not_admitted_by_rule` and
+`admission_errors`.
 
 ### `POST /joblens/collection`
 
@@ -613,8 +618,8 @@ Set or reset collection intent for one exact target set.
 **Request body:**
 ```json
 {
-  "selector": {"scheduler_type": "condor", "cluster_name": "htcondor01",
-               "cluster_tag": "schedd-a", "native_job_id": "172.0"},
+  "selector": {"scheduler_type": "condor", "clusterName": "htcondor01",
+               "clusterTag": "schedd-a", "JobNativeID": "172.0"},
   "scope": "instance",
   "ensure_registered": true,
   "operation": "set",
@@ -624,12 +629,12 @@ Set or reset collection intent for one exact target set.
 
 | Field | Required | Description |
 |---|---|---|
-| `selector` | Yes | Exactly one form: `internal_job_id`, or `scheduler_type` + `cluster_name` + `native_job_id` (+ optional `cluster_tag`, `step_id`) |
-| `scope` | No | `instance` (default) or `job`. `internal_job_id` only supports `instance`; Slurm `job` targets every currently observed local step |
+| `selector` | Yes | Exactly one form: `JobID`, or `scheduler_type` + `clusterName` + `JobNativeID` (+ optional `clusterTag`, `step_id`) |
+| `scope` | No | `instance` (default) or `job`. `JobID` only supports `instance`; Slurm `job` targets every currently observed local step |
 | `ensure_registered` | No | Run one authoritative discovery pass before matching |
 | `operation` | Yes | `set` or `reset_auto` |
 | `collectors` | For `set` | Explicit list; `[]` is a persistent stop. Must be omitted for `reset_auto` |
-| `expected_revision` | No | Record-revision guard, single-instance requests only. Omit for no guard; a supplied value must equal the current `record_revision` (0 is not valid for an existing record) |
+| `expected_revision` | No | Record-revision guard, single-instance requests only. Omit for no guard; a supplied value must equal the current `revision` (0 is not valid for an existing record) |
 
 **Response (200):**
 ```json
@@ -638,10 +643,9 @@ Set or reset collection intent for one exact target set.
   "operation": "set",
   "scope": "instance",
   "targets": [{
-    "instance_id": "42",
-    "internal_job_id": "42",
-    "native_job_id": "172.0",
-    "record_revision": 1,
+    "JobID": "42",
+    "JobNativeID": "172.0",
+    "revision": 1,
     "mode": "manual",
     "desired_collectors": ["cpumem_collector"],
     "applied_collectors": ["cpumem_collector"],
@@ -656,13 +660,11 @@ Set or reset collection intent for one exact target set.
 when the Agent has no collection runtime or a collector refused the binding.
 `status: accepted` only means the intent is durable.
 
-### `GET /joblens/collection?internal_job_id=...`
+### `GET /joblens/collection?JobID=...`
 
 Desired/applied selection, mode, revisions, policy revision and per-collector
-errors for one instance. `internal_job_id` is the decimal internal ID from the
-job list; `instance_id` remains accepted as a deprecated alias by the Trigger
-adapter. `404` when it does not name a verified current instance, `409` when it
-names a closing generation.
+errors for one instance. `JobID` is the decimal string from the job list.
+`404` when no record carries that id, `409` when the record is closing.
 
 ### `GET /joblens/capabilities`
 
@@ -673,8 +675,8 @@ Trigger never declares a capability the Core did not report.
 **Status Codes:**
 - `200` - Success
 - `400` - Invalid request (unknown collector, missing `collectors`, bad selector)
-- `404` - No verified current instance
-- `409` - Ambiguous selector, stale `expected_revision`, closing generation, invalidated cursor
+- `404` - No record with that id
+- `409` - Ambiguous selector, stale `expected_revision`, closing instance, invalidated cursor
 - `502` - Core returned a response that violates the contract
 - `503` - Core RPC unavailable, store unavailable or registry still migrating
 
@@ -684,27 +686,28 @@ Trigger never declares a capability the Core did not report.
 
 The v2 surface is resource-oriented and returns the Core `JobRecord` representation.
 The v1 routes above remain unchanged; v1 and v2 share the same Trigger adapter and
-the same Core methods. The legacy `/joblens/capabilities` response also keeps
-`inventory_version` (1) and `inventory_ready` aliases; `/joblens/inventory/status`
-keeps `inventory_enabled`.
+the same Core methods. Three compatibility aliases outlive the rename:
+`facts_revision` (v1 paths only; same value as `revision`), `candidate_instance_ids`
+(accepted in place of `candidates` in a Core error envelope) and `JobPIDs` (the
+legacy `dump_job` name for the bare `pids` projection of `pid_identities`).
 
 | Method | Path | Semantics |
 |---|---|---|
 | `GET` | `/joblens/v2/jobs` | Paginated job records; same `limit`/`cursor`/filters as `/joblens/jobs/list` |
 | `GET` | `/joblens/v2/jobs/count` | Active job-record count |
-| `GET` | `/joblens/v2/jobs/<internal_job_id>` | One job record |
+| `GET` | `/joblens/v2/jobs/<JobID>` | One job record |
 | `POST` | `/joblens/v2/jobs` | Strict create (`jobs/create`); an existing identity or ID returns 409 |
 | `PUT` | `/joblens/v2/jobs` | Identity-resolved upsert (`jobs/upsert`); body has no `opt` field |
-| `DELETE` | `/joblens/v2/jobs/<internal_job_id>` | Erase/retire (`jobs/erase`) |
-| `POST` | `/joblens/v2/jobs/<internal_job_id>/stop` | Stop collection, retain the record (`jobs/stop`) |
-| `GET` | `/joblens/v2/jobs/<internal_job_id>/collection` | Desired/applied collection state |
-| `PUT` | `/joblens/v2/jobs/<internal_job_id>/collection` | Replace desired collectors (`{"collectors": [...]}`; `[]` stops) |
-| `DELETE` | `/joblens/v2/jobs/<internal_job_id>/collection` | Clear the manual override (reset_auto) |
+| `DELETE` | `/joblens/v2/jobs/<JobID>` | Erase/retire (`jobs/erase`) |
+| `POST` | `/joblens/v2/jobs/<JobID>/stop` | Stop collection, retain the record (`jobs/stop`) |
+| `GET` | `/joblens/v2/jobs/<JobID>/collection` | Desired/applied collection state |
+| `PUT` | `/joblens/v2/jobs/<JobID>/collection` | Replace desired collectors (`{"collectors": [...]}`; `[]` stops) |
+| `DELETE` | `/joblens/v2/jobs/<JobID>/collection` | Clear the manual override (reset_auto) |
 | `GET` | `/joblens/v2/status` | Same status payload as `/joblens/jobs/status` |
 | `GET` | `/joblens/v2/capabilities` | Same capabilities payload; `api_version` is `2` |
 
-The v2 job representation includes `internal_job_id`, `record_revision`, `state`,
-`desired_collectors`, `mode`, `processes`, `generation` and `attributes`. The v1
+The v2 job representation includes `JobID`, `revision`, `state`,
+`desired_collectors`, `mode`, `pid_identities`, `manager` and `attributes`. The v1
 `dump_job` shape is reconstructed by the Trigger adapter from the same record, so
 old clients do not need to change.
 
@@ -720,7 +723,7 @@ old clients do not need to change.
 | `401` | Unauthorized (missing or invalid auth header) |
 | `403` | Forbidden (invalid token) |
 | `404` | Resource not found |
-| `409` | Conflict (ambiguous selector, stale revision, closing generation, invalidated cursor) |
+| `409` | Conflict (ambiguous selector, stale revision, closing instance, invalidated cursor) |
 | `500` | Internal server error |
 | `502` | Core returned a response that violates the contract |
 | `503` | Service unavailable (RPC failure, store unavailable or registry initializing) |

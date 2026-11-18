@@ -104,11 +104,11 @@
 |---|---|---|---|
 | `opt` | string | **是** | 操作类型：`"add"` 或 `"remove"` |
 | `type` | string | **是** | 作业类型：`"job.condor"`、`"job.slurm"` 或 `"job.common"` |
-| `JobID` | int | 否 | 作业 ID |
-| `JobPIDs` | array[int] | 否 | 进程 PID 列表 |
+| `JobID` | int | 否 | 作业句柄：记录 ID，在该 legacy 形状里是数字（v2 接口用其十进制字符串） |
+| `JobPIDs` | array[int] | 否 | 裸 pid 列表，v1 作业接口仍接受；`dump_job`/Lua 的兼容名，对应 `pid_identities` 的 `pids` 投影 |
 | `Lens` | array[string] | 否 | 收集器列表（默认：`["cpumem_collector", "io_collector", "net_collector"]`） |
 | `sub_attr` | object | 否 | 子属性：`condor` 类型需 `cluster_id`/`proc_id`，`slurm` 类型需 `job_id`/`step_id` |
-| `erase` | bool | 否 | 仅用于 `remove`。缺省或 `false` 为 stop 档：停止采集、保留库存事实。`true` 为真删档：采集过的实例归档为 `h:` 历史行，从未采集过的实例直接删除 |
+| `erase` | bool | 否 | 仅用于 `remove`。缺省或 `false` 为 stop 档：停止采集、保留作业记录。`true` 为真删档：采集过的实例归档为 `h:` 历史行，从未采集过的实例直接删除 |
 
 **示例请求：**
 ```json
@@ -147,7 +147,7 @@ Condor 作业专用操作，目前仅支持 `"add"`。
 | 字段 | 类型 | 必填 | 描述 |
 |---|---|---|---|
 | `opt` | string | **是** | 操作类型，仅支持 `"add"` |
-| `JobID` | int | 否 | 作业 ID |
+| `JobID` | int | 否 | Condor 作业编号。该 legacy 接口仍把这个调度器原生编号叫 `JobID`，记录里叫 `JobNativeID` |
 | `slot` | string | **是** | 槽位名称，必须以 `"slot"` 开头 |
 | `Lens` | array[string] | 否 | 收集器列表（默认：`["cpumem_collector", "io_collector", "net_collector"]`） |
 | `sub_attr` | object | 否 | 子属性（如 `{"cluster_id": 123456, "proc_id": 0}`） |
@@ -185,7 +185,7 @@ Slurm 作业专用操作，目前仅支持 `"add"`。
 | 字段 | 类型 | 必填 | 描述 |
 |---|---|---|---|
 | `opt` | string | **是** | 操作类型，仅支持 `"add"` |
-| `JobID` | int | **是** | Slurm 作业 ID |
+| `JobID` | int | **是** | Slurm 作业编号。该 legacy 接口仍把这个调度器原生编号叫 `JobID`，记录里叫 `JobNativeID` |
 | `Lens` | array[string] | 否 | 收集器列表（默认：`["cpumem_collector", "io_collector", "net_collector"]`） |
 | `sub_attr` | object | 否 | 子属性（如 `{"job_id": 12345, "step_id": 0}`） |
 
@@ -553,7 +553,7 @@ Slurm 作业专用操作，目前仅支持 `"add"`。
 ## 12. 作业列表与采集控制
 
 以下接口透传 Core 的作业/采集契约。
-Trigger 只做校验与转发：不分配、不推导内部 ID，Core 的错误绝不会被包装成 HTTP 200。
+Trigger 只做校验与转发：不分配、不推导 `JobID`，Core 的错误绝不会被包装成 HTTP 200。
 
 ### `GET /joblens/jobs/list`
 
@@ -563,8 +563,8 @@ Trigger 只做校验与转发：不分配、不推导内部 ID，Core 的错误�
 |---|---|---|
 | `limit` | int | 每页条数，1–1000，默认 100 |
 | `scheduler_type` | string | `condor` 或 `slurm` |
-| `native_job_id` | string | 调度器原生 ID（精确匹配） |
-| `state` | string | `active`、`suspect` 或 `closing` |
+| `JobNativeID` | string | 调度器原生作业编号，在一个 `clusterName` + `clusterTag` 下唯一（精确匹配） |
+| `state` | string | 记录的生命周期状态：`active` 或 `closing`。`suspect` 能通过校验但匹配不到任何记录——它是 `jobs/status` 的统计口径，不是记录状态 |
 | `cursor` | string | 上一页返回的不透明游标 |
 
 **响应（200）：**
@@ -573,34 +573,39 @@ Trigger 只做校验与转发：不分配、不推导内部 ID，Core 的错误�
   "status": "ok",
   "snapshot_revision": 1234567890,
   "records": [{
-    "instance_id": "42",
-    "internal_job_id": "42",
+    "JobID": "42",
     "schema_version": 2,
-    "record_revision": 3,
+    "revision": 3,
     "state": "active",
     "source": "condor",
     "identity_complete": true,
     "scheduler_type": "condor",
-    "cluster_name": "htcondor01",
-    "cluster_tag": "schedd-a",
-    "native_job_id": "172.0",
+    "clusterName": "htcondor01",
+    "clusterTag": "schedd-a",
+    "JobNativeID": "172.0",
     "step_id": "",
-    "generation": {"boot_id": "...", "manager_pid": 1234, "manager_start_ticks": 999},
-    "processes": [{"pid": 1235, "start_ticks": 1000, "boot_id": "..."}],
+    "manager": {"boot_id": "...", "manager_pid": 1234, "manager_start_ticks": 999},
+    "pid_identities": [{"pid": 1235, "start_ticks": 1000, "boot_id": "..."}],
     "attributes": {"owner": "alice"}
   }],
   "next_cursor": null
 }
 ```
 
-游标仅在快照未变化时有效，否则返回 `409 cursor_invalidated`。新增接口中的内部 ID
-一律为十进制字符串，避免 JavaScript 的 uint64 精度丢失。
+游标仅在快照未变化时有效，否则返回 `409 cursor_invalidated`。本接口的 `JobID` 为
+十进制字符串，避免 JavaScript 的 uint64 精度丢失。
+
+记录上的 `state` 是持久化的生命周期状态，由 `RecordState` 序列化而来，只有
+`active` 与 `closing` 两个值。存活判定不属于它：`jobs/status` 对执行未被
+`presumed_live` 的记录计入 `instances.suspect`，那是快照上的统计口径，不是记录能
+持有的第三种状态。
 
 ### `GET /joblens/jobs/status`
 
 来源、对账、队列与持久化健康状态（active/suspect/closing 计数、扫描时间、
 丢弃事件、存储降级、不完整/隔离身份、已生效与待排空状态）。原样透传 Core，
-即使状态为 `degraded` 也返回 `200`。
+即使状态为 `degraded` 也返回 `200`。准入门计数以 `capture_all`、
+`not_admitted_capture_all_off`、`not_admitted_by_rule`、`admission_errors` 出现。
 
 ### `POST /joblens/collection`
 
@@ -609,8 +614,8 @@ Trigger 只做校验与转发：不分配、不推导内部 ID，Core 的错误�
 **请求体：**
 ```json
 {
-  "selector": {"scheduler_type": "condor", "cluster_name": "htcondor01",
-               "cluster_tag": "schedd-a", "native_job_id": "172.0"},
+  "selector": {"scheduler_type": "condor", "clusterName": "htcondor01",
+               "clusterTag": "schedd-a", "JobNativeID": "172.0"},
   "scope": "instance",
   "ensure_registered": true,
   "operation": "set",
@@ -620,12 +625,12 @@ Trigger 只做校验与转发：不分配、不推导内部 ID，Core 的错误�
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `selector` | 是 | 二选一：`internal_job_id`，或 `scheduler_type` + `cluster_name` + `native_job_id`（可选 `cluster_tag`、`step_id`） |
-| `scope` | 否 | `instance`（默认）或 `job`。`internal_job_id` 只支持 `instance`；Slurm `job` 覆盖当前已观测的所有本地 step |
+| `selector` | 是 | 二选一：`JobID`，或 `scheduler_type` + `clusterName` + `JobNativeID`（可选 `clusterTag`、`step_id`） |
+| `scope` | 否 | `instance`（默认）或 `job`。`JobID` 只支持 `instance`；Slurm `job` 覆盖当前已观测的所有本地 step |
 | `ensure_registered` | 否 | 匹配前先执行一次权威发现 |
 | `operation` | 是 | `set` 或 `reset_auto` |
 | `collectors` | `set` 必填 | 显式列表；`[]` 表示持久停止。`reset_auto` 必须省略 |
-| `expected_revision` | 否 | 记录修订号校验，仅单实例请求可携带；省略表示不校验，携带时必须等于当前 `record_revision` |
+| `expected_revision` | 否 | 记录修订号校验，仅单实例请求可携带；省略表示不校验，携带时必须等于当前 `revision` |
 
 **响应（200）：**
 ```json
@@ -634,10 +639,9 @@ Trigger 只做校验与转发：不分配、不推导内部 ID，Core 的错误�
   "operation": "set",
   "scope": "instance",
   "targets": [{
-    "instance_id": "42",
-    "internal_job_id": "42",
-    "native_job_id": "172.0",
-    "record_revision": 1,
+    "JobID": "42",
+    "JobNativeID": "172.0",
+    "revision": 1,
     "mode": "manual",
     "desired_collectors": ["cpumem_collector"],
     "applied_collectors": ["cpumem_collector"],
@@ -651,10 +655,10 @@ Trigger 只做校验与转发：不分配、不推导内部 ID，Core 的错误�
 `applied_collectors` 是运行时状态：Agent 没有采集运行时、或采集器拒绝绑定时，
 它是空的并在 `errors` 中给出原因。`status: accepted` 只表示意图已持久化。
 
-### `GET /joblens/collection?internal_job_id=...`
+### `GET /joblens/collection?JobID=...`
 
 查询单个实例的期望/已生效选择、模式、修订号、策略修订号与逐采集器错误。
-实例不存在时 `404`，指向正在关闭的代际时 `409`。
+`JobID` 是作业列表给出的十进制字符串。实例不存在时 `404`，记录正在关闭时 `409`。
 
 ### `GET /joblens/capabilities`
 
@@ -664,8 +668,8 @@ Trigger 只做校验与转发：不分配、不推导内部 ID，Core 的错误�
 **状态码：**
 - `200` - 成功
 - `400` - 请求非法（未知采集器、缺少 `collectors`、选择器不合法）
-- `404` - 没有已验证的当前实例
-- `409` - 选择器歧义、`expected_revision` 过期、代际正在关闭、游标失效
+- `404` - 没有该 `JobID` 的记录
+- `409` - 选择器歧义、`expected_revision` 过期、实例正在关闭、游标失效
 - `502` - Core 返回的响应不符合契约
 - `503` - Core RPC 不可用、存储不可用或作业持久层仍在迁移
 
@@ -674,27 +678,28 @@ Trigger 只做校验与转发：不分配、不推导内部 ID，Core 的错误�
 ## 13. v2 资源 API
 
 v2 按资源组织并直接返回 Core 的 `JobRecord` 表示。上面的 v1 路由保持不变；
-v1/v2 共用同一套 Trigger 适配层与 Core 方法。旧版 `/joblens/capabilities` 仍保留
-`inventory_version`（1）与 `inventory_ready` 别名；`/joblens/inventory/status`
-保留 `inventory_enabled`。
+v1/v2 共用同一套 Trigger 适配层与 Core 方法。改名后仍保留三个兼容别名：
+`facts_revision`（仅 v1 路径；取值同 `revision`）、`candidate_instance_ids`
+（在 Core 错误信封中可替代 `candidates` 传入）、`JobPIDs`（`dump_job` 旧名，
+对应 `pid_identities` 的裸 pid 投影 `pids`）。
 
 | 方法 | 路径 | 语义 |
 |---|---|---|
 | `GET` | `/joblens/v2/jobs` | 分页作业记录；`limit`/`cursor`/过滤参数同 `/joblens/jobs/list` |
 | `GET` | `/joblens/v2/jobs/count` | 活跃作业记录数 |
-| `GET` | `/joblens/v2/jobs/<internal_job_id>` | 单个作业记录 |
+| `GET` | `/joblens/v2/jobs/<JobID>` | 单个作业记录 |
 | `POST` | `/joblens/v2/jobs` | 严格创建（`jobs/create`）；身份或 ID 已存在返回 409 |
 | `PUT` | `/joblens/v2/jobs` | 按身份 upsert（`jobs/upsert`）；请求体不带 `opt` |
-| `DELETE` | `/joblens/v2/jobs/<internal_job_id>` | 退役/删除（`jobs/erase`） |
-| `POST` | `/joblens/v2/jobs/<internal_job_id>/stop` | 停止采集、保留记录（`jobs/stop`） |
-| `GET` | `/joblens/v2/jobs/<internal_job_id>/collection` | 期望/已生效采集状态 |
-| `PUT` | `/joblens/v2/jobs/<internal_job_id>/collection` | 替换期望采集器（`{"collectors": [...]}`；`[]` 停止） |
-| `DELETE` | `/joblens/v2/jobs/<internal_job_id>/collection` | 清除 manual override（reset_auto） |
+| `DELETE` | `/joblens/v2/jobs/<JobID>` | 退役/删除（`jobs/erase`） |
+| `POST` | `/joblens/v2/jobs/<JobID>/stop` | 停止采集、保留记录（`jobs/stop`） |
+| `GET` | `/joblens/v2/jobs/<JobID>/collection` | 期望/已生效采集状态 |
+| `PUT` | `/joblens/v2/jobs/<JobID>/collection` | 替换期望采集器（`{"collectors": [...]}`；`[]` 停止） |
+| `DELETE` | `/joblens/v2/jobs/<JobID>/collection` | 清除 manual override（reset_auto） |
 | `GET` | `/joblens/v2/status` | 与 `/joblens/jobs/status` 相同的状态 |
 | `GET` | `/joblens/v2/capabilities` | 相同能力声明；`api_version` 为 `2` |
 
-v2 作业表示包含 `internal_job_id`、`record_revision`、`state`、
-`desired_collectors`、`mode`、`processes`、`generation`、`attributes`。v1 的
+v2 作业表示包含 `JobID`、`revision`、`state`、
+`desired_collectors`、`mode`、`pid_identities`、`manager`、`attributes`。v1 的
 `dump_job` 形状由 Trigger 适配层从同一条记录重建，旧客户端无需修改。
 
 ---
@@ -709,7 +714,7 @@ v2 作业表示包含 `internal_job_id`、`record_revision`、`state`、
 | `401` | 未授权（缺失或无效的认证头） |
 | `403` | 禁止访问（无效 token） |
 | `404` | 资源未找到 |
-| `409` | 冲突（选择器歧义、修订号过期、代际正在关闭、游标失效） |
+| `409` | 冲突（选择器歧义、修订号过期、实例正在关闭、游标失效） |
 | `500` | 内部服务器错误 |
 | `502` | Core 返回的响应不符合契约 |
 | `503` | 服务不可用（RPC 故障、存储不可用或作业持久层初始化中） |

@@ -125,7 +125,7 @@ power_collector_config:
 
 ```text
 PowerCollector interval_s=1 delta_rapl_j=61.3 avg_power_w=61.3 system_overhead_j=16
-PowerCollector job job_id=1 native_job_id=123.0 energy_j=45.3 power_watt=45.3 ipmi_power_watt=0
+PowerCollector job job_id=1 JobNativeID=123.0 energy_j=45.3 power_watt=45.3 ipmi_power_watt=0
 PowerCollector pid job_id=1 pid=12345 energy_j=27.6 cpu_pct=200
 ```
 

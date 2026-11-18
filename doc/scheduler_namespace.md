@@ -11,8 +11,8 @@ The legacy manual RPC uses its local collector/Slurm cluster configuration
 when the request supplies no corresponding label. That fallback does not prove
 where a remote job originated; callers registering remote jobs should supply
 their explicit routing or cluster label.
-The Trigger's `/joblens/job` forwards optional top-level `cluster_name` and
-`cluster_tag` unchanged. The Core injects them into the typed `sub_attr`
+The Trigger's `/joblens/job` forwards optional top-level `clusterName` and
+`clusterTag` unchanged. The Core injects them into the typed `sub_attr`
 facts (facts win) and rejects a contradiction with `namespace_conflict`;
 the Trigger does not reconcile conflicting values.
 
@@ -22,10 +22,10 @@ questions and are not resolved by this namespace policy.
 
 Matching compares separately stored structured fields. Which typed
 `sub_attr` fields form a scheduler's namespace is adapter-owned knowledge
-(`ISchedulerAdapter`'s namespace interface); the common `cluster_name`/
+(`ISchedulerAdapter`'s namespace interface); the common `clusterName`/
 `clusterTag` fields are a rendered projection of those facts — the
 `job_info.*` contract the query side filters on — never an independent
-second source. Request-level `cluster_name`/`cluster_tag` aliases are
+second source. Request-level `clusterName`/`clusterTag` aliases are
 injected into the typed facts at the RPC boundary (facts win; a
 contradiction is an explicit `namespace_conflict` rejection). A
 disagreement between known components is a conflict even when another

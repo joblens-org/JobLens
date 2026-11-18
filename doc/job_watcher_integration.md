@@ -28,7 +28,7 @@ src/ebpf/trace_ssh_session.bpf.c          # optional: exec-hint event source
 
 What you get for free:
 
-- durable storage (`JobRecord`), identity indexing, generation conflicts;
+- durable storage (`JobRecord`), identity indexing, manager conflicts;
 - the heartbeat: authoritative manager passes, absence tracking, retirement
   evidence rules, per-record execution refresh;
 - desired-vs-applied collection reconciliation and `CollectionStatus`;
@@ -59,9 +59,12 @@ What you get for free:
 Two structural rules govern the whole line:
 
 - A discovered **Job** either is ready (resolvable canonical identity plus a
-  complete execution generation — `discovery_job_ready`) or is *explicitly
-  incomplete* with reasons on `job.execution->incomplete_reason`. There is no
-  best-effort middle state.
+  complete execution manager) or is dropped as *incomplete*: the watcher's
+  `finalize_discovery()` returns `nullopt`, so a half-read job never reaches
+  the registry. The reason is logged by the watcher and, when the caller passes
+  the optional `notes` out-parameter, handed back to it — it is not a field on
+  the Job. There is no best-effort middle state, and an unpublished discovery
+  is never read as "ended".
 - A **failed or partial manager pass is never "everything else ended"**:
   `ManagerSet::complete` says whether the pass covered its sources; consumers
   must check it before treating absence as termination evidence.
@@ -124,26 +127,29 @@ The Job is the registration unit: typed facts plus one `execution` evidence
 group, filled where the source parses its inputs. `JobID`, `JobPIDs` and
 `CollectorNames` stay empty — they are store/intent owned.
 
-- Identity fields (`subtype_name`, `cluster_name`, `clusterTag`,
-  `NativeJobID`, `execution->step_id`): whatever the source really provided,
+- Identity fields (`subtype_name`, `clusterName`, `clusterTag`,
+  `JobNativeID`, `execution->step_id`): whatever the source really provided,
   verbatim. Never synthesize values.
 - Cluster namespace (e.g. `COLLECTOR_HOST`, `SLURM_CLUSTER_NAME`): explicit
   config override wins; otherwise derive from the source environment. **Never
-  guessed from a native job number.** Unresolved namespace ⇒ incomplete
-  discovery with a reason.
-- `execution->generation`: manager pid + manager start ticks + boot id. All
-  three or the generation is incomplete.
-- `execution->members`: prefer the execution cgroup's `cgroup.procs` — a
+  guessed from a native job number.** Unresolved namespace ⇒ the discovery is
+  dropped as incomplete, with its reason logged.
+- `execution->manager`: manager pid + manager start ticks + boot id. All
+  three or the manager is incomplete.
+- `execution->pid_identities`: prefer the execution cgroup's `cgroup.procs` — a
   *successful read including an empty list is authoritative*
-  (`members_authoritative = true`). Fall back to manager children only when
-  the cgroup is unreadable, and mark the list partial
-  (`members_authoritative = false`). A member whose start ticks cannot be read
-  stays in the list with `start_ticks == 0` so the missing evidence remains
-  visible.
-- Finish with `finalize_discovery_job(job, reasons)`: it computes readiness
-  (`discovery_job_ready`) from the identity/generation checks and records
-  every missing piece in `execution->incomplete_reason` (empty exactly when
-  ready). Caveats go into `execution->notes`.
+  (`pid_identities_authoritative = true`). Fall back to manager children only
+  when the cgroup is unreadable, and mark the list partial
+  (`pid_identities_authoritative = false`). A member whose start ticks cannot
+  be read stays in the list with `start_ticks == 0` so the missing evidence
+  remains visible. The bare pid list (`pids`, Lua/dump_job name `JobPIDs`) is a
+  projection of this set, never a second source.
+- Finish with `finalize_discovery(job, reasons, &notes)` (the Slurm watcher
+  declares the same signature): it re-checks canonical identity and
+  `execution_complete()` (the manager triple). If either fails it returns
+  `nullopt`, joins the reasons into one `discovery dropped as incomplete: ...`
+  log line and, when a `notes` vector was passed, appends that same line to it.
+  Nothing is written back onto the Job.
 
 ### 3.4 Adapter duties (`ISchedulerAdapter`)
 
@@ -332,7 +338,7 @@ Follow the two existing tiers; neither needs root, live schedulers or eBPF:
    ```
 
    This is where the invariants (I1–I8) get pinned: merge semantics,
-   generation conflicts, absence/suspect transitions, retirement evidence,
+   manager conflicts, absence/suspect transitions, retirement evidence,
    closing semantics.
 
 For eBPF-dependent tests, guard on namespace availability the way
@@ -368,11 +374,12 @@ alternative), matching and cgroup derivation are all adapter-driven.
 - `enumerateManagers()` reports `complete=false` only for pass-level failures;
   unreadable process-table entries are counted and noted, and an unobservable
   manager is a retry, never absence.
-- Discovered Jobs are ready or explicitly incomplete
-  (`execution->incomplete_reason`); the cluster namespace is never guessed
-  from a native id.
+- A discovered Job is published only when ready; an incomplete discovery is
+  dropped by `finalize_discovery()`, its reason logged (and optionally returned
+  to the caller through `notes`), never written into the Job. The cluster
+  namespace is never guessed from a native id.
 - Cgroup membership: successful read (including empty) is authoritative;
-  fallback paths mark `members_authoritative=false`.
+  fallback paths mark `pid_identities_authoritative=false`.
 - The builder leaves `JobID`/`JobPIDs`/`CollectorNames` empty (store and
   intent own them).
 - `traits()` is truthful; missing capabilities are normal states.

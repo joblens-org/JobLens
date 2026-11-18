@@ -28,24 +28,25 @@ collector 与 trigger。
 - **约定优于登记**：配置节 `<name>_job_watcher`、规则目录
   `config/rules/<name>_jobs`、规则前缀 `<name>_job_` 由 adapter 名字推导。
   只有内置类型的历史 `auto_add_*` 键保留为显式兼容特例。
-- **缺失即显式**：身份或执行证据不完整时，发现结果标记为 incomplete 并记录原因，
-  不做猜测、不生成半可信记录。
+- **缺失即显式**：身份或执行证据不完整时，发现结果标记为 incomplete 并被丢弃、
+  原因记入 watcher 日志（调用方传了 `notes` 时一并交回），不做猜测、不生成
+  半可信记录。
 
 ## 3. 身份
 
-`NativeSelector` / `CanonicalIdentity` 使用 `adapter` 字符串，不再使用
+`NativeSelector` / `SchedulerKey` 使用 `adapter` 字符串，不再使用
 `SchedulerType` 枚举。通用逻辑（命名空间拼接、key 组装、原样保留 native 字符串）
 在 `job_identity.cpp`；每个调度器的 native-id 规范化规则通过
 `REGISTER_NATIVE_ID_RULE` 自注册。
 
 身份分层保持独立：
 
-- 内部存储键：`uint64` 的 JobID，0 预留给系统哨兵；
-- 逻辑调度器身份：`NativeSelector` / `CanonicalIdentity`；
-- 本地执行身份：`ExecutionGeneration` + `ProcessIdentity`；
-- 对外实例句柄：内部 ID 的十进制字符串。
+- 内部存储键：`uint64` 的 `JobID`，0 预留给系统哨兵；
+- 逻辑调度器身份：`NativeSelector` / `SchedulerKey`；
+- 本地执行身份：`ExecutionEvidence.manager`（manager 三元组）+ `ProcessIdentity`；
+- 对外实例句柄：`JobID` 的十进制字符串。
 
-调度器原生编号、调用方哈希或裸 PID 都不是内部 ID，也不能单独构成完整身份。
+调度器原生编号、调用方哈希或裸 PID 都不是 `JobID`，也不能单独构成完整身份。
 查不到 native-id 规则时，`canonicalize()` 返回 `nullopt`，调用方按不完整观测处理。
 
 ## 4. facts 表示
@@ -76,9 +77,11 @@ using SubAttr = std::variant<CondorJobAttr, CommonJobAttr, SlurmJobAttr, nlohman
 4. watcher 在解析源的位置直接构造 `Job`：typed facts + 一个 execution 证据组。
    注册表在准入时派生 selector / identity，不存在第二层传输信封。
 
-发现结果只有两种状态：可解析身份且执行代次完整（ready），或显式 incomplete
-并在 `job.execution->incomplete_reason` 写明原因。部分 pass 不得被解释为
-“其余作业都已结束”；消费者必须先检查 `ManagerSet::complete`。
+发现结果只有两种状态：可解析身份且 manager 三元组完整（ready，会被发布），
+或不完整而被 `finalize_discovery()` 丢弃——原因由 watcher 记日志（调用方
+传了 `notes` 出参时一并交回），不写进 Job，注册表永远看不到半读作业。
+部分 pass 不得被解释为“其余作业都已结束”；消费者必须先检查
+`ManagerSet::complete`。
 
 ## 6. 配置与归因
 
@@ -141,8 +144,8 @@ private:
 };
 REGISTER_SCHEDULER_ADAPTER("ssh", SshSchedulerAdapter)
 REGISTER_NATIVE_ID_RULE("ssh", [](const NativeSelector& s) {
-    return s.native_job_id.find_first_not_of("0123456789") == std::string::npos
-        ? std::optional<CanonicalParts>(CanonicalParts{s.native_job_id, s.cluster_name, {}})
+    return s.job_native_id.find_first_not_of("0123456789") == std::string::npos
+        ? std::optional<CanonicalParts>(CanonicalParts{s.job_native_id, s.clusterName, {}})
         : std::nullopt;
 });
 ```
