@@ -759,6 +759,11 @@ inline std::optional<Job> CondorJobWatcher::observe_starter(const DiscoveryEnvir
                 attributes.owner = ad->owner;
                 attributes.scheduler_host = ad->scheduler_host;
                 attributes.scheduler_name = ad->scheduler_name;
+                // The typed pair rides the same parse as the string render;
+                // without it typed selectors and the duplicate screen see a
+                // zero-initialized identity (JL-04).
+                attributes.cluster_id = ad->cluster_id;
+                attributes.proc_id = ad->proc_id;
             }
         }
     }

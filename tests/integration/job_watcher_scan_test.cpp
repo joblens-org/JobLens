@@ -395,6 +395,12 @@ void condor_pass_finds_fixture_job(const Fixture& fixture)
     check(condor_attr.owner == "alice", "owner must come from the job ad");
     check(condor_attr.scheduler_host == "schedd07.fixture",
           "schedd host must come from the job ad");
+    // JL-04: the typed pair is the rule/identity substrate the string render
+    // was built from; losing it leaves typed selectors matching 0.
+    check(condor_attr.cluster_id == 76226337 && condor_attr.proc_id == 0,
+          "the typed cluster/proc pair must come from the ad's GlobalJobId, got " +
+              std::to_string(condor_attr.cluster_id) + "." +
+              std::to_string(condor_attr.proc_id));
 
     const auto health = watcher.health();
     check(health.state == SourceState::Healthy, "a successful pass makes the source healthy");

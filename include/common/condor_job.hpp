@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <climits>
+#include <charconv>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -51,6 +52,8 @@ struct CondorAdIdentity {
     std::string scheduler_name;  // schedd namespace, e.g. "scheduler@schedd07.example"
     std::string scheduler_host;  // schedd host part, e.g. "schedd07.example"
     std::string job_native_id;   // "ClusterId.ProcId" as written in the ad
+    size_t      cluster_id{};    // typed ClusterId parsed from GlobalJobId
+    size_t      proc_id{};       // typed ProcId parsed from GlobalJobId
     std::string owner;
 };
 
@@ -140,12 +143,37 @@ inline std::optional<CondorAdIdentity> parse_ad_identity(const std::string& cont
     ad.job_native_id =
         ad.global_job_id.substr(first_sharp + 1, second_sharp - first_sharp - 1);
     const auto dot = ad.job_native_id.find('.');
+    const auto cluster_part = dot == std::string::npos
+                                  ? std::string{}
+                                  : ad.job_native_id.substr(0, dot);
+    const auto proc_part = dot == std::string::npos
+                               ? std::string{}
+                               : ad.job_native_id.substr(dot + 1);
     if (dot == std::string::npos ||
-        !detail::is_decimal_part(ad.job_native_id.substr(0, dot)) ||
-        !detail::is_decimal_part(ad.job_native_id.substr(dot + 1))) {
+        !detail::is_decimal_part(cluster_part) ||
+        !detail::is_decimal_part(proc_part)) {
         error = "GlobalJobId '" + ad.global_job_id + "' has an unparsable native job id";
         return std::nullopt;
     }
+    // The typed pair comes from the same segment the string render does — one
+    // source, so the two can never disagree. A decimal that does not fit the
+    // typed field is an unparsable identity, never a truncated one.
+    const auto parse_typed = [](const std::string& decimal) -> std::optional<size_t> {
+        size_t value = 0;
+        const auto* begin = decimal.data();
+        const auto* end = decimal.data() + decimal.size();
+        const auto result = std::from_chars(begin, end, value, 10);
+        if (result.ec != std::errc() || result.ptr != end) return std::nullopt;
+        return value;
+    };
+    const auto typed_cluster = parse_typed(cluster_part);
+    const auto typed_proc = parse_typed(proc_part);
+    if (!typed_cluster || !typed_proc || *typed_cluster == 0) {
+        error = "GlobalJobId '" + ad.global_job_id + "' has an unparsable native job id";
+        return std::nullopt;
+    }
+    ad.cluster_id = *typed_cluster;
+    ad.proc_id = *typed_proc;
     return ad;
 }
 
