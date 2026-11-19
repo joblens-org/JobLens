@@ -2200,7 +2200,8 @@ bool JobRegistry::createManualJob(Job& job) {
             return false;
         }
     }
-    spdlog::info("JobRegistry: persisted manual registration of JobID {}", id->id);
+    spdlog::info("JobRegistry: registered manual job JobID {} (committed; the maintenance "
+                 "checkpoint persists it)", id->id);
 
     Job job_for_cb;
     if (auto stored = ownRecord(id->id)) {
@@ -3348,94 +3349,101 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         return result;
     }
     const std::string index_key = key->index_key();
-    const ProcessIdentity manager = manager_of(job);
     const int64_t observed_at = now_us();
 
     JobRecord record;   // the authoritative image this call hands back
 
-    // The whole resolve-decide-commit-publish sequence runs under the record
-    // transaction lock: a decided revision cannot move before its commit
-    // lands. records_mtx_ itself is taken only to read and (after a
-    // successful commit) to publish, so the collection runtime keeps reading
-    // the previous image while the store writes. The lock is scoped: kernel
-    // admission, the runtime wake and the automatic-policy (Lua) evaluation
-    // below never run under it.
-    {
-        std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
-
-        uint64_t job_id = 0;
+    // One observation, two lock scopes: the registry state that decides
+    // create-vs-merge is read and committed under the record transaction lock,
+    // while allocation and construction (no registry state, possibly /proc
+    // reads) run outside it. A commit that loses a create race re-enters the
+    // merge path instead of overwriting the winner. Inside every lock,
+    // records_mtx_ is taken only to read and (after a successful commit) to
+    // publish, so the collection runtime keeps reading the previous image while
+    // the store writes; kernel admission, the runtime wake and the
+    // automatic-policy (Lua) evaluation below never run under one.
+    for (;;) {
         {
-            std::shared_lock lg(records_mtx_);
-            if (const auto indexed = identity_index_.find(index_key);
-                indexed != identity_index_.end()) {
-                job_id = indexed->second;
+            std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
+
+            uint64_t job_id = 0;
+            {
+                std::shared_lock lg(records_mtx_);
+                if (const auto indexed = identity_index_.find(index_key);
+                    indexed != identity_index_.end()) {
+                    job_id = indexed->second;
+                }
             }
-        }
-        if (job_id == 0) {
-            if (auto durable = store_->readRowByIdentity(*key)) {
-                // An earlier create landed ambiguously without publishing
-                // anything: the durable row is the truth memory never held,
-                // and this identity lookup is the documented repair. Adopt
-                // it, then merge.
-                job_id = durable->job.JobID;
-                normalizeNamespaceFacts(durable->job);
-                std::unique_lock lg(records_mtx_);
-                if (!durable->index_key.empty())
-                    identity_index_[durable->index_key] = job_id;
-                records_[job_id] = std::move(*durable);
+            if (job_id == 0) {
+                if (auto durable = store_->readRowByIdentity(*key)) {
+                    // An earlier create landed ambiguously without publishing
+                    // anything: the durable row is the truth memory never held,
+                    // and this identity lookup is the documented repair. Adopt
+                    // it, then merge.
+                    job_id = durable->job.JobID;
+                    normalizeNamespaceFacts(durable->job);
+                    std::unique_lock lg(records_mtx_);
+                    if (!durable->index_key.empty())
+                        identity_index_[durable->index_key] = job_id;
+                    records_[job_id] = std::move(*durable);
+                }
             }
+            JobRecord stored;
+            bool have_stored = false;
+            if (job_id != 0) {
+                std::shared_lock lg(records_mtx_);
+                const auto it = records_.find(job_id);
+                if (it != records_.end()) {
+                    stored = it->second;
+                    have_stored = true;
+                }
+            }
+
+            if (have_stored) {
+                if (!namespace_facts_compatible(namespaceFactsOf(job),
+                                                namespaceFactsOf(stored.job))) {
+                    result.disposition = UpsertDisposition::Conflict;
+                    result.code = RegistrationError::IdentityIndexMismatch;
+                    result.error = to_string(result.code);
+                    result.message =
+                        "canonical identity key aliases conflicting structured namespaces";
+                    return result;
+                }
+                JobRecord updated;
+                result = mergeDiscoveredJob(stored, job, *key, job_id, observed_at, updated);
+                if (!result.ok) return result;
+                if (result.disposition == UpsertDisposition::Unchanged) {
+                    // The facts did not move, but the observed image still
+                    // refreshes memory-only bookkeeping (last_seen_us);
+                    // publication matches the previous store-out behavior.
+                    record = updated;
+                    std::unique_lock lg(records_mtx_);
+                    records_[job_id] = std::move(updated);
+                } else {
+                    // Updated: one unsynced batch; the row joins the dirty set.
+                    // A failed or ambiguous write publishes nothing (the latch
+                    // fences the row).
+                    RecordTxn txn(*this, "update job facts", /*durable=*/false);
+                    txn.touch(job_id);
+                    txn.put(std::move(updated));
+                    if (!txn.commit()) {
+                        result.ok = false;
+                        result.code = RegistrationError::StoreWriteFailed;
+                        result.error = "store_write_failed";
+                        result.message = txn.error();
+                        return result;
+                    }
+                    if (const auto published = ownRecord(job_id)) record = *published;
+                }
+                break;
+            }
+            // No record owns this identity: the create image is prepared
+            // outside every registry lock, and the identity is re-checked at
+            // commit time.
         }
 
-    bool have_stored = false;
-    JobRecord stored;
-    if (job_id != 0) {
-        std::shared_lock lg(records_mtx_);
-        const auto it = records_.find(job_id);
-        if (it != records_.end()) {
-            stored = it->second;
-            have_stored = true;
-        }
-    }
-
-    if (have_stored) {
-        if (!namespace_facts_compatible(namespaceFactsOf(job),
-                                        namespaceFactsOf(stored.job))) {
-            result.disposition = UpsertDisposition::Conflict;
-            result.code = RegistrationError::IdentityIndexMismatch;
-            result.error = to_string(result.code);
-            result.message = "canonical identity key aliases conflicting structured namespaces";
-            return result;
-        }
-        JobRecord updated;
-        result = mergeDiscoveredJob(stored, job, *key, job_id, observed_at, updated);
-        if (!result.ok) return result;
-        if (result.disposition == UpsertDisposition::Unchanged) {
-            // The facts did not move, but the observed image still refreshes
-            // memory-only bookkeeping (last_seen_us); publication matches the
-            // previous store-out publishing behavior.
-            record = updated;
-            std::unique_lock lg(records_mtx_);
-            records_[job_id] = std::move(updated);
-        } else {
-            // Updated: one unsynced batch; the row joins the dirty set. A
-            // failed or ambiguous write publishes nothing (the latch fences
-            // the row).
-            RecordTxn txn(*this, "update job facts", /*durable=*/false);
-            txn.touch(job_id);
-            txn.put(std::move(updated));
-            if (!txn.commit()) {
-                result.ok = false;
-                result.code = RegistrationError::StoreWriteFailed;
-                result.error = "store_write_failed";
-                result.message = txn.error();
-                return result;
-            }
-            if (const auto published = ownRecord(job_id)) record = *published;
-        }
-    } else {
-        // Create a new job record. Nothing is activated and no caller
-        // binding is accepted here. The id reservation rides along in the
-        // same batch as the record and its index entry: one commit, not two.
+        // Allocation and construction are not registry state: the id comes from
+        // the store's allocator and the image from the observation alone.
         std::string create_error;
         const auto id = reserveJobId(0, create_error);
         if (!id) {
@@ -3450,24 +3458,35 @@ UpsertResult JobRegistry::upsertObservedJob(const Job& job,
         }
         auto built = buildJobRecord(job, id->id, FactSource::Discovery, std::nullopt, *key,
                                     observed_at);
-        if (!commitNewRecord(std::move(built), *id, /*durable=*/false, create_error)) {
-            result.code = RegistrationError::StoreWriteFailed;
-            result.error = "store_write_failed";
-            result.message = create_error;
-            return result;
-        }
+        {
+            std::lock_guard<std::mutex> mutation_lock(mutation_mtx_);
+            // The id, its identity entry and (for an allocated id) the counter
+            // ride one batch; a create has no published image to revert, so it
+            // passes no recovery fence.
+            if (!commitNewRecord(std::move(built), *id, /*durable=*/false, create_error)) {
+                // Another producer registered this identity (or took this id)
+                // while the image was built outside the lock: merge the row it
+                // published instead of overwriting it.
+                if (create_error == "duplicate_identity" || create_error == "duplicate_job_id")
+                    continue;
+                result.code = RegistrationError::StoreWriteFailed;
+                result.error = "store_write_failed";
+                result.message = create_error;
+                return result;
+            }
 
-        result.ok = true;
-        result.disposition = UpsertDisposition::Created;
-        result.job_id = id->id;
-        std::shared_lock lg(records_mtx_);
-        result.revision = records_[id->id].revision;
-        record = records_[id->id];
-        spdlog::info("JobRegistry: created job instance {} for {} '{}'",
-                     id->id, key->adapter, key->job_native_id);
+            result.ok = true;
+            result.disposition = UpsertDisposition::Created;
+            result.job_id = id->id;
+            std::shared_lock lg(records_mtx_);
+            result.revision = records_[id->id].revision;
+            record = records_[id->id];
+            spdlog::info("JobRegistry: created job instance {} for {} '{}'",
+                         id->id, key->adapter, key->job_native_id);
         }
-    }   // mutation_mtx_ released: kernel admission, the runtime wake and the
-        // automatic-policy evaluation below never run under a registry lock.
+        break;
+    }   // registry locks released: kernel admission, the runtime wake and the
+        // automatic-policy evaluation below never run under one.
 
     if (result.disposition == UpsertDisposition::Created) {
         // Kernel attribution is initialized here, exactly like manual

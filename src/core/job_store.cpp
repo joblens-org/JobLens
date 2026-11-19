@@ -1233,9 +1233,12 @@ bool JobStore::reserveId(uint64_t& id, uint64_t& durable_counter,
         next_id_ = id + 1;
         durable_counter = next_id_;
     }
-    // The reservation becomes durable together with the record that consumes
-    // it (one WriteBatch == one fsync). An ambiguous outcome still advances the
-    // in-memory high-water mark: a burned id is never handed out twice.
+    // The reservation rides the caller's create batch: the id, the record and
+    // the advanced high-water mark commit together (or not at all). Whether
+    // that batch is fsynced is the caller's choice — a create is written
+    // without a fence and the maintenance checkpoint persists it later. An
+    // ambiguous outcome still advances the in-memory high-water mark: a burned
+    // id is never handed out twice.
     return true;
 }
 
