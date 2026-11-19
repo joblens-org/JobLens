@@ -2121,8 +2121,22 @@ std::optional<JobRegistry::NewRecordId> JobRegistry::reserveJobId(uint64_t reque
         id.id = requested;
         return id;
     }
-    if (!store_->reserveId(id.id, id.counter, id.exhausted, error)) return std::nullopt;
-    id.reserve_counter = true;
+    // The allocator knows its own history, not the registry's rows: an explicit
+    // create may already own the number it answers with. Skip such an id and
+    // ask again — the next answer is the colliding id + 1, and the high-water
+    // counter that rides the create batch already covers the skipped value.
+    for (;;) {
+        if (!store_->reserveId(id.id, id.counter, id.exhausted, error)) return std::nullopt;
+        bool taken = false;
+        {
+            std::shared_lock lg(records_mtx_);
+            taken = records_.count(id.id) != 0;
+        }
+        if (!taken) break;
+        spdlog::warn("JobRegistry: the allocator answered JobID {} which an explicit create "
+                     "already owns; skipping it", id.id);
+    }
+    id.writes_counter = true;
     return id;
 }
 
@@ -2130,7 +2144,11 @@ bool JobRegistry::commitNewRecord(BuiltRecord built, const NewRecordId& id, bool
                                   std::string& error) {
     {
         std::shared_lock lg(records_mtx_);
-        if (!id.reserve_counter && records_.count(id.id) != 0) {
+        // Every new id is checked, allocated or explicit: the allocator only
+        // knows its own history, so its answer is not proof the primary key is
+        // free. A race here refuses the create (a retry allocates again) instead
+        // of overwriting a live row.
+        if (records_.count(id.id) != 0) {
             error = "duplicate_job_id";
             return false;
         }
@@ -2144,7 +2162,7 @@ bool JobRegistry::commitNewRecord(BuiltRecord built, const NewRecordId& id, bool
     // one batch. A create has no published image to revert, so it passes no
     // recovery fence; the identity lookup repairs an ambiguous landing.
     RecordTxn txn(*this, "create job record", durable);
-    if (id.reserve_counter) txn.reserveCounter(id.counter, id.exhausted);
+    if (id.writes_counter) txn.reserveCounter(id.counter, id.exhausted);
     txn.put(std::move(built.record));
     if (built.key) txn.indexPut(*built.key, id.id);
     if (!txn.commit()) {

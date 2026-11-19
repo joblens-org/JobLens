@@ -411,12 +411,13 @@ private:
                                const std::optional<SchedulerKey>& known_key,
                                int64_t observed_at);
     // One allocator answer: the id and the high-water counter that rides the
-    // same batch. An explicit caller id reserves nothing.
+    // same batch. An explicit caller id reserves nothing (writes_counter
+    // false); an allocator answer always persists the advanced counter.
     struct NewRecordId {
         uint64_t id = 0;
         uint64_t counter = 0;
         bool exhausted = false;
-        bool reserve_counter = false;
+        bool writes_counter = false;
     };
     std::optional<NewRecordId> reserveJobId(uint64_t requested, std::string& error);
     // One insert path: primary-key/identity conflict checks, one RecordTxn

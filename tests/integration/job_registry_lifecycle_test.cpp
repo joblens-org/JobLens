@@ -212,6 +212,48 @@ void manual_readd_preserves_creation_metadata(const std::string& base)
     check(registry.deinit(), "manual freeze: cleanup must complete after restoring the seam");
 }
 
+// An explicit caller JobID is a primary key the allocator does not know about:
+// its answer must never reuse that number. The record keeps its own row, the
+// allocator skips the id and continues right after it.
+void explicit_job_id_is_never_reissued(const std::string& base)
+{
+    JobRegistryOptions options;
+    options.db_path = fresh_dir(base, "explicit-id-vs-allocator");
+    options.test_static_registry = true;
+    options.enable_pid_tracker = false;
+    options.register_rpc = false;
+    JobRegistry registry(options);
+    registry.setCollectorValidator(nullptr);
+
+    Job pinned = make_common_job();
+    pinned.JobID = 3;
+    pinned.CollectorNames = {"pinned_collector"};
+    check(registry.addJob(pinned), "an explicit JobID create must succeed");
+
+    for (int i = 0; i < 3; ++i) {
+        Job job = make_common_job();
+        check(registry.addJob(job), "an allocated create must skip the explicit id");
+    }
+
+    const auto records = registry.jobRecords();
+    std::set<uint64_t> ids;
+    for (const auto& record : records) ids.insert(record.job.JobID);
+    check(records.size() == 4, "one explicit plus three allocated records must coexist");
+    check(ids == std::set<uint64_t>({1, 2, 3, 4}),
+          "the allocator must issue 1 and 2, skip the explicit 3 and continue at 4");
+    const auto pinned_record = registry.jobRecord(3);
+    check(pinned_record && pinned_record->selection.manual &&
+              pinned_record->selection.manual->front() == "pinned_collector",
+          "the explicit record must keep its row and selection");
+
+    Job after = make_common_job();
+    check(registry.addJob(after), "a later allocation must still succeed");
+    check(registry.jobRecords().size() == 5, "the allocator must continue after the skip");
+    check(registry.deinit(), "explicit id: the registry must shut down cleanly");
+    pass_case("EXPLICIT-ID",
+              "an explicit JobID keeps its row and is never reissued by the allocator");
+}
+
 void run(const std::string& base)
 {
     // One configuration file for the whole binary (Config::instance keeps the
@@ -1722,6 +1764,7 @@ int main(int argc, char** argv)
     std::filesystem::create_directories(base);
     try {
         manual_readd_preserves_creation_metadata(base + "/data");
+        explicit_job_id_is_never_reissued(base + "/data");
         run(base + "/data");
         return 0;
     } catch (const std::exception& error) {
