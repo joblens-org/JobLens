@@ -254,6 +254,50 @@ void explicit_job_id_is_never_reissued(const std::string& base)
               "an explicit JobID keeps its row and is never reissued by the allocator");
 }
 
+void common_duplicate_put_reports_structured_conflict(const std::string& base)
+{
+    JobRegistryOptions options;
+    options.db_path = fresh_dir(base, "common-dup-put");
+    options.test_static_registry = true;
+    options.enable_pid_tracker = false;
+    options.register_rpc = false;
+    JobRegistry registry(options);
+    registry.setCollectorValidator(nullptr);
+
+    // A Common job has no typed scheduler identity: the explicit JobID is the
+    // only handle the caller owns, and the duplicate screen cannot resolve a
+    // Common row (by design — Common has no identity fields to match).
+    Job request = make_common_job();
+    request.JobID = 9;
+    request.CollectorNames = {"cpumem_collector"};
+    const auto created = registry.addOrUpdateManualJob(
+        request, nlohmann::json::object(), std::nullopt, /*create_only=*/true);
+    check(created.value("status", "") == "success",
+          "the strict create of an explicit-id Common job must succeed: " +
+              created.dump());
+
+    // Same body as an upsert: the request routes to CREATE and collides on the
+    // explicit id. The answer must be a structured already_exists conflict the
+    // trigger can map to 409 — never a codeless error that surfaces as 503
+    // core_error (JL-05).
+    const auto upsert = registry.addOrUpdateManualJob(
+        request, nlohmann::json::object(), std::nullopt, /*create_only=*/false);
+    check(upsert.value("status", "") == "error",
+          "the duplicate Common upsert must fail");
+    check(upsert.value("code", "") == "already_exists",
+          "the duplicate Common upsert must carry a structured conflict code, got: " +
+              upsert.dump());
+    check(upsert.value("JobID", "") == "9",
+          "the conflict must name the instance it collided with: " + upsert.dump());
+    check(registry.jobRecords().size() == 1,
+          "the duplicate upsert must not create a second row");
+
+    check(registry.deinit(), "common dup put: the registry must shut down cleanly");
+    pass_case("COMMON-DUP-PUT",
+              "a Common explicit-id duplicate upsert answers already_exists, not a "
+              "codeless core error");
+}
+
 void run(const std::string& base)
 {
     // One configuration file for the whole binary (Config::instance keeps the
@@ -1765,6 +1809,7 @@ int main(int argc, char** argv)
     try {
         manual_readd_preserves_creation_metadata(base + "/data");
         explicit_job_id_is_never_reissued(base + "/data");
+        common_duplicate_put_reports_structured_conflict(base + "/data");
         run(base + "/data");
         return 0;
     } catch (const std::exception& error) {

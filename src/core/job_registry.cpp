@@ -2172,23 +2172,30 @@ bool JobRegistry::commitNewRecord(BuiltRecord built, const NewRecordId& id, bool
     return true;
 }
 
-bool JobRegistry::createManualJob(Job& job) {
+UpsertResult JobRegistry::createManualJob(Job& job) {
+    UpsertResult result;
     spdlog::info("JobRegistry: createJob entry JobID={}, native_id={}, collectors={}, PIDs={}",
                  job.JobID, job.JobNativeID, job.CollectorNames.size(), pids_of(job).size());
     if (job.CollectorNames.empty()) {
         spdlog::warn("JobRegistry: job with JobID {} has empty CollectorNames", job.JobID);
-        return false;
+        result.fail(RegistrationError::EmptyCollectors,
+                    "a manual create requires at least one collector");
+        return result;
     }
     std::string error;
     if (!recoverStoreIfNeeded(error)) {
         spdlog::error("JobRegistry: refusing registration: {}", error);
-        return false;
+        result.fail(RegistrationError::StoreUnavailable, "registration refused: " + error);
+        return result;
     }
     const auto id = reserveJobId(job.JobID, error);
     if (!id) {
         spdlog::error("JobRegistry: durable JobID allocation failed, refusing to register the "
                       "job: {}", error);
-        return false;
+        result.fail(error == "id_exhausted" ? RegistrationError::IdExhausted
+                                            : RegistrationError::StoreUnavailable,
+                    "durable JobID allocation failed: " + error);
+        return result;
     }
     auto built = buildJobRecord(job, id->id, FactSource::Manual, job.CollectorNames,
                                 std::nullopt, now_us());
@@ -2197,7 +2204,19 @@ bool JobRegistry::createManualJob(Job& job) {
         if (!commitNewRecord(std::move(built), *id, /*durable=*/false, error)) {
             spdlog::error("JobRegistry: manual registration of JobID {} was refused ({})",
                           id->id, error);
-            return false;
+            // commitNewRecord's internal contract is its error string; this is
+            // the one boundary where it becomes the typed code callers branch
+            // on.
+            if (error == "duplicate_job_id")
+                result.fail(RegistrationError::DuplicateJobId,
+                            "another record already owns JobID " + format_job_id(id->id));
+            else if (error == "duplicate_identity")
+                result.fail(RegistrationError::DuplicateIdentity,
+                            "another record already owns this scheduler identity");
+            else
+                result.fail(RegistrationError::StoreWriteFailed,
+                            "durable write refused: " + error);
+            return result;
         }
     }
     spdlog::info("JobRegistry: registered manual job JobID {} (committed; the maintenance "
@@ -2207,7 +2226,9 @@ bool JobRegistry::createManualJob(Job& job) {
     if (auto stored = ownRecord(id->id)) {
         job_for_cb = stored->job;
     } else {
-        return false;
+        result.fail(RegistrationError::StoreReadFailed,
+                    "the committed record vanished before publication");
+        return result;
     }
     sync_job_to_kernel(job_for_cb);
     // The runtime pulls the record it must attach. Waking is a coalesced hint,
@@ -2215,7 +2236,10 @@ bool JobRegistry::createManualJob(Job& job) {
     wake_runtime();
     spdlog::info("JobRegistry: add job with JobID {}", id->id);
     job.JobID = id->id;
-    return true;
+    result.ok = true;
+    result.disposition = UpsertDisposition::Created;
+    result.job_id = id->id;
+    return result;
 }
 
 bool JobRegistry::addJob(const Job& job) {
@@ -2227,7 +2251,7 @@ bool JobRegistry::addJob(const Job& job) {
         spdlog::warn("JobRegistry: duplicate manual registration ignored");
         return false;
     }
-    return createManualJob(copy);
+    return createManualJob(copy).ok;
 }
 
 JobRegistry::ManualTarget JobRegistry::manualUpdateTarget(
@@ -2402,14 +2426,28 @@ nlohmann::json JobRegistry::addOrUpdateManualJob(const Job& job,
                               identity_selector->clusterTag);
         projectRecordFacts(create_job);
     }
-    if (!createManualJob(create_job)) {
-        nlohmann::json out;
-        out["status"] = "error";
-        out["msg"] = fmt::format(
-            "failed to add job {} (type={}): empty collectors on create, duplicate "
-            "JobID, or a rejected durable write — check server logs",
-            job.JobID, job.JobNativeID);
-        return out;
+    const auto created = createManualJob(create_job);
+    if (!created.ok) {
+        // A refused create answers with its typed code so the trigger maps a
+        // real status (409 already_exists / 400 invalid_collectors / 503
+        // store_unavailable) instead of the unknown-code 503 a codeless error
+        // produced (JL-05).
+        if (created.code == RegistrationError::DuplicateJobId ||
+            created.code == RegistrationError::DuplicateIdentity) {
+            // Name the instance the request collided with when the registry
+            // can still see it: the explicit id first, then the identity
+            // index (the create race loser's row).
+            if (create_job.JobID != 0) {
+                if (const auto existing = ownRecord(create_job.JobID))
+                    return already_exists(existing->job.JobID, existing->revision);
+            }
+            if (const auto key = keyOf(create_job)) {
+                if (const auto existing = ownRecordByKey(*key))
+                    return already_exists(existing->job.JobID, existing->revision);
+            }
+        }
+        return {{"status", "error"}, {"code", created.error},
+                {"message", created.message}};
     }
     // Return the created resource identity. The legacy trigger adapter ignores
     // these fields; the v2 job resource uses them to address the new record.

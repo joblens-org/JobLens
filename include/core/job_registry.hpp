@@ -425,8 +425,11 @@ private:
     // hold mutation_mtx_.
     bool commitNewRecord(BuiltRecord built, const NewRecordId& id, bool durable,
                          std::string& error);
-    // The CREATE branch: the manual registration body.
-    bool createManualJob(Job& job);
+    // The CREATE branch: the manual registration body. The result reuses the
+    // registration contract: the typed code is what addOrUpdateManualJob maps
+    // onto wire codes the trigger can translate (409/400/503), so a refused
+    // create never surfaces as an unknown-code 503.
+    UpsertResult createManualJob(Job& job);
     // UPDATE-branch routing, in two steps: the derived identity first (when the
     // facts name one), then the typed sub_attr candidates for a registration
     // whose namespace is unknown (offline/no attribution). The candidate route

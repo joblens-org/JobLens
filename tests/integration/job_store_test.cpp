@@ -820,6 +820,7 @@ void registration_errors_are_typed_and_exhaustively_mapped(const std::string& ba
         E::IdExhausted, E::ManagerConflict, E::InstanceClosing, E::IdentityQuarantined,
         E::IdentityIndexMismatch, E::StaleRevision, E::NotAdmitted, E::PolicyEvaluationFailed,
         E::InitialIntentWriteFailed, E::ObserverDeliveryFailed, E::ReentrantMutation,
+        E::DuplicateJobId, E::DuplicateIdentity, E::EmptyCollectors,
     };
     for (const auto code : codes) {
         const std::string wire = to_string(code);

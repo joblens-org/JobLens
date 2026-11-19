@@ -192,8 +192,11 @@ struct SubAttrMatcher {
                 spdlog::debug("SubAttrMatcher: SlurmJobAttr matched successfully");
                 return true;
             } else if constexpr (std::is_same_v<T, CommonJobAttr>) {
-                // CommonJobAttr 目前没有特殊字段需要匹配
-                spdlog::debug("SubAttrMatcher: matching CommonJobAttr is not implemented, returning false");
+                // Common has no typed identity fields, so a Common matcher
+                // cannot discriminate rows: never matching is the intended
+                // semantics (an explicit JobID, not the sub_attr, is the only
+                // Common handle). Over-matching would merge unrelated jobs.
+                spdlog::debug("SubAttrMatcher: CommonJobAttr has no identity fields to match");
                 return false;
             } else if constexpr (std::is_same_v<T, nlohmann::json>) {
                 // Open-world JSON facts: field-level subset match. Without

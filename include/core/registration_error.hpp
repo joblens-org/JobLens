@@ -41,6 +41,14 @@ enum class RegistrationError {
     IdentityQuarantined,
     IdentityIndexMismatch,
     StaleRevision,
+    // Manual-create conflicts (the addOrUpdateManualJob CREATE branch): the
+    // primary key or the canonical identity index already owns a live row, or
+    // the request carried no collector to select. They share the HTTP surface
+    // the trigger already maps (already_exists -> 409, invalid_collectors ->
+    // 400).
+    DuplicateJobId,
+    DuplicateIdentity,
+    EmptyCollectors,
     // The admission gate (maintenance capture_all=false) refused the
     // observation before any registration work: no record was created and no
     // state changed. Re-reading the source cannot change the decision.

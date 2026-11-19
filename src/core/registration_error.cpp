@@ -27,7 +27,7 @@ struct Entry {
     bool source_retry;
 };
 
-constexpr std::array<Entry, 19> kEntries{{
+constexpr std::array<Entry, 22> kEntries{{
     {RegistrationError::None, "", false},
     {RegistrationError::IncompleteIdentity, "incomplete_identity", true},
     {RegistrationError::IncompleteExecution, "incomplete_execution", true},
@@ -44,6 +44,11 @@ constexpr std::array<Entry, 19> kEntries{{
     {RegistrationError::IdentityQuarantined, "identity_quarantined", false},
     {RegistrationError::IdentityIndexMismatch, "identity_index_mismatch", false},
     {RegistrationError::StaleRevision, "stale_revision", false},
+    // Manual-create conflicts: same wire string as the HTTP conflict the
+    // trigger already maps to 409, and never resolved by a source re-read.
+    {RegistrationError::DuplicateJobId, "already_exists", false},
+    {RegistrationError::DuplicateIdentity, "already_exists", false},
+    {RegistrationError::EmptyCollectors, "invalid_collectors", false},
     // Admission is a configuration decision: the watcher must not loop
     // rescans against it.
     {RegistrationError::NotAdmitted, "not_admitted", false},
