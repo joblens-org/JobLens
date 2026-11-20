@@ -220,15 +220,21 @@ RefreshResult SlurmSchedulerAdapter::refreshFacts(
     // scan's whole-process-table parent map is never rebuilt per record.
     if (execution.manager.complete() && member_hint > 0) {
         if (auto observed =
-                impl_->watcher.observeForHint(member_hint, execution.manager.pid)) {
-            // Execution evidence only. JobNativeID, cluster, typed attrs and
-            // the record's JobID/selection/state are the creation snapshot and
-            // are never rewritten by a refresh.
+                impl_->watcher.observeForHint(member_hint, execution.manager.pid,
+                    !job.group_probed && job.group_probe_attempts < ClassAdValue::kMaxGroupProbeAttempts)) {
+            // Do not backfill from a different scheduler identity, even on the
+            // same PID hint. Other scheduler metadata stays frozen.
+            if (const auto key = keyOf(*observed); key && key == keyOf(job)) {
+                if (!observed->group_probed && observed->group_probe_attempts != 0 && !job.group_probed)
+                    observed->group_probe_attempts += job.group_probe_attempts;
+                fill_missing_groups(job, *observed);
+            }
             execution.manager = observed->execution.manager;
             execution.pid_identities = observed->execution.pid_identities;
             execution.pid_identities_authoritative =
                 observed->execution.pid_identities_authoritative;
             execution.read_order = observed->execution.read_order;
+            if (job.group_probed) SlurmJob::probe_groups(job);   // NSS only
             return probeExecutionEvidence(job, process_probe, cgroup_probe);
         }
     }

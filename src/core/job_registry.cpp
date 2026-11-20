@@ -560,7 +560,10 @@ void JobRegistry::restoreExistingRecords()
     validateRestoredExecutions(rows);
     // Adopt any common namespace aliases into the typed facts before the
     // restored rows become visible.
-    for (auto& row : rows) normalizeNamespaceFacts(row.job);
+    for (auto& row : rows) {
+        normalizeNamespaceFacts(row.job);
+        row.job.group_probed = !getGroups(row.job).empty();
+    }
     for (auto& row : rows) publishRecord(std::move(row));
 }
 
@@ -3112,8 +3115,9 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     // verdict stay with their owners.
     const bool observation = kind == MergeKind::Observation;
     if (observation) updated.source = FactSource::Discovery;
-    // Discovery may acquire source-owned execution evidence for a manual row,
-    // but its stable scheduler metadata remains the creation snapshot.
+    // Group backfill is limited to missing group fields in this execution;
+    // unrelated scheduler metadata remains the creation snapshot.
+    const bool groups_changed = fill_missing_groups(updated.job, job);
     updated.job.CollectorNames.clear();   // intent lives in selection
     // Keep stored execution evidence until the manager/pid identity rules below
     // decide which observed evidence can replace it.
@@ -3145,7 +3149,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     // is identical, so the next load rebuilds its evidence instead of treating
     // it as an operator binding.
     const bool provenance_changed = updated.source != stored.source;
-    const bool changed = recovered || provenance_changed ||
+    const bool changed = recovered || provenance_changed || groups_changed ||
         manager_of(stored.job) != manager_of(updated.job) ||
         pid_identities_of(stored.job) != pid_identities_of(updated.job);
     if (!changed) {

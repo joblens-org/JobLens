@@ -184,9 +184,9 @@ inline bool is_regular_nonsymlink(const std::string& path) {
     return S_ISREG(st.st_mode);
 }
 
-inline uid_t proc_owner_uid(pid_t pid) {
+inline uid_t proc_owner_uid(pid_t pid, const fs::path& proc_root = "/proc") {
     struct stat st{};
-    if (::stat((fs::path("/proc") / std::to_string(pid)).c_str(), &st) != 0) return static_cast<uid_t>(-1);
+    if (::stat((proc_root / std::to_string(pid)).c_str(), &st) != 0) return static_cast<uid_t>(-1);
     return st.st_uid;
 }
 
@@ -196,7 +196,18 @@ inline uid_t file_owner_uid(const std::string& path) {
     return st.st_uid;
 }
 
-// 探测并填充组字段；返回是否取到任一非空组值（供 restore 路径决定 group_need_persist）。
+inline bool apply_ad_groups(CondorJobAttr& attr, const std::string& content)
+{
+    const auto acct = ClassAdValue::decode_string(get_ad_field_from_content(content, "AcctGroup"));
+    const auto unix_grp = ClassAdValue::decode_string(get_ad_field_from_content(content, "PrimaryUnixGroup"));
+    if (!ClassAdValue::valid_group_value(acct, ClassAdValue::kGroupValueMaxLen) ||
+        !ClassAdValue::valid_group_value(unix_grp, ClassAdValue::kGroupValueMaxLen)) return false;
+    attr.acct_group = acct;
+    attr.unix_group = unix_grp;
+    return true;
+}
+
+// Probe a legacy record through a source checked against the recorded identity; tests drive this same reader.
 inline bool probe_groups(Job& job) {
     const auto pids = pids_of(job);
     auto& attr = std::get<CondorJobAttr>(job.sub_attr);
@@ -246,26 +257,14 @@ inline bool probe_groups(Job& job) {
         return bail("GlobalJobId missing or does not match JobNativeID");
     }
 
-    // 3) 读取并校验组值
-    auto acct = ClassAdValue::decode_string(get_ad_field_from_content(content, "AcctGroup"));
-    auto unix_grp = ClassAdValue::decode_string(get_ad_field_from_content(content, "PrimaryUnixGroup"));
-    if (!ClassAdValue::valid_group_value(acct, ClassAdValue::kGroupValueMaxLen) ||
-        !ClassAdValue::valid_group_value(unix_grp, ClassAdValue::kGroupValueMaxLen)) {
-        return bail("group value over length limit or contains control chars");
-    }
-
-    attr.acct_group = acct;
-    attr.unix_group = unix_grp;
-    if (!acct.empty()) {
-        stats.record_non_empty(S, acct);
-    } else {
-        stats.record_empty(S);  // 读成功但无组：合法缺失
-    }
+    if (!apply_ad_groups(attr, content)) return bail("group value over length limit or contains control chars");
+    if (attr.acct_group.empty()) stats.record_empty(S);
+    else stats.record_non_empty(S, attr.acct_group);
     job.group_probed = true;
     job.group_probe_attempts = 0;
     spdlog::debug("CondorJob: JobID {} groups acct_group='{}' unix_group='{}'",
                   job.JobID, attr.acct_group, attr.unix_group);
-    return !acct.empty() || !unix_grp.empty();
+    return !attr.acct_group.empty() || !attr.unix_group.empty();
 }
 
 

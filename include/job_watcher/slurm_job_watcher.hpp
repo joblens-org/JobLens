@@ -72,6 +72,7 @@ public:
     SourceHealth health() const override;
     void requestRescan() override;
     std::optional<Job> observeForHint(pid_t hint_pid, pid_t hint_ppid = 0) override;
+    std::optional<Job> observeForHint(pid_t hint_pid, pid_t hint_ppid, bool read_groups);
 
     // ---- Owner/test observability ------------------------------------------
     bool polling() const;
@@ -125,7 +126,7 @@ private:
     std::optional<Job> observe_stepd(const DiscoveryEnvironment& env, const std::string& boot_id,
                       pid_t stepd_pid,
                       const std::map<pid_t, std::vector<pid_t>>& children,
-                      std::vector<std::string>* drop_notes = nullptr);
+                      std::vector<std::string>* drop_notes = nullptr, bool read_groups = true);
 
     // Direct children of one manager, read from
     // /proc/<pid>/task/<tid>/children. The targeted fallback for observe()
@@ -435,6 +436,12 @@ inline DiscoveryEnvironment SlurmJobWatcher::discovery_environment() const
 
 inline std::optional<Job> SlurmJobWatcher::observeForHint(pid_t hint_pid, pid_t hint_ppid)
 {
+    return observeForHint(hint_pid, hint_ppid, true);
+}
+
+inline std::optional<Job> SlurmJobWatcher::observeForHint(
+    pid_t hint_pid, pid_t hint_ppid, bool read_groups)
+{
     if (hint_pid <= 0) return std::nullopt;
     const auto env = discovery_environment();
     // The event carries its own ppid (the stepd): use it directly. Events
@@ -457,7 +464,7 @@ inline std::optional<Job> SlurmJobWatcher::observeForHint(pid_t hint_pid, pid_t 
     // (merged by observe_stepd) complete the process list.
     std::map<pid_t, std::vector<pid_t>> children;
     children[ppid] = {hint_pid};
-    return observe_stepd(env, boot_id, ppid, children);
+    return observe_stepd(env, boot_id, ppid, children, nullptr, read_groups);
 }
 
 // ---------------------------------------------------------------------------
@@ -578,7 +585,7 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
                                           const std::string& boot_id,
                                           pid_t stepd_pid,
                                           const std::map<pid_t, std::vector<pid_t>>& children,
-                                          std::vector<std::string>* drop_notes)
+                                          std::vector<std::string>* drop_notes, bool read_groups)
 {
     // The Job is the registration unit: typed facts (filled here, where the
     // sources are parsed) plus the execution evidence group. No second
@@ -617,12 +624,19 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
         "SLURM_JOB_ID", "SLURM_STEP_ID", "SLURM_JOB_USER",
         "SLURM_JOB_NAME", "SLURM_JOB_PARTITION", "SLURM_CLUSTER_NAME",
     };
+    static const auto kEnvKeysWithGroups = [] {
+        auto keys = kEnvKeys;
+        keys.emplace_back("SLURM_JOB_ACCOUNT");
+        keys.emplace_back("SLURM_JOB_GID");
+        return keys;
+    }();
+    const auto& keys = read_groups ? kEnvKeysWithGroups : kEnvKeys;
     std::optional<std::uint64_t> job_number;
     std::optional<std::uint32_t> step_id;
     for (pid_t pid : pids) {
         std::map<std::string, std::string> env_values;
         std::string env_error;
-        if (!read_proc_env_values(env.proc_root, pid, kEnvKeys,
+        if (!read_proc_env_values(env.proc_root, pid, keys,
                                   env_values, env_error)) {
             notes.push_back(fmt::format(
                 "child pid {} environment unreadable: {}", pid, env_error));
@@ -663,6 +677,25 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
             continue;
         }
         step_id = candidate_step;
+
+        if (read_groups && !job.group_probed) {
+            auto& stats = GroupProbeStats::instance();
+            const auto source = GroupProbeStats::Source::SlurmEnv;
+            stats.record_attempt(source);
+            const auto account = env_values.find("SLURM_JOB_ACCOUNT");
+            if (account != env_values.end() &&
+                    !ClassAdValue::valid_group_value(account->second, ClassAdValue::kGroupValueMaxLen)) {
+                job.group_probe_attempts = 1;
+                stats.record_failure(source);
+            } else {
+                if (account != env_values.end()) attributes.acct_group = account->second;
+                const auto gid = env_values.find("SLURM_JOB_GID");
+                if (gid != env_values.end()) attributes.unix_gid = SlurmJob::parseGroupGid(gid->second);
+                job.group_probed = true;
+                if (attributes.acct_group.empty()) stats.record_empty(source);
+                else stats.record_non_empty(source, attributes.acct_group);
+            }
+        }
 
         if (attributes.user.empty()) {
             const auto it = env_values.find("SLURM_JOB_USER");
@@ -747,6 +780,8 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
     }
 
     job.sub_attr = attributes;
+    // Once the env is read, the existing probe performs only the bounded NSS lookup.
+    if (read_groups && job.group_probed && attributes.unix_gid >= 0) SlurmJob::probe_groups(job);
     return finalize_discovery(std::move(job), std::move(reasons), drop_notes);
 }
 

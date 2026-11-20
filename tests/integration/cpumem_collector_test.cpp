@@ -455,14 +455,14 @@ int main() {
         {
             Child a, b;
             CPUMemCollector agg;
-            require(agg.init({{"summary", "true"}}), "summary collector init failed");
+            require(init_collector(agg, {{"summary", "true"}}), "summary collector init failed");
             if (access("/proc/self/smaps_rollup", F_OK) == 0) {
                 require(CPUMemCollectorTestAccess::uses_rollup(agg),
                         "smaps_rollup capability probe did not pick the fast path");
             }
             Job agg_job;
             agg_job.JobID = 31;
-            agg_job.JobPIDs = {a.pid, b.pid};
+            set_pids(agg_job, {a.pid, b.pid});
             const unsigned long long t0 = 1000000000ULL;
             const unsigned long long tick = 500ULL * static_cast<unsigned long long>(cores);
 
@@ -474,7 +474,7 @@ int main() {
             write_fake_stat(rollup_path(a.pid), make_rollup_line(4096));
             write_fake_stat(rollup_path(b.pid), make_rollup_line(6144));
             write_fake_stat("/proc/stat", make_proc_stat_line(t0));
-            const auto first_sample = std::any_cast<std::vector<CPUMemInfo>>(agg.collect(agg_job));
+            const auto first_sample = agg.sample_job(agg_job);
             require(first_sample.size() == 3, "summary record missing");
             const auto& sum1 = summary_of(first_sample);
             require(sum1.mem_rss_kb == 30720 && sum1.mem_pss_kb == 10240 && sum1.mem_swap_kb == 3072,
@@ -495,7 +495,7 @@ int main() {
             write_fake_stat(rollup_path(a.pid), make_rollup_line(10240));
             write_fake_stat(rollup_path(b.pid), make_rollup_line(8192));
             write_fake_stat("/proc/stat", make_proc_stat_line(t0 + tick));
-            const auto second_sample = std::any_cast<std::vector<CPUMemInfo>>(agg.collect(agg_job));
+            const auto second_sample = agg.sample_job(agg_job);
             const auto& sum2 = summary_of(second_sample);
             require(sum2.mem_rss_kb == 71680 && sum2.mem_pss_kb == 18432 && sum2.mem_swap_kb == 7168,
                     "second sample aggregation is wrong");
@@ -508,8 +508,7 @@ int main() {
             require(std::abs(record_of(second_sample, a.pid).cpuPercent - 20.0) < 0.5,
                     "cpuPercent does not include reaped children CPU");
 
-            const auto agg_doc = std::any_cast<nlohmann::json>(
-                agg.get_writer_parser("ESWriter")(second_sample));
+            const auto agg_doc = agg.to_document(second_sample);
             const auto& sum_json = agg_doc.at("summary");
             require(sum_json.at("mem_peak_rss_kb").get<long>() == 71680 &&
                     sum_json.at("mem_pss_kb").get<long>() == 18432 &&
@@ -528,21 +527,20 @@ int main() {
         {
             Child c;
             CPUMemCollector no_pss;
-            require(no_pss.init({{"summary", "true"}, {"pss", "false"}}), "pss=false init failed");
+            require(init_collector(no_pss, {{"summary", "true"}, {"pss", "false"}}), "pss=false init failed");
             Job no_pss_job;
             no_pss_job.JobID = 32;
-            no_pss_job.JobPIDs = {c.pid};
+            set_pids(no_pss_job, {c.pid});
             write_fake_stat(stat_path(c.pid), make_stat_line_with_children(c.pid, "c", 0, 0, 0, 0, 821));
             write_fake_stat(status_path(c.pid), make_status_line(8192, 65536, 9000, 512, 1));
             write_fake_stat(rollup_path(c.pid), make_rollup_line(4096));
             fake_opens.clear();
-            const auto no_pss_sample = std::any_cast<std::vector<CPUMemInfo>>(no_pss.collect(no_pss_job));
+            const auto no_pss_sample = no_pss.sample_job(no_pss_job);
             require(fake_opens[rollup_path(c.pid)] == 0, "pss=false still read smaps_rollup");
             require(summary_of(no_pss_sample).mem_pss_kb == -1 &&
                     summary_of(no_pss_sample).mem_peak_pss_kb == -1,
                     "disabled PSS must stay unavailable");
-            const auto no_pss_doc = std::any_cast<nlohmann::json>(
-                no_pss.get_writer_parser("ESWriter")(no_pss_sample));
+            const auto no_pss_doc = no_pss.to_document(no_pss_sample);
             require(!no_pss_doc.at("summary").contains("mem_pss_kb") &&
                     !no_pss_doc.at("summary").contains("mem_peak_pss_kb"),
                     "unavailable PSS was rendered as a value");
@@ -555,17 +553,17 @@ int main() {
         {
             Child legacy_child;
             CPUMemCollector legacy;
-            require(legacy.init({{"summary", "true"}}), "legacy collector init failed");
+            require(init_collector(legacy, {{"summary", "true"}}), "legacy collector init failed");
             CPUMemCollectorTestAccess::force_smaps_mode(legacy);
             Job legacy_job;
             legacy_job.JobID = 33;
-            legacy_job.JobPIDs = {legacy_child.pid};
+            set_pids(legacy_job, {legacy_child.pid});
             write_fake_stat(stat_path(legacy_child.pid),
                             make_stat_line_with_children(legacy_child.pid, "legacy", 0, 0, 0, 0, 831));
             write_fake_stat(status_path(legacy_child.pid),
                             make_status_line(8192, 65536, 9000, 0, 1));
             write_fake_stat(smaps_path(legacy_child.pid), make_smaps_body(12, 8));
-            const auto legacy_sample = std::any_cast<std::vector<CPUMemInfo>>(legacy.collect(legacy_job));
+            const auto legacy_sample = legacy.sample_job(legacy_job);
             require(record_of(legacy_sample, legacy_child.pid).mem_pss_kb == 20,
                     "smaps fallback did not accumulate per-VMA Pss");
             require(summary_of(legacy_sample).mem_pss_kb == 20 &&
@@ -580,13 +578,13 @@ int main() {
         {
             Child s1, s2;
             CPUMemCollector capped;
-            require(capped.init({{"summary", "true"}, {"pss_max_processes", "1"}}),
+            require(init_collector(capped, {{"summary", "true"}, {"pss_max_processes", "1"}}),
                     "pss_max_processes init failed");
             require(CPUMemCollectorTestAccess::pss_cap(capped) == 1,
                     "pss_max_processes config was not applied");
             Job cap_job;
             cap_job.JobID = 34;
-            cap_job.JobPIDs = {s1.pid, s2.pid};
+            set_pids(cap_job, {s1.pid, s2.pid});
             write_fake_stat(stat_path(s1.pid), make_stat_line_with_children(s1.pid, "s1", 0, 0, 0, 0, 841));
             write_fake_stat(stat_path(s2.pid), make_stat_line_with_children(s2.pid, "s2", 0, 0, 0, 0, 842));
             write_fake_stat(status_path(s1.pid), make_status_line(4096, 32768, 5000, 0, 1));
@@ -594,7 +592,7 @@ int main() {
             write_fake_stat(rollup_path(s1.pid), make_rollup_line(2048));
             write_fake_stat(rollup_path(s2.pid), make_rollup_line(2048));
             fake_opens.clear();
-            const auto capped_sample = std::any_cast<std::vector<CPUMemInfo>>(capped.collect(cap_job));
+            const auto capped_sample = capped.sample_job(cap_job);
             require(fake_opens[rollup_path(s1.pid)] == 0 && fake_opens[rollup_path(s2.pid)] == 0,
                     "over-cap job still read smaps_rollup");
             require(summary_of(capped_sample).mem_pss_kb == -1 &&
@@ -605,17 +603,16 @@ int main() {
                     require(info.mem_pss_kb == -1, "over-cap per-process PSS must be absent");
                 }
             }
-            const auto capped_doc = std::any_cast<nlohmann::json>(
-                capped.get_writer_parser("ESWriter")(capped_sample));
+            const auto capped_doc = capped.to_document(capped_sample);
             require(!capped_doc.at("summary").contains("mem_pss_kb"),
                     "over-cap summary rendered a PSS value");
             capped.deinit();
 
             // 0 = 不限：同一份数据和同一组进程必须重新给出完整 PSS。
             CPUMemCollector uncapped;
-            require(uncapped.init({{"summary", "true"}, {"pss_max_processes", "0"}}),
+            require(init_collector(uncapped, {{"summary", "true"}, {"pss_max_processes", "0"}}),
                     "pss_max_processes=0 init failed");
-            const auto uncapped_sample = std::any_cast<std::vector<CPUMemInfo>>(uncapped.collect(cap_job));
+            const auto uncapped_sample = uncapped.sample_job(cap_job);
             require(summary_of(uncapped_sample).mem_pss_kb == 4096,
                     "pss_max_processes=0 must mean unlimited");
             require(CPUMemCollectorTestAccess::pss_cap(uncapped) == 0,

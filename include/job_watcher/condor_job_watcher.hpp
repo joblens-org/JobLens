@@ -67,6 +67,7 @@ public:
     SourceHealth health() const override;
     void requestRescan() override;
     std::optional<Job> observeForHint(pid_t hint_pid, pid_t hint_ppid = 0) override;
+    std::optional<Job> observeForHint(pid_t hint_pid, pid_t hint_ppid, bool read_groups);
 
     // ---- Owner/test observability ------------------------------------------
     bool polling() const;
@@ -137,7 +138,7 @@ private:
     // (exec-hint path) is probed for the job ad before the other pids.
     std::optional<Job> observe_starter(const DiscoveryEnvironment& env, const std::string& boot_id,
                         pid_t starter_pid, pid_t preferred_pid = 0,
-                        std::vector<std::string>* drop_notes = nullptr);
+                        std::vector<std::string>* drop_notes = nullptr, bool read_groups = true);
 
     // Pids of one starter: cgroup pids when the cgroup is readable,
     // otherwise the starter's live children in /proc (the classic layout where
@@ -376,6 +377,12 @@ inline DiscoveryEnvironment CondorJobWatcher::discovery_environment() const
 
 inline std::optional<Job> CondorJobWatcher::observeForHint(pid_t hint_pid, pid_t hint_ppid)
 {
+    return observeForHint(hint_pid, hint_ppid, true);
+}
+
+inline std::optional<Job> CondorJobWatcher::observeForHint(
+    pid_t hint_pid, pid_t hint_ppid, bool read_groups)
+{
     if (hint_pid <= 0) return std::nullopt;
     const auto env = discovery_environment();
     // The event carries its own ppid (the starter): use it directly. Events
@@ -396,7 +403,7 @@ inline std::optional<Job> CondorJobWatcher::observeForHint(pid_t hint_pid, pid_t
     const std::string boot_id = read_boot_id(env.proc_root);
     // The hinted pid is the exec'd job process: probe it for the job ad first,
     // mirroring the old exec-event watcher that read _CONDOR_JOB_AD there.
-    return observe_starter(env, boot_id, ppid, hint_pid);
+    return observe_starter(env, boot_id, ppid, hint_pid, nullptr, read_groups);
 }
 
 // ---------------------------------------------------------------------------
@@ -640,7 +647,7 @@ inline std::optional<Job> CondorJobWatcher::observe_starter(const DiscoveryEnvir
                                              const std::string& boot_id,
                                              pid_t starter_pid,
                                              pid_t preferred_pid,
-                                             std::vector<std::string>* drop_notes)
+                                             std::vector<std::string>* drop_notes, bool read_groups)
 {
     // The Job is the registration unit: typed facts (filled here, where the
     // sources are parsed) plus the execution evidence group. No second
@@ -709,6 +716,7 @@ inline std::optional<Job> CondorJobWatcher::observe_starter(const DiscoveryEnvir
     std::string ad_path;
     std::string env_error;
     bool ad_from_starter = false;
+    pid_t ad_member = 0;
     if (read_proc_env(env.proc_root, starter_pid, "_CONDOR_JOB_AD", ad_path, env_error) &&
         !ad_path.empty()) {
         ad_from_starter = true;
@@ -724,6 +732,7 @@ inline std::optional<Job> CondorJobWatcher::observe_starter(const DiscoveryEnvir
             if (read_proc_env(env.proc_root, candidate, "_CONDOR_JOB_AD", ad_path,
                               candidate_error) &&
                 !ad_path.empty()) {
+                ad_member = candidate;
                 notes.push_back(fmt::format(
                     "_CONDOR_JOB_AD read from job process {} (starter has none)", candidate));
                 break;
@@ -764,6 +773,25 @@ inline std::optional<Job> CondorJobWatcher::observe_starter(const DiscoveryEnvir
                 // zero-initialized identity (JL-04).
                 attributes.cluster_id = ad->cluster_id;
                 attributes.proc_id = ad->proc_id;
+                if (read_groups) {
+                    auto& stats = GroupProbeStats::instance();
+                    const auto source = GroupProbeStats::Source::CondorAd;
+                    stats.record_attempt(source);
+                    const auto owner = CondorJob::file_owner_uid(ad_path);
+                    const bool trusted = owner != static_cast<uid_t>(-1) &&
+                        CondorJob::is_regular_nonsymlink(ad_path) &&
+                        (ad_from_starter || owner == 0 ||
+                         owner == CondorJob::proc_owner_uid(ad_member, env.proc_root) ||
+                         owner == CondorJob::proc_owner_uid(starter_pid, env.proc_root));
+                    if (trusted && CondorJob::apply_ad_groups(attributes, ad_content)) {
+                        job.group_probed = true;
+                        if (attributes.acct_group.empty()) stats.record_empty(source);
+                        else stats.record_non_empty(source, attributes.acct_group);
+                    } else {
+                        job.group_probe_attempts = 1;
+                        stats.record_failure(source);
+                    }
+                }
             }
         }
     }

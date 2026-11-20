@@ -179,6 +179,8 @@ void make_fixture(Fixture& fixture, const std::string& base)
     write_file(fixture.good_ad,
                "GlobalJobId = \"scheduler@schedd07.fixture#76226337.0#1775723895\"\n"
                "Owner = \"alice\"\n"
+               "AcctGroup = \"fixture.long\"\n"
+               "PrimaryUnixGroup = \"fixture\"\n"
                "Cmd = \"/bin/sleep\"\n");
     // An ad that exists but cannot name a job: incomplete, never guessed.
     write_file(fixture.ad_without_global_job_id, "Owner = \"bob\"\n");
@@ -214,7 +216,8 @@ void make_fixture(Fixture& fixture, const std::string& base)
                   {"SLURM_CLUSTER_NAME", "slurm-fixture"},
                   {"SLURM_JOB_USER", "alice"},
                   {"SLURM_JOB_NAME", "demo"},
-                  {"SLURM_JOB_PARTITION", "debug"}},
+                  {"SLURM_JOB_PARTITION", "debug"},
+                  {"SLURM_JOB_ACCOUNT", "fixture-account"}},
                  "/slurm/job_9002/step_3");
     make_process(fixture.proc, 5111, "sleep", 5101, 8011,
                  {{"SLURM_JOB_ID", "9002"},
@@ -395,6 +398,8 @@ void condor_pass_finds_fixture_job(const Fixture& fixture)
     check(condor_attr.owner == "alice", "owner must come from the job ad");
     check(condor_attr.scheduler_host == "schedd07.fixture",
           "schedd host must come from the job ad");
+    check(condor_attr.acct_group == "fixture.long" && condor_attr.unix_group == "fixture",
+          "Condor group facts must come from the validated same ad");
     // JL-04: the typed pair is the rule/identity substrate the string render
     // was built from; losing it leaves typed selectors matching 0.
     check(condor_attr.cluster_id == 76226337 && condor_attr.proc_id == 0,
@@ -484,6 +489,8 @@ void slurm_pass_finds_fixture_job(const Fixture& fixture)
     check(slurm_attr.user == "alice" && slurm_attr.job_name == "demo" &&
               slurm_attr.partition == "debug",
           "scheduler metadata must come from the members' environment");
+    check(slurm_attr.acct_group == "fixture-account" && slurm_attr.unix_gid == -1,
+          "Slurm must read the account without guessing an absent gid");
 
     // A slurmstepd without attributable members is enumerated (it is live) but
     // never published, so the registry cannot see a half-read job.

@@ -256,15 +256,9 @@ struct Job {
     };
     CollectionStatus                        collection;
 
-    // 组字段探测状态（仅内存，不序列化、不进 reflection）：
-    // group_probed 仅在“成功读到来源（ad 文件 / env）”后置位——读失败不置位，
-    // 由 group_probe_attempts 有界重试（每个进程生命周期内最多 kMaxGroupProbeAttempts 次）。
-    // 采集每个周期都会走 update_job → update_job_info，若只按“字段为空就重读”，
-    // 组本来就为空的站点会每周期重读 ad 文件（见 collector_scheduler 的 findJob 调用链）。
+    // Process-local probing state. Only the validated sub_attr fields are durable.
     bool                                    group_probed{false};
     uint8_t                                 group_probe_attempts{0};
-    // restore/更新路径拿到了组值、等待落库一次（write-once + 至多一次回填重写）。
-    bool                                    group_need_persist{false};
 
     // Execution evidence: which local run produced these facts. Not identity:
     // the facts name the job, and this block only proves the processes.
@@ -405,6 +399,37 @@ inline JobGroupView getGroups(const Job& job) {
         // CommonJobAttr 没有组字段，保持全空
     }, job.sub_attr);
     return v;
+}
+
+// Only missing group facts may be filled after creation. Identity, namespace
+// and the rest of the creation snapshot are unchanged.
+inline bool fill_missing_groups(Job& target, const Job& source)
+{
+    bool changed = false;
+    const auto fill = [&](std::string& dst, const std::string& value) {
+        if (!dst.empty() || value.empty()) return;
+        dst = value;
+        changed = true;
+    };
+    if (auto* dst = std::get_if<CondorJobAttr>(&target.sub_attr)) {
+        if (const auto* src = std::get_if<CondorJobAttr>(&source.sub_attr)) {
+            fill(dst->acct_group, src->acct_group);
+            fill(dst->unix_group, src->unix_group);
+        }
+    } else if (auto* dst = std::get_if<SlurmJobAttr>(&target.sub_attr)) {
+        if (const auto* src = std::get_if<SlurmJobAttr>(&source.sub_attr)) {
+            fill(dst->acct_group, src->acct_group);
+            if (dst->unix_gid < 0 && src->unix_gid >= 0) {
+                dst->unix_gid = src->unix_gid;
+                changed = true;
+            }
+            if (dst->unix_gid == src->unix_gid) fill(dst->unix_group, src->unix_group);
+        }
+    }
+    target.group_probed |= source.group_probed;
+    if (!target.group_probed && source.group_probe_attempts > target.group_probe_attempts)
+        target.group_probe_attempts = source.group_probe_attempts;
+    return changed;
 }
 
 // The Lua view of a Job: the reflected fact fields plus the pid projection,

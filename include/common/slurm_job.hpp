@@ -117,8 +117,7 @@ inline std::string getAccount(pid_t pid){
     return Utils::get_env_field(pid, "SLURM_JOB_ACCOUNT");
 }
 
-inline int64_t getGid(pid_t pid){
-    std::string gid_str = Utils::get_env_field(pid, "SLURM_JOB_GID");
+inline int64_t parseGroupGid(const std::string& gid_str){
     if (gid_str.empty()) return -1;
     try {
         size_t pos = 0;
@@ -129,6 +128,10 @@ inline int64_t getGid(pid_t pid){
     } catch (const std::exception&) {
         return -1;
     }
+}
+
+inline int64_t getGid(pid_t pid){
+    return parseGroupGid(Utils::get_env_field(pid, "SLURM_JOB_GID"));
 }
 
 enum class NssOutcome { Ok, Miss, Breaker };
@@ -209,7 +212,7 @@ inline std::string resolve_unix_group_name(int64_t gid, NssOutcome* outcome = nu
     return name;
 }
 
-// 探测并填充组字段；返回是否取到任一非空组值（供 restore 路径决定 group_need_persist）。
+// 探测并填充组字段；返回是否取到任一非空组值。
 inline bool probe_groups(Job& job) {
     const auto pids = pids_of(job);
     auto& attr = std::get<SlurmJobAttr>(job.sub_attr);
