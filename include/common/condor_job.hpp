@@ -13,14 +13,12 @@
  * limitations under the License. */
 #pragma once
 #include "core/collector_type.h"
-#include "core/group_probe_stats.hpp"
-#include "common/classad_decode.hpp"
+#include "core/job_identity.hpp"
 #include "common/utils.hpp"
 #include <unistd.h>
-#include <fcntl.h>
+#include "core/group_probe_stats.hpp"
+#include "common/classad_decode.hpp"
 #include <sys/stat.h>
-#include <climits>
-#include <charconv>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -156,24 +154,16 @@ inline std::optional<CondorAdIdentity> parse_ad_identity(const std::string& cont
         return std::nullopt;
     }
     // The typed pair comes from the same segment the string render does — one
-    // source, so the two can never disagree. A decimal that does not fit the
-    // typed field is an unparsable identity, never a truncated one.
-    const auto parse_typed = [](const std::string& decimal) -> std::optional<size_t> {
-        size_t value = 0;
-        const auto* begin = decimal.data();
-        const auto* end = decimal.data() + decimal.size();
-        const auto result = std::from_chars(begin, end, value, 10);
-        if (result.ec != std::errc() || result.ptr != end) return std::nullopt;
-        return value;
-    };
-    const auto typed_cluster = parse_typed(cluster_part);
-    const auto typed_proc = parse_typed(proc_part);
+    // source, so the two can never disagree. parse_job_id_text is the shared
+    // strict decimal parser; a cluster id of 0 keeps the identity unparsable.
+    const auto typed_cluster = parse_job_id_text(cluster_part);
+    const auto typed_proc = parse_job_id_text(proc_part);
     if (!typed_cluster || !typed_proc || *typed_cluster == 0) {
         error = "GlobalJobId '" + ad.global_job_id + "' has an unparsable native job id";
         return std::nullopt;
     }
-    ad.cluster_id = *typed_cluster;
-    ad.proc_id = *typed_proc;
+    ad.cluster_id = static_cast<size_t>(*typed_cluster);
+    ad.proc_id = static_cast<size_t>(*typed_proc);
     return ad;
 }
 
