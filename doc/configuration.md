@@ -78,7 +78,7 @@ job_registry_config:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `job_db_path` | string | none | LevelDB database directory path. If the database cannot be opened, no exception is thrown; it only degrades operation |
+| `job_db_path` | string | none | LevelDB database directory path. If the database cannot be opened, no exception is thrown; it only degrades operation. On upgrade, a pre-schema database at this path is quarantined to `<path>.legacy` and only the allocator watermark is imported (see doc/jobstore_persistence_service.md §7) |
 | `auto_add_condorjob` | bool | false | **Deprecated.** Automatically start the legacy CondorJobWatcher and auto-add jobs. Ignored for a type listed in `maintenance.types` (the discovery source owns it) |
 | `auto_add_slurmjob` | bool | false | **Deprecated.** Same as above for Slurm |
 | `maintenance.types` | list | `[]` | Scheduler types that get job records, including unselected jobs. `condor` / `slurm`; unknown values are rejected at startup |

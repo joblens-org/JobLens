@@ -413,49 +413,10 @@ bool JobStore::init_db(const Options& options) {
     spdlog::info("JobStore: opened {}", db_path);
     db_running_ = true;
 
-    // Schema admission is strict: this build reads schema 3 and initializes a
-    // genuinely empty store. Any other on-disk layout is rejected loudly; it
-    // is never migrated or deleted in place.
-    bool schema_present = false;
-    {
-        std::lock_guard<std::mutex> db_lock(db_mtx_);
-        std::string value;
-        auto s = db_->Get(leveldb::ReadOptions(), key_meta("schema_version"), &value);
-        if (s.ok()) {
-            schema_present = true;
-            const auto parsed = parse_schema_marker(value);
-            if (!parsed) {
-                // Not a marker this build wrote: no UUID, id counter or record
-                // is initialized from it, and no byte of the store is touched.
-                spdlog::error("JobStore: schema marker '{}' at {} is not canonical; "
-                              "refusing to open an unreadable layout", value, db_path);
-                reject_schema("malformed_schema_marker", 0);
-                return false;
-            }
-            schema_version_ = *parsed;
-        }
-    }
-
-    if (!schema_present) {
-        if (!db_is_empty()) {
-            spdlog::error("JobStore: database at {} has data but no schema marker; "
-                          "refusing to migrate or delete an old-schema store "
-                          "(explicit conversion is required)", db_path);
-            reject_unsupported_schema(/*found=*/0);
-            return false;
-        }
-        if (!initialize_schema()) {
-            spdlog::error("JobStore: could not initialize a new schema-{} store", kJobStoreSchemaVersion);
-            reject_unsupported_schema(/*found=*/0);
-            return false;
-        }
-    } else if (schema_version_ != kJobStoreSchemaVersion) {
-        spdlog::error("JobStore: db schema {} is not supported by this binary (schema {}); "
-                      "refusing to migrate or delete it", schema_version_,
-                      kJobStoreSchemaVersion);
-        reject_unsupported_schema(schema_version_);
-        return false;
-    }
+    // The store format lifecycle seam owns every admission decision (open the
+    // current schema, initialize a fresh store, quarantine a legacy layout,
+    // or reject); init_db only executes its outcome.
+    if (!admit_database(db_path)) return false;
 
     migration_complete_ = true;
     migration_state_ = "complete";
@@ -528,6 +489,175 @@ void JobStore::reject_schema(const std::string& state, uint32_t found) {
         db_ = nullptr;
     }
     db_running_ = false;
+}
+
+// ---------------------------------------------------------------------------
+// Store format lifecycle: the one admission seam
+// ---------------------------------------------------------------------------
+
+bool JobStore::admit_database(const std::string& db_path) {
+    // The marker names the layout this binary speaks.
+    bool schema_present = false;
+    {
+        std::lock_guard<std::mutex> db_lock(db_mtx_);
+        std::string value;
+        auto s = db_->Get(leveldb::ReadOptions(), key_meta("schema_version"), &value);
+        if (s.ok()) {
+            schema_present = true;
+            const auto parsed = parse_schema_marker(value);
+            if (!parsed) {
+                // Not a marker this build wrote: no UUID, id counter or record
+                // is initialized from it, and no byte of the store is touched.
+                spdlog::error("JobStore: schema marker '{}' at {} is not canonical; "
+                              "refusing to open an unreadable layout", value, db_path);
+                reject_schema("malformed_schema_marker", 0);
+                return false;
+            }
+            schema_version_ = *parsed;
+        }
+    }
+    if (schema_present) {
+        if (schema_version_ == kJobStoreSchemaVersion) return true;
+        spdlog::error("JobStore: db schema {} is not supported by this binary (schema {}); "
+                      "refusing to migrate or delete it", schema_version_,
+                      kJobStoreSchemaVersion);
+        reject_unsupported_schema(schema_version_);
+        return false;
+    }
+
+    // No marker. A store with data is a pre-schema legacy layout: quarantine it
+    // by rename — every byte preserved, never migrated or deleted in place.
+    // The slot is single-use: a second legacy store while a quarantined
+    // sibling exists is an operator decision, never an automatic overwrite.
+    if (!db_is_empty()) {
+        const std::string legacy_path = db_path + ".legacy";
+        std::error_code exists_error;
+        if (std::filesystem::exists(legacy_path, exists_error) || exists_error) {
+            spdlog::error("JobStore: database at {} has data but no schema marker and the "
+                          "quarantine slot {} is already taken; refusing to chain "
+                          "quarantines — resolve both stores explicitly",
+                          db_path, legacy_path);
+            reject_unsupported_schema(/*found=*/0);
+            return false;
+        }
+        // Read-only close, the same discipline reject_schema uses: the legacy
+        // store keeps every key and value exactly as the old build left them.
+        {
+            std::lock_guard<std::mutex> db_lock(db_mtx_);
+            delete db_;
+            db_ = nullptr;
+        }
+        std::error_code rename_error;
+        std::filesystem::rename(db_path, legacy_path, rename_error);
+        if (rename_error) {
+            spdlog::error("JobStore: could not quarantine the legacy store at {} to {} "
+                          "({}); rejecting", db_path, legacy_path,
+                          rename_error.message());
+            reject_unsupported_schema(/*found=*/0);
+            return false;
+        }
+        spdlog::warn("JobStore: quarantined a legacy (pre-schema) store to {} — it was "
+                     "neither migrated nor deleted; the allocator watermark is "
+                     "imported, row data is not", legacy_path);
+        leveldb::Options reopen_options;
+        reopen_options.create_if_missing = true;
+        const auto reopened = leveldb::DB::Open(reopen_options, db_path, &db_);
+        if (!reopened.ok()) {
+            spdlog::error("JobStore: could not open a fresh store at {} after "
+                          "quarantining: {}", db_path, reopened.ToString());
+            db_running_ = false;
+            migration_complete_ = false;
+            migration_state_ = "quarantine_reopen_failed";
+            return false;
+        }
+    }
+
+    if (!initialize_schema()) {
+        spdlog::error("JobStore: could not initialize a new schema-{} store",
+                      kJobStoreSchemaVersion);
+        reject_unsupported_schema(/*found=*/0);
+        return false;
+    }
+    // Fresh store: adopt the legacy sibling's allocator watermark. Keyed on
+    // the sibling, so a crash between the rename above and this write makes
+    // the next open redo the import instead of losing the watermark.
+    import_legacy_watermark(db_path + ".legacy");
+    return true;
+}
+
+bool JobStore::import_legacy_watermark(const std::string& legacy_path) {
+    std::error_code exists_error;
+    if (!std::filesystem::exists(legacy_path, exists_error) || exists_error)
+        return false;
+
+    leveldb::Options options;
+    options.create_if_missing = false;
+    leveldb::DB* legacy = nullptr;
+    const auto opened = leveldb::DB::Open(options, legacy_path, &legacy);
+    if (!opened.ok() || legacy == nullptr) {
+        spdlog::warn("JobStore: the legacy store at {} could not be opened for the "
+                     "watermark import: {}", legacy_path, opened.ToString());
+        return false;
+    }
+
+    uint64_t counter = 0;
+    {
+        std::string value;
+        if (legacy->Get(leveldb::ReadOptions(), key_counter("job_id"), &value).ok()) {
+            try {
+                counter = std::stoull(value);
+            } catch (const std::exception&) {
+                spdlog::warn("JobStore: legacy counter value '{}' is not a number; "
+                             "importing from the row ids only", value);
+            }
+        }
+    }
+    uint64_t max_job_id = 0;
+    {
+        leveldb::Iterator* it = legacy->NewIterator(leveldb::ReadOptions());
+        it->Seek(KEY_PREFIX_JOB);
+        if (it->Valid() && it->key().starts_with(KEY_PREFIX_JOB)) {
+            it->SeekToLast();
+            while (it->Valid() && !it->key().starts_with(KEY_PREFIX_JOB)) it->Prev();
+            if (it->Valid())
+                max_job_id = unhex64(it->key().ToString().substr(2));
+        }
+        const auto status = it->status();
+        delete it;
+        if (!status.ok()) {
+            delete legacy;
+            spdlog::warn("JobStore: the legacy store at {} could not be scanned for "
+                         "the watermark import: {}", legacy_path, status.ToString());
+            return false;
+        }
+    }
+    delete legacy;
+
+    const uint64_t watermark = std::max(counter, max_job_id + 1);
+    if (watermark <= 1) return false;  // nothing worth preserving
+
+    std::lock_guard<std::mutex> db_lock(db_mtx_);
+    if (!db_) return false;
+    uint64_t current = 0;
+    {
+        std::string value;
+        if (db_->Get(leveldb::ReadOptions(), key_counter("job_id"), &value).ok()) {
+            try {
+                current = std::stoull(value);
+            } catch (const std::exception&) {
+            }
+        }
+    }
+    if (watermark <= current) return false;  // already ahead: no boot-time writes
+    leveldb::WriteOptions synced;
+    synced.sync = true;
+    if (!db_->Put(synced, key_counter("job_id"), std::to_string(watermark)).ok()) {
+        spdlog::error("JobStore: could not persist the imported allocator watermark");
+        return false;
+    }
+    spdlog::info("JobStore: imported the allocator watermark {} from the legacy "
+                 "store at {}", watermark, legacy_path);
+    return true;
 }
 
 void JobStore::close_db() {

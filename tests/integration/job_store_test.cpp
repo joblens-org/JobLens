@@ -465,10 +465,11 @@ void upsert_is_idempotent_and_activates_nothing(const std::string& base)
     check(registry.jobRecords().size() == 1,
           "rejected observations must not create records");
 }
-// Schema 3 is a hard boundary. A store with data but no schema marker is an
-// old-schema store: this build rejects it and leaves every row untouched. It
-// never migrates or deletes in place.
-void legacy_schema_is_rejected_without_migration(const std::string& base)
+// The store format lifecycle seam: a store with data but no schema marker is
+// a pre-schema legacy store. It is quarantined by rename (never migrated or
+// deleted in place), a fresh schema-5 store takes its place, and only the
+// allocator watermark is imported — keys only, never row content.
+void legacy_store_is_quarantined_with_watermark(const std::string& base)
 {
     const auto path = fresh_dir(base, "a19");
     const uint64_t active_id = 41;
@@ -486,35 +487,39 @@ void legacy_schema_is_rejected_without_migration(const std::string& base)
     {
         JobRegistry registry(isolated(path));
         const auto health = registry.storeHealth();
-        check(!health.db_running, "an old-schema store must be rejected, not opened");
-        check(!health.migration_complete,
-              "a rejected store must not advertise readiness");
-        check(health.migration_state.rfind("unsupported_schema", 0) == 0,
-              "rejection must name the unsupported schema, got " + health.migration_state);
+        check(health.db_running,
+              "a quarantined legacy store must reopen as a fresh schema-5 store");
+        check(health.migration_complete && health.migration_state == "complete",
+              "the quarantined store must be ready, got " + health.migration_state);
+        check(health.schema_version == 5,
+              "the fresh store must carry the current schema version");
         check(registry.jobRecords().empty(),
-              "a rejected store must not publish partial record set");
-        check(revision_of(registry, active_id) == 0,
-              "a rejected store must not synthesize a record");
-        check(registry.getNextJobID() == 0,
-              "a rejected store must not hand out ids");
+              "quarantine starts from an empty record set, never converted rows");
+        const uint64_t next_after_quarantine = registry.getNextJobID();
+        check(next_after_quarantine == 42,
+              "the allocator watermark must import as max(j: 41, c: 41) + 1, got " +
+                  std::to_string(next_after_quarantine));
     }
 
-    // The rows are still there: rejection did not migrate or delete anything.
-    check(raw_keys_with_prefix(path, "j:").size() == 1,
-          "rejection must not delete active records");
-    check(raw_keys_with_prefix(path, "h:").size() == 1,
-          "rejection must not delete history");
+    // Every legacy row survives the quarantine untouched, in the sibling.
+    check(raw_keys_with_prefix(path + ".legacy", "j:").size() == 1,
+          "quarantine must preserve the legacy active records");
+    check(raw_keys_with_prefix(path + ".legacy", "h:").size() == 1,
+          "quarantine must preserve the legacy history");
 
     {
         JobRegistry again(isolated(path));
-        check(!again.storeHealth().db_running,
-              "an old-schema store must stay rejected on every open");
+        check(again.storeHealth().db_running,
+              "a quarantined store must open normally on every later start");
+        check(again.getNextJobID() >= 42,
+              "the imported watermark must survive restarts");
     }
 }
-// Rejection is all-or-nothing and idempotent, even for a populated store.
-void unsupported_schema_is_rejected_idempotently(const std::string& base)
+// Quarantine happens once: the second open sees the schema-5 marker and never
+// renames again, no matter how the first quarantine left things.
+void quarantine_is_one_shot_and_preserves_legacy_rows(const std::string& base)
 {
-    const auto path = fresh_dir(base, "a20-reject");
+    const auto path = fresh_dir(base, "a20-quarantine");
     std::vector<uint64_t> ids;
     for (uint64_t index = 0; index < 70; ++index) ids.push_back(100 + index);
 
@@ -529,24 +534,100 @@ void unsupported_schema_is_rejected_idempotently(const std::string& base)
     write_raw_db(path, entries);
 
     {
-        JobRegistry rejected(isolated(path));
-        check(!rejected.storeHealth().db_running,
-              "a populated old-schema store must be rejected");
-        check(rejected.jobRecords().empty(),
-              "rejection must not publish a partial record set");
+        JobRegistry registry(isolated(path));
+        const auto health = registry.storeHealth();
+        check(health.db_running && health.migration_complete,
+              "a populated legacy store must be quarantined into a ready fresh store");
+        check(registry.jobRecords().empty(),
+              "the fresh store must publish no converted records");
+        check(registry.getNextJobID() == 170,
+              "the watermark must import as max(j: 169, c: 100) + 1");
     }
-    check(raw_keys_with_prefix(path, "j:").size() == ids.size(),
-          "rejection must preserve every record");
+    check(raw_keys_with_prefix(path + ".legacy", "j:").size() == ids.size(),
+          "quarantine must preserve every legacy record");
 
     {
         JobRegistry reopened(isolated(path));
-        check(!reopened.storeHealth().db_running,
-              "reopening must not switch rejection into migration");
-        check(reopened.jobRecords().empty(),
-              "a rejected store publishes no records on retry");
+        check(reopened.storeHealth().db_running && reopened.storeHealth().schema_version == 5,
+              "reopening must see the schema-5 store, not re-quarantine");
     }
-    check(raw_keys_with_prefix(path, "j:").size() == ids.size(),
-          "repeated rejection must not delete rows");
+    check(raw_keys_with_prefix(path + ".legacy", "j:").size() == ids.size(),
+          "the second open must not touch the legacy sibling");
+    check(raw_keys_with_prefix(path, "m:").size() >= 1,
+          "the active store keeps its schema marker");
+}
+// A second legacy store landing in the active path while a quarantined sibling
+// already exists is refused: quarantine never chains and never overwrites.
+void second_legacy_with_sibling_present_is_rejected(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a21-sibling-guard");
+    write_raw_db(path, {
+        {"j:" + hex64(11),
+         legacy_condor_record("11.0", "htcondor01", "schedd-a", {}, 4100).dump()},
+        {"c:job_id", "11"},
+    });
+    write_raw_db(path + ".legacy", {
+        {"j:" + hex64(5),
+         legacy_condor_record("5.0", "htcondor01", "schedd-a", {}, 4100).dump()},
+    });
+
+    {
+        JobRegistry registry(isolated(path));
+        const auto health = registry.storeHealth();
+        check(!health.db_running,
+              "a legacy store with the quarantine slot taken must stay rejected");
+        check(health.migration_state.rfind("unsupported_schema", 0) == 0,
+              "the guard must report the unsupported schema, got " +
+                  health.migration_state);
+        check(registry.jobRecords().empty(),
+              "the rejected store must publish nothing");
+    }
+    check(raw_keys_with_prefix(path, "j:").size() == 1,
+          "the guard must leave the active path untouched");
+    check(raw_keys_with_prefix(path + ".legacy", "j:").size() == 1,
+          "the guard must leave the earlier quarantine untouched");
+}
+// The crash window between rename and watermark write: a fresh store with a
+// legacy sibling imports the watermark on its own first init.
+void fresh_store_imports_watermark_from_legacy_sibling(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a22-sibling-import");
+    write_raw_db(path + ".legacy", {
+        {"j:" + hex64(50),
+         legacy_condor_record("50.0", "htcondor01", "schedd-a", {}, 4100).dump()},
+        {"c:job_id", "42"},
+    });
+
+    JobRegistry registry(isolated(path));
+    check(registry.storeHealth().db_running,
+          "a fresh store with a legacy sibling must initialize normally");
+    const uint64_t next_from_sibling = registry.getNextJobID();
+    check(next_from_sibling == 51,
+          "the sibling watermark must import as max(j: 50, c: 42) + 1, got " +
+              std::to_string(next_from_sibling));
+    check(registry.jobRecords().empty(),
+          "only the watermark is imported, never rows");
+}
+// A marker naming a different schema version stays a hard refusal: quarantine
+// is for unversioned legacy stores only.
+void foreign_schema_marker_is_rejected(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a23-foreign-marker");
+    write_raw_db(path, {
+        {"m:schema_version", "99"},
+        {"j:" + hex64(3),
+         legacy_condor_record("3.0", "htcondor01", "schedd-a", {}, 4100).dump()},
+    });
+
+    {
+        JobRegistry registry(isolated(path));
+        const auto health = registry.storeHealth();
+        check(!health.db_running, "a foreign schema version must be rejected");
+        check(health.migration_state == "unsupported_schema:99",
+              "the refusal must name the found version, got " + health.migration_state);
+    }
+    check(raw_keys_with_prefix(path, "j:").size() == 1,
+          "the foreign-version refusal must not touch any row");
 }
 
 void conflicting_live_execution_is_not_merged(const std::string& base)
@@ -2331,8 +2412,11 @@ int main(int argc, char** argv)
         stable_metadata_is_a_creation_snapshot(base);
         host_refresh_preserves_creation_metadata(base);
         upsert_is_idempotent_and_activates_nothing(base);
-        legacy_schema_is_rejected_without_migration(base);
-        unsupported_schema_is_rejected_idempotently(base);
+        legacy_store_is_quarantined_with_watermark(base);
+        quarantine_is_one_shot_and_preserves_legacy_rows(base);
+        second_legacy_with_sibling_present_is_rejected(base);
+        fresh_store_imports_watermark_from_legacy_sibling(base);
+        foreign_schema_marker_is_rejected(base);
         conflicting_live_execution_is_not_merged(base);
         stale_manager_is_not_replayed(base);
         write_failures_reject_mutations_without_id_reuse(base);
@@ -2364,7 +2448,8 @@ int main(int argc, char** argv)
         ambiguous_discard_is_confirmed_by_the_missing_row(base);
         restored_closing_archives_with_effective_fallback(base);
         std::cout << "PASS job store: empty-binding upsert idempotency, "
-                     "old-schema rejection without migration or deletion, "
+                     "legacy-store quarantine with allocator-watermark import "
+                     "(one-shot, sibling guard, foreign marker refused), "
                      "canonical schema marker, idempotent rejection and "
                      "live-manager conflict, "
                      "durable-write failure handling and no ID reuse, "

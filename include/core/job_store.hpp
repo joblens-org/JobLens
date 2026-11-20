@@ -381,6 +381,16 @@ private:    // Injected by the registry; see setRowProvider.
     // ready. Never deletes data.
     void reject_unsupported_schema(uint32_t found);
     void reject_schema(const std::string& state, uint32_t found);
+    // Store format lifecycle — the one admission seam. Every on-disk state's
+    // fate (open / initialize / quarantine / reject) is decided and executed
+    // here; init_db only calls it. A future schema bump that must keep row
+    // data adds its arm here, and row-content conversion itself belongs to
+    // the registry layer (adapters), never the store.
+    bool admit_database(const std::string& db_path);
+    // Adopts the allocator watermark (c:job_id and the highest j: key) from a
+    // quarantined legacy sibling. Keys only, idempotent, never row content;
+    // also covers the crash window between quarantine and the import write.
+    bool import_legacy_watermark(const std::string& legacy_path);
     void init_id_counter();
     bool store_ready() const;
 

@@ -77,7 +77,7 @@ job_registry_config:
 
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
-| `job_db_path` | string | 无 | LevelDB 数据库目录路径。无法打开数据库时仅降级运行，不抛异常 |
+| `job_db_path` | string | 无 | LevelDB 数据库目录路径。无法打开数据库时仅降级运行，不抛异常。升级时此路径上的旧格式库会被隔离改名为 `<路径>.legacy`，只导入分配水位线（见 doc/jobstore_persistence_service.md 第 7 节） |
 | `auto_add_condorjob` | bool | false | **已弃用**。启动旧版 CondorJobWatcher 并自动登记作业。该类型出现在 `maintenance.types` 时忽略（由发现源负责） |
 | `auto_add_slurmjob` | bool | false | **已弃用**。同上，作用于 Slurm |
 | `maintenance.types` | list | `[]` | 需要完整本地作业记录的调度器类型（包含未被采集的作业）。取值 `condor` / `slurm`，未知值启动即拒绝 |
