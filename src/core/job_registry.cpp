@@ -2206,11 +2206,13 @@ UpsertResult JobRegistry::createManualJob(Job& job) {
                           id->id, error);
             // commitNewRecord's internal contract is its error string; this is
             // the one boundary where it becomes the typed code callers branch
-            // on.
+            // on. The durable index conflict is the ambiguous-create repair
+            // path: the row exists on disk while memory never published it,
+            // so the answer is a conflict, not a store failure.
             if (error == "duplicate_job_id")
                 result.fail(RegistrationError::DuplicateJobId,
                             "another record already owns JobID " + format_job_id(id->id));
-            else if (error == "duplicate_identity")
+            else if (error == "duplicate_identity" || error == "identity_conflict")
                 result.fail(RegistrationError::DuplicateIdentity,
                             "another record already owns this scheduler identity");
             else
@@ -2429,9 +2431,9 @@ nlohmann::json JobRegistry::addOrUpdateManualJob(const Job& job,
     const auto created = createManualJob(create_job);
     if (!created.ok) {
         // A refused create answers with its typed code so the trigger maps a
-        // real status (409 already_exists / 400 invalid_collectors / 503
-        // store_unavailable) instead of the unknown-code 503 a codeless error
-        // produced (JL-05).
+        // real status (409 already_exists / 400 invalid_collectors / the
+        // store family keeps its own code on a 503) instead of the
+        // unknown-code 503 a codeless error produced (JL-05).
         if (created.code == RegistrationError::DuplicateJobId ||
             created.code == RegistrationError::DuplicateIdentity) {
             // Name the instance the request collided with when the registry

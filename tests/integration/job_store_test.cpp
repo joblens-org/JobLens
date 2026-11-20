@@ -38,6 +38,8 @@
 #include "core/registration_error.hpp"
 #include "core/job_registry.hpp"
 #include "job_fixture.h"
+
+#include <fstream>
 #include "collection_runtime_fixture.hpp"
 
 #include <leveldb/db.h>
@@ -607,6 +609,156 @@ void fresh_store_imports_watermark_from_legacy_sibling(const std::string& base)
               std::to_string(next_from_sibling));
     check(registry.jobRecords().empty(),
           "only the watermark is imported, never rows");
+}
+// The crash window between the schema batch and the watermark import: the
+// marker is present, the counter key is not, and the quarantined sibling
+// still knows the floor. The open path must adopt it instead of allocating
+// from 1.
+void crash_window_recovers_watermark_on_reopen(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a24-crash-window");
+    write_raw_db(path, {{"m:schema_version", "5"}});
+    write_raw_db(path + ".legacy", {
+        {"j:" + hex64(42),
+         legacy_condor_record("42.0", "htcondor01", "schedd-a", {}, 4100).dump()},
+        {"c:job_id", "41"},
+    });
+
+    JobRegistry registry(isolated(path));
+    check(registry.storeHealth().db_running,
+          "a store interrupted mid-bootstrap must open, not refuse");
+    const uint64_t next = registry.getNextJobID();
+    check(next == 43,
+          "the sibling watermark must be adopted after the crash window, got " +
+              std::to_string(next));
+}
+// An unreadable sibling (locked or not a database) blocks readiness only
+// while the store has never bootstrapped its own counter; once c:job_id
+// exists the sibling is a residual and startup proceeds.
+void unreadable_sibling_blocks_unbootstrapped_store_only(const std::string& base)
+{
+    const auto blocked = fresh_dir(base, "a25-sibling-blocked");
+    write_raw_db(blocked, {{"m:schema_version", "5"}});
+    std::ofstream legacy_file(blocked + ".legacy");
+    legacy_file << "not a leveldb directory";
+    legacy_file.close();
+    {
+        JobRegistry registry(isolated(blocked));
+        const auto health = registry.storeHealth();
+        check(!health.db_running,
+              "an unreadable sibling must block a store with no counter of its own");
+        check(health.migration_state == "legacy_watermark_unreadable",
+              "the block must name the unreadable watermark, got " +
+                  health.migration_state);
+    }
+
+    const auto resilient = fresh_dir(base, "a25-sibling-residual");
+    write_raw_db(resilient, {{"m:schema_version", "5"}, {"c:job_id", "50"}});
+    std::ofstream residual(resilient + ".legacy");
+    residual << "not a leveldb directory";
+    residual.close();
+    {
+        JobRegistry registry(isolated(resilient));
+        check(registry.storeHealth().db_running,
+              "a store with its own counter must start despite a residual sibling");
+        const uint64_t next = registry.getNextJobID();
+        check(next == 50,
+              "the store keeps its own counter when the sibling is unreadable, got " +
+                  std::to_string(next));
+    }
+}
+// The watermark floor rules, one fixture each: archived ids count, a
+// saturated floor stops allocation instead of wrapping, malformed foreign
+// keys are skipped.
+void legacy_watermark_floor_rules(const std::string& base)
+{
+    const auto floor_case = [&](const std::string& name,
+                                std::vector<std::pair<std::string, std::string>> entries,
+                                uint64_t expected, const std::string& why) {
+        const auto path = fresh_dir(base, name);
+        write_raw_db(path, std::move(entries));
+        JobRegistry registry(isolated(path));
+        check(registry.storeHealth().db_running, why + ": the store must open");
+        const uint64_t next = registry.getNextJobID();
+        check(next == expected, why + ", got " + std::to_string(next));
+    };
+    floor_case("a26-archived-watermark", {
+        {"j:" + hex64(5),
+         legacy_condor_record("5.0", "htcondor01", "schedd-a", {}, 4100).dump()},
+        {"h:" + hex64(61) + ":" + hex64(1234567),
+         legacy_condor_record("61.0", "htcondor01", "schedd-a", {}, 900).dump()},
+        {"c:job_id", "61"},
+    }, 62, "archived ids must count toward the watermark");
+    floor_case("a27-saturated-floor", {
+        {"j:" + hex64(std::numeric_limits<uint64_t>::max()),
+         legacy_condor_record("18446744073709551615.0", "htcondor01", "schedd-a",
+                              {}, 4100).dump()},
+        {"c:job_id", "4"},
+    }, 0, "a saturated floor must stop allocation instead of wrapping low");
+    floor_case("a28-malformed-keys", {
+        {"j:" + hex64(10),
+         legacy_condor_record("10.0", "htcondor01", "schedd-a", {}, 4100).dump()},
+        {"j:not-a-hex-key", "junk"},
+        {"h:short", "junk"},
+        {"c:job_id", "7"},
+    }, 11, "malformed legacy keys must be skipped");
+}
+// A trailing slash in job_db_path must not push the quarantine inside the
+// store directory.
+void trailing_slash_db_path_still_quarantines_correctly(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a29-trailing-slash");
+    write_raw_db(path, {
+        {"j:" + hex64(9),
+         legacy_condor_record("9.0", "htcondor01", "schedd-a", {}, 4100).dump()},
+        {"c:job_id", "3"},
+    });
+
+    JobRegistryOptions options = isolated(path);
+    options.db_path = path + "/";
+    JobRegistry registry(options);
+    check(registry.storeHealth().db_running,
+          "a trailing slash must not break admission");
+    check(std::filesystem::exists(std::filesystem::path(path + ".legacy")),
+          "the quarantine must land next to the store, not inside it");
+    const uint64_t next = registry.getNextJobID();
+    check(next == 10, "the watermark must import through the slash-normalized path, got " +
+                          std::to_string(next));
+}
+// The durable identity conflict: a create whose batch landed but whose
+// outcome reported failure leaves no memory image. The strict-create retry
+// hits the durable identity index and must answer already_exists (409), not a
+// store write failure the trigger maps to 503.
+void durable_identity_conflict_reports_already_exists(const std::string& base)
+{
+    const auto path = fresh_dir(base, "a30-durable-conflict");
+    JobRegistry registry(isolated(path));
+
+    Job request = condor_observation("515.0");
+    request.CollectorNames = {"cpumem_collector"};
+
+    registry.injectStoreFaultForTest(StoreFaultMode::FailAfterWrite, /*skip=*/0);
+    const auto ambiguous = registry.addOrUpdateManualJob(
+        request, nlohmann::json::object(), std::nullopt, /*create_only=*/true);
+    check(ambiguous.value("status", "") == "error",
+          "the ambiguous create must report failure");
+
+    const auto retried = registry.addOrUpdateManualJob(
+        request, nlohmann::json::object(), std::nullopt, /*create_only=*/true);
+    check(retried.value("status", "") == "error",
+          "the strict-create retry against the durable row must not report success");
+    check(retried.value("code", "") == "already_exists",
+          "the durable identity conflict must answer already_exists, got: " +
+              retried.dump());
+
+    registry.deinit();
+    // After the registry released the database lock: the ambiguous create
+    // landed exactly one row, the retry added none.
+    check(raw_keys_with_prefix(path, "j:").size() == 1,
+          "the retry must leave exactly the ambiguous create's durable row");
+    JobRegistry reopened(isolated(path));
+    check(reopened.jobRecords().size() == 1,
+          "after restart exactly the durable row must be restored");
 }
 // A marker naming a different schema version stays a hard refusal: quarantine
 // is for unversioned legacy stores only.
@@ -2416,6 +2568,11 @@ int main(int argc, char** argv)
         quarantine_is_one_shot_and_preserves_legacy_rows(base);
         second_legacy_with_sibling_present_is_rejected(base);
         fresh_store_imports_watermark_from_legacy_sibling(base);
+        crash_window_recovers_watermark_on_reopen(base);
+        unreadable_sibling_blocks_unbootstrapped_store_only(base);
+        legacy_watermark_floor_rules(base);
+        trailing_slash_db_path_still_quarantines_correctly(base);
+        durable_identity_conflict_reports_already_exists(base);
         foreign_schema_marker_is_rejected(base);
         conflicting_live_execution_is_not_merged(base);
         stale_manager_is_not_replayed(base);

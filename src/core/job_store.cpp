@@ -25,7 +25,9 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -80,6 +82,20 @@ uint64_t unhex64(const std::string& s) {
     return std::stoull(s, nullptr, 16);
 }
 
+// Strict hex-id parse for foreign input (the legacy layout): never throws,
+// rejects short/long/non-hex keys instead of guessing an id.
+bool parse_hex_id(const std::string& hex, uint64_t& value)
+{
+    if (hex.size() != 16) return false;
+    for (const char c : hex) {
+        if (std::isxdigit(static_cast<unsigned char>(c)) == 0) return false;
+    }
+    const auto* begin = hex.data();
+    const auto* end = hex.data() + hex.size();
+    const auto result = std::from_chars(begin, end, value, 16);
+    return result.ec == std::errc() && result.ptr == end;
+}
+
 std::string key_job(uint64_t jobID) {
     return KEY_PREFIX_JOB + hex64(jobID);
 }
@@ -94,6 +110,48 @@ std::string key_history(uint64_t jobID, uint64_t end_time) {
 
 std::string key_counter(const std::string& name) {
     return KEY_PREFIX_COUNTER + name;
+}
+
+// One scanner for the id keyspace, used for this store's own rows and for a
+// quarantined sibling's foreign ones: the c:job_id counter plus the highest
+// j:/h: row id. Malformed keys are skipped, never parsed into an exception;
+// a scan failure is reported instead of guessed from.
+struct IdScan {
+    uint64_t counter = 0;
+    uint64_t max_row_id = 0;
+    bool counter_malformed = false;
+    bool ok = true;
+};
+IdScan scan_id_keys(leveldb::DB* db)
+{
+    IdScan out;
+    std::string counter_json;
+    if (db->Get(leveldb::ReadOptions(), key_counter("job_id"), &counter_json).ok()) {
+        try {
+            out.counter = std::stoull(counter_json);
+        } catch (const std::exception&) {
+            out.counter_malformed = true;
+        }
+    }
+    leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+        const std::string key = it->key().ToString();
+        std::string hex_part;
+        if (key.rfind(KEY_PREFIX_JOB, 0) == 0) {
+            hex_part = key.substr(KEY_PREFIX_JOB.size(), 16);
+        } else if (key.rfind(KEY_PREFIX_HISTORY, 0) == 0) {
+            // history key: "h:" + hex64(JobID) + ":" + hex64(end_time)
+            hex_part = key.substr(KEY_PREFIX_HISTORY.size(), 16);
+        } else {
+            continue;
+        }
+        uint64_t id = 0;
+        if (!parse_hex_id(hex_part, id)) continue;
+        if (id > out.max_row_id) out.max_row_id = id;
+    }
+    out.ok = it->status().ok();
+    delete it;
+    return out;
 }
 
 std::string key_meta(const std::string& name) {
@@ -394,6 +452,9 @@ bool JobStore::init_db(const Options& options) {
     if (db_path.empty()) {
         db_path = Config::instance().getString("job_registry_config", "job_db_path");
     }
+    // A trailing separator would push the quarantine sibling inside the store
+    // directory; normalize once here so every downstream path agrees.
+    while (db_path.size() > 1 && db_path.back() == '/') db_path.pop_back();
 
     std::filesystem::path db_dir(db_path);
     if (db_dir.has_parent_path()) {
@@ -457,13 +518,18 @@ bool JobStore::db_is_empty() const {
     return empty;
 }
 
-bool JobStore::initialize_schema() {
+bool JobStore::initialize_schema(uint64_t watermark_floor) {
     std::lock_guard<std::mutex> db_lock(db_mtx_);
     if (!db_) return false;
     if (db_uuid_.empty()) db_uuid_ = generate_db_uuid();
     leveldb::WriteBatch batch;
     batch.Put(key_meta("schema_version"), std::to_string(kJobStoreSchemaVersion));
     batch.Put(key_meta("db_uuid"), db_uuid_);
+    // The watermark rides the bootstrap batch (synced): a crash leaves the
+    // store either unmarked — the whole batch lost — or marked with the
+    // watermark already durable, never marked without it.
+    if (watermark_floor > 1)
+        batch.Put(key_counter("job_id"), std::to_string(watermark_floor));
     const auto status = write_batch_locked(batch, "initialize schema");
     if (!status.ok()) {
         spdlog::error("JobStore: failed to initialize schema {}: {}", kJobStoreSchemaVersion,
@@ -496,12 +562,14 @@ void JobStore::reject_schema(const std::string& state, uint32_t found) {
 // ---------------------------------------------------------------------------
 
 bool JobStore::admit_database(const std::string& db_path) {
-    // The marker names the layout this binary speaks.
+    // The marker names the layout this binary speaks. An unreadable marker is
+    // not "no marker": quarantine decisions must never be made against an
+    // I/O error.
     bool schema_present = false;
     {
         std::lock_guard<std::mutex> db_lock(db_mtx_);
         std::string value;
-        auto s = db_->Get(leveldb::ReadOptions(), key_meta("schema_version"), &value);
+        const auto s = db_->Get(leveldb::ReadOptions(), key_meta("schema_version"), &value);
         if (s.ok()) {
             schema_present = true;
             const auto parsed = parse_schema_marker(value);
@@ -514,15 +582,36 @@ bool JobStore::admit_database(const std::string& db_path) {
                 return false;
             }
             schema_version_ = *parsed;
+        } else if (!s.IsNotFound()) {
+            spdlog::error("JobStore: could not read the schema marker at {}: {}",
+                          db_path, s.ToString());
+            reject_schema("schema_marker_unreadable", 0);
+            return false;
         }
     }
+    const std::string legacy_path = db_path + ".legacy";
+
     if (schema_present) {
-        if (schema_version_ == kJobStoreSchemaVersion) return true;
-        spdlog::error("JobStore: db schema {} is not supported by this binary (schema {}); "
-                      "refusing to migrate or delete it", schema_version_,
-                      kJobStoreSchemaVersion);
-        reject_unsupported_schema(schema_version_);
-        return false;
+        if (schema_version_ != kJobStoreSchemaVersion) {
+            spdlog::error("JobStore: db schema {} is not supported by this binary (schema {}); "
+                          "refusing to migrate or delete it", schema_version_,
+                          kJobStoreSchemaVersion);
+            reject_unsupported_schema(schema_version_);
+            return false;
+        }
+        // Current schema. A sibling may still hold a watermark this store
+        // never adopted — the crash window between the schema batch and the
+        // import. It blocks readiness only while this store has no counter
+        // of its own; with one, the sibling is a residual.
+        const auto imported = import_legacy_watermark(legacy_path);
+        if (imported == WatermarkImport::Blocked && !counter_present_locked()) {
+            spdlog::error("JobStore: the legacy sibling at {} cannot be read and this "
+                          "store carries no allocator watermark of its own; refusing "
+                          "to start without it", legacy_path);
+            reject_schema("legacy_watermark_unreadable", 0);
+            return false;
+        }
+        return true;
     }
 
     // No marker. A store with data is a pre-schema legacy layout: quarantine it
@@ -530,7 +619,6 @@ bool JobStore::admit_database(const std::string& db_path) {
     // The slot is single-use: a second legacy store while a quarantined
     // sibling exists is an operator decision, never an automatic overwrite.
     if (!db_is_empty()) {
-        const std::string legacy_path = db_path + ".legacy";
         std::error_code exists_error;
         if (std::filesystem::exists(legacy_path, exists_error) || exists_error) {
             spdlog::error("JobStore: database at {} has data but no schema marker and the "
@@ -572,72 +660,75 @@ bool JobStore::admit_database(const std::string& db_path) {
         }
     }
 
-    if (!initialize_schema()) {
+    // Fresh store: read the sibling's floor first so the watermark rides the
+    // schema batch — an import failure here is a refusal to start, never a
+    // silent restart of the id space.
+    uint64_t sibling_floor = 1;
+    std::error_code sibling_exists_error;
+    const bool sibling_exists =
+        std::filesystem::exists(legacy_path, sibling_exists_error);
+    if (sibling_exists || sibling_exists_error) {
+        if (!read_legacy_floor(legacy_path, sibling_floor)) {
+            spdlog::error("JobStore: the legacy sibling at {} cannot be read for the "
+                          "watermark import; refusing to initialize without it",
+                          legacy_path);
+            reject_schema("legacy_watermark_unreadable", 0);
+            return false;
+        }
+    }
+    if (!initialize_schema(sibling_floor)) {
         spdlog::error("JobStore: could not initialize a new schema-{} store",
                       kJobStoreSchemaVersion);
         reject_unsupported_schema(/*found=*/0);
         return false;
     }
-    // Fresh store: adopt the legacy sibling's allocator watermark. Keyed on
-    // the sibling, so a crash between the rename above and this write makes
-    // the next open redo the import instead of losing the watermark.
-    import_legacy_watermark(db_path + ".legacy");
     return true;
 }
 
-bool JobStore::import_legacy_watermark(const std::string& legacy_path) {
-    std::error_code exists_error;
-    if (!std::filesystem::exists(legacy_path, exists_error) || exists_error)
-        return false;
-
+bool JobStore::read_legacy_floor(const std::string& legacy_path, uint64_t& floor)
+{
+    floor = 1;
     leveldb::Options options;
     options.create_if_missing = false;
     leveldb::DB* legacy = nullptr;
     const auto opened = leveldb::DB::Open(options, legacy_path, &legacy);
     if (!opened.ok() || legacy == nullptr) {
-        spdlog::warn("JobStore: the legacy store at {} could not be opened for the "
-                     "watermark import: {}", legacy_path, opened.ToString());
+        spdlog::warn("JobStore: the legacy store at {} could not be opened: {}",
+                     legacy_path, opened.ToString());
         return false;
     }
-
-    uint64_t counter = 0;
-    {
-        std::string value;
-        if (legacy->Get(leveldb::ReadOptions(), key_counter("job_id"), &value).ok()) {
-            try {
-                counter = std::stoull(value);
-            } catch (const std::exception&) {
-                spdlog::warn("JobStore: legacy counter value '{}' is not a number; "
-                             "importing from the row ids only", value);
-            }
-        }
-    }
-    uint64_t max_job_id = 0;
-    {
-        leveldb::Iterator* it = legacy->NewIterator(leveldb::ReadOptions());
-        it->Seek(KEY_PREFIX_JOB);
-        if (it->Valid() && it->key().starts_with(KEY_PREFIX_JOB)) {
-            it->SeekToLast();
-            while (it->Valid() && !it->key().starts_with(KEY_PREFIX_JOB)) it->Prev();
-            if (it->Valid())
-                max_job_id = unhex64(it->key().ToString().substr(2));
-        }
-        const auto status = it->status();
-        delete it;
-        if (!status.ok()) {
-            delete legacy;
-            spdlog::warn("JobStore: the legacy store at {} could not be scanned for "
-                         "the watermark import: {}", legacy_path, status.ToString());
-            return false;
-        }
-    }
+    const IdScan scan = scan_id_keys(legacy);
     delete legacy;
+    if (!scan.ok) {
+        spdlog::warn("JobStore: the legacy store at {} could not be scanned",
+                     legacy_path);
+        return false;
+    }
+    // The watermark rule init_id_counter applies to this store's own rows,
+    // applied to the foreign ones: the counter plus every row id (active and
+    // archived), saturated. A saturated floor makes the counter init read an
+    // unmarked MAX back and conservatively stop allocating.
+    if (scan.max_row_id == std::numeric_limits<uint64_t>::max()) {
+        floor = scan.max_row_id;
+        return true;
+    }
+    floor = std::max({scan.counter, scan.max_row_id + 1, uint64_t{1}});
+    return true;
+}
 
-    const uint64_t watermark = std::max(counter, max_job_id + 1);
-    if (watermark <= 1) return false;  // nothing worth preserving
+JobStore::WatermarkImport JobStore::import_legacy_watermark(const std::string& legacy_path)
+{
+    std::error_code exists_error;
+    if (!std::filesystem::exists(legacy_path, exists_error) || exists_error)
+        return WatermarkImport::NoSibling;
+
+    uint64_t floor = 1;
+    if (!read_legacy_floor(legacy_path, floor))
+        return WatermarkImport::Blocked;
+    if (floor <= 1) return WatermarkImport::AlreadyAhead;
 
     std::lock_guard<std::mutex> db_lock(db_mtx_);
-    if (!db_) return false;
+    if (!db_) return WatermarkImport::Blocked;
     uint64_t current = 0;
     {
         std::string value;
@@ -648,16 +739,23 @@ bool JobStore::import_legacy_watermark(const std::string& legacy_path) {
             }
         }
     }
-    if (watermark <= current) return false;  // already ahead: no boot-time writes
+    if (floor <= current) return WatermarkImport::AlreadyAhead;
     leveldb::WriteOptions synced;
     synced.sync = true;
-    if (!db_->Put(synced, key_counter("job_id"), std::to_string(watermark)).ok()) {
+    if (!db_->Put(synced, key_counter("job_id"), std::to_string(floor)).ok()) {
         spdlog::error("JobStore: could not persist the imported allocator watermark");
-        return false;
+        return WatermarkImport::Blocked;
     }
     spdlog::info("JobStore: imported the allocator watermark {} from the legacy "
-                 "store at {}", watermark, legacy_path);
-    return true;
+                 "store at {}", floor, legacy_path);
+    return WatermarkImport::Imported;
+}
+
+bool JobStore::counter_present_locked() const
+{
+    if (!db_) return false;
+    std::string value;
+    return db_->Get(leveldb::ReadOptions(), key_counter("job_id"), &value).ok();
 }
 
 void JobStore::close_db() {
@@ -1190,52 +1288,22 @@ void JobStore::init_id_counter() {
     }
 
     try {
-        uint64_t counter_value = 1;
-        bool counter_malformed = false;
-
-        std::string counter_json;
-        leveldb::Status s = db_->Get(leveldb::ReadOptions(), key_counter("job_id"), &counter_json);
-        if (s.ok()) {
-            try {
-                counter_value = std::stoull(counter_json);
-            } catch (const std::exception&) {
-                counter_malformed = true;
-                spdlog::error("JobStore: job_id counter is not a number ('{}'); refusing to "
-                              "reset the allocator", counter_json);
-            }
+        const IdScan scan = scan_id_keys(db_);
+        if (!scan.ok) {
+            // Fail closed, the same rule db_is_empty applies: never guess an
+            // id floor from an unreadable keyspace.
+            spdlog::error("JobStore: could not scan the id keyspace; keeping the "
+                          "allocator stopped");
+            id_exhausted_ = true;
+            next_id_ = 0;
+            return;
         }
-
-        uint64_t max_job_id = 0;
-
-        // 扫描 jobs 前缀取最大 JobID
-        leveldb::Iterator* it = db_->NewIterator(leveldb::ReadOptions());
-        it->Seek(KEY_PREFIX_JOB);
-        if (it->Valid() && it->key().starts_with(KEY_PREFIX_JOB)) {
-            it->SeekToLast();
-            while (it->Valid() && !it->key().starts_with(KEY_PREFIX_JOB)) {
-                it->Prev();
-            }
-            if (it->Valid()) {
-                uint64_t id = unhex64(it->key().ToString().substr(2));
-                if (id > max_job_id) max_job_id = id;
-            }
+        const uint64_t counter_value = scan.counter;
+        const uint64_t max_job_id = scan.max_row_id;
+        if (scan.counter_malformed) {
+            spdlog::error("JobStore: job_id counter is not a number; refusing to "
+                          "reset the allocator");
         }
-
-        // 扫描 history 前缀
-        it->Seek(KEY_PREFIX_HISTORY);
-        if (it->Valid() && it->key().starts_with(KEY_PREFIX_HISTORY)) {
-            it->SeekToLast();
-            while (it->Valid() && !it->key().starts_with(KEY_PREFIX_HISTORY)) {
-                it->Prev();
-            }
-            if (it->Valid()) {
-                // history key: "h:" + hex64(JobID) + ":" + hex64(timestamp)
-                std::string hex_part = it->key().ToString().substr(2, 16);
-                uint64_t id = unhex64(hex_part);
-                if (id > max_job_id) max_job_id = id;
-            }
-        }
-        delete it;
 
         uint64_t high_water = counter_value;
         if (max_job_id == std::numeric_limits<uint64_t>::max()) {
@@ -1262,7 +1330,7 @@ void JobStore::init_id_counter() {
         }
 
         bool persist_marker = false;
-        if (counter_malformed) {
+        if (scan.counter_malformed) {
             id_exhausted_ = true;
             next_id_ = 0;
             persist_marker = true;

@@ -375,8 +375,10 @@ private:    // Injected by the registry; see setRowProvider.
     bool load_or_create_db_uuid();
     // True when the opened database has no user keys yet (a brand-new store).
     bool db_is_empty() const;
-    // Persists the current schema marker for a brand-new store.
-    bool initialize_schema();
+    // Persists the current schema marker for a brand-new store. The legacy
+    // watermark rides the same synced batch, so the marker and the watermark
+    // can never be split by a crash.
+    bool initialize_schema(uint64_t watermark_floor);
     // Closes a database this build must not touch and records why it is not
     // ready. Never deletes data.
     void reject_unsupported_schema(uint32_t found);
@@ -387,10 +389,19 @@ private:    // Injected by the registry; see setRowProvider.
     // data adds its arm here, and row-content conversion itself belongs to
     // the registry layer (adapters), never the store.
     bool admit_database(const std::string& db_path);
-    // Adopts the allocator watermark (c:job_id and the highest j: key) from a
-    // quarantined legacy sibling. Keys only, idempotent, never row content;
-    // also covers the crash window between quarantine and the import write.
-    bool import_legacy_watermark(const std::string& legacy_path);
+    // Adoption result for a quarantined sibling's allocator watermark.
+    enum class WatermarkImport { NoSibling, Imported, AlreadyAhead, Blocked };
+    // Reads a legacy sibling's id floor: the c:job_id counter and the highest
+    // j:/h: row id, saturated (UINT64_MAX means exhausted) — the same rule
+    // init_id_counter applies to this store's own rows. Malformed keys are
+    // foreign input and are skipped. False: the sibling exists but cannot be
+    // read (locked, not a database, scan failure).
+    bool read_legacy_floor(const std::string& legacy_path, uint64_t& floor);
+    // Adopts the sibling watermark on an already-admitted store: syncs the
+    // higher value, reports AlreadyAhead when there is nothing to do.
+    WatermarkImport import_legacy_watermark(const std::string& legacy_path);
+    // True when this store carries its own c:job_id counter.
+    bool counter_present_locked() const;
     void init_id_counter();
     bool store_ready() const;
 

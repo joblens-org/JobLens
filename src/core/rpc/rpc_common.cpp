@@ -714,6 +714,22 @@ std::optional<nlohmann::json> store_not_ready_payload(const StoreHealth& health)
                                  "write; the database was left untouched (no rewrite, no "
                                  "deletion)");
         }
+        if (health.migration_state == "schema_marker_unreadable") {
+            return error_payload("store_unavailable",
+                                 "job store schema marker could not be read (I/O); "
+                                 "the database was left untouched");
+        }
+        if (health.migration_state == "legacy_watermark_unreadable") {
+            return error_payload("store_unavailable",
+                                 "the quarantined legacy store (<db>.legacy) cannot be "
+                                 "read for the allocator watermark; resolve or remove "
+                                 "it once its job ids are accounted for");
+        }
+        if (health.migration_state == "quarantine_reopen_failed") {
+            return error_payload("store_unavailable",
+                                 "the legacy store was quarantined but the fresh store "
+                                 "could not be opened; check the JobLens data directory");
+        }
         if (health.migration_state.rfind("unsupported_schema", 0) == 0) {
             return error_payload("store_unavailable",
                                  "job store schema is not supported by this build; "
