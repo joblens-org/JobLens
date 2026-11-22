@@ -182,11 +182,11 @@ static void run(bpf_object* object, const Job& first, const Job& second) {
     map_reads = consumed_entries = 0;
     runtimes.clear();
     write_rapl(interval_energy_uj);
-    seed(first.JobPIDs[0], second.JobPIDs[0]);
+    seed(pids_of(first)[0], pids_of(second)[0]);
     PowerCollector collector;
     PowerCollectorTestAccess::setup(collector, object);
     // The first Job refreshes the cache and accounts the consumed interval once.
-    const auto consumed = std::any_cast<PowerSnapshot>(collector.collect(first));
+    const auto consumed = collector.sample_job(first);
     require(map_reads == 1 && consumed_entries == 2 && runtimes.empty(),
             "first sample did not consume the hardware interval once");
     expect_total(collector, consumed, initial_total + interval_kwh);
@@ -194,7 +194,7 @@ static void run(bpf_object* object, const Job& first, const Job& second) {
     require(near(accounted_jobs.at(first.JobID), (first.JobID == 7 ? 0.1 : 0.2) +
                  consumed.jobs[0].energy_j / 3.6e6), "first Job cumulative attribution incorrect");
     // A different Job reuses the same accounted sample without charging it again.
-    const auto other = std::any_cast<PowerSnapshot>(collector.collect(second));
+    const auto other = collector.sample_job(second);
     expect_total(collector, other, initial_total + interval_kwh);
     require(PowerCollectorTestAccess::job_totals(collector) == accounted_jobs &&
             other.jobs.size() == 1 && other.jobs[0].job_id == second.JobID,
@@ -202,8 +202,8 @@ static void run(bpf_object* object, const Job& first, const Job& second) {
     // After the cache expires a new interval is consumed and accounted once more.
     PowerCollectorTestAccess::expire(collector);
     write_rapl(2 * interval_energy_uj);
-    seed(first.JobPIDs[0], second.JobPIDs[0]);
-    const auto next = std::any_cast<PowerSnapshot>(collector.collect(first));
+    seed(pids_of(first)[0], pids_of(second)[0]);
+    const auto next = collector.sample_job(first);
     require(map_reads == 2 && consumed_entries == 4 && runtimes.empty(),
             "accounted sample prevented the next cache refresh");
     expect_total(collector, next, initial_total + 2 * interval_kwh);
@@ -217,19 +217,19 @@ static void run_empty(bpf_object* object, const Job& first, const Job& second, b
     runtimes.clear();
     write_rapl(interval_energy_uj);
     if (no_cores) {
-        seed(first.JobPIDs[0], second.JobPIDs[0]);
+        seed(pids_of(first)[0], pids_of(second)[0]);
         PowerCollectorTestAccess::set_cores(collector, 0);
     }
     const auto previous = PowerCollectorTestAccess::job_totals(collector);
-    const auto empty = std::any_cast<PowerSnapshot>(collector.collect(first));
+    const auto empty = collector.sample_job(first);
     expect_total(collector, empty, initial_total);
     require(empty.jobs.empty() && PowerCollectorTestAccess::job_totals(collector) == previous,
             "unattributable sample reset existing Job cumulative totals");
     PowerCollectorTestAccess::set_cores(collector, 2);
     PowerCollectorTestAccess::expire(collector);
     write_rapl(2 * interval_energy_uj);
-    seed(first.JobPIDs[0], second.JobPIDs[0]);
-    const auto next = std::any_cast<PowerSnapshot>(collector.collect(first));
+    seed(pids_of(first)[0], pids_of(second)[0]);
+    const auto next = collector.sample_job(first);
     expect_total(collector, next, initial_total + interval_kwh);
     std::cout << "PASS Power " << (no_cores ? "zero denominator" : "empty tasks")
               << " preserves prior totals and allows the next sample\n";
@@ -260,8 +260,8 @@ int main(int argc, char** argv) {
         for (const auto [id, pid] : {std::pair<uint64_t, pid_t>{7, getpid()}, {9, child.pid}}) {
             Job job;
             job.JobID = id;
-            job.NativeJobID = "fixture-" + std::to_string(id);
-            job.JobPIDs = {pid};
+            job.JobNativeID = "fixture-" + std::to_string(id);
+            set_pids(job, {pid});
             job.jobtype = JobType::Sys;
             job.subtype = JobSubType::Common;
             job.sub_attr = CommonJobAttr{.auto_update_child = false};
@@ -280,7 +280,7 @@ int main(int argc, char** argv) {
         batch_fallback = false;
         run_empty(object.get(), jobs[0], jobs[1], false);
         run_empty(object.get(), jobs[0], jobs[1], true);
-        for (const auto& job : jobs) JobRegistry::instance().delJob(job.JobID);
+        for (const auto& job : jobs) JobRegistry::instance().removeJob(job.JobID);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

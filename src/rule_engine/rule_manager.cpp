@@ -17,17 +17,29 @@
 #include <fstream>
 #include <system_error>
 
+namespace {
+
+// The inotify watch is installed while the manager is constructed, so the
+// directory must exist before that: creating it in the constructor body would
+// leave the watcher watching nothing on the first start.
+std::string ensure_rules_directory(const std::string& dir)
+{
+    if (dir.empty()) return dir;
+    std::error_code error;
+    fs::create_directories(dir, error);
+    if (error) {
+        spdlog::error("RulesManager: cannot create rules directory '{}': {}",
+                      dir, error.message());
+    }
+    return dir;
+}
+
+}  // namespace
 
 RulesManager::RulesManager(const std::string& name, const std::string& rules_dir, const std::string& rules_prefix) : 
-name_(name), rule_engine_(), rules_dir_(rules_dir), rules_prefix_(rules_prefix), dir_watcher_(rules_dir) {
-    fs::path dir_path(rules_dir);
-    if (!fs::exists(dir_path)) {
-        std::error_code ec;
-        fs::create_directories(dir_path, ec);
-        if (ec) {
-            spdlog::error("RulesManager: failed to create rules dir {}: {}", rules_dir, ec.message());
-        }
-    }
+name_(name), rules_dir_(rules_dir), rules_prefix_(rules_prefix), rule_engine_(),
+dir_watcher_(ensure_rules_directory(rules_dir)) {
+    const fs::path dir_path(rules_dir_);
     // 规则目录只有 root/服务用户可写；否则任何本地用户都能改以 root 执行的规则。
     {
         std::error_code ec;
@@ -43,15 +55,19 @@ name_(name), rule_engine_(), rules_dir_(rules_dir), rules_prefix_(rules_prefix),
                           "any local user can inject Lua that runs as root", rules_dir);
         }
     }
-    rule_engine_.load_rules_from_directory(rules_dir);
+    // Only files whose basename starts with the adapter name belong to this
+    // engine: a directory shared by several types must not feed one type's
+    // rules into another.
+    rule_engine_.load_rules_from_directory(rules_dir, rules_prefix);
 
     dir_watcher_.setEventCallback(
         [this](const std::string& path, uint32_t mask) {
-            auto filename = fs::path(path).filename().string();
+            const fs::path rule_path(path);
+            auto filename = rule_path.filename().string();
             if (filename.find(rules_prefix_) != 0) {
                 return;
             }
-            if (fs::path(path).extension() != ".lua") {
+            if (rule_path.extension() != ".lua") {
                 spdlog::warn("RulesManager: ignoring non-.lua path: {}", path);
                 return;
             }
@@ -69,6 +85,10 @@ name_(name), rule_engine_(), rules_dir_(rules_dir), rules_prefix_(rules_prefix),
         }
     );
     dir_watcher_.start();
+}
+
+std::size_t RulesManager::rule_count() const {
+    return rule_engine_.rule_count();
 }
 
 RulesManager::~RulesManager() {

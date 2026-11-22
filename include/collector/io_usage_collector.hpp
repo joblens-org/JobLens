@@ -15,14 +15,11 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "core/collector_type.h"
+#include "core/output_record.h"
 #include "icollector.h"
 #include <spdlog/spdlog.h>
 #include "common/ebpf_common.hpp"
-#include "common/spin_lock.hpp"
-// #include "ebpf/job_fd_basic.h"
 #include "ebpf/job_fd_rw_stat.h"
-#include <queue>
-#include <thread>
 
 struct FileIOInfo{
     std::string path;
@@ -88,12 +85,16 @@ namespace std {
     };
 }
 
-class IOUsageCollector : public ICollector{
+class IOUsageCollector : public IPeriodicJobCollector{
 public:
-    bool init(const nlohmann::json& cfg) override;
-    CollectResult collect(const Job& job) override;
+    bool init(const nlohmann::json& cfg, CollectorInitContext& context) override;
+    CollectOutcome collect(const Job& job, OutputContext& output) override;
     void deinit() noexcept override;
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type);
+    std::vector<OutputChannel> output_channels() const override;
+    std::vector<IOUsageInfo> sample_job(const Job& job);
+    nlohmann::json to_document(const std::vector<IOUsageInfo>& infos) const;
+    std::string to_text(const std::vector<IOUsageInfo>& infos) const;
+    MetricBatch to_metrics(const std::vector<IOUsageInfo>& infos) const;
 private:
     double collect_period;
     struct pid_state{
@@ -134,12 +135,7 @@ private:
     bool include_file_paths{false};
     bool init_ebpf();
     void deinit_ebpf();
-    bool polling_running;
-    std::unique_ptr<std::thread> poll_thread;
     std::optional<IOUsageCollector::user_rw_stat> get_fd_stat(pid_t pid, uint32_t fd);
-    SpinLock event_swap_mtx_;
-    std::unique_ptr<std::queue<event>> event_front_;
-    std::unique_ptr<std::queue<event>> event_back_;
     std::string rb_name = "event_rb";
     std::string pid2fdstat_map_name = "job_fd_stat";
     std::vector<bpf_link*> bpf_links_;

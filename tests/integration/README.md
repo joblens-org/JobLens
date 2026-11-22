@@ -57,6 +57,80 @@ process-sum summary semantics are retained, including shared-socket totals.
 Run same-load measurements on a deployment node to assess end-to-end gains;
 the syscall regression is not a timing benchmark.
 
+### 作业清单 / 采集解耦回归
+
+在已配置 Ninja 构建目录、具备项目 C++ 编译依赖的本机运行（无需特权、无需 eBPF）：
+
+```bash
+bash tests/integration/run_registry_tests.sh build            # 可加 --suite identity|store|intent|maintenance
+bash tests/integration/run_collection_rpc_test.sh build
+bash tests/integration/run_watcher_scan_test.sh build
+```
+
+- `job_identity_test.cpp`：Condor/Slurm 规范身份、uint64 内部 ID、Slurm step 归一化
+  （`batch` = `SLURM_BATCH_SCRIPT` 0xfffffffe、`extern` = `SLURM_EXTERN_CONT` 0xfffffffd）、
+  PID 复用、实例句柄与序列化。
+- `job_store_test.cpp`：零绑定 upsert 幂等、旧 schema 迁移与恢复、冲突隔离、
+  持久写失败与 ID 不复用。
+- `job_collection_intent_test.cpp`：手工选择优先级、持久停止与 `reset_auto`、重复/过期修订、
+  重启后的意图恢复；自动策略在手工覆盖下不推进客户端可见修订。
+- `job_maintenance_test.cpp`：启动竞争、事件回放、两次完整缺席才移除、EPERM 不算死亡、
+  队列溢出与重扫、tracker 不可用、旧代际迟到清理；另含**无发现源时手工登记记录的刷新与移除**
+  以及**事件触发/按需（`ensure_registered`）的全量对账**。
+- `collection_rpc_test.cpp`：全部清单/采集 RPC 方法通过真实 AF_UNIX RPC 驱动，覆盖选择器形式、
+  分页游标失效、409/503/404 分类、`ensure_registered` 实际触发一次权威发现、
+  以及“无采集运行时不虚报 applied_collectors”的契约。
+- `job_watcher_scan_test.cpp`：fixture procfs/cgroup/job-ad 下的扫描、健康状态与
+  start/stop 幂等；exec 事件在 poll 线程同步登记，未就绪或执行证据不完整时
+  请求一次合并 rescan，由下一轮权威扫描收敛（无登记批次队列）。
+  `run_watcher_scan_test.sh` 默认优先使用 `build-watcher/`（若存在），
+  因此改动头文件后请勿设置 `SKIP_BUILD=1` 复用过期的私有构建目录。
+
+采集意图真正落到采集器的端到端验证在
+`run_execution_tests.sh --suite lifecycle`（`collector_execution_lifecycle_test.cpp`）：
+无绑定的清单实例不产生采集、提交绑定时挂载 lane 并报告 applied、持久停止后摘除且保留清单、
+无论停止后移除还是绑定中自然结束都能被确认且不残留 lane。
+
+`run_registry_tests.sh --suite lifecycle`（`job_registry_lifecycle_test.cpp`）验证
+JobRegistry 自己的生命周期与自动选择：构造即启动清单栈（providers 发布）、
+`stopDiscovery` 幂等且排空期间状态可见、`deinit` 归档并关库且幂等；
+`auto_add` 折算后新实例自动获得配置的采集器、手工覆盖不被覆盖、
+defaults/rules/reject 三种选择语义直接断言。exec hint 的定向观察（不触发全量扫描）
+在 maintenance 套件的 `EXEC` 用例中验证；`EXEC2` 的契约是"一次 hint 一次同步
+尝试，由发现源自己的 poll 循环重读收敛"，注册表不持有 exec ingest 线程。
+
+### 统一采集执行套件 / Unified collector execution suites
+
+```bash
+bash tests/integration/run_execution_tests.sh build --suite all
+# 单套件: --suite executor|matrix|poller|lifecycle|sources
+```
+
+无需特权。覆盖共享执行器(worker 上限/串行 lane/合并/续跑/异常恢复)、四契约矩阵、共享就绪轮询器(staged 注册、one-shot rearm、挂起、失败隔离、线程归属)、生命周期分发(事件分发、System 信封、closing 确认),以及采集器自持真实源:
+
+- `collector_event_source_test.cpp`:`collector_event_fixture.h` 协议下的 AF_UNIX 数据报(Job/System 两作用域、有界续跑、超限/畸形/结束标记拒绝、路径所有权)与流式连接夹具(非阻塞 accept、动态客户端注册、半帧缓冲、断连尾数据、连接上限、慢客户端隔离)。
+- `collector_event_bpf_test.cpp` + `run_event_bpf_test.sh`:私有 eBPF 探针(ring + 精确丢失统计),consume_n 与旧版回调预算两条有界消费路径、两种作用域信封、同 lane 混合 ring+socket 就绪。**需要 root/BPF 特权,无特权时显式跳过(exit 77)**:
+
+```bash
+sudo bash tests/integration/run_event_bpf_test.sh build
+```
+
+### 原生输出契约 / 路由 / 调度集成回归
+
+在已配置 Ninja 构建目录、具备项目 C++ 编译依赖的本机运行：
+
+```bash
+bash tests/integration/run_output_tests.sh
+```
+
+可传入构建目录作为第一个参数，`SKIP_BUILD=1` 可跳过重新构建。三个测试分别覆盖：
+
+- `output_contract_test.cpp`：有界准入（`QueueFull`/`TooLarge`/`Closed`/`Unsupported`）、不可变记录扇出、并发投递、记账不变量与未知通道行为。
+- `output_routing_test.cpp`：`outputs` 显式路由、旧版 `use_writers` 回退、显式禁用、无效绑定诊断、重复目标去重、`emit_to` 限制、记录标识。
+- `collector_output_test.cpp`：真实调度器 + Unix socket RPC + 测试 writer；覆盖 System/Job 作用域分发、零输出、Skipped、Failed、异常、emit 后返回 Skipped 的契约错误、部分样本保留、`operation_semantics_version: 2` 与嵌套 write 计数。
+
+测试只使用本地临时 socket、配置与 LevelDB 目录，不连接生产后端，也不修改内核 map。
+
 ### ESWriter 退避重试与性能计数回归
 
 在已配置 Ninja 构建目录、具备项目 C++ 编译依赖的本机运行：

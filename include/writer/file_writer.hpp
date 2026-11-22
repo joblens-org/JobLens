@@ -15,6 +15,7 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include <fstream>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -42,8 +43,10 @@ public:
     explicit FileWriter(std::string name, std::string type, std::string config_name);
     ~FileWriter() override;
 
+    bool accepts(OutputKind kind) const override { return kind == OutputKind::Text; }
+
 protected:
-    bool flush_impl(const std::vector<write_data>& batch) override;
+    bool flush_impl(const std::vector<OutputRecordPtr>& batch) override;
     void do_shutdown() override;
 
 private:
@@ -56,6 +59,10 @@ private:
     // 对指定路径执行文件旋转级联（path.max_files 删除，path.(N-1)→path.N 降序，path→path.1）
     // 返回 true 表示旋转成功，false 表示部分或全部步骤失败（已记录错误日志）
     bool performRotation(const std::string& path);
+
+    // 按目标路径写出一批已渲染文本（append/overwrite、旋转、流管理）
+    bool write_payloads(const std::map<std::string, std::vector<std::string>>& path_to_payloads,
+                        size_t record_count);
 
     FileWriterOptions options_;
     std::ofstream ofs_;

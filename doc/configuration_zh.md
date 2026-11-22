@@ -67,19 +67,135 @@ lens_config:
 ```yaml
 job_registry_config:
   job_db_path: /var/JobLens/job.db      # 持久化作业状态的 LevelDB 数据库目录路径
-  auto_add_condorjob: true               # 是否自动监控 Condor 作业
-  auto_add_slurmjob: true                # 是否自动监控 Slurm 作业
+  auto_add_condorjob: true               # 已弃用：Condor 自动监控（改用 maintenance）
+  auto_add_slurmjob: true                # 已弃用：Slurm 自动监控（改用 maintenance）
+  maintenance:
+    types: [condor, slurm]               # 需要完整本地作业记录的调度器类型（opt-in，缺省为 []）
+    capture_all: true                    # 无条件登记每个捕获的作业（默认）；false = 登记与否交给 auto_add
+    reconcile_interval_sec: 30           # 对账周期，最小 1 秒
 ```
 
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
-| `job_db_path` | string | 无 | LevelDB 数据库目录路径。无法打开数据库时仅降级运行，不抛异常 |
-| `auto_add_condorjob` | bool | false | 自动启动 CondorJobWatcher，通过 eBPF 追踪 `condor_starter` 进程并自动添加 Condor 作业 |
-| `auto_add_slurmjob` | bool | false | 自动启动 SlurmJobWatcher，通过 eBPF 追踪 `slurm_stepd` 进程并自动添加 Slurm 作业 |
-| `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs`（Condor）或 `{JobLensRootDir}/../config/rules/slurm_jobs`（Slurm） | Lua 规则文件目录，CondorJobWatcher 和 SlurmJobWatcher 在 `use_rules` 启用时使用。注意：默认值因 watcher 而异。 |
+| `job_db_path` | string | 无 | LevelDB 数据库目录路径。无法打开数据库时仅降级运行，不抛异常。升级时此路径上的旧格式库会被隔离改名为 `<路径>.legacy`，只导入分配水位线（见 doc/jobstore_persistence_service.md 第 7 节） |
+| `auto_add_condorjob` | bool | false | **已弃用**。启动旧版 CondorJobWatcher 并自动登记作业。该类型出现在 `maintenance.types` 时忽略（由发现源负责） |
+| `auto_add_slurmjob` | bool | false | **已弃用**。同上，作用于 Slurm |
+| `maintenance.types` | list | `[]` | 需要完整本地作业记录的调度器类型（包含未被采集的作业）。取值 `condor` / `slurm`，未知值启动即拒绝 |
+| `maintenance.capture_all` | bool | `true` | 准入门开关。`true`：捕获的作业无条件准入；`false`：观测是否准入由该类型的 `<type>_job_watcher.auto_add` 判定 |
+| `maintenance.reconcile_interval_sec` | int | 30 | 周期性全量对账间隔，单位秒，最小 1 |
+| `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs`（Condor）或 `{JobLensRootDir}/../config/rules/slurm_jobs`（Slurm） | Lua 规则文件目录，在该类型的 `<type>_job_watcher.auto_add` 为 `rule` 时使用。注意：默认值因 watcher 而异。 |
+
+### 三开关模型
+
+自动登记与自动采集由且仅由三个开关决定，各自回答不同的问题，互不越权：
+
+| 开关 | 键 | 回答的问题 | 默认值 |
+|---|---|---|---|
+| 准入门（`capture_all`） | `job_registry_config.maintenance.capture_all` | 捕获的作业是否可以无条件进入作业注册表？ | `true` |
+| 按类型启停 Watcher | `job_registry_config.maintenance.types` | 该调度器类型是否启动发现 Watcher？ | `[]`（关） |
+| 自动路径动作 | `<type>_job_watcher.auto_add`（`off` / `default` / `rule`） | 自动路径对该类型的观测做什么？ | `off` |
+
+`auto_add` 的三态：
+
+| `auto_add` | 含义 |
+|---|---|
+| `off` | 自动路径对该类型零动作 |
+| `default` | 登记作业，并把 `<type>_job_watcher.auto_add_collectors` 逐字武装上去 |
+| `rule` | 是否登记由 Lua 规则引擎逐作业判定：accept = 登记并加规则的采集器列表（规则未指定时回退 `auto_add_collectors`）；reject = 不登记（`capture_all` 开启时：登记空选择留在库中） |
+
+`auto_add` 的非法取值（非 `off`/`default`/`rule`）启动即拒绝。
+
+#### Lua 规则契约
+
+规则文件返回一个带 `condition(job)` 函数的表。condition 必须返回
+`(bool[, string])`：
+
+- **bool** 是该规则自己的判定——`true` 接受，`false` 不接受；
+- 可选的 **string** 是逗号分隔的采集器列表（如
+  `"cpumem_collector, net_collector"`）；空串或缺省即"接受但未指定列表"。
+
+旧的 `{passed = ..., collectors = {...}}` 表返回不属于契约：返回表、缺首个
+返回值或第二个返回值非字符串都按评估错误处理——该观测不登记（也不计
+入 reject），下一条观测重新评估。
+
+规则按优先级降序行走，**首个接受者胜出**：它的列表即选择，后续规则
+不再评估；返回 `false` 的规则只是不接受，不否决后面的接受。所有规则
+都不接受时该作业被拒绝。
+
+接受了但未指定采集器的规则打 info 日志并回退到
+`<type>_job_watcher.auto_add_collectors`；未配置缺省列表时该判定被拒
+绝：打 error 日志、不登记该观测，计入 `admission_errors`（而非
+reject）。
+
+### 八状态组合矩阵
+
+Watcher 关闭时 `auto_add` 失去意义，只有 `capture_all` 区分两行；Watcher 开启时
+`capture_all` × `auto_add` 共六种组合：
+
+| # | Watcher | `capture_all` | `auto_add` | 该类型观测的行为 |
+|---|---|---|---|---|
+| 1 | 关 | ——（开） | —— | 该类型无发现；手工 CRUD 仍可用 |
+| 2 | 关 | ——（关） | —— | 同上：无发现，自然无准入 |
+| 3 | 开 | 开 | off | 无条件准入；无自动采集器（仅显式请求） |
+| 4 | 开 | 开 | default | 无条件准入 + 默认采集器列表自动武装 |
+| 5 | 开 | 开 | rule | 无条件准入；规则引擎选采集器（reject 或无缺省的裸接受 = 登记空选择） |
+| 6 | 开 | 关 | off | Watcher 照常扫描，但不准入任何作业（计入 `not_admitted_capture_all_off`） |
+| 7 | 开 | 关 | default | 登记并把默认采集器列表作为初始选择 |
+| 8 | 开 | 关 | rule | accept = 登记并加规则列表（裸接受回退 `auto_add_collectors`）；reject = 不准入（计入 `not_admitted_by_rule`）；引擎错误或无缺省的裸接受 = 本次不登记（计入 `admission_errors`），下一条观测重试 |
+
+`capture_all` 关闭时，准入计数在作业列表状态中可见：`capture_all`、
+`not_admitted_capture_all_off`、`not_admitted_by_rule`、`admission_errors`。
+事件路径返回类型化的 `not_admitted` 结果，且绝不会要求 watcher 重扫。
+
+### 旧键映射
+
+当 `auto_add` 缺省时，`auto_collect` / `use_rules` 组合与旧
+`auto_add_<type>job` 旗标仍作为映射来源被接受，解析结果永远落在三态上：
+
+| 旧配置 | 折算后的 `auto_add` |
+|---|---|
+| `auto_collect: false`（或缺省） | `off` |
+| `auto_collect: true` + `use_rules: false` | `default` |
+| `auto_collect: true` + `use_rules: true` | `rule` |
+| `auto_add_<type>job: true`（旧旗标） | 先折算为 `auto_collect: true`，再按上表映射 |
+
+显式给出的 `<type>_job_watcher.auto_add` 永远优先于旧键组合。
+
+`<type>_job_watcher.cluster_name`（可选）在环境变量
+（`COLLECTOR_HOST` / `SLURM_CLUSTER_NAME`）无法推导命名空间时显式指定；
+完全没有来源时观测保持 incomplete，并在作业列表状态中可见。
+
+发现集中在 `JobRegistry`：构造函数为每个已配置类型建一个 watcher 并启动
+维护控制器（含首次全量扫描），整个栈通过 `stopDiscovery()` 与
+`deinit()` 关闭。每个调度器类型只有一个 eBPF 源。
+
+采集意图（期望选择）持久化在 LevelDB 中，由运行中的调度器应用到采集通道。
+`jobs/collection/get` 区分 `desired_collectors` 与 `applied_collectors`：请求可以被
+受理而运行时应用失败（见 `errors`），接口绝不会把未生效的绑报成"正在采集"。
+
+### 手工 CRUD 面
+
+手工路径与三开关正交——它不经由准入门，自动策略也永远不覆盖手工选择
+（显式空的手工选择即 stop，会恒压自动策略）。
+
+| 操作 | 入口 | 语义 |
+|---|---|---|
+| 增 / 改 | `jobs/upsert`（单次 upsert） | 身份命中活跃实例（类型化 `sub_attr` + 调度器命名空间）路由到 UPDATE：请求采集器**并入**现有手工选择（union 去重，绝不整替），事实只补空合并。类型化 sub_attr 命中的行，只有在其身份未解析、或 subtype 携带的 scheduler（schedd）归属与请求一致时，才按 `JobID` 路由 UPDATE：同一 `JobNativeID` 在另一个 schedd 下属于不同作业（各自 CREATE），归属未知的旧记录保持 legacy 容忍，多条命中报 `ambiguous_selector`，绝不猜测。其余走 CREATE：旧版手工登记语义，其查重按同样的 scheduler（schedd）归属判别，空采集器列表仍被拒绝（UPDATE 允许空列表 = 纯事实补录） |
+| 查 / 改选择 | `jobs/collection/get`、`jobs/collection/set`、`jobs/collection/set (reset_auto)` | 不变；手工选择（含空 stop）永远压过自动选择 |
+| 删 —— stop 档（默认） | `jobs/stop` | 停止采集（持久化空的手工选择）；作业记录保留 |
+| 删 —— erase 档 | `jobs/erase` | 真删：先持久化 closing，采集过的实例归档为 `h:` 历史行，从未采集过的直接持久化删除。响应以 `mode: stop\|erase` 区分两档 |
+
+归档还是删除由采集**事实**决定——移除被接受时捕获的运行时实际挂载快照。
+一个已文档化的例外：进程在 closing 持久化与最终归档之间重启（内存快照随
+进程消失）时，恢复的 closing 行回退使用其持久化的生效选择。因此「被选中
+但从未成功挂载」的实例在这种重启后可能留下历史行。失败方向是宁可多留一
+行也不静默丢弃；不经重启完成移除的实例始终按严格事实分类。
+
+两档删除都支持按 `JobID` 或 `matcher` 寻址（与 stop 档一直使用的目标解析
+一致）。trigger 的 `/joblens/job` 端点原样透传 `erase` 字段；缺省即 stop 档。
 
 **作业数据存储**（LevelDB 键值存储）：
-- 键使用前缀 `job_`、`job_history_`、`counter_`，值以 JSON 序列化
+- 键使用前缀 `j:`（活跃作业）、`h:`（历史）、`c:`（ID 分配器）、`m:`（schema/DB UUID/迁移）、`i:`（规范身份索引）、`b:`（采集意图），值以 JSON 序列化
 - 由 `JobRegistry` 内部管理；基于 LevelDB 持久化
 
 ---
@@ -173,7 +289,7 @@ net_sys_collector_config:
 | **BasicInfoCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的 taskstats 数据（TGID 级摘要） |
 | **GPUUsageCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的 GPU 使用数据 |
 | | `freq` | double | 在 `init()` 中额外读取：用于计算 GPU 缓存刷新间隔（`1.0 / (freq * 1.5)`）。这是调度器层 `freq` 之外的额外使用。 |
-| **TaskstatsCollector** | *(无)* | — | 无 init 配置参数。使用 Linux taskstats netlink 接口。**注意**：部分实现——`collect()` 方法仅记录 PID，不产生数据输出；`get_writer_parser()` 返回 `nullptr`。 |
+| **TaskstatsCollector** | *(无)* | — | 无 init 配置参数。使用 Linux taskstats netlink 接口。**注意**：部分实现——在 taskstats 采样实现前，该采集器返回 `Skipped` 且不产生输出。 |
 | **FSMetadataCollector** | `include_process_details` | string | 为 `"true"`（默认）时，输出 Job 聚合数据和按进程明细；为 `"false"` 时，只输出 Job 聚合数据 |
 | | `freq` | double | 调度器层采样频率（Hz），由 `CollectorScheduler` 解析，不在 FSMetadataCollector 的 `init()` 中解析。建议元数据负载场景使用 1 Hz |
 | **NewIOUsageCollector** | `include_process_details` | string | 为 `"true"`（默认）时，输出 Job 聚合数据和进程级/文件级明细；为 `"false"` 时，只输出 Job 聚合数据（`processes`/`files` 为空），可显著降低高文件句柄作业的输出量 |
@@ -214,7 +330,10 @@ net_sys_collector_config:
 writers_config:
   enable_writer_perf: true       # 是否启用写入器性能计数器
   perf_window_size: 1000         # 性能计数器滑动窗口大小
-  buffer_capacity: 4096          # BaseWriter 内部缓冲区容量（记录数）
+  buffer_capacity: 1024          # 每个刷新缓冲区的预留容量（不是硬限制）
+  max_pending_records: 4096      # 前后缓冲区中待处理记录的硬上限
+  max_pending_bytes: 67108864    # 已计入字节的硬上限（64 MiB）
+  max_record_bytes: 8388608      # 单条记录上限，超过即拒绝（8 MiB）
   writers:                       # 写入器实例列表
     - name: es_writer
       type: ESWriter
@@ -226,7 +345,12 @@ writers_config:
 |----|------|--------|------|
 | `enable_writer_perf` | bool | 无 | 启用后记录每次 `flush` 耗时，支持 RPC 查询 |
 | `perf_window_size` | int | 无 | 性能窗口大小 |
-| `buffer_capacity` | int | 无 | BaseWriter 内部环形缓冲区最大消息数 |
+| `buffer_capacity` | int | `1024` | 每个刷新缓冲区的预留容量，**不是**队列上限 |
+| `max_pending_records` | int | `4096` | writer 仍持有的已接受记录硬上限（前缓冲、活动缓冲与保留的重试） |
+| `max_pending_bytes` | int | `67108864` | 已计入的 payload/元数据字节硬上限；准入不等待、不淘汰已接受记录 |
+| `max_record_bytes` | int | `8388608` | 单条记录超过该值时返回 `TooLarge`；不得超过 `max_pending_bytes` |
+
+所有队列限制都可以在各 writer 自己的配置节中用同名键覆盖。零或负值是配置错误，不是"无限制"模式。准入是异步的：`Accepted` 只表示 writer 取得了记录所有权，不代表已到达后端。
 
 ### `writers` 数组元素
 
@@ -461,14 +585,15 @@ file_writer_config:
 
 代码位置：`src/writer/prometheus_exporter_writer.cpp`
 
-通过 RPC 端点暴露采集的指标数据供 Prometheus 抓取。此写入器维护一个按 JobID → PID 组织的内存指标表，涵盖 CPU、内存、I/O 和网络指标。
+通过 RPC 端点暴露采集的指标数据供 Prometheus 抓取。此写入器维护一个以“指标名 + 标签”为键的通用 metric series 表；指标名、类型、标签和值由采集器决定。采集器未提供 `jobid` 时由写入器注入，写入器不再包含按采集器类型分支的 switch，也不再依赖中央指标结构体。
 
 **RPC 端点**（自动注册）：
 
 | 端点 | 描述 |
 |------|------|
-| `/<writer_name>/metrics` | 以 JSON 返回所有作业指标 |
-| `/<writer_name>/info` | 返回写入器元数据 |
+| `/<writer_name>/metrics` | 以通用 JSON 返回指标样本 |
+| `/<writer_name>/metrics_text` | 返回已格式化的 Prometheus exposition 文本 |
+| `/<writer_name>/info` | 返回写入器元数据及 series/job 计数 |
 
 ```yaml
 prmxs_writer_config: {}    # 当前无配置参数；此节必须存在以供 `config` 字段引用
@@ -486,21 +611,23 @@ prmxs_writer_config: {}    # 当前无配置参数；此节必须存在以供 `c
 
 ```yaml
 condor_job_watcher:
-  auto_add_collectors:          # 当 use_rules 为 false 时，发现新 Condor 作业后自动追加的默认收集器列表
+  auto_add: rule                # off | default | rule
+  auto_add_collectors:          # auto_add: default 时逐字武装；rule 裸接受时作为回退
     - cpumem_collector
     - net_collector
     - io_collector
-  use_rules: false              # 是否启用规则引擎过滤作业
-  rules_prefix: condor_job_     # Lua 规则文件前缀（默认：condor_job_）
 ```
 
-> **说明**：Lua 规则的 `rules_dir` 从 `job_registry_config.rules_dir` 读取，不在此节中。当 Condor 启用 `use_rules` 时，默认值为 `{JobLensRootDir}/../config/rules/condor_jobs`。
+> **说明**：规则文件的匹配前缀就是 adapter 名（Condor 为 `condor`），只有文件名以它开头的 `.lua` 才会被该类型加载；`rules_prefix` 键已废弃并被忽略。规则在**启动时**加载（`auto_add: rule` 才会武装规则引擎）。`rules_dir` 优先读本节，缺省时回退到已废弃的 `job_registry_config.rules_dir`，再缺省为 `{JobLensRootDir}/../config/rules/condor_jobs`。目录为空或没有匹配前缀的文件时，启动日志会给出 warning，该类型不会选任何采集器。
 
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
-| `auto_add_collectors` | string[] | 无 | 自动添加到 Condor 作业的收集器名称列表 |
-| `use_rules` | bool | `false` | 是否使用规则引擎过滤作业（不匹配规则的作业不添加） |
-| `rules_prefix` | string | `"condor_job_"` | 规则引擎加载的规则文件前缀 |
+| `auto_add` | string（`off`/`default`/`rule`） | `off` | 自动路径动作三态；显式给出时优先于已弃用的 `auto_collect`/`use_rules` 组合 |
+| `auto_add_collectors` | string[] | 无 | 默认收集器列表：`auto_add: default` 时逐字武装；`auto_add: rule` 的裸接受以它回退 |
+| `auto_collect` | bool | `false` | 旧键映射来源：`auto_add` 缺省时折算入 `auto_add` |
+| `use_rules` | bool | `false` | 旧键映射来源：`auto_collect: true` + `use_rules: true` 折算为 `auto_add: rule` |
+| `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` | 规则目录；支持多个类型共享，前缀保证互不串味 |
+| `rules_prefix` | — | 已废弃 | 匹配前缀固定为 adapter 名，配置值被忽略并告警 |
 
 ### `slurm_job_watcher`
 
@@ -508,103 +635,87 @@ condor_job_watcher:
 
 ```yaml
 slurm_job_watcher:
+  auto_add: off                 # off | default | rule
   auto_add_collectors:
     - cpumem_collector
     - net_collector
     - io_collector
-  use_rules: false
-  rules_prefix: slurm_job_
 ```
 
-> **说明**：Lua 规则的 `rules_dir` 从 `job_registry_config.rules_dir` 读取，不在此节中。当 Slurm 启用 `use_rules` 时，默认值为 `{JobLensRootDir}/../config/rules/slurm_jobs`。
+> **说明**：规则文件的匹配前缀就是 adapter 名（Slurm 为 `slurm`），`rules_prefix` 键已废弃并被忽略；规则在启动时随 `auto_add: rule` 一起加载。`rules_dir` 优先读本节，缺省时回退到已废弃的 `job_registry_config.rules_dir`，再缺省为 `{JobLensRootDir}/../config/rules/slurm_jobs`。
 
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
-| `auto_add_collectors` | string[] | 无 | 自动添加到 Slurm 作业的收集器名称列表 |
-| `use_rules` | bool | `false` | 是否使用规则引擎过滤作业 |
-| `rules_prefix` | string | `"slurm_job_"` | 规则引擎加载的规则文件前缀 |
+| `auto_add` | string（`off`/`default`/`rule`） | `off` | 自动路径动作三态；显式给出时优先于已弃用的 `auto_collect`/`use_rules` 组合 |
+| `auto_add_collectors` | string[] | 无 | 默认收集器列表：`auto_add: default` 时逐字武装；`auto_add: rule` 的裸接受以它回退 |
+| `auto_collect` | bool | `false` | 旧键映射来源：`auto_add` 缺省时折算入 `auto_add` |
+| `use_rules` | bool | `false` | 旧键映射来源：`auto_collect: true` + `use_rules: true` 折算为 `auto_add: rule` |
+| `rules_dir` | string | `{JobLensRootDir}/../config/rules/slurm_jobs` | 规则目录 |
+| `rules_prefix` | — | 已废弃 | 匹配前缀固定为 adapter 名，配置值被忽略并告警 |
 
 ---
 
-## 10. Writer Parser V2 Context API
+## 10. 采集器输出通道
 
-每个收集器为每种写入器类型提供 parser 函数，将原始采集数据转换为写入器特定格式。V2 parser API 在原有 V1 `std::any(std::any)` 签名基础上增加了只读的 `WriterParseContext` 参数，使 parser 可以访问运行时元数据，无需修改现有代码。
+采集器在 `collect()` 内产出带类型的输出记录，通过 `OutputContext` 提交；writer 在 flush 时不再反查采集器实例或 parser。
 
-### V1 兼容性
+### 声明通道
 
-旧版 `get_writer_parser()` 接口（V1）**仍然完全支持**。现有收集器和写入器无需任何修改。V1 parser 由 `ICollector::get_writer_parser_v2()` 中的默认适配器自动包装。
-
-### V2 是 Opt-in 的
-
-收集器通过覆写虚方法选择加入 V2：
+采集器声明自己能产出的通道（`document`、`text`、`metrics` 或额外名称），并实现：
 
 ```cpp
-// include/collector/icollector.h
-virtual CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type);
+CollectOutcome collect(const Job& job, OutputContext& output) override;
+std::vector<OutputChannel> output_channels() const override;
 ```
 
-默认实现透明地包装 V1 parser，丢弃 `WriterParseContext` 并委托给旧签名。未覆写此方法的收集器将按原有方式继续工作。
+`CollectOutcome` 区分三种状态：
 
-### WriterParseContext
+| 状态 | 含义 |
+|------|------|
+| `Success` | 采样成功；允许零输出（例如数值未变化） |
+| `Skipped` | 没有可用样本；不得输出任何记录 |
+| `Failed` | 采样失败；`error` 携带诊断。抛异常同样视为采集失败 |
 
-上下文结构体是**只读**的，在每次调用时按调用点构造。包含以下字段：
+输出后再返回 `Skipped` 属于契约错误，会出现在调度器状态中。输出被拒绝不会把一次成功的传感器读取变成失败的读取，但调度器会把该次回调标记为失败。
 
-| 字段 | 类型 | 描述 |
-|------|------|------|
-| `writer_name` | `std::string` | 写入器实例名称（如 `"file_writer"`） |
-| `writer_type` | `std::string` | 写入器类型标识（如 `"FileWriter"`） |
-| `writer_config_name` | `std::string` | 写入器配置节名称（如 `"file_writer_config"`） |
-| `collector_name` | `std::string` | 触发此写入的收集器实例名称 |
-| `job` | `Job` | 正在采集的 `Job` 对象（包含 JobID、PIDs、sub_attr 等） |
-| `timestamp` | `std::chrono::system_clock::time_point` | parser 被调用的时间戳 |
+### 路由配置
 
-写入器在调用 parser 之前，从自身元数据和批次记录构造上下文：
-
-```cpp
-// src/writer/file_writer.cpp（简化）
-WriterParseContext ctx{name_, type_, config_name_, collect_name, job, timestamp};
-auto parser = CollectorRegistry::instance().resolveBestParserV2(collect_name, type_);
+```yaml
+cpumem_collector_config:
+  freq: 1
+  summary: false
+  outputs:
+    document: [es_writer, kafka_writer]
+    text: [file_writer]
+    metrics: [prometheus_writer]
 ```
 
-### Parser 解析顺序（回退链）
+规则：
 
-写入器推荐使用 `CollectorRegistry::resolveBestParserV2()` 入口，按以下顺序解析最佳 parser：
+1. `outputs` 是显式配置：未列出的已声明通道被禁用；`outputs: {}` 禁用全部输出。
+2. `outputs` 与旧版 `use_writers` 互斥，同时出现是配置错误。
+3. 没有 `outputs` 时回退到采集器级 `use_writers`，再回退到 `collectors_config.default_use_writers`。显式空列表禁用输出，不回退默认值。
+4. 旧版 writer 条目映射到该采集器唯一接受其 payload 类型的通道。无匹配或多匹配都是绑定错误，需要显式配置 `outputs`。
+5. 同一通道内重复的目标会去重；同一 writer 被两个通道引用时会产生两条记录（有意为之）。
+6. 未知 writer/通道、重复 writer 实例名、错误的值类型、不兼容的 payload 类型会让该采集器路由无效：该采集器不启动，其它采集器继续运行，错误出现在调度器状态中。
 
-1. **V2 parser** — `get_writer_parser_v2()` 返回原生 V2 parser（收集器已覆写此方法）
-2. **V1 适配器** — 默认的 `ICollector::get_writer_parser_v2()` 将 V1 parser 包装为丢弃 `WriterParseContext` 的 lambda
-3. **V1 回退** — 显式调用 `get_writer_parser()` 作为防御性回退
-4. **写入器特定回退** — 返回 `nullptr`；写入器自行处理原始数据（如 FileWriter 接受纯 `std::string`）
+payload 契约：`FileWriter` 接受 `Text`；`ESWriter`/`KafkaWriter` 接受 `Document`（JSON 对象）；`PrometheusExporterWriter` 接受 `Metrics`（`MetricBatch`）。
 
-### 首个 PoC 示例：CPUMemCollector → FileWriter
+### 标识与时间戳
 
-`CPUMemCollector` 是首个提供原生 V2 parser 的收集器，专门针对 `FileWriter`。当 `writer_type == "FileWriter"` 时，V2 parser：
+WriterManager 在初始化时生成 128 位进程运行标识，并维护单调递增的采样计数器。`sample_id` 由两者组成；每次 emit 消耗一个上下文内序号，`record_id = sample_id + ":" + sequence`。ES 使用 `record_id` 作为 `_id`，相同时间戳的多条记录不再互相覆盖。`sampled_at` 在采集入口捕获一次，由该次采样的所有记录共享。
 
-- 将 CPU/内存数据序列化为 JSON，包含每个进程的详细信息和可选的汇总数据
-- 在输出中注入上下文元数据（`_writer_name`、`_collector_name`、`_job_id`、`_timestamp`），便于追踪
+### 队列观测
 
-对于其他 writer 类型，`CPUMemCollector::get_writer_parser_v2()` 回退到默认的 V1 适配器。
+`WriterManager/output_status` 始终可用（不依赖性能计数器开关），按 writer 返回：`accepted`、`rejected_full`、`rejected_too_large`、`rejected_closed`、`rejected_invalid`、`rejected_failed`、`pending_records`、`pending_bytes`、高水位、`released_records`、`flush_errors`。一致快照下满足 `accepted = pending_records + released_records`。
 
-### 为新收集器添加 V2 支持
+### 调度器状态语义
 
-```cpp
-// 在收集器头文件中：
-CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type) override;
+`CollectorScheduler/status` 返回 `operation_semantics_version: 2`：
 
-// 在收集器实现中：
-CollectDataParseFuncV2 MyCollector::get_writer_parser_v2(const std::string& writer_type) {
-    if (writer_type == "FileWriter") {
-        return [this](const WriterParseContext& ctx, std::any data) -> std::any {
-            // 使用 ctx.writer_name、ctx.job.JobID、ctx.timestamp 等
-            // 返回写入器特定格式的输出
-            return formatted_output;
-        };
-    }
-    // 其他 writer 类型回退到 V1 适配器
-    return ICollector::get_writer_parser_v2(writer_type);
-}
-```
-
-> **注意**：目前仅有 `CPUMemCollector` 实现了原生 V2 parser。其他收集器继续使用 V1 parser 接口，由适配器自动转换。完整 API 定义见 `include/collector/icollector.h` 和 `include/core/collector_type.h`。
+- 一次 `emit()`/`emit_to()` 计为一次 `write` 操作（含扇出/准入）。零输出即零 write 操作；已声明但被禁用的通道是一次成功的空操作写入。
+- `collect` 包含 payload 构造与嵌套写入；`callback` 覆盖整个调用。两者时间重叠，不能相加。
+- 输出执行期间 `current_job.stage` 为 `write`；返回后恢复为 `collect`。
 
 ---
 
@@ -737,11 +848,11 @@ file_writer_config:
   #     file_path: /var/log/joblens/cpumem.log
 
 condor_job_watcher:
+  auto_add: off
   auto_add_collectors:
     - cpumem_collector
     - net_collector
     - io_collector
-  use_rules: false
 ```
 
 ---

@@ -50,14 +50,17 @@ struct BasicInfo {
 };
 
 
-class BasicInfoCollector : public ICollector {
+class BasicInfoCollector : public IPeriodicJobCollector {
 public:
-    bool init(const nlohmann::json& cfg) override;
-    CollectResult collect(const Job& job) override;
+    bool init(const nlohmann::json& cfg, CollectorInitContext& context) override;
+    CollectOutcome collect(const Job& job, OutputContext& output) override;
     void deinit() noexcept override;
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
+    std::vector<OutputChannel> output_channels() const override;
 
 private:
+    std::vector<BasicInfo> sample_job(const Job& job);
+    nlohmann::json to_document(const std::vector<BasicInfo>& infos) const;
+    std::string to_text(const std::vector<BasicInfo>& infos) const;
     // Netlink连接管理
     bool connect_to_taskstats();
     void disconnect_from_taskstats();

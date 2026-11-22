@@ -12,7 +12,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "writer/file_writer.hpp"
-#include "writer/batch_parser_cache.hpp"
 #include "core/writer_manager.hpp"
 #include <spdlog/spdlog.h>
 #include <map>
@@ -22,7 +21,6 @@
 #include <cstring>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "core/collector_registry.hpp"
 
 namespace {
 
@@ -357,60 +355,37 @@ bool FileWriter::performRotation(const std::string& path)
     return true;
 }
 
-bool FileWriter::flush_impl(const std::vector<write_data>& batch)
+bool FileWriter::flush_impl(const std::vector<OutputRecordPtr>& batch)
 {
-    if (batch.empty()) {
-        return true;
-    }
-
-    bool all_success = true;
-
-    // 第一遍：将每条记录解析为 FileWriter 纯文本块并按目标路径分组
-    // 使用有序 map 以保证确定性输出顺序（文件路径为 key）
     std::map<std::string, std::vector<std::string>> path_to_payloads;
-    BatchParserCache parsers(type_);
-
-    for (const auto& w : batch)
-    {
-        const auto& collect_name = std::get<0>(w);
-        const auto& any_data     = std::get<2>(w);
-
-        std::string payload;
-        const auto& parser_func = parsers.get(collect_name);
-        if (!parser_func) {
-            // 如果 collector 没有为当前 writer 注册 parser，仅支持原始 std::string 数据回退。
-            spdlog::debug("file_writer: no parser for collector '{}', using raw string fallback", collect_name);
-            try {
-                payload = std::any_cast<std::string>(any_data);
-            } catch (const std::bad_any_cast&) {
-                spdlog::error("file_writer: collector '{}' has no FileWriter parser and raw data is not std::string",
-                              collect_name);
-                all_success = false;
-                continue;
-            }
-        } else {
-            spdlog::trace("file_writer: using parser for collector '{}'", collect_name);
-            try {
-                WriterParseContext ctx{name_, type_, config_name_, collect_name, std::get<1>(w), std::get<3>(w)};
-                auto parsed = parser_func(ctx, any_data);
-                payload = std::any_cast<std::string>(std::move(parsed));
-            } catch (const std::exception& e) {
-                spdlog::error("file_writer: failed to parse data for collector '{}': {}", collect_name, e.what());
-                all_success = false;
-                continue;
-            }
+    bool all_success = true;
+    for (const auto& record : batch) {
+        if (!record) {
+            all_success = false;
+            continue;
         }
-
-        // 解析目标路径并分组
-        std::string dest_path = resolveDestinationPath(collect_name);
-        path_to_payloads[dest_path].push_back(std::move(payload));
+        const auto* text = std::get_if<Text>(&record->payload);
+        if (!text) {
+            spdlog::error("file_writer: unsupported native payload for writer '{}', channel='{}'",
+                          name_, record->channel);
+            all_success = false;
+            continue;
+        }
+        path_to_payloads[resolveDestinationPath(record->sample->collector_name)].push_back(text->value);
     }
+    return write_payloads(path_to_payloads, batch.size()) && all_success;
+}
+
+bool FileWriter::write_payloads(const std::map<std::string, std::vector<std::string>>& path_to_payloads,
+                                size_t record_count)
+{
+    bool all_success = true;
 
     // 覆写模式：使用同目录临时文件 + 原子 rename，每个目标路径独立处理
     if (options_.write_mode == "overwrite") {
         namespace fs = std::filesystem;
 
-        for (auto& [path, payloads] : path_to_payloads) {
+        for (const auto& [path, payloads] : path_to_payloads) {
             // 生成唯一临时文件名：target.tmp.<pid>.<timestamp>
             std::string tmp_path = path + ".tmp."
                 + std::to_string(getpid()) + "."
@@ -471,7 +446,7 @@ bool FileWriter::flush_impl(const std::vector<write_data>& batch)
         }
 
         spdlog::debug("file_writer: overwrote {} records to {} destination(s)",
-                      batch.size(), path_to_payloads.size());
+                      record_count, path_to_payloads.size());
         return all_success;
     }
 
@@ -479,7 +454,7 @@ bool FileWriter::flush_impl(const std::vector<write_data>& batch)
     {
         namespace fs = std::filesystem;
 
-        for (auto& [path, payloads] : path_to_payloads)
+        for (const auto& [path, payloads] : path_to_payloads)
         {
             // 计算该目标路径的批次字节数（用于旋转阈值判断）
             size_t batch_bytes = 0;
@@ -577,7 +552,7 @@ bool FileWriter::flush_impl(const std::vector<write_data>& batch)
                     all_success = false;
                 }
             } else {
-                // 非默认路径：使用持久化流（懒加载打开，完整关闭留给 Task 8）
+                // 非默认路径：使用持久化流（懒加载打开，完整关闭由 do_shutdown 负责）
                 auto& ofs = destination_streams_[path];
                 if (!ofs.is_open()) {
                     std::string why;
@@ -611,7 +586,7 @@ bool FileWriter::flush_impl(const std::vector<write_data>& batch)
         }
     }
 
-    spdlog::debug("file_writer: flushed {} records to {} destination(s)", batch.size(), path_to_payloads.size());
+    spdlog::debug("file_writer: flushed {} records to {} destination(s)", record_count, path_to_payloads.size());
     return all_success;
 }
 

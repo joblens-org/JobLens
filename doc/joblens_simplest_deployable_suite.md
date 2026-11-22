@@ -18,7 +18,7 @@
 |-----------|-------------|
 | **JobLens Agent** | The collection daemon running on compute nodes. |
 | **JobLens Trigger** | Local control interface for the Agent, responsible for lifecycle management, rule injection, and job metadata registration. *(Internal codename "Trigger" is retained for historical reasons.)* |
-| **JobLens Manager** *(not included in this kit)* | Centralized control plane for unified configuration, rule distribution, and operational monitoring. Planned for future release. |
+| **JobLens Manager** *(not included in this kit)* | Centralized control plane for unified configuration, rule distribution, and operational monitoring. Deployed separately. |
 | **JobLens TAP** (Trigger & Access Point) | Standalone visualization data hub and query gateway for Elasticsearch backend. Deployed independently. |
 
 ## 3. Architecture at a Glance
@@ -146,7 +146,7 @@ For pilot trials or small-scale validation on a single compute node.
 ### 6.2 Upstream Manager Integration (Reserved)
 The Trigger can be configured with an upstream **Manager** address for service registration, centralized rule distribution, and remote configuration management.
 
-> **Note**: This kit only reserves the interface. The Manager component will be provided in a future release.
+> **Note**: This kit only reserves the interface. Deploying the Manager is outside this kit.
 
 ### 6.3 Job Association Methods
 

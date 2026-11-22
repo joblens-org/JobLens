@@ -81,7 +81,7 @@ return {
   priority = 10,
   condition = function(job)
     return {
-      passed = job.NativeJobID ~= nil and job.NativeJobID ~= "",
+      passed = job.JobNativeID ~= nil and job.JobNativeID ~= "",
       collectors = {"cpumem_collector"}
     }
   end

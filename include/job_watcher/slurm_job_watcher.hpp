@@ -14,209 +14,866 @@
 #pragma once
 #include "common/slurm_job.hpp"
 #include <spdlog/spdlog.h>
-#include <fmt/ranges.h>
+#include <fmt/core.h>
 #include "common/ebpf_common.hpp"
+#include "common/procfs.hpp"
 #include "common/utils.hpp"
-#include "rule_engine/rules_manager.hpp"
-#include "common/config.hpp"
+#include "core/job_discovery.hpp"
+#include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
 #include "ebpf/trace_slurm_stepd.h"
 
-
-class SlurmJobWatcher{
+// Slurm discovery adapter. Same single construction path as CondorJobWatcher:
+// explicit DiscoveryOptions only (no Config, no eBPF, no thread in the
+// constructor), start(DiscoverySink) begins operation, enumerateManagers() is
+// the authoritative pass driven by the registry heartbeat, observe(manager) the
+// O(job) read for a manager that pass does not track yet, and observeForHint(pid)
+// the targeted pass for exec events.
+//
+// Discovery inputs are slurmstepd processes and their children in the process
+// table plus the optional slurmd spool, read through an injectable
+// DiscoveryEnvironment so an unprivileged host can present a fake tree.
+//
+// No cgroup-subtree starter enumeration here (`starter_cgroup_subtree` is
+// Condor-only): the Slurm cgroup layout nests job_X/step_Y directories under
+// the root, and the process table is the stable source for slurmstepd per
+// step across supported Slurm versions.
+class SlurmJobWatcher final : public IDiscoverySource{
 public:
-    SlurmJobWatcher(){
-        auto collectors = Config::instance().getArray<std::string>("slurm_job_watcher", "auto_add_collectors");
-        auto use_rules = Config::instance().getBool("slurm_job_watcher", "use_rules", false);
-        if(use_rules){
-            rules_manager_ = std::make_unique<RulesManager>(
-                "SlurmJobWatcherRules",
-                Config::instance().getString("job_registry_config", "rules_dir", Utils::JobLensRootDir() + "../config/rules/slurm_jobs"),
-                Config::instance().getString("slurm_job_watcher", "rules_prefix", "slurm_job_")
-            );
-            spdlog::info("SlurmJobWatcher: use rules engine to filter slurm jobs");
-        }
-        use_collectors = collectors;
-        if(!init_ebpf()){
-            spdlog::warn("SlurmJobWatcher: init ebpf error, deinit now");
-            deinit_ebpf();
-        }else{
-            spdlog::info("SlurmJobWatcher: inited auto add slurm job");
-        }
-    }
-    ~SlurmJobWatcher(){
-        polling_running = false;
-        if(poll_thread && poll_thread->joinable()){
-            poll_thread->join();
-        }
-        
-        deinit_ebpf();
-    }
+    // Options only: nothing is loaded and nothing polls until start().
+    explicit SlurmJobWatcher(DiscoveryOptions options);
 
-    void register_add_if(std::function<void(Job)> add_if){
-        add_if_ = add_if;
-    }
+    ~SlurmJobWatcher() override { stop(); }
 
-    size_t add_all_slurm_job(bool use_rules = true){
-        size_t added_count = 0;
-        auto slurm_pids = SlurmJob::get_all_slurm_job_pids();
-        for(auto pid: slurm_pids){
-            auto job_opt = buildSlurmJob(pid);
-            if(!job_opt) continue;
+    SlurmJobWatcher(const SlurmJobWatcher&) = delete;
+    SlurmJobWatcher& operator=(const SlurmJobWatcher&) = delete;
 
-            Job job = std::move(job_opt.value());
-            job.JobID = 0; // 设置为0，自动生成JobID
-            job.CollectorNames = use_collectors;
+    // ---- IDiscoverySource -------------------------------------------------
+    const std::string& name() const override { return name_; }
+    bool start(const DiscoverySink& sink) override;
+    void stop() override;
+    // Authoritative pass: the live slurmstepd processes of this pass only,
+    // without reading any step environment or member set. The pass also
+    // refreshes the children index observe() uses, so one pass serves every
+    // manager it reports. Owns the source health of the pass.
+    ManagerSet enumerateManagers() override;
+    // O(job): reads exactly this stepd's children and step cgroup. Members come
+    // from the index of the pass that reported the manager, or from a targeted
+    // /proc/<stepd>/task/*/children read — never a process-table pass.
+    std::optional<Job> observe(const ProcessIdentity& manager) override;
+    SourceHealth health() const override;
+    void requestRescan() override;
+    std::optional<Job> observeForHint(pid_t hint_pid, pid_t hint_ppid = 0) override;
+    std::optional<Job> observeForHint(pid_t hint_pid, pid_t hint_ppid, bool read_groups);
 
-            if(use_rules && !evaluate_rules(job)){
-                spdlog::info("SlurmJobWatcher: job ID {} did not pass rules, skip adding", job.JobID);
-                continue;
-            }
-            add_if_(job);
-            added_count++;
-        }
-        spdlog::info("SlurmJobWatcher: added {} slurm jobs", added_count);
-        return added_count;
-    }
+    // ---- Owner/test observability ------------------------------------------
+    bool polling() const;
+    bool thread_joinable() const;
+
+    // Legacy spelling kept for existing callers.
+    void request_rescan() { requestRescan(); }
+
+    // ---- Watcher-owned discovery semantics ---------------------------------
+    // Whether a Slurm discovery counts as ready, and which reasons to stamp
+    // on an incomplete one, are this adapter's own rules — deliberately NOT
+    // an IDiscoverySource virtual (it is not an external dependency). The
+    // registry keeps deciding whether a Job may be *registered* (identity
+    // resolvable + manager complete); the watcher decides when *its*
+    // discovery is finished. Each scheduler holds its own copy so the rules
+    // may diverge later.
+    static std::optional<Job> finalize_discovery(Job job,
+                                                 std::vector<std::string> source_reasons = {},
+                                                 std::vector<std::string>* notes = nullptr);
+
+    // Discovery inputs (paths, namespaces) may be re-resolved between passes.
+    void set_discovery_environment(const DiscoveryEnvironment& environment);
+    DiscoveryEnvironment discovery_environment() const;
 
 private:
-    std::optional<Job> buildSlurmJob(pid_t pid){
-        auto JobID = SlurmJob::getJobID(pid);
-        if(!JobID) return std::nullopt;
+    bool start_polling();
+    void poll_loop();
+    // Records one authoritative pass outcome on SourceHealth (state, success
+    // timestamp, failure count/error, joined notes). Called with pass_mutex_
+    // held; state_mutex_ guards the fields it writes.
+    void finish_pass(ManagerSet& set, const std::vector<std::string>& notes);
+    // Exec events only hand over the pid; building the discovered Job is the
+    // consumer's job (worker thread), never the polling thread's.
+    // Handled on the polling thread: resolve, offer to this turn's batch, and
+    // remember the pid when the scheduler metadata is not ready yet.
+    // `ppid` comes from the event itself; the observation skips the ppid
+    // read when it is positive.
+    void handle_exec_event(uint32_t pid, uint32_t ppid);
+    // One sample ended the turn: libbpf must stop consuming so the tail batch,
+    // the due re-reads and the stop check can run.
+    bool stop_requested();
+    // Samples handled in the current poll call; the turn ends at
+    // kSamplesPerTurn so the stop check always gets a chance.
+    static constexpr std::size_t kSamplesPerTurn = 32;
+    std::size_t samples_this_turn_ = 0;
+    std::atomic<bool> yield_requested_{false};
 
-        Job job;
-        job.JobID = JobID;
-        job.JobPIDs.push_back(pid);
-        job.jobtype = JobType::Job;
-        job.subtype = JobSubType::Slurm;
+    // Builds the discovered Job for one slurmstepd: manager identity from the
+    // stepd, job pids from its children and the step cgroup, logical
+    // identity from SLURM_* of the job processes.
+    std::optional<Job> observe_stepd(const DiscoveryEnvironment& env, const std::string& boot_id,
+                      pid_t stepd_pid,
+                      const std::map<pid_t, std::vector<pid_t>>& children,
+                      std::vector<std::string>* drop_notes = nullptr, bool read_groups = true);
 
-        job.sub_attr = SlurmJobAttr{
-            .auto_update_child = true,
-            .stepd_pid = SlurmJob::get_ppid_of(pid),
-            .job_id = JobID,
-            .step_id = SlurmJob::getStepID(pid),
-            .cluster_name = SlurmJob::get_cluster_name(pid),
-            .cgroup_path = SlurmJob::v2_cgroup_absolute_path(pid),
-            .user = SlurmJob::getUser(pid),
-            .job_name = SlurmJob::getJobName(pid),
-            .partition = SlurmJob::getPartition(pid)
-        };
-        auto& slurm_attr = std::get<SlurmJobAttr>(job.sub_attr);
-        job.cluster_name = SlurmJob::get_cluster_name(pid);
-        job.clusterTag = SlurmJob::get_cluster_name(pid);
-        job.NativeJobID = SlurmJob::get_native_job_id(pid);
+    // Direct children of one manager, read from
+    // /proc/<pid>/task/<tid>/children. The targeted fallback for observe()
+    // when the pass index does not cover this manager (a fresh adapter, or a
+    // stepd that appeared after the last pass) — one to a few file reads
+    // instead of a process-table pass.
+    static std::vector<pid_t> read_manager_children(const std::string& proc_root, pid_t pid);
 
-        // 发现时探测一次组字段（失败留给 update 路径重试）
-        SlurmJob::probe_groups(job);
-        spdlog::debug("SlurmJobWatcher: built job from pid {}, JobID {}, step_id {}, user {}, partition {}", 
-                    pid, job.JobID, slurm_attr.step_id, slurm_attr.user, slurm_attr.partition);
-        return job;
-    }
+    bool init_event_source();
+    // Idempotent counterpart of init_event_source().
+    void deinit_event_source();
 
-    void buildAndAddJob(pid_t pid, bool use_rules, std::vector<std::string> default_collectors){
-        auto job_opt = buildSlurmJob(pid);
-        if(!job_opt) return;
-
-        Job job = std::move(job_opt.value());
-        // 将规则返回的采集器名称添加到Job对象中
-        if(!evaluate_rules(job)){
-            spdlog::info("SlurmJobWatcher: job ID {} did not pass rules, skip adding", job.JobID);
-            return;
-        }
-        if (!use_rules) {
-            spdlog::info("SlurmJobWatcher: job ID {} passed without rules, adding default collectors", job.JobID);
-            job.CollectorNames.insert(job.CollectorNames.end(), default_collectors.begin(), default_collectors.end());
-        }
-        add_if_(job);
-    }
-
-    bool init_ebpf(){
-        auto path = EbpfCommon::resolve_bpf_obj("trace_slurm_stepd.bpf.o");
-        if (path.empty()) return false;
-        bpf_obj_ = EbpfCommon::load_bpf_obj(path, bpf_links_);
-
-        ring_buffer_sample_fn fn  = [](void *ctx, void *data, size_t size){
-            auto ptr = static_cast<SlurmJobWatcher*>(ctx);
-            auto event_ptr = static_cast<struct slurm_event*>(data);
-            bool use_rules = false;
-            auto default_collectors = ptr->use_collectors;
-            if (ptr->rules_manager_) {
-                use_rules = true;
-            }
-            Job job;
-            spdlog::debug("SlurmJobWatcher: ebpf got exec event pid {} ppid {} comm {}",
-                        event_ptr->pid, event_ptr->ppid, event_ptr->comm);
-            ptr->buildAndAddJob(event_ptr->pid, use_rules, default_collectors);
-            return 0;
-        };
-
-        bpf_rb_ = EbpfCommon::new_rb(bpf_obj_, rb_name, fn, static_cast<void*>(this));
-        
-        if(!bpf_obj_ || !bpf_rb_){
-            return false;
-        }
-        polling_running = true;
-        poll_thread = std::make_unique<std::thread>([this](){
-            while(polling_running){
-                int err = ring_buffer__poll(bpf_rb_, 100 /* ms */);
-                if (err == -EINTR){
-                    spdlog::error("SlurmJobWatcher: error EINTR");
-                    break;
-                }
-                if (err < 0){
-                    spdlog::error("SlurmJobWatcher: error {}", err);
-                }
-            }
-        });
-
-        return true;
-    }
-
-    void deinit_ebpf(){
-        EbpfCommon::free_rb(bpf_rb_);
-        EbpfCommon::unload_bpf_obj(bpf_obj_, bpf_links_);
-        spdlog::info("SlurmJobWatcher: deinit_ebpf");
-    }
-
-    // 评估规则并返回采集器名称
-    // 返回值: std::pair<bool, std::vector<std::string>>
-    // 第一个元素: 是否所有规则都通过
-    // 第二个元素: 所有规则添加的采集器名称列表
-    std::pair<bool, std::vector<std::string>> evaluate_rules_with_collectors(const Job& job){
-        if(!rules_manager_) return {true, {}};
-        spdlog::debug("SlurmJobWatcher: evaluating rules for job ID {}", job.JobID);
-        auto result = rules_manager_->evaluate_all<Job>(job);
-        spdlog::debug("SlurmJobWatcher: job ID {} passed rules: {}, collectors: {}", 
-                     job.JobID, result.first, fmt::join(result.second, ", "));
-        return result;
-    }
-
-    bool evaluate_rules(Job& job){
-        if(!rules_manager_) return true;
-        spdlog::debug("SlurmJobWatcher: evaluating rules for job ID {}", job.JobID);
-        auto [passed, collectors] = evaluate_rules_with_collectors(job);
-        
-        // 将规则返回的采集器名称添加到Job对象中
-        if (!collectors.empty()) {
-            job.CollectorNames.insert(job.CollectorNames.end(), collectors.begin(), collectors.end());
-            // 去重
-            std::sort(job.CollectorNames.begin(), job.CollectorNames.end());
-            job.CollectorNames.erase(std::unique(job.CollectorNames.begin(), job.CollectorNames.end()), 
-                                    job.CollectorNames.end());
-        }
-        
-        spdlog::debug("SlurmJobWatcher: job ID {} passed rules: {}", job.JobID, passed);
-        return passed;
-    }
-    
-    std::unique_ptr<RulesManager> rules_manager_;
-    bool enable_auto_add_slurm_job{false};
-    bool polling_running{false};
-    std::unique_ptr<std::thread> poll_thread;
-    std::vector<std::string> use_collectors;
+    std::string name_{"slurm"};
+    DiscoveryOptions options_;
     std::string rb_name = "slurm_exec_events";
-    std::function<void(Job)> add_if_;
+
+    // Lifecycle of the poll thread.
+    mutable std::mutex life_mutex_;
+    bool polling_running_{false};
+    std::unique_ptr<std::thread> poll_thread_;
+    DiscoverySink sink_;
+    // Serializes stop(): shutdown can arrive from the service lifecycle and
+    // from the destructor.
+    std::mutex stop_mutex_;
+
+    // Health and re-resolvable discovery inputs.
+    mutable std::mutex state_mutex_;
+    SourceHealth health_;
+    // Guards one authoritative pass against another and against observe()'s
+    // read of the children index.
+    std::mutex pass_mutex_;
+
+    // Children of every live process, captured by the last authoritative
+    // enumerateManagers() pass so observe() can build one manager's Job without
+    // a second process-table read. Guarded by pass_mutex_;
+    // child_index_root_ stamps the proc root it was read from, so a re-resolved
+    // environment invalidates it without taking pass_mutex_ there.
+    std::map<pid_t, std::vector<pid_t>> child_index_;
+    std::string child_index_root_;
+    bool child_index_valid_ = false;
+
     std::vector<bpf_link*> bpf_links_;
     bpf_object* bpf_obj_{nullptr};
     ring_buffer* bpf_rb_{nullptr};
+    bool event_source_ready_{false};
+    std::string event_source_note_;
 };
+
+// ---------------------------------------------------------------------------
+// Inline definitions (header-only adapter, no .cpp in the monolithic build)
+// ---------------------------------------------------------------------------
+
+inline SlurmJobWatcher::SlurmJobWatcher(DiscoveryOptions options)
+    : options_(std::move(options))
+{
+    if (!options_.enable_event_source)
+        event_source_note_ =
+            "eBPF event source disabled by configuration: no exec hints, "
+            "discovery runs through the registry pass";
+}
+
+// ---------------------------------------------------------------------------
+// Watcher-owned discovery semantics
+// ---------------------------------------------------------------------------
+
+inline std::optional<Job> SlurmJobWatcher::finalize_discovery(
+    Job job, std::vector<std::string> source_reasons, std::vector<std::string>* notes)
+{
+    std::vector<std::string> reasons = std::move(source_reasons);
+    if (!canonicalize(selector_of(job))) {
+        reasons.push_back(
+            "logical identity unresolved: scheduler type, cluster namespace or native job id missing");
+    }
+    if (!execution_complete(job.execution)) {
+        reasons.push_back(
+            "execution manager unresolved: manager pid, manager start ticks or boot id missing");
+    }
+    if (!reasons.empty()) {
+        // An incomplete discovery is not published. The registry never sees a
+        // half-read job, and the reason stays with the watcher that knows it.
+        std::string joined;
+        for (const auto& reason : reasons) {
+            if (!joined.empty()) joined += "; ";
+            joined += reason;
+        }
+        spdlog::warn("SlurmJobWatcher: discovery dropped as incomplete: {}", joined);
+        if (notes != nullptr) notes->push_back("discovery dropped as incomplete: " + joined);
+        return std::nullopt;
+    }
+    return job;
+}
+
+inline bool SlurmJobWatcher::start(const DiscoverySink& sink)
+{
+    {
+        std::lock_guard<std::mutex> lock(life_mutex_);
+        sink_ = sink;
+    }
+    if (options_.enable_event_source && !event_source_ready_) {
+        if (!init_event_source()) {
+            deinit_event_source();
+            spdlog::warn("SlurmJobWatcher: event source unavailable ({}); "
+                         "continuing without exec hints, the registry pass still "
+                         "discovers managers",
+                         event_source_note_);
+        }
+    }
+    return start_polling();
+}
+
+inline void SlurmJobWatcher::stop()
+{
+    std::lock_guard<std::mutex> stop_lock(stop_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(life_mutex_);
+        polling_running_ = false;
+    }
+
+    std::unique_ptr<std::thread> thread;
+    {
+        std::lock_guard<std::mutex> lock(life_mutex_);
+        thread = std::move(poll_thread_);
+    }
+    if (thread && thread->joinable()) thread->join();
+
+    samples_this_turn_ = 0;
+    yield_requested_ = false;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        health_.polling = false;
+    }
+    deinit_event_source();
+}
+
+inline bool SlurmJobWatcher::polling() const
+{
+    std::lock_guard<std::mutex> lock(life_mutex_);
+    return polling_running_;
+}
+
+inline bool SlurmJobWatcher::thread_joinable() const
+{
+    std::lock_guard<std::mutex> lock(life_mutex_);
+    return poll_thread_ && poll_thread_->joinable();
+}
+
+inline ManagerSet SlurmJobWatcher::enumerateManagers()
+{
+    // The authoritative pass: serialized against itself and against observe()'s
+    // read of the children index, because both enumerate from the same roots.
+    std::lock_guard<std::mutex> pass_lock(pass_mutex_);
+    ManagerSet set;
+    // The pass owns its health record: it consumes a pending rescan request,
+    // records when it started, and finish_pass() records the outcome. Without
+    // this the heartbeat would see rescanRequested() forever and force a pass
+    // on every tick.
+    const std::int64_t started_at_ms = scan_clock_now(options_.clock);
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        health_.last_scan_start_ms = started_at_ms;
+        health_.rescan_requested = false;
+    }
+
+    const auto env = discovery_environment();
+    std::vector<std::string> notes;
+    notes.push_back(event_source_ready_
+        ? "event source: eBPF ring buffer available (the manager pass uses the process table)"
+        : (event_source_note_.empty() ? std::string("event source unavailable")
+                                      : event_source_note_));
+
+    std::string error;
+    if (!ensure_readable_directory(env.proc_root, error)) {
+        set.error = "slurm discovery: " + error;
+        finish_pass(set, notes);
+        return set;
+    }
+
+    const std::string boot_id = read_boot_id(env.proc_root);
+    if (boot_id.empty())
+        notes.push_back("boot id unavailable: no process identity can be complete");
+
+    // One process-table pass: stepd candidates and their children together, so
+    // the following observe() calls need no process-table read at all.
+    std::map<pid_t, std::vector<pid_t>> children;
+    std::vector<pid_t> stepds;
+    std::size_t unreadable_entries = 0;
+    for (pid_t pid : list_proc_pids(env.proc_root)) {
+        std::string cmdline;
+        std::string cmdline_error;
+        if (!read_proc_cmdline(env.proc_root, pid, cmdline, cmdline_error)) {
+            ++unreadable_entries;
+            continue;
+        }
+        if (cmdline.find("slurmstepd") != std::string::npos) stepds.push_back(pid);
+        if (const auto ppid = read_proc_ppid(env.proc_root, pid)) children[*ppid].push_back(pid);
+    }
+    if (unreadable_entries > 0) {
+        notes.push_back(fmt::format(
+            "{} process entries unreadable (permission denied or exited mid-pass); "
+            "they cannot be attributed to slurm", unreadable_entries));
+    }
+
+    // The stepds are live managers whether or not the spool source can be
+    // consulted: fill them before the spool probe so a spool failure only marks
+    // the pass incomplete instead of dropping the processes it found.
+    set.managers.reserve(stepds.size());
+    for (pid_t stepd : stepds) {
+        set.managers.push_back(read_process_identity(env.proc_root, boot_id, stepd));
+    }
+
+    // Keep the index even when the spool probe below fails: these children
+    // came from a complete process-table pass and are what observe() needs.
+    child_index_ = std::move(children);
+    child_index_root_ = env.proc_root;
+    child_index_valid_ = true;
+
+    // The spool source can only corroborate presence, but it is part of the
+    // pass's coverage: an unreadable configured spool root makes the pass
+    // incomplete. The entries themselves add no manager evidence, so they are
+    // never listed here.
+    if (!env.slurm_spool_dir.empty()) {
+        std::string spool_error;
+        if (!ensure_readable_directory(env.slurm_spool_dir, spool_error)) {
+            set.error = "slurm discovery: spool root " + spool_error;
+            finish_pass(set, notes);
+            return set;
+        }
+        std::error_code ec;
+        std::filesystem::directory_iterator probe(env.slurm_spool_dir, ec);
+        if (ec) {
+            set.error = "slurm discovery: cannot enumerate spool root '" +
+                        env.slurm_spool_dir + "': " + ec.message();
+            finish_pass(set, notes);
+            return set;
+        }
+    }
+
+    finish_pass(set, notes);
+    return set;
+}
+
+inline std::optional<Job> SlurmJobWatcher::observe(const ProcessIdentity& manager)
+{
+    if (!manager.complete()) return std::nullopt;
+    const auto env = discovery_environment();
+    const std::string boot_id = read_boot_id(env.proc_root);
+    // A reboot or a different proc root invalidates every saved identity.
+    if (boot_id != manager.boot_id) return std::nullopt;
+
+    // The pid must still be a slurmstepd: a manager identity can outlive the
+    // process by a pass, and a recycled pid must never seed a Job. The triple
+    // is re-verified against the built Job below.
+    std::string cmdline;
+    std::string cmdline_error;
+    if (!read_proc_cmdline(env.proc_root, manager.pid, cmdline, cmdline_error) ||
+        cmdline.find("slurmstepd") == std::string::npos) {
+        return std::nullopt;
+    }
+
+    // Members come from the index of the pass that reported this manager; a
+    // manager that appeared afterwards falls back to the stepd's own
+    // /proc/<pid>/task/*/children, never to a process-table pass.
+    std::map<pid_t, std::vector<pid_t>> children;
+    bool found_in_index = false;
+    {
+        std::lock_guard<std::mutex> lock(pass_mutex_);
+        if (child_index_valid_ && child_index_root_ == env.proc_root) {
+            const auto found = child_index_.find(manager.pid);
+            if (found != child_index_.end()) {
+                children[manager.pid] = found->second;
+                found_in_index = true;
+            }
+        }
+    }
+    if (!found_in_index)
+        children[manager.pid] = read_manager_children(env.proc_root, manager.pid);
+
+    auto job = observe_stepd(env, boot_id, manager.pid, children);
+    if (!job) return std::nullopt;
+    if (job->execution.manager != manager) return std::nullopt;
+    return job;
+}
+
+inline SourceHealth SlurmJobWatcher::health() const
+{
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return health_;
+}
+
+inline void SlurmJobWatcher::requestRescan()
+{
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    health_.rescan_requested = true;
+}
+
+inline void SlurmJobWatcher::set_discovery_environment(const DiscoveryEnvironment& environment)
+{
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    options_.discovery = environment;
+}
+
+inline DiscoveryEnvironment SlurmJobWatcher::discovery_environment() const
+{
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return options_.discovery;
+}
+
+inline std::optional<Job> SlurmJobWatcher::observeForHint(pid_t hint_pid, pid_t hint_ppid)
+{
+    return observeForHint(hint_pid, hint_ppid, true);
+}
+
+inline std::optional<Job> SlurmJobWatcher::observeForHint(
+    pid_t hint_pid, pid_t hint_ppid, bool read_groups)
+{
+    if (hint_pid <= 0) return std::nullopt;
+    const auto env = discovery_environment();
+    // The event carries its own ppid (the stepd): use it directly. Events
+    // from old BPF objects carry 0 and fall back to reading the hint's stat.
+    pid_t ppid = hint_ppid;
+    if (ppid <= 0) {
+        const auto read = read_proc_ppid(env.proc_root, hint_pid);
+        if (!read || *read <= 0) return std::nullopt;
+        ppid = *read;
+    }
+    // Real events guarantee the parent is a slurmstepd; the cmdline check
+    // keeps a recycled pid from fabricating a discovery.
+    std::string cmdline;
+    std::string error;
+    if (!read_proc_cmdline(env.proc_root, ppid, cmdline, error) ||
+        cmdline.find("slurmstepd") == std::string::npos)
+        return std::nullopt;
+    const std::string boot_id = read_boot_id(env.proc_root);
+    // The exec'd task seeds the identity derivation; the step cgroup members
+    // (merged by observe_stepd) complete the process list.
+    std::map<pid_t, std::vector<pid_t>> children;
+    children[ppid] = {hint_pid};
+    return observe_stepd(env, boot_id, ppid, children, nullptr, read_groups);
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+inline bool SlurmJobWatcher::start_polling()
+{
+    std::lock_guard<std::mutex> lock(life_mutex_);
+    if (poll_thread_ && poll_thread_->joinable()) return true;
+    if (!event_source_ready_) {
+        // Discovery itself still runs: the registry heartbeat drives
+        // enumerateManagers()/observe(). Without an event source there is no
+        // asynchronous work, so no thread is started.
+        spdlog::info("SlurmJobWatcher: start requested without an event source, "
+                     "no poll thread (discovery runs through the registry pass)");
+        return false;
+    }
+    polling_running_ = true;
+    {
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        health_.polling = true;
+    }
+    poll_thread_ = std::make_unique<std::thread>([this](){ poll_loop(); });
+    return true;
+}
+
+inline void SlurmJobWatcher::poll_loop()
+{
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(life_mutex_);
+            if (!polling_running_) return;
+        }
+
+        // Block inside libbpf's own epoll: data arrives at kernel-wakeup
+        // speed — the timeout never delays an event, it only bounds how long
+        // a stop() can go unnoticed.
+        samples_this_turn_ = 0;
+        const int err = ring_buffer__poll(bpf_rb_, 100);
+        if (err == -ECANCELED && yield_requested_.exchange(false)) {
+            // Normal turn end requested by the sample callback; the sample
+            // itself was already handled before the yield.
+        } else if (err == -EINTR) {
+            // Plain signal wakeup; fall through to the stop check.
+        } else if (err < 0) {
+            spdlog::error("SlurmJobWatcher: error {}", err);
+        }
+    }
+}
+
+inline bool SlurmJobWatcher::stop_requested()
+{
+    std::lock_guard<std::mutex> lock(life_mutex_);
+    return !polling_running_;
+}
+
+inline void SlurmJobWatcher::handle_exec_event(uint32_t pid, uint32_t ppid)
+{
+    // Runs on the polling thread. The event is only a hint: the discovered Job
+    // is built from current procfs/ad evidence and registered right here, in
+    // memory. Nothing on this path waits for persistence, so a burst of job
+    // starts cannot block the ring.
+    JobSink sink;
+    {
+        std::lock_guard<std::mutex> lock(life_mutex_);
+        sink = sink_.on_job;
+    }
+    if (!sink) return;
+
+    std::optional<Job> discovered;
+    try {
+        discovered = observeForHint(static_cast<pid_t>(pid), static_cast<pid_t>(ppid));
+    } catch (const std::exception& error) {
+        spdlog::debug("SlurmJobWatcher: exec hint {} could not be resolved: {}", pid, error.what());
+    }
+    if (!discovered) return;   // not a JobLens execution, or it already exited
+
+    UpsertResult result;
+    try {
+        result = sink(*discovered);
+    } catch (const std::exception& error) {
+        spdlog::error("SlurmJobWatcher: registration sink failed: {}", error.what());
+        requestRescan();
+        return;
+    }
+    // A facts/metadata failure asks the maintenance pass to look again; a
+    // post-commit failure is repaired from record state.
+    if (!result.ok && result.retry_registration()) requestRescan();
+}
+
+inline void SlurmJobWatcher::finish_pass(ManagerSet& set,
+                                         const std::vector<std::string>& notes)
+{
+    set.complete = set.error.empty();
+    const std::int64_t finished_at_ms = scan_clock_now(options_.clock);
+
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        health_.last_note = join_source_notes(notes);
+        if (set.complete) {
+            health_.state = SourceState::Healthy;
+            health_.last_scan_success_ms = finished_at_ms;
+            health_.consecutive_failures = 0;
+            health_.last_error.clear();
+        } else {
+            health_.state = SourceState::Degraded;
+            health_.last_error = set.error;
+            ++health_.consecutive_failures;
+        }
+    }
+
+    spdlog::debug("SlurmJobWatcher: authoritative pass complete={} managers={}",
+                  set.complete, set.managers.size());
+}
+
+inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironment& env,
+                                          const std::string& boot_id,
+                                          pid_t stepd_pid,
+                                          const std::map<pid_t, std::vector<pid_t>>& children,
+                                          std::vector<std::string>* drop_notes, bool read_groups)
+{
+    // The Job is the registration unit: typed facts (filled here, where the
+    // sources are parsed) plus the execution evidence group. No second
+    // envelope — the registry derives selector/identity on admission.
+    Job job;
+    ExecutionEvidence& execution = job.execution;
+    std::vector<std::string> notes;
+    // Assigned before the first read so the store can reject an older pass
+    // overwriting newer facts.
+    execution.read_order = next_discovery_read_order();
+    std::vector<std::string> reasons;
+    job.subtype_name = name_;
+    job.jobtype = JobType::Job;
+    job.subtype = JobSubType::Slurm;
+
+    const auto manager = read_process_identity(env.proc_root, boot_id, stepd_pid);
+    execution.manager.boot_id = manager.boot_id;
+    execution.manager.pid = stepd_pid;
+    execution.manager.start_ticks = manager.start_ticks;
+
+    // Typed attrs this observation fills from the job pids' environment; the
+    // identity derivations join once the env pass below agrees.
+    SlurmJobAttr attributes{};
+    attributes.auto_update_child = false;
+    attributes.stepd_pid = stepd_pid;
+
+    std::vector<pid_t> pids;
+    const auto found = children.find(stepd_pid);
+    if (found != children.end()) pids = found->second;
+
+    // Logical identity comes from the job pids' environment — the same keys
+    // SlurmJob::parse_job_id()/parse_step_id() decode. One environ read per
+    // pid covers every key (the hot path used to re-read the whole file per
+    // variable).
+    static const std::vector<std::string> kEnvKeys = {
+        "SLURM_JOB_ID", "SLURM_STEP_ID", "SLURM_JOB_USER",
+        "SLURM_JOB_NAME", "SLURM_JOB_PARTITION", "SLURM_CLUSTER_NAME",
+    };
+    static const auto kEnvKeysWithGroups = [] {
+        auto keys = kEnvKeys;
+        keys.emplace_back("SLURM_JOB_ACCOUNT");
+        keys.emplace_back("SLURM_JOB_GID");
+        return keys;
+    }();
+    const auto& keys = read_groups ? kEnvKeysWithGroups : kEnvKeys;
+    std::optional<std::uint64_t> job_number;
+    std::optional<std::uint32_t> step_id;
+    for (pid_t pid : pids) {
+        std::map<std::string, std::string> env_values;
+        std::string env_error;
+        if (!read_proc_env_values(env.proc_root, pid, keys,
+                                  env_values, env_error)) {
+            notes.push_back(fmt::format(
+                "child pid {} environment unreadable: {}", pid, env_error));
+            continue;
+        }
+        const auto job_it = env_values.find("SLURM_JOB_ID");
+        const std::string job_env = job_it != env_values.end() ? job_it->second
+                                                               : std::string{};
+        if (job_env.empty()) continue;  // not a job process
+
+        std::string parse_error;
+        const auto candidate_job_number = SlurmJob::parse_job_id(job_env, parse_error);
+        if (!candidate_job_number) {
+            reasons.push_back(fmt::format("child pid {}: {}", pid, parse_error));
+            continue;
+        }
+        if (job_number && *job_number != *candidate_job_number) {
+            notes.push_back(fmt::format(
+                "slurmstepd {} children disagree on SLURM_JOB_ID; using {}",
+                stepd_pid, *job_number));
+            continue;
+        }
+        job_number = candidate_job_number;
+
+        const auto step_it = env_values.find("SLURM_STEP_ID");
+        const std::string step_env = step_it != env_values.end() ? step_it->second
+                                                                 : std::string{};
+        std::string step_error;
+        const auto candidate_step = SlurmJob::parse_step_id(step_env, step_error);
+        if (!candidate_step) {
+            reasons.push_back(fmt::format("child pid {}: {}", pid, step_error));
+            continue;
+        }
+        if (step_id && *step_id != *candidate_step) {
+            notes.push_back(fmt::format(
+                "slurmstepd {} children disagree on SLURM_STEP_ID; using {}",
+                stepd_pid, SlurmJob::step_id_name(*step_id)));
+            continue;
+        }
+        step_id = candidate_step;
+
+        if (read_groups && !job.group_probed) {
+            auto& stats = GroupProbeStats::instance();
+            const auto source = GroupProbeStats::Source::SlurmEnv;
+            stats.record_attempt(source);
+            const auto account = env_values.find("SLURM_JOB_ACCOUNT");
+            if (account != env_values.end() &&
+                    !ClassAdValue::valid_group_value(account->second, ClassAdValue::kGroupValueMaxLen)) {
+                job.group_probe_attempts = 1;
+                stats.record_failure(source);
+            } else {
+                if (account != env_values.end()) attributes.acct_group = account->second;
+                const auto gid = env_values.find("SLURM_JOB_GID");
+                if (gid != env_values.end()) attributes.unix_gid = SlurmJob::parseGroupGid(gid->second);
+                job.group_probed = true;
+                if (attributes.acct_group.empty()) stats.record_empty(source);
+                else stats.record_non_empty(source, attributes.acct_group);
+            }
+        }
+
+        if (attributes.user.empty()) {
+            const auto it = env_values.find("SLURM_JOB_USER");
+            if (it != env_values.end() && !it->second.empty()) attributes.user = it->second;
+        }
+        if (attributes.job_name.empty()) {
+            const auto it = env_values.find("SLURM_JOB_NAME");
+            if (it != env_values.end() && !it->second.empty()) attributes.job_name = it->second;
+        }
+        if (attributes.partition.empty()) {
+            const auto it = env_values.find("SLURM_JOB_PARTITION");
+            if (it != env_values.end() && !it->second.empty()) attributes.partition = it->second;
+        }
+        if (job.clusterName.empty()) {
+            const auto it = env_values.find("SLURM_CLUSTER_NAME");
+            if (it != env_values.end()) job.clusterName = it->second;
+        }
+    }
+
+    if (!job_number) {
+        reasons.push_back(fmt::format(
+            "slurmstepd {} has no attributable job pids (SLURM_JOB_ID missing)", stepd_pid));
+    } else {
+        job.JobNativeID = std::to_string(*job_number);
+        attributes.job_id = *job_number;
+    }
+    if (!step_id) {
+        if (job_number) reasons.push_back(fmt::format(
+            "slurmstepd {} step identity unresolved (SLURM_STEP_ID missing or unparsable)",
+            stepd_pid));
+    } else {
+        attributes.step_id = *step_id;
+    }
+    if (job.clusterName.empty())
+        job.clusterName = env.clusterName;
+    if (job.clusterName.empty())
+        reasons.push_back("slurm cluster namespace unresolved (SLURM_CLUSTER_NAME unavailable)");
+    attributes.clusterName = job.clusterName;
+
+    // Pids: stepd children plus step-cgroup pids, so a child created before
+    // registration is still attributed. Only a successfully read step cgroup
+    // makes the identity set authoritative; a failed read is never reported as
+    // a confirmed pid identity set.
+    std::string cgroup_path =
+        read_proc_cgroup_path(env.proc_root, stepd_pid, env.cgroup_root);
+    if (cgroup_path.empty() && !pids.empty()) {
+        cgroup_path =
+            read_proc_cgroup_path(env.proc_root, pids.front(), env.cgroup_root);
+        if (!cgroup_path.empty())
+            notes.push_back(fmt::format(
+                "stepd cgroup unknown; used job pid {} cgroup", pids.front()));
+    }
+    attributes.cgroup_path = cgroup_path;
+
+    std::vector<pid_t> effective_pids = pids;
+    std::vector<pid_t> cgroup_pids;
+    std::string cgroup_error;
+    // Pids start as the stepd's children, which may be incomplete (a child
+    // created after this read, or an unreadable stepd). A readable step cgroup
+    // answers for the whole scope — an empty list included — and is the only
+    // thing that makes the set authoritative; an unreadable cgroup leaves it
+    // partial, and an incomplete pid identity below clears it again.
+    if (!cgroup_path.empty()) {
+        if (read_cgroup_members(cgroup_path, cgroup_pids, cgroup_error)) {
+            execution.pid_identities_authoritative = true;
+            for (pid_t cgroup_pid : cgroup_pids) {
+                if (std::find(effective_pids.begin(), effective_pids.end(),
+                              cgroup_pid) == effective_pids.end()) {
+                    effective_pids.push_back(cgroup_pid);
+                }
+            }
+        } else {
+            execution.pid_identities_authoritative = false;
+            notes.push_back("step cgroup membership unreadable: " + cgroup_error);
+        }
+    }
+    for (pid_t pid : effective_pids) {
+        if (pid == stepd_pid) continue;
+        const auto pid_identity = read_process_identity(env.proc_root, boot_id, pid);
+        if (!pid_identity.complete()) execution.pid_identities_authoritative = false;
+        execution.pid_identities.push_back(pid_identity);
+    }
+
+    job.sub_attr = attributes;
+    // Once the env is read, the existing probe performs only the bounded NSS lookup.
+    if (read_groups && job.group_probed && attributes.unix_gid >= 0) SlurmJob::probe_groups(job);
+    return finalize_discovery(std::move(job), std::move(reasons), drop_notes);
+}
+
+inline std::vector<pid_t> SlurmJobWatcher::read_manager_children(const std::string& proc_root,
+                                                                 pid_t pid)
+{
+    // /proc/<pid>/task/<tid>/children lists the tasks a thread forked; the
+    // union over the stepd's threads is its child set. A handful of small
+    // files, never a process-table pass.
+    std::vector<pid_t> children;
+    const std::filesystem::path task_dir =
+        std::filesystem::path(proc_root) / std::to_string(pid) / "task";
+    std::error_code ec;
+    std::filesystem::directory_iterator iterator(task_dir, ec);
+    const std::filesystem::directory_iterator end;
+    while (!ec && iterator != end) {
+        std::ifstream file(iterator->path() / "children");
+        if (file) {
+            std::string line;
+            std::getline(file, line);
+            std::istringstream values(line);
+            long value = 0;
+            while (values >> value) {
+                if (value > 0) children.push_back(static_cast<pid_t>(value));
+            }
+        }
+        iterator.increment(ec);
+    }
+    std::sort(children.begin(), children.end());
+    children.erase(std::unique(children.begin(), children.end()), children.end());
+    return children;
+}
+
+inline bool SlurmJobWatcher::init_event_source()
+{
+    auto path = EbpfCommon::resolve_bpf_obj("trace_slurm_stepd.bpf.o");
+    if (path.empty()) {
+        event_source_note_ = "eBPF object trace_slurm_stepd.bpf.o not found: "
+                             "exec hints disabled, discovery runs through the registry pass";
+        return false;
+    }
+    bpf_obj_ = EbpfCommon::load_bpf_obj(path, bpf_links_);
+    if (!bpf_obj_) {
+        event_source_note_ = "eBPF object trace_slurm_stepd.bpf.o could not be loaded "
+                             "(privilege or kernel support): exec hints disabled, discovery "
+                             "runs through the registry pass";
+        return false;
+    }
+
+    ring_buffer_sample_fn fn  = [](void *ctx, void *data, size_t /*size*/){
+        auto ptr = static_cast<SlurmJobWatcher*>(ctx);
+        auto event_ptr = static_cast<struct slurm_event*>(data);
+        spdlog::trace("SlurmJobWatcher: ebpf got exec event pid {} ppid {} comm {}",
+                      event_ptr->pid, event_ptr->ppid, event_ptr->comm);
+        // Cheap by contract: the pid is handed to the sink and nothing else
+        // happens on this thread (no /proc reads, no policy, no storage).
+        // Admission closed: do not start a new sample, end the turn so the
+        // poll thread can finish and join.
+        if (ptr->stop_requested()) return -ECANCELED;
+        // Handle the CURRENT sample first: libbpf has already advanced the
+        // consumer position, so a sample that is not taken now is lost.
+        // The event carries its ppid: no /proc stat read is needed on this
+        // path (old event objects without the field hand 0 and the
+        // observation falls back to reading it).
+        ptr->handle_exec_event(event_ptr->pid, event_ptr->ppid);
+        // Bound the turn: the sample above is already handled, so yielding now
+        // only ends libbpf's consume loop and lets the stop check run.
+        ++ptr->samples_this_turn_;
+        if (ptr->samples_this_turn_ >= kSamplesPerTurn || ptr->stop_requested()) {
+            ptr->yield_requested_ = true;
+            return -ECANCELED;
+        }
+        return 0;
+    };
+
+    bpf_rb_ = EbpfCommon::new_rb(bpf_obj_, rb_name, fn, static_cast<void*>(this));
+
+    if(!bpf_rb_){
+        event_source_note_ = "eBPF ring buffer for trace_slurm_stepd.bpf.o unavailable: "
+                             "exec hints disabled, discovery runs through the registry pass";
+        return false;
+    }
+    event_source_ready_ = true;
+    return true;
+}
+
+inline void SlurmJobWatcher::deinit_event_source()
+{
+    EbpfCommon::free_rb(bpf_rb_);
+    bpf_rb_ = nullptr;
+    EbpfCommon::unload_bpf_obj(bpf_obj_, bpf_links_);
+    bpf_obj_ = nullptr;
+    event_source_ready_ = false;
+    spdlog::info("SlurmJobWatcher: deinit_ebpf");
+}

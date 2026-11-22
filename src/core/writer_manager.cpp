@@ -19,8 +19,11 @@
 #include "core/collector_type.h"
 #include "common/local_rpc.hpp"
 
+#include <random>
+#include <sstream>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_set>
 #include <fmt/core.h>
 
 
@@ -35,6 +38,7 @@ void WriterManager::initWriterPerf() {
                 j["status"] = "ok";
                 j["writers_perf"] = json::array();
                 try {
+                    std::lock_guard<std::mutex> lg(m_);
                     for (auto& k: writers_){
                         auto optional_s = k->get_perf_snapshot();
                         if (optional_s.has_value()){
@@ -64,30 +68,50 @@ void WriterManager::initWriterPerf() {
     perf_inited = true;
 }
 
-
-
 WriterManager::WriterManager() {
+    // WriterManager is constructed by the AUTO_REGISTER_WRITER static initializers
+    // before main(). Touch the spdlog registry here so it is constructed no later
+    // than WriterManager; static destruction order is then guaranteed to destroy
+    // WriterManager (and its writers, which log during shutdown) first, rather
+    // than logging into an already-destroyed spdlog registry at process exit.
+    (void)spdlog::default_logger_raw();
 
+    // 128-bit 进程运行标识：由操作系统随机源生成，配合单调采样计数器构成 sample_id。
+    std::random_device device;
+    std::ostringstream os;
+    os << std::hex << device() << device() << device() << device();
+    process_run_id_ = os.str();
 }
 
 WriterManager::~WriterManager() {
-
+    shutdown();
 }
 
-void WriterManager::createAllWriters(){
-    if(initialized_){
-        spdlog::warn("WriterManager: createAllWriters called more than once!");
-        return;
-    }
+void WriterManager::initialize(){
+    std::lock_guard lg(m_);
+    if (initialized_) return;
     initialized_ = true;
-        struct Writer{
+    if (!perf_inited) initWriterPerf();
+    if (!status_rpc_registered) {
+        status_rpc_registered = true;
+        // 始终可用，不依赖性能计数器开关。
+        RPCServer::instance().register_method("WriterManager/output_status",
+            [this](const nlohmann::json&) -> nlohmann::json {
+                return output_status();
+            });
+    }
+    createAllWritersLocked();
+}
+
+void WriterManager::createAllWritersLocked(){
+    struct Writer{
         std::string name;
         std::string type;
         std::string config;
     };
     auto global_config = Config::instance();
     spdlog::info("WriterManager: initializing...");
-    auto writers = global_config.getArray<Writer>("writers_config", "writers", 
+    auto writers = global_config.getArray<Writer>("writers_config", "writers",
         [](const YAML::Node& node) {
             Writer w;
             w.name = node["name"].as<std::string>();
@@ -96,7 +120,12 @@ void WriterManager::createAllWriters(){
             return w;
         });
     spdlog::info("WriterManager: found {} writers", writers.size());
+    std::unordered_set<std::string> names;
     for (const auto& writer : writers){
+        if (!names.insert(writer.name).second) {
+            spdlog::error("WriterManager: duplicate writer instance name '{}', skipping", writer.name);
+            continue;
+        }
         auto it = factories_.find(writer.type);
         if (it == factories_.end()){
             spdlog::error("WriterManager: unknown writer type '{}', skipping", writer.type);
@@ -109,7 +138,7 @@ void WriterManager::createAllWriters(){
                 continue;
             }
             newInst->set_perf(enable_writer_perf, perf_win_size);
-            addWriter(std::move(newInst));
+            writers_.push_back(std::move(newInst));
             spdlog::info("WriterManager: registered writer '{}' of type '{}'", writer.name, writer.type);
         }catch(const std::exception& e){
             spdlog::error("WriterManager: exception creating writer '{}': {}", writer.name, e.what());
@@ -120,31 +149,65 @@ void WriterManager::createAllWriters(){
 }
 
 void WriterManager::shutdown() {
-    std::lock_guard lg(m_);
-    spdlog::info("WriterManager: shutting down...");
-    for (auto& writer : writers_) {
+    std::vector<std::shared_ptr<BaseWriter>> writers;
+    {
+        std::lock_guard lg(m_);
+        spdlog::info("WriterManager: shutting down...");
+        writers.swap(writers_);
+    }
+    // 不持 registry 锁 join worker，避免与 writer 回调中的查询互相等待。
+    for (auto& writer : writers) {
         writer->shutdown();
     }
-    // writers_.clear();
+    // The writers die when this vector leaves scope. A status query that
+    // copied shared_ptrs under the manager lock keeps every writer it saw
+    // alive until its snapshot is finished, even past this scope.
 }
 
-std::vector<std::tuple<std::string, OnFinish>> WriterManager::get_onFinishCallbacks() {
-    if(!initialized_){
-        initWriterPerf();
-        createAllWriters();
-    }
+BaseWriter* WriterManager::find(const std::string& name)
+{
     std::lock_guard lg(m_);
-    std::vector<std::tuple<std::string, OnFinish>> callbacks;
-    for (const auto& writer : writers_) {
-        auto name = writer->get_name();
-        auto func = writer->get_onFinishCallback();
-        std::tuple<std::string, OnFinish> t = std::make_tuple(name,func);
-        callbacks.push_back(t);
-    }
-    return callbacks;
+    for (auto& writer : writers_)
+        if (writer->get_name() == name) return writer.get();
+    return nullptr;
 }
 
-void WriterManager::addWriter(std::unique_ptr<BaseWriter> writer) {
+const BaseWriter* WriterManager::find(const std::string& name) const
+{
+    std::lock_guard lg(m_);
+    for (const auto& writer : writers_)
+        if (writer->get_name() == name) return writer.get();
+    return nullptr;
+}
+
+std::vector<std::string> WriterManager::names() const
+{
+    std::lock_guard lg(m_);
+    std::vector<std::string> result;
+    result.reserve(writers_.size());
+    for (const auto& writer : writers_) result.push_back(writer->get_name());
+    return result;
+}
+
+nlohmann::json WriterManager::output_status() const
+{
+    // Snapshot under the lock, use outside it: the shared_ptr copies keep the
+    // writers alive even if shutdown() swaps and destroys the set in between.
+    std::vector<std::shared_ptr<BaseWriter>> writers;
+    {
+        std::lock_guard lg(m_);
+        writers = writers_;
+    }
+    nlohmann::json result;
+    result["status"] = "ok";
+    result["process_run_id"] = process_run_id_;
+    result["writer_count"] = writers.size();
+    result["writers"] = nlohmann::json::array();
+    for (const auto& writer : writers) result["writers"].push_back(writer->output_status());
+    return result;
+}
+
+void WriterManager::addWriter(std::shared_ptr<BaseWriter> writer) {
     std::lock_guard lg(m_);
     writers_.push_back(std::move(writer));
 }

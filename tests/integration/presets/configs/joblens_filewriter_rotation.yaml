@@ -1,4 +1,4 @@
-# JobLens C++ Agent 集成测试配置 — FileWriter 旋转 (Task 11)
+# JobLens C++ Agent 集成测试配置 — FileWriter 旋转
 # 用途: 部署到 worker VM 的 /etc/JobLens/config.yaml
 # 特点: 启用追加模式 + 大小旋转 + max_files: 2 + 极小阈值 (256 bytes)
 #       确保在集成测试中能快速触发旋转

@@ -1,4 +1,4 @@
-# JobLens C++ Agent 集成测试配置 — FileWriter 优雅关闭 (Task 11)
+# JobLens C++ Agent 集成测试配置 — FileWriter 优雅关闭
 # 用途: 部署到 worker VM 的 /etc/JobLens/config.yaml
 # 特点: flush_on_shutdown: true, 追加模式, 测试优雅关闭后记录完整性
 

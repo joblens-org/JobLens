@@ -13,13 +13,12 @@
  * limitations under the License. */
 #pragma once
 #include "core/collector_type.h"
-#include "core/group_probe_stats.hpp"
-#include "common/classad_decode.hpp"
+#include "core/job_identity.hpp"
 #include "common/utils.hpp"
 #include <unistd.h>
-#include <fcntl.h>
+#include "core/group_probe_stats.hpp"
+#include "common/classad_decode.hpp"
 #include <sys/stat.h>
-#include <climits>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -28,6 +27,9 @@
 #include <iostream>
 #include <optional>
 #include <variant>
+#include <algorithm>
+#include <cctype>
+#include <optional>
 #include <spdlog/spdlog.h>
 #include <fmt/core.h>
 
@@ -36,194 +38,133 @@ namespace fs = std::filesystem;
 namespace CondorJob
 {
 
-// 使用Utils命名空间中的公共函数
-using Utils::get_ppid_of;
-using Utils::get_cmdline_of;
-using Utils::get_env_field;
-using Utils::v2_cgroup_absolute_path;
-using Utils::get_pids_in_cgroup;
+// ---------------------------------------------------------------------------
+// Structured job-ad parsing for the discovery adapter
+// ---------------------------------------------------------------------------
+// An unreadable ad, an ad without a GlobalJobId and a GlobalJobId with an
+// unparsable native job id are three different *incomplete* observations, each
+// with its own reason, never a guessed identity.
 
-inline bool update_job_pids(Job& job){
-    auto& condor_attr = std::get<CondorJobAttr>(job.sub_attr);
+struct CondorAdIdentity {
+    std::string global_job_id;   // raw field value as written in the ad
+    std::string scheduler_name;  // schedd namespace, e.g. "scheduler@schedd07.example"
+    std::string scheduler_host;  // schedd host part, e.g. "schedd07.example"
+    std::string job_native_id;   // "ClusterId.ProcId" as written in the ad
+    size_t      cluster_id{};    // typed ClusterId parsed from GlobalJobId
+    size_t      proc_id{};       // typed ProcId parsed from GlobalJobId
+    std::string owner;
+};
 
-    if(condor_attr.starter_pid == 0){
-        if (job.JobPIDs.empty()) {
-            spdlog::debug("CondorJob: cannot initialize starter_pid, JobPIDs is empty");
-            return false;
-        }
-        //初始化相关内容
-        if(job.JobPIDs.size()>1){
-            spdlog::warn("CondorJob: multi pids, use first");
-        }
-        condor_attr.starter_pid = get_ppid_of(job.JobPIDs[0]);
-    }
-
-    if (condor_attr.starter_pid <= 0) {
-        spdlog::debug("CondorJob: cannot update pids by cgroup, invalid starter_pid {}", condor_attr.starter_pid);
+inline bool read_ad_content(const std::string& ad_path, std::string& content,
+                            std::string& error){
+    std::ifstream f(ad_path, std::ios::binary);
+    if (!f) {
+        error = "cannot open '" + ad_path + "'";
         return false;
     }
-
-    if (condor_attr.slots_cgroup_path.empty()) {
-        if (job.JobPIDs.empty()) {
-            spdlog::debug("CondorJob: cannot discover cgroup path, JobPIDs is empty");
-            return false;
-        }
-        condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(job.JobPIDs[0]);
-    }
-
-    if (condor_attr.slots_cgroup_path.empty()) {
-        spdlog::debug("CondorJob: cannot update pids by cgroup, empty cgroup path for starter_pid {}", condor_attr.starter_pid);
+    std::ostringstream buffer;
+    buffer << f.rdbuf();
+    if (f.bad()) {
+        error = "read error on '" + ad_path + "'";
         return false;
     }
-
-    auto pid_slots_cgroup = get_pids_in_cgroup(condor_attr.slots_cgroup_path);
-    pid_slots_cgroup.erase(
-        std::remove(pid_slots_cgroup.begin(), pid_slots_cgroup.end(), condor_attr.starter_pid),
-        pid_slots_cgroup.end());
-
-    if (pid_slots_cgroup.empty()) {
-        spdlog::debug("CondorJob: cgroup {} has no job pids after filtering starter_pid {}",
-                      condor_attr.slots_cgroup_path,
-                      condor_attr.starter_pid);
+    content = buffer.str();
+    if (content.empty()) {
+        error = "job ad '" + ad_path + "' is empty";
         return false;
     }
-
-    job.JobPIDs = std::move(pid_slots_cgroup);
-    spdlog::trace("CondorJob: updated JobPIDs from cgroup {}", condor_attr.slots_cgroup_path);
     return true;
 }
 
-/* 解析 GlobalJobId */
-inline static std::string parse_job_id(const std::string &job_ad)
-{
-    std::ifstream f(job_ad);
+inline std::string get_ad_field_from_content(const std::string& content,
+                                             const std::string &field){
+    std::istringstream stream(content);
     std::string line;
-    while (std::getline(f, line)) {
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         auto p = line.find(" = ");
-        if (p != std::string::npos && line.substr(0, p) == "GlobalJobId") {
-            std::string v = line.substr(p + 3);
-            auto sharp = v.find('#');
-            return sharp == std::string::npos ? "" : v.substr(sharp + 1);
+        if (p != std::string::npos && line.compare(0, p, field) == 0) {
+            return line.substr(p + 3);
         }
     }
     return "";
 }
 
-inline static uint64_t parse_uint64(std::string_view s)
-{
-    uint64_t val = 0;
-    for (char c : s) {
-        if (c == '#') break;
-        if (c == '.') continue;
-        if (c >= '0' && c <= '9') {
-            val = val * 10 + (c - '0');
-        } else {
-            return 0;  // invalid
-        }
+namespace detail {
+inline std::string strip_quotes(std::string value){
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+        return value.substr(1, value.size() - 2);
+    return value;
+}
+inline bool is_decimal_part(const std::string& part){
+    if (part.empty()) return false;
+    return std::all_of(part.begin(), part.end(),
+                       [](unsigned char c){ return std::isdigit(c) != 0; });
+}
+} // namespace detail
+
+// Parses the identity-bearing fields of a condor job ad. Returns nullopt with a
+// reason when the ad cannot name a job; the caller turns that into an
+// incomplete observation.
+inline std::optional<CondorAdIdentity> parse_ad_identity(const std::string& content,
+                                                         std::string& error){
+    CondorAdIdentity ad;
+    ad.global_job_id = detail::strip_quotes(get_ad_field_from_content(content, "GlobalJobId"));
+    if (ad.global_job_id.empty()) {
+        error = "no GlobalJobId field";
+        return std::nullopt;
     }
-    return val;
-}
+    ad.owner = detail::strip_quotes(get_ad_field_from_content(content, "Owner"));
 
-inline std::string get_ad_field(std::string ad_path, const std::string &field){
-    std::ifstream f(ad_path);
-    std::string line;
-    while (std::getline(f, line)) {
-        auto p = line.find(" = ");
-        if (p != std::string::npos && line.substr(0, p).compare(field) == 0) {
-            std::string v = line.substr(p + 3);
-            return v;
-        }
+    // Format: "scheduler@schedd.example#ClusterId.ProcId#timestamp"
+    const auto first_sharp = ad.global_job_id.find('#');
+    if (first_sharp == std::string::npos) {
+        error = "GlobalJobId '" + ad.global_job_id + "' has no schedd segment";
+        return std::nullopt;
     }
-    return "";
-}
-
-inline uint64_t getJobID(pid_t pid){
-    std::string ad_path = get_env_field(pid, "_CONDOR_JOB_AD");
-    spdlog::debug("CondorJob: pid {} _CONDOR_JOB_AD {}", pid, ad_path);
-    if (ad_path.empty()) return 0;
-
-    std::string condor_jobid = parse_job_id(ad_path);
-    spdlog::debug("CondorJob: pid {} condor jobid {}", pid, condor_jobid);
-    if (condor_jobid.empty()) return 0;
-
-    return parse_uint64(condor_jobid);
-}
-
-inline std::string getOwner(pid_t pid){
-    std::string ad_path = get_env_field(pid, "_CONDOR_JOB_AD");
-    if (ad_path.empty()) return "";
-    return get_ad_field(ad_path, "Owner");
-}
-
-inline std::vector<pid_t> get_all_condor_job_pids(){
-    std::vector<pid_t> condor_pids;
-    namespace fs = std::filesystem;
-    for (const auto& entry : fs::directory_iterator("/proc")) {
-        if (!entry.is_directory()) continue;
-        std::string filename = entry.path().filename().string();
-        if (!std::all_of(filename.begin(), filename.end(), ::isdigit)) continue;
-        pid_t pid = static_cast<pid_t>(std::stol(filename));
-        std::string cmdline = get_cmdline_of(pid);
-        if (cmdline.find("condor_starter") != std::string::npos) {
-            condor_pids.push_back(pid);
-        }
+    const auto second_sharp = ad.global_job_id.find('#', first_sharp + 1);
+    if (second_sharp == std::string::npos) {
+        error = "GlobalJobId '" + ad.global_job_id + "' has no job id segment";
+        return std::nullopt;
     }
-    return condor_pids;
-}
 
-inline std::string get_scheduler_host(pid_t pid){
-    std::string ad_path = get_env_field(pid, "_CONDOR_JOB_AD");
-    if (ad_path.empty()) return "";
-    auto global_job_id = get_ad_field(ad_path, "GlobalJobId");
-    std::string host_part;
-    auto at_pos = global_job_id.find('@');
-    if (at_pos != std::string::npos) {
-        auto sharp_pos = global_job_id.find('#', at_pos);
-        if (sharp_pos != std::string::npos) {
-            host_part = global_job_id.substr(at_pos + 1, sharp_pos - at_pos - 1);
-        }
-    }   
-    return host_part;
-}
+    const auto quote = ad.global_job_id.find('"');
+    if (quote != std::string::npos && quote < first_sharp)
+        ad.scheduler_name = ad.global_job_id.substr(quote + 1, first_sharp - quote - 1);
+    else
+        ad.scheduler_name = ad.global_job_id.substr(0, first_sharp);
 
-inline std::string get_scheduler_name(pid_t pid){
-    std::string ad_path = get_env_field(pid, "_CONDOR_JOB_AD");
-    if (ad_path.empty()) return "";
-    auto global_job_id = get_ad_field(ad_path, "GlobalJobId");
-    std::string scheduler_name;
-    // GlobalJobId格式示例："scheduler@schedd07.ihep.ac.cn#76226337.0#1775723895"
-    auto sharp_pos = global_job_id.find('#');
-    if (sharp_pos != std::string::npos) {
-        auto quotation_pos = global_job_id.find('"');
-        if (quotation_pos != std::string::npos) {
-            scheduler_name = global_job_id.substr(quotation_pos + 1, sharp_pos - quotation_pos - 1);
-        }
+    const auto at = ad.global_job_id.find('@');
+    if (at != std::string::npos && at < first_sharp)
+        ad.scheduler_host = ad.global_job_id.substr(at + 1, first_sharp - at - 1);
+
+    ad.job_native_id =
+        ad.global_job_id.substr(first_sharp + 1, second_sharp - first_sharp - 1);
+    const auto dot = ad.job_native_id.find('.');
+    const auto cluster_part = dot == std::string::npos
+                                  ? std::string{}
+                                  : ad.job_native_id.substr(0, dot);
+    const auto proc_part = dot == std::string::npos
+                               ? std::string{}
+                               : ad.job_native_id.substr(dot + 1);
+    if (dot == std::string::npos ||
+        !detail::is_decimal_part(cluster_part) ||
+        !detail::is_decimal_part(proc_part)) {
+        error = "GlobalJobId '" + ad.global_job_id + "' has an unparsable native job id";
+        return std::nullopt;
     }
-    return scheduler_name;
-}
-
-inline std::pair<size_t, size_t> get_cluster_and_proc_id(pid_t pid){
-    std::string ad_path = get_env_field(pid, "_CONDOR_JOB_AD");
-    if (ad_path.empty()) return {0, 0};
-    auto global_job_id = get_ad_field(ad_path, "GlobalJobId");
-    auto first_sharp = global_job_id.find('#');
-    if (first_sharp == std::string::npos) return {0, 0};
-    auto second_sharp = global_job_id.find('#', first_sharp + 1);
-    if (second_sharp == std::string::npos) return {0, 0};
-    
-    std::string cluster_proc = global_job_id.substr(first_sharp + 1, second_sharp - first_sharp - 1);
-    auto dot_pos = cluster_proc.find('.');
-    if (dot_pos == std::string::npos) return {0, 0};
-    
-    size_t cluster_id = parse_uint64(cluster_proc.substr(0, dot_pos));
-    size_t proc_id = parse_uint64(cluster_proc.substr(dot_pos + 1));
-    
-    return {cluster_id, proc_id};
-}
-
-inline std::string get_native_job_id(pid_t pid){
-    auto [cluster_id, proc_id] = get_cluster_and_proc_id(pid);
-    return fmt::format("{}.{}", cluster_id, proc_id);
+    // The typed pair comes from the same segment the string render does — one
+    // source, so the two can never disagree. parse_job_id_text is the shared
+    // strict decimal parser; a cluster id of 0 keeps the identity unparsable.
+    const auto typed_cluster = parse_job_id_text(cluster_part);
+    const auto typed_proc = parse_job_id_text(proc_part);
+    if (!typed_cluster || !typed_proc || *typed_cluster == 0) {
+        error = "GlobalJobId '" + ad.global_job_id + "' has an unparsable native job id";
+        return std::nullopt;
+    }
+    ad.cluster_id = static_cast<size_t>(*typed_cluster);
+    ad.proc_id = static_cast<size_t>(*typed_proc);
+    return ad;
 }
 
 /* ===================== 组归属（只读上游标准 ClassAd 属性） =====================
@@ -237,30 +178,15 @@ inline std::string get_native_job_id(pid_t pid){
  * - 读失败不置 group_probed，由 group_probe_attempts 有界重试；采集周期会反复
  *   走 update_job → update_job_info，probed 标志防止组本就为空的站点每周期重读。
  */
-// 解析 GlobalJobId 中的 cluster.proc（"sched@host#123.0#ts" → {123, 0}）。
-inline std::optional<std::pair<size_t, size_t>> cluster_proc_from_global_job_id(const std::string& g) {
-    auto first = g.find('#');
-    if (first == std::string::npos) return std::nullopt;
-    auto second = g.find('#', first + 1);
-    if (second == std::string::npos) return std::nullopt;
-    std::string cp = g.substr(first + 1, second - first - 1);
-    auto dot = cp.find('.');
-    if (dot == std::string::npos) return std::nullopt;
-    size_t cluster = parse_uint64(cp.substr(0, dot));
-    size_t proc = parse_uint64(cp.substr(dot + 1));
-    if (cluster == 0) return std::nullopt;  // cluster 0 不是合法作业；proc 0 合法
-    return std::make_pair(cluster, proc);
-}
-
 inline bool is_regular_nonsymlink(const std::string& path) {
     struct stat st{};
     if (::lstat(path.c_str(), &st) != 0) return false;
     return S_ISREG(st.st_mode);
 }
 
-inline uid_t proc_owner_uid(pid_t pid) {
+inline uid_t proc_owner_uid(pid_t pid, const fs::path& proc_root = "/proc") {
     struct stat st{};
-    if (::stat((fs::path("/proc") / std::to_string(pid)).c_str(), &st) != 0) return static_cast<uid_t>(-1);
+    if (::stat((proc_root / std::to_string(pid)).c_str(), &st) != 0) return static_cast<uid_t>(-1);
     return st.st_uid;
 }
 
@@ -270,8 +196,20 @@ inline uid_t file_owner_uid(const std::string& path) {
     return st.st_uid;
 }
 
-// 探测并填充组字段；返回是否取到任一非空组值（供 restore 路径决定 group_need_persist）。
+inline bool apply_ad_groups(CondorJobAttr& attr, const std::string& content)
+{
+    const auto acct = ClassAdValue::decode_string(get_ad_field_from_content(content, "AcctGroup"));
+    const auto unix_grp = ClassAdValue::decode_string(get_ad_field_from_content(content, "PrimaryUnixGroup"));
+    if (!ClassAdValue::valid_group_value(acct, ClassAdValue::kGroupValueMaxLen) ||
+        !ClassAdValue::valid_group_value(unix_grp, ClassAdValue::kGroupValueMaxLen)) return false;
+    attr.acct_group = acct;
+    attr.unix_group = unix_grp;
+    return true;
+}
+
+// Probe a legacy record through a source checked against the recorded identity; tests drive this same reader.
 inline bool probe_groups(Job& job) {
+    const auto pids = pids_of(job);
     auto& attr = std::get<CondorJobAttr>(job.sub_attr);
     auto& stats = GroupProbeStats::instance();
     const auto S = GroupProbeStats::Source::CondorAd;
@@ -291,9 +229,9 @@ inline bool probe_groups(Job& job) {
 
     // 1) ad 文件来源：starter env 优先；用户进程 env 兜底并做来源校验
     std::string starter_ad;
-    if (attr.starter_pid > 0) starter_ad = get_env_field(attr.starter_pid, "_CONDOR_JOB_AD");
+    if (attr.starter_pid > 0) starter_ad = Utils::get_env_field(attr.starter_pid, "_CONDOR_JOB_AD");
     std::string user_ad;
-    if (!job.JobPIDs.empty()) user_ad = get_env_field(job.JobPIDs[0], "_CONDOR_JOB_AD");
+    if (!pids.empty()) user_ad = Utils::get_env_field(pids[0], "_CONDOR_JOB_AD");
 
     std::string ad_path;
     if (!starter_ad.empty()) {
@@ -302,7 +240,7 @@ inline bool probe_groups(Job& job) {
         ad_path = user_ad;
         if (!is_regular_nonsymlink(ad_path)) return bail("ad path is not a regular file (symlink?)");
         uid_t owner = file_owner_uid(ad_path);
-        uid_t job_uid = proc_owner_uid(job.JobPIDs[0]);
+        uid_t job_uid = proc_owner_uid(pids[0]);
         uid_t starter_uid = attr.starter_pid > 0 ? proc_owner_uid(attr.starter_pid) : static_cast<uid_t>(-1);
         if (owner != 0 && owner != job_uid && owner != starter_uid) {
             return bail("ad file owner mismatch");
@@ -312,82 +250,22 @@ inline bool probe_groups(Job& job) {
     }
 
     // 2) GlobalJobId 一致性（防 ad 文件串号；不是防伪造）
-    auto cp = cluster_proc_from_global_job_id(get_ad_field(ad_path, "GlobalJobId"));
-    if (cp && !job.NativeJobID.empty()) {
-        auto expect = fmt::format("{}.{}", cp->first, cp->second);
-        if (expect != job.NativeJobID) return bail("GlobalJobId mismatch with NativeJobID");
+    std::string content, error;
+    if (!read_ad_content(ad_path, content, error)) return bail("cannot read job ad");
+    const auto identity = parse_ad_identity(content, error);
+    if (!identity || (!job.JobNativeID.empty() && identity->job_native_id != job.JobNativeID)) {
+        return bail("GlobalJobId missing or does not match JobNativeID");
     }
 
-    // 3) 读取并校验组值
-    auto acct = ClassAdValue::decode_string(get_ad_field(ad_path, "AcctGroup"));
-    auto unix_grp = ClassAdValue::decode_string(get_ad_field(ad_path, "PrimaryUnixGroup"));
-    if (!ClassAdValue::valid_group_value(acct, ClassAdValue::kGroupValueMaxLen) ||
-        !ClassAdValue::valid_group_value(unix_grp, ClassAdValue::kGroupValueMaxLen)) {
-        return bail("group value over length limit or contains control chars");
-    }
-
-    attr.acct_group = acct;
-    attr.unix_group = unix_grp;
-    if (!acct.empty()) {
-        stats.record_non_empty(S, acct);
-    } else {
-        stats.record_empty(S);  // 读成功但无组：合法缺失
-    }
+    if (!apply_ad_groups(attr, content)) return bail("group value over length limit or contains control chars");
+    if (attr.acct_group.empty()) stats.record_empty(S);
+    else stats.record_non_empty(S, attr.acct_group);
     job.group_probed = true;
     job.group_probe_attempts = 0;
     spdlog::debug("CondorJob: JobID {} groups acct_group='{}' unix_group='{}'",
                   job.JobID, attr.acct_group, attr.unix_group);
-    return !acct.empty() || !unix_grp.empty();
+    return !attr.acct_group.empty() || !attr.unix_group.empty();
 }
 
 
-inline void update_job_info(Job& job){
-    auto& condor_attr = std::get<CondorJobAttr>(job.sub_attr);
-    const bool has_job_pid = !job.JobPIDs.empty();
-
-    // 确保 starter_pid 已知 (其他字段依赖它)
-    if (condor_attr.starter_pid == 0) {
-        if (has_job_pid) {
-            condor_attr.starter_pid = get_ppid_of(job.JobPIDs[0]);
-        } else {
-            spdlog::debug("CondorJob: cannot initialize starter_pid in update_job_info, JobPIDs is empty");
-        }
-    }
-
-    // 逐字段检查，为空则从系统补全
-    if (condor_attr.scheduler_host.empty() && condor_attr.starter_pid > 0) {
-        condor_attr.scheduler_host = get_scheduler_host(condor_attr.starter_pid);
-    }
-    if (condor_attr.scheduler_name.empty() && condor_attr.starter_pid > 0) {
-        condor_attr.scheduler_name = get_scheduler_name(condor_attr.starter_pid);
-    }
-    job.clusterTag = condor_attr.scheduler_name;
-
-    if (condor_attr.slots_cgroup_path.empty()) {
-        if (has_job_pid) {
-            condor_attr.slots_cgroup_path = v2_cgroup_absolute_path(job.JobPIDs[0]);
-        } else {
-            spdlog::debug("CondorJob: cannot discover cgroup path in update_job_info, JobPIDs is empty");
-        }
-    }
-    if (condor_attr.collector_host.empty()) {
-        condor_attr.collector_host = Utils::get_condor_collector_host();
-    }
-    if (job.cluster_name.empty()) {
-        job.cluster_name = condor_attr.collector_host;
-    }
-    if ((condor_attr.cluster_id == 0 || condor_attr.proc_id == 0) && condor_attr.starter_pid > 0) {
-        auto [cid, pid_] = get_cluster_and_proc_id(condor_attr.starter_pid);
-        if (condor_attr.cluster_id == 0) condor_attr.cluster_id = cid;
-        if (condor_attr.proc_id == 0) condor_attr.proc_id = pid_;
-        job.NativeJobID = fmt::format("{}.{}", condor_attr.cluster_id, condor_attr.proc_id);
-    }
-
-    // 组字段：只在尚未成功探测过时补（读失败由 group_probe_attempts 有界重试）。
-    if (!job.group_probed) {
-        probe_groups(job);
-    }
-
-    return;
-}
 } // namespace CondorJob

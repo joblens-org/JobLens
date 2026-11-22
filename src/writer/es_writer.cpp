@@ -13,7 +13,6 @@
  * limitations under the License. */
 // elasticsearch_writer.cpp
 #include "writer/es_writer.hpp"
-#include "writer/batch_parser_cache.hpp"
 #include <spdlog/spdlog.h>
 #include <fmt/format.h>
 #include <fmt/chrono.h>
@@ -21,7 +20,6 @@
 #include <unordered_set>
 #include "common/config.hpp"
 #include "collector/collector_utils.hpp"
-#include "core/collector_registry.hpp"
 #include "core/writer_manager.hpp"
 #include "common/utils.hpp"
 
@@ -65,27 +63,6 @@ std::string format_utc8(std::chrono::system_clock::time_point tp)
     return os.str();
 }
 
-/// 生成 ES 文档 _id
-/// 格式：{cluster_name}_{clusterTag}_{job_id}_{timestamp_ns}
-/// - cluster_name: 从 Job.cluster_name 读取（公共属性）
-/// - clusterTag:  来自 Job.clusterTag
-/// - job_id:       Condor 用 "cluster_id.proc_id"，Slurm 用 "job_id.step_id"
-/// - timestamp_ns: 纳秒级时间戳，防止重复
-static std::string generate_doc_id(const Job& job,
-                                   std::chrono::system_clock::time_point ts)
-{
-    std::string cluster_name = job.cluster_name;
-    if (cluster_name.empty())
-        cluster_name = job.clusterTag;
-
-    std::string job_id_str = job.NativeJobID;
-
-    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        ts.time_since_epoch()).count();
-
-    return fmt::format("{}_{}_{}_{}", cluster_name, job.clusterTag, job_id_str, ns);
-}
-
 static size_t discard_cb(char*, size_t size, size_t n, void*) { return size * n; }
 
 /* ---------- 构造/析构 ---------- */
@@ -113,6 +90,21 @@ ESWriter::ESWriter(std::string name, std::string type, std::string config_name)
     if (write_timeout <= 0) throw std::invalid_argument("ESWriter write_timeout must be positive");
     opt_.index_prefix = Config::instance().getString(config_name, "index_prefix", "collector");
     opt_.insecure = Config::instance().getBool(config_name, "insecure", false);
+    if (Config::instance().has(config_name, "indexs")) {
+        struct es_index_config {
+            std::string collector_name;
+            std::string index_name;
+        };
+        auto config_indexs = Config::instance().getArray<es_index_config>(
+            config_name, "indexs",
+            [](const YAML::Node& node) {
+                es_index_config c;
+                c.collector_name = node["collector_name"].as<std::string>();
+                c.index_name = node["index_name"].as<std::string>();
+                return c;
+            });
+        for (const auto& c : config_indexs) index_map_[c.collector_name] = c.index_name;
+    }
     
     spdlog::debug("elasticsearch_writer {}: options - host={} port={} user='{}' index_prefix='{}' batch_size={} write_timeout={}",
                  name, opt_.host, opt_.port, opt_.user, opt_.index_prefix, opt_.batch_size, write_timeout);
@@ -126,7 +118,6 @@ ESWriter::ESWriter(std::string name, std::string type, std::string config_name)
         throw std::runtime_error("Failed to connect to Elasticsearch server at " +
                                  opt_.host + ":" + std::to_string(opt_.port));
     }
-    local_buf_.reserve(opt_.batch_size);
     spdlog::info("elasticsearch_writer {}: initialized with host={} port={} index_prefix='{}' batch_size={}",
                 name, opt_.host, opt_.port, opt_.index_prefix, opt_.batch_size);
 }
@@ -179,116 +170,73 @@ bool ESWriter::test_server()
     return true;
 }
 
-/* ---------- 子类缓冲 ---------- */
-void ESWriter::write(const write_data& w)
-{
-    this->BaseWriter::write(w);
-    // std::lock_guard lg(local_mtx_);
-    // spdlog::debug("elasticsearch_writer: write called for collector '{}'", std::get<0>(w));
-    // local_buf_.push_back(w);
-
-    // if (local_buf_.size() >= opt_.batch_size)
-    // {
-    //     /* 把整批数据一次性交给父类；父类会立即触发后台 flush */
-    //     std::vector<write_data> tmp = std::move(local_buf_);
-    //     local_buf_.clear();
-    //     local_buf_.reserve(opt_.batch_size);
-
-    //     /* 逐条写入父类缓冲区（父类内部会再次合并）*/
-    //     for (auto& item : tmp)
-    //         this->BaseWriter::write(std::move(item));
-    // }
-}
-
 std::string ESWriter::try_get_index_name(const std::string& collector_name)
 {
-    struct es_index_config
-    {
-        std::string collector_name;
-        std::string index_name;
-    };
+    auto it = index_map_.find(collector_name);
+    if (it != index_map_.end()) return it->second;
 
-    static std::unordered_map<std::string, std::string> index_map;
-    static std::once_flag init_flag;
-
-    std::call_once(init_flag, [config_name = config_name_]() {
-        auto config_indexs = Config::instance().getArray<es_index_config>(
-            config_name, "indexs",
-            [](const YAML::Node& node) {
-                es_index_config c;
-                c.collector_name = node["collector_name"].as<std::string>();
-                c.index_name = node["index_name"].as<std::string>();
-                return c;
-            });
-
-        for (const auto& c : config_indexs) {
-            index_map[c.collector_name] = c.index_name;
-        }
-    });
-
-    auto it = index_map.find(collector_name);
-    if (it != index_map.end()) {
-        return it->second;
-    }
-
-    // 缓存默认索引，避免每次重新构造
-    static std::unordered_map<std::string, std::string> default_index_cache;
-    static std::unordered_set<std::string> warned_collectors;
-    static std::mutex default_cache_mutex;
-
-    std::lock_guard<std::mutex> lock(default_cache_mutex);
-    auto default_it = default_index_cache.find(collector_name);
-    if (default_it != default_index_cache.end()) {
-        return default_it->second;
-    }
+    auto default_it = default_index_cache_.find(collector_name);
+    if (default_it != default_index_cache_.end()) return default_it->second;
 
     std::string default_index = fmt::format("{}_{}", opt_.index_prefix, collector_name);
-    default_index_cache[collector_name] = default_index;
+    default_index_cache_[collector_name] = default_index;
 
-    // 首次使用默认索引时发出警告
-    if (warned_collectors.find(default_index) == warned_collectors.end()) {
+    if (warned_index_.insert(default_index).second) {
         spdlog::warn("elasticsearch_writer: using default index for collector '{}'", default_index);
-        warned_collectors.insert(default_index);
     }
-
     return default_index;
 }
 
-bool ESWriter::try_parse_data(const std::string& collector_name, const std::any& data,
-                               const Job& job, std::chrono::system_clock::time_point ts, json& out,
-                               const CollectDataParseFuncV2& parser_func)
+/* ---------- 文档构造与批量发送 ---------- */
+bool ESWriter::build_document(const std::string& collector_name, const Job& job,
+                              std::chrono::system_clock::time_point ts, const std::string& record_id,
+                              json data, BulkDocument& out)
 {
-    if (!parser_func) {
-        spdlog::debug("elasticsearch_writer: no parser for collector '{}', writer '{}'", collector_name, type_);
-        out["error"] = "no parser registered";
+    json action;
+    auto index_name = try_get_index_name(collector_name);
+    index_name += date::format("_%Y.%m.%d", date::floor<date::days>(ts));
+    action["index"]["_index"] = index_name;
+    action["index"]["_id"] = record_id;
+    spdlog::trace("elasticsearch_writer: indexing to '{}'", index_name);
+    json src;
+    src["@timestamp"] = format_utc8(ts); //国产软件不能自己识别时区，要求东八区时间
+    src["hostname"] = collector_utils::get_hostname();
+    src["job_info"] = job_to_json(job);
+    if (Utils::has_template_vars(index_name)) {
+        json jobinfo;
+        jobinfo["job_info"] = src["job_info"];
+        auto flat_job = Utils::flatten_json(jobinfo);
+        action["index"]["_index"] = Utils::render_bracket(index_name, flat_job);
+        spdlog::trace("elasticsearch_writer: rendered index name '{}'",
+                      action["index"]["_index"].get<std::string>());
+    }
+    src["data"] = std::move(data);
+    std::string document = action.dump();
+    document += '\n';
+    document += src.dump();
+    document += '\n';
+
+    // 单文档不可切断；拒绝超限记录，但不阻塞同批次的正常记录。
+    if (document.size() > opt_.max_bulk_bytes) {
+        spdlog::error("elasticsearch_writer: oversized document not sent, collector={}, record={}, job_id={}, document_bytes={}, max_bulk_bytes={}",
+                      collector_name, record_id, job.JobID, document.size(), opt_.max_bulk_bytes);
         return false;
     }
-
-    spdlog::trace("elasticsearch_writer: using parser for collector '{}', writer '{}'", collector_name, type_);
-    try {
-        WriterParseContext ctx{name_, type_, config_name_, collector_name, job, ts};
-        auto parsed_data = parser_func(ctx, data);
-        out = std::any_cast<json>(std::move(parsed_data));
-    }
-    catch (const std::exception& e) {
-        spdlog::error("elasticsearch_writer: bad_any_cast for collector '{}': {}", collector_name, e.what());
-        out["error"] = std::string(e.what());
-        return false;
-    }
-
+    out.ndjson = std::move(document);
+    out.index = action["index"]["_index"].get<std::string>();
+    out.id = action["index"]["_id"].get<std::string>();
+    out.collector = collector_name;
     return true;
 }
 
-/* ---------- 真正写 ES ---------- */
-bool ESWriter::flush_impl(const std::vector<write_data>& batch)
+bool ESWriter::flush_documents(std::vector<BulkDocument> documents)
 {
     retry_documents_.clear();
-    if (batch.empty()) return true;
+    if (documents.empty()) return true;
 
     std::vector<BulkDocument> chunk;
     std::size_t chunk_bytes = 0;
     bool flush_ret = true;
-    BatchParserCache parsers(type_);
     auto send_chunk = [&]() {
         if (chunk.empty()) return;
         if (!send_documents(chunk)) flush_ret = false;
@@ -296,62 +244,52 @@ bool ESWriter::flush_impl(const std::vector<write_data>& batch)
         chunk_bytes = 0;
     };
 
-    for (const auto& [collect_name, job, any_data, ts] : batch)
+    for (auto& document : documents) {
+        if (chunk_bytes > opt_.max_bulk_bytes - document.ndjson.size()) send_chunk();
+        chunk_bytes += document.ndjson.size();
+        chunk.push_back(std::move(document));
+    }
+    send_chunk();
+    return flush_ret;
+}
+
+bool ESWriter::flush_impl(const std::vector<OutputRecordPtr>& batch)
+{
+    if (batch.empty()) return true;
+    std::vector<BulkDocument> documents;
+    bool flush_ret = true;
+
+    for (const auto& record : batch)
     {
         try {
-        json action;
-        auto index_name = try_get_index_name(collect_name);
-        index_name += date::format("_%Y.%m.%d", date::floor<date::days>(ts));
-        action["index"]["_index"] = index_name;
-        action["index"]["_id"] = generate_doc_id(job, ts);
-        spdlog::trace("elasticsearch_writer: indexing to '{}'", action["index"]["_index"].get<std::string>());
-        json src;
-        src["@timestamp"] = format_utc8(ts); //国产软件不能自己识别时区，要求东八区时间
-        src["hostname"] = collector_utils::get_hostname();
-        src["job_info"] = job_to_json(job);
-        if (Utils::has_template_vars(index_name)) {
-            json jobinfo;
-            jobinfo["job_info"] = src["job_info"];
-            auto flat_job = Utils::flatten_json(jobinfo);
-            action["index"]["_index"] = Utils::render_bracket(index_name, flat_job);
-            spdlog::trace("elasticsearch_writer: rendered index name '{}'", action["index"]["_index"].get<std::string>());
-        }
-        json jobj;
-        if (!try_parse_data(collect_name, any_data, job, ts, jobj, parsers.get(collect_name))) {
-            spdlog::error("elasticsearch_writer: parser failed, dropping collector={}, job_id={}", collect_name, job.JobID);
-            flush_ret = false;
-            continue;
-        }
-        src["data"] = std::move(jobj);
-        std::string document = action.dump();
-        document += '\n';
-        document += src.dump();
-        document += '\n';
-
-        // 单文档不可切断；拒绝超限记录，但不阻塞同批次的正常记录。
-        if (document.size() > opt_.max_bulk_bytes) {
-            spdlog::error("elasticsearch_writer: oversized document not sent, collector={}, job_id={}, document_bytes={}, max_bulk_bytes={}",
-                          collect_name, job.JobID, document.size(), opt_.max_bulk_bytes);
-            flush_ret = false;
-            continue;
-        }
-        // 按序列化后的实际字节计量，保留完整 action/source 对及末尾换行。
-        if (chunk_bytes > opt_.max_bulk_bytes - document.size()) {
-            send_chunk();
-        }
-        chunk_bytes += document.size();
-        chunk.push_back({std::move(document), action["index"]["_index"].get<std::string>(),
-                         action["index"]["_id"].get<std::string>(), collect_name});
+            if (!record || !record->sample) {
+                spdlog::error("elasticsearch_writer: native record without sample metadata, writer={}", name_);
+                flush_ret = false;
+                continue;
+            }
+            const auto* payload = std::get_if<Document>(&record->payload);
+            if (!payload || !payload->value.is_object()) {
+                spdlog::error("elasticsearch_writer: native payload is not a JSON object, collector={}, record={}",
+                              record->sample->collector_name, record->record_id);
+                flush_ret = false;
+                continue;
+            }
+            BulkDocument document;
+            if (!build_document(record->sample->collector_name, record->sample->job,
+                                record->sample->sampled_at, record->record_id,
+                                payload->value, document)) {
+                flush_ret = false;
+                continue;
+            }
+            documents.push_back(std::move(document));
         } catch (const std::exception& error) {
-            spdlog::error("elasticsearch_writer: document processing failed, collector={}, job_id={}, reason={}",
-                          collect_name, job.JobID, error.what());
+            spdlog::error("elasticsearch_writer: native document processing failed, reason={}", error.what());
             flush_ret = false;
         } catch (...) {
-            spdlog::error("elasticsearch_writer: document processing failed, collector={}, job_id={}, unknown exception", collect_name, job.JobID);
+            spdlog::error("elasticsearch_writer: native document processing failed, unknown exception");
             flush_ret = false;
         }
     }
 
-    send_chunk();
-    return flush_ret;
+    return flush_documents(std::move(documents)) && flush_ret;
 }

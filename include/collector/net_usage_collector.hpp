@@ -15,6 +15,7 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "core/collector_type.h"
+#include "core/output_record.h"
 #include "icollector.h"
 #include <spdlog/spdlog.h>
 #include <cstdint>
@@ -67,21 +68,22 @@ struct NetInfo{
     std::vector<Connection>     connections;
 };
 
-class NetUsageCollector : public ICollector{
+class NetUsageCollector : public IPeriodicJobCollector{
 public:
-    bool init(const nlohmann::json& cfg) override;
-    CollectResult collect(const Job& job) override;
+    bool init(const nlohmann::json& cfg, CollectorInitContext& context) override;
+    CollectOutcome collect(const Job& job, OutputContext& output) override;
     void deinit() noexcept override;
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type);
+    std::vector<OutputChannel> output_channels() const override;
+    std::vector<NetInfo> sample_job(const Job& job);
+    nlohmann::json to_document(const std::vector<NetInfo>& infos) const;
+    std::string to_text(const std::vector<NetInfo>& infos) const;
+    MetricBatch to_metrics(const std::vector<NetInfo>& infos) const;
 
     static size_t ConnectionHash(const Connection& c);
 
 private:
     void init_netlink();
     int query_single_tcp(Connection& conn); //使用netlink机制查询
-    void parse_tcp_info(const struct inet_diag_msg *m,
-                                       unsigned nlmsg_len,
-                                       Connection& conn);
     int netlink_fd = -1;
     bool netlink_inited = false;
     bool netlink_requested = false;

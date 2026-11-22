@@ -15,6 +15,7 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "core/collector_type.h"
+#include "core/output_record.h"
 #include "icollector.h"
 #include <chrono>
 #include <spdlog/spdlog.h>
@@ -52,13 +53,20 @@ struct CPUMemInfo{
     int         numThreads{};
 };
 
-class CPUMemCollector : public ICollector {
+class CPUMemCollector : public IPeriodicJobCollector {
 public:
-    bool init(const nlohmann::json& cfg) override;
-    CollectResult collect(const Job& job) override;
+    bool init(const nlohmann::json& cfg, CollectorInitContext& context) override;
+    CollectOutcome collect(const Job& job, OutputContext& output) override;
     void deinit() noexcept override;
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type);
-    CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type) override;
+    std::vector<OutputChannel> output_channels() const override;
+    std::vector<CPUMemInfo> sample_job(const Job& job);
+    nlohmann::json to_document(const std::vector<CPUMemInfo>& infos) const;
+    std::string to_text(const std::vector<CPUMemInfo>& infos,
+                        const std::string& writer_name,
+                        const std::string& writer_config_name,
+                        uint64_t job_id,
+                        std::chrono::system_clock::time_point sampled_at) const;
+    MetricBatch to_metrics(const std::vector<CPUMemInfo>& infos) const;
 
 private:
     struct CpuSample {

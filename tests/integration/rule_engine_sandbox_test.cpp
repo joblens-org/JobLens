@@ -65,35 +65,35 @@ int main() {
     // 1) 正常规则仍可用
     write_file(root / "good.lua", rule_with_condition(
         "good",
-        "return { passed = job.JobID == 42, collectors = {\"cpumem_collector\"} }"));
+        "return job.JobID == 42, \"cpumem_collector\""));
     // 2) io 不存在
     write_file(root / "io_write.lua",
         "return { name = \"io_write\", condition = function(job)\n"
         "  local f = io.open(\"" + (root / "pwned").string() + "\", \"w\")\n"
         "  if f ~= nil then f:write(\"x\") f:close() end\n"
-        "  return { passed = false, collectors = {} }\n"
+        "  return false\n"
         "end }\n");
     // 3) require/package 不存在
     write_file(root / "require_os.lua", rule_with_condition(
         "require_os",
         "local ok = pcall(function() return require(\"os\") end)\n"
-        "return { passed = not ok, collectors = {} }"));
+        "return not ok"));
     // 4) load 不存在
     write_file(root / "load_code.lua", rule_with_condition(
         "load_code",
         "local ok = pcall(function() return load(\"return true\") end)\n"
-        "return { passed = not ok, collectors = {} }"));
+        "return not ok"));
     // 5) 条件里的无限循环必须被预算中断
     write_file(root / "loop_condition.lua", rule_with_condition(
         "loop_condition", "while true do end"));
     // 6) 加载期的无限循环同样必须被中断
     write_file(root / "loop_load.lua",
         "while true do end\nreturn { name = \"loop_load\", condition = function(job) "
-        "return { passed = true, collectors = {} } end }\n");
+        "return true end }\n");
     // 7) 超大规则文件必须被拒绝
     {
         std::string big = "return { name = \"too_big\", condition = function(job) "
-                          "return { passed = true, collectors = {} } end }\n";
+                          "return true end }\n";
         big.append(300 * 1024, ' ');
         write_file(root / "too_big.lua", big);
     }
@@ -110,27 +110,27 @@ int main() {
     CHECK(load_ms < 5000);
 
     {
-        auto [passed, collectors] = engine.evaluate("good.lua", job);
-        CHECK(passed);
-        CHECK(collectors.size() == 1 && collectors[0] == "cpumem_collector");
+        const auto outcome = engine.evaluate("good.lua", job);
+        CHECK(outcome.accepted && outcome.error.empty());
+        CHECK(outcome.collectors.size() == 1 && outcome.collectors[0] == "cpumem_collector");
     }
     {
-        auto [passed, _] = engine.evaluate("io_write.lua", job);
-        CHECK(!passed);
+        const auto outcome = engine.evaluate("io_write.lua", job);
+        CHECK(!outcome.accepted && !outcome.error.empty());
         CHECK(!fs::exists(root / "pwned"));
     }
     {
-        auto [passed, _] = engine.evaluate("require_os.lua", job);
-        CHECK(passed);
-        auto [passed2, __] = engine.evaluate("load_code.lua", job);
-        CHECK(passed2);
+        const auto restricted_require = engine.evaluate("require_os.lua", job);
+        CHECK(restricted_require.accepted && restricted_require.error.empty());
+        const auto restricted_load = engine.evaluate("load_code.lua", job);
+        CHECK(restricted_load.accepted && restricted_load.error.empty());
     }
     {
         const auto start = std::chrono::steady_clock::now();
-        auto [passed, _] = engine.evaluate("loop_condition.lua", job);
+        const auto outcome = engine.evaluate("loop_condition.lua", job);
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count();
-        CHECK(!passed);
+        CHECK(!outcome.accepted && !outcome.error.empty());
         CHECK(elapsed < 5000);
     }
 
@@ -138,7 +138,7 @@ int main() {
     const fs::path outside = fs::temp_directory_path() /
         ("joblens-rule-outside-" + std::to_string(::getpid()) + ".lua");
     write_file(outside, rule_with_condition(
-        "outside", "return { passed = true, collectors = {} }"));
+        "outside", "return true"));
     CHECK(!engine.load_rule(outside.string()));
 
     // 9) 规则名/路径校验（与 RulesManager 内部使用的是同一组函数）

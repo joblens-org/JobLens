@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "collector/new_io_usage_collector.hpp"
+#include "core/output_context.hpp"
 #include "common/mountinfo_utils.hpp"
 #include "common/welford_utils.hpp"
 #include "core/collector_registry.hpp"
@@ -113,7 +114,7 @@ json io_counters_to_json(const IoCounters& io)
 
 }
 
-bool NewIOUsageCollector::init(const json& cfg){
+bool NewIOUsageCollector::init(const json& cfg, CollectorInitContext& /*context*/){
     include_process_details = !cfg.contains("include_process_details") ||
         cfg["include_process_details"].get<std::string>() == "true";
     spdlog::info("NewIOUsageCollector: configuration applied include_process_details={} details_configured={}",
@@ -242,7 +243,7 @@ bool NewIOUsageCollector::cleanup_dead_pids(uint64_t job_id, std::unordered_map<
     return cache_changed;
 }
 
-CollectResult NewIOUsageCollector::collect(const Job& job){
+JobIOStat NewIOUsageCollector::sample_job(const Job& job){
     JobIOStat result;
     result.job_id = job.JobID;
 
@@ -438,175 +439,135 @@ CollectResult NewIOUsageCollector::collect(const Job& job){
     return result;
 }
 
-CollectDataParseFunc NewIOUsageCollector::get_writer_parser(const std::string& writer_type){
-    if (writer_type.compare("ESWriter") == 0){
-        return [](std::any data) -> std::any {
-            if (!data.has_value()){
-                json j;
-                j["error"] = "empty data";
-                return j;
-            }
-            const auto& s = std::any_cast<const JobIOStat&>(data);
-            spdlog::debug("NewIOUsageCollector: ES serialization job_id={} processes={} files={}",
-                          s.job_id, s.processes.size(), s.files.size());
-            json j;
-            j["job_id"] = s.job_id;
-            j["collect_period"] = s.collect_period;
-            j["job_total"] = io_counters_to_json(s.job_total);
-            j["job_latency"] = {
-                {"read_hist", std::vector<u64>(std::begin(s.job_latency.read_hist), std::end(s.job_latency.read_hist))},
-                {"write_hist", std::vector<u64>(std::begin(s.job_latency.write_hist), std::end(s.job_latency.write_hist))}
-            };
-            j["files"] = json::array();
-            for (const auto& file_entry : s.files){
-                const auto& f = file_entry.second;
-                json fj;
-                fj["path"] = f.path;
-                fj["mount_point"] = f.mount_point;
-                fj["fs_type"] = f.fs_type;
-                fj["pos"] = nullptr; // File size is intentionally not queried.
-                fj["total"] = io_counters_to_json(f.total);
-                fj["processes"] = json::array();
-                for (const auto& [pid, p] : f.processes){
-                    json pj = io_counters_to_json(p.io);
-                    pj["pid"] = pid;
-                    pj["alive"] = p.alive;
-                    fj["processes"].push_back(std::move(pj));
-                }
-                j["files"].push_back(std::move(fj));
-            }
-            j["processes"] = json::array();
-            for (const auto& [pid, p] : s.processes){
-                json pj = io_counters_to_json(p.io);
-                pj["pid"] = pid;
-                pj["source"] = p.source;
-                pj["alive"] = p.alive;
-                j["processes"].push_back(std::move(pj));
-            }
-            return j;
-        };
-    }
+std::vector<OutputChannel> NewIOUsageCollector::output_channels() const {
+    return {{"document", OutputKind::Document}, {"text", OutputKind::Text}};
+}
 
-    if (writer_type.compare("FileWriter") == 0){
-        return [](std::any data) -> std::any {
-            if (!data.has_value()){
-                return std::string("NewIOUsageCollector error=empty_data\n");
-            }
-            const auto& s = std::any_cast<const JobIOStat&>(data);
-            std::ostringstream out;
-            out << "NewIOUsageCollector job_id=" << s.job_id
-                << " collect_period=" << s.collect_period
-                << " rchar=" << s.job_total.rchar
-                << " wchar=" << s.job_total.wchar
-                << " syscr=" << s.job_total.syscr
-                << " syscw=" << s.job_total.syscw
-                << " read_mean=" << s.job_total.read_mean
-                << " write_mean=" << s.job_total.write_mean
-                << " read_variance=" << s.job_total.read_variance
-                << " write_variance=" << s.job_total.write_variance
-                << " rchar_speed=" << s.job_total.rchar_speed
-                << " wchar_speed=" << s.job_total.wchar_speed
+nlohmann::json NewIOUsageCollector::to_document(const JobIOStat& s) const {
+    nlohmann::json j;
+    j["job_id"] = s.job_id;
+    j["collect_period"] = s.collect_period;
+    j["job_total"] = io_counters_to_json(s.job_total);
+    j["job_latency"] = {
+        {"read_hist", std::vector<u64>(std::begin(s.job_latency.read_hist), std::end(s.job_latency.read_hist))},
+        {"write_hist", std::vector<u64>(std::begin(s.job_latency.write_hist), std::end(s.job_latency.write_hist))}
+    };
+    j["files"] = nlohmann::json::array();
+    for (const auto& file_entry : s.files){
+        const auto& f = file_entry.second;
+        nlohmann::json fj;
+        fj["path"] = f.path;
+        fj["mount_point"] = f.mount_point;
+        fj["fs_type"] = f.fs_type;
+        fj["pos"] = nullptr;
+        fj["total"] = io_counters_to_json(f.total);
+        fj["processes"] = nlohmann::json::array();
+        for (const auto& [pid, p] : f.processes){
+            nlohmann::json pj = io_counters_to_json(p.io);
+            pj["pid"] = pid;
+            pj["alive"] = p.alive;
+            fj["processes"].push_back(std::move(pj));
+        }
+        j["files"].push_back(std::move(fj));
+    }
+    j["processes"] = nlohmann::json::array();
+    for (const auto& [pid, p] : s.processes){
+        nlohmann::json pj = io_counters_to_json(p.io);
+        pj["pid"] = pid;
+        pj["source"] = p.source;
+        pj["alive"] = p.alive;
+        j["processes"].push_back(std::move(pj));
+    }
+    return j;
+}
+
+std::string NewIOUsageCollector::to_text(const JobIOStat& s) const {
+    std::ostringstream out;
+    out << "NewIOUsageCollector job_id=" << s.job_id
+        << " collect_period=" << s.collect_period
+        << " rchar=" << s.job_total.rchar
+        << " wchar=" << s.job_total.wchar
+        << " syscr=" << s.job_total.syscr
+        << " syscw=" << s.job_total.syscw
+        << " read_mean=" << s.job_total.read_mean
+        << " write_mean=" << s.job_total.write_mean
+        << " read_variance=" << s.job_total.read_variance
+        << " write_variance=" << s.job_total.write_variance
+        << " rchar_speed=" << s.job_total.rchar_speed
+        << " wchar_speed=" << s.job_total.wchar_speed
+        << '\n';
+    for (size_t i = 0; i < LATENCY_BUCKETS; ++i){
+        if (s.job_latency.read_hist[i] == 0 && s.job_latency.write_hist[i] == 0) continue;
+        out << "NewIOUsageCollector latency_bucket"
+            << " job_id=" << s.job_id
+            << " bucket=" << i
+            << " read_count=" << s.job_latency.read_hist[i]
+            << " write_count=" << s.job_latency.write_hist[i]
+            << '\n';
+    }
+    for (const auto& [pid, p] : s.processes){
+        out << "NewIOUsageCollector process"
+            << " job_id=" << s.job_id
+            << " pid=" << pid
+            << " source=" << p.source
+            << " alive=" << p.alive
+            << " rchar=" << p.io.rchar
+            << " wchar=" << p.io.wchar
+            << " syscr=" << p.io.syscr
+            << " syscw=" << p.io.syscw
+            << " read_mean=" << p.io.read_mean
+            << " write_mean=" << p.io.write_mean
+            << " read_variance=" << p.io.read_variance
+            << " write_variance=" << p.io.write_variance
+            << " rchar_speed=" << p.io.rchar_speed
+            << " wchar_speed=" << p.io.wchar_speed
+            << '\n';
+    }
+    for (const auto& file_entry : s.files){
+        const auto& f = file_entry.second;
+        out << "NewIOUsageCollector file"
+            << " job_id=" << s.job_id
+            << " path=" << f.path
+            << " mount_point=" << f.mount_point
+            << " fs_type=" << f.fs_type
+            << " pos=unknown"
+            << " rchar=" << f.total.rchar
+            << " wchar=" << f.total.wchar
+            << " syscr=" << f.total.syscr
+            << " syscw=" << f.total.syscw
+            << " read_mean=" << f.total.read_mean
+            << " write_mean=" << f.total.write_mean
+            << " read_variance=" << f.total.read_variance
+            << " write_variance=" << f.total.write_variance
+            << " rchar_speed=" << f.total.rchar_speed
+            << " wchar_speed=" << f.total.wchar_speed
+            << '\n';
+        for (const auto& [pid, p] : f.processes){
+            out << "NewIOUsageCollector file_process"
+                << " job_id=" << s.job_id
+                << " path=" << f.path
+                << " pid=" << pid
+                << " alive=" << p.alive
+                << " rchar=" << p.io.rchar
+                << " wchar=" << p.io.wchar
+                << " syscr=" << p.io.syscr
+                << " syscw=" << p.io.syscw
+                << " read_mean=" << p.io.read_mean
+                << " write_mean=" << p.io.write_mean
+                << " read_variance=" << p.io.read_variance
+                << " write_variance=" << p.io.write_variance
+                << " rchar_speed=" << p.io.rchar_speed
+                << " wchar_speed=" << p.io.wchar_speed
                 << '\n';
-            for (size_t i = 0; i < LATENCY_BUCKETS; ++i){
-                if (s.job_latency.read_hist[i] != 0 || s.job_latency.write_hist[i] != 0){
-                    out << "NewIOUsageCollector latency_bucket"
-                        << " job_id=" << s.job_id
-                        << " bucket=" << i
-                        << " read_count=" << s.job_latency.read_hist[i]
-                        << " write_count=" << s.job_latency.write_hist[i]
-                        << '\n';
-                }
-            }
-            for (const auto& [pid, p] : s.processes){
-                out << "NewIOUsageCollector process"
-                    << " job_id=" << s.job_id
-                    << " pid=" << pid
-                    << " source=" << p.source
-                    << " alive=" << p.alive
-                    << " rchar=" << p.io.rchar
-                    << " wchar=" << p.io.wchar
-                    << " syscr=" << p.io.syscr
-                    << " syscw=" << p.io.syscw
-                    << " read_mean=" << p.io.read_mean
-                    << " write_mean=" << p.io.write_mean
-                    << " read_variance=" << p.io.read_variance
-                    << " write_variance=" << p.io.write_variance
-                    << " rchar_speed=" << p.io.rchar_speed
-                    << " wchar_speed=" << p.io.wchar_speed
-                    << '\n';
-            }
-            for (const auto& file_entry : s.files){
-                const auto& f = file_entry.second;
-                out << "NewIOUsageCollector file"
-                    << " job_id=" << s.job_id
-                    << " path=" << f.path
-                    << " mount_point=" << f.mount_point
-                    << " fs_type=" << f.fs_type
-                    << " pos=unknown"
-                    << " rchar=" << f.total.rchar
-                    << " wchar=" << f.total.wchar
-                    << " syscr=" << f.total.syscr
-                    << " syscw=" << f.total.syscw
-                    << " read_mean=" << f.total.read_mean
-                    << " write_mean=" << f.total.write_mean
-                    << " read_variance=" << f.total.read_variance
-                    << " write_variance=" << f.total.write_variance
-                    << " rchar_speed=" << f.total.rchar_speed
-                    << " wchar_speed=" << f.total.wchar_speed
-                    << '\n';
-                for (const auto& [pid, p] : f.processes){
-                    out << "NewIOUsageCollector file_process"
-                        << " job_id=" << s.job_id
-                        << " path=" << f.path
-                        << " pid=" << pid
-                        << " alive=" << p.alive
-                        << " rchar=" << p.io.rchar
-                        << " wchar=" << p.io.wchar
-                        << " syscr=" << p.io.syscr
-                        << " syscw=" << p.io.syscw
-                        << " read_mean=" << p.io.read_mean
-                        << " write_mean=" << p.io.write_mean
-                        << " read_variance=" << p.io.read_variance
-                        << " write_variance=" << p.io.write_variance
-                        << " rchar_speed=" << p.io.rchar_speed
-                        << " wchar_speed=" << p.io.wchar_speed
-                        << '\n';
-                }
-            }
-            return out.str();
-        };
+        }
     }
+    return out.str();
+}
 
-    if (writer_type.compare("PrometheusExporterWriter") == 0){
-        return [](std::any data) -> std::any {
-            PrometheusExporterWriter::prometheus_job_state ret;
-            if (!data.has_value()){
-                ret.JobID = 0;
-                return ret;
-            }
-            const auto& s = std::any_cast<const JobIOStat&>(data);
-            ret.JobID = static_cast<int>(s.job_id);
-            ret.io_rchar_total = static_cast<int64_t>(s.job_total.rchar);
-            ret.io_wchar_total = static_cast<int64_t>(s.job_total.wchar);
-            ret.io_rchar_per_sec = s.job_total.rchar_speed;
-            ret.io_wchar_per_sec = s.job_total.wchar_speed;
-            PrometheusExporterWriter::prometheus_process_state jobstate;
-            jobstate.pid = 0;
-            jobstate.io_read_bytes_total = static_cast<int64_t>(s.job_total.rchar);
-            jobstate.io_write_bytes_total = static_cast<int64_t>(s.job_total.wchar);
-            jobstate.io_read_bytes_per_sec = s.job_total.rchar_speed;
-            jobstate.io_write_bytes_per_sec = s.job_total.wchar_speed;
-            ret.processes_state.push_back(jobstate);
-            for (const auto& [pid, p] : s.processes){
-                PrometheusExporterWriter::prometheus_process_state ps;
-                ps.pid = pid;
-                ps.io_read_bytes_total = static_cast<int64_t>(p.io.rchar);
-                ps.io_write_bytes_total = static_cast<int64_t>(p.io.wchar);
-                ret.processes_state.push_back(ps);
-            }
-            return ret;
-        };
-    }
-
-    return nullptr;
+CollectOutcome NewIOUsageCollector::collect(const Job& job, OutputContext& output) {
+    if (!output.enabled("document") && !output.enabled("text")) return {};
+    const auto stat = sample_job(job);
+    if (output.enabled("document")) output.emit("document", Document{to_document(stat)});
+    if (output.enabled("text")) output.emit("text", Text{to_text(stat)});
+    return {};
 }

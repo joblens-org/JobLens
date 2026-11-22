@@ -15,254 +15,297 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "writer/prometheus_exporter_writer.hpp"
-#include "writer/batch_parser_cache.hpp"
 #include "core/collector_type.h"
 #include "core/group_probe_stats.hpp"
-#include <spdlog/spdlog.h>
-#include "core/collector_registry.hpp"
 #include "core/writer_manager.hpp"
-#include <ctime>
+
+#include <algorithm>
+#include <cctype>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <fmt/format.h>
+#include <spdlog/spdlog.h>
+
+namespace {
+bool valid_metric_name(std::string_view name)
+{
+    if (name.empty()) return false;
+    const auto is_first = [](unsigned char c) {
+        return std::isalpha(c) || c == '_' || c == ':';
+    };
+    const auto is_rest = [](unsigned char c) {
+        return std::isalnum(c) || c == '_' || c == ':';
+    };
+    if (!is_first(static_cast<unsigned char>(name.front()))) return false;
+    for (size_t index = 1; index < name.size(); ++index) {
+        if (!is_rest(static_cast<unsigned char>(name[index]))) return false;
+    }
+    return true;
+}
+
+bool valid_label_name(std::string_view name)
+{
+    if (name.empty()) return false;
+    const auto is_first = [](unsigned char c) {
+        return std::isalpha(c) || c == '_';
+    };
+    const auto is_rest = [](unsigned char c) {
+        return std::isalnum(c) || c == '_';
+    };
+    if (!is_first(static_cast<unsigned char>(name.front()))) return false;
+    for (size_t index = 1; index < name.size(); ++index) {
+        if (!is_rest(static_cast<unsigned char>(name[index]))) return false;
+    }
+    return true;
+}
+
+std::string escape_help(std::string_view help)
+{
+    std::string out;
+    out.reserve(help.size());
+    for (char value : help) {
+        if (value == '\\') out += "\\\\";
+        else if (value == '\n') out += "\\n";
+        else out.push_back(value);
+    }
+    return out;
+}
+
+std::string escape_label(std::string_view value)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (char character : value) {
+        if (character == '\\') out += "\\\\";
+        else if (character == '"') out += "\\\"";
+        else if (character == '\n') out += "\\n";
+        else out.push_back(character);
+    }
+    return out;
+}
+} // namespace
 
 AUTO_REGISTER_WRITER(
     PrometheusExporterWriter,
-    "Writer for Prometheus Exporter via FIFO",
-    ConfigParams{
-        {"fifo_path", "Path to the FIFO file, e.g., /tmp/prom_metrics.fifo"}
-    }
+    "Generic Prometheus metrics writer exposed through RPC",
+    ConfigParams{}
 )
 
 PrometheusExporterWriter::PrometheusExporterWriter(const std::string& name,
                                                    std::string type,
                                                    const std::string& config_name)
     : BaseWriter(name, "PrometheusExporterWriter", config_name)
-      {
-
-    // 注册RPC方法
+{
     register_rpc_methods();
-    
 }
 
-PrometheusExporterWriter::~PrometheusExporterWriter(){
+PrometheusExporterWriter::~PrometheusExporterWriter()
+{
     shutdown();
 }
 
-enum class PrmxsCollectorType{
-    CPUMem,
-    IO,
-    Net,
-    Power,
-    FSMetadata,
-    UNKNOWN
-};
-
-static inline PrmxsCollectorType type2enum(const std::string& type){
-    static const std::unordered_map<std::string, PrmxsCollectorType> map = {
-        {"CPUMemCollector", PrmxsCollectorType::CPUMem},
-        {"NetUsageCollector", PrmxsCollectorType::Net},
-        {"IOUsageCollector", PrmxsCollectorType::IO},
-        {"PowerCollector", PrmxsCollectorType::Power},
-        {"FSMetadataCollector", PrmxsCollectorType::FSMetadata}
-    };
-    auto it = map.find(type);
-    return (it != map.end()) ? it->second : PrmxsCollectorType::UNKNOWN;
+bool PrometheusExporterWriter::SeriesKey::operator<(const SeriesKey& other) const
+{
+    if (name != other.name) return name < other.name;
+    const size_t count = std::min(labels.size(), other.labels.size());
+    for (size_t index = 0; index < count; ++index) {
+        if (labels[index].name != other.labels[index].name)
+            return labels[index].name < other.labels[index].name;
+        if (labels[index].value != other.labels[index].value)
+            return labels[index].value < other.labels[index].value;
+    }
+    return labels.size() < other.labels.size();
 }
 
-void PrometheusExporterWriter::update_job_metrics(const prometheus_job_state& data,const std::string& type){
-    if (!data.JobID) return;
-    const auto collector_type = type2enum(type);
-    std::unique_lock lk(mtx_);
-    auto& metric = job_metrics_[data.JobID];
-    
-    metric.JobID = data.JobID;
-    // 组 label 是 job 级字段：合并进内存表时必须带上，否则 json_metrics 输出空值。
-    metric.group = data.group;
-    spdlog::trace("PrometheusExporterWriter: update job id: {}", metric.JobID);
-    
-    // Indices survive vector growth and preserve first-seen PID ordering.
-    std::unordered_map<pid_t, std::size_t> process_indices;
-    process_indices.reserve(metric.processes_state.size() + data.processes_state.size());
-    for (std::size_t i = 0; i < metric.processes_state.size(); ++i) {
-        process_indices.emplace(metric.processes_state[i].pid, i);
+size_t PrometheusExporterWriter::SeriesKeyHash::operator()(const SeriesKey& key) const
+{
+    size_t hash = std::hash<std::string>{}(key.name);
+    for (const auto& label : key.labels) {
+        hash ^= std::hash<std::string>{}(label.name) + 0x9e3779b97f4a7c15ULL +
+                (hash << 6) + (hash >> 2);
+        hash ^= std::hash<std::string>{}(label.value) + 0x9e3779b97f4a7c15ULL +
+                (hash << 6) + (hash >> 2);
     }
-
-    for(const auto& s: data.processes_state){
-        const auto [it, inserted] = process_indices.emplace(s.pid, metric.processes_state.size());
-        if (inserted) {
-            metric.processes_state.emplace_back();
-            metric.processes_state.back().job_id = data.JobID;
-            metric.processes_state.back().pid = s.pid;
-        }
-        auto* update_ref = &metric.processes_state[it->second];
-        spdlog::trace("PrometheusExporterWriter: use type {}", static_cast<int>(collector_type));
-        spdlog::trace("PrometheusExporterWriter: update job pid: {}", s.pid);
-        switch (collector_type)
-        {
-            case PrmxsCollectorType::CPUMem:
-                update_ref->name = s.name;
-                update_ref->cpu_usage_percent = s.cpu_usage_percent;
-                update_ref->mem_rss_kb = s.mem_rss_kb;
-                update_ref->threads_cnt = s.threads_cnt;
-                update_ref->mem_usage_percent = s.mem_usage_percent;
-                update_ref->mem_vm_kb = s.mem_vm_kb;
-                update_ref->mem_pss_kb = s.mem_pss_kb;
-                break;
-            
-            case PrmxsCollectorType::IO:
-                update_ref->io_read_bytes_per_sec = s.io_read_bytes_per_sec;
-                update_ref->io_read_bytes_total = s.io_read_bytes_total;
-                update_ref->io_write_bytes_per_sec = s.io_write_bytes_per_sec;
-                update_ref->io_write_bytes_total = s.io_write_bytes_total;
-                break;
-            
-            case PrmxsCollectorType::Net:
-                update_ref->net_recv_bytes_per_sec = s.net_recv_bytes_per_sec;
-                update_ref->net_recv_bytes_total = s.net_recv_bytes_total;
-                update_ref->net_send_bytes_per_sec = s.net_send_bytes_per_sec;
-                update_ref->net_sent_bytes_total = s.net_sent_bytes_total;
-                update_ref->tcp_retrans_total = s.tcp_retrans_total;
-                update_ref->tcp_rtt_us = s.tcp_rtt_us;
-                break;
-            case PrmxsCollectorType::Power:
-                /* Reuse existing fields with power semantics:
-                 *   cpu_usage_percent → energy_j (Joules attributed to this job)
-                 *   mem_usage_percent → energy_pct (this job's share of total RAPL)
-                 *   mem_rss_kb        → avg_power_w (J / interval_s)
-                 *   mem_vm_kb         → weighted_ns (ns·MHz total)
-                 *   threads_cnt       → pid_count (processes in this job)
-                 */
-                update_ref->name = s.name;
-                update_ref->cpu_usage_percent = s.cpu_usage_percent;
-                update_ref->mem_usage_percent = s.mem_usage_percent;
-                update_ref->mem_rss_kb = s.mem_rss_kb;
-                update_ref->mem_vm_kb = s.mem_vm_kb;
-                update_ref->threads_cnt = s.threads_cnt;
-                break;
-            case PrmxsCollectorType::FSMetadata:
-                update_ref->fs_metadata_ops_total = s.fs_metadata_ops_total;
-                update_ref->fs_metadata_ops_per_sec = s.fs_metadata_ops_per_sec;
-                update_ref->fs_metadata_errors_total = s.fs_metadata_errors_total;
-                update_ref->fs_metadata_errors_per_sec = s.fs_metadata_errors_per_sec;
-                break;
-            case PrmxsCollectorType::UNKNOWN:
-                spdlog::warn("PrometheusExporterWriter: type2enum get UNKNOW for {}", type);
-                break;
-            default:
-                break;
-        }
-    }
-
-    return;
+    return hash;
 }
 
-bool PrometheusExporterWriter::flush_impl(const std::vector<write_data>& batch){
-    BatchParserCache parsers(type_);
-    for (const auto& [collect_name, job, any_data, ts] : batch)
-    {
-        spdlog::trace("PrometheusExporterWriter: get in flush");
-        WriterParseContext ctx{name_, type_, config_name_, collect_name, job, ts};
-        const auto& parser_func = parsers.get(collect_name);
-        spdlog::trace("PrometheusExporterWriter: using parser for collector '{}', writer '{}'", collect_name, type_);
-        auto collector_type = CollectorRegistry::instance().getCollectorType(collect_name);
-        auto parsed = std::any_cast<PrometheusExporterWriter::prometheus_job_state>(parser_func(ctx, any_data));
-        spdlog::trace("PrometheusExporterWriter: size of parsed: {}", parsed.processes_state.size());
-        parsed.JobID = job.JobID;
-        // 组 label 取原始计费组原值（getGroups 视图）；>128 字节截断并计数。
-        {
-            auto g = getGroups(job);
-            if (g.acct_group.size() > 128) {
-                parsed.group = g.acct_group.substr(0, 125) + "...";
-                GroupProbeStats::instance().record_truncated();
-            } else {
-                parsed.group = g.acct_group;
+void PrometheusExporterWriter::update_batch(const MetricBatch& batch,
+                                            const SampleMetadata& sample)
+{
+    auto group = getGroups(sample.job).acct_group;
+    if (group.size() > 128) {
+        group = group.substr(0, 125) + "...";
+        GroupProbeStats::instance().record_truncated();
+    }
+    std::unique_lock lock(mtx_);
+    if (!group.empty()) job_groups_[sample.job.JobID] = std::move(group);
+    for (const auto& incoming : batch.samples) {
+        if (!valid_metric_name(incoming.name)) {
+            ++invalid_samples_;
+            continue;
+        }
+
+        std::vector<MetricLabel> labels;
+        labels.reserve(incoming.labels.size() + 1);
+        bool invalid = false;
+        for (const auto& label : incoming.labels) {
+            if (!valid_label_name(label.name)) {
+                invalid = true;
+                break;
             }
+            auto existing = std::find_if(labels.begin(), labels.end(),
+                [&](const MetricLabel& value) { return value.name == label.name; });
+            if (existing != labels.end()) existing->value = label.value;
+            else labels.push_back(label);
         }
-        update_job_metrics(parsed, collector_type);
+        if (invalid) {
+            ++invalid_samples_;
+            continue;
+        }
+        if (std::none_of(labels.begin(), labels.end(),
+                         [](const MetricLabel& label) { return label.name == "jobid"; })) {
+            labels.push_back({"jobid", std::to_string(sample.job.JobID)});
+        }
+        std::sort(labels.begin(), labels.end(),
+                  [](const MetricLabel& lhs, const MetricLabel& rhs) {
+                      return lhs.name < rhs.name;
+                  });
+
+        SeriesKey key{incoming.name, std::move(labels)};
+        auto [it, inserted] = series_.try_emplace(std::move(key), Series{});
+        Series& series = it->second;
+        if (inserted) {
+            series.type = incoming.type;
+            series.help = incoming.help;
+            series.job_id = sample.job.JobID;
+            job_ids_.insert(sample.job.JobID);
+        } else {
+            if (series.type != incoming.type) {
+                spdlog::warn("PrometheusExporterWriter: metric {} changed type from {} to {}; keeping {}",
+                             it->first.name, to_string(series.type), to_string(incoming.type),
+                             to_string(series.type));
+            }
+            if (series.help.empty()) series.help = incoming.help;
+        }
+        series.value = incoming.value;
+    }
+}
+
+bool PrometheusExporterWriter::flush_impl(const std::vector<OutputRecordPtr>& batch)
+{
+    for (const auto& record : batch) {
+        if (!record || !record->sample) {
+            spdlog::error("PrometheusExporterWriter: native record without sample metadata");
+            continue;
+        }
+        const auto* metrics = std::get_if<MetricBatch>(&record->payload);
+        if (!metrics) {
+            spdlog::error("PrometheusExporterWriter: native payload is not a MetricBatch, collector={}, record={}",
+                          record->sample->collector_name, record->record_id);
+            continue;
+        }
+        update_batch(*metrics, *record->sample);
     }
     return true;
 }
 
-void PrometheusExporterWriter::register_rpc_methods() {
-    auto& rpc_server_ = RPCServer::instance();
-    // 注册metrics方法，返回序列化的指标数据
-    rpc_server_.register_method(name_ + "/metrics", [this](const json& params) -> json {
-        spdlog::debug("PrometheusExporterWriter: handling metrics request");
-        try {
-            return json_metrics();
-        } catch (const std::exception& e) {
-            spdlog::error("PrometheusExporterWriter: error serializing metrics: {}", e.what());
-            json error_response = {{ "error", e.what() }};
-            return error_response;
-        }
+void PrometheusExporterWriter::register_rpc_methods()
+{
+    auto& rpc_server = RPCServer::instance();
+    rpc_server.register_method(name_ + "/metrics", [this](const json&) -> json {
+        return json_metrics();
     });
-    
-    // 注册info方法，返回基本信息
-    rpc_server_.register_method(name_ + "/info", [this](const json& params) -> json {
-        std::shared_lock lk(mtx_);
-        json response = {
+    rpc_server.register_method(name_ + "/metrics_text", [this](const json&) -> json {
+        return prometheus_text();
+    });
+    rpc_server.register_method(name_ + "/info", [this](const json&) -> json {
+        std::shared_lock lock(mtx_);
+        return {
             {"name", name_},
             {"type", type_},
             {"config_name", config_name_},
-            {"fifo_path", fifo_path_},
-            {"job_count", job_metrics_.size()},
-            {"running", !stop_.load()}
+            {"series_count", series_.size()},
+            {"job_count", job_ids_.size()},
+            {"invalid_samples", invalid_samples_},
         };
-        return response;
     });
-
-    spdlog::info("PrometheusExporterWriter: registered RPC methods: metrics, info");
 }
 
-json PrometheusExporterWriter::json_metrics(){
-    std::shared_lock lk(mtx_);
-    json wrapper = json::object();
-    for (const auto& [key, value] : job_metrics_)
-        wrapper[std::to_string(key)] = nlohmann::adl_serializer<prometheus_job_state>::to_json(value);
-    return wrapper;
+std::vector<MetricLabel> PrometheusExporterWriter::labels_with_group(
+    const SeriesKey& key, const Series& series) const
+{
+    auto labels = key.labels;
+    if (auto group = job_groups_.find(series.job_id); group != job_groups_.end()) {
+        auto pos = std::lower_bound(labels.begin(), labels.end(), "group",
+            [](const MetricLabel& label, std::string_view name) { return label.name < name; });
+        if (pos != labels.end() && pos->name == "group") pos->value = group->second;
+        else labels.insert(pos, MetricLabel{"group", group->second});
+    }
+    return labels;
 }
 
-/*-------------------- process_state 序列化 --------------------*/
-json nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_process_state>::to_json(
-    const PrometheusExporterWriter::prometheus_process_state& s){
-    return json{
-        {"job_id",                     s.job_id},
-        {"pid",                        s.pid},
-        {"name",                       s.name},
+nlohmann::json PrometheusExporterWriter::json_metrics() const
+{
+    std::shared_lock lock(mtx_);
+    std::vector<const std::pair<const SeriesKey, Series>*> ordered;
+    ordered.reserve(series_.size());
+    for (const auto& entry : series_) ordered.push_back(&entry);
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto* lhs, const auto* rhs) { return lhs->first < rhs->first; });
 
-        {"cpu_usage_percent",          s.cpu_usage_percent},
-
-        {"mem_usage_percent",          s.mem_usage_percent},
-        {"mem_rss_kb",                 s.mem_rss_kb},
-        {"mem_vm_kb",                  s.mem_vm_kb},
-        {"mem_pss_kb",                 s.mem_pss_kb},
-        {"threads_cnt",                s.threads_cnt},
-
-        {"io_read_bytes_total",        s.io_read_bytes_total},
-        {"io_write_bytes_total",       s.io_write_bytes_total},
-        {"io_read_bytes_per_sec",      s.io_read_bytes_per_sec},
-        {"io_write_bytes_per_sec",     s.io_write_bytes_per_sec},
-
-        {"net_sent_bytes_total",       s.net_sent_bytes_total},
-        {"net_recv_bytes_total",       s.net_recv_bytes_total},
-        {"net_send_bytes_per_sec",     s.net_send_bytes_per_sec},
-        {"net_recv_bytes_per_sec",     s.net_recv_bytes_per_sec},
-        {"tcp_retrans_total",          s.tcp_retrans_total},
-        {"tcp_rtt_us",                 s.tcp_rtt_us},
-
-        {"fs_metadata_ops_total",      s.fs_metadata_ops_total},
-        {"fs_metadata_ops_per_sec",    s.fs_metadata_ops_per_sec},
-        {"fs_metadata_errors_total",    s.fs_metadata_errors_total},
-        {"fs_metadata_errors_per_sec",  s.fs_metadata_errors_per_sec}
-    };
+    auto metrics = json::array();
+    for (const auto* entry : ordered) {
+        json labels = json::object();
+        for (const auto& label : labels_with_group(entry->first, entry->second)) labels[label.name] = label.value;
+        metrics.push_back({
+            {"name", entry->first.name},
+            {"type", to_string(entry->second.type)},
+            {"help", entry->second.help},
+            {"labels", std::move(labels)},
+            {"value", entry->second.value},
+        });
+    }
+    return {{"metrics", std::move(metrics)}};
 }
 
-/*-------------------- job_state 序列化 --------------------*/
-json nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_job_state>::to_json(
-    const PrometheusExporterWriter::prometheus_job_state& j){
-    json proc_array = json::array();
-    for (const auto& p : j.processes_state)
-        proc_array.push_back(nlohmann::adl_serializer<PrometheusExporterWriter::prometheus_process_state>::to_json(p));
+std::string PrometheusExporterWriter::prometheus_text() const
+{
+    std::shared_lock lock(mtx_);
+    std::vector<const std::pair<const SeriesKey, Series>*> ordered;
+    ordered.reserve(series_.size());
+    for (const auto& entry : series_) ordered.push_back(&entry);
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto* lhs, const auto* rhs) { return lhs->first < rhs->first; });
 
-    json result{{"JobID", j.JobID}, {"group", j.group}};
-    result["process_state"] = std::move(proc_array);
-    return result;
+    std::string output;
+    std::string current_name;
+    for (const auto* entry : ordered) {
+        const auto& key = entry->first;
+        const auto& series = entry->second;
+        if (key.name != current_name) {
+            current_name = key.name;
+            if (!series.help.empty())
+                output += "# HELP " + key.name + " " + escape_help(series.help) + "\n";
+            output += "# TYPE " + key.name + " " + to_string(series.type) + "\n";
+        }
+        output += key.name;
+        const auto labels = labels_with_group(key, series);
+        if (!labels.empty()) {
+            output.push_back('{');
+            for (size_t index = 0; index < labels.size(); ++index) {
+                if (index) output.push_back(',');
+                output += labels[index].name;
+                output += "=\"";
+                output += escape_label(labels[index].value);
+                output.push_back('"');
+            }
+            output.push_back('}');
+        }
+        output.push_back(' ');
+        output += fmt::format("{}", series.value);
+        output.push_back('\n');
+    }
+    return output;
 }

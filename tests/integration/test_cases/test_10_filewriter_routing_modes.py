@@ -352,8 +352,8 @@ def test_append_mode_shared_path_valid_text(
     注意: 当前 preset 配置仅包含 cpumem_collector（job_registry 中唯一可用的
     作业级 collector）。多 collector 共享同一路径的完整场景（如 cpumem + proc）
     因 preset 中无第二个可产生输出的 collector 而无法在此测试中覆盖。
-    C++ 层面的 append 多 collector 共享路径逻辑已在 Task 5 实现，但集成测试
-    覆盖受限。详见 .omo/notepads/filewriter-enhancements/issues.md。
+    C++ 层面已支持 append 多 collector 共享路径；此处因 preset 缺少第二个
+    可产生输出的 collector，集成测试覆盖受限。
     """
     _deploy_config_and_restart(worker, "filewriter_append_shared")
 

@@ -15,6 +15,7 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "core/collector_type.h"
+#include "core/output_record.h"
 #include "icollector.h"
 #include <spdlog/spdlog.h>
 #include "ebpf/fs_metadata.h"
@@ -89,14 +90,18 @@ struct JobFSMetaStat {
  *   - 用户态: batch dump 明细 map（周期缓存）按 Job 切片聚合进程；Job 级 map + 直方图
  *             按 job_id 直接切片；速率由用户态差分。
  */
-class FSMetadataCollector : public ICollector {
+class FSMetadataCollector : public IPeriodicJobCollector {
 public:
-    bool init(const nlohmann::json& cfg) override;
-    CollectResult collect(const Job& job) override;
+    bool init(const nlohmann::json& cfg, CollectorInitContext& context) override;
+    CollectOutcome collect(const Job& job, OutputContext& output) override;
     void deinit() noexcept override;
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
+    std::vector<OutputChannel> output_channels() const override;
 
 private:
+    JobFSMetaStat sample_job(const Job& job);
+    nlohmann::json to_document(const JobFSMetaStat& s) const;
+    std::string to_text(const JobFSMetaStat& s) const;
+    MetricBatch to_metrics(const JobFSMetaStat& s) const;
     bool init_ebpf();
     void deinit_ebpf();
 

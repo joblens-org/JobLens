@@ -75,12 +75,15 @@ struct JobIOStat {
     std::unordered_map<pid_t, ProcIOStat> processes;
 };
 
-class NewIOUsageCollector : public ICollector {
+class NewIOUsageCollector : public IPeriodicJobCollector {
 public:
-    bool init(const nlohmann::json& cfg) override;
-    CollectResult collect(const Job& job) override;
+    bool init(const nlohmann::json& cfg, CollectorInitContext& context) override;
+    CollectOutcome collect(const Job& job, OutputContext& output) override;
     void deinit() noexcept override;
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
+    std::vector<OutputChannel> output_channels() const override;
+    JobIOStat sample_job(const Job& job);
+    nlohmann::json to_document(const JobIOStat& s) const;
+    std::string to_text(const JobIOStat& s) const;
 private:
     friend struct NewIOUsageCollectorTestAccess;
     bool init_ebpf();

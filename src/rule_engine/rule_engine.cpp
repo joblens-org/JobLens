@@ -148,7 +148,8 @@ bool RuleEngine::load_rule(const std::string& filepath) {
 }
 
 // 加载目录下所有规则文件
-int RuleEngine::load_rules_from_directory(const std::string& dir_path) {
+int RuleEngine::load_rules_from_directory(const std::string& dir_path,
+                                          const std::string& required_prefix) {
     int loaded = 0;
     dir_path_ = dir_path;
     spdlog::debug("RuleEngine: Loading rules from directory '{}'", dir_path);
@@ -160,6 +161,12 @@ int RuleEngine::load_rules_from_directory(const std::string& dir_path) {
     for (const auto& entry : fs::directory_iterator(dir)) {
         spdlog::debug("RuleEngine: Checking entry '{}'", entry.path().string());
         if (entry.is_regular_file() && entry.path().extension().compare(".lua") == 0) {
+            if (!required_prefix.empty() &&
+                entry.path().filename().string().find(required_prefix) != 0) {
+                spdlog::debug("RuleEngine: skipping rule file '{}' (prefix '{}')",
+                              entry.path().string(), required_prefix);
+                continue;
+            }
             spdlog::debug("RuleEngine: Found rule file '{}'", entry.path().string());
             if (load_rule(entry.path().string())) {
                 loaded++;

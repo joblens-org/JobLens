@@ -13,6 +13,7 @@
  * limitations under the License. */
 #pragma once
 #include "core/collector_type.h"
+#include "core/job_identity.hpp"
 #include "core/group_probe_stats.hpp"
 #include "common/classad_decode.hpp"
 #include "common/utils.hpp"
@@ -21,7 +22,10 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <charconv>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -42,136 +46,61 @@ namespace SlurmJob
 {
 
 // 使用Utils命名空间中的公共函数
-using Utils::get_ppid_of;
-using Utils::get_cmdline_of;
 using Utils::get_env_field;
-using Utils::v2_cgroup_absolute_path;
-using Utils::get_pids_in_cgroup;
 
-inline void update_job_pids(Job& job){
-    auto& slurm_attr = std::get<SlurmJobAttr>(job.sub_attr);
-    if(slurm_attr.stepd_pid == 0){
-        //初始化相关内容
-        if(job.JobPIDs.size() > 1){
-            spdlog::warn("SlurmJob: multi pids, use first");
-        }
-        slurm_attr.stepd_pid = get_ppid_of(job.JobPIDs[0]);
-        slurm_attr.cgroup_path = v2_cgroup_absolute_path(job.JobPIDs[0]);
-    }   
-    auto pid_cgroup = get_pids_in_cgroup(slurm_attr.cgroup_path);
-    // 移除stepd_pid本身
-    std::remove(pid_cgroup.begin(), pid_cgroup.end(), slurm_attr.stepd_pid);
-    job.JobPIDs = std::move(pid_cgroup);
+// ---------------------------------------------------------------------------
+// Strict, error-reporting parsing for the discovery adapter
+// ---------------------------------------------------------------------------
+// A discovery observation must keep "missing", "unparsable" and "zero" apart:
+// a guessed step merges two executions, a guessed job id invents a job.
+
+namespace detail {
+inline std::optional<std::uint64_t> parse_decimal_u64(const std::string& raw){
+    if (raw.empty() || raw.size() > 20) return std::nullopt;
+    std::uint64_t value = 0;
+    const auto* begin = raw.data();
+    const auto* end = raw.data() + raw.size();
+    const auto parsed = std::from_chars(begin, end, value, 10);
+    if (parsed.ec != std::errc() || parsed.ptr != end) return std::nullopt;
+    return value;
 }
+} // namespace detail
 
-/* 获取Slurm Job ID */
-inline uint64_t getJobID(pid_t pid){
-    std::string job_id_str = get_env_field(pid, "SLURM_JOB_ID");
-    spdlog::debug("SlurmJob: pid {} SLURM_JOB_ID {}", pid, job_id_str);
-    if (job_id_str.empty()) return 0;
-
-    try {
-        return std::stoull(job_id_str);
-    } catch (const std::exception& e) {
-        spdlog::error("SlurmJob: failed to parse job ID '{}': {}", job_id_str, e.what());
-        return 0;
+// SLURM_JOB_ID -> logical job number. Missing/garbage is an explicit failure.
+inline std::optional<std::uint64_t> parse_job_id(const std::string& raw, std::string& error){
+    const auto value = detail::parse_decimal_u64(raw);
+    if (!value) {
+        error = raw.empty() ? "SLURM_JOB_ID missing" : "SLURM_JOB_ID '" + raw + "' is not decimal";
+        return std::nullopt;
     }
-}
-
-/* 获取Slurm Step ID */
-inline uint32_t getStepID(pid_t pid){
-    std::string step_id_str = get_env_field(pid, "SLURM_STEP_ID");
-    spdlog::debug("SlurmJob: pid {} SLURM_STEP_ID {}", pid, step_id_str);
-    if (step_id_str.empty()) return 0;
-
-    try {
-        return static_cast<uint32_t>(std::stoul(step_id_str));
-    } catch (const std::exception& e) {
-        spdlog::error("SlurmJob: failed to parse step ID '{}': {}", step_id_str, e.what());
-        return 0;
+    if (*value == 0) {
+        error = "SLURM_JOB_ID is 0";
+        return std::nullopt;
     }
+    return value;
 }
 
-/* 获取作业用户 */
-inline std::string getUser(pid_t pid){
-    return get_env_field(pid, "SLURM_JOB_USER");
-}
-
-/* 获取作业名称 */
-inline std::string getJobName(pid_t pid){
-    return get_env_field(pid, "SLURM_JOB_NAME");
-}
-
-/* 获取分区/队列名称 */
-inline std::string getPartition(pid_t pid){
-    return get_env_field(pid, "SLURM_JOB_PARTITION");
-}
-
-/* 获取所有slurmstepd进程PID列表 */
-inline std::vector<pid_t> get_all_slurmstepd_pids(){
-    std::vector<pid_t> slurm_pids;
-    namespace fs = std::filesystem;
-    for (const auto& entry : fs::directory_iterator("/proc")) {
-        if (!entry.is_directory()) continue;
-        std::string filename = entry.path().filename().string();
-        if (!std::all_of(filename.begin(), filename.end(), ::isdigit)) continue;
-        pid_t pid = static_cast<pid_t>(std::stol(filename));
-        std::string cmdline = get_cmdline_of(pid);
-        // slurmstepd 命令行通常包含 "slurmstepd"
-        if (cmdline.find("slurmstepd") != std::string::npos) {
-            slurm_pids.push_back(pid);
-        }
+// SLURM_STEP_ID -> numeric step value. The special batch/extern constants stay
+// distinct from numeric steps (see slurm_step_name in core/job_identity.hpp).
+inline std::optional<std::uint32_t> parse_step_id(const std::string& raw, std::string& error){
+    const auto value = detail::parse_decimal_u64(raw);
+    if (!value || *value > std::numeric_limits<std::uint32_t>::max()) {
+        error = raw.empty() ? "SLURM_STEP_ID missing" : "SLURM_STEP_ID '" + raw + "' is not a step value";
+        return std::nullopt;
     }
-    return slurm_pids;
+    return static_cast<std::uint32_t>(*value);
 }
 
-/* 获取指定slurmstepd下的所有子进程 */
-inline std::vector<pid_t> get_slurm_job_pids(pid_t stepd_pid){
-    std::vector<pid_t> job_pids;
-    namespace fs = std::filesystem;
-    
-    for (const auto& entry : fs::directory_iterator("/proc")) {
-        if (!entry.is_directory()) continue;
-        std::string filename = entry.path().filename().string();
-        if (!std::all_of(filename.begin(), filename.end(), ::isdigit)) continue;
-        pid_t pid = static_cast<pid_t>(std::stol(filename));
-        
-        // 检查父进程是否是该stepd
-        pid_t ppid = get_ppid_of(pid);
-        if (ppid == stepd_pid) {
-            // 检查是否有SLURM_JOB_ID环境变量
-            if (getJobID(pid) > 0) {
-                job_pids.push_back(pid);
-            }
-        }
-    }
-    return job_pids;
+// Adapter-boundary conversion: numeric step -> canonical wire step_id. batch and
+// extern keep their names, every other value is its decimal form; nothing is
+// ever mapped to a different step.
+inline std::string step_id_name(std::uint32_t numeric_step){
+    if (const auto special = slurm_step_name(numeric_step)) return *special;
+    return std::to_string(numeric_step);
 }
 
-/* 获取所有正在运行的Slurm作业PID（去重） */
-inline std::vector<pid_t> get_all_slurm_job_pids(){
-    std::vector<pid_t> all_job_pids;
-    std::unordered_set<pid_t> seen;
-    
-    auto stepd_pids = get_all_slurmstepd_pids();
-    for (auto stepd_pid : stepd_pids) {
-        auto job_pids = get_slurm_job_pids(stepd_pid);
-        for (auto pid : job_pids) {
-            if (seen.insert(pid).second) {
-                all_job_pids.push_back(pid);
-            }
-        }
-    }
-    return all_job_pids;
-}
-
-inline std::string get_cluster_name(pid_t pid = 0){
+inline std::string clusterName(pid_t pid = 0){
     return get_env_field(pid, "SLURM_CLUSTER_NAME");
-}
-
-inline std::string get_native_job_id(pid_t pid){
-    auto jid = getJobID(pid);
-    return fmt::format("{}", jid);
 }
 
 /* ===================== 组归属（只读上游标准变量） =====================
@@ -185,11 +114,10 @@ inline std::string get_native_job_id(pid_t pid){
  *   （受负缓存/熔断限频），避免 LDAP 抖动把 unix_group 永久固定为空
  */
 inline std::string getAccount(pid_t pid){
-    return get_env_field(pid, "SLURM_JOB_ACCOUNT");
+    return Utils::get_env_field(pid, "SLURM_JOB_ACCOUNT");
 }
 
-inline int64_t getGid(pid_t pid){
-    std::string gid_str = get_env_field(pid, "SLURM_JOB_GID");
+inline int64_t parseGroupGid(const std::string& gid_str){
     if (gid_str.empty()) return -1;
     try {
         size_t pos = 0;
@@ -200,6 +128,10 @@ inline int64_t getGid(pid_t pid){
     } catch (const std::exception&) {
         return -1;
     }
+}
+
+inline int64_t getGid(pid_t pid){
+    return parseGroupGid(Utils::get_env_field(pid, "SLURM_JOB_GID"));
 }
 
 enum class NssOutcome { Ok, Miss, Breaker };
@@ -280,8 +212,9 @@ inline std::string resolve_unix_group_name(int64_t gid, NssOutcome* outcome = nu
     return name;
 }
 
-// 探测并填充组字段；返回是否取到任一非空组值（供 restore 路径决定 group_need_persist）。
+// 探测并填充组字段；返回是否取到任一非空组值。
 inline bool probe_groups(Job& job) {
+    const auto pids = pids_of(job);
     auto& attr = std::get<SlurmJobAttr>(job.sub_attr);
     auto& stats = GroupProbeStats::instance();
     bool got_any = false;
@@ -290,7 +223,7 @@ inline bool probe_groups(Job& job) {
     if (!job.group_probed) {
         const auto S = GroupProbeStats::Source::SlurmEnv;
         stats.record_attempt(S);
-        pid_t pid = !job.JobPIDs.empty() ? job.JobPIDs[0] : attr.stepd_pid;
+        pid_t pid = !pids.empty() ? pids[0] : attr.stepd_pid;
         bool ok = false;
         if (pid > 0) {
             auto account = getAccount(pid);
@@ -347,48 +280,5 @@ inline bool probe_groups(Job& job) {
     return got_any;
 }
 
-
-inline void update_job_info(Job& job){
-    if (job.JobPIDs.empty()) return;
-
-    auto& slurm_attr = std::get<SlurmJobAttr>(job.sub_attr);
-    pid_t representative_pid = job.JobPIDs[0]; // 以第一个PID为代表
-
-    // 标识性字段：只在首次未设置时填充
-    if (slurm_attr.job_id == 0) {
-        slurm_attr.job_id = getJobID(representative_pid);
-        slurm_attr.step_id = getStepID(representative_pid);
-        job.NativeJobID = fmt::format("{}", slurm_attr.job_id);
-    }
-
-    // 描述性字段：每次检查，为空/0则从进程环境变量补全
-    if (slurm_attr.user.empty()) {
-        slurm_attr.user = getUser(representative_pid);
-    }
-    if (slurm_attr.job_name.empty()) {
-        slurm_attr.job_name = getJobName(representative_pid);
-    }
-    if (slurm_attr.partition.empty()) {
-        slurm_attr.partition = getPartition(representative_pid);
-    }
-    if (slurm_attr.cluster_name.empty()) {
-        slurm_attr.cluster_name = get_cluster_name(representative_pid);
-    }
-    if (job.cluster_name.empty()) {
-        job.cluster_name = slurm_attr.cluster_name;
-    }
-    if (job.clusterTag.empty()) {
-        job.clusterTag = slurm_attr.cluster_name;
-    }
-    // stepd_pid 取 JobPIDs 中最小的 PID (slurmstepd 通常为父进程, PID 最小)
-    if (slurm_attr.stepd_pid == 0) {
-        slurm_attr.stepd_pid = *std::min_element(job.JobPIDs.begin(), job.JobPIDs.end());
-    }
-
-    // 组字段：env 探测未完成时补（有界重试）；组名解析独立完成态，按周期重试。
-    probe_groups(job);
-
-    return;
-}
 
 } // namespace SlurmJob

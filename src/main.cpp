@@ -21,6 +21,7 @@
 
 #include "common/config.hpp"
 #include "core/collector_registry.hpp"
+#include "core/job_registry.hpp"
 #include "core/writer_manager.hpp"
 #include "core/collector_scheduler.hpp"
 #include "common/utils.hpp"
@@ -121,9 +122,17 @@ int runJobLensService(const cxxopts::ParseResult& result){
     
     // 执行清理操作
     if (mode.compare("service") == 0){
+        // Shutdown order: stop admission and discovery polling,
+        // drain the scheduler's accepted work, then finalize the removal
+        // acknowledgements and close the registry-owned store.
+        JobRegistry::instance().stopDiscovery();
         CollectorScheduler::instance().shutdown();
         WriterManager::instance().shutdown();
         CollectorRegistry::instance().shutdown();
+        if (!JobRegistry::instance().deinit()) {
+            spdlog::error("Main: registry shutdown incomplete; the closing state is "
+                          "persisted for recovery");
+        }
     }
     
     spdlog::info("Main: JobLens service stopped successfully");

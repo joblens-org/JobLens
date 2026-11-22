@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "id": "event_job",
+  "scope": "job",
+  "trigger": "event",
+  "interface": "IEventJobCollector",
+  "activation": "first_binding_by_default; explicit auto_start may keep a listener alive with zero Jobs",
+  "invocation": "on_ready(sources, budget, JobEventContext&)",
+  "source_kinds": ["unix_datagram", "ebpf_ringbuf"],
+  "required_cases": [
+    {
+      "name": "zero_bindings",
+      "jobs": [],
+      "expected_output_records": 0,
+      "expected_unattributed_events": "counted, never emitted with Job 0"
+    },
+    {
+      "name": "two_interleaved_jobs",
+      "jobs": [
+        {"job_id": 101, "monitoring_generation": 1},
+        {"job_id": 202, "monitoring_generation": 1}
+      ],
+      "events": [
+        {"job_id": 101, "sequence": 1},
+        {"job_id": 202, "sequence": 1},
+        {"job_id": 101, "sequence": 2}
+      ],
+      "expected_output_sessions": 2,
+      "expected_envelopes": [101, 202]
+    },
+    {
+      "name": "unknown_job",
+      "event": {"job_id": 999, "sequence": 1},
+      "expected_output_records": 0,
+      "expected_counter": "unattributed_or_unknown"
+    },
+    {
+      "name": "stale_session",
+      "job_id": 101,
+      "event_generation": 1,
+      "active_generation": 2,
+      "expected_output_records": 0,
+      "expected_counter": "stale_generation"
+    },
+    {
+      "name": "removed_job_with_tail",
+      "job_id": 101,
+      "remove_from_active_registry": true,
+      "tail_events": 2,
+      "expected_envelopes": [101],
+      "expected_finish_reason": "job_completion"
+    }
+  ],
+  "output_attribution": "resolve a retained real Job snapshot per session before creating its output session",
+  "finish_boundary": "per_job_cutoff_and_drain_acknowledgement",
+  "input_completion": [
+    "producer stop marker",
+    "per-source terminal sequence",
+    "explicitly bounded best-effort cutoff recorded as incomplete"
+  ],
+  "policies": {
+    "stream": "emit selected records or batches for each Job",
+    "final": "consume continuously into per-Job statistics; one report when each Job finishes",
+    "both": "Job event output plus each Job report"
+  }
+}

@@ -108,42 +108,66 @@ try:
     config = yaml.safe_load(open(real_config_path))
 except FileNotFoundError:
     config = {}
-def use_rpc_opt():
+def _rpc_client_and_methods():
+    """返回 (client, methods)；配置缺失或 Core 不可达时 methods 为 None。"""
     lens_cfg = config.get('lens_config', {})
     socket_path = lens_cfg.get('rpc_socket_path', '')
     timeout = lens_cfg.get('rpc_timeout', 5)
     if not socket_path:
-        return False
+        return None, None
     r = RPCClient(socket_path, timeout)
     try:
-        return 'JobRegistry/job_opt' in r.get_function_list()
+        return r, set(r.get_function_list())
     except RPCError:
+        return r, None
+
+
+def use_rpc_opt():
+    _, methods = _rpc_client_and_methods()
+    if methods is None:
         return False
+    # 新版 Core 用资源方法；旧版 Core 仍是 job_opt。Trigger 同时适配两者。
+    return 'jobs/upsert' in methods or 'JobRegistry/job_opt' in methods
+
+
 def job_opt(data):
     if 'USE_MOCK_TOOLS' in globals() and USE_MOCK_TOOLS:
         # 使用 mock 版本
         return mock_job_opt(data)
-    
-    if use_rpc_opt():
-        lens_cfg = config.get('lens_config', {})
-        r = RPCClient(lens_cfg.get('rpc_socket_path', ''), lens_cfg.get('rpc_timeout', 5))
+
+    r, methods = _rpc_client_and_methods()
+    if methods is not None and ('jobs/upsert' in methods or 'jobs/stop' in methods):
+        opt = data.get('opt', 'add')
+        if opt == 'remove':
+            method = 'jobs/erase' if data.get('erase') else 'jobs/stop'
+            payload = {k: v for k, v in data.items() if k != 'erase'}
+        else:
+            method = 'jobs/upsert'
+            payload = data
+        logger.info("RPC call: %s, type=%s, JobID=%s, PIDs=%s, Lens=%s",
+                    method, data.get('type'), data.get('JobID'),
+                    data.get('JobPIDs'), data.get('Lens'))
+        ret = r.call(method, payload)
+    elif methods is not None and 'JobRegistry/job_opt' in methods:
+        # 旧 Core 兼容路径；仅用于滚动升级。
         logger.info("RPC call: JobRegistry/job_opt, opt=%s, type=%s, JobID=%s, PIDs=%s, Lens=%s",
-                     data.get('opt'), data.get('type'), data.get('JobID'),
-                     data.get('JobPIDs'), data.get('Lens'))
+                    data.get('opt'), data.get('type'), data.get('JobID'),
+                    data.get('JobPIDs'), data.get('Lens'))
         ret = r.call('JobRegistry/job_opt', data)
-        if isinstance(ret, dict):
-            logger.info("RPC response: status=%s, msg=%s", ret.get('status'), ret.get('msg', ''))
-        return ret
     else:
         job_adder_path = config.get('collectors_config', {}).get('job_adder_fifo', '')
         if not job_adder_path:
             raise RuntimeError("无法写入作业：未配置 job_adder_fifo 且 RPC 不可用")
         logger.info("FIFO fallback: writing to %s, opt=%s, type=%s, JobID=%s",
-                     job_adder_path, data.get('opt'), data.get('type'), data.get('JobID'))
+                    job_adder_path, data.get('opt'), data.get('type'), data.get('JobID'))
         with open(job_adder_path, 'w') as f:
             f.write(json.dumps(data))
             f.flush()
         return True
+
+    if isinstance(ret, dict):
+        logger.info("RPC response: status=%s, msg=%s", ret.get('status'), ret.get('msg', ''))
+    return ret
     
 def _to_argv(cmd) -> list:
     """把命令统一成 argv 列表，禁止经过 shell。"""
@@ -435,19 +459,51 @@ def get_joblens_version():
     }
 
 
-def joblens_format_metrics(jobs: dict) -> str:
-    if 'USE_MOCK_TOOLS' in globals() and USE_MOCK_TOOLS:
-        # 使用 mock 版本
-        return mock_joblens_format_metrics(jobs)
-    
-    """
-    把 Slurm 风格的嵌套 JSON 转成 Prometheus 文本协议。
-    jobs: {"102": {"JobID": 102, "process_state": [{...}, ...]}, ...}
-    返回: 多行字符串，可直接写入 /metrics 接口
-    """
-    lines = []
+def _prometheus_escape_label(value: str) -> str:
+    return str(value).replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
 
-    # 统一 TYPE 只写一次，避免重复
+
+def _prometheus_escape_help(value: str) -> str:
+    return str(value).replace('\\', '\\\\').replace('\n', '\\n')
+
+
+def _format_generic_metrics(metrics: list) -> str:
+    """Format the generic MetricBatch JSON emitted by the core."""
+    families = {}
+    for sample in metrics:
+        name = sample.get("name")
+        if not name:
+            continue
+        families.setdefault(name, []).append(sample)
+
+    lines = []
+    for name, samples in families.items():
+        first = samples[0]
+        help_text = first.get("help", "")
+        if help_text:
+            lines.append(f"# HELP {name} {_prometheus_escape_help(help_text)}")
+        metric_type = first.get("type", "gauge")
+        lines.append(f"# TYPE {name} {metric_type}")
+        for sample in samples:
+            labels = sample.get("labels") or {}
+            label_text = ",".join(
+                f'{key}="{_prometheus_escape_label(labels[key])}"'
+                for key in sorted(labels)
+            )
+            value = sample.get("value", 0)
+            if isinstance(value, float):
+                value = format(value, ".17g")
+            if label_text:
+                lines.append(f"{name}{{{label_text}}} {value}")
+            else:
+                lines.append(f"{name} {value}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _format_legacy_metrics(jobs: dict) -> str:
+    """Format the pre-MetricBatch JSON schema; kept during rolling upgrades."""
+    lines = []
     types_written = set()
 
     def write_type(metric: str, desc: str):
@@ -455,10 +511,6 @@ def joblens_format_metrics(jobs: dict) -> str:
             lines.append(f"# HELP {metric} {desc}")
             lines.append(f"# TYPE {metric} gauge")
             types_written.add(metric)
-
-    def _esc_label(v):
-        # Prometheus label 值转义：反斜杠、双引号、换行
-        return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
     for jobid_str, job_body in jobs.items():
         jobid = job_body["JobID"]
@@ -468,15 +520,13 @@ def joblens_format_metrics(jobs: dict) -> str:
             labels = (
                 f'jobid="{jobid}",'
                 f'pid="{proc["pid"]}",'
-                f'name="{_esc_label(proc["name"])}",'
-                f'group="{_esc_label(group)}"'
+                f'name="{_prometheus_escape_label(proc["name"])}",'
+                f'group="{_prometheus_escape_label(group)}"'
             )
 
-            # 1. CPU
             write_type("job_cpu_usage_percent", "Per-process CPU usage percent")
             lines.append(f'job_cpu_usage_percent{{{labels}}} {proc["cpu_usage_percent"]}')
 
-            # 2. 内存 RSS
             write_type("job_mem_rss_kb", "Per-process RSS memory in KB")
             lines.append(f'job_mem_rss_kb{{{labels}}} {proc["mem_rss_kb"]}')
 
@@ -491,29 +541,32 @@ def joblens_format_metrics(jobs: dict) -> str:
             write_type("job_mem_usage_percent", "Per-process memory usage percent")
             lines.append(f'job_mem_usage_percent{{{labels}}} {proc["mem_usage_percent"]}')
 
-            # 4. 磁盘读总量
             write_type("job_io_read_bytes_total", "Total bytes read from disk")
             lines.append(f'job_io_read_bytes_total{{{labels}}} {proc["io_read_bytes_total"]}')
 
-            # 5. 磁盘写总量
             write_type("job_io_write_bytes_total", "Total bytes written to disk")
             lines.append(f'job_io_write_bytes_total{{{labels}}} {proc["io_write_bytes_total"]}')
 
-            # 6. 网络收总量
             write_type("job_net_recv_bytes_total", "Total bytes received via network")
             lines.append(f'job_net_recv_bytes_total{{{labels}}} {proc["net_recv_bytes_total"]}')
 
-            # 7. 网络发总量
             write_type("job_net_sent_bytes_total", "Total bytes sent via network")
             lines.append(f'job_net_sent_bytes_total{{{labels}}} {proc["net_sent_bytes_total"]}')
 
-            # 8. 线程数
             write_type("job_threads_count", "Number of threads")
             lines.append(f'job_threads_count{{{labels}}} {proc["threads_cnt"]}')
 
-            lines.append("")  # 不同样本间空行分隔
+            lines.append("")
 
     return "\n".join(lines)
+
+
+def joblens_format_metrics(jobs: dict) -> str:
+    if 'USE_MOCK_TOOLS' in globals() and USE_MOCK_TOOLS:
+        return mock_joblens_format_metrics(jobs)
+    if isinstance(jobs, dict) and isinstance(jobs.get("metrics"), list):
+        return _format_generic_metrics(jobs["metrics"])
+    return _format_legacy_metrics(jobs)
 
 _RESTART_LOCK = threading.Lock()
 _last_restart_at = 0.0
@@ -721,3 +774,33 @@ def get_job_processes(job_id: str) -> List[Tuple[str, str, str]]:
                         pids.append((node, child_pid, cmd_name))
     
     return pids
+
+
+# ==================== 作业列表 / 采集控制 RPC ====================
+# Trigger 只校验并转发，
+# 不分配、不推导内部 ID，也不在 Core 不可用时伪造响应。
+
+CORE_RPC_TIMEOUT_DEFAULT = 5.0
+RPC_SOCKET_DEFAULT = '/var/JobLens/rpc.sock'
+
+
+def _rpc_endpoint() -> Tuple[str, float]:
+    """从 lens_config 读取 RPC socket 路径与超时，与 job_opt 的配置来源保持一致。"""
+    lens_cfg = config.get('lens_config', {}) if isinstance(config, dict) else {}
+    socket_path = lens_cfg.get('rpc_socket_path') or RPC_SOCKET_DEFAULT
+    timeout = float(lens_cfg.get('rpc_timeout', CORE_RPC_TIMEOUT_DEFAULT))
+    return socket_path, timeout
+
+
+def call_core_rpc(method: str, params=None, rpc_client=None):
+    """调用 Core 的作业/采集控制 RPC 方法。
+
+    优先使用 register_routes 注入的 rpc_client；Trigger 启动时 Core 未就绪
+    （rpc_client 为 None）则按 lens_config 现建客户端，语义与 job_opt 一致。
+    测试通过替换本函数来 mock Core。
+    """
+    client = rpc_client
+    if client is None:
+        socket_path, timeout = _rpc_endpoint()
+        client = RPCClient(socket_path, timeout)
+    return client.call(method, params if params is not None else {})

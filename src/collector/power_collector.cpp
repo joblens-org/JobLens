@@ -34,6 +34,7 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
 #include "collector/power_collector.hpp"
+#include "core/output_context.hpp"
 #include <memory>
 
 #include "core/collector_registry.hpp"
@@ -377,8 +378,8 @@ PowerSnapshot PowerCollector::compute_energy(
     {
         auto jobs = JobRegistry::instance().snapshot();
         for (const auto& job : jobs) {
-            job_native_ids[job.JobID] = job.NativeJobID;
-            for (pid_t p : job.JobPIDs) {
+            job_native_ids[job.JobID] = job.JobNativeID;
+            for (pid_t p : pids_of(job)) {
                 pid2job[p] = job.JobID;
             }
         }
@@ -387,17 +388,15 @@ PowerSnapshot PowerCollector::compute_energy(
     /* ── Sum weighted_ns per job ── */
     struct JobAccum {
         uint64_t job_id = 0;
-        std::string native_job_id;
+        std::string job_native_id;
         double weighted_ns = 0.0;
         std::vector<PowerPerPid> pids;
     };
     std::unordered_map<uint64_t, JobAccum> job_map;
 
-    double attributed_weighted_ns = 0.0;
-
     for (const auto& [pt, acc] : pid_map) {
         uint64_t jid = 0;
-        std::string native_jid;
+        std::string job_native_id;
 
         auto it_j = pid2job.find(acc.pid);       // 先按 tid 查
         if (it_j == pid2job.end()) {
@@ -407,7 +406,7 @@ PowerSnapshot PowerCollector::compute_energy(
             jid = it_j->second;
             auto it_nj = job_native_ids.find(jid);
             if (it_nj != job_native_ids.end()) {
-                native_jid = it_nj->second;
+                job_native_id = it_nj->second;
             }
         }
 
@@ -415,7 +414,7 @@ PowerSnapshot PowerCollector::compute_energy(
 
         auto& ja = job_map[jid];
         ja.job_id        = jid;
-        ja.native_job_id = native_jid;
+        ja.job_native_id = job_native_id;
         ja.weighted_ns  += acc.weighted_ns;
 
         PowerPerPid pp;
@@ -428,15 +427,13 @@ PowerSnapshot PowerCollector::compute_energy(
             : 0.0;
         /* energy assigned below after total is known */
         ja.pids.push_back(pp);
-
-        attributed_weighted_ns += acc.weighted_ns;
     }
 
     /* ── Assign energy per job ── */
     for (auto& [jid, ja] : job_map) {
         PowerPerJob pj;
         pj.job_id           = ja.job_id;
-        pj.native_job_id    = ja.native_job_id;
+        pj.job_native_id    = ja.job_native_id;
         pj.weighted_ns_total = ja.weighted_ns;
         pj.energy_j         = (total_weighted_ns > 0.0)
             ? snap.delta_rapl_j * ja.weighted_ns / total_weighted_ns
@@ -624,32 +621,6 @@ void PowerCollector::validate_against_baseline(const PowerSnapshot& snap)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Gap 1: CPU调速器记录 (对标DESY log-power-consumption.sh)
- * DESY每次IPMI采样时同时记录cpu0的scaling_governor。
- * 我们遍历所有CPU核心读取governor，输出各模式的数量分布。
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-std::vector<std::string> PowerCollector::read_cpu_governors()
-{
-    std::vector<std::string> governors;
-    governors.reserve(core_count_);
-
-    for (int cpu = 0; cpu < core_count_; ++cpu) {
-        std::string path = "/sys/devices/system/cpu/cpu"
-                         + std::to_string(cpu)
-                         + "/cpufreq/scaling_governor";
-        std::ifstream f(path);
-        std::string gov = "unknown";
-        if (f.is_open()) {
-            std::getline(f, gov);
-            if (gov.empty()) gov = "unknown";
-        }
-        governors.push_back(gov);
-    }
-    return governors;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
  * Gap 3: IPMI在线交叉验证 (对标GLASGOW power_plus.py)
  * GLASGOW用离线脚本对比估算功率vs真实IPMI。
  * 我们每个采集周期同时读一次IPMI瞬时功率，在线比较IPMI/RAPL ratio。
@@ -718,7 +689,7 @@ double PowerCollector::read_ipmi_watts()
 
 /* ── ICollector lifecycle ───────────────────────────────────────────────── */
 
-bool PowerCollector::init(const nlohmann::json& cfg)
+bool PowerCollector::init(const nlohmann::json& cfg, CollectorInitContext& /*context*/)
 {
     if (inited_) {
         spdlog::warn("PowerCollector: already initialized");
@@ -847,7 +818,7 @@ PowerSnapshot PowerCollector::extract_job_energy(
 }
 
 /* ── Job-scoped collect: 缓存过期刷新, 提取当前Job归因 ── */
-CollectResult PowerCollector::collect(const Job& job)
+PowerSnapshot PowerCollector::sample_job(const Job& job)
 {
     if (!inited_) {
         spdlog::warn("PowerCollector: collect(job) called before init");
@@ -907,113 +878,73 @@ CollectResult PowerCollector::collect(const Job& job)
     return snap;
 }
 
-/* ── Writer parsers ─────────────────────────────────────────────────────── */
-
-CollectDataParseFunc PowerCollector::get_writer_parser(const std::string& writer_type)
-{
-    spdlog::trace("PowerCollector: get_writer_parser for writer_type: {}", writer_type);
-
-    if (writer_type == "ESWriter") {
-        return [this](std::any data) -> std::any {
-            nlohmann::json ret;
-            if (!data.has_value()) {
-                spdlog::warn("PowerCollector: error ESWriter parser, empty data");
-                ret["error"] = "empty data";
-                return ret;
-            }
-
-            const PowerSnapshot* snapshot;
-            try {
-                snapshot = &std::any_cast<const PowerSnapshot&>(data);
-            } catch (const std::bad_any_cast& e) {
-                spdlog::warn("PowerCollector: bad any_cast in ESWriter parser — {}", e.what());
-                ret["error"] = std::string("bad any_cast: ") + e.what();
-                return ret;
-            }
-            const auto& snap = *snapshot;
-
-            ret["interval_s"]        = snap.interval_s;
-            ret["delta_rapl_j"]      = snap.delta_rapl_j;
-            ret["avg_power_w"]       = snap.avg_power_w;
-            ret["system_overhead_j"] = snap.system_overhead_j;
-            if (snap.ipmi_power_w > 0.0) ret["ipmi_power_w"] = snap.ipmi_power_w;
-
-            if (!snap.jobs.empty()) {
-                const auto& job = snap.jobs[0];
-                ret["job_id"]          = job.job_id;
-                ret["native_job_id"]   = job.native_job_id;
-                ret["energy_j"]        = job.energy_j;
-                ret["power_watt"]      = job.power_watt;
-                ret["ipmi_power_watt"] = job.ipmi_power_watt;
-
-                ret["pids"] = nlohmann::json::array();
-                for (const auto& pp : job.pids) {
-                    ret["pids"].push_back({
-                        {"pid",      pp.pid},
-                        {"energy_j", pp.energy_j},
-                        {"cpu_pct",  pp.cpu_pct}
-                    });
-                }
-            }
-
-            return ret;
-        };
-    }
-
-    if (writer_type == "FileWriter") {
-        return [this](std::any data) -> std::any {
-            if (!data.has_value()) {
-                spdlog::warn("PowerCollector: error FileWriter parser, empty data");
-                return std::string("PowerCollector error=empty_data\n");
-            }
-
-            const PowerSnapshot* snapshot;
-            try {
-                snapshot = &std::any_cast<const PowerSnapshot&>(data);
-            } catch (const std::bad_any_cast& e) {
-                spdlog::warn("PowerCollector: bad any_cast in FileWriter parser — {}", e.what());
-                return std::string("PowerCollector error=bad_any_cast detail=") + e.what() + "\n";
-            }
-            const auto& snap = *snapshot;
-
-            std::ostringstream out;
-            out << "PowerCollector"
-                << " interval_s=" << snap.interval_s
-                << " delta_rapl_j=" << snap.delta_rapl_j
-                << " avg_power_w=" << snap.avg_power_w
-                << " system_overhead_j=" << snap.system_overhead_j;
-            if (snap.ipmi_power_w > 0.0) {
-                out << " ipmi_power_w=" << snap.ipmi_power_w;
-            }
-            out << '\n';
-
-            if (!snap.jobs.empty()) {
-                const auto& job = snap.jobs[0];
-                out << "PowerCollector job"
-                    << " job_id=" << job.job_id
-                    << " native_job_id=" << job.native_job_id
-                    << " energy_j=" << job.energy_j
-                    << " power_watt=" << job.power_watt
-                    << " ipmi_power_watt=" << job.ipmi_power_watt
-                    << '\n';
-
-                for (const auto& pp : job.pids) {
-                    out << "PowerCollector pid"
-                        << " job_id=" << job.job_id
-                        << " pid=" << pp.pid
-                        << " energy_j=" << pp.energy_j
-                        << " cpu_pct=" << pp.cpu_pct
-                        << '\n';
-                }
-
-                spdlog::trace("PowerCollector: FileWriter parsed job#{} E={:.4f}J P={:.2f}W pids={}",
-                              job.job_id, job.energy_j, job.power_watt, job.pids.size());
-            }
-
-            return out.str();
-        };
-    }
-
-    spdlog::warn("PowerCollector: no parser for writer type '{}'", writer_type);
-    return nullptr;
+std::vector<OutputChannel> PowerCollector::output_channels() const {
+    return {{"document", OutputKind::Document}, {"text", OutputKind::Text}};
 }
+
+nlohmann::json PowerCollector::to_document(const PowerSnapshot& snap) const {
+    nlohmann::json ret;
+    ret["interval_s"]        = snap.interval_s;
+    ret["delta_rapl_j"]      = snap.delta_rapl_j;
+    ret["avg_power_w"]       = snap.avg_power_w;
+    ret["system_overhead_j"] = snap.system_overhead_j;
+    if (snap.ipmi_power_w > 0.0) ret["ipmi_power_w"] = snap.ipmi_power_w;
+    if (!snap.jobs.empty()) {
+        const auto& job = snap.jobs[0];
+        ret["job_id"]          = job.job_id;
+        ret["JobNativeID"]     = job.job_native_id;
+        ret["energy_j"]        = job.energy_j;
+        ret["power_watt"]      = job.power_watt;
+        ret["ipmi_power_watt"] = job.ipmi_power_watt;
+        ret["pids"] = nlohmann::json::array();
+        for (const auto& pp : job.pids) {
+            ret["pids"].push_back({
+                {"pid",      pp.pid},
+                {"energy_j", pp.energy_j},
+                {"cpu_pct",  pp.cpu_pct}
+            });
+        }
+    }
+    return ret;
+}
+
+std::string PowerCollector::to_text(const PowerSnapshot& snap) const {
+    std::ostringstream out;
+    out << "PowerCollector"
+        << " interval_s=" << snap.interval_s
+        << " delta_rapl_j=" << snap.delta_rapl_j
+        << " avg_power_w=" << snap.avg_power_w
+        << " system_overhead_j=" << snap.system_overhead_j;
+    if (snap.ipmi_power_w > 0.0) out << " ipmi_power_w=" << snap.ipmi_power_w;
+    out << '\n';
+    if (!snap.jobs.empty()) {
+        const auto& job = snap.jobs[0];
+        out << "PowerCollector job"
+            << " job_id=" << job.job_id
+            << " JobNativeID=" << job.job_native_id
+            << " energy_j=" << job.energy_j
+            << " power_watt=" << job.power_watt
+            << " ipmi_power_watt=" << job.ipmi_power_watt
+            << '\n';
+        for (const auto& pp : job.pids) {
+            out << "PowerCollector pid"
+                << " job_id=" << job.job_id
+                << " pid=" << pp.pid
+                << " energy_j=" << pp.energy_j
+                << " cpu_pct=" << pp.cpu_pct
+                << '\n';
+        }
+    }
+    return out.str();
+}
+
+CollectOutcome PowerCollector::collect(const Job& job, OutputContext& output) {
+    if (!inited_) return {CollectState::Failed, "PowerCollector not initialized"};
+    if (!output.enabled("document") && !output.enabled("text")) return {};
+    const auto snap = sample_job(job);
+    if (output.enabled("document")) output.emit("document", Document{to_document(snap)});
+    if (output.enabled("text")) output.emit("text", Text{to_text(snap)});
+    return {};
+}
+
+/* ── Writer parsers ─────────────────────────────────────────────────────── */

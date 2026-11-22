@@ -1,3 +1,5 @@
+// 已被废弃，迁移到new_io
+
 /* Copyright 2026 - 2026 wzycc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "collector/io_usage_collector.hpp"
+#include "core/output_context.hpp"
 #include <memory>
 #include "common/mountinfo_utils.hpp"
 #include <chrono>
@@ -24,7 +27,6 @@
 #include "core/collector_registry.hpp"
 #include "writer/prometheus_exporter_writer.hpp"
 #include "ebpf/job_pid_track.h"
-// #include "ebpf/job_fd_basic.h"
 
 AUTO_REGISTER_JOB_COLLECTOR(
     IOUsageCollector, 
@@ -43,19 +45,9 @@ using namespace std::chrono;
 bool IOUsageCollector::init_ebpf(){
     auto path = EbpfCommon::resolve_bpf_obj("job_fd_rw_stat.bpf.o");
     if (path.empty()) return false;
-    // event_front_ = std::make_unique<std::queue<event>>();
-    // event_back_ = std::make_unique<std::queue<event>>();
     bpf_obj_ = EbpfCommon::load_bpf_obj_pinned(path, bpf_links_, JOBLENS_BPF_PIN_ROOT);
     ring_buffer_sample_fn fn  = [](void *ctx, void *data, size_t size){
         spdlog::trace("IOUsageCollector: ebpf got io event");
-        // auto ptr = static_cast<IOUsageCollector*>(ctx);
-        // auto event_ptr = static_cast<struct event*>(data);
-        // auto event_copy = *event_ptr;
-        // {
-        //     ptr->event_swap_mtx_.lock();
-        //     ptr->event_front_->push(event_copy);
-        //     ptr->event_swap_mtx_.unlock();
-        // }
         return 0;
     };
 
@@ -63,19 +55,6 @@ bool IOUsageCollector::init_ebpf(){
     if(!bpf_obj_ && !bpf_rb_){
         return false;
     }
-    // poll_thread = std::make_unique<std::thread>([this](){
-    //     spdlog::debug("IOUsageCollector: ebpf poll thread started");
-    //     while(polling_running){
-    //         int err = ring_buffer__poll(bpf_rb_, 100 /* ms */);
-    //         if (err == -EINTR){
-    //             spdlog::error("JobRegistry: error EINTR");
-    //             break;
-    //         }
-    //         if (err < 0){
-    //             spdlog::error("JobRegistry: error {}", err);
-    //         }
-    //     }
-    // });
     return true;
 }
 
@@ -90,40 +69,6 @@ void IOUsageCollector::deinit_ebpf(){
     EbpfCommon::unload_bpf_obj(bpf_obj_, bpf_links_);
     spdlog::info("IOUsageCollector: deinit_ebpf");
 }
-
-// std::optional<IOUsageCollector::user_rw_stat> IOUsageCollector::get_fd_stat(pid_t pid, uint32_t fd)
-// {
-    
-//     event_swap_mtx_.lock(); // 使用自旋锁，减轻损耗
-//     event_front_.swap(event_back_);
-//     event_swap_mtx_.unlock();
-
-//     while(!event_back_->empty()){
-//         auto event = event_back_->front();
-//         event_back_->pop();
-//         auto& stat = pidfd_stat_map[{event.pid, event.fd}];
-//         if (event.is_write){
-//             stat.write_bytes += event.cnt;
-//             // stat.write_time = event.ktimestamp;
-//         }else{
-//             stat.read_bytes += event.cnt;
-//             // stat.read_time = event.ktimestamp;
-//         }
-//     }
-
-//     user_pidfd_key usr_key = { .pid = static_cast<u32>(pid), .fd = fd };
-//     user_rw_stat& usr = pidfd_stat_map[usr_key]; // 上次用户态记录
-//     auto now = std::chrono::steady_clock::now();
-//     // 按照调用作为采样时间点计算速度
-//     usr.read_speed = usr.read_bytes - usr.last_read_bytes / (std::chrono::duration<double>(now - usr.last_read_time).count());
-//     usr.write_speed = usr.write_bytes - usr.last_write_bytes / (std::chrono::duration<double>(now - usr.last_write_time).count());
-//     usr.last_read_bytes = usr.read_bytes;
-//     usr.last_write_bytes = usr.write_bytes;
-//     usr.last_read_time = now;
-//     usr.last_write_time = now;
-    
-//     return usr;
-// }
 
 std::optional<IOUsageCollector::user_rw_stat> IOUsageCollector::get_fd_stat(pid_t pid, uint32_t fd)
 {
@@ -182,7 +127,7 @@ std::optional<IOUsageCollector::user_rw_stat> IOUsageCollector::get_fd_stat(pid_
     return usr;
 }
 
-bool IOUsageCollector::init(const nlohmann::json& cfg){
+bool IOUsageCollector::init(const nlohmann::json& cfg, CollectorInitContext& /*context*/){
     if(cfg.contains("summary") && cfg["summary"].get<std::string>() == "true"){
         summary = true;
     }else{
@@ -247,14 +192,14 @@ static std::string fd_to_path(int pid, int fd)
 }
 
 // --------------- CPUMemCollector ---------------
-CollectResult IOUsageCollector::collect(const Job &job)
+std::vector<IOUsageInfo> IOUsageCollector::sample_job(const Job &job)
 {
     std::vector<IOUsageInfo> result;
     if (use_ebpf){
         // pid2job 由 JobRegistry + 内核 fork/exit hook 维护; 此处仅触发一次无阻塞 fetch。
         ring_buffer__consume(bpf_rb_);
     }
-    for (int pid : job.JobPIDs) {
+    for (int pid : pids_of(job)) {
         // 提高鲁棒性
         if (! Utils::is_process_running(pid)){
             continue;
@@ -398,142 +343,132 @@ CollectResult IOUsageCollector::collect(const Job &job)
 }
 
 
-CollectDataParseFunc IOUsageCollector::get_writer_parser(const std::string& writer_type) {
-    CollectDataParseFunc func = nullptr;
-    
-    if(writer_type.compare("ESWriter") == 0){
-        func = [this](std::any data)->std::any{
-            nlohmann::json ret;
-            if(data.has_value() == false) {
-                spdlog::warn("IOUsageInfo: error writer parser, empty data");
-                ret["error"] = "empty data";
-                return ret;
-            }
-            ret["process_data"] = nlohmann::json::array();
-            const auto& parsed = std::any_cast<const std::vector<IOUsageInfo>&>(data);
-            for (const auto& info : parsed) {
-                nlohmann::json j;
-                j["pid"] = info.pid;
-                j["read_bytes"] = info.read_bytes;
-                j["writer_bytes"] = info.write_bytes;
-                j["read_speed"] = info.read_speed;
-                j["write_speed"] = info.write_speed;
-                j["rchar"] = info.rchar;
-                j["wchar"] = info.wchar;
-                j["rchar_speed"] = info.rchar_speed;
-                j["wchar_speed"] = info.wchar_speed;
-                j["syscr"] = info.syscr;
-                j["syscw"] = info.syscw;
-                nlohmann::json files = nlohmann::json::array();
-                for (const auto& [fd, finfo] : info.file_info) {
-                    nlohmann::json fj;
-                    fj["fd"] = fd;
-                    if (include_file_paths) {
-                        fj["path"] = finfo.path;
-                        fj["mount_point"] = finfo.mount_point;
-                    }
-                    fj["fs_type"] = finfo.fs_type;
-                    fj["pos"] = nullptr; // File size is intentionally not queried.
-                    if (use_ebpf) {
-                        fj["read_bytes"] = finfo.read_bytes;
-                        fj["read_speed"] = finfo.read_speed;
-                        fj["write_bytes"] = finfo.write_bytes;
-                        fj["write_speed"] = finfo.write_speed;
-                        fj["read_mean"] = finfo.read_mean;
-                        fj["write_mean"] = finfo.write_mean;
-                        fj["read_variance"] = finfo.read_variance;
-                        fj["write_variance"] = finfo.write_variance;
-                        fj["write_count"] = finfo.write_count;
-                        fj["read_count"] = finfo.read_count;
-                    }
-                    files.push_back(std::move(fj));
-                }
-                j["files"] = std::move(files);
-                if (info.pid == 0){
-                    if (summary) ret["summary"] = std::move(j);
-                }else{
-                    ret["process_data"].push_back(std::move(j));
-                }
-            }
-            return ret;
-        };
-    }
+std::vector<OutputChannel> IOUsageCollector::output_channels() const {
+    return {
+        {"document", OutputKind::Document},
+        {"text", OutputKind::Text},
+        {"metrics", OutputKind::Metrics}
+    };
+}
 
-    if(writer_type.compare("FileWriter") == 0){
-        func = [this](std::any data)->std::any{
-            if(data.has_value() == false) {
-                spdlog::warn("IOUsageInfo: error FileWriter parser, empty data");
-                return std::string("IOUsageCollector error=empty_data\n");
+nlohmann::json IOUsageCollector::to_document(const std::vector<IOUsageInfo>& infos) const {
+    nlohmann::json ret;
+    ret["process_data"] = nlohmann::json::array();
+    for (const auto& info : infos) {
+        nlohmann::json j;
+        j["pid"] = info.pid;
+        j["read_bytes"] = info.read_bytes;
+        j["writer_bytes"] = info.write_bytes;
+        j["read_speed"] = info.read_speed;
+        j["write_speed"] = info.write_speed;
+        j["rchar"] = info.rchar;
+        j["wchar"] = info.wchar;
+        j["rchar_speed"] = info.rchar_speed;
+        j["wchar_speed"] = info.wchar_speed;
+        j["syscr"] = info.syscr;
+        j["syscw"] = info.syscw;
+        nlohmann::json files = nlohmann::json::array();
+        for (const auto& [fd, finfo] : info.file_info) {
+            nlohmann::json fj;
+            fj["fd"] = fd;
+            if (include_file_paths) {
+                fj["path"] = finfo.path;
+                fj["mount_point"] = finfo.mount_point;
             }
-            const auto& parsed = std::any_cast<const std::vector<IOUsageInfo>&>(data);
-            std::ostringstream out;
-            for (const auto& info : parsed) {
-                out << "IOUsageCollector"
-                    << " type=" << (info.pid == 0 ? "summary" : "process")
-                    << " pid=" << info.pid
-                    << " read_bytes=" << info.read_bytes
-                    << " write_bytes=" << info.write_bytes
-                    << " read_speed=" << info.read_speed
-                    << " write_speed=" << info.write_speed
-                    << " rchar=" << info.rchar
-                    << " wchar=" << info.wchar
-                    << " rchar_speed=" << info.rchar_speed
-                    << " wchar_speed=" << info.wchar_speed
-                    << " syscr=" << info.syscr
-                    << " syscw=" << info.syscw
-                    << '\n';
-                for (const auto& [fd, finfo] : info.file_info) {
-                    out << "IOUsageCollector file"
-                        << " pid=" << info.pid
-                        << " fd=" << fd;
-                    if (include_file_paths) {
-                        out << " path=" << finfo.path
-                            << " mount_point=" << finfo.mount_point;
-                    }
-                    out << " fs_type=" << finfo.fs_type
-                        << " pos=unknown";
-                    if (use_ebpf) {
-                        out << " read_bytes=" << finfo.read_bytes
-                            << " read_speed=" << finfo.read_speed
-                            << " write_bytes=" << finfo.write_bytes
-                            << " write_speed=" << finfo.write_speed
-                            << " read_mean=" << finfo.read_mean
-                            << " write_mean=" << finfo.write_mean
-                            << " read_variance=" << finfo.read_variance
-                            << " write_variance=" << finfo.write_variance
-                            << " write_count=" << finfo.write_count
-                            << " read_count=" << finfo.read_count;
-                    }
-                    out << '\n';
-                }
+            fj["fs_type"] = finfo.fs_type;
+            fj["pos"] = nullptr;
+            if (use_ebpf) {
+                fj["read_bytes"] = finfo.read_bytes;
+                fj["read_speed"] = finfo.read_speed;
+                fj["write_bytes"] = finfo.write_bytes;
+                fj["write_speed"] = finfo.write_speed;
+                fj["read_mean"] = finfo.read_mean;
+                fj["write_mean"] = finfo.write_mean;
+                fj["read_variance"] = finfo.read_variance;
+                fj["write_variance"] = finfo.write_variance;
+                fj["write_count"] = finfo.write_count;
+                fj["read_count"] = finfo.read_count;
             }
-            return out.str();
-        };
+            files.push_back(std::move(fj));
+        }
+        j["files"] = std::move(files);
+        if (info.pid == 0) {
+            if (summary) ret["summary"] = std::move(j);
+        } else {
+            ret["process_data"].push_back(std::move(j));
+        }
     }
+    return ret;
+}
 
-    if(writer_type.compare("PrometheusExporterWriter") == 0){
-        func = [this](std::any data)->std::any{
-            PrometheusExporterWriter::prometheus_job_state ret;
-            if(data.has_value() == false) {
-                spdlog::warn("IOUsageCollector: error writer parser, empty data");
-                ret.JobID = 0;
-                return ret;
+std::string IOUsageCollector::to_text(const std::vector<IOUsageInfo>& infos) const {
+    std::ostringstream out;
+    for (const auto& info : infos) {
+        out << "IOUsageCollector"
+            << " type=" << (info.pid == 0 ? "summary" : "process")
+            << " pid=" << info.pid
+            << " read_bytes=" << info.read_bytes
+            << " write_bytes=" << info.write_bytes
+            << " read_speed=" << info.read_speed
+            << " write_speed=" << info.write_speed
+            << " rchar=" << info.rchar
+            << " wchar=" << info.wchar
+            << " rchar_speed=" << info.rchar_speed
+            << " wchar_speed=" << info.wchar_speed
+            << " syscr=" << info.syscr
+            << " syscw=" << info.syscw
+            << '\n';
+        for (const auto& [fd, finfo] : info.file_info) {
+            out << "IOUsageCollector file"
+                << " pid=" << info.pid
+                << " fd=" << fd;
+            if (include_file_paths) {
+                out << " path=" << finfo.path << " mount_point=" << finfo.mount_point;
             }
-            const auto& parsed = std::any_cast<const std::vector<IOUsageInfo>&>(data);
-            
-            for (const auto& info : parsed) {
-                PrometheusExporterWriter::prometheus_process_state state;
-                state.pid = info.pid;
-                state.io_read_bytes_per_sec = info.read_speed;
-                state.io_read_bytes_total = info.read_bytes;
-                state.io_write_bytes_per_sec = info.write_speed;
-                state.io_write_bytes_total = info.write_bytes;
-                
-                ret.processes_state.push_back(state);
+            out << " fs_type=" << finfo.fs_type
+                << " pos=unknown";
+            if (use_ebpf) {
+                out << " read_bytes=" << finfo.read_bytes
+                    << " read_speed=" << finfo.read_speed
+                    << " write_bytes=" << finfo.write_bytes
+                    << " write_speed=" << finfo.write_speed
+                    << " read_mean=" << finfo.read_mean
+                    << " write_mean=" << finfo.write_mean
+                    << " read_variance=" << finfo.read_variance
+                    << " write_variance=" << finfo.write_variance
+                    << " write_count=" << finfo.write_count
+                    << " read_count=" << finfo.read_count;
             }
-            return ret;
-        };
+            out << '\n';
+        }
     }
-    
-    return func;
+    return out.str();
+}
+
+MetricBatch IOUsageCollector::to_metrics(const std::vector<IOUsageInfo>& infos) const {
+    MetricBatch ret;
+    ret.samples.reserve(infos.size() * 4);
+    for (const auto& info : infos) {
+        const std::vector<MetricLabel> labels{{"pid", std::to_string(info.pid)}};
+        ret.samples.push_back({"job_io_read_bytes_total", MetricType::Counter,
+            "Total bytes read from the storage layer", labels,
+            static_cast<double>(info.read_bytes)});
+        ret.samples.push_back({"job_io_write_bytes_total", MetricType::Counter,
+            "Total bytes written to the storage layer", labels,
+            static_cast<double>(info.write_bytes)});
+        ret.samples.push_back({"job_io_read_bytes_per_sec", MetricType::Gauge,
+            "Storage read rate in bytes per second", labels, info.read_speed});
+        ret.samples.push_back({"job_io_write_bytes_per_sec", MetricType::Gauge,
+            "Storage write rate in bytes per second", labels, info.write_speed});
+    }
+    return ret;
+}
+
+CollectOutcome IOUsageCollector::collect(const Job& job, OutputContext& output) {
+    if (!output.enabled("document") && !output.enabled("text") && !output.enabled("metrics")) return {};
+    const auto infos = sample_job(job);
+    if (output.enabled("document")) output.emit("document", Document{to_document(infos)});
+    if (output.enabled("text")) output.emit("text", Text{to_text(infos)});
+    if (output.enabled("metrics")) output.emit("metrics", to_metrics(infos));
+    return {};
 }

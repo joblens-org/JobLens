@@ -68,19 +68,156 @@ lens_config:
 ```yaml
 job_registry_config:
   job_db_path: /var/JobLens/job.db      # LevelDB database directory path for persisting job state
-  auto_add_condorjob: true               # Whether to automatically monitor Condor jobs
-  auto_add_slurmjob: true                # Whether to automatically monitor Slurm jobs
+  auto_add_condorjob: true               # Deprecated: automatic Condor monitoring (see maintenance below)
+  auto_add_slurmjob: true                # Deprecated: automatic Slurm monitoring (see maintenance below)
+  maintenance:
+    types: [condor, slurm]               # Types with a full local record set (opt-in, absent = [])
+    capture_all: true                    # Register every captured job (default); false = admission by auto_add
+    reconcile_interval_sec: 30           # Reconciliation interval, must be >= 1
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `job_db_path` | string | none | LevelDB database directory path. If the database cannot be opened, no exception is thrown; it only degrades operation |
-| `auto_add_condorjob` | bool | false | Automatically start CondorJobWatcher, trace `condor_starter` processes via eBPF, and auto-add Condor jobs |
-| `auto_add_slurmjob` | bool | false | Automatically start SlurmJobWatcher, trace `slurm_stepd` processes via eBPF, and auto-add Slurm jobs |
-| `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` (Condor) or `{JobLensRootDir}/../config/rules/slurm_jobs` (Slurm) | Directory for Lua rule files, used by CondorJobWatcher and SlurmJobWatcher when `use_rules` is enabled. Note: the default varies by watcher context. |
+| `job_db_path` | string | none | LevelDB database directory path. If the database cannot be opened, no exception is thrown; it only degrades operation. On upgrade, a pre-schema database at this path is quarantined to `<path>.legacy` and only the allocator watermark is imported (see doc/jobstore_persistence_service.md §7) |
+| `auto_add_condorjob` | bool | false | **Deprecated.** Automatically start the legacy CondorJobWatcher and auto-add jobs. Ignored for a type listed in `maintenance.types` (the discovery source owns it) |
+| `auto_add_slurmjob` | bool | false | **Deprecated.** Same as above for Slurm |
+| `maintenance.types` | list | `[]` | Scheduler types that get job records, including unselected jobs. `condor` / `slurm`; unknown values are rejected at startup |
+| `maintenance.capture_all` | bool | `true` | The admission gate. `true`: every captured job is admitted unconditionally. `false`: whether an observation is admitted is decided by the type's `<type>_job_watcher.auto_add` |
+| `maintenance.reconcile_interval_sec` | int | 30 | Periodic full reconciliation interval in seconds (minimum 1) |
+| `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` (Condor) or `{JobLensRootDir}/../config/rules/slurm_jobs` (Slurm) | Directory for Lua rule files, used when `<type>_job_watcher.auto_add` is `rule`. Note: the default varies by watcher context. |
+
+### The three switches
+
+Automatic registration and collection are governed by exactly three
+switches. They answer different questions and never override each other:
+
+| Switch | Key | Question it answers | Default |
+|---|---|---|---|
+| admission gate | `job_registry_config.maintenance.capture_all` | May every captured job enter the registry unconditionally? | `true` |
+| per-type watcher | `job_registry_config.maintenance.types` | Does this scheduler type get a discovery watcher at all? | `[]` (off) |
+| automatic action | `<type>_job_watcher.auto_add` (`off` / `default` / `rule`) | What does the automatic path do with an observation of this type? | `off` |
+
+The `auto_add` tri-state:
+
+| `auto_add` | Meaning |
+|---|---|
+| `off` | The automatic path takes no action for this type |
+| `default` | Register the job and arm `<type>_job_watcher.auto_add_collectors` verbatim |
+| `rule` | Register is decided per job by the Lua rule engine: accept = register with the rule's collector list (or the `auto_add_collectors` defaults when the rule names none), reject = do not register (with `capture_all` on: register with an empty selection) |
+
+An invalid `auto_add` value (anything but `off`/`default`/`rule`) rejects
+startup.
+
+#### The Lua rule contract
+
+A rule file returns a table with a `condition(job)` function. The condition
+must return `(bool[, string])`:
+
+- the **bool** is the rule's own verdict — `true` accepts the job, `false`
+  declines it;
+- the optional **string** is a comma-separated collector list (for example
+  `"cpumem_collector, net_collector"`); an empty or absent string means
+  "accepted without a specified list".
+
+The old `{passed = ..., collectors = {...}}` table return is not part of the
+contract: a table, a missing first value or a non-string second value is an
+evaluation error — the observation is not registered (and not counted as a
+reject) and the next one re-evaluates.
+
+Rules walk in priority order (descending) and the **first accepting rule
+wins**: its list is the selection and later rules are not consulted. A
+declining (`false`) rule never vetoes a later accept. When every rule
+declines the job is rejected.
+
+An accepting rule that names no collectors logs at info and falls back to
+`<type>_job_watcher.auto_add_collectors`. When no defaults are configured
+the decision is refused: an error is logged, the observation is not
+registered, and it is counted in `admission_errors` (not as a reject).
+
+### The eight-state matrix
+
+With the per-type watcher off, `auto_add` is irrelevant and only `capture_all`
+distinguishes the two rows. With the watcher on there are six
+combinations of `capture_all` and `auto_add`:
+
+| # | watcher | `capture_all` | `auto_add` | Behavior for an observation of this type |
+|---|---|---|---|---|
+| 1 | off | — (on) | — | No discovery for the type; manual CRUD still works |
+| 2 | off | — (off) | — | Same: nothing is discovered, so nothing is admitted |
+| 3 | on | on | off | Admitted unconditionally; no automatic collectors (explicit requests only) |
+| 4 | on | on | default | Admitted unconditionally + the default collector list armed automatically |
+| 5 | on | on | rule | Admitted unconditionally; the rule engine picks the collectors (reject or a refused bare accept = registered with an empty selection) |
+| 6 | on | off | off | The watcher keeps scanning, but nothing is admitted (counted in `not_admitted_capture_all_off`) |
+| 7 | on | off | default | Registers with the default collector list as the initial selection |
+| 8 | on | off | rule | accept = registers with the rule's list (a bare accept falls back to `auto_add_collectors`); reject = the observation is not admitted (`not_admitted_by_rule`); an engine error or a bare accept without defaults registers nothing, is counted in `admission_errors` and is retried on the next observation |
+
+With `capture_all` off, the admission counters are observable in the joblens
+status: `capture_all`, `not_admitted_capture_all_off`, `not_admitted_by_rule`
+and `admission_errors`. The event path reports a typed `not_admitted` result
+that never asks the watcher to rescan.
+
+### Legacy key mapping
+
+When `auto_add` is absent, the `auto_collect` / `use_rules` pair and the
+legacy `auto_add_<type>job` flags remain accepted as the mapping source. The
+resolved state is always the tri-state:
+
+| Old configuration | Resolved `auto_add` |
+|---|---|
+| `auto_collect: false` (or absent) | `off` |
+| `auto_collect: true` + `use_rules: false` | `default` |
+| `auto_collect: true` + `use_rules: true` | `rule` |
+| `auto_add_<type>job: true` (legacy flag) | folded into `auto_collect: true` first, then mapped as above |
+
+An explicit `<type>_job_watcher.auto_add` always wins over the legacy
+combination.
+
+`<type>_job_watcher.cluster_name` (optional) pins the scheduler namespace used
+for identity when it cannot be derived from the environment
+(`COLLECTOR_HOST` / `SLURM_CLUSTER_NAME`); without any source the observation
+stays incomplete and is visible in the joblens status.
+
+Discovery is centralized in `JobRegistry`: its constructor builds exactly one
+watcher per configured type and starts the registry heartbeat (initial scan
+included), and the whole stack stops through `stopDiscovery()`
+and `deinit()`. There is no second eBPF source per scheduler type.
+
+Collection intent (desired selection) is stored in LevelDB and applied to the
+collector lanes by the running scheduler. `jobs/collection/get` distinguishes
+`desired_collectors` from `applied_collectors`: a request can be accepted while
+runtime application fails (`errors`), and the response never claims collection
+is active when it is not.
+
+### The manual CRUD surface
+
+The manual path is orthogonal to the three switches — it never runs through
+the admission gate, and the automatic policy never overwrites a manual
+selection (an explicit empty manual selection, a stop, pins the automatic
+policy down forever).
+
+| Operation | Entry | Semantics |
+|---|---|---|
+| Create / Update | `jobs/upsert` (one upsert) | Identity hit on a live instance (typed `sub_attr` + scheduler namespace) routes to UPDATE: the requested collectors UNION into the existing manual selection (never a wholesale replace) and facts merge fill-empty-only. A typed-sub_attr duplicate routes to UPDATE by `JobID` only when the row has no resolved identity or its scheduler (schedd) attribution agrees with the request: the same `JobNativeID` under another schedd is a different job and creates its own record, a row with an unknown schedd keeps the legacy tolerance, and several surviving duplicates are an `ambiguous_selector` error, never a guess. Otherwise CREATE: the legacy manual registration, whose duplicate check discriminates by the same scheduler (schedd) attribution, and which still rejects an empty collector list (an UPDATE with no collectors is a pure facts update and stays valid) |
+| Read / modify selection | `jobs/collection/get`, `jobs/collection/set`, `jobs/collection/reset` | Unchanged; a manual selection (including the empty stop) always wins over the automatic one |
+| Remove — stop tier (default) | `jobs/stop` | Stops collection (a persistent empty manual selection); the job record is retained |
+| Remove — erase tier | `jobs/erase` | Retires the instance for real: the closing fact is durable first, then a collected instance is archived as an `h:` history row and a never-collected one is durably deleted. The response distinguishes the tiers through `mode: stop\|erase` |
+
+Archive-versus-delete is decided by the collection *fact* — the runtime's
+actual attachment snapshot captured when the removal is accepted. One
+documented exception: when the process restarts between the durable
+Closing write and the finalization (the in-memory capture dies with the
+process), the restored closing row falls back to its durable effective
+selection instead. A selected-but-never-attached instance may therefore
+leave a history row after such a restart. The failure direction is
+keep-a-row over silently dropping one; instances removed without a
+restart are classified strictly.
+
+Both remove tiers address targets by `JobID` or by `matcher`, the same
+resolution the stop tier always used. The trigger's `/joblens/job` endpoint
+forwards the `erase` field verbatim; absent means the stop tier.
 
 **Job data storage** (LevelDB key-value store):
-- Keys use prefixes `job_`, `job_history_`, `counter_` with values serialized as JSON
+- Keys use prefixes `j:` (active jobs), `h:` (history), `c:` (ID allocator), `m:` (schema/DB UUID/migration), `i:` (canonical identity index) and `b:` (collection intent) with values serialized as JSON
 - Internally managed by `JobRegistry`; backed by LevelDB for persistence
 
 ---
@@ -174,7 +311,7 @@ The collector's `init(json_cfg)` method receives a JSON object converted from th
 | **BasicInfoCollector** | `summary` | string | When `"true"`, aggregates taskstats data across all processes (TGID-level summary) | `basic_info_collector.cpp:45` |
 | **GPUUsageCollector** | `summary` | string | When `"true"`, aggregates GPU usage data across all processes | `gpu_usage_collector.cpp:162` |
 | | `freq` | double | Additionally read in `init()`: used to calculate GPU cache refresh interval (`1.0 / (freq * 1.5)`). This is in addition to the scheduler-level `freq`. | `gpu_usage_collector.cpp:156-197` |
-| **TaskstatsCollector** | *(none)* | — | No init config parameters. Uses Linux taskstats netlink interface. **Note**: partially implemented — `collect()` method logs PIDs but does not produce data output; `get_writer_parser()` returns `nullptr`. | `taskstats_collector.cpp:44-47` |
+| **TaskstatsCollector** | *(none)* | — | No init config parameters. Uses Linux taskstats netlink interface. **Note**: partially implemented — the collector returns `Skipped` and produces no output until taskstats sampling is implemented. | `taskstats_collector.cpp:44-47` |
 | **FSMetadataCollector** | `include_process_details` | string | When `"true"` (default), emits a Job aggregate plus per-process detail. When `"false"`, emits the Job aggregate only. | `fs_metadata_collector.cpp:64` |
 | | `freq` | double | Scheduler-level sampling frequency (Hz), parsed by `CollectorScheduler`, not by FSMetadataCollector `init()`. Recommended: 1 Hz for metadata workloads | `collector_scheduler.cpp` |
 | **NewIOUsageCollector** | `include_process_details` | string | When `"true"` (default), emits Job aggregate plus per-process and per-file detail. When `"false"`, emits the Job aggregate only (empty `processes`/`files`), significantly reducing output volume for jobs with many open file handles. | `new_io_usage_collector.cpp:116` |
@@ -232,7 +369,10 @@ Code location: `src/core/writer_manager.cpp`, `src/writer/base_writer.cpp`
 writers_config:
   enable_writer_perf: true       # Whether to enable writer performance counters
   perf_window_size: 1000         # Sliding window size for performance counters
-  buffer_capacity: 4096          # Internal buffer capacity for BaseWriter (number of records)
+  buffer_capacity: 1024          # Reserve capacity per flush buffer (not a hard limit)
+  max_pending_records: 4096      # Hard bound on records pending in front/active buffers
+  max_pending_bytes: 67108864    # Hard bound on accounted bytes (64 MiB)
+  max_record_bytes: 8388608      # Reject a single record above this size (8 MiB)
   writers:                       # List of writer instances
     - name: es_writer
       type: ESWriter
@@ -244,7 +384,12 @@ writers_config:
 |-----|------|---------|-------------|------------------|
 | `enable_writer_perf` | bool | `true` | When enabled, records duration of each `flush`, supports RPC queries | `writer_manager.cpp:28` |
 | `perf_window_size` | int | `1000` | Performance window size | `writer_manager.cpp:30` |
-| `buffer_capacity` | int | none | Maximum number of messages in the BaseWriter's internal ring buffer | `base_writer.cpp:32` |
+| `buffer_capacity` | int | `1024` | Reserve capacity per flush buffer; it is **not** a queue limit | `base_writer.cpp` |
+| `max_pending_records` | int | `4096` | Hard bound on accepted records still owned by the writer (front + active buffers, including retained retries) | `base_writer.cpp` |
+| `max_pending_bytes` | int | `67108864` | Hard bound on accounted payload/metadata bytes; admission never waits or evicts accepted records | `base_writer.cpp` |
+| `max_record_bytes` | int | `8388608` | Reject a single record larger than this with `TooLarge`; must not exceed `max_pending_bytes` | `base_writer.cpp` |
+
+All queue limits may be overridden per writer instance inside that writer's config section (same key names). Zero or negative limits are configuration errors, not an unlimited mode. Admission is asynchronous: `Accepted` means the writer owns the record, not that it reached the backend.
 
 ### `writers` Array Elements
 
@@ -497,14 +642,15 @@ The entire rotation cascade happens before the triggering batch is written, so t
 
 Code location: `src/writer/prometheus_exporter_writer.cpp`
 
-Exposes collected metrics via RPC endpoints for Prometheus scraping. This writer maintains an in-memory metrics table organized by JobID → PID, covering CPU, memory, I/O, and network metrics.
+Exposes collected metrics via RPC endpoints for Prometheus scraping. This writer maintains a generic metric series table keyed by metric name plus labels; collectors choose the metric names, types, labels and values. The writer injects `jobid` when the collector omits it and does not contain a per-collector switch or a central metric schema.
 
 **RPC Endpoints** (automatically registered):
 
 | Endpoint | Description |
 |----------|-------------|
-| `/<writer_name>/metrics` | Returns all job metrics as JSON |
-| `/<writer_name>/info` | Returns writer metadata |
+| `/<writer_name>/metrics` | Returns generic metric samples as JSON |
+| `/<writer_name>/metrics_text` | Returns preformatted Prometheus exposition text |
+| `/<writer_name>/info` | Returns writer metadata and series/job counts |
 
 ```yaml
 prmxs_writer_config: {}    # Currently no config parameters; the section must exist for the `config` field to reference
@@ -522,21 +668,23 @@ Code location: `include/job_watcher/condor_job_watcher.hpp`
 
 ```yaml
 condor_job_watcher:
-  auto_add_collectors:          # When use_rules is false, the default collector list is automatically appended upon the discovery of a new Condor job.
+  auto_add: rule                # off | default | rule
+  auto_add_collectors:          # armed for auto_add: default; fallback for a bare rule accept
     - cpumem_collector
     - net_collector
     - io_collector
-  use_rules: false              # Whether to enable the rule engine for filtering jobs
-  rules_prefix: condor_job_     # Prefix for Lua rule files (default: condor_job_)
 ```
 
-> **Note**: The `rules_dir` for Lua rules is read from `job_registry_config.rules_dir`, not from this section. Its default is `{JobLensRootDir}/../config/rules/condor_jobs` when `use_rules` is enabled for Condor.
+> **Note**: The rule file prefix is the adapter name (`condor`): only `.lua` files whose basename starts with it are loaded, and `rules_prefix` is deprecated and ignored. Rules are loaded at **startup** (`auto_add: rule` arms the engine). `rules_dir` resolves from this section first, then the deprecated `job_registry_config.rules_dir`, then the default `{JobLensRootDir}/../config/rules/condor_jobs`. An empty directory or no prefix match logs a startup warning and selects no collectors for the type.
 
 | Key | Type | Default | Description | Source Reference |
 |-----|------|---------|-------------|------------------|
-| `auto_add_collectors` | string[] | none | List of collector names to automatically add to Condor jobs | `condor_job_watcher.hpp:28` |
-| `use_rules` | bool | `false` | Whether to filter jobs using the rule engine (jobs not matching the rules are not added) | `condor_job_watcher.hpp:29` |
-| `rules_prefix` | string | `"condor_job_"` | Prefix for rule files loaded by the rule engine | `condor_job_watcher.hpp:34` |
+| `auto_add` | string (`off`/`default`/`rule`) | `off` | The automatic-action tri-state; an explicit value wins over the deprecated `auto_collect`/`use_rules` pair | `maintenance_config.cpp` |
+| `auto_add_collectors` | string[] | none | The default collector list: armed verbatim for `auto_add: default`, and the fallback for an `auto_add: rule` accept that names no collectors | `condor_job_watcher.hpp:28` |
+| `auto_collect` | bool | `false` | Legacy mapping source: folds into `auto_add` when `auto_add` is absent | `maintenance_config.cpp` |
+| `use_rules` | bool | `false` | Legacy mapping source: `auto_collect: true` + `use_rules: true` maps to `auto_add: rule` | `condor_job_watcher.hpp:29` |
+| `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` | Rule directory; several types may share it safely thanks to the prefix | `maintenance_config.cpp` |
+| `rules_prefix` | — | deprecated | The matching prefix is always the adapter name; a configured value is ignored with a warning | `maintenance_config.cpp` |
 
 ### `slurm_job_watcher`
 
@@ -544,103 +692,87 @@ Code location: `include/job_watcher/slurm_job_watcher.hpp`
 
 ```yaml
 slurm_job_watcher:
+  auto_add: off                 # off | default | rule
   auto_add_collectors:
     - cpumem_collector
     - net_collector
     - io_collector
-  use_rules: false
-  rules_prefix: slurm_job_
 ```
 
-> **Note**: The `rules_dir` for Lua rules is read from `job_registry_config.rules_dir`, not from this section. Its default is `{JobLensRootDir}/../config/rules/slurm_jobs` when `use_rules` is enabled for Slurm.
+> **Note**: The rule file prefix is the adapter name (`slurm`); `rules_prefix` is deprecated and ignored, and rules load at startup with `auto_add: rule`. `rules_dir` resolves from this section first, then the deprecated `job_registry_config.rules_dir`, then the default `{JobLensRootDir}/../config/rules/slurm_jobs`.
 
 | Key | Type | Default | Description | Source Reference |
 |-----|------|---------|-------------|------------------|
-| `auto_add_collectors` | string[] | none | List of collector names to automatically add to Slurm jobs | `slurm_job_watcher.hpp:29` |
-| `use_rules` | bool | `false` | Whether to filter jobs using the rule engine | `slurm_job_watcher.hpp:30` |
-| `rules_prefix` | string | `"slurm_job_"` | Prefix for rule files loaded by the rule engine | `slurm_job_watcher.hpp:35` |
+| `auto_add` | string (`off`/`default`/`rule`) | `off` | The automatic-action tri-state; an explicit value wins over the deprecated `auto_collect`/`use_rules` pair | `maintenance_config.cpp` |
+| `auto_add_collectors` | string[] | none | The default collector list: armed verbatim for `auto_add: default`, and the fallback for an `auto_add: rule` accept that names no collectors | `slurm_job_watcher.hpp:29` |
+| `auto_collect` | bool | `false` | Legacy mapping source: folds into `auto_add` when `auto_add` is absent | `maintenance_config.cpp` |
+| `use_rules` | bool | `false` | Legacy mapping source: `auto_collect: true` + `use_rules: true` maps to `auto_add: rule` | `slurm_job_watcher.hpp:30` |
+| `rules_dir` | string | `{JobLensRootDir}/../config/rules/slurm_jobs` | Rule directory | `maintenance_config.cpp` |
+| `rules_prefix` | — | deprecated | The matching prefix is always the adapter name; a configured value is ignored with a warning | `maintenance_config.cpp` |
 
 ---
 
-## 10. Writer Parser V2 Context API
+## 10. Collector Output Channels
 
-Each collector provides a parser function per writer type, converting raw collection data into a writer-specific format. The V2 parser API extends the original V1 `std::any(std::any)` signature with a read-only `WriterParseContext` argument, giving parsers access to runtime metadata without breaking existing code.
+Collectors produce typed output records during `collect()` and submit them through an `OutputContext`. Writers never look up a collector instance or parser while flushing.
 
-### V1 Compatibility
+### Declaring channels
 
-The legacy `get_writer_parser()` interface (V1) **remains fully supported**. No existing collector or writer needs modification. V1 parsers are automatically wrapped by the default adapter in `ICollector::get_writer_parser_v2()`.
-
-### V2 is Opt-in
-
-A collector opts into V2 by overriding the virtual method:
+A collector declares the channels it can produce (`document`, `text`, `metrics`, or additional names) and implements:
 
 ```cpp
-// include/collector/icollector.h
-virtual CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type);
+CollectOutcome collect(const Job& job, OutputContext& output) override;
+std::vector<OutputChannel> output_channels() const override;
 ```
 
-The default implementation wraps the V1 parser transparently, discarding `WriterParseContext` and delegating to the old signature. Collectors that do not override this method continue to work as before.
+`CollectOutcome` distinguishes three states:
 
-### WriterParseContext
+| State | Meaning |
+|-------|---------|
+| `Success` | Sampling succeeded; zero emissions are allowed (for example unchanged values) |
+| `Skipped` | No sample was available; the collector must not emit anything |
+| `Failed` | Sampling failed; `error` carries a diagnostic. Exceptions are also collection failures. |
 
-The context struct is **read-only** and constructed at the call site per invocation. It contains:
+Returning `Skipped` after emitting is a contract error reported in scheduler status. An output rejection does not turn a successful sensor read into a failed read, but the scheduler reports it as a failed callback.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `writer_name` | `std::string` | Writer instance name (e.g. `"file_writer"`) |
-| `writer_type` | `std::string` | Writer type identifier (e.g. `"FileWriter"`) |
-| `writer_config_name` | `std::string` | Writer config section name (e.g. `"file_writer_config"`) |
-| `collector_name` | `std::string` | Collector instance name that triggered the write |
-| `job` | `Job` | The `Job` object being collected (contains JobID, PIDs, sub_attr, etc.) |
-| `timestamp` | `std::chrono::system_clock::time_point` | Timestamp when the parser was invoked |
+### Routing configuration
 
-Writers construct the context from their own metadata and the batch record before calling the parser:
-
-```cpp
-// src/writer/file_writer.cpp (simplified)
-WriterParseContext ctx{name_, type_, config_name_, collect_name, job, timestamp};
-auto parser = CollectorRegistry::instance().resolveBestParserV2(collect_name, type_);
+```yaml
+cpumem_collector_config:
+  freq: 1
+  summary: false
+  outputs:
+    document: [es_writer, kafka_writer]
+    text: [file_writer]
+    metrics: [prometheus_writer]
 ```
 
-### Parser Resolution (Fallback Order)
+Rules:
 
-The recommended entry point for writers is `CollectorRegistry::resolveBestParserV2()`, which resolves the best available parser in this order:
+1. `outputs` is explicit: omitted declared channels are disabled; `outputs: {}` disables all output.
+2. `outputs` and the legacy `use_writers` key are mutually exclusive.
+3. Without `outputs`, `use_writers` (collector level) or `collectors_config.default_use_writers` is used. An explicit empty list disables output and does not fall back.
+4. A legacy writer entry maps to the collector's unique channel that accepts its payload kind. No match or multiple matches is a binding error; configure `outputs` explicitly.
+5. Duplicate destinations within one channel are deduplicated. One writer referenced by two channels intentionally receives two records.
+6. Unknown writers/channels, duplicate writer instance names, wrong value types, and incompatible payload kinds make the collector's route invalid. That collector does not start; other collectors continue and the error appears in scheduler status.
 
-1. **V2 parser** — `get_writer_parser_v2()` returns a native V2 parser (collector has overridden the method)
-2. **V1 adapter** — the default `ICollector::get_writer_parser_v2()` wraps the V1 parser with a `WriterParseContext`-discarding lambda
-3. **V1 fallback** — explicit `get_writer_parser()` call as a defensive fallback
-4. **Writer-specific fallback** — returns `nullptr`; the writer handles raw data (e.g. FileWriter accepts plain `std::string`)
+Payload contracts: `FileWriter` accepts `Text`, `ESWriter` and `KafkaWriter` accept `Document` (JSON object), `PrometheusExporterWriter` accepts `Metrics` (`MetricBatch`).
 
-### First PoC: CPUMemCollector → FileWriter
+### Identity and timestamps
 
-`CPUMemCollector` is the first collector to provide a native V2 parser, specifically for `FileWriter`. When `writer_type == "FileWriter"`, the V2 parser:
+WriterManager creates a 128-bit process-run identifier at initialization and a monotonic per-sample counter. `sample_id` combines both values; every emit consumes a per-context sequence and `record_id = sample_id + ":" + sequence`. ES uses `record_id` as `_id`, so records sharing a timestamp no longer overwrite each other. `sampled_at` is captured once at collection entry and shared by all records of that sample.
 
-- Serializes CPU/memory data as JSON with per-process details and optional summary
-- Injects context metadata (`_writer_name`, `_collector_name`, `_job_id`, `_timestamp`) into the output for traceability
+### Queue observability
 
-For all other writer types, `CPUMemCollector::get_writer_parser_v2()` falls through to the default V1 adapter.
+`WriterManager/output_status` is always available (independent of performance counters) and returns per writer: `accepted`, `rejected_full`, `rejected_too_large`, `rejected_closed`, `rejected_invalid`, `rejected_failed`, `pending_records`, `pending_bytes`, high-water marks, `released_records`, and `flush_errors`. At a coherent snapshot `accepted = pending_records + released_records`.
 
-### Adding V2 Support to a New Collector
+### Scheduler status semantics
 
-```cpp
-// In your collector's header:
-CollectDataParseFuncV2 get_writer_parser_v2(const std::string& writer_type) override;
+`CollectorScheduler/status` reports `operation_semantics_version: 2`:
 
-// In your collector's implementation:
-CollectDataParseFuncV2 MyCollector::get_writer_parser_v2(const std::string& writer_type) {
-    if (writer_type == "FileWriter") {
-        return [this](const WriterParseContext& ctx, std::any data) -> std::any {
-            // Use ctx.writer_name, ctx.job.JobID, ctx.timestamp, etc.
-            // Return writer-specific formatted output
-            return formatted_output;
-        };
-    }
-    // Fall back to V1 adapter for other writer types
-    return ICollector::get_writer_parser_v2(writer_type);
-}
-```
-
-> **Note**: Only `CPUMemCollector` currently implements a native V2 parser. Other collectors continue to use the V1 parser interface and are automatically adapted. See `include/collector/icollector.h` and `include/core/collector_type.h` for the full API definition.
+- One `emit()`/`emit_to()` call counts as one `write` operation, including fan-out/admission. Zero emissions produce zero write operations; a disabled valid channel is a successful no-op write.
+- `collect` includes payload preparation and nested writes; `callback` wraps the whole invocation. Those durations overlap and must not be added together.
+- While an emission runs, `current_job.stage` is `write`; after it returns the stage is `collect` again.
 
 ---
 
@@ -773,11 +905,11 @@ file_writer_config:
   #     file_path: /var/log/joblens/cpumem.log
 
 condor_job_watcher:
+  auto_add: off
   auto_add_collectors:
     - cpumem_collector
     - net_collector
     - io_collector
-  use_rules: false
 ```
 
 ---

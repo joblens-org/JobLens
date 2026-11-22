@@ -101,7 +101,10 @@ static void test_condor_attr_json() {
     CHECK(old.cluster_id == 123);
 
     // null 值不炸（contains && !is_null 分支）
-    auto with_null = nlohmann::json::parse(R"({"acct_group": null, "unix_group": null})").get<CondorJobAttr>();
+    auto nullable = nlohmann::json::parse(legacy);
+    nullable["acct_group"] = nullptr;
+    nullable["unix_group"] = nullptr;
+    auto with_null = nullable.get<CondorJobAttr>();
     CHECK(with_null.acct_group.empty());
 }
 
@@ -110,7 +113,7 @@ static void test_slurm_attr_json() {
     a.stepd_pid = 99;
     a.job_id = 648949;
     a.step_id = 0;
-    a.cluster_name = "slurm_cluster_2";
+    a.clusterName = "slurm_cluster_2";
     a.cgroup_path = "/sys/fs/cgroup/slurm/job648949";
     a.user = "carol";
     a.job_name = "Sim01";
@@ -121,7 +124,7 @@ static void test_slurm_attr_json() {
 
     nlohmann::json j = a;
     CHECK(j.size() == 12);
-    CHECK(j.contains("cluster_name"));  // 行为变化锁定：旧 reflection 漏写
+    CHECK(j.contains("clusterName"));  // 行为变化锁定：旧 reflection 漏写
     CHECK(j.contains("unix_gid"));
     auto back = j.get<SlurmJobAttr>();
     CHECK(back.acct_group == "gpupwa");
@@ -131,14 +134,15 @@ static void test_slurm_attr_json() {
     auto old = nlohmann::json::parse(R"({
         "auto_update_child": true, "stepd_pid": 7, "job_id": 42, "step_id": 0,
         "cgroup_path": "/c", "user": "dave", "job_name": "n", "partition": "cpu",
-        "cluster_name": "cl"
+        "clusterName": "cl"
     })").get<SlurmJobAttr>();
     CHECK(old.acct_group.empty());
     CHECK(old.unix_group.empty());
     CHECK(old.unix_gid == -1);
 
     // 大 gid（uint32 上限）不溢出、不与 -1 哨兵混淆
-    auto big = nlohmann::json::parse(R"({"unix_gid": 4294967294})").get<SlurmJobAttr>();
+    j["unix_gid"] = 4294967294LL;
+    auto big = j.get<SlurmJobAttr>();
     CHECK(big.unix_gid == 4294967294LL);
 }
 
@@ -223,8 +227,8 @@ static void write_fake_ad(const std::string& path) {
     f << "PrimaryUnixGroup = \"juno\"\n";
 }
 
-static void test_condor_probe() {
-    const std::string ad = "/tmp/opencode/group_fields_fake.job.ad";
+static void test_condor_probe(const std::string& work) {
+    const std::string ad = work + "/group_fields_fake.job.ad";
     write_fake_ad(ad);
 
     // 5.1 正常路径：子进程 env 指向 ad 文件（starter 缺失 → 用户路径 + 来源校验）
@@ -232,8 +236,8 @@ static void test_condor_probe() {
     Job job;
     job.subtype = JobSubType::Condor;
     job.JobID = 24193;
-    job.JobPIDs = {child};
-    job.NativeJobID = "24193.0";
+    set_pids(job, {child});
+    job.JobNativeID = "24193.0";
     job.sub_attr = CondorJobAttr{.starter_pid = 0, .cluster_id = 24193, .proc_id = 0};
     CHECK(CondorJob::probe_groups(job));
     CHECK(job.group_probed);
@@ -248,8 +252,8 @@ static void test_condor_probe() {
     Job bad;
     bad.subtype = JobSubType::Condor;
     bad.JobID = 999;
-    bad.JobPIDs = {child};
-    bad.NativeJobID = "999.9";
+    set_pids(bad, {child});
+    bad.JobNativeID = "999.9";
     bad.sub_attr = CondorJobAttr{.starter_pid = 0};
     CHECK(!CondorJob::probe_groups(bad));
     CHECK(!bad.group_probed);
@@ -259,14 +263,14 @@ static void test_condor_probe() {
     waitpid(child, nullptr, 0);
 
     // 5.3 ad 路径为符号链接 → 拒绝
-    const std::string link = "/tmp/opencode/group_fields_fake.link";
+    const std::string link = work + "/group_fields_fake.link";
     unlink(link.c_str());
     symlink(ad.c_str(), link.c_str());
     child = spawn_child_with_env({{"_CONDOR_JOB_AD", link}});
     Job sym;
     sym.subtype = JobSubType::Condor;
-    sym.JobPIDs = {child};
-    sym.NativeJobID = "24193.0";
+    set_pids(sym, {child});
+    sym.JobNativeID = "24193.0";
     sym.sub_attr = CondorJobAttr{.starter_pid = 0};
     CHECK(!CondorJob::probe_groups(sym));
     CHECK(std::get<CondorJobAttr>(sym.sub_attr).acct_group.empty());
@@ -289,8 +293,8 @@ static void test_slurm_probe() {
     Job job;
     job.subtype = JobSubType::Slurm;
     job.JobID = 648949;
-    job.JobPIDs = {child};
-    job.NativeJobID = "648949";
+    set_pids(job, {child});
+    job.JobNativeID = "648949";
     job.sub_attr = SlurmJobAttr{.stepd_pid = 0, .job_id = 648949};
     CHECK(SlurmJob::probe_groups(job));
     CHECK(job.group_probed);
@@ -305,7 +309,7 @@ static void test_slurm_probe() {
     child = spawn_child_with_env({{"SLURM_JOB_ACCOUNT", "bad\ngrp"}});
     Job bad;
     bad.subtype = JobSubType::Slurm;
-    bad.JobPIDs = {child};
+    set_pids(bad, {child});
     bad.sub_attr = SlurmJobAttr{};
     CHECK(!SlurmJob::probe_groups(bad));
     CHECK(!bad.group_probed);
@@ -318,13 +322,14 @@ static void test_slurm_probe() {
     }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc != 2) return 2;
     test_classad_decode();
     test_condor_attr_json();
     test_slurm_attr_json();
     test_groups_view();
     test_probe_stats();
-    test_condor_probe();
+    test_condor_probe(argv[1]);
     test_slurm_probe();
 
     if (g_failed == 0) {

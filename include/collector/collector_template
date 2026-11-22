@@ -1,6 +1,7 @@
 #pragma once
 #include "icollector.h"
 #include "core/collector_type.h"
+#include "core/output_record.h"
 #include "nlohmann/json.hpp"
 #include <unordered_map>
 #include <vector>
@@ -13,20 +14,31 @@ struct __YOUR_COLLECTOR_NAME__Data {
 };
 
 //-------------------- 采集器声明 --------------------
-class __YOUR_COLLECTOR_NAME__Collector : public ICollector {
+class __YOUR_COLLECTOR_NAME__Collector : public IPeriodicJobCollector {
 public:
     /*-------- 生命周期 --------*/
-    bool init(const nlohmann::json& cfg) override;
+    bool init(const nlohmann::json& cfg, CollectorInitContext& context) override;
     void deinit() noexcept override;
 
-    /*-------- 采集接口 --------*/
-    CollectResult collect() override;                    // 系统级采集
-    CollectResult collect(const Job& job) override;      // 进程级采集
+    /*-------- Job 生命周期钩子（按需覆写，默认空实现）--------
+     * Job 级采集器只收到 CollectorNames 中包含自己的 Job；
+     * System 级采集器收到全机 Job 事件广播。
+     * 同步调用、持锁执行：必须快速返回且幂等，禁止回调 JobRegistry/CollectorScheduler。 */
+    void on_job_added(const Job& job) override;
+    void on_job_updated(const Job& job) override;
+    void on_job_removed(const Job& job) override;
 
-    /*-------- 输出适配 --------*/
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
+    /*-------- 原生采集接口 --------
+     * 采集器负责采样并构造 0..N 条输出记录，经 OutputContext 提交。
+     * 采样只做一次；只有被路由启用的表示才需要构造。 */
+    CollectOutcome collect(const Job& job, OutputContext& output) override;
+    std::vector<OutputChannel> output_channels() const override;
 
 private:
+    std::vector<__YOUR_COLLECTOR_NAME__Data> sample_job(const Job& job);
+    nlohmann::json to_document(const std::vector<__YOUR_COLLECTOR_NAME__Data>& data) const;
+    std::string to_text(const std::vector<__YOUR_COLLECTOR_NAME__Data>& data) const;
+
     /*-------- 业务状态 --------*/
     double freq_{0.2};               // 例子：采样周期
     std::unordered_map<pid_t, double> last_value_;  // 例子：上次采样值

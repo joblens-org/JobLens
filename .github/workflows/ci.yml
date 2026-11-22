@@ -173,6 +173,10 @@ jobs:
             -DCPACK_RPM_PACKAGE_RELEASE="1${{ matrix.target.dist }}"
           cmake --build --preset ${{ matrix.target.preset }}
 
+      - name: Run unprivileged output regressions
+        if: matrix.target.preset == 'rpm-system-deps'
+        run: SKIP_BUILD=1 bash tests/integration/run_output_tests.sh build
+
       - name: Package TGZ
         if: matrix.target.preset == 'rpm-system-deps'
         run: cpack --preset ${{ matrix.target.preset }}

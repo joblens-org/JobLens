@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "collector/net_usage_collector.hpp"
+#include "core/output_context.hpp"
 
 #include <algorithm>
 #include <any>
@@ -366,25 +367,6 @@ struct NamespaceSockets {
     std::unordered_map<uint64_t, std::vector<size_t>> inode_to_connections;
 };
 
-void print_hex(const void* p, std::size_t len, bool upper_case = false)
-{
-    const unsigned char* buf = static_cast<const unsigned char*>(p);
-    auto old_flags = std::cout.flags();          // 保存原来的格式标志
-    std::cout << std::hex << std::setfill('0');
-
-    for (std::size_t i = 0; i < len; ++i)
-    {
-        if (upper_case)
-            std::cout << std::uppercase;
-        else
-            std::cout << std::nouppercase;
-
-        std::cout << std::setw(2) << static_cast<unsigned>(buf[i]) << ' ';
-    }
-    std::cout << std::dec << std::endl;          // 切换回十进制输出
-    std::cout.flags(old_flags);                  // 恢复原来的格式
-}
-
 namespace {
 // The diagnostic socket is non-blocking, so send/recv retry after the socket
 // becomes ready again.
@@ -504,7 +486,6 @@ int NetUsageCollector::query_single_tcp(Connection& conn) {
             struct tcp_info sample{};
             std::memcpy(&sample, RTA_DATA(rta), std::min<size_t>(sizeof(sample), RTA_PAYLOAD(rta)));
             const struct tcp_info* info = &sample;
-            // print_hex(info, rta->rta_len, true);
             conn.sent = info->tcpi_bytes_sent;
             conn.recv = info->tcpi_bytes_received;
             conn.delivery_rate = info->tcpi_delivery_rate;
@@ -537,7 +518,7 @@ void NetUsageCollector::init_netlink(){
 }
 
 
-bool NetUsageCollector::init(const nlohmann::json& cfg) {
+bool NetUsageCollector::init(const nlohmann::json& cfg, CollectorInitContext& /*context*/) {
     spdlog::debug("NetUsageCollector: init with config: {}", cfg.dump());
     if(cfg.contains("summary") && cfg["summary"].get<std::string>() == "true"){
         summary = true;
@@ -554,19 +535,19 @@ bool NetUsageCollector::init(const nlohmann::json& cfg) {
 }
 
 
-CollectResult NetUsageCollector::collect(const Job& job) {
+std::vector<NetInfo> NetUsageCollector::sample_job(const Job& job) {
     if (netlink_requested && !netlink_inited) init_netlink();
     std::vector<NetInfo> all;
     Connection summary_conn;
     summary_conn.summary = true;
-    all.reserve(job.JobPIDs.size());
+    all.reserve(pids_of(job).size());
     // These snapshots deliberately live for just this collect(Job) call. They
     // cannot leak stale PID/FD ownership or samples into a later Job or cycle.
     std::vector<ProcessSockets> processes;
-    processes.reserve(job.JobPIDs.size());
+    processes.reserve(pids_of(job).size());
     std::vector<NamespaceSockets> namespaces;
     std::unordered_map<std::string, size_t> namespace_indices;
-    for (pid_t pid : job.JobPIDs) {
+    for (pid_t pid : pids_of(job)) {
         if (!Utils::is_process_running(pid)) continue;
         auto inode_to_fd = BuildInodeToFdMap(pid);
         if (!inode_to_fd) continue;
@@ -654,7 +635,7 @@ CollectResult NetUsageCollector::collect(const Job& job) {
         all.push_back(std::move(summary_info));
     }
     prune_stale_connection_states(std::chrono::steady_clock::now());
-    return CollectResult{std::move(all)};
+    return all;
 }
 
 
@@ -668,136 +649,131 @@ void NetUsageCollector::deinit() noexcept {
 }
 
 
-// 若 writer 未定义标准接口，这里返回一个空的默认解析器（按需在你的框架中实现）
-CollectDataParseFunc NetUsageCollector::get_writer_parser(const std::string& writer_type) {
-    CollectDataParseFunc func = nullptr;
-    spdlog::trace("NetUsageCollector: get_writer_parser for writer_type: {}", writer_type);
-    if(writer_type.compare("ESWriter") == 0){
-        func = [this](std::any data)->std::any{
-            nlohmann::json ret;
-            if(data.has_value() == false) {
-                spdlog::warn("NetUsageCollector: error writer parser, empty data");
-                ret["error"] = "empty data";
-                return ret;
-            }
-            ret["process_data"] = nlohmann::json::array();
-            const auto& parsed = std::any_cast<const std::vector<NetInfo>&>(data);
-            spdlog::trace("NetUsageCollector: writer parser get {} NetInfo entries", parsed.size());
-            for (const auto& info : parsed) {
-                nlohmann::json j;
-                j["pid"] = info.pid;
-                j["connections"] = nlohmann::json::array();
-                
-                for (const auto& c : info.connections) {
-                    nlohmann::json cj;
-                    cj["proto"] = (c.proto == L4Proto::TCP) ? "TCP" : "UDP";
-                    cj["state"] = static_cast<int>(c.state);
-                    cj["local_addr"] = c.local.addr;
-                    cj["local_port"] = c.local.port;
-                    cj["peer_addr"]  = c.peer.addr;
-                    cj["peer_port"]  = c.peer.port;
-                    cj["recv_q"]    = c.recv_q;
-                    cj["send_q"]    = c.send_q;
-                    cj["sent"]      = c.sent;
-                    cj["recv"]      = c.recv;
-                    cj["send_rate"] = c.send_rate;
-                    cj["recv_rate"] = c.recv_rate;
-                    cj["delivery_rate"] = c.delivery_rate;
-                    cj["uid"]       = c.uid;
-                    cj["inode"]     = c.inode;
-                    cj["fd"]        = c.fd;
-                    cj["retrans"]   = c.retrans;
-                    cj["rto"]       = c.rto;
-                    cj["rtt"]       = c.rtt;
-                    cj["rtt_var"]   = c.rtt_var;
-                    cj["fd_path"]   = fd_to_path(info.pid, c.fd);
-                    j["connections"].push_back(std::move(cj));
-                }
-                if (info.pid == 0){
-                    if (summary) ret["summary"] = std::move(j);
-                }else{
-                    ret["process_data"].push_back(std::move(j));
-                }
-            }
-            return ret;
-        };
-    }
-
-    if(writer_type.compare("FileWriter") == 0){
-        func = [this](std::any data)->std::any{
-            if(data.has_value() == false) {
-                spdlog::warn("NetUsageCollector: error FileWriter parser, empty data");
-                return std::string("NetUsageCollector error=empty_data\n");
-            }
-            const auto& parsed = std::any_cast<const std::vector<NetInfo>&>(data);
-            std::ostringstream out;
-            for (const auto& info : parsed) {
-                out << "NetUsageCollector"
-                    << " type=" << (info.pid == 0 ? "summary" : "process")
-                    << " pid=" << info.pid
-                    << " connections=" << info.connections.size()
-                    << '\n';
-                for (const auto& c : info.connections) {
-                    out << "NetUsageCollector connection"
-                        << " pid=" << info.pid
-                        << " proto=" << ((c.proto == L4Proto::TCP) ? "TCP" : "UDP")
-                        << " state=" << static_cast<int>(c.state)
-                        << " local_addr=" << c.local.addr
-                        << " local_port=" << c.local.port
-                        << " peer_addr=" << c.peer.addr
-                        << " peer_port=" << c.peer.port
-                        << " recv_q=" << c.recv_q
-                        << " send_q=" << c.send_q
-                        << " sent=" << c.sent
-                        << " recv=" << c.recv
-                        << " send_rate=" << c.send_rate
-                        << " recv_rate=" << c.recv_rate
-                        << " delivery_rate=" << c.delivery_rate
-                        << " uid=" << c.uid
-                        << " inode=" << c.inode
-                        << " fd=" << c.fd
-                        << " retrans=" << c.retrans
-                        << " rto=" << c.rto
-                        << " rtt=" << c.rtt
-                        << " rtt_var=" << c.rtt_var
-                        << " fd_path=" << fd_to_path(info.pid, c.fd)
-                        << '\n';
-                }
-            }
-            return out.str();
-        };
-    }
-
-    if(writer_type.compare("PrometheusExporterWriter") == 0){
-        func = [this](std::any data)->std::any{
-            PrometheusExporterWriter::prometheus_job_state ret;
-            if(data.has_value() == false) {
-                spdlog::warn("IOUsageCollector: error writer parser, empty data");
-                ret.JobID = 0;
-                return ret;
-            }
-            const auto& parsed = std::any_cast<const std::vector<NetInfo>&>(data);
-            
-            for (const auto& info : parsed) {
-                PrometheusExporterWriter::prometheus_process_state state;
-                state.pid = info.pid;
-                for (const auto& c : info.connections){
-                    state.net_recv_bytes_per_sec += c.recv_rate;
-                    state.net_recv_bytes_total += c.recv;
-                    state.net_send_bytes_per_sec += c.send_rate;
-                    state.net_sent_bytes_total += c.sent;
-                    state.tcp_retrans_total += c.retrans;
-                    state.tcp_rtt_us += c.rtt;
-                }
-                if (!info.connections.empty()) {
-                    state.tcp_rtt_us /= info.connections.size();
-                }
-
-                ret.processes_state.push_back(state);
-            }
-            return ret;
-        };
-    }
-    
-    return func;
+std::vector<OutputChannel> NetUsageCollector::output_channels() const {
+    return {
+        {"document", OutputKind::Document},
+        {"text", OutputKind::Text},
+        {"metrics", OutputKind::Metrics}
+    };
 }
+
+nlohmann::json NetUsageCollector::to_document(const std::vector<NetInfo>& infos) const {
+    nlohmann::json ret;
+    ret["process_data"] = nlohmann::json::array();
+    for (const auto& info : infos) {
+        nlohmann::json j;
+        j["pid"] = info.pid;
+        j["connections"] = nlohmann::json::array();
+        for (const auto& c : info.connections) {
+            nlohmann::json cj;
+            cj["proto"] = (c.proto == L4Proto::TCP) ? "TCP" : "UDP";
+            cj["state"] = static_cast<int>(c.state);
+            cj["local_addr"] = c.local.addr;
+            cj["local_port"] = c.local.port;
+            cj["peer_addr"]  = c.peer.addr;
+            cj["peer_port"]  = c.peer.port;
+            cj["recv_q"]    = c.recv_q;
+            cj["send_q"]    = c.send_q;
+            cj["sent"]      = c.sent;
+            cj["recv"]      = c.recv;
+            cj["send_rate"] = c.send_rate;
+            cj["recv_rate"] = c.recv_rate;
+            cj["delivery_rate"] = c.delivery_rate;
+            cj["uid"]       = c.uid;
+            cj["inode"]     = c.inode;
+            cj["fd"]        = c.fd;
+            cj["retrans"]   = c.retrans;
+            cj["rto"]       = c.rto;
+            cj["rtt"]       = c.rtt;
+            cj["rtt_var"]   = c.rtt_var;
+            cj["fd_path"]   = fd_to_path(info.pid, c.fd);
+            j["connections"].push_back(std::move(cj));
+        }
+        if (info.pid == 0) {
+            if (summary) ret["summary"] = std::move(j);
+        } else {
+            ret["process_data"].push_back(std::move(j));
+        }
+    }
+    return ret;
+}
+
+std::string NetUsageCollector::to_text(const std::vector<NetInfo>& infos) const {
+    std::ostringstream out;
+    for (const auto& info : infos) {
+        out << "NetUsageCollector"
+            << " type=" << (info.pid == 0 ? "summary" : "process")
+            << " pid=" << info.pid
+            << " connections=" << info.connections.size()
+            << '\n';
+        for (const auto& c : info.connections) {
+            out << "NetUsageCollector connection"
+                << " pid=" << info.pid
+                << " proto=" << ((c.proto == L4Proto::TCP) ? "TCP" : "UDP")
+                << " state=" << static_cast<int>(c.state)
+                << " local_addr=" << c.local.addr
+                << " local_port=" << c.local.port
+                << " peer_addr=" << c.peer.addr
+                << " peer_port=" << c.peer.port
+                << " recv_q=" << c.recv_q
+                << " send_q=" << c.send_q
+                << " sent=" << c.sent
+                << " recv=" << c.recv
+                << " send_rate=" << c.send_rate
+                << " recv_rate=" << c.recv_rate
+                << " delivery_rate=" << c.delivery_rate
+                << " uid=" << c.uid
+                << " inode=" << c.inode
+                << " fd=" << c.fd
+                << " retrans=" << c.retrans
+                << " rto=" << c.rto
+                << " rtt=" << c.rtt
+                << " rtt_var=" << c.rtt_var
+                << " fd_path=" << fd_to_path(info.pid, c.fd)
+                << '\n';
+        }
+    }
+    return out.str();
+}
+
+MetricBatch NetUsageCollector::to_metrics(const std::vector<NetInfo>& infos) const {
+    MetricBatch ret;
+    ret.samples.reserve(infos.size() * 6);
+    for (const auto& info : infos) {
+        double recv = 0, sent = 0, recv_rate = 0, send_rate = 0, retrans = 0, rtt = 0;
+        for (const auto& connection : info.connections) {
+            recv += connection.recv;
+            sent += connection.sent;
+            recv_rate += connection.recv_rate;
+            send_rate += connection.send_rate;
+            retrans += connection.retrans;
+            rtt += connection.rtt;
+        }
+        if (!info.connections.empty()) rtt /= info.connections.size();
+        const std::vector<MetricLabel> labels{{"pid", std::to_string(info.pid)}};
+        ret.samples.push_back({"job_net_recv_bytes_total", MetricType::Counter,
+            "Total bytes received via network", labels, recv});
+        ret.samples.push_back({"job_net_sent_bytes_total", MetricType::Counter,
+            "Total bytes sent via network", labels, sent});
+        ret.samples.push_back({"job_net_recv_bytes_per_sec", MetricType::Gauge,
+            "Network receive rate in bytes per second", labels, recv_rate});
+        ret.samples.push_back({"job_net_send_bytes_per_sec", MetricType::Gauge,
+            "Network send rate in bytes per second", labels, send_rate});
+        ret.samples.push_back({"job_net_tcp_retrans_total", MetricType::Counter,
+            "Total TCP retransmissions", labels, retrans});
+        ret.samples.push_back({"job_net_tcp_rtt_us", MetricType::Gauge,
+            "Average TCP round-trip time in microseconds", labels, rtt});
+    }
+    return ret;
+}
+
+CollectOutcome NetUsageCollector::collect(const Job& job, OutputContext& output) {
+    if (!output.enabled("document") && !output.enabled("text") && !output.enabled("metrics")) return {};
+    const auto infos = sample_job(job);
+    if (output.enabled("document")) output.emit("document", Document{to_document(infos)});
+    if (output.enabled("text")) output.emit("text", Text{to_text(infos)});
+    if (output.enabled("metrics")) output.emit("metrics", to_metrics(infos));
+    return {};
+}
+
+// 若 writer 未定义标准接口，这里返回一个空的默认解析器（按需在你的框架中实现）

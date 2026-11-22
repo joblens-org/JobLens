@@ -18,11 +18,11 @@
 #include "core/writer_manager.hpp"
 #include "core/job_registry.hpp"
 #include "core/collector_scheduler.hpp"
-#include "common/permission_opt.hpp"
 #include "common/local_rpc.hpp"
 #include "common/version.h"
 
 #include <iostream>
+#include <memory>
 #include <spdlog/spdlog.h>
 #include <fmt/ranges.h>
 #include <signal.h>
@@ -132,7 +132,17 @@ bool already_running() {
 
 void onBecomeService() {
     spdlog::info("Main: app start as service mode.");
-    CollectorScheduler::instance().start();
+    // The registry constructor is the single assembly point for durable state:
+    // it opens the store, creates the kernel namespace and starts registry
+    // discovery and maintenance (initial scan included).
+    JobRegistry& registry = JobRegistry::instance();
+    // Explicit ownership seam: the scheduler pulls desired state from the
+    // registry and reports a completed drain back to it. Neither side reaches
+    // for the other's singleton after this wiring.
+    CollectorScheduler& scheduler = CollectorScheduler::instance();
+    scheduler.attach(&registry, &registry);
+    registry.setCollectionRuntime(&scheduler);
+    scheduler.start();
 }
 
 int version() {

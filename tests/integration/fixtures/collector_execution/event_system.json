@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "id": "event_system",
+  "scope": "system",
+  "trigger": "event",
+  "interface": "IEventSystemCollector",
+  "activation": "auto_start_or_explicit_start",
+  "invocation": "on_ready(sources, budget, SystemEventContext&)",
+  "source_kinds": ["unix_datagram", "ebpf_ringbuf"],
+  "required_cases": [
+    {
+      "name": "zero_jobs",
+      "jobs": [],
+      "expected_invocations": "driven by source readiness or max-wait scan",
+      "envelope": {
+        "job_id": 0,
+        "job_type": "Sys",
+        "is_system_placeholder": true
+      }
+    },
+    {
+      "name": "payload_mentions_real_job",
+      "jobs": [
+        {"job_id": 101, "pids": [1010], "type": "Job", "subtype": "Common"}
+      ],
+      "event": {"reported_job_id": 101, "sequence": 1},
+      "expected_envelope_job_id": 0,
+      "expected_job_session_available": false
+    },
+    {
+      "name": "last_job_removed",
+      "jobs": [],
+      "expected_collector_state": "running",
+      "expected_final_report": false,
+      "expected_lifecycle_observation": "real removal observed without per-Job finalization"
+    },
+    {
+      "name": "instance_restart",
+      "expected_report_identity": "new_instance_run",
+      "expected_stale_event_handling": "old generation ignored"
+    }
+  ],
+  "output_attribution": "System session only; Job 0 envelope throughout",
+  "finish_boundary": "instance_stop",
+  "input_completion": [
+    "producer stop marker",
+    "per-source terminal sequence",
+    "explicitly bounded best-effort cutoff recorded as incomplete"
+  ],
+  "policies": {
+    "stream": "emit selected System events or batches",
+    "final": "consume continuously into global statistics; one report when the instance run stops",
+    "both": "System event output plus the instance-run report"
+  }
+}

@@ -39,7 +39,8 @@ nlohmann::json serialize(const CollectorRuntime::Entry& entry,
     std::string state = entry.failed ? "error" : (entry.timer_active ? "scheduled" : "idle");
     if (entry.phase != "idle") state = entry.phase;
     else if (!entry.metrics.at("callback").active.empty()) state = "running";
-    return {{"name", entry.name}, {"scope", entry.scope}, {"config", entry.config},
+    return {{"name", entry.name}, {"scope", entry.scope}, {"trigger", entry.trigger},
+        {"output_policy", entry.output_policy}, {"config", entry.config},
         {"state", state}, {"has_error", entry.failed}, {"period_ms", entry.period_ms},
         {"job_count", entry.job_count}, {"timer_active", entry.timer_active},
         {"active_callback_count", entry.metrics.at("callback").active.size()},
@@ -48,14 +49,18 @@ nlohmann::json serialize(const CollectorRuntime::Entry& entry,
 }
 }
 void CollectorRuntime::configure(const std::string& name, const std::string& config,
-                                 const std::string& scope, double period_ms) {
+                                 const std::string& scope, double period_ms,
+                                 const std::string& trigger,
+                                 const std::string& output_policy) {
     std::lock_guard lock(mutex_);
     auto& entry = entries_[name];
     entry.name = name;
     entry.config = config;
     entry.scope = scope;
+    entry.trigger = trigger;
+    entry.output_policy = output_policy;
     entry.period_ms = period_ms;
-    for (const auto* kind : {"init", "deinit", "callback", "lookup_job", "wait_collector_lock", "collect", "write"})
+    for (const auto* kind : {"init", "deinit", "callback", "lookup_job", "wait_collector_lock", "collect", "event_drain", "write"})
         entry.metrics.try_emplace(kind);
 }
 void CollectorRuntime::jobs(const std::string& name, size_t count) {
@@ -73,6 +78,10 @@ void CollectorRuntime::error(const std::string& name, const std::string& message
     entry.last_error = message.substr(0, 512);
     for (auto& ch : entry.last_error)
         if (static_cast<unsigned char>(ch) >= 128) ch = '?';
+}
+void CollectorRuntime::clear_error(const std::string& name) {
+    std::lock_guard lock(mutex_);
+    entries_.at(name).failed = false;
 }
 void CollectorRuntime::lifecycle(const std::string& value) {
     std::lock_guard lock(mutex_);
@@ -121,6 +130,7 @@ nlohmann::json CollectorRuntime::snapshot() const {
         errors += entry.failed;
     }
     return {{"status", "ok"}, {"lifecycle", lifecycle},
+        {"operation_semantics_version", 2},
         {"observed_at_unix_ms", wallNow()}, {"collector_count", entries.size()},
         {"collectors_with_error", errors}, {"active_callback_count", active},
         {"collectors", collectors}, {"scheduler", scheduler}};
@@ -174,8 +184,8 @@ CollectorRuntime::Operation::~Operation() {
     } else {
         ++metric.success;
         metric.last_success_unix_ms = wallNow();
-        // 空扫描不能掩盖初始化或采集错误；历史错误文本和计数保留。
-        if (kind_ == "init" || kind_ == "write") entry.failed = false;
+        // 空扫描不能掩盖初始化错误；采集错误只在完整成功的调用后由调度器显式清除。
+        if (kind_ == "init") entry.failed = false;
     }
     if (kind_ == "init" || kind_ == "deinit") entry.phase = "idle";
 }

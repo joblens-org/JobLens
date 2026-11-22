@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "id": "periodic_job",
+  "scope": "job",
+  "trigger": "periodic",
+  "interface": "IPeriodicJobCollector",
+  "activation": "first_binding_or_explicit_start",
+  "invocation": "collect(job, output) once per selected attached Job in one logical timer sweep",
+  "required_cases": [
+    {
+      "name": "zero_bindings",
+      "jobs": [],
+      "expected_invocations": 0,
+      "expected_output_records": 0
+    },
+    {
+      "name": "one_job",
+      "jobs": [
+        {"job_id": 101, "pids": [1010], "type": "Job", "subtype": "Common"}
+      ],
+      "expected_invocations": 1,
+      "envelope": {
+        "job_id": 101,
+        "job_type": "Job",
+        "is_system_placeholder": false
+      }
+    },
+    {
+      "name": "two_jobs",
+      "jobs": [
+        {"job_id": 101, "pids": [1010], "type": "Job", "subtype": "Common"},
+        {"job_id": 202, "pids": [2020], "type": "Job", "subtype": "Common"}
+      ],
+      "expected_invocations": 2,
+      "expected_calls_per_job": 1
+    },
+    {
+      "name": "removed_job",
+      "jobs": [
+        {"job_id": 101, "pids": [1010], "type": "Job", "subtype": "Common"}
+      ],
+      "remove_job_id": 101,
+      "expected_invocations_after_removal": 0,
+      "expected_finish_reason": "job_completion"
+    }
+  ],
+  "output_attribution": "each invocation carries its own real Job snapshot",
+  "finish_boundary": "per_job",
+  "policies": {
+    "stream": "one output set per selected Job sample",
+    "final": "aggregate per Job; one logical report when that Job finishes",
+    "both": "Job samples plus one logical final report per monitoring session"
+  }
+}

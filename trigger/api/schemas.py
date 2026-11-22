@@ -17,8 +17,8 @@ JobLens Trigger API Schemas
 使用 Pydantic 规范所有请求体和响应体
 """
 
-from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Literal, Optional
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 
 # ==================== 请求体模型 ====================
@@ -28,9 +28,23 @@ class JobRequest(BaseModel):
     opt: str = Field(..., description="操作类型: add/remove")
     type: str = Field(..., description="作业类型: job.condor/job.common")
     JobID: Optional[int] = Field(None, description="作业ID")
-    JobPIDs: Optional[List[int]] = Field(None, description="进程ID列表")
+    JobPIDs: Optional[List[int]] = Field(None, description="进程ID列表（裸 pid，兼容别名）")
     Lens: Optional[List[str]] = Field(None, description="采集器列表，默认 ['cpumem_collector', 'io_collector', 'net_collector']")
+    clusterName: Optional[str] = Field(None, description="调度器集群或池路由标签")
+    clusterTag: Optional[str] = Field(None, description="调度器命名空间标签")
     sub_attr: Optional[Dict[str, Any]] = Field(None, description="子属性，condor类型需cluster_id/proc_id，slurm类型需job_id/step_id")
+    erase: Optional[bool] = Field(None, description="remove 的真删档：true=退役实例（采集过归档 h: 行，未采集过纯删）；默认 false 保留 stop 语义（停采集、留库存）")
+
+
+class JobUpsertRequest(BaseModel):
+    """v2 作业 upsert 请求：不带 action 字段，身份由 type/sub_attr 决定。"""
+    type: str = Field(..., description="作业类型: job.condor/job.slurm/job.common")
+    JobID: Optional[int] = Field(None, description="内部 ID 兼容提示，可省略")
+    JobPIDs: Optional[List[int]] = Field(None, description="进程ID列表")
+    Lens: Optional[List[str]] = Field(None, description="采集器列表")
+    clusterName: Optional[str] = Field(None, description="调度器集群或池路由标签")
+    clusterTag: Optional[str] = Field(None, description="调度器命名空间标签")
+    sub_attr: Optional[Dict[str, Any]] = Field(None, description="调度器 typed facts")
 
 
 class CondorJobRequest(BaseModel):
@@ -43,9 +57,14 @@ class CondorJobRequest(BaseModel):
 
 
 class SlurmJobRequest(BaseModel):
-    """Slurm作业专用请求"""
+    """Slurm作业专用请求
+
+    JobID 是兼容提示，不是权威身份。原生身份以 sub_attr 的
+    job_id/step_id + 调度器命名空间为准，因此 identity-only 的
+    legacy add 可以不带 JobID。
+    """
     opt: str = Field(..., description="操作类型，目前仅支持 'add'")
-    JobID: int = Field(..., description="Slurm作业ID")
+    JobID: Optional[int] = Field(None, description="作业ID（兼容提示，可省略）")
     Lens: Optional[List[str]] = Field(None, description="采集器列表，默认 ['cpumem_collector', 'io_collector', 'net_collector']")
     sub_attr: Optional[Dict[str, Any]] = Field(None, description="子属性，包含job_id/step_id，不提供则用JobID/0")
 
@@ -214,4 +233,186 @@ class UpgradeResponse(BaseModel):
 
 class HardwareInfoResponse(BaseModel):
     """硬件信息响应 - 动态字段"""
+    model_config = {"extra": "allow"}
+
+
+# ==================== 作业列表 / 采集控制模型 ====================
+# 契约见 doc/api_documentation.md 第 12 节。
+# Trigger 只做边界校验与透传：不分配、不推导内部 ID。
+
+class CollectionSelector(BaseModel):
+    """采集控制选择器，两种互斥形式之一
+
+    形式 1（原生身份）: scheduler_type + clusterName + JobNativeID
+                        [+ clusterTag] [+ step_id]
+    形式 2（实例句柄）: JobID（内部记录 ID 的十进制字符串）；
+                        旧版不透明 instance_id 句柄已退役，边界即拒绝
+    """
+    # 退役的 instance_id 键不再被静默丢弃：显式拒绝，调用方立刻看见迁移点
+    model_config = ConfigDict(extra="forbid")
+
+    scheduler_type: Optional[str] = Field(None, description="调度器类型，如 condor/slurm")
+    clusterName: Optional[str] = Field(None, description="调度器命名空间；原生身份必填")
+    clusterTag: Optional[str] = Field(None, description="调度器命名空间标签，可选")
+    JobNativeID: Optional[str] = Field(None, description="调度器原生作业 ID 字符串，如 '172.0'")
+    step_id: Optional[str] = Field(None, description="Slurm step 字符串，可选")
+    JobID: Optional[str] = Field(
+        None,
+        pattern=r"^[0-9]+$",
+        description="内部记录 ID 的十进制字符串；实例句柄形式，仅支持 instance scope",
+    )
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _normalize_identity_string(cls, value: Any, info: ValidationInfo) -> Any:
+        """原生 ID/namespace 一律按契约以字符串过界；这里只做无损归一化。"""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError(f"{info.field_name} must be a string")
+        if isinstance(value, int):
+            if info.field_name not in ("JobNativeID", "step_id"):
+                raise ValueError(f"{info.field_name} must be a string")
+            value = str(value)
+        if not isinstance(value, str):
+            raise ValueError(f"{info.field_name} must be a string")
+        value = value.strip()
+        if not value:
+            raise ValueError(f"{info.field_name} must not be empty")
+        return value
+
+
+class CollectionControlRequest(BaseModel):
+    """POST /joblens/collection 请求体"""
+    selector: CollectionSelector = Field(..., description="实例句柄或原生身份选择器，二者只能取其一")
+    scope: Literal["instance", "job"] = Field("instance", description="instance 或 job；实例句柄只支持 instance")
+    ensure_registered: bool = Field(False, description="为 true 时要求 Core 先刷新发现再匹配")
+    operation: Literal["set", "reset_auto"] = Field(..., description="set 显式设置采集器；reset_auto 交回自动策略")
+    collectors: Optional[List[str]] = Field(None, description="set 必填，[] 表示持久停止；reset_auto 必须省略")
+    expected_revision: Optional[int] = Field(
+        None, ge=0, description="绑定期望修订号，0 表示尚无绑定；仅单实例请求可携带"
+    )
+
+    @field_validator("collectors")
+    @classmethod
+    def _normalize_collector_names(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        names: List[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("collectors must be a list of non-empty collector names")
+            names.append(item.strip())
+        return names
+
+    @model_validator(mode="after")
+    def _validate_contract(self) -> "CollectionControlRequest":
+        selector = self.selector
+        has_internal = selector.JobID is not None
+        native_fields = [
+            name for name in ("scheduler_type", "clusterName", "clusterTag", "JobNativeID", "step_id")
+            if getattr(selector, name) is not None
+        ]
+
+        if has_internal and native_fields:
+            raise ValueError(
+                "selector must use exactly one form: an instance handle (JobID) "
+                "or native identity fields, not both"
+            )
+        if not has_internal:
+            missing = [
+                name for name in ("scheduler_type", "clusterName", "JobNativeID")
+                if getattr(selector, name) is None
+            ]
+            if missing:
+                raise ValueError(
+                    "incomplete native selector, missing: " + ", ".join(missing)
+                )
+        if has_internal and self.scope != "instance":
+            raise ValueError("instance handle selectors only support scope=instance")
+        if self.operation == "set" and self.collectors is None:
+            raise ValueError(
+                "operation=set requires an explicit collectors array; [] means persistent stop"
+            )
+        if self.operation == "reset_auto" and self.collectors is not None:
+            raise ValueError("operation=reset_auto must omit collectors")
+        if self.expected_revision is not None and self.scope != "instance":
+            raise ValueError(
+                "expected_revision is only accepted for a single-instance request (scope=instance)"
+            )
+        return self
+
+
+class JobCollectionIntentRequest(BaseModel):
+    """v2 作业采集意图：PUT 替换期望集合，DELETE 清回自动策略。"""
+    collectors: List[str] = Field(..., description="显式采集器列表；[] 表示持久停止")
+    expected_revision: Optional[int] = Field(
+        None, ge=0, description="记录修订号；省略表示不校验"
+    )
+
+    @field_validator("collectors")
+    @classmethod
+    def _normalize_collector_names(cls, value: List[str]) -> List[str]:
+        names: List[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("collectors must be a list of non-empty collector names")
+            names.append(item.strip())
+        return names
+
+
+class CollectionErrorResponse(BaseModel):
+    """结构化错误体"""
+    code: str = Field(..., description="机器可读错误码")
+    message: str = Field(..., description="人类可读错误信息")
+    candidates: Optional[List[str]] = Field(None, description="歧义选择器的候选实例句柄")
+
+
+class CollectionTarget(BaseModel):
+    """被精确解析到的单个实例"""
+    JobID: str = Field(..., pattern=r"^[0-9]+$", description="内部记录 ID，十进制字符串")
+    JobNativeID: Optional[str] = Field(None, description="调度器原生作业 ID 字符串")
+    revision: int = Field(..., description="已受理（accepted）的记录修订号")
+    mode: str = Field(..., description="绑定模式，如 manual/auto")
+    desired_collectors: List[str] = Field(..., description="已持久化的期望采集器")
+    applied_collectors: List[str] = Field(..., description="调度器已实际生效的采集器")
+    applied_attach_token: int = Field(0, description="实际生效的调度器附着令牌")
+    draining: bool = Field(False, description="该实例的停止是否仍在排空")
+    errors: List[Any] = Field(default_factory=list, description="单实例应用错误")
+    model_config = {"extra": "allow"}
+
+
+class CollectionControlResponse(BaseModel):
+    """POST /joblens/collection 成功响应"""
+    status: str = Field(..., description="受理状态，如 accepted")
+    targets: List[CollectionTarget] = Field(..., description="精确解析到的目标实例")
+    model_config = {"extra": "allow"}
+
+
+class CollectionStatusResponse(BaseModel):
+    """GET /joblens/collection 响应 - 透传 Core 的期望/生效选择与错误"""
+    model_config = {"extra": "allow"}
+
+
+class JobListPageResponse(BaseModel):
+    """GET /joblens/jobs/list 响应"""
+    snapshot_revision: int = Field(..., description="首页捕获的快照修订号")
+    records: List[Dict[str, Any]] = Field(..., description="作业记录，内部 ID 为十进制字符串")
+    next_cursor: Optional[str] = Field(None, description="下一页不透明游标；无更多数据为 null")
+    model_config = {"extra": "allow"}
+
+
+class JobLensStatusResponse(BaseModel):
+    """GET /joblens/jobs/status 响应 - 透传 Core 的来源/持久化/队列/对账健康"""
+    model_config = {"extra": "allow"}
+
+
+class CapabilitiesResponse(BaseModel):
+    """GET /joblens/capabilities 响应 - 只透传，绝不代 Core 声明能力"""
+    api_version: Optional[int] = Field(None, description="作业/采集 RPC 契约版本")
+    collection_control_version: Optional[int] = Field(None, description="采集控制契约版本")
+    native_identity_selectors: Optional[bool] = Field(None, description="是否支持原生身份选择器")
+    job_scope: Optional[str] = Field(None, description="job scope 语义，如 current_local_instances")
+    db_schema_version: Optional[int] = Field(None, description="DB schema 版本")
+    ready: Optional[bool] = Field(None, description="作业持久层是否已完成迁移并可用")
     model_config = {"extra": "allow"}

@@ -9,8 +9,6 @@ build=$(cd "$build" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-mkdir -p /tmp/opencode
-
 if [[ ${SKIP_BUILD:-0} != 1 ]]; then cmake --build "$build" -j 2; fi
 
 link=""
@@ -29,4 +27,4 @@ c++ -std=c++17 -O0 -g -DSPDLOG_COMPILED_LIB -DYAML_CPP_STATIC_DEFINE -DHAS_STRIN
 command=${link/CMakeFiles\/JobLens.dir\/src\/main.cpp.o/\"$work\/$test.o\"}
 command=${command/ -o JobLens / -o \"$work\/$test\" }
 (cd "$build"; bash -c "$command")
-timeout 60 "$work/$test"
+timeout 60 "$work/$test" "$work"

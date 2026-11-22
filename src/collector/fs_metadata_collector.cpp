@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #include "collector/fs_metadata_collector.hpp"
+#include "core/output_context.hpp"
 #include "core/collector_registry.hpp"
 #include "common/utils.hpp"
 #include "common/ebpf_common.hpp"
@@ -61,7 +62,7 @@ static std::string op_name_from_id(uint32_t op_id) {
     }
 }
 
-bool FSMetadataCollector::init(const nlohmann::json& cfg) {
+bool FSMetadataCollector::init(const nlohmann::json& cfg, CollectorInitContext& /*context*/) {
     include_process_details = !cfg.contains("include_process_details") ||
         cfg["include_process_details"].get<std::string>() == "true";
 
@@ -117,7 +118,7 @@ void FSMetadataCollector::refresh_dump_cache_if_needed() {
     last_dump_time_ = complete ? now : steady_clock::time_point{};
 }
 
-CollectResult FSMetadataCollector::collect(const Job& job) {
+JobFSMetaStat FSMetadataCollector::sample_job(const Job& job) {
     JobFSMetaStat result;
     result.job_id = job.JobID;
 
@@ -270,194 +271,171 @@ CollectResult FSMetadataCollector::collect(const Job& job) {
         last_proc_op_errors_[job.JobID] = std::move(current_proc_errors);
     }
 
-    return std::any(result);
+    return result;
 }
 
-CollectDataParseFunc FSMetadataCollector::get_writer_parser(const std::string& writer_type) {
-    if (writer_type == "ESWriter") {
-        return [](std::any data) -> std::any {
-            json j;
-            if (!data.has_value()) {
-                j["error"] = "empty data";
-                return j;
-            }
-            try {
-                const auto& s = std::any_cast<const JobFSMetaStat&>(data);
-                j["job_id"] = s.job_id;
-                j["collect_period"] = s.collect_period;
-                j["job_metadata_ops_total"] = s.job_metadata_ops_total;
-                j["job_metadata_ops_rate"] = s.job_metadata_ops_rate;
+std::vector<OutputChannel> FSMetadataCollector::output_channels() const {
+    return {
+        {"document", OutputKind::Document},
+        {"text", OutputKind::Text},
+        {"metrics", OutputKind::Metrics}
+    };
+}
 
-                j["job_ops"] = json::array();
-                for (const auto& [op, oc] : s.job_ops) {
-                    json oj;
-                    oj["op_id"] = oc.op_id;
-                    oj["op_name"] = oc.op_name;
-                    oj["calls"] = oc.calls;
-                    oj["calls_rate"] = oc.calls_rate;
-                    oj["error_rate"] = oc.error_rate;
-                    oj["success"] = oc.success;
-                    oj["errors"] = oc.errors;
-                    oj["last_errno"] = oc.last_errno;
-                    oj["total_latency_ns"] = oc.total_latency_ns;
-                    oj["max_latency_ns"] = oc.max_latency_ns;
-                    auto it = s.job_latency.find(op);
-                    if (it != s.job_latency.end()) {
-                        oj["latency_hist"] = std::vector<u64>(
-                            std::begin(it->second.hist), std::end(it->second.hist));
-                    }
-                    j["job_ops"].push_back(std::move(oj));
-                }
-
-                j["processes"] = json::array();
-                for (const auto& [pid, p] : s.processes) {
-                    json pj;
-                    pj["pid"] = p.pid;
-                    pj["metadata_ops_total"] = p.metadata_ops_total;
-                    pj["metadata_ops_rate"] = p.metadata_ops_rate;
-                    pj["ops"] = json::array();
-                    for (const auto& [op, oc] : p.ops) {
-                        pj["ops"].push_back({
-                            {"op_id", oc.op_id}, {"op_name", oc.op_name},
-                            {"calls", oc.calls}, {"calls_rate", oc.calls_rate},
-                            {"error_rate", oc.error_rate},
-                            {"success", oc.success}, {"errors", oc.errors},
-                            {"last_errno", oc.last_errno},
-                            {"total_latency_ns", oc.total_latency_ns},
-                            {"max_latency_ns", oc.max_latency_ns}
-                        });
-                    }
-                    j["processes"].push_back(std::move(pj));
-                }
-                return j;
-            } catch (const std::bad_any_cast& e) {
-                spdlog::error("FSMetadataCollector: ESWriter parser bad_any_cast: {}", e.what());
-                j["error"] = "bad cast";
-                return j;
-            }
-        };
+nlohmann::json FSMetadataCollector::to_document(const JobFSMetaStat& s) const {
+    using json = nlohmann::json;
+    json j;
+    j["job_id"] = s.job_id;
+    j["collect_period"] = s.collect_period;
+    j["job_metadata_ops_total"] = s.job_metadata_ops_total;
+    j["job_metadata_ops_rate"] = s.job_metadata_ops_rate;
+    j["job_ops"] = json::array();
+    for (const auto& [op, oc] : s.job_ops) {
+        json oj;
+        oj["op_id"] = oc.op_id;
+        oj["op_name"] = oc.op_name;
+        oj["calls"] = oc.calls;
+        oj["calls_rate"] = oc.calls_rate;
+        oj["error_rate"] = oc.error_rate;
+        oj["success"] = oc.success;
+        oj["errors"] = oc.errors;
+        oj["last_errno"] = oc.last_errno;
+        oj["total_latency_ns"] = oc.total_latency_ns;
+        oj["max_latency_ns"] = oc.max_latency_ns;
+        auto it = s.job_latency.find(op);
+        if (it != s.job_latency.end()) {
+            oj["latency_hist"] = std::vector<u64>(std::begin(it->second.hist), std::end(it->second.hist));
+        }
+        j["job_ops"].push_back(std::move(oj));
     }
-
-    if (writer_type == "FileWriter") {
-        return [](std::any data) -> std::any {
-            if (!data.has_value()) {
-                return std::string("FSMetadataCollector error=empty_data\n");
-            }
-            try {
-                const auto& s = std::any_cast<const JobFSMetaStat&>(data);
-                std::ostringstream out;
-                out << "FSMetadataCollector job_id=" << s.job_id
-                    << " collect_period=" << s.collect_period
-                    << " metadata_ops_total=" << s.job_metadata_ops_total
-                    << " metadata_ops_rate=" << s.job_metadata_ops_rate
-                    << '\n';
-
-                // Job 级各 op
-                for (const auto& [op, oc] : s.job_ops) {
-                    out << "FSMetadataCollector job_op"
-                        << " job_id=" << s.job_id
-                        << " op=" << oc.op_name
-                        << " calls=" << oc.calls
-                        << " calls_rate=" << oc.calls_rate
-                        << " error_rate=" << oc.error_rate
-                        << " success=" << oc.success
-                        << " errors=" << oc.errors
-                        << " last_errno=" << oc.last_errno
-                        << " total_latency_ns=" << oc.total_latency_ns
-                        << " max_latency_ns=" << oc.max_latency_ns
-                        << '\n';
-                }
-
-                // Job 级各 op 的时延桶（仅输出非零桶）
-                for (const auto& [op, hist] : s.job_latency) {
-                    for (size_t b = 0; b < FS_META_LATENCY_BUCKETS; ++b) {
-                        if (hist.hist[b] != 0) {
-                            out << "FSMetadataCollector latency_bucket"
-                                << " job_id=" << s.job_id
-                                << " op=" << op_name_from_id(op)
-                                << " bucket=" << b
-                                << " count=" << hist.hist[b]
-                                << '\n';
-                        }
-                    }
-                }
-
-                // 进程级各 op
-                for (const auto& [pid, p] : s.processes) {
-                    for (const auto& [op, oc] : p.ops) {
-                        out << "FSMetadataCollector process_op"
-                            << " job_id=" << s.job_id
-                            << " pid=" << p.pid
-                            << " op=" << oc.op_name
-                            << " calls=" << oc.calls
-                            << " calls_rate=" << oc.calls_rate
-                            << " error_rate=" << oc.error_rate
-                            << " success=" << oc.success
-                            << " errors=" << oc.errors
-                            << " last_errno=" << oc.last_errno
-                            << " total_latency_ns=" << oc.total_latency_ns
-                            << " max_latency_ns=" << oc.max_latency_ns
-                            << '\n';
-                    }
-                }
-                return out.str();
-            } catch (const std::bad_any_cast& e) {
-                spdlog::error("FSMetadataCollector: FileWriter parser bad_any_cast: {}", e.what());
-                return std::string("FSMetadataCollector error=bad_cast\n");
-            }
-        };
+    j["processes"] = json::array();
+    for (const auto& [pid, p] : s.processes) {
+        json pj;
+        pj["pid"] = p.pid;
+        pj["metadata_ops_total"] = p.metadata_ops_total;
+        pj["metadata_ops_rate"] = p.metadata_ops_rate;
+        pj["ops"] = json::array();
+        for (const auto& [op, oc] : p.ops) {
+            pj["ops"].push_back({
+                {"op_id", oc.op_id}, {"op_name", oc.op_name},
+                {"calls", oc.calls}, {"calls_rate", oc.calls_rate},
+                {"error_rate", oc.error_rate},
+                {"success", oc.success}, {"errors", oc.errors},
+                {"last_errno", oc.last_errno},
+                {"total_latency_ns", oc.total_latency_ns},
+                {"max_latency_ns", oc.max_latency_ns}
+            });
+        }
+        j["processes"].push_back(std::move(pj));
     }
+    return j;
+}
 
-    if (writer_type == "PrometheusExporterWriter") {
-        return [](std::any data) -> std::any {
-            PrometheusExporterWriter::prometheus_job_state ret;
-            if (!data.has_value()) {
-                ret.JobID = 0;
-                return ret;
-            }
-            try {
-                const auto& s = std::any_cast<const JobFSMetaStat&>(data);
-                ret.JobID = static_cast<int>(s.job_id);
-
-                // Job 级汇总（pid=0）
-                uint64_t job_errors = 0;
-                double job_errors_per_sec = 0.0;
-                for (const auto& [op, oc] : s.job_ops) {
-                    job_errors += oc.errors;
-                    job_errors_per_sec += oc.error_rate;
-                }
-                PrometheusExporterWriter::prometheus_process_state jobstate{};
-                jobstate.pid = 0;
-                jobstate.fs_metadata_ops_total = s.job_metadata_ops_total;
-                jobstate.fs_metadata_ops_per_sec = s.job_metadata_ops_rate;
-                jobstate.fs_metadata_errors_total = job_errors;
-                jobstate.fs_metadata_errors_per_sec = job_errors_per_sec;
-                ret.processes_state.push_back(std::move(jobstate));
-
-                // 进程级
-                for (const auto& [pid, p] : s.processes) {
-                    uint64_t total_errors = 0;
-                    double errors_per_sec = 0.0;
-                    for (const auto& [op, oc] : p.ops) {
-                        total_errors += oc.errors;
-                        errors_per_sec += oc.error_rate;
-                    }
-                    PrometheusExporterWriter::prometheus_process_state ps{};
-                    ps.pid = p.pid;
-                    ps.fs_metadata_ops_total = p.metadata_ops_total;
-                    ps.fs_metadata_ops_per_sec = p.metadata_ops_rate;
-                    ps.fs_metadata_errors_total = total_errors;
-                    ps.fs_metadata_errors_per_sec = errors_per_sec;
-                    ret.processes_state.push_back(std::move(ps));
-                }
-                return ret;
-            } catch (const std::bad_any_cast& e) {
-                spdlog::error("FSMetadataCollector: PrometheusExporterWriter parser bad_any_cast: {}", e.what());
-                ret.JobID = 0;
-                return ret;
-            }
-        };
+std::string FSMetadataCollector::to_text(const JobFSMetaStat& s) const {
+    std::ostringstream out;
+    out << "FSMetadataCollector job_id=" << s.job_id
+        << " collect_period=" << s.collect_period
+        << " metadata_ops_total=" << s.job_metadata_ops_total
+        << " metadata_ops_rate=" << s.job_metadata_ops_rate
+        << '\n';
+    for (const auto& [op, oc] : s.job_ops) {
+        out << "FSMetadataCollector job_op"
+            << " job_id=" << s.job_id
+            << " op=" << oc.op_name
+            << " calls=" << oc.calls
+            << " calls_rate=" << oc.calls_rate
+            << " error_rate=" << oc.error_rate
+            << " success=" << oc.success
+            << " errors=" << oc.errors
+            << " last_errno=" << oc.last_errno
+            << " total_latency_ns=" << oc.total_latency_ns
+            << " max_latency_ns=" << oc.max_latency_ns
+            << '\n';
     }
+    for (const auto& [op, hist] : s.job_latency) {
+        for (size_t b = 0; b < FS_META_LATENCY_BUCKETS; ++b) {
+            if (hist.hist[b] == 0) continue;
+            out << "FSMetadataCollector latency_bucket"
+                << " job_id=" << s.job_id
+                << " op=" << op_name_from_id(op)
+                << " bucket=" << b
+                << " count=" << hist.hist[b]
+                << '\n';
+        }
+    }
+    for (const auto& [pid, p] : s.processes) {
+        for (const auto& [op, oc] : p.ops) {
+            out << "FSMetadataCollector process_op"
+                << " job_id=" << s.job_id
+                << " pid=" << p.pid
+                << " op=" << oc.op_name
+                << " calls=" << oc.calls
+                << " calls_rate=" << oc.calls_rate
+                << " error_rate=" << oc.error_rate
+                << " success=" << oc.success
+                << " errors=" << oc.errors
+                << " last_errno=" << oc.last_errno
+                << " total_latency_ns=" << oc.total_latency_ns
+                << " max_latency_ns=" << oc.max_latency_ns
+                << '\n';
+        }
+    }
+    return out.str();
+}
 
-    return nullptr;
+MetricBatch FSMetadataCollector::to_metrics(const JobFSMetaStat& s) const {
+    MetricBatch ret;
+    ret.samples.reserve(s.processes.size() * 4 + 4);
+    uint64_t job_errors = 0;
+    double job_errors_per_sec = 0.0;
+    for (const auto& [op, counters] : s.job_ops) {
+        (void)op;
+        job_errors += counters.errors;
+        job_errors_per_sec += counters.error_rate;
+    }
+    const std::vector<MetricLabel> job_labels{{"pid", "0"}};
+    ret.samples.push_back({"job_fs_metadata_ops_total", MetricType::Counter,
+        "Total filesystem metadata operations", job_labels,
+        static_cast<double>(s.job_metadata_ops_total)});
+    ret.samples.push_back({"job_fs_metadata_ops_per_sec", MetricType::Gauge,
+        "Filesystem metadata operations per second", job_labels,
+        s.job_metadata_ops_rate});
+    ret.samples.push_back({"job_fs_metadata_errors_total", MetricType::Counter,
+        "Total filesystem metadata errors", job_labels,
+        static_cast<double>(job_errors)});
+    ret.samples.push_back({"job_fs_metadata_errors_per_sec", MetricType::Gauge,
+        "Filesystem metadata errors per second", job_labels,
+        job_errors_per_sec});
+
+    for (const auto& [pid, process] : s.processes) {
+        uint64_t total_errors = 0;
+        double errors_per_sec = 0.0;
+        for (const auto& [op, counters] : process.ops) {
+            (void)op;
+            total_errors += counters.errors;
+            errors_per_sec += counters.error_rate;
+        }
+        const std::vector<MetricLabel> labels{{"pid", std::to_string(pid)}};
+        ret.samples.push_back({"job_fs_metadata_ops_total", MetricType::Counter,
+            "Total filesystem metadata operations", labels,
+            static_cast<double>(process.metadata_ops_total)});
+        ret.samples.push_back({"job_fs_metadata_ops_per_sec", MetricType::Gauge,
+            "Filesystem metadata operations per second", labels,
+            process.metadata_ops_rate});
+        ret.samples.push_back({"job_fs_metadata_errors_total", MetricType::Counter,
+            "Total filesystem metadata errors", labels,
+            static_cast<double>(total_errors)});
+        ret.samples.push_back({"job_fs_metadata_errors_per_sec", MetricType::Gauge,
+            "Filesystem metadata errors per second", labels, errors_per_sec});
+    }
+    return ret;
+}
+
+CollectOutcome FSMetadataCollector::collect(const Job& job, OutputContext& output) {
+    if (!output.enabled("document") && !output.enabled("text") && !output.enabled("metrics")) return {};
+    const auto stat = sample_job(job);
+    if (output.enabled("document")) output.emit("document", Document{to_document(stat)});
+    if (output.enabled("text")) output.emit("text", Text{to_text(stat)});
+    if (output.enabled("metrics")) output.emit("metrics", to_metrics(stat));
+    return {};
 }

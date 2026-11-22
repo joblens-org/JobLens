@@ -63,7 +63,7 @@ struct PowerPerPid {
 /* ── 每个Job的能耗归因结果 (输出单位) ───────────────────────────────── */
 struct PowerPerJob {
     uint64_t job_id;            // JobLens内部JobID
-    std::string native_job_id;  // 调度器原生作业ID (如Condor "123.0")
+    std::string job_native_id;  // 调度器原生作业ID (如Condor "123.0")
     double energy_j;            // RAPL归因能耗 (J)
     double power_watt;          // RAPL归因平均功率 (W) = energy_j / interval_s
     double ipmi_power_watt;     // IPMI按比例分摊功率 (W) = ipmi_total × 占比
@@ -109,17 +109,20 @@ struct CalibrationRef {
     std::string source_path;        // 校准数据来源 (summary.json路径)
 };
 
-class PowerCollector : public ICollector {
+class PowerCollector : public IPeriodicJobCollector {
 public:
     /* ── ICollector 生命周期 ──────────────────────────────────────── */
-    bool init(const nlohmann::json& cfg) override;   // 加载eBPF、检测RAPL、配置参数
+    bool init(const nlohmann::json& cfg, CollectorInitContext& context) override;   // 加载eBPF、检测RAPL、配置参数
     void deinit() noexcept override;                  // 卸载eBPF、清理资源
 
-    /* Job-scoped: 全局缓存后按Job逐个归因 (对标IO/Net Collector) */
-    CollectResult collect(const Job& job) override;   // 读缓存→归因单个Job
+    /* Job-scoped: 全局缓存后按Job逐个归因 (对标IO/Net Collector) */   // 读缓存→归因单个Job
 
     /* Writer适配器: 将PowerSnapshot转成各Writer可消费的格式 */
-    CollectDataParseFunc get_writer_parser(const std::string& writer_type) override;
+    CollectOutcome collect(const Job& job, OutputContext& output) override;
+    std::vector<OutputChannel> output_channels() const override;
+    PowerSnapshot sample_job(const Job& job);
+    nlohmann::json to_document(const PowerSnapshot& snap) const;
+    std::string to_text(const PowerSnapshot& snap) const;
 
 private:
     friend struct PowerCollectorTestAccess;
@@ -135,7 +138,6 @@ private:
 
     /* ── CPU频率与调速器 ──────────────────────────────────────────── */
     std::vector<double> read_cpu_freqs_mhz();          // 读每核瞬时频率
-    std::vector<std::string> read_cpu_governors();     // 读每核调速器模式
     int detect_core_count();                            // 检测CPU核心数
 
     /* ── IPMI交叉验证 ──────────────────────────────────────────────── */

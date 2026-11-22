@@ -14,6 +14,7 @@
 #pragma once
 
 #include <sol/sol.hpp>
+#include <nlohmann/json.hpp>
 #include <vector>
 #include <variant>
 #include <string>
@@ -84,6 +85,30 @@ inline sol::object to_lua(sol::state_view lua, const std::string& value) {
 
 inline sol::object to_lua(sol::state_view lua, std::string&& value) {
     return sol::make_object(lua, std::move(value));
+}
+
+// JSON facts（开放世界 SubAttr 成员）：递归转 Lua 值/表。显式重载避免与
+// 基本类型重载经 json 的隐式转换产生歧义。
+inline sol::object to_lua(sol::state_view lua, const nlohmann::json& value) {
+    if (value.is_object()) {
+        sol::table tbl = lua.create_table();
+        for (auto it = value.begin(); it != value.end(); ++it)
+            tbl[it.key()] = to_lua(lua, it.value());
+        return tbl;
+    }
+    if (value.is_array()) {
+        sol::table tbl = lua.create_table();
+        for (std::size_t i = 0; i < value.size(); ++i)
+            tbl[i + 1] = to_lua(lua, value[i]);
+        return tbl;
+    }
+    if (value.is_string()) return sol::make_object(lua, value.get<std::string>());
+    if (value.is_boolean()) return sol::make_object(lua, value.get<bool>());
+    if (value.is_number_unsigned())
+        return sol::make_object(lua, value.get<unsigned long long>());
+    if (value.is_number_integer()) return sol::make_object(lua, value.get<long long>());
+    if (value.is_number_float()) return sol::make_object(lua, value.get<double>());
+    return sol::make_object(lua, sol::lua_nil);
 }
 
 // 处理枚举（如果有 to_string 函数）

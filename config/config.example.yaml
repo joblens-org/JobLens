@@ -23,6 +23,39 @@ lens_config:
 # ============================================================
 job_registry_config:
   job_db_path: /var/JobLens/job.db          # LevelDB database directory for job persistence
+  # Discovery and maintenance. `types` is opt-in: an absent list means [] (no
+  # broad discovery). `reconcile_interval_sec` defaults to 30 and must be >= 1;
+  # invalid values are rejected at startup. `capture_all` (default true)
+  # registers every captured job unconditionally; when false, registration is
+  # decided by the type's `<type>_job_watcher.auto_add`.
+  maintenance:
+    types: [condor, slurm]
+    reconcile_interval_sec: 30
+    capture_all: true
+
+# Scheduler discovery. Listing a type under job_registry_config.maintenance.types
+# maintains every recognized local instance. `auto_add` is the tri-state
+# automatic path:
+#   off     - never select collectors automatically (the job still registers
+#             when capture_all is true);
+#   default - apply auto_add_collectors verbatim to every new job;
+#   rule    - let the Lua rule engine decide per job (first accepting rule wins;
+#             an accept without a collector list falls back to
+#             auto_add_collectors).
+# The legacy auto_collect/use_rules pair is accepted as a mapping source when
+# auto_add is absent.
+# The rule file prefix is the adapter name itself (condor*, slurm*): a rule
+# file belongs to a type only when its basename starts with that name, so a
+# shared rules directory can never feed one type's rules into another.
+condor_job_watcher:
+  auto_add: rule
+  rules_dir: /etc/JobLens/rules/condor_jobs
+  auto_add_collectors: [cpumem_collector]
+
+slurm_job_watcher:
+  auto_add: off
+  rules_dir: /etc/JobLens/rules/slurm_jobs
+  auto_add_collectors: [cpumem_collector]
 
 # ============================================================
 # Collector Configuration — cpumem only
@@ -47,15 +80,25 @@ cpumem_collector_config:
   pss: true                                  # Collect PSS (Proportional Set Size); false disables /proc/<pid>/smaps_rollup reads
   pss_fallback_smaps: true                   # Kernels without smaps_rollup fall back to per-VMA smaps parsing
   pss_max_processes: 64                      # Skip PSS for jobs with more live pids (0 = unlimited)
-  use_writers:
-    - file_writer                            # Output to local file
+  # Explicit output routing: channel -> writer instances.
+  # Channels declared by CPUMemCollector: document, text, metrics.
+  # Omitted channels are disabled; an empty list disables that channel.
+  outputs:
+    text:
+      - file_writer                          # Output prepared plain text to local file
+  # Legacy form (mutually exclusive with 'outputs'); still accepted during migration:
+  # use_writers:
+  #   - file_writer
 
 # ============================================================
 # Writer Configuration — FileWriter only
 # ============================================================
 writers_config:
   enable_writer_perf: false                  # Disable writer performance counters
-  buffer_capacity: 1024                      # Internal ring buffer capacity
+  buffer_capacity: 1024                      # Reserve capacity per flush buffer (not a hard queue limit)
+  max_pending_records: 4096                  # Hard bound: records pending in front/back buffers
+  max_pending_bytes: 67108864                # Hard bound: accounted payload+metadata bytes (64 MiB)
+  max_record_bytes: 8388608                  # Reject a single record larger than this (8 MiB)
   writers:
     - name: file_writer
       type: FileWriter

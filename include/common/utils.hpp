@@ -33,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include "common/procfs.hpp"
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -40,63 +41,6 @@ using json = nlohmann::json;
 namespace Utils
 {
     // =============== 进程信息相关工具函数 ===============
-    
-    /**
-     * @brief 获取指定pid的父进程pid
-     * @param pid 进程ID
-     * @return 父进程ID，出错返回-1
-     */
-    inline pid_t get_ppid_of(pid_t pid)
-    {
-        std::string path = "/proc/" + std::to_string(pid) + "/stat";
-        std::ifstream stat(path);
-        if (!stat)
-            return -1;
-
-        // 格式：pid (comm) S ppid ...
-        std::string line;
-        if (!std::getline(stat, line))
-            return -1;
-
-        // 从右括号后开始找第 4 个字段
-        std::size_t last_rparen = line.rfind(')');
-        if (last_rparen == std::string::npos)
-            return -1;
-
-        std::istringstream iss(line.substr(last_rparen + 1));
-        pid_t ppid;
-        std::string state;
-        iss >> state >> ppid;   // 字段序: state ppid pgrp ...; 多读一个会取到 pgrp
-        return ppid;
-    }
-
-    /**
-     * @brief 获取指定pid的命令行（空格分隔）
-     * @param pid 进程ID
-     * @return 命令行字符串，失败返回空串
-     */
-    inline std::string get_cmdline_of(pid_t pid)
-    {
-        std::string path = "/proc/" + std::to_string(pid) + "/cmdline";
-        std::ifstream cmdline(path, std::ios::binary);
-        if (!cmdline)
-            return {};
-
-        std::string content;
-        content.assign(std::istreambuf_iterator<char>(cmdline),
-                       std::istreambuf_iterator<char>());
-
-        // 把 '\0' 换成空格
-        for (char &c : content)
-            if (c == '\0')
-                c = ' ';
-
-        // 去掉末尾多余空格
-        if (!content.empty() && content.back() == ' ')
-            content.pop_back();
-
-        return content;
-    }
 
     /**
      * @brief 从/proc/<pid>/environ中读取指定环境变量
@@ -124,53 +68,6 @@ namespace Utils
         return "";
     }
 
-    /**
-     * @brief 获取指定进程的cgroup v2绝对路径
-     * @param pid 进程ID，默认为0表示当前进程
-     * @return cgroup绝对路径，失败返回空串
-     */
-    inline std::string v2_cgroup_absolute_path(pid_t pid = 0){
-        const fs::path proc = (pid == 0) ? "/proc/self/cgroup"
-                                         : "/proc/" + std::to_string(pid) + "/cgroup";
-
-        std::ifstream fin(proc);
-        if (!fin)
-            return {};                 // 进程不存在或权限不足
-
-        std::string line;
-        while (std::getline(fin, line)){
-            // v2 统一层级格式：0::/relative/path
-            if (line.compare(0,3,"0::") == 0){
-                std::string rel = line.substr(3);          // "/system.slice/xxx"
-                // 拼到挂载点即可。v2 统一层级挂载点 99% 是 /sys/fs/cgroup
-                fs::path mount = "/sys/fs/cgroup";
-                fs::path rel_path = fs::path(rel).lexically_normal();
-                if (rel_path.is_absolute()) {
-                    rel_path = rel_path.relative_path();
-                }
-                return (mount / rel_path).lexically_normal().string();
-            }
-        }
-        return {};   // 不是 v2 或没找到
-    }
-
-    /**
-     * @brief 获取指定cgroup目录中的所有进程PID
-     * @param cgroup_dir cgroup目录路径
-     * @return PID列表
-     */
-    inline std::vector<pid_t> get_pids_in_cgroup(const std::string& cgroup_dir){
-        std::vector<pid_t> pids;
-        fs::path procs = fs::path(cgroup_dir) / "cgroup.procs";
-        std::ifstream fin(procs);
-        if (!fin)
-            return pids;   // 文件不存在或权限不足
-
-        pid_t pid;
-        while (fin >> pid)          // 每行一个 PID
-            pids.push_back(pid);
-        return pids;
-    }
     inline std::string executableDir() {
         char buf[PATH_MAX + 1] = {};
         ssize_t len = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -280,7 +177,8 @@ namespace Utils
     }
 
     inline bool is_process_running(pid_t pid) {
-        return kill(pid, 0) == 0;
+        // EPERM 表示进程存在但当前用户无权限发送信号（例如 pid 1）。
+        return kill(pid, 0) == 0 || errno == EPERM;
     }
 
     inline std::string get_backtrace() {

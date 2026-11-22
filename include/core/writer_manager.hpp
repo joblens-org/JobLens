@@ -14,6 +14,7 @@
 #pragma once
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LOGGER_TRACE
 
+#include <atomic>
 #include <vector>
 #include <memory>
 #include <mutex>
@@ -21,6 +22,7 @@
 #include <unordered_map>
 #include <string>
 #include <spdlog/spdlog.h>
+#include <nlohmann/json.hpp>
 #include "common/perf_counter.hpp"
 #include "writer/base_writer.hpp"
 
@@ -28,24 +30,25 @@
 class WriterManager {
 public:
     ~WriterManager();
-    
+
+    /// 显式、幂等的初始化入口。路由绑定和 System 采集器自动启动之前必须调用。
+    void initialize();
     void shutdown();
 
-    std::vector<std::tuple<std::string, OnFinish>> get_onFinishCallbacks();
+    BaseWriter* find(const std::string& name);
+    const BaseWriter* find(const std::string& name) const;
+    std::vector<std::string> names() const;
 
-    std::string getWriterType(const std::string& name){
-        for(auto& writer: writers_){
-            if(writer->get_name().compare(name) == 0){
-                return writer->get_type();
-            }
-        }
-        return "";
-    }
+    /// 进程运行标识 + 采样序号，用于构造稳定的 sample_id / record_id。
+    std::string process_run_id() const { return process_run_id_; }
+    uint64_t next_sample_counter() { return sample_counter_.fetch_add(1, std::memory_order_relaxed); }
+
+    nlohmann::json output_status() const;
 
     template <typename T>
     void registerWriter(std::string name) {
-        factories_.emplace(std::move(name), [](std::string name, std::string type, std::string config_name) -> std::unique_ptr<BaseWriter> {
-            return std::make_unique<T>(name, type, config_name);
+        factories_.emplace(std::move(name), [](std::string name, std::string type, std::string config_name) -> std::shared_ptr<BaseWriter> {
+            return std::make_shared<T>(name, type, config_name);
         });
     };
 
@@ -60,20 +63,26 @@ public:
     const std::string getFmtHelp(const std::string& name, int width) const;
 
 private:
-    using Factory = std::function<std::unique_ptr<BaseWriter>(std::string name, std::string type, std::string config_name)>;
+    using Factory = std::function<std::shared_ptr<BaseWriter>(std::string name, std::string type, std::string config_name)>;
     std::unordered_map<std::string, Factory> factories_;
-    std::vector<std::unique_ptr<BaseWriter>> writers_;
-    std::mutex m_;
+    // Shared ownership: a status snapshot hands out shared_ptr copies under
+    // the manager lock and uses them outside it, so a concurrent shutdown can
+    // swap and shut the writers down without destroying one mid-query.
+    std::vector<std::shared_ptr<BaseWriter>> writers_;
+    mutable std::mutex m_;
     bool initialized_ = false;
+    std::string process_run_id_;
+    std::atomic<uint64_t> sample_counter_{0};
     std::unordered_map<std::string, WriterHelpInfo> help_;
-    void createAllWriters();
+    void createAllWritersLocked();
     WriterManager();
-    void addWriter(std::unique_ptr<BaseWriter> writer);
+    void addWriter(std::shared_ptr<BaseWriter> writer);
     // writer perf
     void initWriterPerf();
-    bool enable_writer_perf;
-    bool perf_inited;
-    int perf_win_size;
+    bool enable_writer_perf = false;
+    bool perf_inited = false;
+    int perf_win_size = 0;
+    bool status_rpc_registered = false;
 
 };
 
