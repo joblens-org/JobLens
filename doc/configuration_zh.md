@@ -281,9 +281,6 @@ net_sys_collector_config:
 | | `pss` | bool | 默认 `true`。采集 PSS（比例集大小，共享页按进程数均摊）；`false` 时完全不读 `smaps_rollup`，输出中省略 `mem_pss_kb` |
 | | `pss_fallback_smaps` | bool | 默认 `true`。内核无 `smaps_rollup` 时降级为逐 VMA 解析 `smaps`（成本更高）；设为 `false` 则直接关闭 PSS |
 | | `pss_max_processes` | int | 默认 `64`。作业存活进程数超过该值时本样本整体跳过 PSS（全有或全无，不做部分求和）；`0` 表示不限 |
-| **IOUsageCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的 I/O 数据 |
-| | `use_ebpf` | string | 为 `"true"` 时，使用 eBPF 采集文件级 I/O 数据（需要 root 权限和内核支持） |
-| | `collect_file_paths` | string | 为 `"true"` 时输出每个 fd 的 `path` 与 `mount_point`；默认 `"false"`。文件路径会暴露用户读写哪些文件，共享登录节点上应仅在排障时开启。 |
 | **NetUsageCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的网络数据 |
 | | `use_netlink` | string | 为 `"true"` 时，使用 netlink 查询 TCP_INFO（RTT、重传次数等） |
 | **BasicInfoCollector** | `summary` | string | 为 `"true"` 时，聚合所有进程的 taskstats 数据（TGID 级摘要） |
@@ -314,7 +311,7 @@ net_sys_collector_config:
 - `include_process_details=true` 输出 Job 聚合指标和按进程明细；`include_process_details=false` 只输出 Job 聚合指标
 - 输出不包含 `mount_point` 或 `fs_type`，此收集器不提供文件系统特定归因
 
-**IO 文件元数据**：`IOUsageCollector` 与 `NewIOUsageCollector` 通过 `/proc/<pid>/fd` 解析文件路径，通过 `/proc/<pid>/mountinfo` 解析挂载信息，二者不会对目标文件调用 `stat()`，避免远端文件系统认证等待（例如 AFS）阻塞整个采集周期。旧 `pos` 字段此前上报的其实是文件大小而非当前文件偏移，现改为 JSON 输出 `null`、文本输出 `unknown`。文件级明细不再限定常规文件与块设备：任何绝对路径的 fd 目标都可能出现，包括目录或已删除但仍打开的文件。在不访问目标文件元数据的情况下，既有 IO 计数器仍照常可用。
+**IO 文件元数据**：`NewIOUsageCollector` 通过 `/proc/<pid>/fd` 解析文件路径，通过 `/proc/<pid>/mountinfo` 解析挂载信息，不会对目标文件调用 `stat()`，避免远端文件系统认证等待（例如 AFS）阻塞整个采集周期。`pos` 字段固定输出 JSON `null`、文本 `unknown`。文件级明细不限定常规文件与块设备：任何绝对路径的 fd 目标都可能出现，包括目录或已删除但仍打开的文件。在不访问目标文件元数据的情况下，既有 IO 计数器仍照常可用；每个 fd 的 `path`/`mount_point` 仅在 `include_process_details=true` 时输出。
 
 **NewIOUsageCollector 说明**：
 - 通用 I/O 计量采集器（VFS syscall 层语义，rchar/wchar），始终基于 eBPF，没有 `use_ebpf` 开关
@@ -379,8 +376,6 @@ ES_writer_config:
   indexs:                        # 可选的索引名映射列表
     - collector_name: cpumem_collector
       index_name: cpu_mem_metrics
-    - collector_name: io_usage_collector
-      index_name: io_metrics
 ```
 
 | 键 | 类型 | 必填 | 默认值 | 描述 |
@@ -488,8 +483,6 @@ file_writer_config:
   outputs:                                   # 按收集器路由文件（可选）
     - collector_name: cpumem_collector
       file_path: /var/log/joblens/cpumem.log
-    - collector_name: io_usage_collector
-      file_path: /var/log/joblens/io.log
 ```
 
 ### 选项参考
@@ -615,7 +608,6 @@ condor_job_watcher:
   auto_add_collectors:          # auto_add: default 时逐字武装；rule 裸接受时作为回退
     - cpumem_collector
     - net_collector
-    - io_collector
 ```
 
 > **说明**：规则文件的匹配前缀就是 adapter 名（Condor 为 `condor`），只有文件名以它开头的 `.lua` 才会被该类型加载；`rules_prefix` 键已废弃并被忽略。规则在**启动时**加载（`auto_add: rule` 才会武装规则引擎）。`rules_dir` 优先读本节，缺省时回退到已废弃的 `job_registry_config.rules_dir`，再缺省为 `{JobLensRootDir}/../config/rules/condor_jobs`。目录为空或没有匹配前缀的文件时，启动日志会给出 warning，该类型不会选任何采集器。
@@ -639,7 +631,6 @@ slurm_job_watcher:
   auto_add_collectors:
     - cpumem_collector
     - net_collector
-    - io_collector
 ```
 
 > **说明**：规则文件的匹配前缀就是 adapter 名（Slurm 为 `slurm`），`rules_prefix` 键已废弃并被忽略；规则在启动时随 `auto_add: rule` 一起加载。`rules_dir` 优先读本节，缺省时回退到已废弃的 `job_registry_config.rules_dir`，再缺省为 `{JobLensRootDir}/../config/rules/slurm_jobs`。
@@ -747,9 +738,6 @@ collectors_config:
     - name: net_collector
       type: NetUsageCollector
       config: net_collector_config
-    - name: io_collector
-      type: IOUsageCollector
-      config: io_collector_config
     - name: basic_info_collector
       type: BasicInfoCollector
       config: basic_info_collector_config
@@ -771,15 +759,6 @@ net_collector_config:
   freq: 1
   use_netlink: true
   summary: false
-  use_writers:
-    - es_writer
-
-io_collector_config:
-  freq: 1
-  summary: false
-  use_ebpf: false
-  # 文件路径属于敏感信息；定位 I/O 卡顿时再设为 true
-  collect_file_paths: false
   use_writers:
     - es_writer
 
@@ -852,7 +831,6 @@ condor_job_watcher:
   auto_add_collectors:
     - cpumem_collector
     - net_collector
-    - io_collector
 ```
 
 ---

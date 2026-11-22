@@ -74,7 +74,7 @@ JobLens 通常部署在**多用户登录节点**上，以 root 运行，并开�
   `RestrictSUIDSGID`。
 - `%post` 会收紧旧版本遗留的宽松权限（`%config(noreplace)` 不会自动改权限）。
 - `FileWriter` 拒绝符号链接目标；以 root 运行时拒绝世界可写父目录。
-- IO 采集器默认不输出文件路径（`collect_file_paths: false`）。
+- 旧 `IOUsageCollector` 已移除，其 `collect_file_paths` 隐私开关随之失效；`NewIOUsageCollector` 通过 `include_process_details` 控制是否输出进程/文件级明细。
 
 ### 3.5 依赖与构建
 
@@ -164,10 +164,26 @@ journalctl -u joblens-trigger | grep -i 'etcd'
 - **鉴权默认开启**：旧脚本调用受保护接口会收到 401/403。RPM 的 `%post` 会在
   `/etc/JobLens/secrets.env`（0600）中自动生成 `JOBLENS_TRIGGER_TOKEN`（已有则
   保留），从该文件读取后放进运维脚本的请求头即可，无需手写配置。
-- **IO 文件路径默认关闭**：需要文件级排障时显式 `collect_file_paths: true`。
 - **5xx 响应不再包含内部错误文本**：排障改用 `request_id` + 日志。
 - 配置文件权限会被 `%post` 收敛为 0640；如果 Trigger 以后改为非 root 运行，
   需要把它加入 `joblens` 组并相应调整。
 - 二进制、systemd unit、Lua 沙箱、RPC 与 FileWriter 的修复都在 RPM 内容里，
   升级即生效；只有 `%config(noreplace)` 的配置项（监听地址、etcd/ES 凭据、
   采集器开关）需要按上面的说明手工决定。
+
+---
+
+## 8. 升级注意（0.3.8 → 0.4.0）
+
+- **旧 `IOUsageCollector` 已移除**：`io_collector` 实例、`io_collector_config`
+  段以及 ES `indexs` 里的 `io_usage_collector` 映射都要从配置中删除。新版本没有
+  这个采集器类型，引用它的作业会在绑定时报
+  `collector 'io_collector' is not configured on this core`；历史 ES 索引不受影响，
+  仍可查询。
+- **IO 明细的隐私开关换位**：原 `collect_file_paths` 随旧采集器一起失效，
+  `NewIOUsageCollector` 用 `include_process_details`（默认 `true`）控制是否输出
+  进程级/文件级明细。
+- **采集器输出改为显式通道**：`outputs: {document|text|metrics: [writer...]}`，
+  与旧 `use_writers` 互斥；旧写法仍兼容，但一个写入器匹配到多个通道时会报错。
+- **发现开关显式化**：`job_registry_config.maintenance.types` 缺省为 `[]`
+  （不自动发现），watcher 段存在不等于发现打开。

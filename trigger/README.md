@@ -123,7 +123,7 @@ Content-Type: application/json
   "type": "job.common",   # Job type: "job.common" or "job.condor"
   "JobID": 12345,         # Job ID
   "JobPIDs": [6789],      # Process PID list
-  "Lens": ["cpumem_collector", "io_collector", "net_collector"]  # Collectors to use
+  "Lens": ["cpumem_collector", "new_io_usage_collector", "net_collector"]  # Collectors to use
 }
 ```
 

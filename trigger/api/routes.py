@@ -213,7 +213,7 @@ def _v2_job_payload(data):
     req = JobUpsertRequest.model_validate(data)
     payload = req.model_dump(exclude_none=True)
     if not payload.get('Lens'):
-        payload['Lens'] = ['cpumem_collector', 'io_collector', 'net_collector']
+        payload['Lens'] = ['cpumem_collector', 'new_io_usage_collector', 'net_collector']
     if 'sub_attr' not in payload:
         if payload['type'] == 'job.condor':
             payload['sub_attr'] = {'cluster_id': 0, 'proc_id': 0}
@@ -393,7 +393,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             "type": "job.condor",
             "JobID": 1,
             "JobPIDs": [1],
-            "Lens": ["cpumem_collector", "io_collector", "net_collector"],
+            "Lens": ["cpumem_collector", "new_io_usage_collector", "net_collector"],
             "sub_attr": {"cluster_id": 123456, "proc_id": 0}
         }
         """
@@ -412,7 +412,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         opt_data = req.model_dump(exclude_none=True)
         # Lens 默认处理
         if not opt_data.get('Lens'):
-            opt_data['Lens'] = ['cpumem_collector', 'io_collector', 'net_collector']
+            opt_data['Lens'] = ['cpumem_collector', 'new_io_usage_collector', 'net_collector']
         
         # 对 condor/slurm 类型自动补全 sub_attr，避免C++端因缺失而抛异常
         if 'sub_attr' not in opt_data:
@@ -448,7 +448,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
             "opt": "add",
             "JobID": 1,
             "slot": "slotx",
-            "Lens": ["cpumem_collector","io_collector"],
+            "Lens": ["cpumem_collector","new_io_usage_collector"],
             "sub_attr": {"cluster_id": 123456, "proc_id": 0}
         }
         """
@@ -470,7 +470,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         opt_data = req.model_dump(exclude_none=True)
         # Lens 默认处理
         if not opt_data.get('Lens'):
-            opt_data['Lens'] = ['cpumem_collector', 'io_collector', 'net_collector']
+            opt_data['Lens'] = ['cpumem_collector', 'new_io_usage_collector', 'net_collector']
 
         logger.info("Condor job add request: JobID=%s, slot=%s, Lens=%s, sub_attr=%s",
                      opt_data.get('JobID'), opt_data.get('slot'), opt_data.get('Lens'), opt_data.get('sub_attr'))
@@ -498,7 +498,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         {
             "opt": "add",
             "JobID": 12345,
-            "Lens": ["cpumem_collector", "io_collector", "net_collector"]
+            "Lens": ["cpumem_collector", "new_io_usage_collector", "net_collector"]
         }
         """
         try:
@@ -517,7 +517,7 @@ def register_routes(app: Flask, rpc_client, config_manager, service_registrar, r
         opt_data = req.model_dump(exclude_none=True)
         # Lens 默认处理
         if not opt_data.get('Lens'):
-            opt_data['Lens'] = ['cpumem_collector', 'io_collector', 'net_collector']
+            opt_data['Lens'] = ['cpumem_collector', 'new_io_usage_collector', 'net_collector']
 
         logger.info("Slurm job add request: JobID=%s, Lens=%s, sub_attr=%s",
                      opt_data.get('JobID'), opt_data.get('Lens'), opt_data.get('sub_attr'))

@@ -122,9 +122,9 @@ const char* COLLECTORS_BLOCK =
     "  default_use_writers: []\n"
     "  collectors:\n"
     "    - {name: cpumem_collector, type: CPUMemCollector, config: cpumem_collector_config}\n"
-    "    - {name: io_collector, type: IOUsageCollector, config: io_collector_config}\n"
+    "    - {name: new_io_usage_collector, type: NewIOUsageCollector, config: new_io_usage_collector_config}\n"
     "cpumem_collector_config:\n  freq: 1\n  use_writers: []\n"
-    "io_collector_config:\n  freq: 1\n  use_writers: []\n";
+    "new_io_usage_collector_config:\n  freq: 1\n  use_writers: []\n";
 
 Job make_common_job()
 {
@@ -362,7 +362,7 @@ void run(const std::string& base)
                  "rule.name = \"comma_list\"\n"
                  "rule.priority = 10\n"
                  "function rule.condition(job)\n"
-                 "    return true, \" io_collector,,cpumem_collector , \"\n"
+                 "    return true, \" new_io_usage_collector,,cpumem_collector , \"\n"
                  "end\n"
                  "return rule\n";
         std::filesystem::create_directories(rules_root / "condor_contract_second");
@@ -388,7 +388,7 @@ void run(const std::string& base)
                 "rule.name = \"accept_low\"\n"
                 "rule.priority = 5\n"
                 "function rule.condition(job)\n"
-                "    return true, \"io_collector\"\n"
+                "    return true, \"new_io_usage_collector\"\n"
                 "end\n"
                 "return rule\n";
         std::filesystem::create_directories(rules_root / "condor_order_both");
@@ -397,7 +397,7 @@ void run(const std::string& base)
                  "rule.name = \"accept_first\"\n"
                  "rule.priority = 10\n"
                  "function rule.condition(job)\n"
-                 "    return true, \"io_collector\"\n"
+                 "    return true, \"new_io_usage_collector\"\n"
                  "end\n"
                  "return rule\n";
         std::ofstream also(rules_root / "condor_order_both" / "condor_job_also.lua");
@@ -417,7 +417,7 @@ void run(const std::string& base)
                   "  job_db_path: " << base << "/cfg.db\n"
                   << COLLECTORS_BLOCK
                   << "condor_job_watcher:\n"
-                  "  auto_add_collectors: [cpumem_collector, io_collector]\n"
+                  "  auto_add_collectors: [cpumem_collector, new_io_usage_collector]\n"
                   "  use_rules: false\n"
                   "  cluster_name: htcondor01\n"
                   "  rules_dir: \"" << rules_root.string() << "/condor_jobs\"\n"
@@ -520,7 +520,7 @@ void run(const std::string& base)
 
         // A manual override keeps winning over the automatic decision.
                 registry.setCollectorValidator([](const std::string& name) {
-            return name == "cpumem_collector" || name == "io_collector";
+            return name == "cpumem_collector" || name == "new_io_usage_collector";
         });
         CollectionRequest stop;
         stop.targets = {created.job_id};
@@ -628,7 +628,7 @@ void run(const std::string& base)
             (rules_root / "condor_order").string(), "condor_job_");
         const auto late = ordered.select(job, revision, error);
         check(error.empty() && late.accepted && late.collectors.size() == 1 &&
-                  late.collectors.front() == "io_collector",
+                  late.collectors.front() == "new_io_usage_collector",
               "auto policy: the walk must continue past a declining rule");
 
         // Two accepting rules: only the higher-priority one selects.
@@ -636,7 +636,7 @@ void run(const std::string& base)
             (rules_root / "condor_order_both").string(), "condor_job_");
         const auto first_win = both.select(job, revision, error);
         check(error.empty() && first_win.accepted && first_win.collectors.size() == 1 &&
-                  first_win.collectors.front() == "io_collector",
+                  first_win.collectors.front() == "new_io_usage_collector",
               "auto policy: the first accepting rule must win exclusively");
 
         // The collector string is a comma-separated list: trimmed, empty
@@ -646,8 +646,8 @@ void run(const std::string& base)
         const auto list = comma.select(job, revision, error);
         check(error.empty() && list.accepted && list.collectors.size() == 2 &&
                   ((list.collectors[0] == "cpumem_collector" &&
-                    list.collectors[1] == "io_collector") ||
-                   (list.collectors[0] == "io_collector" &&
+                    list.collectors[1] == "new_io_usage_collector") ||
+                   (list.collectors[0] == "new_io_usage_collector" &&
                     list.collectors[1] == "cpumem_collector")),
               "auto policy: the collector string must split on commas");
 
@@ -655,7 +655,7 @@ void run(const std::string& base)
         // defaults become the selection.
         auto bare = AutoCollectorPolicy::rules(
             (rules_root / "condor_contract_boolonly").string(), "condor_job_",
-            {"cpumem_collector", "io_collector"});
+            {"cpumem_collector", "new_io_usage_collector"});
         const auto fallback = bare.select(job, revision, error);
         check(error.empty() && fallback.accepted && fallback.collectors.size() == 2,
               "auto policy: a bare accept must fall back to the configured defaults");
@@ -709,7 +709,7 @@ void run(const std::string& base)
                           "rule.name = \"slurm_accept\"\n"
                           "rule.priority = 10\n"
                           "function rule.condition(job)\n"
-                          "    return true, \"io_collector\"\n"
+                          "    return true, \"new_io_usage_collector\"\n"
                           "end\n"
                           "return rule\n";
         }
@@ -894,7 +894,7 @@ void run(const std::string& base)
                       "upsert: the first manual add must set the manual selection");
             }
 
-            manual.CollectorNames = {"io_collector"};
+            manual.CollectorNames = {"new_io_usage_collector"};
             const auto second =
                 registry.addOrUpdateManualJob(manual, nlohmann::json::object(), selector);
             check(second["status"] == "success",
@@ -951,7 +951,7 @@ void run(const std::string& base)
                 registry.jobRecord(created_id)->revision;
 
             Job repeat = manual;
-            repeat.CollectorNames = {"io_collector"};
+            repeat.CollectorNames = {"new_io_usage_collector"};
             const auto updated =
                 registry.addOrUpdateManualJob(repeat, nlohmann::json::object(), std::nullopt);
             check(updated["status"] == "success",
@@ -1027,7 +1027,7 @@ void run(const std::string& base)
             // A schedd-b claim routes to schedd-b's row only; schedd-a's
             // selection is a different job's and must stay untouched.
             Job claim_b = manual_condor("schedd-b", "sb.example.com");
-            claim_b.CollectorNames = {"io_collector"};
+            claim_b.CollectorNames = {"new_io_usage_collector"};
             const auto updated_b =
                 registry.addOrUpdateManualJob(claim_b, nlohmann::json::object(), std::nullopt);
             check(updated_b["status"] == "success" && updated_b["JobID"] == format_job_id(id_b),
@@ -1043,7 +1043,7 @@ void run(const std::string& base)
                       "schedd: the schedd-b claim must union into schedd-b's selection");
             }
             Job claim_a = manual_condor("schedd-a", "sa.example.com");
-            claim_a.CollectorNames = {"io_collector"};
+            claim_a.CollectorNames = {"new_io_usage_collector"};
             const auto updated_a =
                 registry.addOrUpdateManualJob(claim_a, nlohmann::json::object(), std::nullopt);
             check(updated_a["status"] == "success" && updated_a["JobID"] == format_job_id(id_a),
@@ -1053,7 +1053,7 @@ void run(const std::string& base)
             // A legacy request with no scheduler attribution matches both
             // rows: an ambiguity the caller must resolve, never a guess.
             Job bare = manual_condor(nullptr, nullptr);
-            bare.CollectorNames = {"io_collector"};
+            bare.CollectorNames = {"new_io_usage_collector"};
             const auto ambiguous =
                 registry.addOrUpdateManualJob(bare, nlohmann::json::object(), std::nullopt);
             check(ambiguous["status"] == "error" &&
@@ -1087,7 +1087,7 @@ void run(const std::string& base)
             Job claim_legacy = legacy;
             std::get<CondorJobAttr>(claim_legacy.sub_attr).scheduler_name = "schedd-a";
             std::get<CondorJobAttr>(claim_legacy.sub_attr).scheduler_host = "sa.example.com";
-            claim_legacy.CollectorNames = {"io_collector"};
+            claim_legacy.CollectorNames = {"new_io_usage_collector"};
             const auto tolerated =
                 registry.addOrUpdateManualJob(claim_legacy, nlohmann::json::object(), std::nullopt);
             check(tolerated["status"] == "error" &&
@@ -1255,7 +1255,7 @@ void run(const std::string& base)
             selector.clusterName = "pool-b";
             selector.clusterTag = "schedd@submit";
             selector.job_native_id = "901.0";
-            second.CollectorNames = {"io_collector"};
+            second.CollectorNames = {"new_io_usage_collector"};
             const auto update = registry.addOrUpdateManualJob(second, nlohmann::json::object(), selector);
             check(update.value("status", "") == "success" && update["JobID"] == format_job_id(second_id),
                   "namespace: exact complete selector updates only its pool");
@@ -1325,7 +1325,7 @@ void run(const std::string& base)
             for (const auto& row : registry.jobRecords())
                 if (row.job.clusterName == "cluster-b") id_b = row.job.JobID;
             NativeSelector selector{"slurm", "cluster-b", "", "904", ""};
-            b.CollectorNames = {"io_collector"};
+            b.CollectorNames = {"new_io_usage_collector"};
             const auto updated = registry.addOrUpdateManualJob(b, nlohmann::json::object(), selector);
             check(id_b != 0 && updated.value("status", "") == "success" &&
                       updated["JobID"] == format_job_id(id_b),
@@ -1409,7 +1409,7 @@ void run(const std::string& base)
                       "namespace: restart preserves intact structured schedd");
                 Job request = restored->job;
                 request.JobID = 0;
-                request.CollectorNames = {"io_collector"};
+                request.CollectorNames = {"new_io_usage_collector"};
                 const auto updated = registry.addOrUpdateManualJob(request, nlohmann::json::object());
                 check(updated.value("status", "") == "success" && updated["JobID"] == format_job_id(saved),
                       "namespace: intact schedd matches after restart without reparsing");
@@ -1438,7 +1438,7 @@ void run(const std::string& base)
             std::get<CondorJobAttr>(a.sub_attr).scheduler_name = "schedd-a@submit";
             Job b = legacy;
             std::get<CondorJobAttr>(b.sub_attr).scheduler_name = "schedd-b@submit";
-            b.CollectorNames = {"io_collector"};
+            b.CollectorNames = {"new_io_usage_collector"};
             const auto results = JobRegistryNamespaceTestAccess::updatePreselected(registry, a, b);
             check(results.first.value("status", "") == "error" &&
                       results.first.value("code", "") == "namespace_conflict",
@@ -1484,7 +1484,7 @@ void run(const std::string& base)
             std::get<CondorJobAttr>(pool_a.sub_attr).collector_host = "pool-a";
             pool_b.clusterName = "pool-b";
             std::get<CondorJobAttr>(pool_b.sub_attr).collector_host = "pool-b";
-            pool_b.CollectorNames = {"io_collector"};
+            pool_b.CollectorNames = {"new_io_usage_collector"};
             const auto pool_results =
                 JobRegistryNamespaceTestAccess::updatePreselected(registry, pool_a, pool_b);
             check(pool_results.first.value("code", "") == "namespace_conflict" &&
@@ -1503,7 +1503,7 @@ void run(const std::string& base)
             Job slurm_b = slurm;
             std::get<SlurmJobAttr>(slurm_a.sub_attr).clusterName = "cluster-a";
             std::get<SlurmJobAttr>(slurm_b.sub_attr).clusterName = "cluster-b";
-            slurm_b.CollectorNames = {"io_collector"};
+            slurm_b.CollectorNames = {"new_io_usage_collector"};
             const auto slurm_results =
                 JobRegistryNamespaceTestAccess::updatePreselected(registry, slurm_a, slurm_b);
             check(slurm_results.first.value("code", "") == "namespace_conflict" &&
@@ -1541,7 +1541,7 @@ void run(const std::string& base)
             Job claim = legacy;
             claim.clusterTag = selector.clusterTag;
             std::get<CondorJobAttr>(claim.sub_attr).scheduler_name = selector.clusterTag;
-            claim.CollectorNames = {"io_collector"};
+            claim.CollectorNames = {"new_io_usage_collector"};
             const auto rejected = JobRegistryNamespaceTestAccess::update(registry, target, claim);
             check(rejected.value("status", "") == "error",
                   "adoption occupied: stale update must reject occupied key");
@@ -1648,7 +1648,7 @@ void run(const std::string& base)
             check(registry.addJob(legacy), "selection recovery: legacy create");
             const auto id = registry.jobRecords().front().job.JobID;
             Job claim = legacy;
-            claim.CollectorNames = {"io_collector"};
+            claim.CollectorNames = {"new_io_usage_collector"};
             NativeSelector selector{"condor", "pool", "", "914.0", ""};
             registry.injectStoreFaultForTest(mode);
             const auto failed = registry.addOrUpdateManualJob(claim, nlohmann::json::object(), selector);
@@ -1663,7 +1663,7 @@ void run(const std::string& base)
                       registry.jobRecords().size() == 1,
                   "selection recovery: row and index resolve together");
             check(registry.selectionRecord(id).manual ==
-                      std::optional<std::vector<std::string>>(std::vector<std::string>{"cpumem_collector", "io_collector"}) &&
+                      std::optional<std::vector<std::string>>(std::vector<std::string>{"cpumem_collector", "new_io_usage_collector"}) &&
                       registry.jobRecord(id)->job.clusterTag.empty(),
                   "selection recovery: retry changes only collectors, never the namespace");
             registry.deinit();
@@ -1700,7 +1700,7 @@ void run(const std::string& base)
             captured_future.wait();
             const bool serialized = JobRegistryNamespaceTestAccess::mutationLocked(registry);
             Job claim = old_job;
-            claim.CollectorNames = {"io_collector"};
+            claim.CollectorNames = {"new_io_usage_collector"};
             std::promise<void> adoption_started;
             auto started = adoption_started.get_future();
             nlohmann::json adopted;
@@ -1728,7 +1728,7 @@ void run(const std::string& base)
                       durable->job.clusterTag.empty() &&
                       !JobRegistryNamespaceTestAccess::durableByIdentity(reopened, *new_identity) &&
                       reopened.selectionRecord(original.job_id).manual ==
-                          std::optional<std::vector<std::string>>(std::vector<std::string>{"io_collector"}),
+                          std::optional<std::vector<std::string>>(std::vector<std::string>{"new_io_usage_collector"}),
                   "checkpoint selection: the frozen identity and new selection must survive restart");
             auto new_job = old_job;
             const auto observed = reopened.upsertObservedJob(new_job);

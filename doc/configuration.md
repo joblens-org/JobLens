@@ -303,9 +303,6 @@ The collector's `init(json_cfg)` method receives a JSON object converted from th
 | | `pss` | bool | Default `true`. Collects PSS (proportional set size, shared pages split across processes). `false` disables `smaps_rollup` reads entirely and omits `mem_pss_kb` from the output |
 | | `pss_fallback_smaps` | bool | Default `true`. On kernels without `smaps_rollup`, degrades to per-VMA `smaps` parsing (higher cost); set `false` to disable PSS instead |
 | | `pss_max_processes` | int | Default `64`. When a job has more live pids than this, PSS is skipped for that sample (all-or-nothing, never a partial sum). `0` means unlimited | `cpumem_collector.cpp:42` |
-| **IOUsageCollector** | `summary` | string | When `"true"`, aggregates I/O data across all processes | `io_usage_collector.cpp:186` |
-| | `use_ebpf` | string | When `"true"`, uses eBPF to collect file‑level I/O data (requires root + kernel support) | `io_usage_collector.cpp:192` |
-| | `collect_file_paths` | string | When `"true"`, emits per-fd `path` and `mount_point`. Default `"false"`: file paths reveal what each user reads/writes and should not be collected on shared login nodes unless needed for diagnosis. | `io_usage_collector.cpp` |
 | **NetUsageCollector** | `summary` | string | When `"true"`, aggregates network data across all processes | `net_usage_collector.cpp:477` |
 | | `use_netlink` | string | When `"true"`, uses netlink to query TCP_INFO (RTT, retransmissions, etc.) | `net_usage_collector.cpp:482` |
 | **BasicInfoCollector** | `summary` | string | When `"true"`, aggregates taskstats data across all processes (TGID-level summary) | `basic_info_collector.cpp:45` |
@@ -342,16 +339,15 @@ The collector's `init(json_cfg)` method receives a JSON object converted from th
 - `include_process_details=true` emits both Job aggregate metrics and per-process detail. `include_process_details=false` emits Job aggregate metrics only
 - Output does not include `mount_point` or `fs_type`; the collector does not provide filesystem-specific attribution
 
-**IO file metadata**: `IOUsageCollector` and `NewIOUsageCollector` resolve file
-paths through `/proc/<pid>/fd` and mount information through `/proc/<pid>/mountinfo`.
-They do not call `stat()` on target files, avoiding remote filesystem authentication
-waits (for example, AFS). The legacy `pos` field previously reported file size,
-not the current file offset; it is now `null` in JSON and `unknown` in text output.
-File details are no longer restricted to regular files and block devices: any
-absolute fd target may appear, including directories or deleted open files.
-Existing IO counters remain available without target metadata access.
-Per-fd `path`/`mount_point` are only emitted when `collect_file_paths=true`;
-the default is `false` because paths reveal user file access on shared nodes.
+**IO file metadata**: `NewIOUsageCollector` resolves file paths through
+`/proc/<pid>/fd` and mount information through `/proc/<pid>/mountinfo`. It does
+not call `stat()` on target files, avoiding remote filesystem authentication
+waits (for example, AFS). The `pos` field is always `null` in JSON and `unknown`
+in text output. File details are not restricted to regular files and block
+devices: any absolute fd target may appear, including directories or deleted
+open files. Existing IO counters remain available without target metadata
+access. Per-fd `path`/`mount_point` are emitted only when
+`include_process_details=true`.
 
 **NewIOUsageCollector Notes**:
 - Generic I/O accounting collector at the VFS syscall layer (rchar/wchar semantics), always eBPF-backed with no `use_ebpf` switch
@@ -424,8 +420,6 @@ ES_writer_config:
   indexs:                        # Optional index name mapping list
     - collector_name: cpumem_collector
       index_name: cpu_mem_metrics
-    - collector_name: io_usage_collector
-      index_name: io_metrics
 ```
 
 | Key | Type | Required | Default | Description |
@@ -545,8 +539,6 @@ file_writer_config:
   outputs:                                   # Per-collector file routing (optional)
     - collector_name: cpumem_collector
       file_path: /var/log/joblens/cpumem.log
-    - collector_name: io_usage_collector
-      file_path: /var/log/joblens/io.log
 ```
 
 ### Option Reference
@@ -672,7 +664,6 @@ condor_job_watcher:
   auto_add_collectors:          # armed for auto_add: default; fallback for a bare rule accept
     - cpumem_collector
     - net_collector
-    - io_collector
 ```
 
 > **Note**: The rule file prefix is the adapter name (`condor`): only `.lua` files whose basename starts with it are loaded, and `rules_prefix` is deprecated and ignored. Rules are loaded at **startup** (`auto_add: rule` arms the engine). `rules_dir` resolves from this section first, then the deprecated `job_registry_config.rules_dir`, then the default `{JobLensRootDir}/../config/rules/condor_jobs`. An empty directory or no prefix match logs a startup warning and selects no collectors for the type.
@@ -696,7 +687,6 @@ slurm_job_watcher:
   auto_add_collectors:
     - cpumem_collector
     - net_collector
-    - io_collector
 ```
 
 > **Note**: The rule file prefix is the adapter name (`slurm`); `rules_prefix` is deprecated and ignored, and rules load at startup with `auto_add: rule`. `rules_dir` resolves from this section first, then the deprecated `job_registry_config.rules_dir`, then the default `{JobLensRootDir}/../config/rules/slurm_jobs`.
@@ -804,9 +794,6 @@ collectors_config:
     - name: net_collector
       type: NetUsageCollector
       config: net_collector_config
-    - name: io_collector
-      type: IOUsageCollector
-      config: io_collector_config
     - name: basic_info_collector
       type: BasicInfoCollector
       config: basic_info_collector_config
@@ -828,15 +815,6 @@ net_collector_config:
   freq: 1
   use_netlink: true
   summary: false
-  use_writers:
-    - es_writer
-
-io_collector_config:
-  freq: 1
-  summary: false
-  use_ebpf: false
-  # 文件路径属于敏感信息；定位 I/O 卡顿时再设为 true
-  collect_file_paths: false
   use_writers:
     - es_writer
 
@@ -909,7 +887,6 @@ condor_job_watcher:
   auto_add_collectors:
     - cpumem_collector
     - net_collector
-    - io_collector
 ```
 
 ---

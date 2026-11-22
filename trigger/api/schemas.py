@@ -29,7 +29,7 @@ class JobRequest(BaseModel):
     type: str = Field(..., description="作业类型: job.condor/job.common")
     JobID: Optional[int] = Field(None, description="作业ID")
     JobPIDs: Optional[List[int]] = Field(None, description="进程ID列表（裸 pid，兼容别名）")
-    Lens: Optional[List[str]] = Field(None, description="采集器列表，默认 ['cpumem_collector', 'io_collector', 'net_collector']")
+    Lens: Optional[List[str]] = Field(None, description="采集器列表，默认 ['cpumem_collector', 'new_io_usage_collector', 'net_collector']")
     clusterName: Optional[str] = Field(None, description="调度器集群或池路由标签")
     clusterTag: Optional[str] = Field(None, description="调度器命名空间标签")
     sub_attr: Optional[Dict[str, Any]] = Field(None, description="子属性，condor类型需cluster_id/proc_id，slurm类型需job_id/step_id")
@@ -52,7 +52,7 @@ class CondorJobRequest(BaseModel):
     opt: str = Field(..., description="操作类型，目前仅支持 'add'")
     JobID: Optional[int] = Field(None, description="作业ID")
     slot: str = Field(..., description="slot名称，必须以 'slot' 开头")
-    Lens: Optional[List[str]] = Field(None, description="采集器列表，默认 ['cpumem_collector', 'io_collector', 'net_collector']")
+    Lens: Optional[List[str]] = Field(None, description="采集器列表，默认 ['cpumem_collector', 'new_io_usage_collector', 'net_collector']")
     sub_attr: Optional[Dict[str, Any]] = Field(None, description="子属性，包含cluster_id/proc_id，不提供则默认0")
 
 
@@ -65,7 +65,7 @@ class SlurmJobRequest(BaseModel):
     """
     opt: str = Field(..., description="操作类型，目前仅支持 'add'")
     JobID: Optional[int] = Field(None, description="作业ID（兼容提示，可省略）")
-    Lens: Optional[List[str]] = Field(None, description="采集器列表，默认 ['cpumem_collector', 'io_collector', 'net_collector']")
+    Lens: Optional[List[str]] = Field(None, description="采集器列表，默认 ['cpumem_collector', 'new_io_usage_collector', 'net_collector']")
     sub_attr: Optional[Dict[str, Any]] = Field(None, description="子属性，包含job_id/step_id，不提供则用JobID/0")
 
 

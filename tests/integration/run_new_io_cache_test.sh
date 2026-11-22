@@ -37,11 +37,8 @@ done < <(ninja -C "$build" -t commands JobLens)
 ${CXX:-c++} -std=c++17 -O0 -g $joblens_test_defines \
     -I"$build/include" -I"$root/include" -I/usr/include/libnl3 \
     $joblens_test_extra_flags -c "$root/tests/integration/new_io_cache_test.cpp" -o "$work/test.o"
-${CXX:-c++} -std=c++17 -O0 -g $joblens_test_defines \
-    -I"$build/include" -I"$root/include" -I/usr/include/libnl3 \
-    $joblens_test_extra_flags -c "$root/tests/integration/io_no_stat_test.cpp" -o "$work/legacy.o"
 command=${link/CMakeFiles\/JobLens.dir\/src\/main.cpp.o/\"$work\/test.o\"}
-wraps="\"$work/legacy.o\" -Wl,--wrap=stat -Wl,--wrap=kill -Wl,--wrap=bpf_map_lookup_batch -Wl,--wrap=bpf_object__load"
+wraps="-Wl,--wrap=stat -Wl,--wrap=kill -Wl,--wrap=bpf_map_lookup_batch -Wl,--wrap=bpf_object__load"
 wraps+=" -Wl,--wrap=bpf_object__find_map_fd_by_name -Wl,--wrap=bpf_map__fd"
 wraps+=" -Wl,--wrap=bpf_map_update_elem -Wl,--wrap=bpf_map_lookup_elem -Wl,--wrap=bpf_map_delete_elem"
 wraps+=" -Wl,--wrap=bpf_map__lookup_elem -Wl,--wrap=bpf_map__lookup_and_delete_elem"

@@ -106,7 +106,7 @@ Generic job operation (add or remove).
 | `type` | string | **Yes** | Job type: `"job.condor"`, `"job.slurm"`, or `"job.common"` |
 | `JobID` | int | No | Job handle: the record ID, numeric in this legacy shape (v2 endpoints carry the decimal string) |
 | `JobPIDs` | array[int] | No | Bare pid list, accepted on the v1 job endpoints; the legacy `dump_job`/Lua name for the `pids` projection of `pid_identities` |
-| `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "io_collector", "net_collector"]`) |
+| `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "new_io_usage_collector", "net_collector"]`) |
 | `sub_attr` | object | No | Sub-attributes: `condor` type needs `cluster_id`/`proc_id`, `slurm` type needs `job_id`/`step_id` |
 | `erase` | bool | No | For `remove` only. `false` or absent keeps the stop tier: collection stops, the job record remains. `true` removes the instance: a collected instance is archived as an `h:` history row, a never-collected instance is deleted |
 
@@ -149,7 +149,7 @@ Condor job specific operation. Currently only supports `"add"`.
 | `opt` | string | **Yes** | Operation type, only `"add"` is supported |
 | `JobID` | int | No | Condor job number. The legacy endpoint keeps the name `JobID` for the scheduler-native id the record calls `JobNativeID` |
 | `slot` | string | **Yes** | Slot name, must start with `"slot"` |
-| `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "io_collector", "net_collector"]`) |
+| `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "new_io_usage_collector", "net_collector"]`) |
 | `sub_attr` | object | No | Sub-attributes (e.g., `{"cluster_id": 123456, "proc_id": 0}`) |
 
 **Example request:**
@@ -186,7 +186,7 @@ Slurm job specific operation. Currently only supports `"add"`.
 |---|---|---|---|
 | `opt` | string | **Yes** | Operation type, only `"add"` is supported |
 | `JobID` | int | **Yes** | Slurm job number. The legacy endpoint keeps the name `JobID` for the scheduler-native id the record calls `JobNativeID` |
-| `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "io_collector", "net_collector"]`) |
+| `Lens` | array[string] | No | Collector list (default: `["cpumem_collector", "new_io_usage_collector", "net_collector"]`) |
 | `sub_attr` | object | No | Sub-attributes (e.g., `{"job_id": 12345, "step_id": 0}`) |
 
 **Example request:**

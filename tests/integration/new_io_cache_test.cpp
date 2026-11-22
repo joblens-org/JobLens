@@ -288,15 +288,12 @@ static void run_failure_retry(const char* path) {
     std::cout << "PASS empty and partial BPF dump failures retry inside the TTL\n";
 }
 
-void run_legacy_without_metadata();
-
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[2], "--map-fixture") == 0) BpfMapFixture::enabled = true;
     else if (argc != 2) { std::cerr << "Usage: new_io_cache_test maps.bpf.o [--map-fixture]\n"; return 2; }
     spdlog::set_level(spdlog::level::warn);
     if (BpfMapFixture::enabled) std::cout << "BPF map backend: in-memory fixture (no kernel BPF validation)\n";
     try {
-        run_legacy_without_metadata();
         run(argv[1], true); run(argv[1], false);
         run_cleanup_recovery(argv[1], true); run_cleanup_recovery(argv[1], false);
         run_cleanup_recovery(argv[1], true, true);
