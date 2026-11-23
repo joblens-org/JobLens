@@ -57,10 +57,14 @@
 #include "core/maintenance_config.hpp"
 #include "core/status_provider.hpp"
 #include "core/job_registry.hpp"
+#include "common/config.hpp"
+#include "job_watcher/condor_adapter.hpp"
 #include "job_watcher/condor_job_watcher.hpp"
 #include "collection_runtime_fixture.hpp"
 
 #include <spdlog/spdlog.h>
+
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -489,15 +493,24 @@ void case_config()
 {
     {
         const auto config = resolve_maintenance_config(nlohmann::json::object());
-        check(config.types.empty(), "config: absent types must default to []");
+        check(config.auto_discovery_types.empty(),
+              "config: absent auto_discovery_types must default to []");
         check(config.reconcile_interval_sec == 30, "config: default interval is 30");
         check(!config.settings.at("condor").auto_collect,
               "config: auto_collect defaults to false");
+        // Adapter settings exist for every registered scheduler whether or not
+        // its discovery source is enabled: the adapter is the facts/interface
+        // layer, `auto_discovery_types` only arms the watcher.
+        check(config.settings.count("condor") == 1 &&
+                  config.settings.count("slurm") == 1,
+              "config: every registered adapter must have settings");
+        check(!config.settings.at("condor").auto_discovery_enabled,
+              "config: discovery is off unless the type is listed");
     }
     {
         const auto config = resolve_maintenance_config(nlohmann::json{
             {"job_registry_config", nlohmann::json{
-                {"types", nlohmann::json::array({"condor", "slurm"})},
+                {"auto_discovery_types", nlohmann::json::array({"condor", "slurm"})},
                 {"reconcile_interval_sec", 5},
             }},
             {"condor_job_watcher", nlohmann::json{
@@ -512,7 +525,11 @@ void case_config()
                 {"rules_prefix", "slurm_job_"},
             }},
         });
-        check(config.types.size() == 2, "config: both types resolved");
+        check(config.auto_discovery_types.size() == 2,
+              "config: both auto discovery types resolved");
+        check(config.settings.at("condor").auto_discovery_enabled &&
+                  config.settings.at("slurm").auto_discovery_enabled,
+              "config: a listed type arms its discovery source");
         check(config.reconcile_interval_sec == 5, "config: explicit interval wins");
         const auto& condor = config.settings.at("condor");
         check(condor.auto_collect && !condor.use_rules &&
@@ -529,17 +546,36 @@ void case_config()
         const auto config = resolve_maintenance_config(nlohmann::json{
             {"job_registry_config", nlohmann::json{{"auto_add_condorjob", true}}},
         });
-        check(config.types.size() == 1 && config.types.front() == "condor",
-              "config: legacy auto_add folds into discovery");
+        check(config.auto_discovery_types.size() == 1 &&
+                  config.auto_discovery_types.front() == "condor",
+              "config: legacy auto_add folds into auto discovery");
+        check(config.settings.at("condor").auto_discovery_enabled,
+              "config: legacy folding arms the discovery source");
         check(config.settings.at("condor").auto_collect,
               "config: legacy folding turns auto collection on");
+    }
+    {
+        // The old key is gone. Silently ignoring it would turn discovery off
+        // without an error, so a present legacy key is an explicit rejection.
+        bool threw = false;
+        try {
+            (void)resolve_maintenance_config(nlohmann::json{
+                {"job_registry_config", nlohmann::json{
+                    {"types", nlohmann::json::array({"condor"})}},
+            }});
+        } catch (const std::invalid_argument& error) {
+            threw = std::string(error.what()).find("auto_discovery_types") !=
+                    std::string::npos;
+        }
+        check(threw, "config: the removed job_registry_config.types key must be "
+                     "rejected and name auto_discovery_types");
     }
     {
         bool threw = false;
         try {
             (void)resolve_maintenance_config(nlohmann::json{
                 {"job_registry_config", nlohmann::json{
-                    {"types", nlohmann::json::array({"bogus"})}},
+                    {"auto_discovery_types", nlohmann::json::array({"bogus"})}},
             }});
         } catch (const std::invalid_argument&) {
             threw = true;
@@ -569,7 +605,7 @@ void case_config()
             nlohmann::json watcher{{"auto_add", auto_add}};
             return nlohmann::json{
                 {"job_registry_config", nlohmann::json{
-                    {"types", nlohmann::json::array({"condor"})},
+                    {"auto_discovery_types", nlohmann::json::array({"condor"})},
                 }},
                 {"condor_job_watcher", std::move(watcher)},
             };
@@ -587,7 +623,7 @@ void case_config()
             if (use_rules) watcher["use_rules"] = *use_rules;
             return nlohmann::json{
                 {"job_registry_config", nlohmann::json{
-                    {"types", nlohmann::json::array({"condor"})},
+                    {"auto_discovery_types", nlohmann::json::array({"condor"})},
                 }},
                 {"condor_job_watcher", std::move(watcher)},
             };
@@ -608,7 +644,7 @@ void case_config()
         {
             const auto config = resolve(nlohmann::json{
                 {"job_registry_config", nlohmann::json{
-                    {"types", nlohmann::json::array({"condor"})},
+                    {"auto_discovery_types", nlohmann::json::array({"condor"})},
                 }},
                 {"condor_job_watcher", nlohmann::json{
                     {"auto_add", "off"},
@@ -1450,8 +1486,13 @@ void run_legacy(const std::string& base)
     check(!records.front().job.execution.manager.complete(),
           "legacy: a manual registration must not invent an execution manager");
 
-    check(heartbeat_status()["configured_types"].empty(),
-          "legacy: no discovery type should be configured");
+    const auto status = heartbeat_status();
+    check(status["auto_discovery_types"].empty(),
+          "legacy: no auto discovery type should be enabled");
+    check(!status.contains("configured_types"),
+          "legacy: the discovery list is reported as auto_discovery_types");
+    check(status["configured_adapters"].empty(),
+          "legacy: test wiring installs no production adapter set");
 
     check(registry.reconcileNow(), "legacy: the pass did not run");
     check(registry.findJob(id).has_value(),
@@ -1470,6 +1511,82 @@ void run_legacy(const std::string& base)
 
     pass_case("LEGACY", "manual registrations remove on process evidence without a source");
 }
+
+// ---------------------------------------------------------------------------
+// Adapter set vs auto discovery: `auto_discovery_types` only arms watchers.
+// Every registered scheduler keeps a settings-driven adapter for jobs that
+// arrive through any other path (manual registration, RPC, restored rows).
+// ---------------------------------------------------------------------------
+
+void run_adapter_set(const std::string& base)
+{
+    const auto dir = fresh_dir(base, "adapter-set");
+    const auto config_path = std::filesystem::path(dir) / "config.yaml";
+    {
+        std::ofstream config(config_path);
+        check(static_cast<bool>(config), "adapter-set: cannot write the config");
+        config << "job_registry_config:\n"
+                  "  job_db_path: " << dir << "/job.db\n"
+                  "  auto_discovery_types: []\n"
+                  "  reconcile_interval_sec: 30\n"
+                  "collectors_config:\n"
+                  "  default_freq: 1\n"
+                  "  default_use_writers: []\n"
+                  "  collectors:\n"
+                  "    - {name: cpumem_collector, type: CPUMemCollector, "
+                  "config: cpumem_collector_config}\n"
+                  "cpumem_collector_config:\n"
+                  "  freq: 1\n"
+                  "  use_writers: []\n";
+    }
+    // This binary never initializes the config singleton earlier: production
+    // wiring is the only reader, and it is exercised here.
+    Config::instance(config_path.string());
+
+    JobRegistryOptions options;
+    options.db_path = dir + "/job.db";
+    options.enable_pid_tracker = false;
+    options.register_rpc = false;
+    JobRegistry registry(options);
+    registry.setCollectorValidator(nullptr);
+
+    const auto status = heartbeat_status();
+    std::set<std::string> adapters;
+    for (const auto& name : status.at("configured_adapters"))
+        adapters.insert(name.get<std::string>());
+    check(adapters.count("condor") == 1 && adapters.count("slurm") == 1,
+          "adapter-set: every registered adapter must exist even with discovery off");
+    check(status.at("auto_discovery_types").empty(),
+          "adapter-set: no auto discovery type was configured");
+    check(!status.contains("configured_types"),
+          "adapter-set: the enabled discovery list is auto_discovery_types");
+    check(status.at("sources").empty(),
+          "adapter-set: no discovery source may start without an enabled type");
+
+    // A manual registration of a scheduler whose discovery is off still gets
+    // the adapter-owned facts/interface path.
+    Job job;
+    job.jobtype = JobType::Job;
+    job.subtype = JobSubType::Condor;
+    job.subtype_name = "condor";
+    job.JobNativeID = "76226370.0";
+    CondorJobAttr attr;
+    attr.cluster_id = 76226370;
+    attr.proc_id = 0;
+    job.sub_attr = attr;
+    set_pids(job, {getpid()});
+    job.CollectorNames = {"cpumem_collector"};
+    check(registry.addJob(job), "adapter-set: a manual registration must not need discovery");
+    check(registry.adapterNamed("condor") != nullptr,
+          "adapter-set: the facts adapter must exist without an enabled watcher");
+    check(registry.jobRecords().size() == 1,
+          "adapter-set: the manual registration must be inventoried");
+
+    check(registry.deinit(), "adapter-set: deinit must succeed");
+    pass_case("ADAPTER-SET", "every registered adapter exists regardless of "
+                             "auto_discovery_types; only enabled types start a source");
+}
+
 
 // ---------------------------------------------------------------------------
 // RESTORE-UNKNOWN (round 3): an unverifiable restored execution keeps its saved
@@ -2435,6 +2552,7 @@ int main(int argc, char** argv)
         run_a25(base);
         run_a28(base);
         run_legacy(base);
+        run_adapter_set(base);
         run_restore_unknown_keeps_evidence(base);
         run_remove_explicit(base);
         run_admit(base);

@@ -42,11 +42,14 @@ What you get for free:
 1. **Registration (before `main()`):** `REGISTER_SCHEDULER_ADAPTER("ssh",
    SshSchedulerAdapter)` at TU scope inserts a factory into
    `SchedulerAdapterRegistry` — same convention as `AUTO_REGISTER_COLLECTOR`.
-2. **Assembly (`JobRegistry::armDiscovery()`, called from the registry
-   constructor):** the resolved config's
-   `job_registry_config.types` entries are built through the registry, one adapter per
-   type. The adapter is the *only* component that knows the scheduler's
-   attribute schema, identity format and capabilities.
+2. **Assembly (`JobRegistry::buildAdapters()`, before the store restores
+   rows):** the resolved config's per-adapter settings build exactly one
+   adapter per registered scheduler. The adapter is the *only* component that
+   knows the scheduler's attribute schema, identity format and capabilities,
+   and it answers for jobs from every source. `armDiscovery()` then arms the
+   discovery sources of the `job_registry_config.auto_discovery_types` subset
+   only; an adapter whose watcher is off still serves manual registrations,
+   restored rows, refresh and kernel attribution.
 3. **Runtime:** the heartbeat drives the adapter's `IDiscoverySource`:
    `enumerateManagers()` enumerates the live per-job managers of one pass (no
    job ad, no member reads), `observe(manager)` builds the Job for a manager
@@ -172,8 +175,10 @@ group, filled where the source parses its inputs. `JobID`, `JobPIDs` and
 ### Step 1 — minimal shared wiring
 
 No scheduler logic is added outside the watcher and adapter. The adapter name is
-the scheduler identity everywhere: config `types` are registry names validated
-at startup, `<name>_job_watcher` sections resolve by convention, native-id
+the scheduler identity everywhere: `auto_discovery_types` names are validated
+against the registry at startup, `<name>_job_watcher` sections resolve by
+convention, every registered adapter is assembled regardless of discovery,
+native-id
 rules self-register (`REGISTER_NATIVE_ID_RULE`), facts for non-built-in
 schedulers ride the `SubAttr` JSON alternative with `subtype_name`, and
 identity/cgroup derivation dispatches through `ISchedulerAdapter` methods. The
@@ -307,9 +312,11 @@ ssh_job_watcher:
   cluster_name: ""            # empty: derive from the source environment
 ```
 
-and list the type under `job_registry_config.types: [condor, slurm, ssh]`.
-Leaving it out keeps the type dormant; the heartbeat still maintains any
-existing records of that type.
+and list the type under
+`job_registry_config.auto_discovery_types: [condor, slurm, ssh]` to start its
+watcher. Leaving it out leaves only the watcher dormant: the adapter still
+exists and the heartbeat still maintains manually registered and restored
+records of that type.
 
 ### Step 7 — tests
 
@@ -357,7 +364,7 @@ For eBPF-dependent tests, guard on namespace availability the way
 |---|---|
 | `include/core/job_registry.hpp` (or any compiled TU) | include the adapter header so its `REGISTER_SCHEDULER_ADAPTER` registrar is linked |
 | `include/core/job_discovery.hpp` | optional: a special `DiscoveryEnvironment` root (e.g. a spool dir) |
-| `config/config.example.yaml` | `<t>_job_watcher` section + `job_registry_config.types` entry |
+| `config/config.example.yaml` | `<t>_job_watcher` section + `job_registry_config.auto_discovery_types` entry (start the watcher; the adapter exists regardless) |
 
 No changes are needed in `collector_type.h`, `job_identity`, `maintenance_config`,
 `JobStore`, the heartbeat/removal logic, `KernelAttribution`, the RPC methods

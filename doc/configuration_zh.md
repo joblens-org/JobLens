@@ -67,9 +67,9 @@ lens_config:
 ```yaml
 job_registry_config:
   job_db_path: /var/JobLens/job.db      # 持久化作业状态的 LevelDB 数据库目录路径
-  auto_add_condorjob: true               # 已弃用：Condor 自动监控（改用 types/capture_all）
-  auto_add_slurmjob: true                # 已弃用：Slurm 自动监控（改用 types/capture_all）
-  types: [condor, slurm]               # 需要完整本地作业记录的调度器类型（opt-in，缺省为 []）
+  auto_add_condorjob: true               # 已弃用：Condor 自动监控（改用 auto_discovery_types/capture_all）
+  auto_add_slurmjob: true                # 已弃用：Slurm 自动监控（改用 auto_discovery_types/capture_all）
+  auto_discovery_types: [condor, slurm] # 启动发现 Watcher 的调度器类型（opt-in，缺省为 []）
   capture_all: true                    # 无条件登记每个捕获的作业（默认）；false = 登记与否交给 auto_add
   reconcile_interval_sec: 30           # 对账周期，最小 1 秒
 ```
@@ -77,9 +77,9 @@ job_registry_config:
 | 键 | 类型 | 默认值 | 描述 |
 |----|------|--------|------|
 | `job_db_path` | string | 无 | LevelDB 数据库目录路径。无法打开数据库时仅降级运行，不抛异常。升级时此路径上的旧格式库会被隔离改名为 `<路径>.legacy`，只导入分配水位线（见 doc/jobstore_persistence_service.md 第 7 节） |
-| `auto_add_condorjob` | bool | false | **已弃用**。启动旧版 CondorJobWatcher 并自动登记作业。该类型出现在 `types` 时忽略（由发现源负责） |
+| `auto_add_condorjob` | bool | false | **已弃用**。启动旧版 CondorJobWatcher 并自动登记作业。该类型出现在 `auto_discovery_types` 时忽略（由发现源负责） |
 | `auto_add_slurmjob` | bool | false | **已弃用**。同上，作用于 Slurm |
-| `types` | list | `[]` | 需要完整本地作业记录的调度器类型（包含未被采集的作业）。取值 `condor` / `slurm`，未知值启动即拒绝 |
+| `auto_discovery_types` | list | `[]` | 启动发现 Watcher 的调度器类型。取值 `condor` / `slurm`，未知值启动即拒绝。该开关只控制发现：每个已注册调度器的 adapter 始终存在，手工注册的作业仍可走类型化事实、刷新与内核归因。旧键 `types` 会在启动配置解析时失败（错误信息指明本键；发现/维护栈保持关闭，服务仍启动） |
 | `capture_all` | bool | `true` | 准入门开关。`true`：捕获的作业无条件准入；`false`：观测是否准入由该类型的 `<type>_job_watcher.auto_add` 判定 |
 | `reconcile_interval_sec` | int | 30 | 周期性全量对账间隔，单位秒，最小 1 |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs`（Condor）或 `{JobLensRootDir}/../config/rules/slurm_jobs`（Slurm） | Lua 规则文件目录，在该类型的 `<type>_job_watcher.auto_add` 为 `rule` 时使用。注意：默认值因 watcher 而异。 |
@@ -91,7 +91,7 @@ job_registry_config:
 | 开关 | 键 | 回答的问题 | 默认值 |
 |---|---|---|---|
 | 准入门（`capture_all`） | `job_registry_config.capture_all` | 捕获的作业是否可以无条件进入作业注册表？ | `true` |
-| 按类型启停 Watcher | `job_registry_config.types` | 该调度器类型是否启动发现 Watcher？ | `[]`（关） |
+| 按类型启停 Watcher | `job_registry_config.auto_discovery_types` | 该调度器类型的发现 Watcher 是否启动？（adapter 本身始终存在） | `[]`（关） |
 | 自动路径动作 | `<type>_job_watcher.auto_add`（`off` / `default` / `rule`） | 自动路径对该类型的观测做什么？ | `off` |
 
 `auto_add` 的三态：

@@ -739,7 +739,7 @@ ProcessLivenessProbe recording_probe(std::vector<pid_t>& asked, pid_t dead_pid)
 
 void condor_adapter_refresh_evidence(const Fixture& fixture)
 {
-    CondorSchedulerAdapter adapter(DiscoveryTypeSettings{});
+    CondorSchedulerAdapter adapter(SchedulerAdapterSettings{});
     auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
     check(watcher != nullptr,
           "the condor adapter must expose its watcher through source()");
@@ -821,7 +821,7 @@ void condor_adapter_refresh_evidence(const Fixture& fixture)
 
 void slurm_adapter_refresh_evidence(const Fixture& fixture)
 {
-    SlurmSchedulerAdapter adapter(DiscoveryTypeSettings{});
+    SlurmSchedulerAdapter adapter(SchedulerAdapterSettings{});
     auto* watcher = dynamic_cast<SlurmJobWatcher*>(&adapter.source());
     check(watcher != nullptr, "the slurm adapter must expose its watcher through source()");
     watcher->set_discovery_environment(fixture_options(fixture, "").discovery);
@@ -878,7 +878,7 @@ void condor_refresh_without_cgroup_reads_children(const Fixture& fixture)
     // The kernel's per-task children file is the only membership source here.
     write_file(fixture.proc / "4601" / "task" / "4601" / "children", "4610\n");
 
-    CondorSchedulerAdapter adapter(DiscoveryTypeSettings{});
+    CondorSchedulerAdapter adapter(SchedulerAdapterSettings{});
     auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
     check(watcher != nullptr, "the condor adapter must expose its watcher");
     watcher->set_discovery_environment(fixture_options(fixture).discovery);

@@ -579,7 +579,7 @@ int main(int argc, char** argv)
     // desired-state commit path only. Actual attachment belongs to the
     // scheduler and is not part of this number.
 
-    DiscoveryTypeSettings settings;
+    SchedulerAdapterSettings settings;
     settings.clusterName = args.cluster;
     auto adapter = SchedulerAdapterRegistry::instance().build("condor", settings);
     if (!adapter) {

@@ -67,7 +67,7 @@ static_assert(joblens::facts::valid_schema<CondorJobAttr>(),
 
 class CondorSchedulerAdapter final : public ISchedulerAdapter {
 public:
-    explicit CondorSchedulerAdapter(const DiscoveryTypeSettings& settings);
+    explicit CondorSchedulerAdapter(const SchedulerAdapterSettings& settings);
     ~CondorSchedulerAdapter() override;
 
     const std::string& name() const override;
@@ -75,7 +75,7 @@ public:
     IDiscoverySource& source() override;
     AdapterTraits traits() const override;
 
-    DiscoveryOptions discoveryOptions(const DiscoveryTypeSettings& settings) const override;
+    DiscoveryOptions discoveryOptions(const SchedulerAdapterSettings& settings) const override;
 
     // ---- typed facts / record projection ---------------------------------
     Job decodeFacts(const nlohmann::json& row) const override;

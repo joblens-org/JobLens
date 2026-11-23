@@ -23,18 +23,23 @@ lens_config:
 # ============================================================
 job_registry_config:
   job_db_path: /var/JobLens/job.db          # LevelDB database directory for job persistence
-  # Discovery and maintenance. `types` is opt-in: an absent list means [] (no
-  # broad discovery). `reconcile_interval_sec` defaults to 30 and must be >= 1;
-  # invalid values are rejected at startup. `capture_all` (default true)
-  # registers every captured job unconditionally; when false, registration is
-  # decided by the type's `<type>_job_watcher.auto_add`.
-  types: [condor, slurm]
+  # Discovery and maintenance. `auto_discovery_types` arms the discovery
+  # watchers: an absent list means [] (no watcher starts, no manager pass
+  # scans). Every registered scheduler adapter is assembled regardless, so a
+  # job registered another way (Trigger / RPC / restored row) still gets its
+  # typed facts, refresh and kernel attribution. The former `types` key was
+  # renamed; a configuration that still carries it is rejected at startup.
+  # `reconcile_interval_sec` defaults to 30 and must be >= 1; invalid values
+  # are rejected at startup. `capture_all` (default true) registers every
+  # captured job unconditionally; when false, registration is decided by the
+  # type's `<type>_job_watcher.auto_add`.
+  auto_discovery_types: [condor, slurm]
   reconcile_interval_sec: 30
   capture_all: true
 
-# Scheduler discovery. Listing a type under job_registry_config.types
-# maintains every recognized local instance. `auto_add` is the tri-state
-# automatic path:
+# Scheduler discovery. Listing a type under
+# job_registry_config.auto_discovery_types maintains every recognized local
+# instance. `auto_add` is the tri-state automatic path:
 #   off     - never select collectors automatically (the job still registers
 #             when capture_all is true);
 #   default - apply auto_add_collectors verbatim to every new job;

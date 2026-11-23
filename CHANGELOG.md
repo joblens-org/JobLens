@@ -1,5 +1,18 @@
 # JobLens Changelog
 
+## Unreleased
+
+### Breaking Changes
+
+- `job_registry_config.types` was renamed to `job_registry_config.auto_discovery_types`. A configuration that still carries `types` fails configuration resolution at startup: the error names the new key and the discovery/maintenance stack stays disabled (the service still starts and answers RPC). Silently ignoring the old key would turn discovery off without a word. Update the deployed configuration before upgrading.
+- The key's meaning is now strictly "which discovery watchers start". Every registered scheduler adapter is assembled at startup whether or not its watcher is enabled, so manually registered (Trigger / RPC) and restored jobs of a scheduler with discovery off still get their typed facts, per-record refresh, identity and kernel attribution. Previously the adapter for such a scheduler existed only as a lazily built default-configured fallback.
+- The heartbeat status replaced `configured_types` with two fields: `configured_adapters` (every assembled adapter) and `auto_discovery_types` (the watchers that are armed). A consumer reading `configured_types` must switch to `auto_discovery_types`.
+
+### Job registry
+
+- Adapters are built once, from the resolved per-adapter settings, **before** the store restores rows, so a restored row decodes through the same settings-driven adapter instance the runtime uses. The kernel-attribution capability gate now always consults the adapter's declared trait.
+- Internal naming follows the semantics: `DiscoveryTypeSettings` became `SchedulerAdapterSettings`, `MaintenanceConfig::types` became `auto_discovery_types`, and its `enabled` flag became `auto_discovery_enabled`.
+
 ## v0.4.0 (2026-11-22)
 
 ### Job registry and persistence

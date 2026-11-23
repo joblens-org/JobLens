@@ -166,8 +166,9 @@ struct SourceHealth {
 // ---------------------------------------------------------------------------
 
 // A discovery adapter never reads Config, never loads eBPF and never starts a
-// thread in its constructor: the assembly layer (JobRegistry::armDiscovery)
-// builds these options explicitly and start() begins operation.
+// thread in its constructor: the assembly layer (JobRegistry::buildAdapters,
+// from the resolved per-adapter settings) builds these options explicitly and
+// start() begins operation.
 struct DiscoveryOptions {
     // Load the eBPF ring buffer used for incremental discovery hints. It is
     // always started by start(), never by the constructor.

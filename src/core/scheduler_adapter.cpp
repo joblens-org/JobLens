@@ -179,7 +179,7 @@ std::vector<std::string> SchedulerAdapterRegistry::names() const
 }
 
 std::unique_ptr<ISchedulerAdapter> SchedulerAdapterRegistry::build(
-    const std::string& name, const DiscoveryTypeSettings& settings) const
+    const std::string& name, const SchedulerAdapterSettings& settings) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = factories_.find(name);
