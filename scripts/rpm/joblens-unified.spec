@@ -255,6 +255,15 @@ install -d -m 750 %{buildroot}%{_sharedstatedir}/joblens
 #     使用 CMakePresets 中预设定义的构建目录（build/）
 DESTDIR=%{buildroot} cmake --install build --prefix %{_prefix}
 
+# 15b. 剥离主二进制的调试段
+#      RelWithDebInfo 会让 /usr/bin/JobLens 带上完整调试信息（约 100MB）；
+#      全局 __strip 被替换成 /bin/true 是为了保护 .bpf.o，因此这里只对主
+#      二进制显式 strip（保留动态符号与 build-id），绝不碰 bpf_obj/ 下的对象。
+if [ -f %{buildroot}%{_bindir}/JobLens ]; then
+    /usr/bin/strip --strip-debug %{buildroot}%{_bindir}/JobLens
+    echo "✓ JobLens 已剥离调试段"
+fi
+
 # 16. 验证 eBPF 对象文件已由 cmake --install 安装到位
 #     cmake --install 通过 Packaging.cmake 的 install(DIRECTORY ...) 安装 .bpf.o
 #     到 ${CMAKE_INSTALL_LIBDIR}/joblens/bpf_obj/（64-bit 系统为 lib64）。
