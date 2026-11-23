@@ -40,7 +40,7 @@ src/ebpf/trace_ssh_session.bpf.c          # 可选：exec-hint 事件源
    SshSchedulerAdapter)` 把工厂函数插入 `SchedulerAdapterRegistry`——和
    `AUTO_REGISTER_COLLECTOR` 同一套约定。
 2. **装配（`JobRegistry::armDiscovery()`，由注册表构造函数调用）：** 配置解析出的
-   `maintenance.types` 逐项通过注册表构建，每种类型恰好一个 adapter。
+   `job_registry_config.types` 逐项通过注册表构建，每种类型恰好一个 adapter。
    adapter 是**唯一**知道该调度器属性 schema、身份格式和能力的东西。
 3. **运行：** 心跳驱动 adapter 的 `IDiscoverySource`：`enumerateManagers()`
    枚举一遍 pass 里的全部存活 per-job manager（不读 job ad、不读成员），
@@ -278,7 +278,7 @@ ssh_job_watcher:
   cluster_name: ""            # 空：从源环境推导
 ```
 
-并在 `job_registry_config.maintenance.types: [condor, slurm, ssh]` 里列出
+并在 `job_registry_config.types: [condor, slurm, ssh]` 里列出
 该类型。不列出则该类型保持休眠；心跳仍会维护该类型的既有记录。
 
 ### 第 7 步 — 测试
@@ -325,7 +325,7 @@ ssh_job_watcher:
 |---|---|
 | `include/core/job_registry.hpp`（或任一已编译 TU） | include adapter 头，使其 `REGISTER_SCHEDULER_ADAPTER` 注册器被链接 |
 | `include/core/job_discovery.hpp` | 可选：特殊 `DiscoveryEnvironment` 根字段（如 spool 目录） |
-| `config/config.example.yaml` | `<t>_job_watcher` 配置节 + `maintenance.types` 一项 |
+| `config/config.example.yaml` | `<t>_job_watcher` 配置节 + `job_registry_config.types` 一项 |
 
 `collector_type.h`、`job_identity`、`maintenance_config`、`JobStore`、
 心跳/移除逻辑、`KernelAttribution`、RPC 方法、trigger 均**不需要改动**：

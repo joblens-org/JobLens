@@ -181,54 +181,48 @@ MaintenanceConfig resolve_maintenance_config(const nlohmann::json& config)
             parse_bool(*node, std::string("job_registry_config.") + legacy.key);
     }
 
-    const auto* maintenance = member(registry_node, "maintenance");
-    if (maintenance != nullptr) {
-        if (!maintenance->is_object())
-            config_error("job_registry_config.maintenance must be a mapping");
-
-        if (const auto* types = member(*maintenance, "types")) {
-            if (!types->is_array())
-                config_error("job_registry_config.maintenance.types must be a list");
-            for (const auto& entry : *types) {
-                const std::string raw = scalar_text(
-                    entry, "job_registry_config.maintenance.types[]");
-                const std::string name = normalize_adapter_name(raw);
-                if (name.empty() || name == "unknown")
-                    config_error("unknown discovery type '" + raw + "'");
-                if (!SchedulerAdapterRegistry::instance().known(name)) {
-                    config_error("unknown discovery type '" + raw + "' (registered: " +
-                                 [&] {
-                                     std::string joined;
-                                     for (const auto& known :
-                                          SchedulerAdapterRegistry::instance().names())
-                                         joined += (joined.empty() ? "" : ", ") + known;
-                                     return joined;
-                                 }() +
-                                 ")");
-                }
-                if (std::find(resolved.types.begin(), resolved.types.end(), name) ==
-                    resolved.types.end()) {
-                    resolved.types.push_back(name);
-                }
+    // The discovery switches live directly under job_registry_config.
+    if (const auto* types = member(registry_node, "types")) {
+        if (!types->is_array())
+            config_error("job_registry_config.types must be a list");
+        for (const auto& entry : *types) {
+            const std::string raw = scalar_text(entry, "job_registry_config.types[]");
+            const std::string name = normalize_adapter_name(raw);
+            if (name.empty() || name == "unknown")
+                config_error("unknown discovery type '" + raw + "'");
+            if (!SchedulerAdapterRegistry::instance().known(name)) {
+                config_error("unknown discovery type '" + raw + "' (registered: " +
+                             [&] {
+                                 std::string joined;
+                                 for (const auto& known :
+                                      SchedulerAdapterRegistry::instance().names())
+                                     joined += (joined.empty() ? "" : ", ") + known;
+                                 return joined;
+                             }() +
+                             ")");
+            }
+            if (std::find(resolved.types.begin(), resolved.types.end(), name) ==
+                resolved.types.end()) {
+                resolved.types.push_back(name);
             }
         }
+    }
 
-        if (const auto* interval = member(*maintenance, "reconcile_interval_sec")) {
-            resolved.reconcile_interval_sec = parse_interval_sec(
-                *interval, "job_registry_config.maintenance.reconcile_interval_sec");
-        }
-        if (const auto* capture_all = member(*maintenance, "capture_all")) {
-            resolved.capture_all =
-                parse_bool(*capture_all, "job_registry_config.maintenance.capture_all");
-        }
-        if (member(*maintenance, "registration_batch_size") != nullptr) {
-            spdlog::warn("maintenance: registration_batch_size was removed; a discovery event "
-                         "registers its job immediately");
-        }
-        if (member(*maintenance, "auto_policy_budget_us") != nullptr) {
-            spdlog::warn("maintenance: auto_policy_budget_us was removed; the initial policy "
-                         "decision is always evaluated synchronously");
-        }
+    if (const auto* interval = member(registry_node, "reconcile_interval_sec")) {
+        resolved.reconcile_interval_sec = parse_interval_sec(
+            *interval, "job_registry_config.reconcile_interval_sec");
+    }
+    if (const auto* capture_all = member(registry_node, "capture_all")) {
+        resolved.capture_all =
+            parse_bool(*capture_all, "job_registry_config.capture_all");
+    }
+    if (member(registry_node, "registration_batch_size") != nullptr) {
+        spdlog::warn("job_registry_config.registration_batch_size was removed; a discovery "
+                     "event registers its job immediately");
+    }
+    if (member(registry_node, "auto_policy_budget_us") != nullptr) {
+        spdlog::warn("job_registry_config.auto_policy_budget_us was removed; the initial "
+                     "policy decision is always evaluated synchronously");
     }
 
     const std::string legacy_rules_dir =
@@ -317,7 +311,7 @@ MaintenanceConfig resolve_maintenance_config(const nlohmann::json& config)
     // use_rules only decides whether the collector list comes from the rule
     // engine (accept = rule result, reject = empty) or verbatim from
     // auto_add_collectors. An explicit per-type auto_collect or an explicit
-    // maintenance.types entry always wins over the legacy flag.
+    // An explicit types entry always wins over the legacy flag.
     for (const auto& legacy : kLegacyFlags) {
         auto& settings = resolved.settings.at(legacy.adapter);
         const bool explicit_type =

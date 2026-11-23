@@ -152,7 +152,7 @@ struct JobRegistryOptions {
     // below is the key it is armed under.
     std::function<AutoCollectorPolicy()> test_auto_policy;
     std::string test_auto_policy_adapter{"condor"};
-    // Admission-gate test wiring (production reads maintenance.capture_all and
+    // Admission-gate test wiring (production reads capture_all and
     // the per-type auto_add tri-state from the resolved configuration).
     // test_capture_all=false arms the gate; the state map carries the
     // per-subtype tri-state (a missing entry behaves as Off).
@@ -750,7 +750,7 @@ private:
     // execution whose child is still alive.
     void probeSurvivingPidIdentities(const Job& stored, const Job& refreshed,
                                      RefreshResult& evidence) const;
-    // Registration admission gate (maintenance.capture_all=false). Returns
+    // Registration admission gate (capture_all=false). Returns
     // nullopt to drop the observation (counted by the caller-visible
     // hb_not_admitted_* counters); otherwise the register decision
     // and, when the type's policy was pre-evaluated, the initial collector

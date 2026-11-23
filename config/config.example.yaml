@@ -28,12 +28,11 @@ job_registry_config:
   # invalid values are rejected at startup. `capture_all` (default true)
   # registers every captured job unconditionally; when false, registration is
   # decided by the type's `<type>_job_watcher.auto_add`.
-  maintenance:
-    types: [condor, slurm]
-    reconcile_interval_sec: 30
-    capture_all: true
+  types: [condor, slurm]
+  reconcile_interval_sec: 30
+  capture_all: true
 
-# Scheduler discovery. Listing a type under job_registry_config.maintenance.types
+# Scheduler discovery. Listing a type under job_registry_config.types
 # maintains every recognized local instance. `auto_add` is the tri-state
 # automatic path:
 #   off     - never select collectors automatically (the job still registers

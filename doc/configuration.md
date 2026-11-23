@@ -68,22 +68,21 @@ lens_config:
 ```yaml
 job_registry_config:
   job_db_path: /var/JobLens/job.db      # LevelDB database directory path for persisting job state
-  auto_add_condorjob: true               # Deprecated: automatic Condor monitoring (see maintenance below)
-  auto_add_slurmjob: true                # Deprecated: automatic Slurm monitoring (see maintenance below)
-  maintenance:
-    types: [condor, slurm]               # Types with a full local record set (opt-in, absent = [])
-    capture_all: true                    # Register every captured job (default); false = admission by auto_add
-    reconcile_interval_sec: 30           # Reconciliation interval, must be >= 1
+  auto_add_condorjob: true               # Deprecated: automatic Condor monitoring (see types/capture_all below)
+  auto_add_slurmjob: true                # Deprecated: automatic Slurm monitoring (see types/capture_all below)
+  types: [condor, slurm]               # Types with a full local record set (opt-in, absent = [])
+  capture_all: true                    # Register every captured job (default); false = admission by auto_add
+  reconcile_interval_sec: 30           # Reconciliation interval, must be >= 1
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `job_db_path` | string | none | LevelDB database directory path. If the database cannot be opened, no exception is thrown; it only degrades operation. On upgrade, a pre-schema database at this path is quarantined to `<path>.legacy` and only the allocator watermark is imported (see doc/jobstore_persistence_service.md §7) |
-| `auto_add_condorjob` | bool | false | **Deprecated.** Automatically start the legacy CondorJobWatcher and auto-add jobs. Ignored for a type listed in `maintenance.types` (the discovery source owns it) |
+| `auto_add_condorjob` | bool | false | **Deprecated.** Automatically start the legacy CondorJobWatcher and auto-add jobs. Ignored for a type listed in `types` (the discovery source owns it) |
 | `auto_add_slurmjob` | bool | false | **Deprecated.** Same as above for Slurm |
-| `maintenance.types` | list | `[]` | Scheduler types that get job records, including unselected jobs. `condor` / `slurm`; unknown values are rejected at startup |
-| `maintenance.capture_all` | bool | `true` | The admission gate. `true`: every captured job is admitted unconditionally. `false`: whether an observation is admitted is decided by the type's `<type>_job_watcher.auto_add` |
-| `maintenance.reconcile_interval_sec` | int | 30 | Periodic full reconciliation interval in seconds (minimum 1) |
+| `types` | list | `[]` | Scheduler types that get job records, including unselected jobs. `condor` / `slurm`; unknown values are rejected at startup |
+| `capture_all` | bool | `true` | The admission gate. `true`: every captured job is admitted unconditionally. `false`: whether an observation is admitted is decided by the type's `<type>_job_watcher.auto_add` |
+| `reconcile_interval_sec` | int | 30 | Periodic full reconciliation interval in seconds (minimum 1) |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` (Condor) or `{JobLensRootDir}/../config/rules/slurm_jobs` (Slurm) | Directory for Lua rule files, used when `<type>_job_watcher.auto_add` is `rule`. Note: the default varies by watcher context. |
 
 ### The three switches
@@ -93,8 +92,8 @@ switches. They answer different questions and never override each other:
 
 | Switch | Key | Question it answers | Default |
 |---|---|---|---|
-| admission gate | `job_registry_config.maintenance.capture_all` | May every captured job enter the registry unconditionally? | `true` |
-| per-type watcher | `job_registry_config.maintenance.types` | Does this scheduler type get a discovery watcher at all? | `[]` (off) |
+| admission gate | `job_registry_config.capture_all` | May every captured job enter the registry unconditionally? | `true` |
+| per-type watcher | `job_registry_config.types` | Does this scheduler type get a discovery watcher at all? | `[]` (off) |
 | automatic action | `<type>_job_watcher.auto_add` (`off` / `default` / `rule`) | What does the automatic path do with an observation of this type? | `off` |
 
 The `auto_add` tri-state:

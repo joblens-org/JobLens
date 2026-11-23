@@ -44,7 +44,7 @@ What you get for free:
    `SchedulerAdapterRegistry` — same convention as `AUTO_REGISTER_COLLECTOR`.
 2. **Assembly (`JobRegistry::armDiscovery()`, called from the registry
    constructor):** the resolved config's
-   `maintenance.types` entries are built through the registry, one adapter per
+   `job_registry_config.types` entries are built through the registry, one adapter per
    type. The adapter is the *only* component that knows the scheduler's
    attribute schema, identity format and capabilities.
 3. **Runtime:** the heartbeat drives the adapter's `IDiscoverySource`:
@@ -307,7 +307,7 @@ ssh_job_watcher:
   cluster_name: ""            # empty: derive from the source environment
 ```
 
-and list the type under `job_registry_config.maintenance.types: [condor, slurm, ssh]`.
+and list the type under `job_registry_config.types: [condor, slurm, ssh]`.
 Leaving it out keeps the type dormant; the heartbeat still maintains any
 existing records of that type.
 
@@ -357,7 +357,7 @@ For eBPF-dependent tests, guard on namespace availability the way
 |---|---|
 | `include/core/job_registry.hpp` (or any compiled TU) | include the adapter header so its `REGISTER_SCHEDULER_ADAPTER` registrar is linked |
 | `include/core/job_discovery.hpp` | optional: a special `DiscoveryEnvironment` root (e.g. a spool dir) |
-| `config/config.example.yaml` | `<t>_job_watcher` section + `maintenance.types` entry |
+| `config/config.example.yaml` | `<t>_job_watcher` section + `job_registry_config.types` entry |
 
 No changes are needed in `collector_type.h`, `job_identity`, `maintenance_config`,
 `JobStore`, the heartbeat/removal logic, `KernelAttribution`, the RPC methods

@@ -22,7 +22,7 @@
 // Adding a scheduler type = declare its facts and its projections in a
 // self-contained adapter header/TU, add one line to the closed-variant
 // manifest in collector_type.h, add one REGISTER_SCHEDULER_ADAPTER line and
-// one maintenance.types entry.
+// one job_registry_config.types entry.
 #pragma once
 
 #include <sys/types.h>
@@ -61,7 +61,7 @@ enum class AutoAdd {
 };
 
 // Resolved settings for one scheduler type, keyed by adapter name.
-// `enabled` mirrors job_registry_config.maintenance.types membership;
+// `enabled` mirrors job_registry_config.types membership;
 // `auto_add` resolution precedence:
 //   explicit <type>_job_watcher.auto_add (off/default/rule)  wins
 //   otherwise derived from the legacy pair:

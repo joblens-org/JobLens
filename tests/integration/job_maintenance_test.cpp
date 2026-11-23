@@ -497,10 +497,8 @@ void case_config()
     {
         const auto config = resolve_maintenance_config(nlohmann::json{
             {"job_registry_config", nlohmann::json{
-                {"maintenance", nlohmann::json{
-                    {"types", nlohmann::json::array({"condor", "slurm"})},
-                    {"reconcile_interval_sec", 5},
-                }},
+                {"types", nlohmann::json::array({"condor", "slurm"})},
+                {"reconcile_interval_sec", 5},
             }},
             {"condor_job_watcher", nlohmann::json{
                 {"auto_collect", true},
@@ -541,9 +539,7 @@ void case_config()
         try {
             (void)resolve_maintenance_config(nlohmann::json{
                 {"job_registry_config", nlohmann::json{
-                    {"maintenance", nlohmann::json{
-                        {"types", nlohmann::json::array({"bogus"})}},
-                }},
+                    {"types", nlohmann::json::array({"bogus"})}},
             }});
         } catch (const std::invalid_argument&) {
             threw = true;
@@ -555,7 +551,7 @@ void case_config()
         try {
             (void)resolve_maintenance_config(nlohmann::json{
                 {"job_registry_config", nlohmann::json{
-                    {"maintenance", nlohmann::json{{"reconcile_interval_sec", 0}}},
+                    {"reconcile_interval_sec", 0},
                 }},
             });
         } catch (const std::invalid_argument&) {
@@ -573,7 +569,7 @@ void case_config()
             nlohmann::json watcher{{"auto_add", auto_add}};
             return nlohmann::json{
                 {"job_registry_config", nlohmann::json{
-                    {"maintenance", nlohmann::json{{"types", nlohmann::json::array({"condor"})}}},
+                    {"types", nlohmann::json::array({"condor"})},
                 }},
                 {"condor_job_watcher", std::move(watcher)},
             };
@@ -591,7 +587,7 @@ void case_config()
             if (use_rules) watcher["use_rules"] = *use_rules;
             return nlohmann::json{
                 {"job_registry_config", nlohmann::json{
-                    {"maintenance", nlohmann::json{{"types", nlohmann::json::array({"condor"})}}},
+                    {"types", nlohmann::json::array({"condor"})},
                 }},
                 {"condor_job_watcher", std::move(watcher)},
             };
@@ -612,7 +608,7 @@ void case_config()
         {
             const auto config = resolve(nlohmann::json{
                 {"job_registry_config", nlohmann::json{
-                    {"maintenance", nlohmann::json{{"types", nlohmann::json::array({"condor"})}}},
+                    {"types", nlohmann::json::array({"condor"})},
                 }},
                 {"condor_job_watcher", nlohmann::json{
                     {"auto_add", "off"},
@@ -1881,7 +1877,7 @@ void run_admit(const std::string& base)
         check(config.capture_all, "ADMIT: capture_all must default to true");
         const auto off = resolve_maintenance_config(nlohmann::json{
             {"job_registry_config", nlohmann::json{
-                {"maintenance", nlohmann::json{{"capture_all", false}}},
+                {"capture_all", false},
             }},
         });
         check(!off.capture_all, "ADMIT: capture_all=false must parse");
