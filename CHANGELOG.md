@@ -11,6 +11,8 @@
 ### Job registry
 
 - Adapters are built once, from the resolved per-adapter settings, **before** the store restores rows, so a restored row decodes through the same settings-driven adapter instance the runtime uses. The kernel-attribution capability gate now always consults the adapter's declared trait.
+- A periodic refresh completes and persists an execution-scope fact the record never carried (the slot cgroup / starter pid that became derivable only later), so a job registered before its member process was readable is repaired without re-registration; kernel attribution's reconcile then maps the cgroup. Only empty fact slots are completed — identity and the creation namespace stay frozen.
+- Explicit registration evidence (`starter_pid` / `slots_cgroup_path` / `slot`) is accepted only when the cgroup is readable and provably job-scoped (never the shared daemon tree), the same proof the derived facts require. Explicit values win over derivation, never over that proof.
 - Internal naming follows the semantics: `DiscoveryTypeSettings` became `SchedulerAdapterSettings`, `MaintenanceConfig::types` became `auto_discovery_types`, and its `enabled` flag became `auto_discovery_enabled`.
 
 ## v0.4.0 (2026-11-22)

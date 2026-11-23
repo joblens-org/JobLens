@@ -2049,12 +2049,13 @@ void JobRegistry::attributionExitHint(pid_t pid) {
 
 std::string JobRegistry::attributionCgroupPath(uint64_t job_id) {
     // Adapter-owned: cgroupPathOf is the only place that knows where the
-    // cgroup lives in the typed facts. Manual/unknown adapters have none.
+    // cgroup lives in the typed facts. The adapter answers through the
+    // namespace cache, so a manual registration works on a node that
+    // configures no discovery type (the armed list is empty there).
     const auto record = ownRecord(job_id);
     if (!record) return {};
-    for (const auto& adapter : adapters_)
-        if (adapter->name() == record->job.subtype_name)
-            return adapter->cgroupPathOf(record->job);
+    if (const auto* const adapter = namespaceAdapterOf(record->job))
+        return adapter->cgroupPathOf(record->job);
     return {};
 }
 
@@ -2245,6 +2246,14 @@ UpsertResult JobRegistry::createManualJob(Job& job) {
         result.fail(RegistrationError::StoreUnavailable, "registration refused: " + error);
         return result;
     }
+    // Registration-time fact completion: a manual request names member pids,
+    // not the execution scope. The adapter owning the facts derives whatever
+    // the request did not carry (the slot cgroup, the starter pid) from that
+    // evidence, BEFORE the record is built, so kernel attribution's first
+    // activation already has a cgroup mapping and the refresh pass sees the
+    // whole scope instead of the named pids.
+    if (ISchedulerAdapter* const adapter = namespaceAdapterOf(job))
+        adapter->deriveExecutionFacts(job);
     const auto id = reserveJobId(job.JobID, error);
     if (!id) {
         spdlog::error("JobRegistry: durable JobID allocation failed, refusing to register the "
@@ -3172,6 +3181,16 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     // Group backfill is limited to missing group fields in this execution;
     // unrelated scheduler metadata remains the creation snapshot.
     const bool groups_changed = fill_missing_groups(updated.job, job);
+    // A refresh may have DERIVED an execution-scope fact the record never
+    // carried (a registration made before its member pid was readable). The
+    // adapter completes only empty slots, so identity, namespace and every
+    // existing value stay frozen; a completion is persisted like any other
+    // change so kernel attribution's reconcile can map the cgroup.
+    bool facts_completed = false;
+    if (!observation) {
+        if (ISchedulerAdapter* const adapter = namespaceAdapterOf(updated.job))
+            facts_completed = adapter->completeRefreshedFacts(updated.job, job);
+    }
     updated.job.CollectorNames.clear();   // intent lives in selection
     // Keep stored execution evidence until the manager/pid identity rules below
     // decide which observed evidence can replace it.
@@ -3204,6 +3223,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     // it as an operator binding.
     const bool provenance_changed = updated.source != stored.source;
     const bool changed = recovered || provenance_changed || groups_changed ||
+        facts_completed ||
         manager_of(stored.job) != manager_of(updated.job) ||
         pid_identities_of(stored.job) != pid_identities_of(updated.job);
     if (!changed) {

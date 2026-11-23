@@ -183,6 +183,30 @@ public:
         (void)job; (void)request;
     }
 
+    // Registration-time fact completion: derives the execution-scope facts the
+    // request did not carry (the execution cgroup and its supervisor pid) from
+    // the process evidence the job already names. Fill-empty only — a fact the
+    // request or a discovery watcher supplied always wins. The registry calls
+    // this on the manual create path before the record is built, so the first
+    // kernel activation already has a cgroup mapping to seed and the periodic
+    // refresh expands the whole execution scope instead of the named pids.
+    virtual void deriveExecutionFacts(Job& job) const
+    {
+        (void)job;
+    }
+
+    // Fill-empty counterpart of deriveExecutionFacts for the periodic refresh:
+    // completes an adapter-owned execution fact the RECORD never carried (for
+    // example a cgroup derived after registration, when the member pid was not
+    // readable yet) from the refreshed image. Only empty slots are written;
+    // identity, namespace and every existing value stay frozen. Returns true
+    // when a fact was completed, so the caller persists and re-reports it.
+    virtual bool completeRefreshedFacts(Job& target, const Job& refreshed) const
+    {
+        (void)target; (void)refreshed;
+        return false;
+    }
+
     // The typed-facts duplicate screen. Default: no typed fields; callers
     // still get the subtype the adapter was registered under.
     virtual SubAttrMatcher duplicateMatcher(const Job& job) const;

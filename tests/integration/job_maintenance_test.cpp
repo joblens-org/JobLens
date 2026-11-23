@@ -1587,6 +1587,113 @@ void run_adapter_set(const std::string& base)
                              "auto_discovery_types; only enabled types start a source");
 }
 
+// ---------------------------------------------------------------------------
+// A refresh COMPLETES execution-scope facts the record never carried and
+// persists them. This is the repair path for records registered before the
+// fact was derivable (a member pid not readable yet, or a row created by an
+// older version): re-registering such a job resolves to UPDATE, which never
+// touches facts, so without this the cgroup/starter stay empty forever.
+// ---------------------------------------------------------------------------
+
+void run_refresh_backfills_facts(const std::string& base)
+{
+    const auto dir = fresh_dir(base, "refresh-backfill");
+    const std::filesystem::path proc = std::filesystem::path(dir) / "proc";
+    const std::filesystem::path cgroup = std::filesystem::path(dir) / "cgroup";
+
+    const auto write_text = [](const std::filesystem::path& path, const std::string& text) {
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        check(static_cast<bool>(out), "refresh-backfill: cannot write " + path.string());
+        out << text;
+    };
+    const auto stat_line = [](pid_t pid, const std::string& comm, pid_t ppid,
+                              std::uint64_t start_ticks) {
+        std::string line = std::to_string(pid) + " (" + comm + ") S " + std::to_string(ppid);
+        for (int field = 5; field <= 21; ++field) line += " 0";
+        line += " " + std::to_string(start_ticks) + " 4096 200 0 0 0 0 0 0 0 0 0 0 0\n";
+        return line;
+    };
+    const auto make_process = [&](pid_t pid, const std::string& comm, pid_t ppid) {
+        write_text(proc / std::to_string(pid) / "stat", stat_line(pid, comm, ppid, pid));
+        std::string cmdline = comm;
+        cmdline.push_back('\0');
+        write_text(proc / std::to_string(pid) / "cmdline", cmdline);
+        write_text(proc / std::to_string(pid) / "environ", "");
+        write_text(proc / std::to_string(pid) / "cgroup", "0::/htcondor/slotA\n");
+    };
+
+    write_text(proc / "sys" / "kernel" / "random" / "boot_id", "boot-backfill\n");
+    make_process(48100, "condor_starter", 1);
+    make_process(48110, "sleep", 48100);
+    write_text(cgroup / "htcondor" / "slotA" / "cgroup.procs", "48100\n48110\n");
+
+    FakeProbes probes;
+    JobRegistry registry(legacy_heartbeat_options(fresh_dir(dir, "db"), probes));
+    registry.setCollectorValidator(nullptr);
+
+    // Test wiring bypasses configuration, so the facts adapter is the cached
+    // condor one. It starts on the host roots, where the fixture member pid does
+    // not exist: that is exactly the "fact not derivable at registration"
+    // situation this repair path exists for.
+    auto* adapter = const_cast<ISchedulerAdapter*>(registry.adapterNamed("condor"));
+    check(adapter != nullptr, "refresh-backfill: the condor facts adapter must exist");
+    auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter->source());
+    check(watcher != nullptr, "refresh-backfill: the condor adapter must expose its watcher");
+
+    Job job;
+    job.jobtype = JobType::Job;
+    job.subtype = JobSubType::Condor;
+    job.subtype_name = "condor";
+    job.JobNativeID = "76226380.0";
+    CondorJobAttr attr;
+    attr.cluster_id = 76226380;
+    attr.proc_id = 0;
+    attr.collector_host = "htcondor-fixture";
+    job.sub_attr = attr;
+    set_pids(job, {48110});
+    job.CollectorNames = {"cpumem_collector"};
+    check(registry.addJob(job), "refresh-backfill: the manual registration must succeed");
+    const auto id = registry.jobRecords().front().job.JobID;
+    check(std::get<CondorJobAttr>(registry.jobRecord(id)->job.sub_attr)
+              .slots_cgroup_path.empty(),
+          "refresh-backfill: the fixture record must start without a cgroup fact");
+
+    // Now the member becomes readable (same process, discoverable fixture
+    // roots): the next refresh derives and persists the facts.
+    DiscoveryEnvironment environment;
+    environment.proc_root = proc.string();
+    environment.cgroup_root = cgroup.string();
+    watcher->set_discovery_environment(environment);
+
+    check(registry.reconcileNow(), "refresh-backfill: the refresh pass did not run");
+    const auto record = registry.jobRecord(id);
+    check(record.has_value(), "refresh-backfill: the record vanished");
+    const auto& facts = std::get<CondorJobAttr>(record->job.sub_attr);
+    check(facts.slots_cgroup_path ==
+              (cgroup / "htcondor" / "slotA").string(),
+          "refresh-backfill: the refresh must persist the derived cgroup, got '" +
+              facts.slots_cgroup_path + "'");
+    check(facts.starter_pid == 48100,
+          "refresh-backfill: the refresh must persist the derived starter pid, got " +
+              std::to_string(facts.starter_pid));
+
+    // A second pass is a no-op for the facts: the completed value is never
+    // rewritten and no further revision is produced by the completion.
+    const auto revision = record->revision;
+    check(registry.reconcileNow(), "refresh-backfill: the second pass did not run");
+    const auto repeated = registry.jobRecord(id);
+    check(repeated.has_value() &&
+              std::get<CondorJobAttr>(repeated->job.sub_attr).slots_cgroup_path ==
+                  facts.slots_cgroup_path,
+          "refresh-backfill: a repeated refresh must keep the completed cgroup");
+    check(repeated->revision == revision,
+          "refresh-backfill: a completed fact must not churn the revision every pass");
+
+    check(registry.deinit(), "refresh-backfill: deinit must succeed");
+    pass_case("REFRESH-BACKFILL", "a refresh completes and persists missing execution "
+                                  "facts for records that never carried them");
+}
 
 // ---------------------------------------------------------------------------
 // RESTORE-UNKNOWN (round 3): an unverifiable restored execution keeps its saved
@@ -2553,6 +2660,7 @@ int main(int argc, char** argv)
         run_a28(base);
         run_legacy(base);
         run_adapter_set(base);
+        run_refresh_backfills_facts(base);
         run_restore_unknown_keeps_evidence(base);
         run_remove_explicit(base);
         run_admit(base);

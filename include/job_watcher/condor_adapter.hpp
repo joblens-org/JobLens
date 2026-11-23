@@ -84,6 +84,8 @@ public:
 
     NativeSelector registrationSelector(const Job& job) const override;
     void applyRequestFacts(Job& job, const nlohmann::json& request) const override;
+    void deriveExecutionFacts(Job& job) const override;
+    bool completeRefreshedFacts(Job& target, const Job& refreshed) const override;
     SubAttrMatcher duplicateMatcher(const Job& job) const override;
 
     // ---- per-record fact refresh (condor_starter is the manager) ----------
