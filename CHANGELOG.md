@@ -1,29 +1,18 @@
 # JobLens Changelog
 
-## Unreleased
-
-### Breaking Changes
-
-- `job_registry_config.types` was renamed to `job_registry_config.auto_discovery_types`. A configuration that still carries `types` fails configuration resolution at startup: the error names the new key and the discovery/maintenance stack stays disabled (the service still starts and answers RPC). Silently ignoring the old key would turn discovery off without a word. Update the deployed configuration before upgrading.
-- The key's meaning is now strictly "which discovery watchers start". Every registered scheduler adapter is assembled at startup whether or not its watcher is enabled, so manually registered (Trigger / RPC) and restored jobs of a scheduler with discovery off still get their typed facts, per-record refresh, identity and kernel attribution. Previously the adapter for such a scheduler existed only as a lazily built default-configured fallback.
-- The heartbeat status replaced `configured_types` with two fields: `configured_adapters` (every assembled adapter) and `auto_discovery_types` (the watchers that are armed). A consumer reading `configured_types` must switch to `auto_discovery_types`.
-
-### Job registry
-
-- Adapters are built once, from the resolved per-adapter settings, **before** the store restores rows, so a restored row decodes through the same settings-driven adapter instance the runtime uses. The kernel-attribution capability gate now always consults the adapter's declared trait.
-- A periodic refresh completes and persists an execution-scope fact the record never carried (the slot cgroup / starter pid that became derivable only later), so a job registered before its member process was readable is repaired without re-registration; kernel attribution's reconcile then maps the cgroup. Only empty fact slots are completed — identity and the creation namespace stay frozen.
-- Explicit registration evidence (`starter_pid` / `slots_cgroup_path` / `slot`) is accepted only when the cgroup is readable and provably job-scoped (never the shared daemon tree), the same proof the derived facts require. Explicit values win over derivation, never over that proof.
-- Internal naming follows the semantics: `DiscoveryTypeSettings` became `SchedulerAdapterSettings`, `MaintenanceConfig::types` became `auto_discovery_types`, and its `enabled` flag became `auto_discovery_enabled`.
-
-## v0.4.0 (2026-11-22)
+## v0.4.0 (2026-11-23)
 
 ### Job registry and persistence
 
 - `JobRegistry` is now the single source of truth: discovery, registration, merge, removal and collection selection all happen under the record lock, and `JobStore` is reduced to a pure persistence service over LevelDB (`j:` records, `i:` identity index, `h:` archive, `c:` allocator high-water, `m:` metadata) with row codecs, atomic batch writes, tiered durability, recovery fencing and automatic ID allocation.
 - Store schema is bumped to 5. An unmarked legacy database is quarantined to `<db>.legacy` on first open and only the allocator watermark is imported; row data is never migrated. Rollback steps and the JobID-reuse caveat are documented in `doc/jobstore_persistence_service.md` §7.
 - Runtime projections (dynamic PID attribution, `presumed_live`, the attached collector set) are no longer persisted; they are rebuilt by discovery and re-observation after a restart.
-- Scheduler discovery is open-world: the adapter name is the identity (`condor`, `slurm`, any new type), `job_registry_config.types` is the explicit switch, `capture_all` decides the admission gate, and a new type needs only a watcher and an adapter.
+- Scheduler discovery is open-world: the adapter name is the identity (`condor`, `slurm`, any new type), `job_registry_config.auto_discovery_types` is the explicit discovery switch, `capture_all` decides the admission gate, and a new type needs only a watcher and an adapter. A registered adapter exists for jobs from every source whether or not its watcher is enabled.
 - The registration path is split into transactions by concern: facts are written in one commit, registration errors are typed, and retirement/archival follow the collection fact.
+- Adapters are built once, from the resolved per-adapter settings, **before** the store restores rows, so a restored row decodes through the same settings-driven adapter instance the runtime uses. The kernel-attribution capability gate now always consults the adapter's declared trait.
+- A periodic refresh completes and persists an execution-scope fact the record never carried (the slot cgroup / starter pid that became derivable only later), so a job registered before its member process was readable is repaired without re-registration; kernel attribution's reconcile then maps the cgroup. Only empty fact slots are completed — identity and the creation namespace stay frozen.
+- Explicit registration evidence (`starter_pid` / `slots_cgroup_path` / `slot`) is accepted only when the cgroup is readable and provably job-scoped (never the shared daemon tree), the same proof the derived facts require. Explicit values win over derivation, never over that proof.
+- Internal naming follows the semantics: `DiscoveryTypeSettings` became `SchedulerAdapterSettings`, `MaintenanceConfig::types` became `auto_discovery_types`, and its `enabled` flag became `auto_discovery_enabled`.
 
 ### Collection and output
 
@@ -45,7 +34,10 @@
 
 ### Breaking Changes
 
-- Config vocabulary: discovery moved to `job_registry_config.types` / `.capture_all` / `.reconcile_interval_sec` (no nested section); collector `use_writers` became `outputs`; watcher `auto_collect` / `use_rules` became the `auto_add` tri-state; rule file names must start with the adapter name (`condor*` / `slurm*`).
+- `job_registry_config.types` was renamed to `job_registry_config.auto_discovery_types`. A configuration that still carries `types` fails configuration resolution at startup: the error names the new key and the discovery/maintenance stack stays disabled (the service still starts and answers RPC). Silently ignoring the old key would turn discovery off without a word. Update the deployed configuration before upgrading.
+- The key's meaning is now strictly "which discovery watchers start". Every registered scheduler adapter is assembled at startup whether or not its watcher is enabled, so manually registered (Trigger / RPC) and restored jobs of a scheduler with discovery off still get their typed facts, per-record refresh, identity and kernel attribution. Previously the adapter for such a scheduler existed only as a lazily built default-configured fallback.
+- The heartbeat status replaced `configured_types` with two fields: `configured_adapters` (every assembled adapter) and `auto_discovery_types` (the watchers that are armed). A consumer reading `configured_types` must switch to `auto_discovery_types`.
+- Config vocabulary: discovery switches are `job_registry_config.auto_discovery_types` / `.capture_all` / `.reconcile_interval_sec` (no nested section); collector `use_writers` became `outputs`; watcher `auto_collect` / `use_rules` became the `auto_add` tri-state; rule file names must start with the adapter name (`condor*` / `slurm*`).
 - A legacy LevelDB store is quarantined under a new name; rollback requires stopping the service, swapping `<db>.legacy` back and reinstalling the old version.
 - `io_collector` is gone: remove the instance, `io_collector_config` and the ES `indexs` entry, or jobs referencing it fail to bind.
 - ES identity keys were renamed (`JobNativeID` / `clusterName`); query sides must follow or use the dual-key transition.
