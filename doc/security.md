@@ -25,7 +25,7 @@ JobLens 通常部署在**多用户登录节点**上，以 root 运行，并开�
 | 区域 | 路径 | 要求 |
 |---|---|---|
 | root 执行区 | `/usr/bin/JobLens`、`/usr/lib64/joblens/bpf_obj/`、`/usr/lib/joblens/trigger-venv/` | root 属主，普通用户只读 |
-| 配置 | `/etc/JobLens/`、`/etc/JobLens/trigger/` | 目录 0750，文件 0640，root 属主 |
+| 配置 | `/etc/JobLens/`、`/etc/JobLens/trigger/` | 目录 0750，文件 0600，root 属主 |
 | 凭据 | `/etc/JobLens/secrets.env` | 0600 root，由 systemd `EnvironmentFile` 加载 |
 | 运行数据 | `/var/JobLens/`、`/var/lib/joblens/` | 0700/0750，root 属主 |
 | 控制面 | Trigger `127.0.0.1:7592` | 默认只监听回环；除健康/指标外都要求 Bearer token |
@@ -68,7 +68,7 @@ JobLens 通常部署在**多用户登录节点**上，以 root 运行，并开�
 
 ### 3.4 文件与权限
 
-- unified RPM：配置 0640，`/etc/JobLens*` 0750，`/var/JobLens*` 0700。
+- unified RPM：配置 0600，`/etc/JobLens*` 0750，`/var/JobLens*` 0700。
 - 两个 systemd unit 均设置 `UMask=0077`，因此 `rpc.sock`、FIFO、LevelDB、日志
   天然只允许 root 访问；`LimitCORE=0`、`NoNewPrivileges`、`PrivateTmp`、
   `RestrictSUIDSGID`。

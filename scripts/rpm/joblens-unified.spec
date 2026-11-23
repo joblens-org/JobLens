@@ -234,11 +234,11 @@ find %{buildroot}/usr/lib/joblens/trigger-venv -name '__pycache__' -type d -exec
 find %{buildroot}/usr/lib/joblens/trigger-venv -name '*.pyc' -delete 2>/dev/null || true
 
 # 12. 安装 Trigger 配置文件
-#     0640：文件里可能出现令牌/etcd 凭据；普通用户不得读取。
+#     0600：文件里可能出现令牌/etcd 凭据；仅 root 可读写。
 install -d -m 750 %{buildroot}/etc/JobLens/trigger
-install -m 640 trigger/config.example.yaml %{buildroot}/etc/JobLens/trigger/
-install -m 640 trigger/gunicorn.conf.py %{buildroot}/etc/JobLens/trigger/
-install -m 640 trigger/config.example.yaml %{buildroot}/etc/JobLens/trigger/config.yaml
+install -m 600 trigger/config.example.yaml %{buildroot}/etc/JobLens/trigger/
+install -m 600 trigger/gunicorn.conf.py %{buildroot}/etc/JobLens/trigger/
+install -m 600 trigger/config.example.yaml %{buildroot}/etc/JobLens/trigger/config.yaml
 
 # 13. 安装 Trigger systemd unit
 # 先创建目录（core 的 cmake --install 尚未运行）
@@ -315,10 +315,10 @@ rm -rf %{buildroot}%{_libdir}/cmake/date 2>/dev/null || :
 /usr/lib/joblens/trigger-venv/
 
 # ===== 配置文件 =====
-%config(noreplace) %{_sysconfdir}/JobLens/config.yaml
-%config(noreplace) %{_sysconfdir}/JobLens/trigger/config.yaml
+%config(noreplace) %attr(0600, root, root) %{_sysconfdir}/JobLens/config.yaml
+%config(noreplace) %attr(0600, root, root) %{_sysconfdir}/JobLens/trigger/config.yaml
 %{_sysconfdir}/JobLens/trigger/config.example.yaml
-%config(noreplace) %{_sysconfdir}/JobLens/trigger/gunicorn.conf.py
+%config(noreplace) %attr(0600, root, root) %{_sysconfdir}/JobLens/trigger/gunicorn.conf.py
 
 # ===== systemd unit 文件 =====
 %{_unitdir}/joblens.service
@@ -409,7 +409,7 @@ restore_config %{_sysconfdir}/JobLens/trigger/gunicorn.conf.py
 
 # ---- 收紧历史版本遗留的宽松权限 ----
 # %config(noreplace) 升级不会修改已存在文件的权限，%attr 也只对新建文件生效，
-# 因此这里显式收敛：普通用户不得读取配置/运行数据。
+# 因此这里显式收敛：配置仅 root 可读写（0600），运行数据仅 root 可读。
 for cfg in \
     %{_sysconfdir}/JobLens/config.yaml \
     %{_sysconfdir}/JobLens/trigger/config.yaml \
@@ -417,7 +417,7 @@ for cfg in \
 do
     if [ -f "$cfg" ]; then
         chown root:root "$cfg" 2>/dev/null || :
-        chmod 0640 "$cfg" 2>/dev/null || :
+        chmod 0600 "$cfg" 2>/dev/null || :
     fi
 done
 chmod 0750 %{_sysconfdir}/JobLens %{_sysconfdir}/JobLens/trigger 2>/dev/null || :
