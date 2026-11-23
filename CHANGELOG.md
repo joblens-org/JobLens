@@ -4,36 +4,42 @@
 
 ### Job registry and persistence
 
-- `JobRegistry` 成为唯一事实来源：发现、登记、合并、移除与采集选择都在记录锁内完成“读事实 → 判定 → 变换”，再交给 `JobStore` 写入；`JobStore` 退化为纯持久化服务（`j:` 记录、`i:` 身份索引、`h:` 归档、`c:` 高水位、`m:` 元数据），负责行编解码、批量原子写、分层 durability、恢复围栏与自动 ID 分配。
-- 存储 schema 升到 5。升级时无标记的旧库会被自动隔离为 `<db>.legacy`，只导入分配水位线，行数据不迁移；回滚步骤与 JobID 重发风险见 `doc/jobstore_persistence_service.md` §7。
-- 运行时投影（动态 PID 归属、`presumed_live`、实际挂载的采集器）不再持久化，重启后由发现与再次观察重建。
-- 调度器发现改为开放世界：适配器名即身份（`condor`、`slurm` 及任意新类型），`job_registry_config.maintenance.types` 是显式开关，`capture_all` 决定登记口径，新类型接入只需一个 watcher 与一个 adapter。
-- 登记路径按功能拆分事务：事实写入一次提交，注册错误有类型化返回，缩容与归档按采集事实分流。
+- `JobRegistry` is now the single source of truth: discovery, registration, merge, removal and collection selection all happen under the record lock, and `JobStore` is reduced to a pure persistence service over LevelDB (`j:` records, `i:` identity index, `h:` archive, `c:` allocator high-water, `m:` metadata) with row codecs, atomic batch writes, tiered durability, recovery fencing and automatic ID allocation.
+- Store schema is bumped to 5. An unmarked legacy database is quarantined to `<db>.legacy` on first open and only the allocator watermark is imported; row data is never migrated. Rollback steps and the JobID-reuse caveat are documented in `doc/jobstore_persistence_service.md` §7.
+- Runtime projections (dynamic PID attribution, `presumed_live`, the attached collector set) are no longer persisted; they are rebuilt by discovery and re-observation after a restart.
+- Scheduler discovery is open-world: the adapter name is the identity (`condor`, `slurm`, any new type), `job_registry_config.types` is the explicit switch, `capture_all` decides the admission gate, and a new type needs only a watcher and an adapter.
+- The registration path is split into transactions by concern: facts are written in one commit, registration errors are typed, and retirement/archival follow the collection fact.
 
 ### Collection and output
 
-- 采集器输出改为显式通道 `outputs: {document|text|metrics: [...]}`，与旧 `use_writers` 互斥；每个写入器声明自己接受的载荷类型，绑定在启动时校验。
-- 写入器增加背压硬限（`max_pending_records`、`max_pending_bytes`、`max_record_bytes`）；`ESWriter` 改为按序列化字节数分包，并带重试预算与退避上限。
-- 移除旧 `IOUsageCollector`（`io_collector` 实例与 `job_fd_rw_stat` eBPF 程序），IO 数据统一由 `NewIOUsageCollector` 提供。
-- 调度器 watcher 改为在 ring buffer 上阻塞唤醒、在轮询线程内完成登记；移除固定切片扫描与死扫描路径。
+- Collectors emit through explicit channels (`outputs: {document|text|metrics: [...]}`), mutually exclusive with the legacy `use_writers`; each writer declares the payload kind it accepts and bindings are validated at startup.
+- Writers gained hard backpressure bounds (`max_pending_records`, `max_pending_bytes`, `max_record_bytes`); `ESWriter` splits bulks by serialized byte size and applies a retry budget with capped backoff.
+- The legacy `IOUsageCollector` is removed (`io_collector` instance and the `job_fd_rw_stat` eBPF program); IO data comes from `NewIOUsageCollector` only.
+- Scheduler watchers block on ring-buffer wakeups and register on the poll thread; the fixed-slice scan and the dead scan path are gone.
+
+### Trigger
+
+- The listen address now comes from the trigger configuration (`service.host` / `service.port`). `JOBLENS_TRIGGER_BIND` overrides the whole address, `JOBLENS_HOST` / `JOBLENS_PORT` override a single part, and the default remains `127.0.0.1:7592`.
+- Configuration files under `/etc/JobLens` now install as `0600` (root only); the `%post` scriptlet tightens permissions left by older releases.
 
 ### API
 
-- Trigger 新增 v2 资源面（jobs / collectors / writers），v1 的 `/joblens/job`、`/joblens/jobs`、`/joblens/condor_job` 等保留旧响应形状。
-- 集群身份字段统一为 `clusterName` / `clusterTag` / `JobNativeID`；查询方可按新旧双拼写过渡。
-- 作业组字段（groups）贯通 Condor/Slurm 采集、持久化、RPC 与 Prometheus 输出。
+- The Trigger gained a v2 resource surface (jobs / collectors / writers); the v1 routes (`/joblens/job`, `/joblens/jobs`, `/joblens/condor_job`, ...) keep their legacy response shapes.
+- Cluster identity fields are unified as `clusterName` / `clusterTag` / `JobNativeID`; query sides can transition on either spelling.
+- Job group fields flow through Condor/Slurm collection, persistence, RPC and the Prometheus output.
 
 ### Breaking Changes
 
-- 配置词表：`inventory` 改为 `maintenance`，采集器 `use_writers` 改为 `outputs`，watcher 的 `auto_collect`/`use_rules` 由 `auto_add` 三态取代，规则文件前缀必须是适配器名（`condor*`/`slurm*`）。
-- 旧格式 LevelDB 会被隔离改名；回滚需停服务、换回 `<db>.legacy`、再安装旧版本。
-- `io_collector` 已删除：配置中的实例、`io_collector_config` 与 ES `indexs` 映射必须移除，否则引用它的作业绑定时报错。
-- ES 文档身份键改名（`JobNativeID` / `clusterName`），查询侧需同步或使用双键过渡。
-- 本版本包含 0.3.8 的全部安全加固（Trigger 默认回环 + 统一 token、Lua 沙箱、etcd TLS、权限收紧）；从 0.3.7 直接升级会同时引入这些破坏性变更。
+- Config vocabulary: discovery moved to `job_registry_config.types` / `.capture_all` / `.reconcile_interval_sec` (no nested section); collector `use_writers` became `outputs`; watcher `auto_collect` / `use_rules` became the `auto_add` tri-state; rule file names must start with the adapter name (`condor*` / `slurm*`).
+- A legacy LevelDB store is quarantined under a new name; rollback requires stopping the service, swapping `<db>.legacy` back and reinstalling the old version.
+- `io_collector` is gone: remove the instance, `io_collector_config` and the ES `indexs` entry, or jobs referencing it fail to bind.
+- ES identity keys were renamed (`JobNativeID` / `clusterName`); query sides must follow or use the dual-key transition.
+- This release carries all 0.3.8 security hardening (Trigger loopback default + bearer token, Lua sandbox, etcd TLS, tightened permissions); upgrading straight from 0.3.7 introduces those breaking changes as well.
+- `/etc/JobLens` configuration files are now `0600`; non-root operators can no longer read them.
 
 ### Documentation
 
-- 新增 `doc/jobstore_persistence_service.md`（存储边界、schema 生命周期与回滚）、`doc/job_watcher_integration.md` 及中文版（新调度器类型接入指南）、`doc/scheduler_namespace.md`（Condor 命名空间语义）；更新配置手册与 API 文档。
+- New `doc/jobstore_persistence_service.md` (store boundary, schema lifecycle and rollback), `doc/job_watcher_integration.md` plus its Chinese edition (how to add a scheduler type), and `doc/scheduler_namespace.md` (Condor namespace semantics); the configuration manual and API docs were updated.
 
 ## v0.3.8 (2026-11-08)
 
