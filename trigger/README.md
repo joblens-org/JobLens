@@ -88,7 +88,7 @@ lens_config:
 ### Environment Variables
 - `JOBLENS_TRIGGER_TOKEN`: Bearer token required by every endpoint except `/`, `/metrics`, `/trigger/health`, `/joblens/healthy`. If unset, protected endpoints fail closed (503). The RPM generates one in `/etc/JobLens/secrets.env` (0600, root-only) on install/upgrade if the file does not exist; the systemd unit loads it.
 - `JOBLENS_TRIGGER_AUTH`: `on` (default) or `off`. `off` is for tests only and logs a warning.
-- `JOBLENS_TRIGGER_BIND` / `JOBLENS_HOST`: listen address; default is `127.0.0.1:7592`.
+- Listen address: `service.host` / `service.port` in the trigger config (default `127.0.0.1:7592`). `JOBLENS_TRIGGER_BIND` overrides the whole address; `JOBLENS_HOST` / `JOBLENS_PORT` override the configured host and port.
 - `JOBLENS_ETCD_CA_CERT` / `JOBLENS_ETCD_CERT_KEY` / `JOBLENS_ETCD_CERT_CERT` / `JOBLENS_ETCD_USER` / `JOBLENS_ETCD_PASSWORD`: etcd mTLS and credentials. etcd requires TLS by default; `JOBLENS_ETCD_TLS_REQUIRED=off` allows plaintext explicitly (not recommended).
 - `JOBLENS_RESTART_DEBOUNCE_SECONDS`: minimum interval between core restarts triggered by config changes (default 10).
 
@@ -239,7 +239,7 @@ sudo systemctl start joblens-trigger
 
 ### Gunicorn Configuration
 Gunicorn config file (`gunicorn.conf.py`) key settings:
-- Bind address: `127.0.0.1:7592` (override with `JOBLENS_TRIGGER_BIND`)
+- Bind address: `service.host:service.port` from the trigger config, default `127.0.0.1:7592` (`JOBLENS_TRIGGER_BIND` overrides)
 - Worker count: 1 (sync mode)
 - Timeout: 120 seconds
 - Log level: info

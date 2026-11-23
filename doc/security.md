@@ -39,7 +39,7 @@ JobLens 通常部署在**多用户登录节点**上，以 root 运行，并开�
 
 ### 3.1 Trigger 控制面
 
-- 默认监听 `127.0.0.1:7592`（`JOBLENS_TRIGGER_BIND` 可覆盖）。
+- 监听地址来自 trigger 配置的 `service.host` / `service.port`，缺省 `127.0.0.1:7592`；`JOBLENS_TRIGGER_BIND` 可整体覆盖。
 - `trigger/api/auth.py`：除 `/`、`/metrics`、`/trigger/health`、`/joblens/healthy`
   外全部要求 `Authorization: Bearer <token>` 或 `X-JobLens-Token`。
 - 令牌来自 `JOBLENS_TRIGGER_TOKEN`；**未配置时保护端点返回 503**，不会放行。
@@ -158,14 +158,16 @@ journalctl -u joblens-trigger | grep -i 'etcd'
 
 ## 7. 升级注意（0.3.7 → 0.3.8）
 
-- **默认监听从 `0.0.0.0` 改为 `127.0.0.1`**：远程调用会断，需要隧道或显式覆盖。
-  注意 `gunicorn.conf.py` 是 `%config(noreplace)`，已部署节点升级后仍保留旧的
-  `0.0.0.0`；需要回环监听时手工改这一行。
+- **默认监听从 `0.0.0.0` 改为 `127.0.0.1`**：远程调用会断，需要在 trigger 配置里
+  显式写 `service.host: 0.0.0.0`（或设 `JOBLENS_TRIGGER_BIND`），并在防火墙层限制来源。
+  注意 `gunicorn.conf.py` 是 `%config(noreplace)`：**只有被改过的文件才会保留**；
+  旧版本原样安装（包默认值、未修改）的节点，升级时会被替换成新版本，
+  监听随之变成回环。
 - **鉴权默认开启**：旧脚本调用受保护接口会收到 401/403。RPM 的 `%post` 会在
   `/etc/JobLens/secrets.env`（0600）中自动生成 `JOBLENS_TRIGGER_TOKEN`（已有则
   保留），从该文件读取后放进运维脚本的请求头即可，无需手写配置。
 - **5xx 响应不再包含内部错误文本**：排障改用 `request_id` + 日志。
-- 配置文件权限会被 `%post` 收敛为 0640；如果 Trigger 以后改为非 root 运行，
+- 配置文件权限会被 `%post` 收敛为 0600；如果 Trigger 以后改为非 root 运行，
   需要把它加入 `joblens` 组并相应调整。
 - 二进制、systemd unit、Lua 沙箱、RPC 与 FileWriter 的修复都在 RPM 内容里，
   升级即生效；只有 `%config(noreplace)` 的配置项（监听地址、etcd/ES 凭据、

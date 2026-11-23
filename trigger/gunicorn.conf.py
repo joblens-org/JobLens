@@ -38,23 +38,53 @@ os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "true")
 os.environ.setdefault("GRPC_POLL_STRATEGY", "poll")
 
 
-def _resolve_loglevel() -> str:
-    """从 trigger 配置文件读取 logging.level，供 gunicorn 自身日志复用；读取失败回退 info"""
+def _trigger_config() -> dict:
+    """读取 trigger 配置文件；缺失或格式错误时返回空 dict"""
     config_path = os.environ.get(
         "JOBLENS_TRIGGER_CONFIG_PATH", "/etc/JobLens/trigger/config.yaml"
     )
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
-        return str(cfg.get("logging", {}).get("level", "info")).lower()
+        return cfg if isinstance(cfg, dict) else {}
     except Exception:
-        return "info"
+        return {}
+
+
+def _resolve_loglevel() -> str:
+    """从 trigger 配置文件读取 logging.level，供 gunicorn 自身日志复用；读取失败回退 info"""
+    return str(_trigger_config().get("logging", {}).get("level", "info")).lower()
+
+
+def _resolve_bind() -> str:
+    """监听地址按以下优先级解析：
+
+    1. ``JOBLENS_TRIGGER_BIND``（完整的 host:port，运维显式覆盖）；
+    2. trigger 配置文件里的 ``service.host`` / ``service.port``，
+       其中 ``JOBLENS_HOST`` / ``JOBLENS_PORT`` 会覆盖配置值（与 app_factory 一致）；
+    3. 默认 ``127.0.0.1:7592``。
+
+    配置默认只监听回环：Trigger 以 root 运行在多用户节点上，0.0.0.0 会让任意
+    可达用户操作控制面。需要对外时在配置里显式写 host: 0.0.0.0，并在防火墙层
+    限制来源。
+    """
+    explicit = (os.environ.get("JOBLENS_TRIGGER_BIND") or "").strip()
+    if explicit:
+        return explicit
+
+    service = _trigger_config().get("service") or {}
+    host = (os.environ.get("JOBLENS_HOST") or str(service.get("host") or "")).strip()
+    try:
+        port = int(os.environ.get("JOBLENS_PORT") or service.get("port") or 7592)
+    except (TypeError, ValueError):
+        port = 7592
+    if not host:
+        host = "127.0.0.1"
+    return f"{host}:{port}"
 
 
 # Network binding
-# 默认只监听回环：Trigger 以 root 运行在多用户节点上，0.0.0.0 会让任意可达
-# 用户操作控制面。需要对外时显式设置 JOBLENS_TRIGGER_BIND，并在防火墙层限制。
-bind = os.environ.get("JOBLENS_TRIGGER_BIND", "127.0.0.1:7592")
+bind = _resolve_bind()
 
 # Worker configuration
 workers = 1

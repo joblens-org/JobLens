@@ -7,7 +7,9 @@
 # /etc/JobLens/secrets.env（0600），不要写进本文件。
 
 service:
-  # 默认只监听回环；需要对外时改这里或用 JOBLENS_HOST 覆盖，并在防火墙层限制来源。
+  # gunicorn 以这里的 host:port 作为监听地址（JOBLENS_TRIGGER_BIND 可整体覆盖，
+  # JOBLENS_HOST/JOBLENS_PORT 可覆盖单项）。默认只监听回环；需要对外时显式改这里，
+  # 并在防火墙层限制来源。本文件安装为 0600（仅 root 可读）。
   host: 127.0.0.1
   port: 7592
 
