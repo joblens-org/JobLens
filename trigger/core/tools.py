@@ -274,13 +274,48 @@ def _docker_top_pids(container: str) -> List[int]:
     return sorted(set(pids))
 
 
-def find_pids_by_slot(slot: str):
-    """返回 slot 对应作业的真实进程 PID 列表。
+def _cgroup2_mountpoint() -> str:
+    """本机 cgroup v2 的挂载点；挂载信息不可读时退回 /sys/fs/cgroup。"""
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
+            for line in f:
+                fields = line.split()
+                # mountinfo: ... <mount point> ... - <fstype> <source> <options>
+                if len(fields) >= 9 and fields[-3] == "cgroup2":
+                    return fields[4]
+    except OSError:
+        pass
+    return "/sys/fs/cgroup"
 
-    自动探测两种作业形态：
-    1. docker 作业：condor_starter 进程树里存在 `docker start -a <容器名>` 命令行，
-       则解析出容器名并用 docker top 获取容器内进程的 host PID。
-    2. 普通作业：回退到 pstree，返回 condor_starter 下的全部子进程 PID（排除 starter 自身）。
+
+def _read_cgroup_path(pid: int) -> str:
+    """返回进程所在 cgroup v2 的绝对路径；非 v2 或读不到返回空串。
+
+    Trigger 已经知道作业的 starter 与成员 PID，把这条证据直接带给 core 比让它
+    再从排序后的 PID 列表里猜 starter 更可靠。
+    """
+    if pid <= 0:
+        return ""
+    try:
+        with open(f"/proc/{pid}/cgroup", "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        if not line.startswith("0::"):
+            continue
+        relative = line[3:].strip()
+        if not relative or relative == "/":
+            return ""
+        return os.path.join(_cgroup2_mountpoint(), relative.lstrip("/"))
+    return ""
+
+
+def find_slot_processes(slot: str) -> Tuple[int, List[int], str]:
+    """返回 slot 对应作业的 (starter_pid, 成员 PID 列表, slot cgroup 路径)。
+
+    cgroup 路径取自第一个成员 PID（不是 starter：starter 常驻守护进程的
+    cgroup，读它得到的是整棵守护树）。读不到时返回空串，由 core 自行推导。
     """
     if not slot.startswith('slot'):
         raise ValueError("slot 名必须以 'slot' 开头")
@@ -325,7 +360,8 @@ def find_pids_by_slot(slot: str):
         pids = _docker_top_pids(container)
         logger.info("Docker job pids via docker top: slot=%s, container=%s, pids_count=%d",
                      slot, container, len(pids))
-        return pids
+        cgroup_path = _read_cgroup_path(pids[0]) if pids else ""
+        return starter_pid, pids, cgroup_path
 
     # 回退：普通 condor 作业，取 starter 进程树的子进程
     tree = run(f"/usr/bin/pstree -pT {starter_pid}")
@@ -337,7 +373,14 @@ def find_pids_by_slot(slot: str):
     if not child_pids:
         raise RuntimeError(f"slot {slot} 的 condor_starter 下未找到子进程")
 
-    return child_pids
+    cgroup_path = _read_cgroup_path(child_pids[0])
+    return starter_pid, child_pids, cgroup_path
+
+
+def find_pids_by_slot(slot: str) -> List[int]:
+    """返回 slot 对应作业的成员 PID 列表（保留原有调用面）。"""
+    _, pids, _ = find_slot_processes(slot)
+    return pids
 
 
 def add_condorjob(data):
@@ -350,19 +393,25 @@ def add_condorjob(data):
     :param data: dict, job data
     """
     slot = data.get('slot')
-    pids = find_pids_by_slot(slot)
-    logger.info("Condor job process discovery: slot=%s, pids_count=%d", slot, len(pids))
+    starter_pid, pids, cgroup_path = find_slot_processes(slot)
+    logger.info("Condor job process discovery: slot=%s, starter=%s, pids_count=%d, cgroup=%s",
+                slot, starter_pid, len(pids), cgroup_path or "<unavailable>")
     jobid = data.get('JobID')
     if not pids:
         raise RuntimeError(f"未找到 {slot} 对应的 condor_starter 进程")
     if not jobid:
         raise RuntimeError("JobID is required")
     
-    # 构造sub_attr，优先使用请求中提供的，否则给默认值避免C++端抛异常
-    sub_attr = data.get('sub_attr')
-    if sub_attr is None:
-        sub_attr = {'cluster_id': 0, 'proc_id': 0}
-        logger.debug("Condor job sub_attr auto-filled: %s", sub_attr)
+    # 构造sub_attr，优先使用请求中提供的，否则给默认值避免C++端抛异常。
+    # 执行作用域证据（starter_pid / slots_cgroup_path）在这里直接带给 core：
+    # 触发侧已经解析出 starter 与 cgroup，core 不必再从排序后的 PID 列表里猜。
+    sub_attr = dict(data.get('sub_attr') or {})
+    sub_attr.setdefault('cluster_id', 0)
+    sub_attr.setdefault('proc_id', 0)
+    if starter_pid > 0:
+        sub_attr.setdefault('starter_pid', starter_pid)
+    if cgroup_path:
+        sub_attr.setdefault('slots_cgroup_path', cgroup_path)
     job_data = {
         "opt": "add",
         "type": "job.condor",
