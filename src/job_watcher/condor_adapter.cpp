@@ -375,26 +375,39 @@ void CondorSchedulerAdapter::deriveExecutionFacts(Job& job) const
     const pid_t member_hint = firstPid(job);
     if (member_hint <= 0) return;
 
+    // The anchor has to be a member whose parent is a real condor_starter. A
+    // manual request carries the members in the caller's order (the trigger
+    // sends a sorted pid list, so the first entry can be a grandchild), and
+    // anchoring on a fixed position made the derivation give up even when the
+    // record already named a resolvable member.
+    pid_t anchor = member_hint;
     if (attr->starter_pid <= 0) {
         // A manager the refresh already resolved from the same member is the
-        // validated supervisor; otherwise resolve it from the member's parent.
+        // validated supervisor; otherwise resolve it from the members' parents.
         const ProcessIdentity& resolved = manager_of(job);
         if (resolved.complete()) {
             attr->starter_pid = resolved.pid;
-        } else if (const auto manager = managerOfPid(member_hint)) {
-            attr->starter_pid = manager->pid;
+        } else {
+            for (const auto& candidate : pid_identities_of(job)) {
+                if (candidate.pid <= 0) continue;
+                const auto manager = managerOfPid(candidate.pid);
+                if (!manager) continue;
+                attr->starter_pid = manager->pid;
+                anchor = candidate.pid;
+                break;
+            }
         }
         if (attr->starter_pid > 0)
             spdlog::debug("CondorSchedulerAdapter: derived starter pid {} for job '{}' "
                           "(JobID {}) from member pid {}",
-                          attr->starter_pid, job.JobNativeID, job.JobID, member_hint);
+                          attr->starter_pid, job.JobNativeID, job.JobID, anchor);
     }
 
     if (attr->slots_cgroup_path.empty()) {
         const bool first_report = job.execution.read_order == 0;
         const DiscoveryEnvironment env = impl_->watcher.discovery_environment();
         const auto derived =
-            read_proc_cgroup_path(env.proc_root, member_hint, env.cgroup_root);
+            read_proc_cgroup_path(env.proc_root, anchor, env.cgroup_root);
         if (derived.empty()) {
             // No derivable scope is a degraded read, not a failure: the record
             // stays valid with the pids it knows, and the refresh retries.
@@ -403,7 +416,7 @@ void CondorSchedulerAdapter::deriveExecutionFacts(Job& job) const
                 fmt::format("no execution cgroup derivable for job '{}' (JobID {}, "
                             "member pid {}); the execution scope stays unexpanded and "
                             "kernel attribution gets no cgroup mapping",
-                            job.JobNativeID, job.JobID, member_hint));
+                            job.JobNativeID, job.JobID, anchor));
             return;
         }
         // The derived cgroup must PROVE it is the job's own scope: cgroup.procs
@@ -417,7 +430,7 @@ void CondorSchedulerAdapter::deriveExecutionFacts(Job& job) const
                 fmt::format("member pid {} has no resolvable supervisor, so cgroup "
                             "'{}' cannot be proven job-scoped; not recording it for job "
                             "'{}' (JobID {})",
-                            member_hint, derived, job.JobNativeID, job.JobID));
+                            anchor, derived, job.JobNativeID, job.JobID));
             return;
         }
         if (!read_job_membership(env.proc_root, env.cgroup_root, attr->starter_pid, derived)
@@ -427,14 +440,14 @@ void CondorSchedulerAdapter::deriveExecutionFacts(Job& job) const
                 fmt::format("cgroup '{}' of member pid {} is unreadable or shared with "
                             "the daemon tree (supervisor {}); not recording it for job "
                             "'{}' (JobID {})",
-                            derived, member_hint, attr->starter_pid, job.JobNativeID,
+                            derived, anchor, attr->starter_pid, job.JobNativeID,
                             job.JobID));
             return;
         }
         attr->slots_cgroup_path = derived;
         spdlog::debug("CondorSchedulerAdapter: derived execution cgroup '{}' for job "
                       "'{}' (JobID {}) from member pid {}",
-                      derived, job.JobNativeID, job.JobID, member_hint);
+                      derived, job.JobNativeID, job.JobID, anchor);
     }
 }
 
@@ -542,6 +555,18 @@ RefreshResult CondorSchedulerAdapter::refreshFacts(
                 fill_missing_groups(job, *observed);
             }
             execution.manager = observed->execution.manager;
+            // The record's job-scoped cgroup is the membership truth. The ad
+            // read starts at the starter, which on nodes with per-slot cgroups
+            // lives in the daemon cgroup and therefore only sees its direct
+            // children; letting that observation replace the membership kept
+            // the whole execution scope out of the record.
+            const auto* recorded_attr = std::get_if<CondorJobAttr>(&job.sub_attr);
+            if (recorded_attr != nullptr && !recorded_attr->slots_cgroup_path.empty()) {
+                execution.read_order = observed->execution.read_order;
+                return refreshPidIdentities(job, env.proc_root, env.cgroup_root,
+                                            recorded_attr->slots_cgroup_path,
+                                            process_probe, cgroup_probe);
+            }
             execution.pid_identities = observed->execution.pid_identities;
             execution.pid_identities_authoritative =
                 observed->execution.pid_identities_authoritative;

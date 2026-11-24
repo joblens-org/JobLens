@@ -1619,6 +1619,91 @@ void slurm_empty_cgroup_stays_authoritative(const Fixture& /*shared*/)
 
 } // namespace
 
+
+// A refresh must read the RECORDED job-scoped cgroup even when the ad path
+// succeeds. Real HTCondor layouts put the starter in the daemon cgroup
+// (`/system.slice/condor.service`), where the ad reader only sees the starter's
+// direct children; letting that observation replace the membership froze the
+// record at one pid while the slot cgroup held the whole execution.
+void condor_refresh_prefers_recorded_cgroup_over_starter_children(const Fixture&)
+{
+    Fixture local;
+    make_fixture(local, "joblens-refresh-recorded-cgroup");
+
+    make_process(local.proc, 4001, "condor_master", 1, 7000, {}, "/system.slice/condor.service");
+    make_process(local.proc, 4101, "condor_starter", 4001, 7001,
+                 {{"_CONDOR_JOB_AD", local.good_ad.string()}},
+                 "/system.slice/condor.service");
+    // The execution scope: wrapper -> worker -> payload, all in the slot cgroup.
+    make_process(local.proc, 4110, "wrapper", 4101, 7010, {}, "/htcondor/slot1");
+    make_process(local.proc, 4111, "worker", 4110, 7011, {}, "/htcondor/slot1");
+    make_process(local.proc, 4112, "payload", 4111, 7012, {}, "/htcondor/slot1");
+    make_cgroup(local.cgroup, "/system.slice/condor.service", {4001, 4101});
+    make_cgroup(local.cgroup, "/htcondor/slot1", {4110, 4111, 4112});
+    make_children(local.proc, 4101, {4110});
+
+    CondorSchedulerAdapter adapter(SchedulerAdapterSettings{});
+    auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
+    check(watcher != nullptr, "the condor adapter must expose its watcher");
+    watcher->set_discovery_environment(fixture_options(local).discovery);
+
+    Job job;
+    job.subtype = JobSubType::Condor;
+    job.subtype_name = "condor";
+    job.JobNativeID = "105712203.0";
+    CondorJobAttr attr;
+    attr.starter_pid = 4101;
+    attr.slots_cgroup_path = (local.cgroup / "htcondor" / "slot1").string();
+    job.sub_attr = attr;
+    job.execution.pid_identities = {ProcessIdentity{4110, 7010, "boot-fixture-0001"}};
+
+    adapter.refreshFacts(job, make_proc_liveness_probe(local.proc.string(), "boot-fixture-0001"),
+                         make_cgroup_membership_probe());
+
+    const auto members = member_pids(job);
+    check(members.size() == 3,
+          "a record with a job-scoped cgroup must refresh from that cgroup, not from "
+          "the starter's children; got " + std::to_string(members.size()) + " member(s)");
+    check(members[0] == 4110 && members[1] == 4111 && members[2] == 4112,
+          "the slot cgroup members must be adopted in ascending order");
+}
+
+// The derivation anchor must be a member whose parent is a real condor_starter;
+// a manual request carries a sorted pid list, so the first entry can be a
+// grandchild. Anchoring on a fixed position used to give up while the record
+// already named a resolvable member.
+void condor_derive_scans_members_for_supervisor(const Fixture& fixture)
+{
+    // A grandchild under the wrapper is *not* an anchor.
+    make_process(fixture.proc, 4120, "grandchild", 4110, 7020, {}, "/htcondor/slot1");
+    make_cgroup(fixture.cgroup, "/htcondor/slot1", {4101, 4110, 4111, 4120});
+
+    CondorSchedulerAdapter adapter(SchedulerAdapterSettings{});
+    auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
+    check(watcher != nullptr, "the condor adapter must expose its watcher");
+    watcher->set_discovery_environment(fixture_options(fixture).discovery);
+
+    Job job;
+    job.subtype = JobSubType::Condor;
+    job.subtype_name = "condor";
+    job.JobNativeID = "105679866.5";
+    job.sub_attr = CondorJobAttr{};
+    job.execution.pid_identities = {
+        ProcessIdentity{4120, 7020, "boot-fixture-0001"},
+        ProcessIdentity{4111, 7011, "boot-fixture-0001"},
+    };
+
+    adapter.deriveExecutionFacts(job);
+
+    const auto& attr = std::get<CondorJobAttr>(job.sub_attr);
+    check(attr.starter_pid == 4101,
+          "the derivation must find the starter through any member, got starter " +
+              std::to_string(attr.starter_pid));
+    check(attr.slots_cgroup_path == (fixture.cgroup / "htcondor" / "slot1").string(),
+          "the derivation must record the member's slot cgroup, got '" +
+              attr.slots_cgroup_path + "'");
+}
+
 int main(int argc, char** argv)
 {
     const std::string base =
@@ -1684,6 +1769,10 @@ int main(int argc, char** argv)
              condor_refresh_rejects_daemon_shared_derived_cgroup},
             {"condor_request_facts_accept_explicit_evidence",
              condor_request_facts_accept_explicit_evidence},
+            {"condor_refresh_prefers_recorded_cgroup_over_starter_children",
+             condor_refresh_prefers_recorded_cgroup_over_starter_children},
+            {"condor_derive_scans_members_for_supervisor",
+             condor_derive_scans_members_for_supervisor},
         };
 
         for (const auto& test : tests) {
