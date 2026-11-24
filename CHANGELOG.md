@@ -10,7 +10,7 @@
 - Scheduler discovery is open-world: the adapter name is the identity (`condor`, `slurm`, any new type), `job_registry_config.auto_discovery_types` is the explicit discovery switch, `capture_all` decides the admission gate, and a new type needs only a watcher and an adapter. A registered adapter exists for jobs from every source whether or not its watcher is enabled.
 - The registration path is split into transactions by concern: facts are written in one commit, registration errors are typed, and retirement/archival follow the collection fact.
 - Adapters are built once, from the resolved per-adapter settings, **before** the store restores rows, so a restored row decodes through the same settings-driven adapter instance the runtime uses. The kernel-attribution capability gate now always consults the adapter's declared trait.
-- A periodic refresh completes and persists an execution-scope fact the record never carried (the slot cgroup / starter pid that became derivable only later), so a job registered before its member process was readable is repaired without re-registration; kernel attribution's reconcile then maps the cgroup. Only empty fact slots are completed — identity and the creation namespace stay frozen.
+- A periodic refresh completes and persists an execution-scope fact the record never carried (the slot cgroup / starter pid that became derivable only later), so a job registered before its member process was readable is repaired without re-registration; kernel attribution's reconcile then maps the cgroup. Only empty fact slots are completed — identity and the creation namespace stay frozen. When the record already carries its job-scoped cgroup, the refresh reads membership from that cgroup instead of from the starter's children file: on per-slot layouts the starter lives in the daemon cgroup, where its children only reach the wrapper and the whole execution scope would be dropped.
 - Explicit registration evidence (`starter_pid` / `slots_cgroup_path` / `slot`) is accepted only when the cgroup is readable and provably job-scoped (never the shared daemon tree), the same proof the derived facts require. Explicit values win over derivation, never over that proof.
 - Internal naming follows the semantics: `DiscoveryTypeSettings` became `SchedulerAdapterSettings`, `MaintenanceConfig::types` became `auto_discovery_types`, and its `enabled` flag became `auto_discovery_enabled`.
 
@@ -24,6 +24,7 @@
 ### Trigger
 
 - The listen address now comes from the trigger configuration (`service.host` / `service.port`). `JOBLENS_TRIGGER_BIND` overrides the whole address, `JOBLENS_HOST` / `JOBLENS_PORT` override a single part, and the default remains `127.0.0.1:7592`.
+- Manual Condor registration resolves the execution evidence in the Trigger (`ps` for the slot's `condor_starter`, `pstree` for its members, `/proc/<pid>/cgroup` from the first member) and forwards it as `starter_pid` / `slots_cgroup_path`; the core records those facts instead of re-deriving them, and falls back to scanning the request's member pids only when they are absent.
 - Configuration files under `/etc/JobLens` now install as `0600` (root only); the `%post` scriptlet tightens permissions left by older releases.
 
 ### API
