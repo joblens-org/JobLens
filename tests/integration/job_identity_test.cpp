@@ -27,6 +27,7 @@
 // rules (the only ones a real deployment ever sees).
 #include "job_watcher/condor_adapter.hpp"
 #include "job_watcher/slurm_adapter.hpp"
+#include "common/slurm_job.hpp"
 
 #include <cstdint>
 #include <iostream>
@@ -200,17 +201,50 @@ void slurm_steps_and_pid_reuse()
           "extern conversion");
     // These are the real slurm/slurm.h constants, not self-referential checks:
     // a swapped table would label every batch step as extern.
-    check(kSlurmBatchStepValue == 0xfffffffeu, "SLURM_BATCH_SCRIPT must be 0xfffffffe");
-    check(kSlurmExternStepValue == 0xfffffffdu, "SLURM_EXTERN_CONT must be 0xfffffffd");
-    check(slurm_step_name(0xfffffffeu) == std::string("batch"),
+    check(kSlurmBatchStepValue == 0xfffffffbu, "SLURM_BATCH_SCRIPT must be 0xfffffffb");
+    check(kSlurmExternStepValue == 0xfffffffcu, "SLURM_EXTERN_CONT must be 0xfffffffc");
+    check(slurm_step_name(0xfffffffbu) == std::string("batch"),
           "SLURM_BATCH_SCRIPT numeric value must map to batch");
-    check(slurm_step_name(0xfffffffdu) == std::string("extern"),
+    check(slurm_step_name(0xfffffffcu) == std::string("extern"),
           "SLURM_EXTERN_CONT numeric value must map to extern");
+    check(!slurm_step_name(0xfffffffdu).has_value(),
+          "SLURM_PENDING_STEP must not be labelled extern");
+    check(!slurm_step_name(0xfffffffeu).has_value(),
+          "0xfffffffe is not a step constant");
     check(!slurm_step_name(5).has_value(), "plain numbers have no special name");
     check(slurm_step_value("batch") == kSlurmBatchStepValue, "batch numeric value");
     check(slurm_step_value("extern") == kSlurmExternStepValue, "extern numeric value");
     check(slurm_step_value("7") == 7u, "plain step numeric value");
     check(!slurm_step_value("nope").has_value(), "unknown step name has no value");
+
+    // The step cgroup is the authoritative source for the batch step (which
+    // exports no SLURM_STEP_ID). Only the "<job_N>/step_<name>" shape counts.
+    {
+        const auto batch = SlurmJob::parse_cgroup_job_step(
+            "/system.slice/slurmstepd.scope/job_158/step_batch/user/task_special");
+        check(batch && batch->job_id == 158 && batch->step == kSlurmBatchStepValue,
+              "the batch step must be parsed from the step cgroup");
+        const auto zero = SlurmJob::parse_cgroup_job_step("/slurm/uid_0/job_9102/step_0");
+        check(zero && zero->job_id == 9102 && zero->step == 0,
+              "a numeric step must be parsed from the step cgroup");
+        const auto extern_step = SlurmJob::parse_cgroup_job_step(
+            "/system.slice/slurmstepd.scope/job_9103/step_extern/slurm");
+        check(extern_step && extern_step->step == kSlurmExternStepValue,
+              "the extern step must be parsed from the step cgroup");
+        const auto nested = SlurmJob::parse_cgroup_job_step(
+            "/system.slice/slurmstepd.scope/job_158/step_batch/user/task_special/task_1");
+        check(nested && nested->step == kSlurmBatchStepValue,
+              "nested task directories must not shadow the step");
+    }
+    check(!SlurmJob::parse_cgroup_job_step("/slurm/job_1/task_special").has_value(),
+          "a task directory is not a step identity");
+    check(!SlurmJob::parse_cgroup_job_step("/slurm/job_0/step_1").has_value(),
+          "job id zero is not a job");
+    check(!SlurmJob::parse_cgroup_job_step("/slurm/job_1/step_4294967290").has_value(),
+          "a reserved step value is not a normal step");
+    check(!SlurmJob::parse_cgroup_job_step("/slurm/job_1/step_x").has_value(),
+          "a non-numeric step name is invalid");
+    check(!SlurmJob::parse_cgroup_job_step("").has_value(), "an empty path has no step");
 
     // PID reuse: the same PID with different start ticks or boot ids is a
     // different process.

@@ -90,8 +90,8 @@ std::optional<std::string> normalize_slurm_step_id(const std::string& raw);
 // numeric constants map to and from the canonical special step names. The
 // values mirror slurm/slurm.h (SLURM_BATCH_SCRIPT / SLURM_EXTERN_CONT) used by
 // slurmstepd: the batch step is 0xfffffffe, the extern step is 0xfffffffd.
-inline constexpr uint32_t kSlurmBatchStepValue = 0xfffffffeu;
-inline constexpr uint32_t kSlurmExternStepValue = 0xfffffffeu - 1u;  // 0xfffffffd
+inline constexpr uint32_t kSlurmBatchStepValue = 0xfffffffbu;   // SLURM_BATCH_SCRIPT
+inline constexpr uint32_t kSlurmExternStepValue = 0xfffffffcu;  // SLURM_EXTERN_CONT
 std::optional<std::string> slurm_step_name(uint32_t numeric_step);
 std::optional<uint32_t> slurm_step_value(const std::string& step_id);
 

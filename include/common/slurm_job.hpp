@@ -99,6 +99,47 @@ inline std::string step_id_name(std::uint32_t numeric_step){
     return std::to_string(numeric_step);
 }
 
+// cgroup 路径里的 step 段。Slurm 在 ".../job_<id>/step_<name>" 下为每个 step
+// 建 cgroup；batch step 不导出 SLURM_STEP_ID，step 身份只在这里有权威名字。
+// 只接受 step_batch / step_extern / step_<十进制普通 step>，其它形态返回
+// nullopt——发现层不据此猜身份。
+struct CgroupJobStep {
+    std::uint64_t job_id{0};
+    std::uint32_t step{0};
+};
+
+inline std::optional<CgroupJobStep> parse_cgroup_job_step(const std::string& path)
+{
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    while (start <= path.size()) {
+        const std::size_t end = path.find('/', start);
+        const std::size_t stop = end == std::string::npos ? path.size() : end;
+        if (stop > start) parts.push_back(path.substr(start, stop - start));
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    for (std::size_t index = 0; index + 1 < parts.size(); ++index) {
+        const std::string& job = parts[index];
+        if (job.size() <= 4 || job.compare(0, 4, "job_") != 0) continue;
+        std::string error;
+        const auto job_id = parse_job_id(job.substr(4), error);
+        if (!job_id) continue;
+        const std::string& step = parts[index + 1];
+        if (step.size() <= 5 || step.compare(0, 5, "step_") != 0) continue;
+        const std::string name = step.substr(5);
+        if (name == "batch")
+            return CgroupJobStep{*job_id, kSlurmBatchStepValue};
+        if (name == "extern")
+            return CgroupJobStep{*job_id, kSlurmExternStepValue};
+        const auto value = detail::parse_decimal_u64(name);
+        // SLURM_MAX_NORMAL_STEP_ID = 0xfffffff0；更小的保留值不属于普通 step。
+        if (!value || *value >= 0xfffffff0ull) continue;
+        return CgroupJobStep{*job_id, static_cast<std::uint32_t>(*value)};
+    }
+    return std::nullopt;
+}
+
 inline std::string clusterName(pid_t pid = 0){
     return get_env_field(pid, "SLURM_CLUSTER_NAME");
 }
