@@ -1704,6 +1704,111 @@ void condor_derive_scans_members_for_supervisor(const Fixture& fixture)
               attr.slots_cgroup_path + "'");
 }
 
+// Slurm's batch step does not export SLURM_STEP_ID (the kernel only names it in
+// the step cgroup). The watcher must take the step from "<job_N>/step_<name>"
+// instead of dropping the job, while an environment/cgroup step disagreement is
+// still unresolved (never silently pick one).
+void slurm_batch_step_derived_from_cgroup(const Fixture& /*shared*/)
+{
+    Fixture fixture;
+    make_fixture(fixture, "/tmp/job_watcher_scan_slurm_batch_step");
+
+    // batch step: no SLURM_STEP_ID in the member environment.
+    make_process(fixture.proc, 5301, "slurmstepd", 1, 8200,
+                 {{"SLURM_VERSION", "23.11"}}, "/slurm/job_9101/step_batch");
+    make_process(fixture.proc, 5310, "bash", 5301, 8210,
+                 {{"SLURM_JOB_ID", "9101"},
+                  {"SLURM_CLUSTER_NAME", "slurm-fixture"},
+                  {"SLURM_JOB_USER", "alice"}},
+                 "/slurm/job_9101/step_batch");
+    make_cgroup(fixture.cgroup, "/slurm/job_9101/step_batch", {5301, 5310});
+
+    // srun step 0: environment and cgroup agree.
+    make_process(fixture.proc, 5321, "slurmstepd", 1, 8220,
+                 {{"SLURM_VERSION", "23.11"}}, "/slurm/job_9102/step_0");
+    make_process(fixture.proc, 5330, "sleep", 5321, 8230,
+                 {{"SLURM_JOB_ID", "9102"},
+                  {"SLURM_STEP_ID", "0"},
+                  {"SLURM_CLUSTER_NAME", "slurm-fixture"}},
+                 "/slurm/job_9102/step_0");
+    make_cgroup(fixture.cgroup, "/slurm/job_9102/step_0", {5321, 5330});
+
+    // extern step: also named only by the cgroup.
+    make_process(fixture.proc, 5341, "slurmstepd", 1, 8240,
+                 {{"SLURM_VERSION", "23.11"}}, "/slurm/job_9103/step_extern");
+    make_process(fixture.proc, 5350, "sleep", 5341, 8250,
+                 {{"SLURM_JOB_ID", "9103"},
+                  {"SLURM_CLUSTER_NAME", "slurm-fixture"}},
+                 "/slurm/job_9103/step_extern");
+    make_cgroup(fixture.cgroup, "/slurm/job_9103/step_extern", {5341, 5350});
+
+    // Conflicting environment and cgroup step: unresolved, never published.
+    make_process(fixture.proc, 5361, "slurmstepd", 1, 8260,
+                 {{"SLURM_VERSION", "23.11"}}, "/slurm/job_9104/step_2");
+    make_process(fixture.proc, 5370, "sleep", 5361, 8270,
+                 {{"SLURM_JOB_ID", "9104"},
+                  {"SLURM_STEP_ID", "1"},
+                  {"SLURM_CLUSTER_NAME", "slurm-fixture"}},
+                 "/slurm/job_9104/step_2");
+    make_cgroup(fixture.cgroup, "/slurm/job_9104/step_2", {5361, 5370});
+
+    auto options = fixture_options(fixture, "");
+    options.discovery.slurm_spool_dir = fixture.slurmd.string();
+    SlurmJobWatcher watcher(options);
+    const auto pass = run_pass(watcher);
+    check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
+    // The shared base fixture contributes its two stepds (9002 publishes,
+    // 9003 stays unobservable); four more are added here.
+    check(pass.set.managers.size() == 6,
+          "six stepds must name six managers, got " +
+              std::to_string(pass.set.managers.size()));
+    check(pass.jobs.size() == 4 && pass.unobservable == 2,
+          "batch/step0/extern must publish and the conflict must not, got jobs=" +
+              std::to_string(pass.jobs.size()) + " unobservable=" +
+              std::to_string(pass.unobservable));
+
+    const auto* batch = find_complete(pass.jobs, "9101");
+    check(batch != nullptr, "the batch step must be derived from the step cgroup");
+    if (batch) {
+        const auto& attr = std::get<SlurmJobAttr>(batch->sub_attr);
+        check(attr.step_id == kSlurmBatchStepValue,
+              "the batch step must use SLURM_BATCH_SCRIPT");
+        check(attr.clusterName == "slurm-fixture",
+              "the namespace must survive a missing SLURM_STEP_ID, got '" +
+                  attr.clusterName + "'");
+        auto selector = selector_of(*batch);
+        if (const auto name = slurm_step_name(attr.step_id)) selector.step_id = *name;
+        const auto identity = canonicalize(selector);
+        check(identity && identity->key() == "slurm|slurm-fixture|9101|batch",
+              "the batch identity must stay (job, step), got " +
+                  (identity ? identity->key() : std::string("<none>")));
+        check(attr.cgroup_path ==
+                  (fixture.cgroup / "slurm" / "job_9101" / "step_batch").string(),
+              "the batch step cgroup path must be recorded, got " + attr.cgroup_path);
+    }
+
+    const auto* step_zero = find_complete(pass.jobs, "9102");
+    check(step_zero != nullptr, "the srun step 0 must still publish");
+    if (step_zero) {
+        check(std::get<SlurmJobAttr>(step_zero->sub_attr).step_id == 0,
+              "environment and cgroup step 0 must agree");
+    }
+
+    const auto* extern_step = find_complete(pass.jobs, "9103");
+    check(extern_step != nullptr, "the extern step must be derived from the step cgroup");
+    if (extern_step) {
+        check(std::get<SlurmJobAttr>(extern_step->sub_attr).step_id == kSlurmExternStepValue,
+              "the extern step must use SLURM_EXTERN_CONT");
+    }
+
+    check(find_complete(pass.jobs, "9104") == nullptr,
+          "an environment/cgroup step disagreement must not publish");
+    for (const auto& discovered : pass.jobs) {
+        check(execution_complete(discovered.execution),
+              "a published slurm discovery must carry complete execution evidence");
+    }
+}
+
 int main(int argc, char** argv)
 {
     const std::string base =
@@ -1753,6 +1858,7 @@ int main(int argc, char** argv)
             {"condor_daemon_shared_cgroup_falls_back",
              condor_daemon_shared_cgroup_falls_back},
             {"slurm_empty_cgroup_stays_authoritative", slurm_empty_cgroup_stays_authoritative},
+            {"slurm_batch_step_derived_from_cgroup", slurm_batch_step_derived_from_cgroup},
             // Fact refresh without a readable cgroup, appended last: it adds
             // its own starter/child pair to the shared fixture.
             {"condor_refresh_without_cgroup_reads_children",
