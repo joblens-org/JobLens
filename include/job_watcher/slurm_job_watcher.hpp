@@ -633,6 +633,7 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
     const auto& keys = read_groups ? kEnvKeysWithGroups : kEnvKeys;
     std::optional<std::uint64_t> job_number;
     std::optional<std::uint32_t> step_id;
+    std::string step_env_error;
     for (pid_t pid : pids) {
         std::map<std::string, std::string> env_values;
         std::string env_error;
@@ -661,23 +662,8 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
         }
         job_number = candidate_job_number;
 
-        const auto step_it = env_values.find("SLURM_STEP_ID");
-        const std::string step_env = step_it != env_values.end() ? step_it->second
-                                                                 : std::string{};
-        std::string step_error;
-        const auto candidate_step = SlurmJob::parse_step_id(step_env, step_error);
-        if (!candidate_step) {
-            reasons.push_back(fmt::format("child pid {}: {}", pid, step_error));
-            continue;
-        }
-        if (step_id && *step_id != *candidate_step) {
-            notes.push_back(fmt::format(
-                "slurmstepd {} children disagree on SLURM_STEP_ID; using {}",
-                stepd_pid, SlurmJob::step_id_name(*step_id)));
-            continue;
-        }
-        step_id = candidate_step;
-
+        // Descriptive facts and groups are read before the step decision: a
+        // missing SLURM_STEP_ID must not hide the namespace or the user.
         if (read_groups && !job.group_probed) {
             auto& stats = GroupProbeStats::instance();
             const auto source = GroupProbeStats::Source::SlurmEnv;
@@ -713,6 +699,26 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
             const auto it = env_values.find("SLURM_CLUSTER_NAME");
             if (it != env_values.end()) job.clusterName = it->second;
         }
+
+        // The batch step does not export SLURM_STEP_ID; the step cgroup below
+        // is the fallback. A present-but-unparsable value is remembered so the
+        // final reason can report it.
+        const auto step_it = env_values.find("SLURM_STEP_ID");
+        const std::string step_env = step_it != env_values.end() ? step_it->second
+                                                                 : std::string{};
+        std::string step_error;
+        const auto candidate_step = SlurmJob::parse_step_id(step_env, step_error);
+        if (!candidate_step) {
+            if (!step_env.empty() && step_env_error.empty()) step_env_error = step_error;
+            continue;
+        }
+        if (step_id && *step_id != *candidate_step) {
+            notes.push_back(fmt::format(
+                "slurmstepd {} children disagree on SLURM_STEP_ID; using {}",
+                stepd_pid, SlurmJob::step_id_name(*step_id)));
+            continue;
+        }
+        step_id = candidate_step;
     }
 
     if (!job_number) {
@@ -722,23 +728,12 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
         job.JobNativeID = std::to_string(*job_number);
         attributes.job_id = *job_number;
     }
-    if (!step_id) {
-        if (job_number) reasons.push_back(fmt::format(
-            "slurmstepd {} step identity unresolved (SLURM_STEP_ID missing or unparsable)",
-            stepd_pid));
-    } else {
-        attributes.step_id = *step_id;
-    }
-    if (job.clusterName.empty())
-        job.clusterName = env.clusterName;
-    if (job.clusterName.empty())
-        reasons.push_back("slurm cluster namespace unresolved (SLURM_CLUSTER_NAME unavailable)");
-    attributes.clusterName = job.clusterName;
 
     // Pids: stepd children plus step-cgroup pids, so a child created before
     // registration is still attributed. Only a successfully read step cgroup
     // makes the identity set authoritative; a failed read is never reported as
-    // a confirmed pid identity set.
+    // a confirmed pid identity set. The same path is the step source for the
+    // batch step, which does not export SLURM_STEP_ID.
     std::string cgroup_path =
         read_proc_cgroup_path(env.proc_root, stepd_pid, env.cgroup_root);
     if (cgroup_path.empty() && !pids.empty()) {
@@ -749,6 +744,42 @@ inline std::optional<Job> SlurmJobWatcher::observe_stepd(const DiscoveryEnvironm
                 "stepd cgroup unknown; used job pid {} cgroup", pids.front()));
     }
     attributes.cgroup_path = cgroup_path;
+
+    if (!cgroup_path.empty()) {
+        const auto cgroup_step = SlurmJob::parse_cgroup_job_step(cgroup_path);
+        if (cgroup_step && job_number && cgroup_step->job_id != *job_number) {
+            notes.push_back(fmt::format(
+                "step cgroup {} belongs to job {}; ignored", cgroup_path,
+                cgroup_step->job_id));
+        } else if (cgroup_step && job_number) {
+            if (!step_id) {
+                step_id = cgroup_step->step;
+                notes.push_back(fmt::format(
+                    "step identity derived from step cgroup: {}",
+                    SlurmJob::step_id_name(cgroup_step->step)));
+            } else if (*step_id != cgroup_step->step) {
+                // Environment and cgroup disagree: neither is silently chosen.
+                reasons.push_back(fmt::format(
+                    "slurmstepd {} step {} disagrees with step cgroup {}",
+                    stepd_pid, SlurmJob::step_id_name(*step_id),
+                    SlurmJob::step_id_name(cgroup_step->step)));
+                step_id.reset();
+            }
+        }
+    }
+
+    if (!step_id) {
+        if (job_number) reasons.push_back(fmt::format(
+            "slurmstepd {} step identity unresolved (SLURM_STEP_ID missing or unparsable and no step cgroup){}",
+            stepd_pid, step_env_error.empty() ? std::string{} : ": " + step_env_error));
+    } else {
+        attributes.step_id = *step_id;
+    }
+    if (job.clusterName.empty())
+        job.clusterName = env.clusterName;
+    if (job.clusterName.empty())
+        reasons.push_back("slurm cluster namespace unresolved (SLURM_CLUSTER_NAME unavailable)");
+    attributes.clusterName = job.clusterName;
 
     std::vector<pid_t> effective_pids = pids;
     std::vector<pid_t> cgroup_pids;
