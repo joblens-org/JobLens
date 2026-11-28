@@ -80,13 +80,8 @@ struct DiscoveryEnvironment {
     // cgroup v2 mount root used to turn a procfs "0::/path" line into an
     // absolute cgroup directory ("<cgroup_root>/path/cgroup.procs").
     std::string cgroup_root{"/sys/fs/cgroup"};
-    // Optional slurmd spool root ("/var/spool/slurmd"), holding "job<id>"
-    // directories the daemon creates per running job on the node. Empty
-    // disables the spool source; it can only corroborate presence, never
-    // provide process evidence.
-    std::string slurm_spool_dir;
     // Resolved scheduler cluster namespaces. Empty means "derive from the
-    // source itself" (Condor: COLLECTOR_HOST, Slurm: SLURM_CLUSTER_NAME).
+    // source itself".
     // Neither value is ever guessed from a native job number.
     std::string clusterName;
 };
@@ -173,14 +168,6 @@ struct DiscoveryOptions {
     // Load the eBPF ring buffer used for incremental discovery hints. It is
     // always started by start(), never by the constructor.
     bool enable_event_source = true;
-    // Condor tier-1 starter enumeration: path of the slot cgroup subtree
-    // RELATIVE to discovery.cgroup_root (verified layout: the startd keeps
-    // one directory per slot under <cgroup_root>/system.slice/htcondor, each
-    // listing that slot's processes in cgroup.procs). Empty, unreadable or
-    // starter-less subtrees fall back to the full process-table scan. Slurm
-    // does not use this field.
-    std::string starter_cgroup_subtree;
-
     DiscoveryEnvironment discovery;
     ScanClock clock;
 };

@@ -245,10 +245,6 @@ DiscoveryOptions fixture_options(const Fixture& fixture,
     options.discovery.proc_root = fixture.proc.string();
     options.discovery.cgroup_root = fixture.cgroup.string();
     options.discovery.clusterName = clusterName;
-    // The fixture's slot cgroups live at <cgroup>/htcondor/slotN: the
-    // cgroup-subtree enumeration tier must engage for the condor cases
-    // (slurm ignores the field).
-    options.starter_cgroup_subtree = "htcondor";
     options.clock = [] { return kFakeNowMs; };
     return options;
 }
@@ -345,7 +341,7 @@ DiscoverySink discovery_sink(JobSink on_job)
 
 void condor_pass_finds_fixture_job(const Fixture& fixture)
 {
-    CondorJobWatcher watcher(fixture_options(fixture));
+    CondorJobWatcher watcher(fixture_options(fixture), "htcondor");
     check(watcher.health().state == SourceState::Initializing,
           "a fresh adapter starts in SourceState::Initializing");
     check(!watcher.polling(), "constructing a discovery adapter must not start polling");
@@ -417,7 +413,7 @@ void condor_pass_finds_fixture_job(const Fixture& fixture)
 
 void condor_incomplete_observations_are_not_published(const Fixture& fixture)
 {
-    CondorJobWatcher watcher(fixture_options(fixture));
+    CondorJobWatcher watcher(fixture_options(fixture), "htcondor");
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "condor pass must succeed: " + pass.set.error);
 
@@ -446,8 +442,7 @@ void condor_incomplete_observations_are_not_published(const Fixture& fixture)
 void slurm_pass_finds_fixture_job(const Fixture& fixture)
 {
     auto options = fixture_options(fixture, "");
-    options.discovery.slurm_spool_dir = fixture.slurmd.string();
-    SlurmJobWatcher watcher(options);
+    SlurmJobWatcher watcher(options, fixture.slurmd.string());
 
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "slurm pass must succeed on the fixture: " + pass.set.error);
@@ -467,7 +462,7 @@ void slurm_pass_finds_fixture_job(const Fixture& fixture)
     check(slurm_step_attr.step_id == 3,
           "step id must be the normalized member step");
     auto slurm_selector = selector_of(*job);
-    if (const auto step_name = slurm_step_name(slurm_step_attr.step_id))
+    if (const auto step_name = SlurmJob::special_step_name(slurm_step_attr.step_id))
         slurm_selector.step_id = *step_name;
     else
         slurm_selector.step_id = std::to_string(slurm_step_attr.step_id);
@@ -510,8 +505,8 @@ void slurm_pass_finds_fixture_job(const Fixture& fixture)
 void slurm_spool_root_is_pass_coverage(const Fixture& fixture)
 {
     auto options = fixture_options(fixture, "");
-    options.discovery.slurm_spool_dir = (fixture.root / "missing-spool").string();
-    SlurmJobWatcher watcher(options);
+    const auto spool = fixture.root / "missing-spool";
+    SlurmJobWatcher watcher(options, spool.string());
 
     const auto failed = watcher.enumerateManagers();
     check(!failed.complete,
@@ -526,8 +521,7 @@ void slurm_spool_root_is_pass_coverage(const Fixture& fixture)
           "an incomplete pass degrades the source");
     check(health.consecutive_failures == 1, "the failure count must advance");
 
-    options.discovery.slurm_spool_dir = fixture.slurmd.string();
-    watcher.set_discovery_environment(options.discovery);
+    fs::create_directories(spool);
     const auto recovered = watcher.enumerateManagers();
     check(recovered.error.empty() && recovered.complete,
           "the pass recovers once the spool root is readable: " + recovered.error);
@@ -544,7 +538,7 @@ void health_degrades_and_recovers(const Fixture& fixture)
 {
     auto options = fixture_options(fixture);
     options.discovery.proc_root = (fixture.root / "missing-proc").string();
-    CondorJobWatcher watcher(options);
+    CondorJobWatcher watcher(options, "htcondor");
     check(watcher.health().state == SourceState::Initializing, "starts initializing");
 
     const auto failed = watcher.enumerateManagers();
@@ -572,7 +566,7 @@ void health_degrades_and_recovers(const Fixture& fixture)
 
 void rescan_request_is_consumed(const Fixture& fixture)
 {
-    CondorJobWatcher watcher(fixture_options(fixture));
+    CondorJobWatcher watcher(fixture_options(fixture), "htcondor");
     watcher.request_rescan();
     check(watcher.health().rescan_requested, "a rescan request must be visible in health");
     watcher.enumerateManagers();
@@ -582,7 +576,7 @@ void rescan_request_is_consumed(const Fixture& fixture)
 void construction_does_nothing_until_start(const Fixture& fixture)
 {
     // The only construction path: no Config read, no eBPF load, no thread.
-    CondorJobWatcher watcher(fixture_options(fixture));
+    CondorJobWatcher watcher(fixture_options(fixture), "htcondor");
     check(!watcher.polling(), "a fresh adapter must not poll");
     check(!watcher.thread_joinable(), "a fresh adapter must not own a thread");
     check(!watcher.health().polling, "health must not report polling before start()");
@@ -599,7 +593,7 @@ void construction_does_nothing_until_start(const Fixture& fixture)
 
 void observe_hint_targets_one_execution(const Fixture& fixture)
 {
-    CondorJobWatcher condor(fixture_options(fixture));
+    CondorJobWatcher condor(fixture_options(fixture), "htcondor");
     // 4110 is a member process whose parent is the starter 4101.
     const auto targeted = condor.observeForHint(4110);
     check(targeted.has_value(), "a hint under a starter must resolve");
@@ -616,8 +610,7 @@ void observe_hint_targets_one_execution(const Fixture& fixture)
           "a pid whose parent is not a starter must not resolve");
 
     auto slurm_options = fixture_options(fixture, "");
-    slurm_options.discovery.slurm_spool_dir = (fixture.slurmd).string();
-    SlurmJobWatcher slurm(slurm_options);
+    SlurmJobWatcher slurm(slurm_options, fixture.slurmd.string());
     // 5110's parent is the stepd 5101 of job 9002 step 3.
     const auto step = slurm.observeForHint(5110);
     check(step.has_value(), "a hint under a stepd must resolve");
@@ -630,7 +623,7 @@ void observe_hint_targets_one_execution(const Fixture& fixture)
 
 void polymorphic_source_interface(const Fixture& fixture)
 {
-    CondorJobWatcher condor(fixture_options(fixture));
+    CondorJobWatcher condor(fixture_options(fixture), "htcondor");
     SlurmJobWatcher slurm(fixture_options(fixture, ""));
 
     IDiscoverySource* sources[] = {&condor, &slurm};
@@ -659,7 +652,7 @@ void polymorphic_source_interface(const Fixture& fixture)
 
 void lifecycle_is_safe(const Fixture& fixture)
 {
-    CondorJobWatcher watcher(fixture_options(fixture));
+    CondorJobWatcher watcher(fixture_options(fixture), "htcondor");
 
     std::atomic<int> delivered{0};
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -1225,7 +1218,7 @@ void condor_ad_on_member_process_is_found(const Fixture& fixture)
                  {{"_CONDOR_JOB_AD", ad.string()}}, "/htcondor/slot4");
     make_cgroup(fixture.cgroup, "/htcondor/slot4", {4401, 4410});
 
-    CondorJobWatcher watcher(fixture_options(fixture));
+    CondorJobWatcher watcher(fixture_options(fixture), "htcondor");
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
     const auto* job = find_complete(pass.jobs, "76226340.0");
@@ -1235,7 +1228,7 @@ void condor_ad_on_member_process_is_found(const Fixture& fixture)
           "the ad metadata must come from the member's ad");
 
     // The exec-hint path must prefer the hinted pid's own environment.
-    CondorJobWatcher hints(fixture_options(fixture));
+    CondorJobWatcher hints(fixture_options(fixture), "htcondor");
     const auto targeted = hints.observeForHint(4410);
     check(targeted.has_value(), "a hint for the job process must resolve");
     check(targeted->JobNativeID == "76226340.0",
@@ -1267,8 +1260,7 @@ void condor_without_cgroup_still_resolves_members(const Fixture& fixture)
     make_children(fixture.proc, 4501, {4510, 4511});
 
     auto options = fixture_options(fixture);
-    options.starter_cgroup_subtree.clear();   // this layout predates slot cgroups
-    CondorJobWatcher watcher(options);
+    CondorJobWatcher watcher(options);  // this layout predates slot cgroups
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
     const auto* job = find_complete(pass.jobs, "76226341.0");
@@ -1292,8 +1284,7 @@ void condor_without_cgroup_still_resolves_members(const Fixture& fixture)
 void condor_cgroup_subtree_missing_falls_back(const Fixture& fixture)
 {
     auto options = fixture_options(fixture);
-    options.starter_cgroup_subtree = "no-such-subtree";
-    CondorJobWatcher watcher(options);
+    CondorJobWatcher watcher(options, "no-such-subtree");
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(),
           "the pass must succeed despite the missing subtree: " + pass.set.error);
@@ -1316,8 +1307,7 @@ void condor_cgroup_subtree_without_starters_falls_back(const Fixture& fixture)
     write_file(empty_subtree / "slot1" / "cgroup.procs", "");
 
     auto options = fixture_options(fixture);
-    options.starter_cgroup_subtree = "htcondor-empty";
-    CondorJobWatcher watcher(options);
+    CondorJobWatcher watcher(options, "htcondor-empty");
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty() && pass.set.complete,
           "a starter-less subtree must fall back to a complete pass: " + pass.set.error);
@@ -1344,7 +1334,7 @@ void condor_pass_owns_health(const Fixture& fixture)
     std::int64_t now_ms = kFakeNowMs;
     auto options = fixture_options(fixture);
     options.clock = [&now_ms] { return now_ms; };
-    CondorJobWatcher watcher(options);
+    CondorJobWatcher watcher(options, "htcondor");
 
     const auto first = watcher.enumerateManagers();
     check(first.error.empty() && first.complete,
@@ -1383,9 +1373,8 @@ void slurm_pass_owns_health(const Fixture& fixture)
 {
     std::int64_t now_ms = kFakeNowMs;
     auto options = fixture_options(fixture, "");
-    options.discovery.slurm_spool_dir = fixture.slurmd.string();
     options.clock = [&now_ms] { return now_ms; };
-    SlurmJobWatcher watcher(options);
+    SlurmJobWatcher watcher(options, fixture.slurmd.string());
 
     const auto first = watcher.enumerateManagers();
     check(first.error.empty() && first.complete,
@@ -1428,7 +1417,7 @@ void condor_observe_matches_enumerated_managers(const Fixture& /*shared*/)
                "GlobalJobId = \"scheduler@schedd07.fixture#76226339.0#1775723895\"\n"
                "Owner = \"carol\"\n");
 
-    CondorJobWatcher watcher(fixture_options(fixture));
+    CondorJobWatcher watcher(fixture_options(fixture), "htcondor");
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
     check(pass.jobs.size() == 3,
@@ -1489,8 +1478,7 @@ void slurm_observe_matches_enumerated_managers(const Fixture& /*shared*/)
     make_cgroup(fixture.cgroup, "/slurm/job_9003/step_1", {5201, 5210});
 
     auto options = fixture_options(fixture, "");
-    options.discovery.slurm_spool_dir = fixture.slurmd.string();
-    SlurmJobWatcher watcher(options);
+    SlurmJobWatcher watcher(options, fixture.slurmd.string());
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
     check(pass.jobs.size() == 2,
@@ -1558,8 +1546,7 @@ void condor_daemon_shared_cgroup_falls_back(const Fixture& /*shared*/)
     make_children(fixture.proc, 4701, {4710});
 
     auto options = fixture_options(fixture);
-    options.starter_cgroup_subtree.clear();  // the service cgroup is not a slot dir
-    CondorJobWatcher watcher(options);
+    CondorJobWatcher watcher(options);  // the service cgroup is not a slot dir
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
     const auto* job = find_complete(pass.jobs, "76226342.0");
@@ -1753,8 +1740,7 @@ void slurm_batch_step_derived_from_cgroup(const Fixture& /*shared*/)
     make_cgroup(fixture.cgroup, "/slurm/job_9104/step_2", {5361, 5370});
 
     auto options = fixture_options(fixture, "");
-    options.discovery.slurm_spool_dir = fixture.slurmd.string();
-    SlurmJobWatcher watcher(options);
+    SlurmJobWatcher watcher(options, fixture.slurmd.string());
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
     // The shared base fixture contributes its two stepds (9002 publishes,
@@ -1771,13 +1757,13 @@ void slurm_batch_step_derived_from_cgroup(const Fixture& /*shared*/)
     check(batch != nullptr, "the batch step must be derived from the step cgroup");
     if (batch) {
         const auto& attr = std::get<SlurmJobAttr>(batch->sub_attr);
-        check(attr.step_id == kSlurmBatchStepValue,
+        check(attr.step_id == SlurmJob::kSlurmBatchStepValue,
               "the batch step must use SLURM_BATCH_SCRIPT");
         check(attr.clusterName == "slurm-fixture",
               "the namespace must survive a missing SLURM_STEP_ID, got '" +
                   attr.clusterName + "'");
         auto selector = selector_of(*batch);
-        if (const auto name = slurm_step_name(attr.step_id)) selector.step_id = *name;
+        if (const auto name = SlurmJob::special_step_name(attr.step_id)) selector.step_id = *name;
         const auto identity = canonicalize(selector);
         check(identity && identity->key() == "slurm|slurm-fixture|9101|batch",
               "the batch identity must stay (job, step), got " +
@@ -1797,7 +1783,7 @@ void slurm_batch_step_derived_from_cgroup(const Fixture& /*shared*/)
     const auto* extern_step = find_complete(pass.jobs, "9103");
     check(extern_step != nullptr, "the extern step must be derived from the step cgroup");
     if (extern_step) {
-        check(std::get<SlurmJobAttr>(extern_step->sub_attr).step_id == kSlurmExternStepValue,
+        check(std::get<SlurmJobAttr>(extern_step->sub_attr).step_id == SlurmJob::kSlurmExternStepValue,
               "the extern step must use SLURM_EXTERN_CONT");
     }
 

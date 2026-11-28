@@ -13,9 +13,9 @@
  * limitations under the License. */
 #pragma once
 #include "core/collector_type.h"
-#include "core/job_identity.hpp"
-#include "core/group_probe_stats.hpp"
-#include "common/classad_decode.hpp"
+#include "job_watcher/slurm_step.hpp"
+#include "job_watcher/group_probe_stats.hpp"
+#include "job_watcher/classad_decode.hpp"
 #include "common/utils.hpp"
 #include <unistd.h>
 #include <grp.h>
@@ -80,8 +80,8 @@ inline std::optional<std::uint64_t> parse_job_id(const std::string& raw, std::st
     return value;
 }
 
-// SLURM_STEP_ID -> numeric step value. The special batch/extern constants stay
-// distinct from numeric steps (see slurm_step_name in core/job_identity.hpp).
+// SLURM_STEP_ID -> numeric step value. Diagnostics and canonical projection
+// use the same adapter-local step codec below.
 inline std::optional<std::uint32_t> parse_step_id(const std::string& raw, std::string& error){
     const auto value = detail::parse_decimal_u64(raw);
     if (!value || *value > std::numeric_limits<std::uint32_t>::max()) {
@@ -89,14 +89,6 @@ inline std::optional<std::uint32_t> parse_step_id(const std::string& raw, std::s
         return std::nullopt;
     }
     return static_cast<std::uint32_t>(*value);
-}
-
-// Adapter-boundary conversion: numeric step -> canonical wire step_id. batch and
-// extern keep their names, every other value is its decimal form; nothing is
-// ever mapped to a different step.
-inline std::string step_id_name(std::uint32_t numeric_step){
-    if (const auto special = slurm_step_name(numeric_step)) return *special;
-    return std::to_string(numeric_step);
 }
 
 // cgroup 路径里的 step 段。Slurm 在 ".../job_<id>/step_<name>" 下为每个 step
@@ -128,13 +120,10 @@ inline std::optional<CgroupJobStep> parse_cgroup_job_step(const std::string& pat
         const std::string& step = parts[index + 1];
         if (step.size() <= 5 || step.compare(0, 5, "step_") != 0) continue;
         const std::string name = step.substr(5);
-        if (name == "batch")
-            return CgroupJobStep{*job_id, kSlurmBatchStepValue};
-        if (name == "extern")
-            return CgroupJobStep{*job_id, kSlurmExternStepValue};
+        if (const auto special = special_step_value(name))
+            return CgroupJobStep{*job_id, *special};
         const auto value = detail::parse_decimal_u64(name);
-        // SLURM_MAX_NORMAL_STEP_ID = 0xfffffff0；更小的保留值不属于普通 step。
-        if (!value || *value >= 0xfffffff0ull) continue;
+        if (!value || *value >= kSlurmMaxNormalStepId) continue;
         return CgroupJobStep{*job_id, static_cast<std::uint32_t>(*value)};
     }
     return std::nullopt;

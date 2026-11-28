@@ -1945,6 +1945,7 @@ void run_admit(const std::string& base)
         auto options = heartbeat_options(fresh_dir(base, "admit-default"), source, probes);
         options.test_capture_all = false;
         options.test_auto_add_states = {{"condor", AutoAdd::Default}};
+        options.test_auto_policy_adapter = "condor";
         options.test_auto_policy = [] {
             return AutoCollectorPolicy::defaults({"CPUMemCollector"});
         };
@@ -1980,6 +1981,7 @@ void run_admit(const std::string& base)
         auto options = heartbeat_options(fresh_dir(base, "admit-reject"), source, probes);
         options.test_capture_all = false;
         options.test_auto_add_states = {{"condor", AutoAdd::Rule}};
+        options.test_auto_policy_adapter = "condor";
         options.test_auto_policy = [&] {
             return AutoCollectorPolicy::rules((rules_root / "reject").string(),
                                               "condor_job_");
@@ -2005,6 +2007,7 @@ void run_admit(const std::string& base)
         auto options = heartbeat_options(fresh_dir(base, "admit-accept"), source, probes);
         options.test_capture_all = false;
         options.test_auto_add_states = {{"condor", AutoAdd::Rule}};
+        options.test_auto_policy_adapter = "condor";
         options.test_auto_policy = [&] {
             return AutoCollectorPolicy::rules((rules_root / "accept").string(),
                                               "condor_job_");
@@ -2037,6 +2040,7 @@ void run_admit(const std::string& base)
         auto options = heartbeat_options(fresh_dir(base, "admit-bare-defaults"), source, probes);
         options.test_capture_all = false;
         options.test_auto_add_states = {{"condor", AutoAdd::Rule}};
+        options.test_auto_policy_adapter = "condor";
         options.test_auto_policy = [&] {
             return AutoCollectorPolicy::rules((rules_root / "accept_bare").string(),
                                               "condor_job_", {"CPUMemCollector"});
@@ -2073,6 +2077,7 @@ void run_admit(const std::string& base)
         auto options = heartbeat_options(fresh_dir(base, "admit-bare-nodefaults"), source, probes);
         options.test_capture_all = false;
         options.test_auto_add_states = {{"condor", AutoAdd::Rule}};
+        options.test_auto_policy_adapter = "condor";
         options.test_auto_policy = [&] {
             return AutoCollectorPolicy::rules((rules_root / "accept_bare").string(),
                                               "condor_job_");
@@ -2126,6 +2131,7 @@ void run_stop_pin(const std::string& base)
     probes.set_process(5900, LivenessState::Alive, 555);
     source.set_scan([&]() { return scan_with({job}); });
     auto options = heartbeat_options(fresh_dir(base, "stop-pin"), source, probes);
+    options.test_auto_policy_adapter = "condor";
     options.test_auto_policy = [] {
         return AutoCollectorPolicy::defaults({"CPUMemCollector"});
     };

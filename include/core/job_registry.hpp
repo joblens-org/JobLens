@@ -156,7 +156,7 @@ struct JobRegistryOptions {
     // job_registry_config.maintenance + <type>_job_watcher). The adapter name
     // below is the key it is armed under.
     std::function<AutoCollectorPolicy()> test_auto_policy;
-    std::string test_auto_policy_adapter{"condor"};
+    std::string test_auto_policy_adapter;
     // Admission-gate test wiring (production reads capture_all and
     // the per-type auto_add tri-state from the resolved configuration).
     // test_capture_all=false arms the gate; the state map carries the

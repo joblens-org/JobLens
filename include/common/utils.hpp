@@ -131,36 +131,6 @@ namespace Utils
         return std::string(msg);
     }
 
-    /// 惰性获取 HTCondor COLLECTOR_HOST 作为集群名称。
-    /// 首次调用时执行 condor_config_val 并缓存，后续直接返回（线程安全）。
-    /// 返回值自动剥离端口号，保留完整域名。
-    inline std::string get_condor_collector_host() {
-        static const std::string cached = []() -> std::string {
-            std::array<char, 256> buf{};
-            std::string result;
-            std::unique_ptr<FILE, decltype(&pclose)> pipe(
-                popen("condor_config_val COLLECTOR_HOST 2>/dev/null", "r"),
-                pclose);
-            if (!pipe) return "";
-            while (fgets(buf.data(), static_cast<int>(buf.size()), pipe.get()))
-                result += buf.data();
-            if (!result.empty() && result.back() == '\n')
-                result.pop_back();
-            // 剥离端口号: "host.domain:9618" -> "host.domain"
-            auto pos = result.rfind(':');
-            if (pos != std::string::npos) {
-                bool all_digits = true;
-                for (size_t i = pos + 1; i < result.size(); ++i)
-                    if (!std::isdigit(static_cast<unsigned char>(result[i]))) {
-                        all_digits = false; break;
-                    }
-                if (all_digits) result.resize(pos);
-            }
-            return result;
-        }();
-        return cached;
-    }
-
     inline std::uint64_t file_hash_xxh64(const std::string& path) {
         std::ifstream f(path, std::ios::ate | std::ios::binary);
         if (!f)

@@ -44,7 +44,7 @@
 #include "common/utils.hpp"
 #include "common/common_job.hpp"
 #include "common/local_rpc.hpp"
-#include "core/group_probe_stats.hpp"
+#include "job_watcher/group_probe_stats.hpp"
 #include <algorithm>
 
 #include <set>

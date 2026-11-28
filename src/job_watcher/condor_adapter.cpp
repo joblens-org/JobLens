@@ -15,6 +15,7 @@
 // adapter header; this TU owns every projection between those facts and the
 // Job/JobRecord, so no scheduler branch leaks into the registry or the store.
 #include "job_watcher/condor_adapter.hpp"
+#include "job_watcher/condor_identity.hpp"
 
 #include <filesystem>
 #include <optional>
@@ -27,7 +28,7 @@
 
 #include "core/collector_type.h"
 #include "job_watcher/condor_job_watcher.hpp"
-#include "common/condor_job.hpp"
+#include "job_watcher/condor_job.hpp"
 #include "common/procfs.hpp"
 #include "common/utils.hpp"
 
@@ -100,12 +101,9 @@ void report_derivation_issue(bool first_report, const std::string& message)
 }  // namespace
 
 struct CondorSchedulerAdapter::Impl {
-    // Declared before the watcher: the slot-layout hint must be read while
-    // `options` is still a live object (the watcher takes it by move).
     explicit Impl(DiscoveryOptions options)
-        : starter_cgroup_subtree(options.starter_cgroup_subtree),
-          watcher(std::move(options)) {}
-    std::string starter_cgroup_subtree;
+        : watcher(std::move(options), starter_cgroup_subtree) {}
+    const std::string starter_cgroup_subtree{"system.slice/htcondor"};
     CondorJobWatcher watcher;
 };
 
@@ -148,7 +146,6 @@ DiscoveryOptions CondorSchedulerAdapter::discoveryOptions(
     // Verified on the integration node (192.168.82.26): the startd keeps
     // one directory per slot under this subtree, each slot's cgroup.procs
     // listing its processes (starter included).
-    options.starter_cgroup_subtree = "system.slice/htcondor";
     if (!settings.clusterName.empty())
         options.discovery.clusterName = settings.clusterName;
     return options;
@@ -218,7 +215,7 @@ NativeSelector CondorSchedulerAdapter::registrationSelector(const Job& job) cons
     // A manual registration carries no discovery environment; fall back to
     // the local collector for the pool-routing component.
     if (selector.clusterName.empty())
-        selector.clusterName = Utils::get_condor_collector_host();
+        selector.clusterName = CondorJob::collector_host();
     if (selector.clusterName.empty() || selector.job_native_id.empty()) return {};
     return selector;
 }
@@ -244,7 +241,7 @@ void CondorSchedulerAdapter::applyRequestFacts(Job& job,
     attr.owner = sub.value("owner", "");
     attr.collector_host = sub.value("collector_host", "");
     if (attr.collector_host.empty())
-        attr.collector_host = Utils::get_condor_collector_host();
+        attr.collector_host = CondorJob::collector_host();
 
     // Optional explicit execution evidence. The caller may already know where
     // the job runs (the trigger resolved the starter, or a restart replays a
@@ -480,13 +477,25 @@ bool CondorSchedulerAdapter::completeRefreshedFacts(Job& target,
     return completed;
 }
 
+JobGroupView scheduler_groups(const CondorJobAttr& facts)
+{
+    return {facts.acct_group, facts.unix_group};
+}
+
+bool backfill_scheduler_groups(CondorJobAttr& target, const CondorJobAttr& source)
+{
+    const bool account = fill_missing_group_text(target.acct_group, source.acct_group);
+    const bool unix_group = fill_missing_group_text(target.unix_group, source.unix_group);
+    return account || unix_group;
+}
+
 SubAttrMatcher CondorSchedulerAdapter::duplicateMatcher(const Job& job) const
 {
     SubAttrMatcher matcher;
     matcher.subtype = JobSubType::Condor;
     if (const auto* attr = std::get_if<CondorJobAttr>(&job.sub_attr)) {
-        matcher.condor_cluster_id = attr->cluster_id;
-        matcher.condor_proc_id = attr->proc_id;
+        matcher.require(&CondorJobAttr::cluster_id, attr->cluster_id);
+        matcher.require(&CondorJobAttr::proc_id, attr->proc_id);
     }
     return matcher;
 }
@@ -639,7 +648,7 @@ void CondorSchedulerAdapter::renderNamespace(Job& job) const
 REGISTER_NATIVE_ID_RULE("condor", [](const NativeSelector& selector)
     -> std::optional<CanonicalParts> {
     if (!selector.step_id.empty()) return std::nullopt;  // Condor has no steps
-    auto parsed = parse_condor_native(selector.job_native_id);
+    const auto parsed = CondorJob::parse_native_id(selector.job_native_id);
     if (!parsed) return std::nullopt;
     CanonicalParts parts;
     parts.cluster_namespace = selector.clusterName;
@@ -649,4 +658,5 @@ REGISTER_NATIVE_ID_RULE("condor", [](const NativeSelector& selector)
     return parts;
 })
 
-REGISTER_SCHEDULER_ADAPTER("condor", CondorSchedulerAdapter)
+REGISTER_SCHEDULER_ADAPTER_WITH_LEGACY_FLAG("condor", CondorSchedulerAdapter,
+                                          "auto_add_condorjob")

@@ -65,32 +65,14 @@ const NativeIdRule* NativeIdRuleRegistry::find(const std::string& adapter) const
     return it == rules_.end() ? nullptr : &it->second;
 }
 
-// Shared helpers of the adapters' native-id rules (declared in the header so
-// the adapter headers' REGISTER_NATIVE_ID_RULE bodies can call them).
-
 // Leading zeros are tolerated on native components; the canonical numeric
-// value removes them so "012.3" and "12.3" name the same job.
+// value removes them.
 std::optional<std::string> strip_leading_zeros(const std::string& decimal)
 {
     if (!is_decimal(decimal)) return std::nullopt;
     const auto first_non_zero = decimal.find_first_not_of('0');
     if (first_non_zero == std::string::npos) return std::string{"0"};
     return decimal.substr(first_non_zero);
-}
-
-// Condor native id: "<ClusterId>.<ProcId>", both decimal, both non-empty.
-std::optional<CondorNativeId> parse_condor_native(const std::string& raw)
-{
-    const auto dot = raw.find('.');
-    if (dot == std::string::npos) return std::nullopt;
-    const auto cluster = raw.substr(0, dot);
-    const auto proc = raw.substr(dot + 1);
-    if (cluster.empty() || proc.empty()) return std::nullopt;
-    if (proc.find('.') != std::string::npos) return std::nullopt;
-    auto canonical_cluster = strip_leading_zeros(cluster);
-    auto canonical_proc = strip_leading_zeros(proc);
-    if (!canonical_cluster || !canonical_proc) return std::nullopt;
-    return CondorNativeId{*canonical_cluster, *canonical_proc};
 }
 
 // ---------------------------------------------------------------------------
@@ -147,37 +129,6 @@ LegacyId parse_job_id(const nlohmann::json& node)
     parsed.status = is_reserved_job_id(value) ? LegacyIdStatus::Reserved
                                                    : LegacyIdStatus::Valid;
     return parsed;
-}
-
-// ---------------------------------------------------------------------------
-// Slurm step identity
-// ---------------------------------------------------------------------------
-
-std::optional<std::string> normalize_slurm_step_id(const std::string& raw)
-{
-    if (raw == "batch" || raw == "extern") return raw;
-    if (raw.empty()) return std::nullopt;
-    return strip_leading_zeros(raw);
-}
-
-std::optional<std::string> slurm_step_name(uint32_t numeric_step)
-{
-    if (numeric_step == kSlurmBatchStepValue) return std::string{"batch"};
-    if (numeric_step == kSlurmExternStepValue) return std::string{"extern"};
-    return std::nullopt;
-}
-
-std::optional<uint32_t> slurm_step_value(const std::string& step_id)
-{
-    if (step_id == "batch") return kSlurmBatchStepValue;
-    if (step_id == "extern") return kSlurmExternStepValue;
-    if (!is_decimal(step_id)) return std::nullopt;
-    uint32_t value = 0;
-    const auto* begin = step_id.data();
-    const auto* end = step_id.data() + step_id.size();
-    const auto result = std::from_chars(begin, end, value, 10);
-    if (result.ec != std::errc() || result.ptr != end) return std::nullopt;
-    return value;
 }
 
 // ---------------------------------------------------------------------------
