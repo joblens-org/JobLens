@@ -38,8 +38,6 @@
 #include <stdexcept>
 
 #include "common/config.hpp"
-#include "common/condor_job.hpp"
-#include "common/slurm_job.hpp"
 #include "common/common_job.hpp"
 
 namespace {

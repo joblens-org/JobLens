@@ -67,8 +67,10 @@ bash tests/integration/run_collection_rpc_test.sh build
 bash tests/integration/run_watcher_scan_test.sh build
 ```
 
-- `job_identity_test.cpp`：Condor/Slurm 规范身份、uint64 内部 ID、Slurm step 归一化
-  （`batch` = `SLURM_BATCH_SCRIPT` 0xfffffffe、`extern` = `SLURM_EXTERN_CONT` 0xfffffffd）、
+- `run_adapter_isolation_test.sh`：单独编译 core 身份模块，不链接任何调度器 adapter，
+  验证身份规则由注册的 adapter 提供。`identity` 套件会先执行这项检查。
+- `job_identity_test.cpp`：Condor/Slurm 规范身份、uint64 内部 ID、Slurm adapter 的 step 归一化
+  （`batch` = `SLURM_BATCH_SCRIPT` 0xfffffffb、`extern` = `SLURM_EXTERN_CONT` 0xfffffffc）、
   PID 复用、实例句柄与序列化。
 - `job_store_test.cpp`：零绑定 upsert 幂等、旧 schema 迁移与恢复、冲突隔离、
   持久写失败与 ID 不复用。

@@ -12,7 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #pragma once
-#include "common/slurm_job.hpp"
+#include "job_watcher/slurm_job.hpp"
 #include <spdlog/spdlog.h>
 #include <fmt/core.h>
 #include "common/ebpf_common.hpp"
@@ -42,14 +42,12 @@
 // table plus the optional slurmd spool, read through an injectable
 // DiscoveryEnvironment so an unprivileged host can present a fake tree.
 //
-// No cgroup-subtree starter enumeration here (`starter_cgroup_subtree` is
-// Condor-only): the Slurm cgroup layout nests job_X/step_Y directories under
-// the root, and the process table is the stable source for slurmstepd per
-// step across supported Slurm versions.
+// The process table is the discovery source for slurmstepd; cgroup paths
+// corroborate step identity and membership after enumeration.
 class SlurmJobWatcher final : public IDiscoverySource{
 public:
     // Options only: nothing is loaded and nothing polls until start().
-    explicit SlurmJobWatcher(DiscoveryOptions options);
+    explicit SlurmJobWatcher(DiscoveryOptions options, std::string spool_dir = {});
 
     ~SlurmJobWatcher() override { stop(); }
 
@@ -141,6 +139,8 @@ private:
 
     std::string name_{"slurm"};
     DiscoveryOptions options_;
+    // Optional spool probe: it can corroborate presence, not identify processes.
+    std::string spool_dir_;
     std::string rb_name = "slurm_exec_events";
 
     // Lifecycle of the poll thread.
@@ -179,8 +179,8 @@ private:
 // Inline definitions (header-only adapter, no .cpp in the monolithic build)
 // ---------------------------------------------------------------------------
 
-inline SlurmJobWatcher::SlurmJobWatcher(DiscoveryOptions options)
-    : options_(std::move(options))
+inline SlurmJobWatcher::SlurmJobWatcher(DiscoveryOptions options, std::string spool_dir)
+    : options_(std::move(options)), spool_dir_(std::move(spool_dir))
 {
     if (!options_.enable_event_source)
         event_source_note_ =
@@ -347,18 +347,18 @@ inline ManagerSet SlurmJobWatcher::enumerateManagers()
     // pass's coverage: an unreadable configured spool root makes the pass
     // incomplete. The entries themselves add no manager evidence, so they are
     // never listed here.
-    if (!env.slurm_spool_dir.empty()) {
+    if (!spool_dir_.empty()) {
         std::string spool_error;
-        if (!ensure_readable_directory(env.slurm_spool_dir, spool_error)) {
+        if (!ensure_readable_directory(spool_dir_, spool_error)) {
             set.error = "slurm discovery: spool root " + spool_error;
             finish_pass(set, notes);
             return set;
         }
         std::error_code ec;
-        std::filesystem::directory_iterator probe(env.slurm_spool_dir, ec);
+        std::filesystem::directory_iterator probe(spool_dir_, ec);
         if (ec) {
             set.error = "slurm discovery: cannot enumerate spool root '" +
-                        env.slurm_spool_dir + "': " + ec.message();
+                        spool_dir_ + "': " + ec.message();
             finish_pass(set, notes);
             return set;
         }

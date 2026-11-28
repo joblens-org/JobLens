@@ -88,6 +88,7 @@ link_test() {
 }
 
 run_identity() {
+    bash "$root/tests/integration/run_adapter_isolation_test.sh"
     link_test "$root/tests/integration/job_identity_test.cpp" job_identity_test
 }
 

@@ -16,6 +16,8 @@
 #pragma once
 
 #include "core/collector_type.h"
+#include "job_watcher/condor_identity.hpp"
+#include "job_watcher/slurm_step.hpp"
 #include "core/job_identity.hpp"
 
 #include <cstdint>
@@ -37,7 +39,7 @@ inline Job discovered_job(NativeSelector selector, ProcessIdentity manager,
         auto attr = CondorJobAttr{};
         attr.collector_host = selector.clusterName;
         attr.scheduler_name = selector.clusterTag;
-        if (const auto parsed = parse_condor_native(selector.job_native_id)) {
+        if (const auto parsed = CondorJob::parse_native_id(selector.job_native_id)) {
             attr.cluster_id = std::stoull(parsed->cluster);
             attr.proc_id = std::stoull(parsed->proc);
         }
@@ -52,7 +54,7 @@ inline Job discovered_job(NativeSelector selector, ProcessIdentity manager,
             attr.job_id = 0;
         }
         if (!selector.step_id.empty()) {
-            if (const auto numeric = slurm_step_value(selector.step_id)) attr.step_id = *numeric;
+            if (const auto numeric = SlurmJob::step_value(selector.step_id)) attr.step_id = *numeric;
         }
         job.sub_attr = std::move(attr);
     }

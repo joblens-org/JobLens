@@ -372,7 +372,8 @@ TargetResolution resolve_native_target(JobRegistry& registry, const NativeSelect
         result.code = "invalid_request";
         result.message =
             "incomplete native selector: scheduler_type, clusterName and JobNativeID "
-            "must name one scheduler identity (Condor native ids are '<ClusterId>.<ProcId>')";
+            "must name one scheduler identity";
+        result.message += kLegacyNativeSelectorFormatHint;
         return result;
     }
 
@@ -531,34 +532,12 @@ SubAttrMatcher parse_legacy_matcher(const nlohmann::json& matcher_json)
     SubAttrMatcher matcher;
     if (matcher_json.contains("subtype")) {
         const auto subtype = matcher_json["subtype"].get<std::string>();
-        if (subtype == "Condor") matcher.subtype = JobSubType::Condor;
-        else if (subtype == "Slurm") matcher.subtype = JobSubType::Slurm;
-        else if (subtype == "Common") matcher.subtype = JobSubType::Common;
-        else {
-            // 开放世界：任意 adapter 名字按名字匹配（Job::subtype_name）。
-            matcher.subtype_name = normalize_adapter_name(subtype);
-        }
+        if (const auto legacy = legacy_subtype_named(subtype)) matcher.subtype = *legacy;
+        else matcher.subtype_name = normalize_adapter_name(subtype);
     }
     if (matcher_json.contains("facts_fields") && matcher_json["facts_fields"].is_object())
         matcher.json_fields = matcher_json["facts_fields"];
-    if (matcher_json.contains("condor_cluster_id"))
-        matcher.condor_cluster_id = matcher_json["condor_cluster_id"].get<size_t>();
-    if (matcher_json.contains("condor_proc_id"))
-        matcher.condor_proc_id = matcher_json["condor_proc_id"].get<size_t>();
-    if (matcher_json.contains("condor_owner"))
-        matcher.condor_owner = matcher_json["condor_owner"].get<std::string>();
-    if (matcher_json.contains("condor_starter_pid"))
-        matcher.condor_starter_pid = matcher_json["condor_starter_pid"].get<pid_t>();
-    if (matcher_json.contains("slurm_job_id"))
-        matcher.slurm_job_id = matcher_json["slurm_job_id"].get<size_t>();
-    if (matcher_json.contains("slurm_step_id"))
-        matcher.slurm_step_id = matcher_json["slurm_step_id"].get<uint32_t>();
-    if (matcher_json.contains("slurm_user"))
-        matcher.slurm_user = matcher_json["slurm_user"].get<std::string>();
-    if (matcher_json.contains("slurm_job_name"))
-        matcher.slurm_job_name = matcher_json["slurm_job_name"].get<std::string>();
-    if (matcher_json.contains("slurm_stepd_pid"))
-        matcher.slurm_stepd_pid = matcher_json["slurm_stepd_pid"].get<pid_t>();
+    matcher.addLegacyFields(matcher_json);
     return matcher;
 }
 

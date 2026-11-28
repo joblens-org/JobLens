@@ -16,8 +16,8 @@
 #include "core/job_identity.hpp"
 #include "common/utils.hpp"
 #include <unistd.h>
-#include "core/group_probe_stats.hpp"
-#include "common/classad_decode.hpp"
+#include "job_watcher/group_probe_stats.hpp"
+#include "job_watcher/classad_decode.hpp"
 #include <sys/stat.h>
 #include <fstream>
 #include <sstream>
@@ -37,6 +37,37 @@ namespace fs = std::filesystem;
 
 namespace CondorJob
 {
+
+/// 惰性获取 HTCondor COLLECTOR_HOST 作为集群名称。
+/// 首次调用时执行 condor_config_val 并缓存，后续直接返回（线程安全）。
+/// 返回值自动剥离端口号，保留完整域名。
+inline std::string collector_host() {
+    static const std::string cached = []() -> std::string {
+        std::array<char, 256> buf{};
+        std::string result;
+        std::unique_ptr<FILE, decltype(&pclose)> pipe(
+            popen("condor_config_val COLLECTOR_HOST 2>/dev/null", "r"),
+            pclose);
+        if (!pipe) return "";
+        while (fgets(buf.data(), static_cast<int>(buf.size()), pipe.get()))
+            result += buf.data();
+        if (!result.empty() && result.back() == '\n')
+            result.pop_back();
+        // 剥离端口号: "host.domain:9618" -> "host.domain"
+        auto pos = result.rfind(':');
+        if (pos != std::string::npos) {
+            bool all_digits = true;
+            for (size_t i = pos + 1; i < result.size(); ++i)
+                if (!std::isdigit(static_cast<unsigned char>(result[i]))) {
+                    all_digits = false; break;
+                }
+            if (all_digits) result.resize(pos);
+        }
+        return result;
+    }();
+    return cached;
+}
+
 
 // ---------------------------------------------------------------------------
 // Structured job-ad parsing for the discovery adapter

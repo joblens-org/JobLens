@@ -16,7 +16,7 @@
 
 #include "writer/prometheus_exporter_writer.hpp"
 #include "core/collector_type.h"
-#include "core/group_probe_stats.hpp"
+#include "job_watcher/group_probe_stats.hpp"
 #include "core/writer_manager.hpp"
 
 #include <algorithm>

@@ -14,8 +14,7 @@
 // Maintenance configuration contract. The scheduler identity here is the
 // ADAPTER REGISTRY NAME (open world, no enum): a new scheduler appears the
 // moment it registers and gets a `<name>_job_watcher` config section. The
-// resolver keeps the legacy auto_add_condorjob/auto_add_slurmjob folding as
-// explicit built-in special cases.
+// resolver folds legacy flags declared by adapters at registration.
 #pragma once
 
 #include <map>

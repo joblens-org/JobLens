@@ -148,19 +148,13 @@ SchedulerAdapterRegistry& SchedulerAdapterRegistry::instance()
     return registry;
 }
 
-void SchedulerAdapterRegistry::registerAdapter(const std::string& name, Factory factory)
+void SchedulerAdapterRegistry::registerAdapter(const std::string& name, Factory factory,
+                                                std::string legacy_auto_add_key)
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    // Find-then-store, never emplace-then-assign: a failed emplace may already
-    // have moved-from `factory`, and assigning it here would brick a stored
-    // factory with an empty function (every TU including job_registry.hpp runs
-    // the REGISTER_SCHEDULER_ADAPTER registrar once, so duplicates are the
-    // norm). Replacement is intentional: last registration wins.
-    auto it = factories_.find(name);
-    if (it == factories_.end())
-        factories_.emplace_hint(it, name, std::move(factory));
-    else
-        it->second = std::move(factory);
+    // Last registration wins; replace the factory and its metadata together.
+    factories_.insert_or_assign(name, Registration{std::move(factory),
+                                                   std::move(legacy_auto_add_key)});
 }
 
 bool SchedulerAdapterRegistry::known(const std::string& name) const
@@ -178,11 +172,22 @@ std::vector<std::string> SchedulerAdapterRegistry::names() const
     return out;
 }
 
+std::map<std::string, std::string> SchedulerAdapterRegistry::legacyAutoAddKeys() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::map<std::string, std::string> keys;
+    for (const auto& [name, registration] : factories_) {
+        if (!registration.legacy_auto_add_key.empty())
+            keys.emplace(name, registration.legacy_auto_add_key);
+    }
+    return keys;
+}
+
 std::unique_ptr<ISchedulerAdapter> SchedulerAdapterRegistry::build(
     const std::string& name, const SchedulerAdapterSettings& settings) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = factories_.find(name);
     if (it == factories_.end()) return nullptr;
-    return it->second(settings);
+    return it->second.factory(settings);
 }

@@ -19,9 +19,8 @@
 // decoding, identity validation and capability traits. Nothing in the store,
 // the registry or the RPC surface names a scheduler.
 //
-// Adding a scheduler type = declare its facts and its projections in a
-// self-contained adapter header/TU, add one line to the closed-variant
-// manifest in collector_type.h and one REGISTER_SCHEDULER_ADAPTER line. The
+// Adding a scheduler type = declare its facts and projections in a
+// self-contained adapter header/TU and register its factory. The
 // adapter then exists for jobs from every source; enabling its discovery
 // watcher is a separate deployment choice
 // (job_registry_config.auto_discovery_types).
@@ -332,29 +331,39 @@ public:
 
     // Registers (or replaces) the factory for `name`. Replacement keeps the
     // deterministic test harness simple.
-    void registerAdapter(const std::string& name, Factory factory);
+    void registerAdapter(const std::string& name, Factory factory,
+                         std::string legacy_auto_add_key = {});
 
     bool known(const std::string& name) const;
     std::vector<std::string> names() const;
+    // Adapter-declared compatibility aliases, available before construction.
+    std::map<std::string, std::string> legacyAutoAddKeys() const;
     // Builds one adapter; nullptr for an unknown name (callers report the
     // registered names instead of guessing).
     std::unique_ptr<ISchedulerAdapter> build(const std::string& name,
                                              const SchedulerAdapterSettings& settings) const;
 
 private:
+    struct Registration {
+        Factory factory;
+        std::string legacy_auto_add_key;
+    };
     mutable std::mutex mutex_;
-    std::map<std::string, Factory> factories_;
+    std::map<std::string, Registration> factories_;
 };
 
 // Registers an adapter factory at TU scope (dynamic init), mirroring
 // AUTO_REGISTER_COLLECTOR. Example:
 //   REGISTER_SCHEDULER_ADAPTER("condor", CondorSchedulerAdapter)
-#define REGISTER_SCHEDULER_ADAPTER(NAME, CLASS)                                \
+#define REGISTER_SCHEDULER_ADAPTER(NAME, CLASS) \
+    REGISTER_SCHEDULER_ADAPTER_WITH_LEGACY_FLAG(NAME, CLASS, "")
+
+#define REGISTER_SCHEDULER_ADAPTER_WITH_LEGACY_FLAG(NAME, CLASS, FLAG)           \
     static bool joblens_adapter_reg_##CLASS = [] {                             \
         SchedulerAdapterRegistry::instance().registerAdapter(                  \
             NAME, [](const SchedulerAdapterSettings& settings)                    \
                   -> std::unique_ptr<ISchedulerAdapter> {                      \
                       return std::make_unique<CLASS>(settings);                \
-                  });                                                          \
+                  }, FLAG);                                                    \
         return true;                                                           \
     }();

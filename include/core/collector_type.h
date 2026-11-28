@@ -12,6 +12,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #pragma once
+#include <algorithm>
+#include <tuple>
+#include <utility>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -25,6 +28,9 @@
 #include <variant>
 #include "common/struct2ltable.hpp"
 #include "core/job_identity.hpp"
+#include "core/job_groups.hpp"
+#include "core/sub_attr_reflect.hpp"
+#include "job_watcher/builtin_job_facts.hpp"
 #include <spdlog/spdlog.h>
 
 // Job is a concrete struct rather than a generic property bag: collectors and
@@ -44,22 +50,6 @@ inline const char* to_string(JobType t) {
         case JobType::Job: return "Job";
         case JobType::Sys: return "Sys";
         default:           return "Unknown";
-    }
-}
-
-enum class JobSubType{
-    Unknown = 0,
-    Common,
-    Condor,
-    Slurm
-};
-
-inline const char* to_string(JobSubType t) {
-    switch (t) {
-        case JobSubType::Common: return "Common";
-        case JobSubType::Condor: return "Condor";
-        case JobSubType::Slurm:  return "Slurm";
-        default:                 return "Unknown";
     }
 }
 
@@ -87,14 +77,6 @@ inline const char* to_string(CollectorScope scope) {
     }
 }
 
-// Scheduler facts are declared next to their adapter. This header only
-// assembles the closed variant and the generic helpers; it does not know a
-// scheduler's fields. The facts structs themselves carry the schema (see
-// sub_attr_reflect.hpp).
-#include "job_watcher/condor_adapter.hpp"
-#include "job_watcher/slurm_adapter.hpp"
-#include "core/sub_attr_reflect.hpp"
-
 struct CommonJobAttr {
     bool auto_update_child{}; //当为true时，每次采集时自动更新有没有子进程
 
@@ -106,134 +88,85 @@ struct CommonJobAttr {
 static_assert(joblens::facts::valid_schema<CommonJobAttr>(),
               "CommonJobAttr::field_names must cover every reflected member");
 
-using SubAttr = std::variant<CondorJobAttr, CommonJobAttr, SlurmJobAttr, nlohmann::json>;
-// The json alternative is the open-world facts channel: a scheduler
-// whose adapter registered after the built-ins carries its typed facts as a
-// JSON object the adapter owns (schema, keys, evolution). Built-in attrs
-// stay strongly typed so existing collectors and matchers are untouched.
+using SubAttr = JobFactStorage<CommonJobAttr>;
 
-// The closed variant's manifest: one line per typed adapter. This is the only
-// place a new typed scheduler is named in core; its facts struct and its
-// adapter registration live together in the adapter header.
-#define JOBLENS_SUB_ATTR_TABLE(X)     \
-    X(condor, CondorJobAttr, Condor)  \
-    X(slurm, SlurmJobAttr, Slurm)
+// A typed legacy adapter supplies its wire-key/member mapping next to its
+// facts. The open-world default uses JSON field matching instead.
+template <class Attr>
+constexpr auto legacy_matcher_fields(const Attr*) { return std::tuple<>{}; }
 
-inline const char* adapter_name_for(JobSubType subtype)
-{
-#define JOBLENS_SUB_ATTR_CASE(name, type, subtype_token) \
-    case JobSubType::subtype_token: return #name;
-    switch (subtype) {
-        JOBLENS_SUB_ATTR_TABLE(JOBLENS_SUB_ATTR_CASE)
-        default: return nullptr;
-    }
-#undef JOBLENS_SUB_ATTR_CASE
-}
-
-
-// SubAttr 匹配器，用于通过 sub_attr 字段匹配作业
 struct SubAttrMatcher {
-    // 通用匹配条件
-    std::optional<JobSubType> subtype;  // 匹配特定的子类型
-    
-    // CondorJobAttr 匹配字段
-    std::optional<size_t> condor_cluster_id;
-    std::optional<size_t> condor_proc_id;
-    std::optional<std::string> condor_owner;
-    std::optional<pid_t> condor_starter_pid;
-    
-    // SlurmJobAttr 匹配字段
-    std::optional<size_t> slurm_job_id;
-    std::optional<uint32_t> slurm_step_id;
-    std::optional<std::string> slurm_user;
-    std::optional<std::string> slurm_job_name;
-    std::optional<pid_t> slurm_stepd_pid;
-    
-    // CommonJobAttr 匹配字段（如果需要可以添加）
-
-    // 开放世界匹配（新调度器）：subtype_name 与 Job::subtype_name 比对；
-    // json_fields 对 sub_attr 的 JSON 成员做字段级子集匹配。
+    std::optional<JobSubType> subtype;
     std::optional<std::string> subtype_name;
     std::optional<nlohmann::json> json_fields;
 
-    // 检查是否匹配给定的 SubAttr
-    bool matches(const SubAttr& attr) const {        // 首先检查子类型
-        if (subtype.has_value()) {
-            JobSubType actual_subtype;
-            std::visit([&actual_subtype](const auto& a) {
-                using T = std::decay_t<decltype(a)>;
-                if constexpr (std::is_same_v<T, CondorJobAttr>) actual_subtype = JobSubType::Condor;
-                else if constexpr (std::is_same_v<T, SlurmJobAttr>) actual_subtype = JobSubType::Slurm;
-                else actual_subtype = JobSubType::Common;
-            }, attr);
-            if (actual_subtype != subtype.value()) return false;
-        }
-        
-        // 检查具体字段
-        return std::visit([this](const auto& a) -> bool {
-            using T = std::decay_t<decltype(a)>;
-            if constexpr (std::is_same_v<T, CondorJobAttr>) {
-                spdlog::debug("SubAttrMatcher: matching CondorJobAttr with cluster_id={}, proc_id={}, owner={}, starter_pid={}, scheduler_name={}, scheduler_host={}", 
-                    a.cluster_id, a.proc_id, a.owner, a.starter_pid, a.scheduler_name, a.scheduler_host);
-                if (condor_cluster_id.has_value() && a.cluster_id != condor_cluster_id.value()) return false;
-                if (condor_proc_id.has_value() && a.proc_id != condor_proc_id.value()) return false;
-                if (condor_owner.has_value() && a.owner != condor_owner.value()) return false;
-                if (condor_starter_pid.has_value() && a.starter_pid != condor_starter_pid.value()) return false;
-                spdlog::debug("SubAttrMatcher: CondorJobAttr matched successfully");
-                return true;
-            } else if constexpr (std::is_same_v<T, SlurmJobAttr>) {
-                spdlog::debug("SubAttrMatcher: matching SlurmJobAttr with job_id={}, step_id={}, user={}, job_name={}, stepd_pid={}", 
-                    a.job_id, a.step_id, a.user, a.job_name, a.stepd_pid);
-                if (slurm_job_id.has_value() && a.job_id != slurm_job_id.value()) return false;
-                if (slurm_step_id.has_value() && a.step_id != slurm_step_id.value()) return false;
-                if (slurm_user.has_value() && a.user != slurm_user.value()) return false;
-                if (slurm_job_name.has_value() && a.job_name != slurm_job_name.value()) return false;
-                if (slurm_stepd_pid.has_value() && a.stepd_pid != slurm_stepd_pid.value()) return false;
-                spdlog::debug("SubAttrMatcher: SlurmJobAttr matched successfully");
-                return true;
-            } else if constexpr (std::is_same_v<T, CommonJobAttr>) {
-                // Common has no typed identity fields, so a Common matcher
-                // cannot discriminate rows: never matching is the intended
-                // semantics (an explicit JobID, not the sub_attr, is the only
-                // Common handle). Over-matching would merge unrelated jobs.
-                spdlog::debug("SubAttrMatcher: CommonJobAttr has no identity fields to match");
+    template <class Attr, class Field>
+    void require(Field Attr::* member, Field value) {
+        typed_filters_.emplace_back([member, value = std::move(value)](const SubAttr& attr) {
+            const auto* facts = std::get_if<Attr>(&attr);
+            // Preserve the legacy contract: a field filter applies only to
+            // the facts type that owns it; subtype is a separate filter.
+            return facts == nullptr || facts->*member == value;
+        });
+    }
+
+    void addLegacyFields(const nlohmann::json& request) {
+        addLegacyFields(request, static_cast<const SubAttr*>(nullptr));
+    }
+
+    bool matches(const SubAttr& attr) const {
+        return std::visit([this, &attr](const auto& facts) {
+            using Attr = std::decay_t<decltype(facts)>;
+            constexpr auto tag = static_cast<const Attr*>(nullptr);
+            if (subtype && *subtype != legacy_subtype_of(tag)) return false;
+            if constexpr (std::is_same_v<Attr, CommonJobAttr>) {
+                // A Common job has no native facts to match; address it by JobID.
                 return false;
-            } else if constexpr (std::is_same_v<T, nlohmann::json>) {
-                // Open-world JSON facts: field-level subset match. Without
-                // json_fields the match is by presence (callers combine it
-                // with subtype_name at the Job level).
-                if (!json_fields.has_value()) return true;
-                for (auto it = json_fields->begin(); it != json_fields->end(); ++it) {
-                    if (!a.contains(it.key()) || a.at(it.key()) != it.value()) return false;
-                }
-                return true;
+            } else if constexpr (std::tuple_size_v<decltype(legacy_matcher_fields(tag))> != 0) {
+                return std::all_of(typed_filters_.begin(), typed_filters_.end(),
+                                   [&attr](const auto& filter) { return filter(attr); });
             } else {
-                // A future typed adapter: match through the JSON projection
-                // its generated to_json already produces. No core edit is
-                // needed when a new facts type joins the variant.
-                const nlohmann::json facts = a;
-                if (!json_fields.has_value()) return true;
+                if (!json_fields) return true;
+                const nlohmann::json& json = facts;
                 for (auto it = json_fields->begin(); it != json_fields->end(); ++it) {
-                    if (!facts.contains(it.key()) || facts.at(it.key()) != it.value()) return false;
+                    if (!json.contains(it.key()) || json.at(it.key()) != it.value()) return false;
                 }
                 return true;
             }
-            return false;
         }, attr);
     }
+
+private:
+    template <class... Attrs>
+    void addLegacyFields(const nlohmann::json& request, const std::variant<Attrs...>*) {
+        (addLegacyType(request, static_cast<const Attrs*>(nullptr)), ...);
+    }
+
+    template <class Attr>
+    void addLegacyType(const nlohmann::json& request, const Attr* tag) {
+        std::apply([&](const auto&... fields) {
+            (requireIfPresent(request, fields.first, fields.second), ...);
+        }, legacy_matcher_fields(tag));
+    }
+
+    template <class Attr, class Field>
+    void requireIfPresent(const nlohmann::json& request, const char* key, Field Attr::* member) {
+        const auto it = request.find(key);
+        if (it != request.end()) require(member, it->template get<Field>());
+    }
+
+    std::vector<std::function<bool(const SubAttr&)>> typed_filters_;
 };
 
-// The facts of one scheduled job. The execution evidence block proves which
-// local run produced them; the job itself is named by the facts.
 struct Job {
     uint64_t                              JobID{};
-    std::string                           JobNativeID{};   // 调度器原生作业ID字符串，用于查询（Condor: cluster_id.proc_id, Slurm: job_id.step_id）
+    std::string                           JobNativeID{};   // Scheduler-native id, preserved verbatim.
     // 命名空间公共字段是 typed sub_attr 的渲染投影（ES job_info 查询契约），
     // 不是第二事实源：哪个 attr 字段喂哪个分量由 adapter 拥有
-    //（Condor: collector_host/scheduler_name, Slurm: cluster name）。比较、
+    // 比较、
     // 判重与注入永远走结构化事实（ISchedulerAdapter 的 namespace 接口）。
-    std::string                           clusterTag{};    // 渲染：调度器标签（Condor=schedd 名）
-    std::string                           clusterName{};   // 渲染：集群名（Condor=COLLECTOR_HOST, Slurm=SLURM_CLUSTER_NAME）
+    std::string                           clusterTag{};    // Rendered scheduler tag.
+    std::string                           clusterName{};   // Rendered cluster label.
     JobType                                 jobtype{JobType::Unknown};
     JobSubType                              subtype{JobSubType::Unknown};
     // Projection of identity.adapter. Persisted next to the numeric subtype
@@ -370,62 +303,26 @@ inline bool matches_job(const SubAttrMatcher& matcher, const Job& job) {
 //     std::visit([&j](const auto& obj) { j = obj; }, v);
 // }
 
-// 组归属的统一只读访问器：组字段只存在于 sub_attr（源样，随调度器取值，
-// 对外 JSON/LevelDB 也只出现在 sub_attr 下，不再有顶层 groups 对象）。
-// writer/registry 通过本视图取值，不各自 std::visit 按 subtype 分支。
-// unix_gid 语义：-1 表示未知，内存/LevelDB/Lua/对外 JSON 一致。
-struct JobGroupView {
-    std::string acct_group;
-    std::string unix_group;
-    int64_t     unix_gid{-1};
+// Adapter overloads project group facts from their own schemas. A facts
+// type without such a projection has no supported group fields.
+template <class Attr>
+JobGroupView scheduler_groups(const Attr&) { return {}; }
 
-    bool empty() const {
-        return acct_group.empty() && unix_group.empty() && unix_gid < 0;
-    }
-};
+template <class Attr>
+bool backfill_scheduler_groups(Attr&, const Attr&) { return false; }
 
 inline JobGroupView getGroups(const Job& job) {
-    JobGroupView v;
-    std::visit([&v](const auto& attr) {
-        using T = std::decay_t<decltype(attr)>;
-        if constexpr (std::is_same_v<T, CondorJobAttr>) {
-            v.acct_group = attr.acct_group;
-            v.unix_group = attr.unix_group;
-        } else if constexpr (std::is_same_v<T, SlurmJobAttr>) {
-            v.acct_group = attr.acct_group;
-            v.unix_group = attr.unix_group;
-            v.unix_gid   = attr.unix_gid;
-        }
-        // CommonJobAttr 没有组字段，保持全空
-    }, job.sub_attr);
-    return v;
+    return std::visit([](const auto& facts) { return scheduler_groups(facts); }, job.sub_attr);
 }
 
-// Only missing group facts may be filled after creation. Identity, namespace
-// and the rest of the creation snapshot are unchanged.
+// Group facts can only fill empty slots; probe bookkeeping is common.
 inline bool fill_missing_groups(Job& target, const Job& source)
 {
-    bool changed = false;
-    const auto fill = [&](std::string& dst, const std::string& value) {
-        if (!dst.empty() || value.empty()) return;
-        dst = value;
-        changed = true;
-    };
-    if (auto* dst = std::get_if<CondorJobAttr>(&target.sub_attr)) {
-        if (const auto* src = std::get_if<CondorJobAttr>(&source.sub_attr)) {
-            fill(dst->acct_group, src->acct_group);
-            fill(dst->unix_group, src->unix_group);
-        }
-    } else if (auto* dst = std::get_if<SlurmJobAttr>(&target.sub_attr)) {
-        if (const auto* src = std::get_if<SlurmJobAttr>(&source.sub_attr)) {
-            fill(dst->acct_group, src->acct_group);
-            if (dst->unix_gid < 0 && src->unix_gid >= 0) {
-                dst->unix_gid = src->unix_gid;
-                changed = true;
-            }
-            if (dst->unix_gid == src->unix_gid) fill(dst->unix_group, src->unix_group);
-        }
-    }
+    const bool changed = std::visit([&source](auto& dst) {
+        using Attr = std::decay_t<decltype(dst)>;
+        const auto* src = std::get_if<Attr>(&source.sub_attr);
+        return src && backfill_scheduler_groups(dst, *src);
+    }, target.sub_attr);
     target.group_probed |= source.group_probed;
     if (!target.group_probed && source.group_probe_attempts > target.group_probe_attempts)
         target.group_probe_attempts = source.group_probe_attempts;
