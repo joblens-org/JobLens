@@ -19,10 +19,11 @@
 // decoding, identity validation and capability traits. Nothing in the store,
 // the registry or the RPC surface names a scheduler.
 //
-// Adding a scheduler type = declare its facts and its projections in a
-// self-contained adapter header/TU, add one line to the closed-variant
-// manifest in collector_type.h, add one REGISTER_SCHEDULER_ADAPTER line and
-// one job_registry_config.types entry.
+// Adding a scheduler type = declare its facts and projections in a
+// self-contained adapter header/TU and register its factory. The
+// adapter then exists for jobs from every source; enabling its discovery
+// watcher is a separate deployment choice
+// (job_registry_config.auto_discovery_types).
 #pragma once
 
 #include <sys/types.h>
@@ -60,8 +61,12 @@ enum class AutoAdd {
     Rule,
 };
 
-// Resolved settings for one scheduler type, keyed by adapter name.
-// `enabled` mirrors job_registry_config.types membership;
+// Resolved settings for one scheduler adapter, keyed by adapter name. They
+// exist for every registered adapter, whether or not its discovery source is
+// armed: an adapter answers for jobs from any source (discovery, manual
+// registration, restored rows).
+// `auto_discovery_enabled` mirrors job_registry_config.auto_discovery_types
+// membership: it arms the discovery watcher only, never the adapter itself.
 // `auto_add` resolution precedence:
 //   explicit <type>_job_watcher.auto_add (off/default/rule)  wins
 //   otherwise derived from the legacy pair:
@@ -70,8 +75,8 @@ enum class AutoAdd {
 //     auto_collect=true + use_rules=true  -> Rule
 //   with job_registry_config.auto_add_<type>job (legacy) folded into
 //   auto_collect first.
-struct DiscoveryTypeSettings {
-    bool enabled = false;
+struct SchedulerAdapterSettings {
+    bool auto_discovery_enabled = false;
     // DEPRECATED as an input contract: auto_collect/use_rules (and the
     // explicit/legacy provenance flags below) remain parsed and tracked as
     // the mapping sources for one more schema version; consumers read the
@@ -140,7 +145,7 @@ public:
     // Discovery: the authoritative passes and targeted hints.
     virtual IDiscoverySource& source() = 0;
     // Per-type discovery options derived from the resolved settings.
-    virtual DiscoveryOptions discoveryOptions(const DiscoveryTypeSettings& settings) const = 0;
+    virtual DiscoveryOptions discoveryOptions(const SchedulerAdapterSettings& settings) const = 0;
 
     // Legacy (schema < 2) decode: typed facts from a stored JSON row. The
     // adapter owns the whole record projection: common fields, pids, typed
@@ -175,6 +180,30 @@ public:
     virtual void applyRequestFacts(Job& job, const nlohmann::json& request) const
     {
         (void)job; (void)request;
+    }
+
+    // Registration-time fact completion: derives the execution-scope facts the
+    // request did not carry (the execution cgroup and its supervisor pid) from
+    // the process evidence the job already names. Fill-empty only — a fact the
+    // request or a discovery watcher supplied always wins. The registry calls
+    // this on the manual create path before the record is built, so the first
+    // kernel activation already has a cgroup mapping to seed and the periodic
+    // refresh expands the whole execution scope instead of the named pids.
+    virtual void deriveExecutionFacts(Job& job) const
+    {
+        (void)job;
+    }
+
+    // Fill-empty counterpart of deriveExecutionFacts for the periodic refresh:
+    // completes an adapter-owned execution fact the RECORD never carried (for
+    // example a cgroup derived after registration, when the member pid was not
+    // readable yet) from the refreshed image. Only empty slots are written;
+    // identity, namespace and every existing value stay frozen. Returns true
+    // when a fact was completed, so the caller persists and re-reports it.
+    virtual bool completeRefreshedFacts(Job& target, const Job& refreshed) const
+    {
+        (void)target; (void)refreshed;
+        return false;
     }
 
     // The typed-facts duplicate screen. Default: no typed fields; callers
@@ -296,35 +325,45 @@ protected:
 class SchedulerAdapterRegistry {
 public:
     using Factory = std::function<std::unique_ptr<ISchedulerAdapter>(
-        const DiscoveryTypeSettings& settings)>;
+        const SchedulerAdapterSettings& settings)>;
 
     static SchedulerAdapterRegistry& instance();
 
     // Registers (or replaces) the factory for `name`. Replacement keeps the
     // deterministic test harness simple.
-    void registerAdapter(const std::string& name, Factory factory);
+    void registerAdapter(const std::string& name, Factory factory,
+                         std::string legacy_auto_add_key = {});
 
     bool known(const std::string& name) const;
     std::vector<std::string> names() const;
+    // Adapter-declared compatibility aliases, available before construction.
+    std::map<std::string, std::string> legacyAutoAddKeys() const;
     // Builds one adapter; nullptr for an unknown name (callers report the
     // registered names instead of guessing).
     std::unique_ptr<ISchedulerAdapter> build(const std::string& name,
-                                             const DiscoveryTypeSettings& settings) const;
+                                             const SchedulerAdapterSettings& settings) const;
 
 private:
+    struct Registration {
+        Factory factory;
+        std::string legacy_auto_add_key;
+    };
     mutable std::mutex mutex_;
-    std::map<std::string, Factory> factories_;
+    std::map<std::string, Registration> factories_;
 };
 
 // Registers an adapter factory at TU scope (dynamic init), mirroring
 // AUTO_REGISTER_COLLECTOR. Example:
 //   REGISTER_SCHEDULER_ADAPTER("condor", CondorSchedulerAdapter)
-#define REGISTER_SCHEDULER_ADAPTER(NAME, CLASS)                                \
+#define REGISTER_SCHEDULER_ADAPTER(NAME, CLASS) \
+    REGISTER_SCHEDULER_ADAPTER_WITH_LEGACY_FLAG(NAME, CLASS, "")
+
+#define REGISTER_SCHEDULER_ADAPTER_WITH_LEGACY_FLAG(NAME, CLASS, FLAG)           \
     static bool joblens_adapter_reg_##CLASS = [] {                             \
         SchedulerAdapterRegistry::instance().registerAdapter(                  \
-            NAME, [](const DiscoveryTypeSettings& settings)                    \
+            NAME, [](const SchedulerAdapterSettings& settings)                    \
                   -> std::unique_ptr<ISchedulerAdapter> {                      \
                       return std::make_unique<CLASS>(settings);                \
-                  });                                                          \
+                  }, FLAG);                                                    \
         return true;                                                           \
     }();

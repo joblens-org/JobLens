@@ -245,10 +245,6 @@ DiscoveryOptions fixture_options(const Fixture& fixture,
     options.discovery.proc_root = fixture.proc.string();
     options.discovery.cgroup_root = fixture.cgroup.string();
     options.discovery.clusterName = clusterName;
-    // The fixture's slot cgroups live at <cgroup>/htcondor/slotN: the
-    // cgroup-subtree enumeration tier must engage for the condor cases
-    // (slurm ignores the field).
-    options.starter_cgroup_subtree = "htcondor";
     options.clock = [] { return kFakeNowMs; };
     return options;
 }
@@ -345,7 +341,7 @@ DiscoverySink discovery_sink(JobSink on_job)
 
 void condor_pass_finds_fixture_job(const Fixture& fixture)
 {
-    CondorJobWatcher watcher(fixture_options(fixture));
+    CondorJobWatcher watcher(fixture_options(fixture), "htcondor");
     check(watcher.health().state == SourceState::Initializing,
           "a fresh adapter starts in SourceState::Initializing");
     check(!watcher.polling(), "constructing a discovery adapter must not start polling");
@@ -417,7 +413,7 @@ void condor_pass_finds_fixture_job(const Fixture& fixture)
 
 void condor_incomplete_observations_are_not_published(const Fixture& fixture)
 {
-    CondorJobWatcher watcher(fixture_options(fixture));
+    CondorJobWatcher watcher(fixture_options(fixture), "htcondor");
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "condor pass must succeed: " + pass.set.error);
 
@@ -446,8 +442,7 @@ void condor_incomplete_observations_are_not_published(const Fixture& fixture)
 void slurm_pass_finds_fixture_job(const Fixture& fixture)
 {
     auto options = fixture_options(fixture, "");
-    options.discovery.slurm_spool_dir = fixture.slurmd.string();
-    SlurmJobWatcher watcher(options);
+    SlurmJobWatcher watcher(options, fixture.slurmd.string());
 
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "slurm pass must succeed on the fixture: " + pass.set.error);
@@ -467,7 +462,7 @@ void slurm_pass_finds_fixture_job(const Fixture& fixture)
     check(slurm_step_attr.step_id == 3,
           "step id must be the normalized member step");
     auto slurm_selector = selector_of(*job);
-    if (const auto step_name = slurm_step_name(slurm_step_attr.step_id))
+    if (const auto step_name = SlurmJob::special_step_name(slurm_step_attr.step_id))
         slurm_selector.step_id = *step_name;
     else
         slurm_selector.step_id = std::to_string(slurm_step_attr.step_id);
@@ -510,8 +505,8 @@ void slurm_pass_finds_fixture_job(const Fixture& fixture)
 void slurm_spool_root_is_pass_coverage(const Fixture& fixture)
 {
     auto options = fixture_options(fixture, "");
-    options.discovery.slurm_spool_dir = (fixture.root / "missing-spool").string();
-    SlurmJobWatcher watcher(options);
+    const auto spool = fixture.root / "missing-spool";
+    SlurmJobWatcher watcher(options, spool.string());
 
     const auto failed = watcher.enumerateManagers();
     check(!failed.complete,
@@ -526,8 +521,7 @@ void slurm_spool_root_is_pass_coverage(const Fixture& fixture)
           "an incomplete pass degrades the source");
     check(health.consecutive_failures == 1, "the failure count must advance");
 
-    options.discovery.slurm_spool_dir = fixture.slurmd.string();
-    watcher.set_discovery_environment(options.discovery);
+    fs::create_directories(spool);
     const auto recovered = watcher.enumerateManagers();
     check(recovered.error.empty() && recovered.complete,
           "the pass recovers once the spool root is readable: " + recovered.error);
@@ -544,7 +538,7 @@ void health_degrades_and_recovers(const Fixture& fixture)
 {
     auto options = fixture_options(fixture);
     options.discovery.proc_root = (fixture.root / "missing-proc").string();
-    CondorJobWatcher watcher(options);
+    CondorJobWatcher watcher(options, "htcondor");
     check(watcher.health().state == SourceState::Initializing, "starts initializing");
 
     const auto failed = watcher.enumerateManagers();
@@ -572,7 +566,7 @@ void health_degrades_and_recovers(const Fixture& fixture)
 
 void rescan_request_is_consumed(const Fixture& fixture)
 {
-    CondorJobWatcher watcher(fixture_options(fixture));
+    CondorJobWatcher watcher(fixture_options(fixture), "htcondor");
     watcher.request_rescan();
     check(watcher.health().rescan_requested, "a rescan request must be visible in health");
     watcher.enumerateManagers();
@@ -582,7 +576,7 @@ void rescan_request_is_consumed(const Fixture& fixture)
 void construction_does_nothing_until_start(const Fixture& fixture)
 {
     // The only construction path: no Config read, no eBPF load, no thread.
-    CondorJobWatcher watcher(fixture_options(fixture));
+    CondorJobWatcher watcher(fixture_options(fixture), "htcondor");
     check(!watcher.polling(), "a fresh adapter must not poll");
     check(!watcher.thread_joinable(), "a fresh adapter must not own a thread");
     check(!watcher.health().polling, "health must not report polling before start()");
@@ -599,7 +593,7 @@ void construction_does_nothing_until_start(const Fixture& fixture)
 
 void observe_hint_targets_one_execution(const Fixture& fixture)
 {
-    CondorJobWatcher condor(fixture_options(fixture));
+    CondorJobWatcher condor(fixture_options(fixture), "htcondor");
     // 4110 is a member process whose parent is the starter 4101.
     const auto targeted = condor.observeForHint(4110);
     check(targeted.has_value(), "a hint under a starter must resolve");
@@ -616,8 +610,7 @@ void observe_hint_targets_one_execution(const Fixture& fixture)
           "a pid whose parent is not a starter must not resolve");
 
     auto slurm_options = fixture_options(fixture, "");
-    slurm_options.discovery.slurm_spool_dir = (fixture.slurmd).string();
-    SlurmJobWatcher slurm(slurm_options);
+    SlurmJobWatcher slurm(slurm_options, fixture.slurmd.string());
     // 5110's parent is the stepd 5101 of job 9002 step 3.
     const auto step = slurm.observeForHint(5110);
     check(step.has_value(), "a hint under a stepd must resolve");
@@ -630,7 +623,7 @@ void observe_hint_targets_one_execution(const Fixture& fixture)
 
 void polymorphic_source_interface(const Fixture& fixture)
 {
-    CondorJobWatcher condor(fixture_options(fixture));
+    CondorJobWatcher condor(fixture_options(fixture), "htcondor");
     SlurmJobWatcher slurm(fixture_options(fixture, ""));
 
     IDiscoverySource* sources[] = {&condor, &slurm};
@@ -659,7 +652,7 @@ void polymorphic_source_interface(const Fixture& fixture)
 
 void lifecycle_is_safe(const Fixture& fixture)
 {
-    CondorJobWatcher watcher(fixture_options(fixture));
+    CondorJobWatcher watcher(fixture_options(fixture), "htcondor");
 
     std::atomic<int> delivered{0};
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -739,7 +732,7 @@ ProcessLivenessProbe recording_probe(std::vector<pid_t>& asked, pid_t dead_pid)
 
 void condor_adapter_refresh_evidence(const Fixture& fixture)
 {
-    CondorSchedulerAdapter adapter(DiscoveryTypeSettings{});
+    CondorSchedulerAdapter adapter(SchedulerAdapterSettings{});
     auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
     check(watcher != nullptr,
           "the condor adapter must expose its watcher through source()");
@@ -821,7 +814,7 @@ void condor_adapter_refresh_evidence(const Fixture& fixture)
 
 void slurm_adapter_refresh_evidence(const Fixture& fixture)
 {
-    SlurmSchedulerAdapter adapter(DiscoveryTypeSettings{});
+    SlurmSchedulerAdapter adapter(SchedulerAdapterSettings{});
     auto* watcher = dynamic_cast<SlurmJobWatcher*>(&adapter.source());
     check(watcher != nullptr, "the slurm adapter must expose its watcher through source()");
     watcher->set_discovery_environment(fixture_options(fixture, "").discovery);
@@ -878,7 +871,7 @@ void condor_refresh_without_cgroup_reads_children(const Fixture& fixture)
     // The kernel's per-task children file is the only membership source here.
     write_file(fixture.proc / "4601" / "task" / "4601" / "children", "4610\n");
 
-    CondorSchedulerAdapter adapter(DiscoveryTypeSettings{});
+    CondorSchedulerAdapter adapter(SchedulerAdapterSettings{});
     auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
     check(watcher != nullptr, "the condor adapter must expose its watcher");
     watcher->set_discovery_environment(fixture_options(fixture).discovery);
@@ -911,6 +904,299 @@ void condor_refresh_without_cgroup_reads_children(const Fixture& fixture)
 }
 
 
+// A manual registration (no discovery watcher) names only the member pids and
+// never carries the slot cgroup. 0.3.8 derived that cgroup from the member's
+// own /proc/<pid>/cgroup and expanded the whole execution scope on every read;
+// 0.4.0 must do the same, or the collectors only ever see the wrapper process.
+// Registered last for the shared-fixture reason: it adds its own slot.
+void condor_refresh_derives_cgroup_from_member(const Fixture& fixture)
+{
+    make_process(fixture.proc, 4801, "condor_starter", 1, 7501, {}, "/htcondor/slot5");
+    make_process(fixture.proc, 4810, "sleep", 4801, 7510, {{}}, "/htcondor/slot5");
+    make_process(fixture.proc, 4811, "sleep", 4801, 7511, {{}}, "/htcondor/slot5");
+    make_process(fixture.proc, 4812, "sleep", 4801, 7512, {{}}, "/htcondor/slot5");
+    make_cgroup(fixture.cgroup, "/htcondor/slot5", {4801, 4810, 4811, 4812});
+
+    CondorSchedulerAdapter adapter(SchedulerAdapterSettings{});
+    auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
+    check(watcher != nullptr, "the condor adapter must expose its watcher");
+    watcher->set_discovery_environment(fixture_options(fixture).discovery);
+
+    // The record a manual registration produces: one known member, no cgroup
+    // path and no starter pid.
+    Job job;
+    job.subtype = JobSubType::Condor;
+    job.subtype_name = "condor";
+    job.JobNativeID = "76226350.0";
+    CondorJobAttr attr;
+    attr.cluster_id = 76226350;
+    attr.collector_host = "htcondor-fixture";
+    job.sub_attr = attr;
+    job.execution.pid_identities = {ProcessIdentity{4810, 0, {}}};
+
+    std::vector<pid_t> asked;
+    const RefreshResult result = adapter.refreshFacts(
+        job, recording_probe(asked, 0), make_cgroup_membership_probe());
+
+    const auto& derived = std::get<CondorJobAttr>(job.sub_attr);
+    check(derived.slots_cgroup_path ==
+              (fixture.cgroup / "htcondor" / "slot5").string(),
+          "a missing cgroup path must be derived from the member's /proc cgroup, "
+          "got '" + derived.slots_cgroup_path + "'");
+    check(derived.starter_pid == 4801,
+          "a missing starter pid must be derived from the member's parent, got " +
+              std::to_string(derived.starter_pid));
+    const auto members = member_pids(job);
+    check(members.size() == 3 && members[0] == 4810 && members[1] == 4811 &&
+              members[2] == 4812,
+          "the derived cgroup must expand the whole execution scope, got " +
+              std::to_string(members.size()) + " pid(s)");
+    check(job.execution.pid_identities_authoritative,
+          "a readable slot cgroup makes the derived member list authoritative");
+    check(job.execution.manager.pid == 4801 &&
+              job.execution.manager.start_ticks == 7501,
+          "the derived starter must be the member's complete parent identity");
+    check(result.manager == LivenessState::Alive,
+          "the refresh must still report the caller's manager liveness");
+}
+
+// A cgroup path the record already carries (discovery watcher facts, or an
+// explicit request value) is the recorded fact: the derivation must not run on
+// that branch at all. The record here keeps starter_pid 0 on purpose — a
+// derivation pass would fill it, so the assertion observes the branch.
+void condor_refresh_keeps_recorded_cgroup(const Fixture& fixture)
+{
+    CondorSchedulerAdapter adapter(SchedulerAdapterSettings{});
+    auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
+    check(watcher != nullptr, "the condor adapter must expose its watcher");
+    watcher->set_discovery_environment(fixture_options(fixture).discovery);
+
+    Job job = condor_refresh_record(fixture);  // slot1 path recorded, no starter pid
+    std::vector<pid_t> asked;
+    adapter.refreshFacts(job, recording_probe(asked, 4101),
+                         make_cgroup_membership_probe());
+
+    const auto& kept = std::get<CondorJobAttr>(job.sub_attr);
+    check(kept.slots_cgroup_path ==
+              (fixture.cgroup / "htcondor" / "slot1").string(),
+          "a recorded cgroup path must never be re-derived, got '" +
+              kept.slots_cgroup_path + "'");
+    check(kept.starter_pid == 0,
+          "the derivation must not run when the record already carries a cgroup, got "
+          "starter pid " + std::to_string(kept.starter_pid));
+    const auto members = member_pids(job);
+    check(members.size() == 2 && members[0] == 4110 && members[1] == 4111,
+          "the recorded cgroup still supplies the member set");
+}
+
+// A derived path whose cgroup.procs cannot be read is missing evidence, not
+// termination: the recorded members stay, nothing crashes, no empty scope is
+// claimed — and the unproven path is not recorded (the scope proof needs the
+// readable cgroup, both for the daemon-tree check and to know the scope is
+// current).
+void condor_refresh_unreadable_derived_cgroup_keeps_members(const Fixture& fixture)
+{
+    make_process(fixture.proc, 4831, "condor_starter", 1, 7531, {}, "/htcondor/gone");
+    make_process(fixture.proc, 4830, "sleep", 4831, 7530, {{}}, "/htcondor/gone");
+    // Deliberately no <cgroup>/htcondor/gone/cgroup.procs in the fixture.
+
+    CondorSchedulerAdapter adapter(SchedulerAdapterSettings{});
+    auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
+    check(watcher != nullptr, "the condor adapter must expose its watcher");
+    watcher->set_discovery_environment(fixture_options(fixture).discovery);
+
+    Job job;
+    job.subtype = JobSubType::Condor;
+    job.subtype_name = "condor";
+    CondorJobAttr attr;
+    attr.cluster_id = 76226351;
+    attr.collector_host = "htcondor-fixture";
+    job.sub_attr = attr;
+    job.execution.pid_identities = {ProcessIdentity{4830, 0, {}}};
+
+    std::vector<pid_t> asked;
+    const RefreshResult result = adapter.refreshFacts(
+        job, recording_probe(asked, 0), make_cgroup_membership_probe());
+
+    check(std::get<CondorJobAttr>(job.sub_attr).slots_cgroup_path.empty(),
+          "an unreadable cgroup is no scope proof, so its path must not be recorded");
+    const auto members = member_pids(job);
+    check(members.size() == 1 && members[0] == 4830,
+          "an unreadable cgroup is not evidence, so the known member survives");
+    check(!result.cgroup_empty_confirmed,
+          "an unreadable cgroup can never be reported as confirmed empty");
+}
+
+// A node without per-job cgroups keeps the daemons and every job in one
+// service cgroup. Deriving that path would make kernel attribution claim the
+// whole daemon tree, so the derivation must reject it exactly like the
+// discovery reader does.
+void condor_refresh_rejects_daemon_shared_derived_cgroup(const Fixture& fixture)
+{
+    make_process(fixture.proc, 4900, "condor_master", 1, 7540, {}, "/htcondor/shared");
+    make_process(fixture.proc, 4901, "condor_starter", 4900, 7541, {}, "/htcondor/shared");
+    make_process(fixture.proc, 4910, "sleep", 4901, 7542, {{}}, "/htcondor/shared");
+    make_cgroup(fixture.cgroup, "/htcondor/shared", {4900, 4901, 4910});
+    make_children(fixture.proc, 4901, {4910});
+
+    CondorSchedulerAdapter adapter(SchedulerAdapterSettings{});
+    auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
+    check(watcher != nullptr, "the condor adapter must expose its watcher");
+    watcher->set_discovery_environment(fixture_options(fixture).discovery);
+
+    Job job;
+    job.subtype = JobSubType::Condor;
+    job.subtype_name = "condor";
+    CondorJobAttr attr;
+    attr.cluster_id = 76226352;
+    attr.collector_host = "htcondor-fixture";
+    job.sub_attr = attr;
+    job.execution.pid_identities = {ProcessIdentity{4910, 0, {}}};
+
+    std::vector<pid_t> asked;
+    adapter.refreshFacts(job, recording_probe(asked, 0), make_cgroup_membership_probe());
+
+    const auto& derived = std::get<CondorJobAttr>(job.sub_attr);
+    check(derived.slots_cgroup_path.empty(),
+          "a daemon-shared cgroup must never be recorded as the job's scope, got '" +
+              derived.slots_cgroup_path + "'");
+    check(derived.starter_pid == 4901,
+          "the supervisor itself is still a valid fact");
+    const auto members = member_pids(job);
+    check(members.size() == 1 && members[0] == 4910,
+          "the member set falls back to the starter's children, not the daemon tree");
+    check(!job.execution.pid_identities_authoritative,
+          "a children-only fallback is partial evidence");
+}
+
+// The registration request may carry the evidence itself. Explicit values are
+// validated against this host's discovery roots and then win over derivation.
+void condor_request_facts_accept_explicit_evidence(const Fixture& fixture)
+{
+    CondorSchedulerAdapter adapter(SchedulerAdapterSettings{});
+    auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
+    check(watcher != nullptr, "the condor adapter must expose its watcher");
+    watcher->set_discovery_environment(fixture_options(fixture).discovery);
+
+    const std::string slot_path = (fixture.cgroup / "htcondor" / "slot1").string();
+    nlohmann::json request;
+    request["JobPIDs"] = {4110};
+    request["sub_attr"] = {
+        {"cluster_id", 76226337u},
+        {"proc_id", 0u},
+        {"starter_pid", 4101},
+        {"slots_cgroup_path", slot_path},
+        {"job_ad_path", fixture.good_ad.string()},
+    };
+
+    Job job;
+    set_pids(job, {4110});
+    adapter.applyRequestFacts(job, request);
+
+    const auto& attr = std::get<CondorJobAttr>(job.sub_attr);
+    check(attr.cluster_id == 76226337 && attr.proc_id == 0,
+          "the typed cluster/proc pair must still come from the request");
+    check(attr.starter_pid == 4101,
+          "an explicit starter pid must be kept, got " + std::to_string(attr.starter_pid));
+    check(attr.slots_cgroup_path == slot_path,
+          "an explicit cgroup path must be kept, got '" + attr.slots_cgroup_path + "'");
+    check(attr.job_ad_path == fixture.good_ad.string(),
+          "an explicit job ad path must be kept, got '" + attr.job_ad_path + "'");
+
+    // A recorded fact is never re-derived: the periodic refresh keeps the
+    // explicit path and starter as they were supplied.
+    std::vector<pid_t> refreshed_asked;
+    adapter.refreshFacts(job, recording_probe(refreshed_asked, 0),
+                         make_cgroup_membership_probe());
+    const auto& refreshed = std::get<CondorJobAttr>(job.sub_attr);
+    check(refreshed.slots_cgroup_path == slot_path,
+          "the refresh must keep the explicit cgroup path, got '" +
+              refreshed.slots_cgroup_path + "'");
+    check(refreshed.starter_pid == 4101,
+          "the refresh must keep the explicit starter pid, got " +
+              std::to_string(refreshed.starter_pid));
+
+    // A path outside the configured cgroup root says nothing about this host's
+    // execution scopes: it is refused, never stored as a fact.
+    nlohmann::json outside;
+    outside["JobPIDs"] = {4110};
+    outside["sub_attr"] = {
+        {"cluster_id", 76226338u},
+        {"proc_id", 0u},
+        {"slots_cgroup_path", "/etc"},
+    };
+    Job rejected;
+    set_pids(rejected, {4110});
+    adapter.applyRequestFacts(rejected, outside);
+    check(std::get<CondorJobAttr>(rejected.sub_attr).slots_cgroup_path.empty(),
+          "a cgroup path outside cgroup_root must not be recorded");
+
+    // An explicit starter that is not a live process is not evidence either.
+    nlohmann::json dead_starter;
+    dead_starter["JobPIDs"] = {4110};
+    dead_starter["sub_attr"] = {
+        {"cluster_id", 76226339u},
+        {"proc_id", 0u},
+        {"starter_pid", 999999},
+    };
+    Job unresolved;
+    set_pids(unresolved, {4110});
+    adapter.applyRequestFacts(unresolved, dead_starter);
+    check(std::get<CondorJobAttr>(unresolved.sub_attr).starter_pid == 0,
+          "an unreadable explicit starter pid must not be recorded");
+
+    // A shared daemon cgroup is not this job's scope even when the request
+    // names it explicitly: the scope proof applies to explicit values too.
+    make_process(fixture.proc, 4950, "condor_master", 1, 7560, {}, "/htcondor/shared2");
+    make_process(fixture.proc, 4951, "condor_starter", 4950, 7561, {{}}, "/htcondor/shared2");
+    make_process(fixture.proc, 4960, "sleep", 4951, 7562, {{}}, "/htcondor/shared2");
+    make_cgroup(fixture.cgroup, "/htcondor/shared2", {4950, 4951, 4960});
+    nlohmann::json shared;
+    shared["JobPIDs"] = {4960};
+    shared["sub_attr"] = {
+        {"cluster_id", 76226341u},
+        {"proc_id", 0u},
+        {"starter_pid", 4951},
+        {"slots_cgroup_path", (fixture.cgroup / "htcondor" / "shared2").string()},
+    };
+    Job shared_target;
+    set_pids(shared_target, {4960});
+    adapter.applyRequestFacts(shared_target, shared);
+    check(std::get<CondorJobAttr>(shared_target.sub_attr).slots_cgroup_path.empty(),
+          "an explicit daemon-shared cgroup must not be recorded");
+
+    // A slot name is resolved under the adapter's slot subtree and kept only
+    // when the directory exists and proves job-scoped.
+    make_cgroup(fixture.cgroup, "/system.slice/htcondor/slot7", {4101, 4110});
+    nlohmann::json by_slot;
+    by_slot["JobPIDs"] = {4110};
+    by_slot["sub_attr"] = {
+        {"cluster_id", 76226342u},
+        {"proc_id", 0u},
+        {"slot", "slot7"},
+    };
+    Job slot_target;
+    set_pids(slot_target, {4110});
+    adapter.applyRequestFacts(slot_target, by_slot);
+    check(std::get<CondorJobAttr>(slot_target.sub_attr).slots_cgroup_path ==
+              (fixture.cgroup / "system.slice" / "htcondor" / "slot7").string(),
+          "a slot hint must resolve to its readable slot cgroup, got '" +
+              std::get<CondorJobAttr>(slot_target.sub_attr).slots_cgroup_path + "'");
+
+    nlohmann::json missing_slot;
+    missing_slot["JobPIDs"] = {4110};
+    missing_slot["sub_attr"] = {
+        {"cluster_id", 76226343u},
+        {"proc_id", 0u},
+        {"slot", "slot-does-not-exist"},
+    };
+    Job missing_target;
+    set_pids(missing_target, {4110});
+    adapter.applyRequestFacts(missing_target, missing_slot);
+    check(std::get<CondorJobAttr>(missing_target.sub_attr).slots_cgroup_path.empty(),
+          "a slot naming a directory that does not exist must not be recorded");
+}
+
 // ---------------------------------------------------------------------------
 // Regression: the classic HTCondor layout where _CONDOR_JOB_AD lives on the
 // job child process, not on the starter (the old exec-event watcher read it
@@ -932,7 +1218,7 @@ void condor_ad_on_member_process_is_found(const Fixture& fixture)
                  {{"_CONDOR_JOB_AD", ad.string()}}, "/htcondor/slot4");
     make_cgroup(fixture.cgroup, "/htcondor/slot4", {4401, 4410});
 
-    CondorJobWatcher watcher(fixture_options(fixture));
+    CondorJobWatcher watcher(fixture_options(fixture), "htcondor");
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
     const auto* job = find_complete(pass.jobs, "76226340.0");
@@ -942,7 +1228,7 @@ void condor_ad_on_member_process_is_found(const Fixture& fixture)
           "the ad metadata must come from the member's ad");
 
     // The exec-hint path must prefer the hinted pid's own environment.
-    CondorJobWatcher hints(fixture_options(fixture));
+    CondorJobWatcher hints(fixture_options(fixture), "htcondor");
     const auto targeted = hints.observeForHint(4410);
     check(targeted.has_value(), "a hint for the job process must resolve");
     check(targeted->JobNativeID == "76226340.0",
@@ -974,8 +1260,7 @@ void condor_without_cgroup_still_resolves_members(const Fixture& fixture)
     make_children(fixture.proc, 4501, {4510, 4511});
 
     auto options = fixture_options(fixture);
-    options.starter_cgroup_subtree.clear();   // this layout predates slot cgroups
-    CondorJobWatcher watcher(options);
+    CondorJobWatcher watcher(options);  // this layout predates slot cgroups
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
     const auto* job = find_complete(pass.jobs, "76226341.0");
@@ -999,8 +1284,7 @@ void condor_without_cgroup_still_resolves_members(const Fixture& fixture)
 void condor_cgroup_subtree_missing_falls_back(const Fixture& fixture)
 {
     auto options = fixture_options(fixture);
-    options.starter_cgroup_subtree = "no-such-subtree";
-    CondorJobWatcher watcher(options);
+    CondorJobWatcher watcher(options, "no-such-subtree");
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(),
           "the pass must succeed despite the missing subtree: " + pass.set.error);
@@ -1023,8 +1307,7 @@ void condor_cgroup_subtree_without_starters_falls_back(const Fixture& fixture)
     write_file(empty_subtree / "slot1" / "cgroup.procs", "");
 
     auto options = fixture_options(fixture);
-    options.starter_cgroup_subtree = "htcondor-empty";
-    CondorJobWatcher watcher(options);
+    CondorJobWatcher watcher(options, "htcondor-empty");
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty() && pass.set.complete,
           "a starter-less subtree must fall back to a complete pass: " + pass.set.error);
@@ -1051,7 +1334,7 @@ void condor_pass_owns_health(const Fixture& fixture)
     std::int64_t now_ms = kFakeNowMs;
     auto options = fixture_options(fixture);
     options.clock = [&now_ms] { return now_ms; };
-    CondorJobWatcher watcher(options);
+    CondorJobWatcher watcher(options, "htcondor");
 
     const auto first = watcher.enumerateManagers();
     check(first.error.empty() && first.complete,
@@ -1090,9 +1373,8 @@ void slurm_pass_owns_health(const Fixture& fixture)
 {
     std::int64_t now_ms = kFakeNowMs;
     auto options = fixture_options(fixture, "");
-    options.discovery.slurm_spool_dir = fixture.slurmd.string();
     options.clock = [&now_ms] { return now_ms; };
-    SlurmJobWatcher watcher(options);
+    SlurmJobWatcher watcher(options, fixture.slurmd.string());
 
     const auto first = watcher.enumerateManagers();
     check(first.error.empty() && first.complete,
@@ -1135,7 +1417,7 @@ void condor_observe_matches_enumerated_managers(const Fixture& /*shared*/)
                "GlobalJobId = \"scheduler@schedd07.fixture#76226339.0#1775723895\"\n"
                "Owner = \"carol\"\n");
 
-    CondorJobWatcher watcher(fixture_options(fixture));
+    CondorJobWatcher watcher(fixture_options(fixture), "htcondor");
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
     check(pass.jobs.size() == 3,
@@ -1196,8 +1478,7 @@ void slurm_observe_matches_enumerated_managers(const Fixture& /*shared*/)
     make_cgroup(fixture.cgroup, "/slurm/job_9003/step_1", {5201, 5210});
 
     auto options = fixture_options(fixture, "");
-    options.discovery.slurm_spool_dir = fixture.slurmd.string();
-    SlurmJobWatcher watcher(options);
+    SlurmJobWatcher watcher(options, fixture.slurmd.string());
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
     check(pass.jobs.size() == 2,
@@ -1265,8 +1546,7 @@ void condor_daemon_shared_cgroup_falls_back(const Fixture& /*shared*/)
     make_children(fixture.proc, 4701, {4710});
 
     auto options = fixture_options(fixture);
-    options.starter_cgroup_subtree.clear();  // the service cgroup is not a slot dir
-    CondorJobWatcher watcher(options);
+    CondorJobWatcher watcher(options);  // the service cgroup is not a slot dir
     const auto pass = run_pass(watcher);
     check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
     const auto* job = find_complete(pass.jobs, "76226342.0");
@@ -1326,6 +1606,195 @@ void slurm_empty_cgroup_stays_authoritative(const Fixture& /*shared*/)
 
 } // namespace
 
+
+// A refresh must read the RECORDED job-scoped cgroup even when the ad path
+// succeeds. Real HTCondor layouts put the starter in the daemon cgroup
+// (`/system.slice/condor.service`), where the ad reader only sees the starter's
+// direct children; letting that observation replace the membership froze the
+// record at one pid while the slot cgroup held the whole execution.
+void condor_refresh_prefers_recorded_cgroup_over_starter_children(const Fixture&)
+{
+    Fixture local;
+    make_fixture(local, "joblens-refresh-recorded-cgroup");
+
+    make_process(local.proc, 4001, "condor_master", 1, 7000, {}, "/system.slice/condor.service");
+    make_process(local.proc, 4101, "condor_starter", 4001, 7001,
+                 {{"_CONDOR_JOB_AD", local.good_ad.string()}},
+                 "/system.slice/condor.service");
+    // The execution scope: wrapper -> worker -> payload, all in the slot cgroup.
+    make_process(local.proc, 4110, "wrapper", 4101, 7010, {}, "/htcondor/slot1");
+    make_process(local.proc, 4111, "worker", 4110, 7011, {}, "/htcondor/slot1");
+    make_process(local.proc, 4112, "payload", 4111, 7012, {}, "/htcondor/slot1");
+    make_cgroup(local.cgroup, "/system.slice/condor.service", {4001, 4101});
+    make_cgroup(local.cgroup, "/htcondor/slot1", {4110, 4111, 4112});
+    make_children(local.proc, 4101, {4110});
+
+    CondorSchedulerAdapter adapter(SchedulerAdapterSettings{});
+    auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
+    check(watcher != nullptr, "the condor adapter must expose its watcher");
+    watcher->set_discovery_environment(fixture_options(local).discovery);
+
+    Job job;
+    job.subtype = JobSubType::Condor;
+    job.subtype_name = "condor";
+    job.JobNativeID = "105712203.0";
+    CondorJobAttr attr;
+    attr.starter_pid = 4101;
+    attr.slots_cgroup_path = (local.cgroup / "htcondor" / "slot1").string();
+    job.sub_attr = attr;
+    job.execution.pid_identities = {ProcessIdentity{4110, 7010, "boot-fixture-0001"}};
+
+    adapter.refreshFacts(job, make_proc_liveness_probe(local.proc.string(), "boot-fixture-0001"),
+                         make_cgroup_membership_probe());
+
+    const auto members = member_pids(job);
+    check(members.size() == 3,
+          "a record with a job-scoped cgroup must refresh from that cgroup, not from "
+          "the starter's children; got " + std::to_string(members.size()) + " member(s)");
+    check(members[0] == 4110 && members[1] == 4111 && members[2] == 4112,
+          "the slot cgroup members must be adopted in ascending order");
+}
+
+// The derivation anchor must be a member whose parent is a real condor_starter;
+// a manual request carries a sorted pid list, so the first entry can be a
+// grandchild. Anchoring on a fixed position used to give up while the record
+// already named a resolvable member.
+void condor_derive_scans_members_for_supervisor(const Fixture& fixture)
+{
+    // A grandchild under the wrapper is *not* an anchor.
+    make_process(fixture.proc, 4120, "grandchild", 4110, 7020, {}, "/htcondor/slot1");
+    make_cgroup(fixture.cgroup, "/htcondor/slot1", {4101, 4110, 4111, 4120});
+
+    CondorSchedulerAdapter adapter(SchedulerAdapterSettings{});
+    auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter.source());
+    check(watcher != nullptr, "the condor adapter must expose its watcher");
+    watcher->set_discovery_environment(fixture_options(fixture).discovery);
+
+    Job job;
+    job.subtype = JobSubType::Condor;
+    job.subtype_name = "condor";
+    job.JobNativeID = "105679866.5";
+    job.sub_attr = CondorJobAttr{};
+    job.execution.pid_identities = {
+        ProcessIdentity{4120, 7020, "boot-fixture-0001"},
+        ProcessIdentity{4111, 7011, "boot-fixture-0001"},
+    };
+
+    adapter.deriveExecutionFacts(job);
+
+    const auto& attr = std::get<CondorJobAttr>(job.sub_attr);
+    check(attr.starter_pid == 4101,
+          "the derivation must find the starter through any member, got starter " +
+              std::to_string(attr.starter_pid));
+    check(attr.slots_cgroup_path == (fixture.cgroup / "htcondor" / "slot1").string(),
+          "the derivation must record the member's slot cgroup, got '" +
+              attr.slots_cgroup_path + "'");
+}
+
+// Slurm's batch step does not export SLURM_STEP_ID (the kernel only names it in
+// the step cgroup). The watcher must take the step from "<job_N>/step_<name>"
+// instead of dropping the job, while an environment/cgroup step disagreement is
+// still unresolved (never silently pick one).
+void slurm_batch_step_derived_from_cgroup(const Fixture& /*shared*/)
+{
+    Fixture fixture;
+    make_fixture(fixture, "/tmp/job_watcher_scan_slurm_batch_step");
+
+    // batch step: no SLURM_STEP_ID in the member environment.
+    make_process(fixture.proc, 5301, "slurmstepd", 1, 8200,
+                 {{"SLURM_VERSION", "23.11"}}, "/slurm/job_9101/step_batch");
+    make_process(fixture.proc, 5310, "bash", 5301, 8210,
+                 {{"SLURM_JOB_ID", "9101"},
+                  {"SLURM_CLUSTER_NAME", "slurm-fixture"},
+                  {"SLURM_JOB_USER", "alice"}},
+                 "/slurm/job_9101/step_batch");
+    make_cgroup(fixture.cgroup, "/slurm/job_9101/step_batch", {5301, 5310});
+
+    // srun step 0: environment and cgroup agree.
+    make_process(fixture.proc, 5321, "slurmstepd", 1, 8220,
+                 {{"SLURM_VERSION", "23.11"}}, "/slurm/job_9102/step_0");
+    make_process(fixture.proc, 5330, "sleep", 5321, 8230,
+                 {{"SLURM_JOB_ID", "9102"},
+                  {"SLURM_STEP_ID", "0"},
+                  {"SLURM_CLUSTER_NAME", "slurm-fixture"}},
+                 "/slurm/job_9102/step_0");
+    make_cgroup(fixture.cgroup, "/slurm/job_9102/step_0", {5321, 5330});
+
+    // extern step: also named only by the cgroup.
+    make_process(fixture.proc, 5341, "slurmstepd", 1, 8240,
+                 {{"SLURM_VERSION", "23.11"}}, "/slurm/job_9103/step_extern");
+    make_process(fixture.proc, 5350, "sleep", 5341, 8250,
+                 {{"SLURM_JOB_ID", "9103"},
+                  {"SLURM_CLUSTER_NAME", "slurm-fixture"}},
+                 "/slurm/job_9103/step_extern");
+    make_cgroup(fixture.cgroup, "/slurm/job_9103/step_extern", {5341, 5350});
+
+    // Conflicting environment and cgroup step: unresolved, never published.
+    make_process(fixture.proc, 5361, "slurmstepd", 1, 8260,
+                 {{"SLURM_VERSION", "23.11"}}, "/slurm/job_9104/step_2");
+    make_process(fixture.proc, 5370, "sleep", 5361, 8270,
+                 {{"SLURM_JOB_ID", "9104"},
+                  {"SLURM_STEP_ID", "1"},
+                  {"SLURM_CLUSTER_NAME", "slurm-fixture"}},
+                 "/slurm/job_9104/step_2");
+    make_cgroup(fixture.cgroup, "/slurm/job_9104/step_2", {5361, 5370});
+
+    auto options = fixture_options(fixture, "");
+    SlurmJobWatcher watcher(options, fixture.slurmd.string());
+    const auto pass = run_pass(watcher);
+    check(pass.set.error.empty(), "the pass must succeed: " + pass.set.error);
+    // The shared base fixture contributes its two stepds (9002 publishes,
+    // 9003 stays unobservable); four more are added here.
+    check(pass.set.managers.size() == 6,
+          "six stepds must name six managers, got " +
+              std::to_string(pass.set.managers.size()));
+    check(pass.jobs.size() == 4 && pass.unobservable == 2,
+          "batch/step0/extern must publish and the conflict must not, got jobs=" +
+              std::to_string(pass.jobs.size()) + " unobservable=" +
+              std::to_string(pass.unobservable));
+
+    const auto* batch = find_complete(pass.jobs, "9101");
+    check(batch != nullptr, "the batch step must be derived from the step cgroup");
+    if (batch) {
+        const auto& attr = std::get<SlurmJobAttr>(batch->sub_attr);
+        check(attr.step_id == SlurmJob::kSlurmBatchStepValue,
+              "the batch step must use SLURM_BATCH_SCRIPT");
+        check(attr.clusterName == "slurm-fixture",
+              "the namespace must survive a missing SLURM_STEP_ID, got '" +
+                  attr.clusterName + "'");
+        auto selector = selector_of(*batch);
+        if (const auto name = SlurmJob::special_step_name(attr.step_id)) selector.step_id = *name;
+        const auto identity = canonicalize(selector);
+        check(identity && identity->key() == "slurm|slurm-fixture|9101|batch",
+              "the batch identity must stay (job, step), got " +
+                  (identity ? identity->key() : std::string("<none>")));
+        check(attr.cgroup_path ==
+                  (fixture.cgroup / "slurm" / "job_9101" / "step_batch").string(),
+              "the batch step cgroup path must be recorded, got " + attr.cgroup_path);
+    }
+
+    const auto* step_zero = find_complete(pass.jobs, "9102");
+    check(step_zero != nullptr, "the srun step 0 must still publish");
+    if (step_zero) {
+        check(std::get<SlurmJobAttr>(step_zero->sub_attr).step_id == 0,
+              "environment and cgroup step 0 must agree");
+    }
+
+    const auto* extern_step = find_complete(pass.jobs, "9103");
+    check(extern_step != nullptr, "the extern step must be derived from the step cgroup");
+    if (extern_step) {
+        check(std::get<SlurmJobAttr>(extern_step->sub_attr).step_id == SlurmJob::kSlurmExternStepValue,
+              "the extern step must use SLURM_EXTERN_CONT");
+    }
+
+    check(find_complete(pass.jobs, "9104") == nullptr,
+          "an environment/cgroup step disagreement must not publish");
+    for (const auto& discovered : pass.jobs) {
+        check(execution_complete(discovered.execution),
+              "a published slurm discovery must carry complete execution evidence");
+    }
+}
+
 int main(int argc, char** argv)
 {
     const std::string base =
@@ -1375,10 +1844,27 @@ int main(int argc, char** argv)
             {"condor_daemon_shared_cgroup_falls_back",
              condor_daemon_shared_cgroup_falls_back},
             {"slurm_empty_cgroup_stays_authoritative", slurm_empty_cgroup_stays_authoritative},
+            {"slurm_batch_step_derived_from_cgroup", slurm_batch_step_derived_from_cgroup},
             // Fact refresh without a readable cgroup, appended last: it adds
             // its own starter/child pair to the shared fixture.
             {"condor_refresh_without_cgroup_reads_children",
              condor_refresh_without_cgroup_reads_children},
+            // Manual-registration fact completion, appended last for the same
+            // shared-fixture reason.
+            {"condor_refresh_derives_cgroup_from_member",
+             condor_refresh_derives_cgroup_from_member},
+            {"condor_refresh_keeps_recorded_cgroup",
+             condor_refresh_keeps_recorded_cgroup},
+            {"condor_refresh_unreadable_derived_cgroup_keeps_members",
+             condor_refresh_unreadable_derived_cgroup_keeps_members},
+            {"condor_refresh_rejects_daemon_shared_derived_cgroup",
+             condor_refresh_rejects_daemon_shared_derived_cgroup},
+            {"condor_request_facts_accept_explicit_evidence",
+             condor_request_facts_accept_explicit_evidence},
+            {"condor_refresh_prefers_recorded_cgroup_over_starter_children",
+             condor_refresh_prefers_recorded_cgroup_over_starter_children},
+            {"condor_derive_scans_members_for_supervisor",
+             condor_derive_scans_members_for_supervisor},
         };
 
         for (const auto& test : tests) {

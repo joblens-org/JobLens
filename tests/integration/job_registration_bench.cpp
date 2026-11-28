@@ -563,6 +563,7 @@ int main(int argc, char** argv)
     if (args.register_rules > 0) {
         const auto rules_dir = fs::path(out_dir) / "register-rules";
         write_probe_rules(rules_dir, args.register_rules);
+        options.test_auto_policy_adapter = "condor";
         options.test_auto_policy = [rules_dir]() {
             return AutoCollectorPolicy::rules(rules_dir.string(), "condor_job_");
         };
@@ -579,7 +580,7 @@ int main(int argc, char** argv)
     // desired-state commit path only. Actual attachment belongs to the
     // scheduler and is not part of this number.
 
-    DiscoveryTypeSettings settings;
+    SchedulerAdapterSettings settings;
     settings.clusterName = args.cluster;
     auto adapter = SchedulerAdapterRegistry::instance().build("condor", settings);
     if (!adapter) {

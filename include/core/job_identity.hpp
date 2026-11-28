@@ -37,14 +37,6 @@
 // Scheduler identity — the adapter name (string)
 // ---------------------------------------------------------------------------
 //
-// Shared code never branches on a scheduler. The adapter registry name IS the
-// identity ("condor", "slurm", "ssh", ...); the built-in names below are data,
-// not a type. Empty string means "unresolved". Per-scheduler native-id
-// knowledge lives in self-registered rules (NativeIdRuleRegistry), mirroring
-// REGISTER_SCHEDULER_ADAPTER.
-inline constexpr const char* kAdapterCondor = "condor";
-inline constexpr const char* kAdapterSlurm = "slurm";
-
 // Normalizes a wire/persisted scheduler name: lowercase, whitespace-stripped.
 // Unknown names are NOT errors here (open world); call sites that need a
 // registered adapter validate against SchedulerAdapterRegistry.
@@ -77,36 +69,16 @@ struct LegacyId {
 LegacyId parse_job_id(const nlohmann::json& node);
 
 // ---------------------------------------------------------------------------
-// Slurm step identity
-// ---------------------------------------------------------------------------
-
-// Wire step_id is a string. Numeric steps canonicalize without leading zeros
-// ("07" -> "7"); the special step names keep their identity and are never
-// parsed as numbers (in particular they never collapse to the numeric step
-// "0"). Returns nullopt for values that cannot name a step.
-std::optional<std::string> normalize_slurm_step_id(const std::string& raw);
-
-// Explicit conversion table at the adapter boundary: scheduler-specific
-// numeric constants map to and from the canonical special step names. The
-// values mirror slurm/slurm.h (SLURM_BATCH_SCRIPT / SLURM_EXTERN_CONT) used by
-// slurmstepd: the batch step is 0xfffffffe, the extern step is 0xfffffffd.
-inline constexpr uint32_t kSlurmBatchStepValue = 0xfffffffeu;
-inline constexpr uint32_t kSlurmExternStepValue = 0xfffffffeu - 1u;  // 0xfffffffd
-std::optional<std::string> slurm_step_name(uint32_t numeric_step);
-std::optional<uint32_t> slurm_step_value(const std::string& step_id);
-
-// ---------------------------------------------------------------------------
 // Native selector (query side) and process identity (evidence leaf)
 // ---------------------------------------------------------------------------
 
 struct NativeSelector {
     std::string adapter;            // adapter registry name; empty = unresolved
     std::string clusterName;  // resolved cluster namespace (never empty)
-    // Condor schedd / tag namespace; required by Condor when the cluster has
-    // more than one schedd. Optional for Slurm.
+    // Optional adapter-defined namespace component.
     std::string clusterTag;
     std::string job_native_id;  // original native string, preserved verbatim
-    // Slurm only; empty means "the logical job, no step claim". Use
+    // Adapter-defined execution selector; empty means no step claim. Use
     // scope=instance selectors with a step for step-exact targeting.
     std::string step_id;
 };
@@ -135,7 +107,7 @@ struct SchedulerKey {
     std::string cluster_namespace;   // clusterName plus tag when applicable
     std::string job_native_id;       // original native string, preserved
     std::string canonical_native;    // numeric-normalized form used for keys
-    std::string step_id;             // normalized Slurm step, or empty
+    std::string step_id;             // normalized adapter-defined step, or empty
 
     bool complete() const
     {
@@ -168,21 +140,13 @@ inline bool execution_complete(const ExecutionEvidence& evidence)
 }
 
 // ---------------------------------------------------------------------------
-// Native-id rule helpers (used by the built-in adapters' rules)
+// Shared decimal helper for native-id rules
 // ---------------------------------------------------------------------------
 
 // Leading zeros are tolerated on native components; the canonical numeric
-// value removes them so "012.3" and "12.3" name the same job. Nullopt for
+// value removes them. Nullopt for
 // anything that is not pure decimal digits.
 std::optional<std::string> strip_leading_zeros(const std::string& decimal);
-
-// Condor native id: "<ClusterId>.<ProcId>", both decimal, both non-empty,
-// canonicalized through strip_leading_zeros.
-struct CondorNativeId {
-    std::string cluster;
-    std::string proc;
-};
-std::optional<CondorNativeId> parse_condor_native(const std::string& raw);
 
 // ---------------------------------------------------------------------------
 // Native-id rules (per-adapter, self-registered)
@@ -190,9 +154,8 @@ std::optional<CondorNativeId> parse_condor_native(const std::string& raw);
 
 // What one adapter's rule derives from a selector: the canonical native form
 // used in identity keys, the cluster namespace and the normalized step. The
-// rule owns every scheduler-specific detail (Condor: "cluster.proc" plus the
-// schedd tag namespace, no steps; Slurm: job number with optional normalized
-// step). Returning nullopt means "this selector cannot name a job of mine" —
+// rule owns every scheduler-specific detail. Returning nullopt means
+// "this selector cannot name a job of mine" —
 // an incomplete observation, never a guess.
 struct CanonicalParts {
     std::string canonical_native;

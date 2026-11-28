@@ -27,10 +27,13 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
 #include "core/scheduler_adapter.hpp"
+#include "core/job_groups.hpp"
 #include "core/sub_attr_reflect.hpp"
 
 struct CondorJobAttr {
@@ -65,9 +68,21 @@ struct CondorJobAttr {
 static_assert(joblens::facts::valid_schema<CondorJobAttr>(),
               "CondorJobAttr::field_names must cover every reflected member");
 
+inline constexpr auto legacy_matcher_fields(const CondorJobAttr*)
+{
+    return std::make_tuple(
+        std::pair{"condor_cluster_id", &CondorJobAttr::cluster_id},
+        std::pair{"condor_proc_id", &CondorJobAttr::proc_id},
+        std::pair{"condor_owner", &CondorJobAttr::owner},
+        std::pair{"condor_starter_pid", &CondorJobAttr::starter_pid});
+}
+
+JobGroupView scheduler_groups(const CondorJobAttr& facts);
+bool backfill_scheduler_groups(CondorJobAttr& target, const CondorJobAttr& source);
+
 class CondorSchedulerAdapter final : public ISchedulerAdapter {
 public:
-    explicit CondorSchedulerAdapter(const DiscoveryTypeSettings& settings);
+    explicit CondorSchedulerAdapter(const SchedulerAdapterSettings& settings);
     ~CondorSchedulerAdapter() override;
 
     const std::string& name() const override;
@@ -75,7 +90,7 @@ public:
     IDiscoverySource& source() override;
     AdapterTraits traits() const override;
 
-    DiscoveryOptions discoveryOptions(const DiscoveryTypeSettings& settings) const override;
+    DiscoveryOptions discoveryOptions(const SchedulerAdapterSettings& settings) const override;
 
     // ---- typed facts / record projection ---------------------------------
     Job decodeFacts(const nlohmann::json& row) const override;
@@ -84,6 +99,8 @@ public:
 
     NativeSelector registrationSelector(const Job& job) const override;
     void applyRequestFacts(Job& job, const nlohmann::json& request) const override;
+    void deriveExecutionFacts(Job& job) const override;
+    bool completeRefreshedFacts(Job& target, const Job& refreshed) const override;
     SubAttrMatcher duplicateMatcher(const Job& job) const override;
 
     // ---- per-record fact refresh (condor_starter is the manager) ----------

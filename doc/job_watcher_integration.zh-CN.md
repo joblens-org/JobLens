@@ -39,8 +39,10 @@ src/ebpf/trace_ssh_session.bpf.c          # 可选：exec-hint 事件源
 1. **注册（`main()` 之前）：** TU 作用域的 `REGISTER_SCHEDULER_ADAPTER("ssh",
    SshSchedulerAdapter)` 把工厂函数插入 `SchedulerAdapterRegistry`——和
    `AUTO_REGISTER_COLLECTOR` 同一套约定。
-2. **装配（`JobRegistry::armDiscovery()`，由注册表构造函数调用）：** 配置解析出的
-   `job_registry_config.types` 逐项通过注册表构建，每种类型恰好一个 adapter。
+2. **装配（`JobRegistry::buildAdapters()`，在 store 恢复记录之前；随后
+   `armDiscovery()` 武装发现源）：** 解析后的每适配器 settings 构建且每种已注册
+   调度器恰好一个 adapter；`job_registry_config.auto_discovery_types` 只决定启动哪些
+   发现源，未启用的 adapter 仍服务手工注册、恢复记录、事实刷新与内核归因。
    adapter 是**唯一**知道该调度器属性 schema、身份格式和能力的东西。
 3. **运行：** 心跳驱动 adapter 的 `IDiscoverySource`：`enumerateManagers()`
    枚举一遍 pass 里的全部存活 per-job manager（不读 job ad、不读成员），
@@ -154,7 +156,7 @@ store/intent 所有。
 ### 第 1 步 — 最小共享接线
 
 调度器逻辑只住在 watcher 和 adapter 里。adapter 名字就是处处通行的调度器
-身份：配置 `types` 是启动时对注册表校验的名字，`<name>_job_watcher` 配置节
+身份：`auto_discovery_types` 是启动时对注册表校验的名字，`<name>_job_watcher` 配置节
 按约定解析，native-id 规则自注册（`REGISTER_NATIVE_ID_RULE`），非内置调度器
 的 facts 走 `SubAttr` 的 JSON 通道（配 `subtype_name`），身份/cgroup 推导经
 `ISchedulerAdapter` 接口分派。
@@ -278,7 +280,7 @@ ssh_job_watcher:
   cluster_name: ""            # 空：从源环境推导
 ```
 
-并在 `job_registry_config.types: [condor, slurm, ssh]` 里列出
+并在 `job_registry_config.auto_discovery_types: [condor, slurm, ssh]` 里列出（仅启动发现 Watcher；adapter 始终存在）
 该类型。不列出则该类型保持休眠；心跳仍会维护该类型的既有记录。
 
 ### 第 7 步 — 测试
@@ -325,7 +327,7 @@ ssh_job_watcher:
 |---|---|
 | `include/core/job_registry.hpp`（或任一已编译 TU） | include adapter 头，使其 `REGISTER_SCHEDULER_ADAPTER` 注册器被链接 |
 | `include/core/job_discovery.hpp` | 可选：特殊 `DiscoveryEnvironment` 根字段（如 spool 目录） |
-| `config/config.example.yaml` | `<t>_job_watcher` 配置节 + `job_registry_config.types` 一项 |
+| `config/config.example.yaml` | `<t>_job_watcher` 配置节 + `job_registry_config.auto_discovery_types` 一项 |
 
 `collector_type.h`、`job_identity`、`maintenance_config`、`JobStore`、
 心跳/移除逻辑、`KernelAttribution`、RPC 方法、trigger 均**不需要改动**：

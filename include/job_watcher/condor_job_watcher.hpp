@@ -12,7 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. */
 #pragma once
-#include "common/condor_job.hpp"
+#include "job_watcher/condor_job.hpp"
 #include <spdlog/spdlog.h>
 #include <fmt/core.h>
 #include "common/ebpf_common.hpp"
@@ -46,7 +46,8 @@
 class CondorJobWatcher final : public IDiscoverySource{
 public:
     // Options only: nothing is loaded and nothing polls until start().
-    explicit CondorJobWatcher(DiscoveryOptions options);
+    explicit CondorJobWatcher(DiscoveryOptions options,
+                              std::string starter_cgroup_subtree = {});
 
     ~CondorJobWatcher() override { stop(); }
 
@@ -156,6 +157,8 @@ private:
 
     std::string name_{"condor"};
     DiscoveryOptions options_;
+    // Relative to the cgroup mount. Empty or unreadable falls back to /proc.
+    std::string starter_cgroup_subtree_;
     std::string rb_name = "exec_events";
 
     // Lifecycle of the poll thread.
@@ -184,8 +187,10 @@ private:
 // Inline definitions (header-only adapter, no .cpp in the monolithic build)
 // ---------------------------------------------------------------------------
 
-inline CondorJobWatcher::CondorJobWatcher(DiscoveryOptions options)
-    : options_(std::move(options))
+inline CondorJobWatcher::CondorJobWatcher(DiscoveryOptions options,
+                                           std::string starter_cgroup_subtree)
+    : options_(std::move(options)),
+      starter_cgroup_subtree_(std::move(starter_cgroup_subtree))
 {
     if (!options_.enable_event_source)
         event_source_note_ =
@@ -573,9 +578,9 @@ inline std::vector<pid_t> CondorJobWatcher::enumerate_starters(
 {
     std::vector<pid_t> starters;
     // Tier 1: the slot cgroup subtree, when one is configured.
-    if (!options_.starter_cgroup_subtree.empty()) {
+    if (!starter_cgroup_subtree_.empty()) {
         const std::string subtree_root =
-            (std::filesystem::path(env.cgroup_root) / options_.starter_cgroup_subtree)
+            (std::filesystem::path(env.cgroup_root) / starter_cgroup_subtree_)
                 .lexically_normal()
                 .string();
         if (enumerate_starters_from_cgroup(env, subtree_root, starters)) {
@@ -664,7 +669,7 @@ inline std::optional<Job> CondorJobWatcher::observe_starter(const DiscoveryEnvir
     job.subtype = JobSubType::Condor;
 
     std::string clusterName = env.clusterName;
-    if (clusterName.empty()) clusterName = Utils::get_condor_collector_host();
+    if (clusterName.empty()) clusterName = CondorJob::collector_host();
     if (clusterName.empty())
         reasons.push_back("condor cluster namespace unresolved (COLLECTOR_HOST unavailable)");
     job.clusterName = clusterName;

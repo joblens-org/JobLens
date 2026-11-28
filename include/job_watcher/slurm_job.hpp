@@ -13,9 +13,9 @@
  * limitations under the License. */
 #pragma once
 #include "core/collector_type.h"
-#include "core/job_identity.hpp"
-#include "core/group_probe_stats.hpp"
-#include "common/classad_decode.hpp"
+#include "job_watcher/slurm_step.hpp"
+#include "job_watcher/group_probe_stats.hpp"
+#include "job_watcher/classad_decode.hpp"
 #include "common/utils.hpp"
 #include <unistd.h>
 #include <grp.h>
@@ -80,8 +80,8 @@ inline std::optional<std::uint64_t> parse_job_id(const std::string& raw, std::st
     return value;
 }
 
-// SLURM_STEP_ID -> numeric step value. The special batch/extern constants stay
-// distinct from numeric steps (see slurm_step_name in core/job_identity.hpp).
+// SLURM_STEP_ID -> numeric step value. Diagnostics and canonical projection
+// use the same adapter-local step codec below.
 inline std::optional<std::uint32_t> parse_step_id(const std::string& raw, std::string& error){
     const auto value = detail::parse_decimal_u64(raw);
     if (!value || *value > std::numeric_limits<std::uint32_t>::max()) {
@@ -91,12 +91,42 @@ inline std::optional<std::uint32_t> parse_step_id(const std::string& raw, std::s
     return static_cast<std::uint32_t>(*value);
 }
 
-// Adapter-boundary conversion: numeric step -> canonical wire step_id. batch and
-// extern keep their names, every other value is its decimal form; nothing is
-// ever mapped to a different step.
-inline std::string step_id_name(std::uint32_t numeric_step){
-    if (const auto special = slurm_step_name(numeric_step)) return *special;
-    return std::to_string(numeric_step);
+// cgroup 路径里的 step 段。Slurm 在 ".../job_<id>/step_<name>" 下为每个 step
+// 建 cgroup；batch step 不导出 SLURM_STEP_ID，step 身份只在这里有权威名字。
+// 只接受 step_batch / step_extern / step_<十进制普通 step>，其它形态返回
+// nullopt——发现层不据此猜身份。
+struct CgroupJobStep {
+    std::uint64_t job_id{0};
+    std::uint32_t step{0};
+};
+
+inline std::optional<CgroupJobStep> parse_cgroup_job_step(const std::string& path)
+{
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    while (start <= path.size()) {
+        const std::size_t end = path.find('/', start);
+        const std::size_t stop = end == std::string::npos ? path.size() : end;
+        if (stop > start) parts.push_back(path.substr(start, stop - start));
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    for (std::size_t index = 0; index + 1 < parts.size(); ++index) {
+        const std::string& job = parts[index];
+        if (job.size() <= 4 || job.compare(0, 4, "job_") != 0) continue;
+        std::string error;
+        const auto job_id = parse_job_id(job.substr(4), error);
+        if (!job_id) continue;
+        const std::string& step = parts[index + 1];
+        if (step.size() <= 5 || step.compare(0, 5, "step_") != 0) continue;
+        const std::string name = step.substr(5);
+        if (const auto special = special_step_value(name))
+            return CgroupJobStep{*job_id, *special};
+        const auto value = detail::parse_decimal_u64(name);
+        if (!value || *value >= kSlurmMaxNormalStepId) continue;
+        return CgroupJobStep{*job_id, static_cast<std::uint32_t>(*value)};
+    }
+    return std::nullopt;
 }
 
 inline std::string clusterName(pid_t pid = 0){

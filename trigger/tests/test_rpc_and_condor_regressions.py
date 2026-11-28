@@ -376,3 +376,84 @@ def test_find_pids_by_slot_rejects_malformed_starter_pid(monkeypatch: pytest.Mon
 
     with pytest.raises(RuntimeError, match="condor_starter"):
         tools.find_pids_by_slot("slot117")
+
+
+def test_find_slot_processes_returns_starter_and_member_cgroup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ps_output = "117 condor_starter /usr/sbin/condor_starter -f slot117@worker"
+
+    def fake_subprocess_run(args, text, stdout, stderr):
+        return _completed_process(ps_output)
+
+    monkeypatch.setattr(tools.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(tools, "run", lambda command, check=True: "condor_starter(117)---python(3000)")
+    monkeypatch.setattr(tools, "_find_docker_container_by_slot", lambda slot, starter_pid: None)
+    monkeypatch.setattr(
+        tools, "_read_cgroup_path", lambda pid: f"/sys/fs/cgroup/htcondor/slot{pid}"
+    )
+
+    starter_pid, pids, cgroup_path = tools.find_slot_processes("slot117")
+
+    assert starter_pid == 117
+    assert pids == [3000]
+    # The cgroup comes from the first member, never from the starter (which on
+    # this layout sits in the daemon cgroup).
+    assert cgroup_path == "/sys/fs/cgroup/htcondor/slot3000"
+
+
+def test_add_condorjob_forwards_starter_and_cgroup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tools,
+        "find_slot_processes",
+        lambda slot: (5001, [5002, 5003], "/sys/fs/cgroup/htcondor/slot1"),
+    )
+    captured: dict = {}
+
+    def fake_job_opt(data):
+        captured["data"] = data
+        return {"status": "ok"}
+
+    monkeypatch.setattr(tools, "job_opt", fake_job_opt)
+
+    tools.add_condorjob(
+        {
+            "slot": "slot1",
+            "JobID": 105712203,
+            "sub_attr": {"cluster_id": 105712203, "proc_id": 0},
+        }
+    )
+
+    data = captured["data"]
+    assert data["JobPIDs"] == [5002, 5003]
+    assert data["sub_attr"]["starter_pid"] == 5001
+    assert data["sub_attr"]["slots_cgroup_path"] == "/sys/fs/cgroup/htcondor/slot1"
+
+
+def test_add_condorjob_keeps_explicit_scope_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        tools,
+        "find_slot_processes",
+        lambda slot: (5001, [5002], "/sys/fs/cgroup/htcondor/slot1"),
+    )
+    captured: dict = {}
+    monkeypatch.setattr(tools, "job_opt", lambda data: captured.setdefault("data", data))
+
+    tools.add_condorjob(
+        {
+            "slot": "slot1",
+            "JobID": 105712204,
+            "sub_attr": {
+                "cluster_id": 105712204,
+                "proc_id": 0,
+                "starter_pid": 9001,
+                "slots_cgroup_path": "/sys/fs/cgroup/htcondor/explicit",
+            },
+        }
+    )
+
+    sub_attr = captured["data"]["sub_attr"]
+    assert sub_attr["starter_pid"] == 9001
+    assert sub_attr["slots_cgroup_path"] == "/sys/fs/cgroup/htcondor/explicit"

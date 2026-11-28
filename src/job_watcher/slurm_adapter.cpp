@@ -25,14 +25,14 @@
 #include "core/collector_type.h"
 #include "job_watcher/slurm_job_watcher.hpp"
 #include "common/procfs.hpp"
-#include "common/slurm_job.hpp"
+#include "job_watcher/slurm_job.hpp"
 
 struct SlurmSchedulerAdapter::Impl {
     explicit Impl(DiscoveryOptions options) : watcher(std::move(options)) {}
     SlurmJobWatcher watcher;
 };
 
-SlurmSchedulerAdapter::SlurmSchedulerAdapter(const DiscoveryTypeSettings& settings)
+SlurmSchedulerAdapter::SlurmSchedulerAdapter(const SchedulerAdapterSettings& settings)
     : impl_(std::make_unique<Impl>(discoveryOptions(settings)))
 {
 }
@@ -64,7 +64,7 @@ AdapterTraits SlurmSchedulerAdapter::traits() const
 }
 
 DiscoveryOptions SlurmSchedulerAdapter::discoveryOptions(
-    const DiscoveryTypeSettings& settings) const
+    const SchedulerAdapterSettings& settings) const
 {
     DiscoveryOptions options;
     options.enable_event_source = true;
@@ -102,7 +102,7 @@ NativeSelector SlurmSchedulerAdapter::legacySelector(const Job& job) const
         // their render (kept as a fallback for facts built before one existed).
         selector.clusterName = attr->clusterName;
         if (attr->step_id != 0) {
-            if (const auto name = slurm_step_name(attr->step_id)) {
+            if (const auto name = SlurmJob::special_step_name(attr->step_id)) {
                 selector.step_id = *name;
             } else {
                 selector.step_id = std::to_string(attr->step_id);
@@ -168,13 +168,32 @@ void SlurmSchedulerAdapter::applyRequestFacts(Job& job,
     projectFacts(job);
 }
 
+JobGroupView scheduler_groups(const SlurmJobAttr& facts)
+{
+    return {facts.acct_group, facts.unix_group, facts.unix_gid};
+}
+
+bool backfill_scheduler_groups(SlurmJobAttr& target, const SlurmJobAttr& source)
+{
+    bool changed = fill_missing_group_text(target.acct_group, source.acct_group);
+    if (target.unix_gid < 0 && source.unix_gid >= 0) {
+        target.unix_gid = source.unix_gid;
+        changed = true;
+    }
+    if (target.unix_gid == source.unix_gid &&
+        fill_missing_group_text(target.unix_group, source.unix_group)) {
+        changed = true;
+    }
+    return changed;
+}
+
 SubAttrMatcher SlurmSchedulerAdapter::duplicateMatcher(const Job& job) const
 {
     SubAttrMatcher matcher;
     matcher.subtype = JobSubType::Slurm;
     if (const auto* attr = std::get_if<SlurmJobAttr>(&job.sub_attr)) {
-        matcher.slurm_job_id = attr->job_id;
-        matcher.slurm_step_id = attr->step_id;
+        matcher.require(&SlurmJobAttr::job_id, attr->job_id);
+        matcher.require(&SlurmJobAttr::step_id, attr->step_id);
     }
     return matcher;
 }
@@ -302,7 +321,7 @@ REGISTER_NATIVE_ID_RULE("slurm", [](const NativeSelector& selector)
     if (!job_number) return std::nullopt;
     CanonicalParts parts;
     if (!selector.step_id.empty()) {
-        auto step = normalize_slurm_step_id(selector.step_id);
+        auto step = SlurmJob::normalize_step_id(selector.step_id);
         if (!step) return std::nullopt;
         parts.step_id = *step;
     }
@@ -311,4 +330,5 @@ REGISTER_NATIVE_ID_RULE("slurm", [](const NativeSelector& selector)
     return parts;
 })
 
-REGISTER_SCHEDULER_ADAPTER("slurm", SlurmSchedulerAdapter)
+REGISTER_SCHEDULER_ADAPTER_WITH_LEGACY_FLAG("slurm", SlurmSchedulerAdapter,
+                                          "auto_add_slurmjob")

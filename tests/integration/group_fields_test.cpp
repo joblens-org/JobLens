@@ -13,11 +13,11 @@
  * limitations under the License. */
 // group_fields_test：组字段（sub_attr.groups）的解析 / 序列化兼容 / 视图 / 探测回归。
 // 通过 run_group_fields_test.sh 以“换 main.cpp.o 重链生产对象”的方式运行。
-#include "common/classad_decode.hpp"
-#include "common/condor_job.hpp"
-#include "common/slurm_job.hpp"
+#include "job_watcher/classad_decode.hpp"
+#include "job_watcher/condor_job.hpp"
+#include "job_watcher/slurm_job.hpp"
 #include "core/collector_type.h"
-#include "core/group_probe_stats.hpp"
+#include "job_watcher/group_probe_stats.hpp"
 
 #include <cassert>
 #include <chrono>
@@ -181,6 +181,36 @@ static void test_groups_view() {
     CHECK(!dump_job(jm).contains("groups"));
 }
 
+static void test_group_backfill() {
+    Job condor;
+    Job condor_observation;
+    condor.sub_attr = CondorJobAttr{.owner = "original"};
+    condor_observation.sub_attr = CondorJobAttr{
+        .owner = "observed", .acct_group = "project", .unix_group = "science"};
+    CHECK(fill_missing_groups(condor, condor_observation));
+    CHECK(getGroups(condor).acct_group == "project");
+    CHECK(getGroups(condor).unix_group == "science");
+    CHECK(std::get<CondorJobAttr>(condor.sub_attr).owner == "original");
+    CHECK(!fill_missing_groups(condor, condor_observation));
+
+    Job slurm;
+    Job slurm_observation;
+    slurm.sub_attr = SlurmJobAttr{.acct_group = "original", .unix_gid = 290};
+    slurm_observation.sub_attr = SlurmJobAttr{
+        .acct_group = "observed", .unix_group = "wrong gid", .unix_gid = 291};
+    CHECK(!fill_missing_groups(slurm, slurm_observation));
+    CHECK(getGroups(slurm).acct_group == "original");
+    CHECK(getGroups(slurm).unix_gid == 290);
+    CHECK(getGroups(slurm).unix_group.empty());
+    CHECK(!fill_missing_groups(slurm, condor_observation));
+
+    std::get<SlurmJobAttr>(slurm_observation.sub_attr).unix_gid = 290;
+    std::get<SlurmJobAttr>(slurm_observation.sub_attr).unix_group = "science";
+    CHECK(fill_missing_groups(slurm, slurm_observation));
+    CHECK(getGroups(slurm).unix_group == "science");
+    CHECK(getGroups(slurm).acct_group == "original");
+}
+
 // ---------- 4. GroupProbeStats 计数与 JSON 形状 ----------
 static void test_probe_stats() {
     auto& st = GroupProbeStats::instance();
@@ -328,6 +358,7 @@ int main(int argc, char** argv) {
     test_condor_attr_json();
     test_slurm_attr_json();
     test_groups_view();
+    test_group_backfill();
     test_probe_stats();
     test_condor_probe(argv[1]);
     test_slurm_probe();

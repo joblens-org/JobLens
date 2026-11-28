@@ -68,9 +68,9 @@ lens_config:
 ```yaml
 job_registry_config:
   job_db_path: /var/JobLens/job.db      # LevelDB database directory path for persisting job state
-  auto_add_condorjob: true               # Deprecated: automatic Condor monitoring (see types/capture_all below)
-  auto_add_slurmjob: true                # Deprecated: automatic Slurm monitoring (see types/capture_all below)
-  types: [condor, slurm]               # Types with a full local record set (opt-in, absent = [])
+  auto_add_condorjob: true               # Deprecated: automatic Condor monitoring (see auto_discovery_types/capture_all below)
+  auto_add_slurmjob: true                # Deprecated: automatic Slurm monitoring (see auto_discovery_types/capture_all below)
+  auto_discovery_types: [condor, slurm] # Types whose discovery watcher starts (opt-in, absent = [])
   capture_all: true                    # Register every captured job (default); false = admission by auto_add
   reconcile_interval_sec: 30           # Reconciliation interval, must be >= 1
 ```
@@ -78,9 +78,9 @@ job_registry_config:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `job_db_path` | string | none | LevelDB database directory path. If the database cannot be opened, no exception is thrown; it only degrades operation. On upgrade, a pre-schema database at this path is quarantined to `<path>.legacy` and only the allocator watermark is imported (see doc/jobstore_persistence_service.md §7) |
-| `auto_add_condorjob` | bool | false | **Deprecated.** Automatically start the legacy CondorJobWatcher and auto-add jobs. Ignored for a type listed in `types` (the discovery source owns it) |
+| `auto_add_condorjob` | bool | false | **Deprecated.** Automatically start the legacy CondorJobWatcher and auto-add jobs. Ignored for a type listed in `auto_discovery_types` (the discovery source owns it) |
 | `auto_add_slurmjob` | bool | false | **Deprecated.** Same as above for Slurm |
-| `types` | list | `[]` | Scheduler types that get job records, including unselected jobs. `condor` / `slurm`; unknown values are rejected at startup |
+| `auto_discovery_types` | list | `[]` | Scheduler types whose discovery watcher is armed. `condor` / `slurm`; unknown values are rejected at startup. This switch only controls discovery: every registered scheduler adapter already exists and still serves manually registered jobs, refresh and kernel attribution. The former key `types` fails configuration resolution at startup (error names this key; discovery/maintenance stays disabled and the service still starts) |
 | `capture_all` | bool | `true` | The admission gate. `true`: every captured job is admitted unconditionally. `false`: whether an observation is admitted is decided by the type's `<type>_job_watcher.auto_add` |
 | `reconcile_interval_sec` | int | 30 | Periodic full reconciliation interval in seconds (minimum 1) |
 | `rules_dir` | string | `{JobLensRootDir}/../config/rules/condor_jobs` (Condor) or `{JobLensRootDir}/../config/rules/slurm_jobs` (Slurm) | Directory for Lua rule files, used when `<type>_job_watcher.auto_add` is `rule`. Note: the default varies by watcher context. |
@@ -93,7 +93,7 @@ switches. They answer different questions and never override each other:
 | Switch | Key | Question it answers | Default |
 |---|---|---|---|
 | admission gate | `job_registry_config.capture_all` | May every captured job enter the registry unconditionally? | `true` |
-| per-type watcher | `job_registry_config.types` | Does this scheduler type get a discovery watcher at all? | `[]` (off) |
+| per-type watcher | `job_registry_config.auto_discovery_types` | Does this scheduler type's discovery watcher start? (The adapter itself exists either way) | `[]` (off) |
 | automatic action | `<type>_job_watcher.auto_add` (`off` / `default` / `rule`) | What does the automatic path do with an observation of this type? | `off` |
 
 The `auto_add` tri-state:
@@ -176,10 +176,11 @@ for identity when it cannot be derived from the environment
 (`COLLECTOR_HOST` / `SLURM_CLUSTER_NAME`); without any source the observation
 stays incomplete and is visible in the joblens status.
 
-Discovery is centralized in `JobRegistry`: its constructor builds exactly one
-watcher per configured type and starts the registry heartbeat (initial scan
-included), and the whole stack stops through `stopDiscovery()`
-and `deinit()`. There is no second eBPF source per scheduler type.
+Discovery is centralized in `JobRegistry`: its constructor assembles exactly
+one adapter per registered scheduler, starts a discovery watcher only for the
+`auto_discovery_types` and starts the registry heartbeat (initial scan
+included); the whole stack stops through `stopDiscovery()` and `deinit()`.
+There is no second eBPF source per scheduler type.
 
 Collection intent (desired selection) is stored in LevelDB and applied to the
 collector lanes by the running scheduler. `jobs/collection/get` distinguishes

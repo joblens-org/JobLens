@@ -168,7 +168,7 @@ Job slurm_observation(const NativeSelector& selector, pid_t manager_pid)
     attr.auto_update_child = false;
     attr.stepd_pid = manager_pid;
     attr.job_id = std::stoul(selector.job_native_id);
-    attr.step_id = *slurm_step_value(selector.step_id);
+    attr.step_id = *SlurmJob::step_value(selector.step_id);
     attr.clusterName = selector.clusterName;
     attr.user = "bob";
     observation.subtype = JobSubType::Slurm;
@@ -289,6 +289,17 @@ void run_selector_cases(JobRegistry& registry, const Fixture& ids)
                                   collection_request(selector, "set", json::array()));
         check(response["code"] == "invalid_request",
               "unknown scheduler_type must be invalid_request: " + response.dump());
+    }
+    // --- invalid native-id keeps the legacy caller-facing diagnostic --
+    {
+        const auto response = rpc(
+            "jobs/collection/set",
+            collection_request(condor_selector_json("172", "schedd-a"), "set", json::array()));
+        check(response["code"] == "invalid_request" &&
+                  response["message"] ==
+                      "incomplete native selector: scheduler_type, clusterName and JobNativeID "
+                      "must name one scheduler identity (Condor native ids are '<ClusterId>.<ProcId>')",
+              "invalid selector must preserve the wire diagnostic: " + response.dump());
     }
     // --- condor native selector resolves one instance -----------------
     {
@@ -756,6 +767,26 @@ void run_legacy_cases(JobRegistry& registry, const Fixture& ids)
                   response["JobID"] == format_job_id(ids.condor_legacy),
               "the internal-id lookup must return the job resource: " + response.dump());
     }
+    // Adapter-owned legacy filters still accept the original RPC field names.
+    const auto sibling = seed(registry,
+        condor_observation(condor_selector("180.1", "schedd-a"), 4247), "condor 180.1");
+    const auto attach = rpc("jobs/collection/set",
+        collection_request(json{{"JobID", format_job_id(sibling)}}, "set",
+                           json::array({"cpumem_collector"})));
+    check(attach["status"] == "accepted", "attach the Condor sibling: " + attach.dump());
+    const auto stop_with_matcher = [](const json& matcher, uint64_t expected) {
+        const auto response = rpc("jobs/stop", json{{"matcher", matcher}});
+        check(response["status"] == "success" &&
+                  response["stopped_instances"] == json::array({format_job_id(expected)}),
+              "legacy matcher must stop precisely the matched instance: " + response.dump());
+    };
+    stop_with_matcher({{"subtype", "Condor"}, {"condor_cluster_id", 180},
+                       {"condor_proc_id", 0}}, ids.condor_legacy);
+    check(registry.selectionRecord(sibling).manual ==
+              std::vector<std::string>{"cpumem_collector"},
+          "matching proc 0 must not change the sibling proc's collection intent");
+    stop_with_matcher({{"subtype", "slurm"}, {"slurm_job_id", 9001},
+                       {"slurm_step_id", 2}}, ids.slurm_step2);
 }
 
 void run_job_record_cases(JobRegistry& registry, const Fixture& ids)

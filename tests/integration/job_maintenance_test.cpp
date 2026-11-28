@@ -57,10 +57,14 @@
 #include "core/maintenance_config.hpp"
 #include "core/status_provider.hpp"
 #include "core/job_registry.hpp"
+#include "common/config.hpp"
+#include "job_watcher/condor_adapter.hpp"
 #include "job_watcher/condor_job_watcher.hpp"
 #include "collection_runtime_fixture.hpp"
 
 #include <spdlog/spdlog.h>
+
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -489,15 +493,24 @@ void case_config()
 {
     {
         const auto config = resolve_maintenance_config(nlohmann::json::object());
-        check(config.types.empty(), "config: absent types must default to []");
+        check(config.auto_discovery_types.empty(),
+              "config: absent auto_discovery_types must default to []");
         check(config.reconcile_interval_sec == 30, "config: default interval is 30");
         check(!config.settings.at("condor").auto_collect,
               "config: auto_collect defaults to false");
+        // Adapter settings exist for every registered scheduler whether or not
+        // its discovery source is enabled: the adapter is the facts/interface
+        // layer, `auto_discovery_types` only arms the watcher.
+        check(config.settings.count("condor") == 1 &&
+                  config.settings.count("slurm") == 1,
+              "config: every registered adapter must have settings");
+        check(!config.settings.at("condor").auto_discovery_enabled,
+              "config: discovery is off unless the type is listed");
     }
     {
         const auto config = resolve_maintenance_config(nlohmann::json{
             {"job_registry_config", nlohmann::json{
-                {"types", nlohmann::json::array({"condor", "slurm"})},
+                {"auto_discovery_types", nlohmann::json::array({"condor", "slurm"})},
                 {"reconcile_interval_sec", 5},
             }},
             {"condor_job_watcher", nlohmann::json{
@@ -512,7 +525,11 @@ void case_config()
                 {"rules_prefix", "slurm_job_"},
             }},
         });
-        check(config.types.size() == 2, "config: both types resolved");
+        check(config.auto_discovery_types.size() == 2,
+              "config: both auto discovery types resolved");
+        check(config.settings.at("condor").auto_discovery_enabled &&
+                  config.settings.at("slurm").auto_discovery_enabled,
+              "config: a listed type arms its discovery source");
         check(config.reconcile_interval_sec == 5, "config: explicit interval wins");
         const auto& condor = config.settings.at("condor");
         check(condor.auto_collect && !condor.use_rules &&
@@ -529,17 +546,36 @@ void case_config()
         const auto config = resolve_maintenance_config(nlohmann::json{
             {"job_registry_config", nlohmann::json{{"auto_add_condorjob", true}}},
         });
-        check(config.types.size() == 1 && config.types.front() == "condor",
-              "config: legacy auto_add folds into discovery");
+        check(config.auto_discovery_types.size() == 1 &&
+                  config.auto_discovery_types.front() == "condor",
+              "config: legacy auto_add folds into auto discovery");
+        check(config.settings.at("condor").auto_discovery_enabled,
+              "config: legacy folding arms the discovery source");
         check(config.settings.at("condor").auto_collect,
               "config: legacy folding turns auto collection on");
+    }
+    {
+        // The old key is gone. Silently ignoring it would turn discovery off
+        // without an error, so a present legacy key is an explicit rejection.
+        bool threw = false;
+        try {
+            (void)resolve_maintenance_config(nlohmann::json{
+                {"job_registry_config", nlohmann::json{
+                    {"types", nlohmann::json::array({"condor"})}},
+            }});
+        } catch (const std::invalid_argument& error) {
+            threw = std::string(error.what()).find("auto_discovery_types") !=
+                    std::string::npos;
+        }
+        check(threw, "config: the removed job_registry_config.types key must be "
+                     "rejected and name auto_discovery_types");
     }
     {
         bool threw = false;
         try {
             (void)resolve_maintenance_config(nlohmann::json{
                 {"job_registry_config", nlohmann::json{
-                    {"types", nlohmann::json::array({"bogus"})}},
+                    {"auto_discovery_types", nlohmann::json::array({"bogus"})}},
             }});
         } catch (const std::invalid_argument&) {
             threw = true;
@@ -569,7 +605,7 @@ void case_config()
             nlohmann::json watcher{{"auto_add", auto_add}};
             return nlohmann::json{
                 {"job_registry_config", nlohmann::json{
-                    {"types", nlohmann::json::array({"condor"})},
+                    {"auto_discovery_types", nlohmann::json::array({"condor"})},
                 }},
                 {"condor_job_watcher", std::move(watcher)},
             };
@@ -587,7 +623,7 @@ void case_config()
             if (use_rules) watcher["use_rules"] = *use_rules;
             return nlohmann::json{
                 {"job_registry_config", nlohmann::json{
-                    {"types", nlohmann::json::array({"condor"})},
+                    {"auto_discovery_types", nlohmann::json::array({"condor"})},
                 }},
                 {"condor_job_watcher", std::move(watcher)},
             };
@@ -608,7 +644,7 @@ void case_config()
         {
             const auto config = resolve(nlohmann::json{
                 {"job_registry_config", nlohmann::json{
-                    {"types", nlohmann::json::array({"condor"})},
+                    {"auto_discovery_types", nlohmann::json::array({"condor"})},
                 }},
                 {"condor_job_watcher", nlohmann::json{
                     {"auto_add", "off"},
@@ -1450,8 +1486,13 @@ void run_legacy(const std::string& base)
     check(!records.front().job.execution.manager.complete(),
           "legacy: a manual registration must not invent an execution manager");
 
-    check(heartbeat_status()["configured_types"].empty(),
-          "legacy: no discovery type should be configured");
+    const auto status = heartbeat_status();
+    check(status["auto_discovery_types"].empty(),
+          "legacy: no auto discovery type should be enabled");
+    check(!status.contains("configured_types"),
+          "legacy: the discovery list is reported as auto_discovery_types");
+    check(status["configured_adapters"].empty(),
+          "legacy: test wiring installs no production adapter set");
 
     check(registry.reconcileNow(), "legacy: the pass did not run");
     check(registry.findJob(id).has_value(),
@@ -1469,6 +1510,189 @@ void run_legacy(const std::string& base)
     registry.deinit();
 
     pass_case("LEGACY", "manual registrations remove on process evidence without a source");
+}
+
+// ---------------------------------------------------------------------------
+// Adapter set vs auto discovery: `auto_discovery_types` only arms watchers.
+// Every registered scheduler keeps a settings-driven adapter for jobs that
+// arrive through any other path (manual registration, RPC, restored rows).
+// ---------------------------------------------------------------------------
+
+void run_adapter_set(const std::string& base)
+{
+    const auto dir = fresh_dir(base, "adapter-set");
+    const auto config_path = std::filesystem::path(dir) / "config.yaml";
+    {
+        std::ofstream config(config_path);
+        check(static_cast<bool>(config), "adapter-set: cannot write the config");
+        config << "job_registry_config:\n"
+                  "  job_db_path: " << dir << "/job.db\n"
+                  "  auto_discovery_types: []\n"
+                  "  reconcile_interval_sec: 30\n"
+                  "collectors_config:\n"
+                  "  default_freq: 1\n"
+                  "  default_use_writers: []\n"
+                  "  collectors:\n"
+                  "    - {name: cpumem_collector, type: CPUMemCollector, "
+                  "config: cpumem_collector_config}\n"
+                  "cpumem_collector_config:\n"
+                  "  freq: 1\n"
+                  "  use_writers: []\n";
+    }
+    // This binary never initializes the config singleton earlier: production
+    // wiring is the only reader, and it is exercised here.
+    Config::instance(config_path.string());
+
+    JobRegistryOptions options;
+    options.db_path = dir + "/job.db";
+    options.enable_pid_tracker = false;
+    options.register_rpc = false;
+    JobRegistry registry(options);
+    registry.setCollectorValidator(nullptr);
+
+    const auto status = heartbeat_status();
+    std::set<std::string> adapters;
+    for (const auto& name : status.at("configured_adapters"))
+        adapters.insert(name.get<std::string>());
+    check(adapters.count("condor") == 1 && adapters.count("slurm") == 1,
+          "adapter-set: every registered adapter must exist even with discovery off");
+    check(status.at("auto_discovery_types").empty(),
+          "adapter-set: no auto discovery type was configured");
+    check(!status.contains("configured_types"),
+          "adapter-set: the enabled discovery list is auto_discovery_types");
+    check(status.at("sources").empty(),
+          "adapter-set: no discovery source may start without an enabled type");
+
+    // A manual registration of a scheduler whose discovery is off still gets
+    // the adapter-owned facts/interface path.
+    Job job;
+    job.jobtype = JobType::Job;
+    job.subtype = JobSubType::Condor;
+    job.subtype_name = "condor";
+    job.JobNativeID = "76226370.0";
+    CondorJobAttr attr;
+    attr.cluster_id = 76226370;
+    attr.proc_id = 0;
+    job.sub_attr = attr;
+    set_pids(job, {getpid()});
+    job.CollectorNames = {"cpumem_collector"};
+    check(registry.addJob(job), "adapter-set: a manual registration must not need discovery");
+    check(registry.adapterNamed("condor") != nullptr,
+          "adapter-set: the facts adapter must exist without an enabled watcher");
+    check(registry.jobRecords().size() == 1,
+          "adapter-set: the manual registration must be inventoried");
+
+    check(registry.deinit(), "adapter-set: deinit must succeed");
+    pass_case("ADAPTER-SET", "every registered adapter exists regardless of "
+                             "auto_discovery_types; only enabled types start a source");
+}
+
+// ---------------------------------------------------------------------------
+// A refresh COMPLETES execution-scope facts the record never carried and
+// persists them. This is the repair path for records registered before the
+// fact was derivable (a member pid not readable yet, or a row created by an
+// older version): re-registering such a job resolves to UPDATE, which never
+// touches facts, so without this the cgroup/starter stay empty forever.
+// ---------------------------------------------------------------------------
+
+void run_refresh_backfills_facts(const std::string& base)
+{
+    const auto dir = fresh_dir(base, "refresh-backfill");
+    const std::filesystem::path proc = std::filesystem::path(dir) / "proc";
+    const std::filesystem::path cgroup = std::filesystem::path(dir) / "cgroup";
+
+    const auto write_text = [](const std::filesystem::path& path, const std::string& text) {
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        check(static_cast<bool>(out), "refresh-backfill: cannot write " + path.string());
+        out << text;
+    };
+    const auto stat_line = [](pid_t pid, const std::string& comm, pid_t ppid,
+                              std::uint64_t start_ticks) {
+        std::string line = std::to_string(pid) + " (" + comm + ") S " + std::to_string(ppid);
+        for (int field = 5; field <= 21; ++field) line += " 0";
+        line += " " + std::to_string(start_ticks) + " 4096 200 0 0 0 0 0 0 0 0 0 0 0\n";
+        return line;
+    };
+    const auto make_process = [&](pid_t pid, const std::string& comm, pid_t ppid) {
+        write_text(proc / std::to_string(pid) / "stat", stat_line(pid, comm, ppid, pid));
+        std::string cmdline = comm;
+        cmdline.push_back('\0');
+        write_text(proc / std::to_string(pid) / "cmdline", cmdline);
+        write_text(proc / std::to_string(pid) / "environ", "");
+        write_text(proc / std::to_string(pid) / "cgroup", "0::/htcondor/slotA\n");
+    };
+
+    write_text(proc / "sys" / "kernel" / "random" / "boot_id", "boot-backfill\n");
+    make_process(48100, "condor_starter", 1);
+    make_process(48110, "sleep", 48100);
+    write_text(cgroup / "htcondor" / "slotA" / "cgroup.procs", "48100\n48110\n");
+
+    FakeProbes probes;
+    JobRegistry registry(legacy_heartbeat_options(fresh_dir(dir, "db"), probes));
+    registry.setCollectorValidator(nullptr);
+
+    // Test wiring bypasses configuration, so the facts adapter is the cached
+    // condor one. It starts on the host roots, where the fixture member pid does
+    // not exist: that is exactly the "fact not derivable at registration"
+    // situation this repair path exists for.
+    auto* adapter = const_cast<ISchedulerAdapter*>(registry.adapterNamed("condor"));
+    check(adapter != nullptr, "refresh-backfill: the condor facts adapter must exist");
+    auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter->source());
+    check(watcher != nullptr, "refresh-backfill: the condor adapter must expose its watcher");
+
+    Job job;
+    job.jobtype = JobType::Job;
+    job.subtype = JobSubType::Condor;
+    job.subtype_name = "condor";
+    job.JobNativeID = "76226380.0";
+    CondorJobAttr attr;
+    attr.cluster_id = 76226380;
+    attr.proc_id = 0;
+    attr.collector_host = "htcondor-fixture";
+    job.sub_attr = attr;
+    set_pids(job, {48110});
+    job.CollectorNames = {"cpumem_collector"};
+    check(registry.addJob(job), "refresh-backfill: the manual registration must succeed");
+    const auto id = registry.jobRecords().front().job.JobID;
+    check(std::get<CondorJobAttr>(registry.jobRecord(id)->job.sub_attr)
+              .slots_cgroup_path.empty(),
+          "refresh-backfill: the fixture record must start without a cgroup fact");
+
+    // Now the member becomes readable (same process, discoverable fixture
+    // roots): the next refresh derives and persists the facts.
+    DiscoveryEnvironment environment;
+    environment.proc_root = proc.string();
+    environment.cgroup_root = cgroup.string();
+    watcher->set_discovery_environment(environment);
+
+    check(registry.reconcileNow(), "refresh-backfill: the refresh pass did not run");
+    const auto record = registry.jobRecord(id);
+    check(record.has_value(), "refresh-backfill: the record vanished");
+    const auto& facts = std::get<CondorJobAttr>(record->job.sub_attr);
+    check(facts.slots_cgroup_path ==
+              (cgroup / "htcondor" / "slotA").string(),
+          "refresh-backfill: the refresh must persist the derived cgroup, got '" +
+              facts.slots_cgroup_path + "'");
+    check(facts.starter_pid == 48100,
+          "refresh-backfill: the refresh must persist the derived starter pid, got " +
+              std::to_string(facts.starter_pid));
+
+    // A second pass is a no-op for the facts: the completed value is never
+    // rewritten and no further revision is produced by the completion.
+    const auto revision = record->revision;
+    check(registry.reconcileNow(), "refresh-backfill: the second pass did not run");
+    const auto repeated = registry.jobRecord(id);
+    check(repeated.has_value() &&
+              std::get<CondorJobAttr>(repeated->job.sub_attr).slots_cgroup_path ==
+                  facts.slots_cgroup_path,
+          "refresh-backfill: a repeated refresh must keep the completed cgroup");
+    check(repeated->revision == revision,
+          "refresh-backfill: a completed fact must not churn the revision every pass");
+
+    check(registry.deinit(), "refresh-backfill: deinit must succeed");
+    pass_case("REFRESH-BACKFILL", "a refresh completes and persists missing execution "
+                                  "facts for records that never carried them");
 }
 
 // ---------------------------------------------------------------------------
@@ -1721,6 +1945,7 @@ void run_admit(const std::string& base)
         auto options = heartbeat_options(fresh_dir(base, "admit-default"), source, probes);
         options.test_capture_all = false;
         options.test_auto_add_states = {{"condor", AutoAdd::Default}};
+        options.test_auto_policy_adapter = "condor";
         options.test_auto_policy = [] {
             return AutoCollectorPolicy::defaults({"CPUMemCollector"});
         };
@@ -1756,6 +1981,7 @@ void run_admit(const std::string& base)
         auto options = heartbeat_options(fresh_dir(base, "admit-reject"), source, probes);
         options.test_capture_all = false;
         options.test_auto_add_states = {{"condor", AutoAdd::Rule}};
+        options.test_auto_policy_adapter = "condor";
         options.test_auto_policy = [&] {
             return AutoCollectorPolicy::rules((rules_root / "reject").string(),
                                               "condor_job_");
@@ -1781,6 +2007,7 @@ void run_admit(const std::string& base)
         auto options = heartbeat_options(fresh_dir(base, "admit-accept"), source, probes);
         options.test_capture_all = false;
         options.test_auto_add_states = {{"condor", AutoAdd::Rule}};
+        options.test_auto_policy_adapter = "condor";
         options.test_auto_policy = [&] {
             return AutoCollectorPolicy::rules((rules_root / "accept").string(),
                                               "condor_job_");
@@ -1813,6 +2040,7 @@ void run_admit(const std::string& base)
         auto options = heartbeat_options(fresh_dir(base, "admit-bare-defaults"), source, probes);
         options.test_capture_all = false;
         options.test_auto_add_states = {{"condor", AutoAdd::Rule}};
+        options.test_auto_policy_adapter = "condor";
         options.test_auto_policy = [&] {
             return AutoCollectorPolicy::rules((rules_root / "accept_bare").string(),
                                               "condor_job_", {"CPUMemCollector"});
@@ -1849,6 +2077,7 @@ void run_admit(const std::string& base)
         auto options = heartbeat_options(fresh_dir(base, "admit-bare-nodefaults"), source, probes);
         options.test_capture_all = false;
         options.test_auto_add_states = {{"condor", AutoAdd::Rule}};
+        options.test_auto_policy_adapter = "condor";
         options.test_auto_policy = [&] {
             return AutoCollectorPolicy::rules((rules_root / "accept_bare").string(),
                                               "condor_job_");
@@ -1902,6 +2131,7 @@ void run_stop_pin(const std::string& base)
     probes.set_process(5900, LivenessState::Alive, 555);
     source.set_scan([&]() { return scan_with({job}); });
     auto options = heartbeat_options(fresh_dir(base, "stop-pin"), source, probes);
+    options.test_auto_policy_adapter = "condor";
     options.test_auto_policy = [] {
         return AutoCollectorPolicy::defaults({"CPUMemCollector"});
     };
@@ -2435,6 +2665,8 @@ int main(int argc, char** argv)
         run_a25(base);
         run_a28(base);
         run_legacy(base);
+        run_adapter_set(base);
+        run_refresh_backfills_facts(base);
         run_restore_unknown_keeps_evidence(base);
         run_remove_explicit(base);
         run_admit(base);

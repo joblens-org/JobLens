@@ -24,11 +24,17 @@
 #include "common/config.hpp"
 #include "core/status_provider.hpp"
 #include "core/job_registry.hpp"
+#include "core/scheduler_adapter.hpp"
+#include "job_watcher/condor_adapter.hpp"
+#include "job_watcher/condor_job_watcher.hpp"
 #include "job_fixture.h"
 #include "collection_runtime_fixture.hpp"
 #include "job_fixture.h"
 #include "collection_runtime_fixture.hpp"
 
+#include <sys/types.h>
+
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -76,6 +82,12 @@ struct JobRegistryNamespaceTestAccess {
         if (target.kind != JobRegistry::ManualTarget::Kind::Update)
             throw std::runtime_error("namespace adoption: expected an update target");
         return target.record;
+    }
+    // The path kernel attribution resolves for a record (KernelAttribution's
+    // Host seam): a non-empty answer is exactly what reaches cgroup2job.
+    static std::string attributionCgroupPath(JobRegistry& registry, uint64_t id)
+    {
+        return registry.attributionCgroupPath(id);
     }
     static nlohmann::json update(JobRegistry& registry, const JobRecord& target, const Job& job)
     {
@@ -210,6 +222,111 @@ void manual_readd_preserves_creation_metadata(const std::string& base)
           "a stale manual target must not accept a closing metadata-only re-add");
     registry.setKernelCleanupForTest(nullptr);
     check(registry.deinit(), "manual freeze: cleanup must complete after restoring the seam");
+}
+
+// A manual Condor registration (no discovery watcher configured) names only
+// the job's member pids: the registry must complete the execution-scope facts
+// (starter pid + slot cgroup) before the record is built, so the first kernel
+// activation already has a cgroup mapping and the refresh pass expands the
+// whole scope. The fixture presents a fake procfs/cgroup tree the adapter
+// reads through its injectable discovery roots.
+void manual_condor_create_derives_execution_facts(const std::string& base)
+{
+    const std::filesystem::path root = fresh_dir(base, "manual-condor-facts");
+    const std::filesystem::path proc = root / "proc";
+    const std::filesystem::path cgroup = root / "cgroup";
+
+    const auto write_text = [](const std::filesystem::path& path, const std::string& text) {
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) throw std::runtime_error("cannot write " + path.string());
+        out << text;
+    };
+    // /proc/<pid>/stat with starttime in field 22 (the identity tick).
+    const auto stat_line = [](pid_t pid, const std::string& comm, pid_t ppid,
+                              std::uint64_t start_ticks) {
+        std::string line = std::to_string(pid) + " (" + comm + ") S " + std::to_string(ppid);
+        for (int field = 5; field <= 21; ++field) line += " 0";
+        line += " " + std::to_string(start_ticks) + " 4096 200 0 0 0 0 0 0 0 0 0 0 0\n";
+        return line;
+    };
+    const auto make_process = [&](pid_t pid, const std::string& comm, pid_t ppid,
+                                  std::uint64_t start_ticks,
+                                  const std::string& cgroup_relative) {
+        write_text(proc / std::to_string(pid) / "stat", stat_line(pid, comm, ppid, start_ticks));
+        std::string cmdline = comm;
+        cmdline.push_back('\0');
+        cmdline += "-f";
+        cmdline.push_back('\0');
+        write_text(proc / std::to_string(pid) / "cmdline", cmdline);
+        write_text(proc / std::to_string(pid) / "environ", "");
+        write_text(proc / std::to_string(pid) / "cgroup", "0::" + cgroup_relative + "\n");
+    };
+
+    write_text(proc / "sys" / "kernel" / "random" / "boot_id", "boot-condor-fixture\n");
+    make_process(4801, "condor_starter", 1, 7501, "/htcondor/slot1");
+    make_process(4810, "sleep", 4801, 7510, "/htcondor/slot1");
+    make_process(4811, "sleep", 4801, 7511, "/htcondor/slot1");
+    write_text(cgroup / "htcondor" / "slot1" / "cgroup.procs", "4801\n4810\n4811\n");
+
+    JobRegistryOptions options;
+    options.db_path = fresh_dir(base, "manual-condor-facts-db");
+    options.test_static_registry = true;
+    options.enable_pid_tracker = false;
+    options.register_rpc = false;
+    JobRegistry registry(options);
+    registry.setCollectorValidator(nullptr);
+
+    // The registry answers facts questions through its unarmed adapter cache;
+    // point that adapter at the fixture roots (production reads /proc).
+    auto* adapter = const_cast<ISchedulerAdapter*>(registry.adapterNamed("condor"));
+    check(adapter != nullptr, "the registry must build the condor facts adapter");
+    auto* watcher = dynamic_cast<CondorJobWatcher*>(&adapter->source());
+    check(watcher != nullptr, "the condor adapter must expose its watcher");
+    DiscoveryEnvironment environment;
+    environment.proc_root = proc.string();
+    environment.cgroup_root = cgroup.string();
+    watcher->set_discovery_environment(environment);
+
+    Job job;
+    job.jobtype = JobType::Job;
+    job.subtype = JobSubType::Condor;
+    job.subtype_name = "condor";
+    job.JobNativeID = "76226360.0";
+    CondorJobAttr attr;
+    attr.cluster_id = 76226360;
+    attr.proc_id = 0;
+    attr.collector_host = "pool.example.com";
+    attr.scheduler_name = "scheduler@schedd.example.com";
+    job.sub_attr = attr;
+    set_pids(job, {4810});  // the manual request knows only one member
+    job.CollectorNames = {"cpumem_collector"};
+
+    const auto created = registry.addOrUpdateManualJob(
+        job, nlohmann::json::object(),
+        NativeSelector{"condor", "pool.example.com", "scheduler@schedd.example.com",
+                       "76226360.0", ""});
+    check(created.value("status", "") == "success",
+          "the manual condor create must succeed: " + created.dump());
+    const auto id = std::stoull(created.value("JobID", std::string{}));
+    const auto record = registry.jobRecord(id);
+    check(record.has_value(), "the created record must be published");
+
+    const auto& facts = std::get<CondorJobAttr>(record->job.sub_attr);
+    check(facts.slots_cgroup_path == (cgroup / "htcondor" / "slot1").string(),
+          "a manual create must derive the slot cgroup from the member pid, got '" +
+              facts.slots_cgroup_path + "'");
+    check(facts.starter_pid == 4801,
+          "a manual create must derive the starter pid from the member's parent, got " +
+              std::to_string(facts.starter_pid));
+    check(JobRegistryNamespaceTestAccess::attributionCgroupPath(registry, id) ==
+              facts.slots_cgroup_path,
+          "the kernel attribution path must see the derived cgroup "
+          "(cgroup2job write input)");
+    check(registry.deinit(), "manual condor facts: deinit must succeed");
+    pass_case("CONDOR-FACTS",
+              "a manual condor create derives the starter pid and slot cgroup from "
+              "the member pid, so kernel attribution and refresh see the whole scope");
 }
 
 // An explicit caller JobID is a primary key the allocator does not know about:
@@ -1808,6 +1925,7 @@ int main(int argc, char** argv)
     std::filesystem::create_directories(base);
     try {
         manual_readd_preserves_creation_metadata(base + "/data");
+        manual_condor_create_derives_execution_facts(base + "/data");
         explicit_job_id_is_never_reissued(base + "/data");
         common_duplicate_put_reports_structured_conflict(base + "/data");
         run(base + "/data");

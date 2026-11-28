@@ -46,6 +46,11 @@
 #include "core/liveness.hpp"
 #include "core/scheduler_adapter.hpp"
 
+// The resolved maintenance picture (discovery switches, per-adapter settings).
+// Passed by reference through the construction path; the full definition lives
+// in core/maintenance_config.hpp.
+struct MaintenanceConfig;
+
 // ---------------------------------------------------------------------------
 // Collection selection control (registry-owned)
 // ---------------------------------------------------------------------------
@@ -151,7 +156,7 @@ struct JobRegistryOptions {
     // job_registry_config.maintenance + <type>_job_watcher). The adapter name
     // below is the key it is armed under.
     std::function<AutoCollectorPolicy()> test_auto_policy;
-    std::string test_auto_policy_adapter{"condor"};
+    std::string test_auto_policy_adapter;
     // Admission-gate test wiring (production reads capture_all and
     // the per-type auto_add tri-state from the resolved configuration).
     // test_capture_all=false arms the gate; the state map carries the
@@ -348,13 +353,15 @@ private:
     enum class DiscoveryWiring { Disabled, Test, Production };
     // Decides WHICH discovery sources, probes and facts encoder the heartbeat
     // drives, once, before any source starts. Test wiring copies the
-    // constructor-provided seams verbatim; production resolves the
-    // configuration and builds one adapter per configured type.
-    // Construction phases, called in order by the constructor: open the
-    // store, restore and validate existing rows, gate collector names, arm
-    // the registry components (adapters/policies/probes/capability gate),
-    // then start sources, the first authoritative pass, the status providers
-    // and the maintenance worker.
+    // constructor-provided seams verbatim; production arms the configuration
+    // resolved before the store restored rows. The adapter set itself comes
+    // from buildAdapters(): one per registered scheduler, independent of
+    // `auto_discovery_types`.
+    // Construction phases, called in order by the constructor: build the
+    // adapters, open the store, restore and validate existing rows, gate
+    // collector names, arm the registry components (policies/probes/
+    // capability gate/sources), then start sources, the first authoritative
+    // pass, the status providers and the maintenance worker.
     void openStore(const JobRegistryOptions& options);
     // Adapter-owned row projection for JobStore: the adapter that owns the
     // facts decodes the Job fields; open-world/Common rows keep the generic
@@ -363,7 +370,13 @@ private:
     void restoreExistingRecords();
     void installCollectorValidator();
     void resetHeartbeatState();
-    DiscoveryWiring armDiscovery(const JobRegistryOptions& options);
+    // Assembles one settings-driven adapter per registered scheduler before
+    // the store restores rows. Discovery arming is separate: an adapter
+    // exists whether or not its watcher is enabled.
+    bool buildAdapters(const MaintenanceConfig& config);
+    DiscoveryWiring armDiscovery(const JobRegistryOptions& options,
+                                 const MaintenanceConfig& config,
+                                 bool maintenance_ready);
     void runInitialPass();
     // Admit restored active records to kernel ownership through the single
     // admission path (a restarted process starts with an empty namespace).
@@ -513,10 +526,10 @@ private:
                                   const SchedulerKey& key, uint64_t job_id,
                                   int64_t observed_at, JobRecord& updated_out,
                                   MergeKind kind = MergeKind::Observation);
-    // Interpretation-only adapter access: namespace semantics must not
-    // depend on which discovery types are CONFIGURED. Returns the configured
-    // adapter when the type is armed, otherwise a lazily built and cached
-    // one (never started, facts interpretation only), nullptr for a name no
+    // Interpretation-only adapter access. Production assembles the complete
+    // adapter set in buildAdapters(), so this resolves through adapters_; the
+    // lazy cached build is the test-wiring / late-registration fallback only
+    // (never started, facts interpretation only). nullptr for a name no
     // registered adapter answers to.
     ISchedulerAdapter* namespaceAdapterOf(const Job& job) const;
     ISchedulerAdapter* namespaceAdapterNamed(const std::string& name) const;
@@ -561,8 +574,10 @@ private:
 
     // Owned discovery/maintenance stack (construction order: store -> manager
     // -> heartbeat -> attribution -> RPC; destruction runs deinit()).
-    // Adapters are built from the resolved configuration through the
-    // SchedulerAdapterRegistry; the registry never names a scheduler.
+    // One adapter per registered scheduler, built from the resolved
+    // configuration before the store restores rows; the registry never names a
+    // scheduler. Only the `auto_discovery_types` subset is driven as a
+    // discovery source.
     std::vector<std::unique_ptr<ISchedulerAdapter>> adapters_;
 
     // --- registry heartbeat state (guarded by hb_mtx_ unless noted) --------
@@ -638,6 +653,10 @@ private:
     // Every discovery source the heartbeat drives (adapters or test sources),
     // populated by armDiscovery().
     std::vector<std::pair<std::string, IDiscoverySource*>> hb_sources_;
+    // The scheduler names whose discovery watcher is armed
+    // (job_registry_config.auto_discovery_types). Status/observability only;
+    // the adapter set itself is independent of it.
+    std::vector<std::string> auto_discovery_types_;
     DiscoverySink heartbeat_sink_;
     // Control-plane validation. Guarded because tests install it after
     // construction; the command path copies the callable under the lock and

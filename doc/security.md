@@ -187,5 +187,5 @@ journalctl -u joblens-trigger | grep -i 'etcd'
   进程级/文件级明细。
 - **采集器输出改为显式通道**：`outputs: {document|text|metrics: [writer...]}`，
   与旧 `use_writers` 互斥；旧写法仍兼容，但一个写入器匹配到多个通道时会报错。
-- **发现开关显式化**：`job_registry_config.types` 缺省为 `[]`
+- **发现开关显式化**：`job_registry_config.auto_discovery_types` 缺省为 `[]`
   （不自动发现），watcher 段存在不等于发现打开。

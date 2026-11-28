@@ -24,10 +24,13 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
 #include "core/scheduler_adapter.hpp"
+#include "core/job_groups.hpp"
 #include "core/sub_attr_reflect.hpp"
 
 struct SlurmJobAttr {
@@ -61,9 +64,22 @@ struct SlurmJobAttr {
 static_assert(joblens::facts::valid_schema<SlurmJobAttr>(),
               "SlurmJobAttr::field_names must cover every reflected member");
 
+inline constexpr auto legacy_matcher_fields(const SlurmJobAttr*)
+{
+    return std::make_tuple(
+        std::pair{"slurm_job_id", &SlurmJobAttr::job_id},
+        std::pair{"slurm_step_id", &SlurmJobAttr::step_id},
+        std::pair{"slurm_user", &SlurmJobAttr::user},
+        std::pair{"slurm_job_name", &SlurmJobAttr::job_name},
+        std::pair{"slurm_stepd_pid", &SlurmJobAttr::stepd_pid});
+}
+
+JobGroupView scheduler_groups(const SlurmJobAttr& facts);
+bool backfill_scheduler_groups(SlurmJobAttr& target, const SlurmJobAttr& source);
+
 class SlurmSchedulerAdapter final : public ISchedulerAdapter {
 public:
-    explicit SlurmSchedulerAdapter(const DiscoveryTypeSettings& settings);
+    explicit SlurmSchedulerAdapter(const SchedulerAdapterSettings& settings);
     ~SlurmSchedulerAdapter() override;
 
     const std::string& name() const override;
@@ -71,7 +87,7 @@ public:
     IDiscoverySource& source() override;
     AdapterTraits traits() const override;
 
-    DiscoveryOptions discoveryOptions(const DiscoveryTypeSettings& settings) const override;
+    DiscoveryOptions discoveryOptions(const SchedulerAdapterSettings& settings) const override;
 
     // ---- typed facts / record projection ---------------------------------
     Job decodeFacts(const nlohmann::json& row) const override;

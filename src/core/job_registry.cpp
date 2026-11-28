@@ -44,7 +44,7 @@
 #include "common/utils.hpp"
 #include "common/common_job.hpp"
 #include "common/local_rpc.hpp"
-#include "core/group_probe_stats.hpp"
+#include "job_watcher/group_probe_stats.hpp"
 #include <algorithm>
 
 #include <set>
@@ -380,9 +380,11 @@ ISchedulerAdapter* JobRegistry::namespaceAdapterNamed(const std::string& name) c
     std::lock_guard lock(namespace_adapter_mtx_);
     const auto cached = namespace_adapters_.find(name);
     if (cached != namespace_adapters_.end()) return cached->second.get();
-    // Built but never armed: the watcher carries no state until a discovery
-    // source starts it, so this instance answers facts questions only.
-    auto built = SchedulerAdapterRegistry::instance().build(name, DiscoveryTypeSettings{});
+    // Fallback for test wiring (which bypasses configuration) and a scheduler
+    // registered after the adapter set was assembled. Built but never armed:
+    // the watcher carries no state until a discovery source starts it, so this
+    // instance answers facts questions only.
+    auto built = SchedulerAdapterRegistry::instance().build(name, SchedulerAdapterSettings{});
     if (!built) return nullptr;
     auto* const raw = built.get();
     namespace_adapters_[name] = std::move(built);
@@ -403,9 +405,10 @@ ISchedulerAdapter* JobRegistry::namespaceAdapterOf(const Job& job) const {
 
 std::optional<SchedulerKey> JobRegistry::keyOf(const Job& job) const {
     // The adapter owning the facts derives the key from them; interpretation
-    // goes through the namespace cache, so it does not depend on which
-    // discovery types are configured. Without an adapter the generic selector
-    // is the best the facts can say — and nullopt is reported, never a guess.
+    // goes through the assembled adapter set (or the test/unknown fallback
+    // cache), so it never depends on which discovery types are enabled.
+    // Without an adapter the generic selector is the best the facts can say —
+    // and nullopt is reported, never a guess.
     if (const auto* adapter = namespaceAdapterOf(job)) return adapter->keyOf(job);
     return canonicalize(selector_of(job));
 }
@@ -435,6 +438,29 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
     process_probe_ = options.test_process_probe ? options.test_process_probe
                                                 : make_proc_liveness_probe();
 
+    // The adapter set is assembled BEFORE the store restores rows: a persisted
+    // row decodes through the same settings-driven adapter the runtime uses,
+    // never through a lazily built default-configured one. Every registered
+    // scheduler gets exactly one adapter whether or not its discovery source
+    // is enabled — the adapter is the facts/interface layer for jobs from any
+    // source, `auto_discovery_types` only arms the watcher.
+    MaintenanceConfig maintenance;
+    bool maintenance_ready = false;
+    const bool production_wiring =
+        !options.test_static_registry && options.test_sources.empty() &&
+        !options.test_heartbeat;
+    if (production_wiring) {
+        try {
+            maintenance = resolve_maintenance_config(Config::instance().dumpConfig());
+            maintenance_ready = true;
+        } catch (const std::exception& error) {
+            spdlog::error("JobRegistry: invalid maintenance configuration; registry "
+                          "maintenance is disabled: {}", error.what());
+        }
+        if (maintenance_ready && !buildAdapters(maintenance))
+            maintenance_ready = false;
+    }
+
     // The registry owns the records; the store is the persistence executor
     // (it opens the db and admits the schema). Rows are loaded and validated
     // with the same probe the admission gate uses, so a row cannot be
@@ -454,7 +480,7 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
     // Discovery startup, in the order that matters: reset the heartbeat
     // bookkeeping and install the registration sink (both BEFORE the wiring
     // decision, so a Disabled registry exits in the same state as today),
-    // then arm the components (adapters, policies, probes, capability gate),
+    // then arm the components (policies, probes, capability gate, sources),
     // then admit the restored owners through that gate, then start the sources
     // (the sink must exist before any poll thread), run the first
     // authoritative pass (blocking: the record set is settled before the RPC
@@ -466,7 +492,7 @@ JobRegistry::JobRegistry(const JobRegistryOptions& options) {
     if (!options.test_static_registry) {
         resetHeartbeatState();
         installHeartbeatSink();
-        wiring = armDiscovery(options);
+        wiring = armDiscovery(options, maintenance, maintenance_ready);
     }
 
     // Restored active records must be re-seeded into the kernel namespace this
@@ -1530,24 +1556,61 @@ void JobRegistry::resetHeartbeatState()
     hb_refresh_failures_ = 0;
 }
 
-// Arms the registry components from the resolved configuration: one adapter
-// per configured type, the automatic-selection policies, the production
-// liveness probes and the kernel-attribution capability gate. Nothing is
-// started here; the caller starts sources and the first pass afterwards, so
-// the gate is guaranteed to exist before any attribution can activate.
+// Assembles exactly one settings-driven adapter per registered scheduler,
+// before anything can restore, decode or register a job. The adapter is the
+// scheduler's facts/interface layer for jobs from every source; whether its
+// discovery watcher runs is decided later, per `auto_discovery_types`.
+bool JobRegistry::buildAdapters(const MaintenanceConfig& config)
+{
+    adapters_.clear();
+    for (const auto& [adapter_name, settings] : config.settings) {
+        // A configuration section for a scheduler with no registered factory
+        // stays inert (resolve_maintenance_config already warned); it cannot
+        // arm a source or answer facts.
+        if (!SchedulerAdapterRegistry::instance().known(adapter_name)) continue;
+        auto adapter = SchedulerAdapterRegistry::instance().build(adapter_name, settings);
+        if (!adapter) {
+            spdlog::error("JobRegistry: no factory built the registered adapter '{}'; "
+                          "registered: {}",
+                          adapter_name,
+                          fmt::join(SchedulerAdapterRegistry::instance().names(), ", "));
+            adapters_.clear();
+            return false;
+        }
+        adapters_.push_back(std::move(adapter));
+    }
+    std::string assembled;
+    for (const auto& adapter : adapters_)
+        assembled += (assembled.empty() ? "" : ", ") + adapter->name();
+    spdlog::info("JobRegistry: {} scheduler adapter(s) assembled: {}", adapters_.size(),
+                 assembled);
+    return true;
+}
+
+// Arms the registry components from the resolved configuration: the
+// automatic-selection policies, the discovery sources of the enabled types,
+// the production liveness probes and the kernel-attribution capability gate.
+// The adapter set itself was built by buildAdapters() before the store
+// restored anything. Nothing is started here; the caller starts sources and
+// the first pass afterwards, so the gate is guaranteed to exist before any
+// attribution can activate.
 JobRegistry::DiscoveryWiring
-JobRegistry::armDiscovery(const JobRegistryOptions& options)
+JobRegistry::armDiscovery(const JobRegistryOptions& options,
+                          const MaintenanceConfig& config,
+                          bool maintenance_ready)
 {
     // Symmetric resets first: every exit path (including failures) leaves the
-    // same armed-state behind.
-    adapters_.clear();
+    // same armed-state behind. adapters_ belongs to buildAdapters(): it is
+    // cleared there (or never built under test wiring), never here.
     auto_policies_.clear();
     auto_add_states_.clear();
+    auto_discovery_types_.clear();
     capture_all_ = true;
 
     // Test wiring: pre-built sources and injected probes, no configuration
     // and no automatic selection.
     if (!options.test_sources.empty() || options.test_heartbeat) {
+        adapters_.clear();   // test wiring installs no production adapter set
         hb_sources_ = options.test_sources;
         process_probe_ = options.test_process_probe;
         cgroup_probe_ = options.test_cgroup_probe;
@@ -1563,44 +1626,20 @@ JobRegistry::armDiscovery(const JobRegistryOptions& options)
         return DiscoveryWiring::Test;
     }
 
-    MaintenanceConfig config;
-    try {
-        config = resolve_maintenance_config(Config::instance().dumpConfig());
-    } catch (const std::exception& error) {
-        spdlog::error("JobRegistry: invalid maintenance configuration; registry maintenance "
-                      "is disabled: {}",
-                      error.what());
-        return DiscoveryWiring::Disabled;
-    }
+    // The configuration was resolved (and the adapters built) before the
+    // store restored rows; an invalid document or a failed adapter build
+    // disables the runtime here.
+    if (!maintenance_ready) return DiscoveryWiring::Disabled;
+
     reconcile_interval_sec_ = config.reconcile_interval_sec;
     // The admission gate follows the resolved configuration.
     capture_all_ = config.capture_all;
+    auto_discovery_types_ = config.auto_discovery_types;
     for (const auto& [adapter_name, settings] : config.settings) {
         auto_add_states_[adapter_name] = settings.auto_add;
     }
     // Configuration wins over the construction default so the budget is a
     // deployment knob, not a rebuild.
-
-    // Exactly one adapter per configured scheduler name, built through the
-    // self-registration registry; the heartbeat drives them through
-    // IDiscoverySource and owns no adapter details.
-    for (const auto& name : config.types) {
-        const auto& settings = config.settings.at(name);
-        auto adapter = SchedulerAdapterRegistry::instance().build(name, settings);
-        if (!adapter) {
-            spdlog::error("JobRegistry: no adapter registered for discovery type '{}'; "
-                          "registered: {}",
-                          name,
-                          fmt::join(SchedulerAdapterRegistry::instance().names(), ", "));
-            adapters_.clear();
-            return DiscoveryWiring::Disabled;
-        }
-        adapters_.push_back(std::move(adapter));
-    }
-    if (config.types.empty()) {
-        spdlog::info("JobRegistry: no discovery types configured; discovery is disabled and "
-                     "existing records are still maintained");
-    }
 
     // Automatic selection is armed per adapter name from the resolved
     // tri-state: Default adds the configured defaults to every job, Rule
@@ -1626,9 +1665,26 @@ JobRegistry::armDiscovery(const JobRegistryOptions& options)
         }
     }
 
+    // Discovery sources: only the adapters whose type is listed in
+    // `auto_discovery_types`. Every other adapter stays available for facts,
+    // identity, refresh and kernel attribution of jobs that arrive another
+    // way (manual registration, RPC, restored rows).
     hb_sources_.clear();
     for (const auto& adapter : adapters_) {
+        const auto settings = config.settings.find(adapter->name());
+        if (settings == config.settings.end() ||
+            !settings->second.auto_discovery_enabled)
+            continue;
         hb_sources_.emplace_back(adapter->name(), &adapter->source());
+    }
+    if (auto_discovery_types_.empty()) {
+        spdlog::info("JobRegistry: no auto discovery types configured; no watcher starts, "
+                     "and every registered adapter still serves manual registrations, "
+                     "refresh and kernel attribution");
+    } else {
+        spdlog::info("JobRegistry: auto discovery enabled for {} type(s): {}",
+                     hb_sources_.size(),
+                     fmt::join(auto_discovery_types_, ", "));
     }
 
     // Adapter-owned identity->facts derivation needs no wiring anymore: the
@@ -1641,17 +1697,15 @@ JobRegistry::armDiscovery(const JobRegistryOptions& options)
     cgroup_probe_ = make_cgroup_membership_probe();
 
     // Kernel attribution capability gate: only adapters with the trait
-    // register into pid2job/cgroup2job; manual rows (unknown adapter)
-    // keep participating. Installed before the initial pass can activate
-    // anything.
+    // register into pid2job/cgroup2job. An open-world subtype with no adapter
+    // has no trait to consult and keeps the legacy participation. Installed
+    // before the initial pass can activate anything.
     if (attribution_) {
         attribution_->setCapabilityLookup([this](uint64_t job_id) {
             auto record = ownRecord(job_id);
             if (!record) return false;
-            for (const auto& adapter : adapters_) {
-                if (adapter->name() == record->job.subtype_name)
-                    return adapter->traits().kernel_attribution;
-            }
+            if (const auto* const adapter = namespaceAdapterOf(record->job))
+                return adapter->traits().kernel_attribution;
             return true;
         });
     }
@@ -1995,12 +2049,13 @@ void JobRegistry::attributionExitHint(pid_t pid) {
 
 std::string JobRegistry::attributionCgroupPath(uint64_t job_id) {
     // Adapter-owned: cgroupPathOf is the only place that knows where the
-    // cgroup lives in the typed facts. Manual/unknown adapters have none.
+    // cgroup lives in the typed facts. The adapter answers through the
+    // namespace cache, so a manual registration works on a node that
+    // configures no discovery type (the armed list is empty there).
     const auto record = ownRecord(job_id);
     if (!record) return {};
-    for (const auto& adapter : adapters_)
-        if (adapter->name() == record->job.subtype_name)
-            return adapter->cgroupPathOf(record->job);
+    if (const auto* const adapter = namespaceAdapterOf(record->job))
+        return adapter->cgroupPathOf(record->job);
     return {};
 }
 
@@ -2191,6 +2246,14 @@ UpsertResult JobRegistry::createManualJob(Job& job) {
         result.fail(RegistrationError::StoreUnavailable, "registration refused: " + error);
         return result;
     }
+    // Registration-time fact completion: a manual request names member pids,
+    // not the execution scope. The adapter owning the facts derives whatever
+    // the request did not carry (the slot cgroup, the starter pid) from that
+    // evidence, BEFORE the record is built, so kernel attribution's first
+    // activation already has a cgroup mapping and the refresh pass sees the
+    // whole scope instead of the named pids.
+    if (ISchedulerAdapter* const adapter = namespaceAdapterOf(job))
+        adapter->deriveExecutionFacts(job);
     const auto id = reserveJobId(job.JobID, error);
     if (!id) {
         spdlog::error("JobRegistry: durable JobID allocation failed, refusing to register the "
@@ -3118,6 +3181,16 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     // Group backfill is limited to missing group fields in this execution;
     // unrelated scheduler metadata remains the creation snapshot.
     const bool groups_changed = fill_missing_groups(updated.job, job);
+    // A refresh may have DERIVED an execution-scope fact the record never
+    // carried (a registration made before its member pid was readable). The
+    // adapter completes only empty slots, so identity, namespace and every
+    // existing value stay frozen; a completion is persisted like any other
+    // change so kernel attribution's reconcile can map the cgroup.
+    bool facts_completed = false;
+    if (!observation) {
+        if (ISchedulerAdapter* const adapter = namespaceAdapterOf(updated.job))
+            facts_completed = adapter->completeRefreshedFacts(updated.job, job);
+    }
     updated.job.CollectorNames.clear();   // intent lives in selection
     // Keep stored execution evidence until the manager/pid identity rules below
     // decide which observed evidence can replace it.
@@ -3150,6 +3223,7 @@ UpsertResult JobRegistry::mergeDiscoveredJob(const JobRecord& stored, const Job&
     // it as an operator binding.
     const bool provenance_changed = updated.source != stored.source;
     const bool changed = recovered || provenance_changed || groups_changed ||
+        facts_completed ||
         manager_of(stored.job) != manager_of(updated.job) ||
         pid_identities_of(stored.job) != pid_identities_of(updated.job);
     if (!changed) {
@@ -4071,8 +4145,12 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
         else state = "healthy";
     }
 
-    nlohmann::json configured_types = nlohmann::json::array();
-    for (const auto& adapter : adapters_) configured_types.push_back(adapter->name());
+    nlohmann::json configured_adapters = nlohmann::json::array();
+    for (const auto& adapter : adapters_)
+        configured_adapters.push_back(adapter->name());
+    nlohmann::json auto_discovery_types = nlohmann::json::array();
+    for (const auto& name : auto_discovery_types_)
+        auto_discovery_types.push_back(name);
 
     nlohmann::json sources = nlohmann::json::array();
     {
@@ -4090,7 +4168,8 @@ nlohmann::json JobRegistry::heartbeatStatusJson() const {
 
     nlohmann::json out;
     out["state"] = state;
-    out["configured_types"] = std::move(configured_types);
+    out["configured_adapters"] = std::move(configured_adapters);
+    out["auto_discovery_types"] = std::move(auto_discovery_types);
     out["reconcile_interval_sec"] = reconcile_interval_sec_;
     out["last_scan_start_ms"] = last_scan_start_ms;
     out["last_scan_success_ms"] = last_scan_success_ms;

@@ -119,17 +119,6 @@ namespace {
 
 constexpr std::string_view kSectionSuffix = "_job_watcher";
 
-// The legacy auto_add flags predate the adapter model; they stay explicit
-// built-in special cases forever (folding semantics, deprecation warnings).
-struct LegacyFlag {
-    const char* adapter;
-    const char* key;
-};
-constexpr LegacyFlag kLegacyFlags[] = {
-    {"condor", "auto_add_condorjob"},
-    {"slurm", "auto_add_slurmjob"},
-};
-
 std::string section_of(const std::string& adapter)
 {
     return adapter + std::string(kSectionSuffix);
@@ -149,11 +138,12 @@ MaintenanceConfig resolve_maintenance_config(const nlohmann::json& config)
         config_error("job_registry_config must be a mapping");
 
     MaintenanceConfig resolved;
+    const auto legacy_flags = SchedulerAdapterRegistry::instance().legacyAutoAddKeys();
 
     // Candidate names, open world: every REGISTERED adapter (so the resolved
     // picture is complete and a new scheduler appears without edits), every
     // top-level "<name>_job_watcher" section the configuration carries, and
-    // the two legacy auto_add flags.
+    // any legacy auto-add flag declared by an adapter.
     std::set<std::string> candidates;
     for (const auto& name : SchedulerAdapterRegistry::instance().names())
         candidates.insert(name);
@@ -165,33 +155,40 @@ MaintenanceConfig resolve_maintenance_config(const nlohmann::json& config)
             continue;
         candidates.insert(key.substr(0, key.size() - kSectionSuffix.size()));
     }
-    for (const auto& legacy : kLegacyFlags) {
-        if (member(registry_node, legacy.key) != nullptr)
-            candidates.insert(legacy.adapter);
+    for (const auto& [adapter, key] : legacy_flags) {
+        if (member(registry_node, key) != nullptr) candidates.insert(adapter);
     }
 
     for (const auto& name : candidates)
-        resolved.settings.emplace(name, DiscoveryTypeSettings{});
+        resolved.settings.emplace(name, SchedulerAdapterSettings{});
 
     // Legacy flags resolve first (per-type precedence input).
-    for (const auto& legacy : kLegacyFlags) {
-        const auto* node = member(registry_node, legacy.key);
+    for (const auto& [adapter, key] : legacy_flags) {
+        const auto* node = member(registry_node, key);
         if (node == nullptr) continue;
-        resolved.settings.at(legacy.adapter).legacy_auto_collect =
-            parse_bool(*node, std::string("job_registry_config.") + legacy.key);
+        resolved.settings.at(adapter).legacy_auto_collect =
+            parse_bool(*node, "job_registry_config." + key);
     }
 
-    // The discovery switches live directly under job_registry_config.
-    if (const auto* types = member(registry_node, "types")) {
+    // The discovery switches live directly under job_registry_config. The old
+    // `types` key described the same list but read as if it decided which
+    // scheduler types exist; silently ignoring it would turn discovery off
+    // without a word, so a present legacy key is an explicit rejection.
+    if (member(registry_node, "types") != nullptr) {
+        config_error("job_registry_config.types was renamed to "
+                     "job_registry_config.auto_discovery_types; update the configuration");
+    }
+    if (const auto* types = member(registry_node, "auto_discovery_types")) {
         if (!types->is_array())
-            config_error("job_registry_config.types must be a list");
+            config_error("job_registry_config.auto_discovery_types must be a list");
         for (const auto& entry : *types) {
-            const std::string raw = scalar_text(entry, "job_registry_config.types[]");
+            const std::string raw =
+                scalar_text(entry, "job_registry_config.auto_discovery_types[]");
             const std::string name = normalize_adapter_name(raw);
             if (name.empty() || name == "unknown")
-                config_error("unknown discovery type '" + raw + "'");
+                config_error("unknown auto discovery type '" + raw + "'");
             if (!SchedulerAdapterRegistry::instance().known(name)) {
-                config_error("unknown discovery type '" + raw + "' (registered: " +
+                config_error("unknown auto discovery type '" + raw + "' (registered: " +
                              [&] {
                                  std::string joined;
                                  for (const auto& known :
@@ -201,9 +198,10 @@ MaintenanceConfig resolve_maintenance_config(const nlohmann::json& config)
                              }() +
                              ")");
             }
-            if (std::find(resolved.types.begin(), resolved.types.end(), name) ==
-                resolved.types.end()) {
-                resolved.types.push_back(name);
+            if (std::find(resolved.auto_discovery_types.begin(),
+                          resolved.auto_discovery_types.end(),
+                          name) == resolved.auto_discovery_types.end()) {
+                resolved.auto_discovery_types.push_back(name);
             }
         }
     }
@@ -228,12 +226,12 @@ MaintenanceConfig resolve_maintenance_config(const nlohmann::json& config)
     const std::string legacy_rules_dir =
         scalar_field(registry_node, "rules_dir", "job_registry_config", std::string());
 
-    for (const auto& name : resolved.types) {
-        resolved.settings[name].enabled = true;
+    for (const auto& name : resolved.auto_discovery_types) {
+        resolved.settings[name].auto_discovery_enabled = true;
     }
 
     // Per-adapter sections resolve by convention: <name>_job_watcher. The rule
-    // file prefix is the adapter name itself (condor*, slurm*): a deterministic
+    // file prefix is the adapter name itself: a deterministic
     // convention keeps a shared rules directory from feeding one type's rules
     // into another. Rules live under config/rules/<name>_jobs by default.
     for (auto& [name, settings] : resolved.settings) {
@@ -311,21 +309,24 @@ MaintenanceConfig resolve_maintenance_config(const nlohmann::json& config)
     // use_rules only decides whether the collector list comes from the rule
     // engine (accept = rule result, reject = empty) or verbatim from
     // auto_add_collectors. An explicit per-type auto_collect or an explicit
-    // An explicit types entry always wins over the legacy flag.
-    for (const auto& legacy : kLegacyFlags) {
-        auto& settings = resolved.settings.at(legacy.adapter);
+    // auto_discovery_types entry always wins over the legacy flag.
+    for (const auto& [adapter, key] : legacy_flags) {
+        const auto found = resolved.settings.find(adapter);
+        if (found == resolved.settings.end()) continue;
+        auto& settings = found->second;
         const bool explicit_type =
-            std::find(resolved.types.begin(), resolved.types.end(),
-                      legacy.adapter) != resolved.types.end();
+            std::find(resolved.auto_discovery_types.begin(),
+                      resolved.auto_discovery_types.end(),
+                      adapter) != resolved.auto_discovery_types.end();
         if (!settings.legacy_auto_collect || explicit_type || settings.auto_collect_explicit)
             continue;
-        resolved.types.push_back(legacy.adapter);
-        settings.enabled = true;
+        resolved.auto_discovery_types.push_back(adapter);
+        settings.auto_discovery_enabled = true;
         settings.auto_collect = true;
         spdlog::warn("maintenance configuration: job_registry_config.{} is folded "
                      "into discovery with automatic collection; set {}.auto_collect "
                      "explicitly to override",
-                     legacy.key, section_of(legacy.adapter));
+                     key, section_of(adapter));
     }
 
     // Resolve the tri-state for every type: an explicit `auto_add` stands;
